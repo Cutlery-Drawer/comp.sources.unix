@@ -1,0 +1,1659 @@
+Newsgroups: comp.sources.unix
+From: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Subject: v29i025: mvstape - suite of utilities for handling IBM MVS tapes, Part06/09
+References: <1.807573809.16947@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Posting-Number: Volume 29, Issue 25
+Archive-Name: mvstape/part06
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 6 (of 9)."
+# Contents:  misc.c scanning.c unpick.c
+# Wrapped by nmm1@ursa.cus.cam.ac.uk on Fri Aug  4 15:43:59 1995
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'misc.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'misc.c'\"
+else
+echo shar: Extracting \"'misc.c'\" \(18271 characters\)
+sed "s/^X//" >'misc.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xmisc.c  -  miscellaneous code that does not fit naturally elsewhere. */
+X
+X
+X
+X#include <ctype.h>
+X#include <limits.h>
+X#include <stdarg.h>
+X#include <time.h>
+X
+X#include "mvstape.h"
+X#include "control.h"
+X#include "tarpit.h"
+X
+X
+X
+X/* Global variables that are used only within this module. */
+X
+Xstatic char tar_block_space[TAR_BLKSIZE] = ""; /* Just being lazy */
+Xstatic int tar_mode = 0, tar_uid = 0, tar_gid = 0, /* Saved for reuse */
+X    skip_labels = 0, skip_data = 0, /* Used by the tape I/O functions */
+X    raw_block_number = 0, next_bad_block = 0, /* For I/O error emulation etc. */
+X    stdin_reset = 0;                /* To check against rewinding stdin */
+Xstatic char *saved_blocks[10] = {
+X    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+X};
+Xstatic int saved_lengths[10] = {
+X    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+X};
+X
+X
+X
+Xvoid get_string (char *target, const char *data, int length) {
+X
+X/* Convert a piece of EBCDIC text to an ASCII C string, removing trailing
+Xspaces.  target must be longer than data. */
+X
+X    int i, k;
+X    char *ptr;
+X
+X    for (i = 0; i < length; ++i) if (data[i] != EBCDIC_SPACE) break;
+X    k = 0;
+X    for ( ; i < length; ++i) target[k++] = EBCDIC_to_ASCII(data[i]);
+X    target[k] = '\0';
+X    if ((ptr = strchr(target,' ')) != NULL) *ptr = '\0';
+X}
+X
+X
+X
+XSTATIC void get_next_bad_block (void) {
+X    int k, n;
+X
+X/* Read the next block number to look out for.  Note that a missing -F argument
+Xshould not look out for any blocks. */
+X
+X    errno = 0;
+X    if (IO_error_file == NULL)
+X        next_bad_block = INT_MAX;
+X    else if ((k = fscanf(IO_error_file,"%d",&n)) == EOF) {
+X        if (ferror(IO_error_file))
+X            fatal("unable to read I/O error file",ERR_system);
+X        next_bad_block = INT_MAX;
+X    } else if (k != 1 || n <= next_bad_block)
+X        fatal("invalid data in I/O error file",ERR_system);
+X    else
+X        next_bad_block = n;
+X}
+X
+X
+X
+Xint reset_disk_file (int block) {
+X
+X/* If its argument is non-negative, this resets the block number after an
+Xlseek() and rewinds the I/O error file to match.  It returns the previous
+Xposition. */
+X
+X    int n = raw_block_number;
+X
+X    if (block >= 0) {
+X        if (stdin_reset)
+X            fatal("second attempt to rewind stdin - seek expert",ERR_private);
+X        if (TLS_dict_fileno == STDIN_FILENO) stdin_reset = 1;
+X        if (IO_error_file != NULL) rewind(IO_error_file);
+X        raw_block_number = block;
+X        next_bad_block = 0;
+X    }
+X    return n;
+X}
+X
+X
+X
+XSTATIC void read_diskized_data (char *ptr, int length) {
+X
+X/* Read a section of data from the disk file, kludging up POSIX's horrible
+Xblocking semantics for pipes. */
+X
+X    int n;
+X
+X    while (length > 0) {
+X        errno = 0;
+X        if ((n = Read(TLS_dict_fileno,ptr,length)) > 0) {
+X            ptr += n;
+X            length -= n;
+X        } else if (n == 0 && stop_on_EOF)
+X            stop(EXIT_SUCCESS);
+X        else if (n == 0)
+X            fatal("unexpected end of file while reading 'diskized' tape file",
+X                ERR_system);
+X        else {
+X            ++block_number;
+X            fatal("unable to read 'diskized' tape file data",ERR_system);
+X        }
+X    }
+X}
+X
+X
+X
+Xint read_disk_block (void) {
+X
+X/* This reads a 'diskized' tape block, which is usually the initial labels and
+XTLS dictionary.  Note that it does not count I/O errors, because they are
+Xsometimes ignored while skipping.  It must not call IO_error except with
+XERR_ignore.  It returns the block length (as from read()). */
+X
+X    BE_int length;
+X
+X/* When reading a 'diskized' tape from stdin the second time round, recover the
+Xblock from the saved state.  This code relies on the structure of some code in
+Xmvstape.c and labels.c. */
+X
+X    block_buffer = actual_block_buffer;
+X    if (raw_block_number < 10 && saved_lengths[raw_block_number] >= 0) {
+X        block_length = saved_lengths[raw_block_number];
+X        memcpy(actual_block_buffer,saved_blocks[raw_block_number],block_length);
+X
+X/* Read the actual disk block first time round and for all real disk files.
+XRemember POSIX's horrible blocking semantics for pipes. */
+X
+X    } else {
+X        read_diskized_data((char *)length,sizeof(length));
+X        if ((block_length = get_BE_int(length)) > constant_64K)
+X            fatal("invalid block length in 'diskized' tape file",ERR_private);
+X        read_diskized_data(actual_block_buffer,block_length);
+X    }
+X
+X/* Save copies of the blocks if reading the volume labels from stdin. */
+X
+X    if (TLS_dict_fileno == STDIN_FILENO && ! stdin_reset) {
+X        if (raw_block_number >= 10)
+X            fatal("trying to save too many initial stdin blocks - seek expert",
+X                ERR_private);
+X        saved_lengths[raw_block_number] = block_length;
+X        if (block_length > 0) {
+X            if ((saved_blocks[raw_block_number] = malloc(block_length)) == NULL)
+X                fatal("unable to get space for saving initial stdin blocks",
+X                    ERR_system);
+X            memcpy(saved_blocks[raw_block_number],actual_block_buffer,
+X                block_length);
+X        }
+X    }
+X
+X/* Emulate an I/O error if requested. */
+X
+X    if (++raw_block_number == next_bad_block) {
+X        get_next_bad_block();
+X        ++block_number;
+X        following_EOF = 0;
+X        return (block_length = -1);
+X    } else if (raw_block_number > next_bad_block)
+X        get_next_bad_block();
+X
+X/* Now set the flags appropriately. */
+X
+X    if (block_length == 0) {
+X        if (following_EOF) ++tape_mark_count;
+X        following_EOF = 1;
+X    } else if (block_length < 0) {
+X        ++block_number;
+X        following_EOF = 0;
+X    } else {
+X        ++block_number;
+X        following_EOF = 0;
+X    }
+X    return block_length;
+X}
+X
+X
+X
+Xint read_simple_block (void) {
+X
+X/* This reads a simple (i.e. non-TLS) block.  It is just an indirection to
+Xread_actual_block(), but the indirection is critical.  It could be done by
+Xanother level of pointer, but I find this clearer. */
+X
+X    return read_actual_block();
+X}
+X
+X
+X
+Xvoid skip_file (int labels) {
+X
+X/* This skips a file from a 'diskized' tape file, and calls another function to
+Xdo the same for tape.  It ignores errors, and must not call IO_error except
+Xwith ERR_ignore. */
+X
+X    if (read_actual_block == read_tape_block)
+X        skip_tape_file(labels);
+X    else
+X        while (read_actual_block() != 0) ;
+X}
+X
+X
+X
+XSTATIC void write_message (const char *message, va_list args) {
+X
+X/* Add the command name onto the front of the message. */
+X
+X    char text[100];
+X
+X    strcpy(text,command_name);
+X    strcat(text,": ");
+X    strncat(text,message,90);
+X    strcat(text,"\n");
+X    vfprintf(stderr,text,args);
+X    if (ferror(stderr)) abort();    /* Yeah, well, what else can I do? */
+X}
+X
+X
+X
+XSTATIC void write_diagnostics (int errtype, int error) {
+X
+X/* Write any associated diagnostic information. */
+X
+X    errno = error;
+X    if ((errtype == ERR_system || errtype == ERR_tapeio) && errno != 0)
+X        Perror(command_name);
+X    if (errtype == ERR_tapeio && tape_fileno >= 0) diagnose_tape();
+X}
+X
+X
+X
+Xvoid fatal (const char *message, int errtype, ...) {
+X
+X/* Write an error message to stderr and stop. */
+X
+X    va_list args;
+X    int error;
+X
+X    error = errno;
+X    va_start(args,errtype);
+X    write_message(message,args);
+X    va_end(args);
+X    write_diagnostics(errtype,error);
+X    stop(EXIT_FAILURE);
+X}
+X
+X
+X
+Xvoid warn (const char *message, int errtype, ...) {
+X
+X/* Write an error message to stderr and carry on. */
+X
+X    va_list args;
+X    int error;
+X
+X    error = errno;
+X    va_start(args,errtype);
+X    write_message(message,args);
+X    va_end(args);
+X    write_diagnostics(errtype,error);
+X    return_code = EXIT_FAILURE;
+X}
+X
+X
+X
+Xvoid comment (const char *message, ...) {
+X
+X/* Write a comment to stderr and carry on. */
+X
+X    va_list args;
+X
+X    va_start(args,message);
+X    write_message(message,args);
+X    va_end(args);
+X}
+X
+X
+X
+Xvoid save_tape_block (const char *buffer, int length) {
+X
+X/* Save a tape block in 'diskized' form. */
+X
+X    BE_int temp;
+X
+X    put_BE_int(temp,length);
+X    errno = 0;
+X    if (Write(TLS_dict_fileno,&temp,sizeof(temp)) != sizeof(temp) ||
+X            Write(TLS_dict_fileno,buffer,length) != length)
+X        fatal("I/O error while writing TLS dictionary",ERR_system);
+X}
+X
+X
+X
+Xvoid write_TLS_dictionary (const char *filename) {
+X
+X/* Write out enough of the tape to use as a TLS dictionary (and no more). */
+X
+X    errno = 0;
+X    if ((TLS_dict_fileno = Open(filename,O_WRITE,O_WRMODE)) < 0)
+X        fatal("unable to open the TLS dictionary for output",ERR_system);
+X    save_tape_block((char *)vol1_label,TAPE_LABEL_SIZE);
+X    save_tape_block((char *)hdr1_label,TAPE_LABEL_SIZE);
+X    save_tape_block(NULL,0);
+X    save_tape_block((char *)TLS_dictionary,TLS_dict_length);
+X    save_tape_block(NULL,0);
+X    save_tape_block(NULL,0);
+X    if (Close(TLS_dict_fileno) != 0)
+X        fatal("unable to close the TLS dictionary",ERR_system);
+X    TLS_dict_fileno = -1;
+X}
+X
+X
+X
+XSTATIC int write_tar_header (int size) {
+X
+X/* This writes a tar header, which has already been cleared and had its link
+Xflag and link name, if any, set up.  It returns 0 for success and 1 if the name
+Xis too long. */
+X
+X    tar_header *tar_block = (tar_header *)tar_block_space;
+X    unsigned int mask;    /* Should really be mode_t, but what the hell? */
+X    char temp[TAR_FIELDSIZE];
+X    struct tm date;
+X    time_t creation;
+X    int chksum, i;
+X
+X    if (strlen(UNIX_filename)+1 > TAR_NAMESIZE) {
+X        warn("file name '%s' is too long for tar format - skipped",ERR_private,
+X            UNIX_filename);
+X        if (++disk_IO_errors >= disk_IO_error_limit) stop(EXIT_FAILURE);
+X        return 1;
+X    } else
+X        strcpy(tar_block->name,UNIX_filename);
+X
+X/* Work out the time since the Epoch using ANSI C functions. */
+X
+X    if (dataset_int_date[0] != 0) {
+X        date.tm_year = dataset_int_date[0];
+X        date.tm_mon = dataset_int_date[1];
+X        date.tm_mday = dataset_int_date[2];
+X        date.tm_sec = date.tm_min = date.tm_hour = 0;
+X        date.tm_isdst = -1;
+X        if ((creation = mktime(&date)) == (time_t)-1) creation = 0;
+X    } else
+X        creation = 0;
+X
+X/* If this is the first time through, get the mode from the umask and the uid
+Xand gid. */
+X
+X    if (tar_uid == 0) {
+X        mask = S_ALLBITS;
+X        mask = Umask(mask);
+X        Umask(mask);
+X        tar_mode = S_ALLRDWR&~mask;
+X        tar_uid = Getuid();
+X        tar_gid = Getgid();
+X        if (debug)
+X            comment("mode = %.3o,    uid = %d,    gid = %d\n",
+X                tar_mode,tar_uid,tar_gid);
+X    }
+X
+X/* Set the mode to be 644-umask, the uid and gid to be those of the caller, and
+Xthe other fields to their defined values. */
+X
+X    sprintf(tar_block->mode,"%*o ",(int)sizeof(tar_block->mode)-2,tar_mode);
+X    sprintf(tar_block->uid,"%*o ",(int)sizeof(tar_block->uid)-2,tar_uid);
+X    sprintf(tar_block->gid,"%*o ",(int)sizeof(tar_block->gid)-2,tar_gid);
+X    sprintf(temp,"%*o ",(int)sizeof(tar_block->size)-1,size);
+X    memcpy(tar_block->size,temp,sizeof(tar_block->size));
+X    sprintf(temp,"%*lo ",(int)sizeof(tar_block->mtime)-1,
+X        (unsigned long)creation);
+X    memcpy(tar_block->mtime,temp,sizeof(tar_block->mtime));
+X
+X/* Lastly work out the check sum, and store it in what I fondly believe to be
+Xthe safest fashion.  I have little evidence for this, and much evidence that
+Xthere is no canonical fashion .... */
+X
+X    memset(tar_block->chksum,' ',sizeof(tar_block->chksum));
+X    chksum = 0;
+X    for (i = 0; i < TAR_BLKSIZE; ++i)
+X        chksum += ((unsigned char *)tar_block)[i];
+X    chksum &= 0xffff;
+X    sprintf(temp,"%*o",(int)sizeof(tar_block->chksum)-2,chksum);
+X    memcpy(tar_block->chksum,temp,sizeof(tar_block->chksum)-1);
+X    if (Write(tar_fileno,tar_block,TAR_BLKSIZE) != TAR_BLKSIZE)
+X        fatal("unable to write to the output tar file",ERR_system);
+X    return 0;
+X}
+X
+X
+X
+Xint write_tar_file (int size) {
+X
+X/* If size is negative, this just writes a block of zeroes.  Otherwise, it
+Xwrites a tar header and then copies the file off the work file.  It returns 0
+Xfor success and 1 if the name is too long. */
+X
+X    tar_header *tar_block = (tar_header *)tar_block_space;
+X    int n;
+X
+X    if (size < 0) {
+X        memset(tar_block,0,TAR_BLKSIZE);
+X        if (Write(tar_fileno,tar_block,TAR_BLKSIZE) != TAR_BLKSIZE)
+X            fatal("unable to write to the output tar file",ERR_system);
+X        return 0;
+X    }
+X
+X/* Since size is not negative, write a suitable header. */
+X
+X    if (Lseek(temp_tar_fileno,0l,SEEK_SET) < 0)
+X        fatal("unable to rewind the tar work file",ERR_system);
+X    memset(tar_block,0,TAR_BLKSIZE);
+X    tar_block->linkflag = TAR_REGTYPE;
+X    if (write_tar_header(size)) return 1;
+X
+X/* Copy the file to the tar archive. */
+X
+X    while (size > 0) {
+X        if (size < TAR_BLKSIZE) {
+X            memset(tar_block,0,TAR_BLKSIZE);
+X            n = size;
+X        } else
+X            n = TAR_BLKSIZE;
+X        if (Read(temp_tar_fileno,tar_block,n) != n)
+X            fatal("unable to read the tar work file",ERR_system);
+X        if (Write(tar_fileno,tar_block,TAR_BLKSIZE) != TAR_BLKSIZE)
+X            fatal("unable to write to the output tar file",ERR_system);
+X        size -= n;
+X    }
+X    if (Lseek(temp_tar_fileno,0l,SEEK_SET) != 0)
+X        fatal("unable to rewind the tar work file",ERR_system);
+X    return 0;
+X}
+X
+X
+X
+Xint write_tar_alias (const char *linkname) {
+X
+X/* This writes an entry defining dataset_name as an alias (hard link) of name,
+Xto give some emulation of PDS members.  The linkname must already have been
+Xaccepted, so does not need checking.  It returns 0 for success and 1 if the
+XUNIX_filename is too long. */
+X
+X    tar_header *tar_block = (tar_header *)tar_block_space;
+X
+X    memset(tar_block,0,TAR_BLKSIZE);
+X    tar_block->linkflag = TAR_LINKTYPE;
+X    strcpy(tar_block->linkname,linkname);
+X    return write_tar_header(0);
+X}
+X
+X
+X
+Xconst char *format_recfm (int recfm) {
+X
+X/* This returns the argument as a string, which must be copied or printed. */
+X
+X    static char text[10] = "", *ptr;
+X
+X    ptr = text;
+X    if (recfm&recfm_U) *ptr++ = 'U';
+X    if (recfm&recfm_F) *ptr++ = 'F';
+X    if (recfm&recfm_V) *ptr++ = 'V';
+X    if (recfm&recfm_B) *ptr++ = 'B';
+X    if (recfm&recfm_S) *ptr++ = 'S';
+X    if (recfm&recfm_A) *ptr++ = 'A';
+X    if (recfm&recfm_M) *ptr++ = 'M';
+X    if (recfm&~(recfm_U|recfm_F|recfm_V|recfm_B|recfm_S|recfm_A|recfm_M))
+X        *ptr++ = '?';
+X    *ptr = '\0';
+X    return text;
+X}
+X
+X
+X
+Xvoid display_buffer (FILE *file, const char *buffer, int text, int hex) {
+X
+X/* Display a block of text in character form (translated from EBCDIC) and
+Xhexadecimal. */
+X
+X    int c, i;
+X
+X/* First print 1/3 or 1/2 of the lines in character form, replacing all bad
+Xcharacters by '?'. */
+X
+X    for (i = 0; i < text; ++i) {
+X        if (i == 0)
+X            fprintf(file,"Text: ");
+X        else if (i%64 == 0)
+X            fprintf(file,"\n%2d:   ",i);
+X        c = EBCDIC_to_ASCII(buffer[i]);
+X        putc((c >= 0 && isprint(c) ? c : '?'),file);
+X    }
+X    if (text > 0) putc('\n',file);
+X
+X/* Then print the remainder as hexadecimal. */
+X
+X    for (i = 0; i < hex; ++i) {
+X        if (i == 0)
+X            fprintf(file,"Hex.: ");
+X        else if (i%32 == 0)
+X            fprintf(file,"\n%2d:   ",i);
+X        else if (i%4 == 0)
+X            putc(' ',file);
+X        fprintf(file,"%.2x",(unsigned char)buffer[i]);
+X    }
+X    if (hex > 0) putc('\n',file);
+X}
+X
+X
+X
+Xvoid open_tape (const char *name) {
+X
+X/* Open the tape device for input. */
+X
+X    if ((tape_fileno = basic_tape_open(name)) < 0) {
+X        if (tape_fileno == -2)
+X            fatal("-t does not specify a tape device",ERR_private);
+X        else if (tape_fileno == -3)
+X            fatal("the tape device is in a strange state",ERR_tapeio);
+X        else if (tape_fileno == -4)
+X            fatal("unable to position the tape device at the start",ERR_tapeio);
+X        else
+X            fatal("unable to open tape for reading",ERR_system);
+X    }
+X}
+X
+X
+X
+Xvoid close_tape (void) {
+X
+X/* Close the tape device. */
+X
+X    errno = 0;
+X    if (basic_tape_close(tape_fileno) < 0)
+X        fatal("unable to open the tape device",ERR_tapeio);
+X}
+X
+X
+X
+Xvoid rewind_tape (void) {
+X
+X/* Rewind a tape, leaving it at the load point. */
+X
+X    if (basic_tape_rewind(tape_fileno) != 0)
+X        fatal("unable to rewind the tape",ERR_tapeio);
+X    skip_labels = skip_data = 0;
+X    block_buffer = actual_block_buffer;
+X    block_length = 0;
+X    following_EOF = 1;
+X}
+X
+X
+X
+Xvoid diagnose_tape (void) {
+X
+X/* Issue some diagnostics after an I/O error or unexpected EOF on tape.  Note
+Xthat this can be called from other diagnostic routines, and that failure is
+Xdefinitely catastrophic! */
+X
+X    const char *status;
+X
+X    if ((status = basic_tape_status(tape_fileno)) != NULL)
+X        comment("%s",status);
+X    else {
+X        comment("unable to find status of tape device");
+X        tape_fileno = -1;
+X        stop(EXIT_FAILURE);
+X    }
+X}
+X
+X
+X
+Xvoid skip_tape_file (int labels) {
+X
+X/* This skips a file, which is flagged according to whether it is data or
+Xlabels.  Note that it attempts to do nothing until a read is needed, but needs
+Xa kludge to bypass a common bug in UNIX device drivers which causes skips
+Ximmediately following a read tape mark to go wrong. */
+X
+X    block_buffer = actual_block_buffer;
+X    if (following_EOF && skip_labels+skip_data == 0 &&
+X            read_tape_block() == 0)
+X        return;
+X    else if (labels)
+X        ++skip_labels;
+X    else
+X        ++skip_data;
+X    block_length = 0;
+X    following_EOF = 1;
+X}
+X
+X
+X
+Xint read_tape_block (void) {
+X
+X/* Read an actual tape block, handling hardware I/O errors, block counting etc.
+XNote that it does not count I/O errors, because they are sometimes ignored
+Xwhile skipping.  It must not call IO_error except with ERR_ignore. */
+X
+X    if (skip_labels+skip_data > 0 &&
+X            basic_tape_skip(tape_fileno,skip_labels,skip_data))
+X        fatal("unable to skip tape files",ERR_tapeio);
+X    skip_labels = skip_data = 0;
+X
+X/* Having skipped to where we need to be, read the next block. */
+X
+X    errno = 0;
+X    block_buffer = actual_block_buffer;
+X    block_length =
+X        basic_tape_read(tape_fileno,actual_block_buffer,constant_64K);
+X    if (block_length == 0) {
+X        if (following_EOF) ++tape_mark_count;
+X        following_EOF = 1;
+X    } else if (block_length >= constant_64K) {
+X        ++block_number;
+X        fatal("block length on tape exceeds 65535",ERR_private);
+X    } else {
+X        ++block_number;
+X        following_EOF = 0;
+X    }
+X    return block_length;
+X}
+END_OF_FILE
+if test 18271 -ne `wc -c <'misc.c'`; then
+    echo shar: \"'misc.c'\" unpacked with wrong size!
+fi
+# end of 'misc.c'
+fi
+if test -f 'scanning.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'scanning.c'\"
+else
+echo shar: Extracting \"'scanning.c'\" \(16106 characters\)
+sed "s/^X//" >'scanning.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xscanning.c  -  this controls the scanning of the tape, file matching and so
+Xon, in conjunction with control.c.  All really foul stuff is put into labels.c,
+Xiebcopy.c, tlspds.c or tapeio.c, but this interacts horribly with those in some
+Xplaces. */
+X
+X
+X
+X#include <limits.h>
+X
+X#include "mvstape.h"
+X#include "control.h"
+X
+X
+X
+X/* Global variables that are used only in this module and control.c for
+XI/O error recovery. */
+X
+Xint IO_jump_set = 0;      /* Whether IO_error_jump is set */
+Xjmp_buf IO_error_jump;    /* This cannot be initialised portably */
+X
+X
+X
+Xvoid print_volume (void) {
+X
+X/* Print out information about the tape volume, which depends very much on
+Xthe type of tape it is. */
+X
+X    errno = 0;
+X    if (tape_name[0] != '\0') {
+X        if (tape_date[0] != '\0' || tape_owner[0] != '\0')
+X            fprintf(listing_file,"Tape %s labelled",tape_name);
+X        else
+X            fprintf(listing_file,"The tape is labelled %s",tape_name);
+X        if (tape_date[0] != '\0') fprintf(listing_file," on %s",tape_date);
+X        if (tape_owner[0] != '\0') fprintf(listing_file," by %s",tape_owner);
+X        putc('\n',listing_file);
+X        if (TLS_version != 0)
+X            fprintf(listing_file,"It is a version %d TLS tape\n",TLS_version);
+X    } else
+X        fprintf(listing_file,"The tape is unlabelled\n");
+X    putc('\n',listing_file);
+X    if (ferror(listing_file)) fatal("I/O error on the listing file",ERR_system);
+X}
+X
+X
+X
+Xvoid print_headers (void) {
+X
+X/* Print out information about the current dataset, from the header labels and
+XTLS dictionary entry. */
+X
+X    errno = 0;
+X
+X/* It is at least a labelled tape.  Print the sequence number, dataset name
+Xand, if it is a TLS tape, the dsorg. */
+X
+X    fprintf(listing_file,(dataset_deleted ? "%d:  [%s]  (" : "%d:  %s  ("),
+X        dataset_seqno,dataset_name);
+X    switch (dataset_dsorg) {
+Xcase dsorg_PS:  if (TLS_version != 0) fprintf(listing_file,"PS,"); break;
+Xcase dsorg_PO:  fprintf(listing_file,"PO,"); break;
+Xcase dsorg_DA:  fprintf(listing_file,"DA,"); break;
+Xdefault:  fprintf(listing_file,"?,"); break;
+X    }
+X
+X/* Print the record format precisely enough for our purposes, plus the lrecl
+Xand blksize. */
+X
+X    fprintf(listing_file,"%s",format_recfm(dataset_recfm));
+X    fprintf(listing_file,(dataset_lrecl == INT_MAX ? ",X," : ",%d,"),
+X        dataset_lrecl);
+X    fprintf(listing_file,"%d)",dataset_blksize);
+X
+X/* If it is a TLS entry, print the size in kilobytes and number of directory
+Xblocks followed, in both the TLS and SL cases, by the date and comments. */
+X
+X    if (tape_type == type_TLS) {
+X        fprintf(listing_file,"  %dK",dataset_KB);
+X        if (dataset_dsorg == dsorg_PO)
+X            fprintf(listing_file,"/%d",dataset_dir_blks);
+X    }
+X    fprintf(listing_file,"  %s  %s\n",dataset_date,dataset_comments);
+X    if (ferror(listing_file)) fatal("I/O error on the listing file",ERR_system);
+X}
+X
+X
+X
+XSTATIC void print_PDS_directory (void) {
+X
+X/* Print out the initial part of a PDS directory for TLS PDSs, treating aliases
+Xin a similar way to XPDS. */
+X
+X    int lines = 0, width = 0, newline = 1, i, j, n;
+X    char *name;
+X
+X    errno = 0;
+X
+X/* First find out if the name will fit and, if so, whether this will avoid a
+Xfirst alias being on a new line. */
+X
+X    for (n = 0; n < PDS_member_count; ++n) {
+X        if (! (PDS_member_list[n].flags&PDS_flags_head)) continue;
+X        i = n;
+X        do {
+X            name = PDS_member_list[i].name;
+X            j = PDS_member_list[i].next_entry;
+X            if (i == n) {
+X                width += (newline ? 0 : 4)+strlen(name);
+X                if (j != i && width+3+strlen(PDS_member_list[j].name) > 80)
+X                    width = 100;
+X            } else
+X                width += 3+strlen(name);
+X
+X/* Print a newline if necessary, some text and then the name. */
+X
+X            if (width > 80) {
+X                putc('\n',listing_file);
+X                newline = 1;
+X                if (++lines >= print_lines) goto finished;
+X                if (i == n)
+X                    width = strlen(name);
+X                else {
+X                    fprintf(listing_file,"    = ");
+X                    width = 6+strlen(name);
+X                }
+X            } else
+X                fprintf(listing_file,
+X                    (i == n ? (newline ? "" : "    ") : " = "));
+X            fprintf(listing_file,"%s",name);
+X            newline = 0;
+X        } while ((i = j) != n);
+X    }
+Xfinished:
+X    if (! newline) putc('\n',listing_file);
+X    if (ferror(listing_file)) fatal("I/O error on the listing file",ERR_system);
+X}
+X
+X
+X
+XSTATIC void print_contents (void) {
+X
+X/* Print out the initial contents of a tape block, except for TLS PDSs.  For
+XTLS DA files, it ignores the TLS prefix.  I really cannot be bothered to
+Xparameterise this or, worse, control it by arguments! */
+X
+X    int text, hex;
+X
+X    errno = 0;
+X    text = ((print_lines+1)/2)*64;
+X    hex = ((print_lines+1)/2)*32;
+X    if (text > block_length) text = block_length;
+X    if (hex > block_length) hex = block_length;
+X    display_buffer(listing_file,block_buffer,text,hex);
+X    if (ferror(listing_file)) fatal("I/O error on the listing file",ERR_system);
+X}
+X
+X
+X
+XSTATIC void print_trailers (int byte_count, int block_no, int IO_errors,
+X    int max_block, int min_block, int last_only) {
+X
+X/* Print out the block count etc. at file end. */
+X
+X    errno = 0;
+X    if (block_no == 0)
+X        fprintf(listing_file,"empty file");
+X    else if (byte_count == 0)
+X        fprintf(listing_file,"no good blocks,  %d I/O errors",IO_errors);
+X    else {
+X        fprintf(listing_file,"%d blocks,  ",block_no);
+X        if (IO_errors > 0) fprintf(listing_file,"%d I/O errors,  ",IO_errors);
+X        if (min_block == max_block)
+X            fprintf(listing_file,"%d bytes,  all blocks %d",
+X                byte_count,min_block);
+X        else
+X            fprintf(listing_file,"%d bytes,  max. block %d,  min. block %d%s",
+X                byte_count,max_block,min_block,
+X                (last_only ? " (last only)" : ""));
+X    }
+X    if (PDS_member_count >= 0)
+X        fprintf(listing_file,",  %d members\n",PDS_member_count);
+X    else
+X        putc('\n',listing_file);
+X    if (ferror(listing_file)) fatal("I/O error on the listing file",ERR_system);
+X}
+X
+X
+X
+Xvoid display_tape_globals (void) {
+X
+X/* Print the global variables that relate to tape processing. */
+X
+X    comment("Global variables that relate to tape handling:");
+X    comment(
+X        "tape_file_count = %d,    block_number = %d,    following_EOF = %d",
+X        tape_file_count,block_number,following_EOF);
+X    comment("block_length = %d",block_length);
+X    comment("");
+X}
+X
+X
+X
+Xvoid display_label_globals (void) {
+X
+X/* Print the global variables that relate to label processing. */
+X
+X    comment("Global variables that relate to datasets:");
+X    comment(
+X        "dataset_name = %s,    dataset_date = %s,    dataset_seqno = %d",
+X        dataset_name,dataset_date,dataset_seqno);
+X    comment(
+X        "dataset_recfm = %s,    dataset_lrecl = %d,    dataset_blksize = %d",
+X        format_recfm(dataset_recfm),dataset_lrecl,dataset_blksize);
+X    comment("dataset_comments = '%s',    dataset_dsorg = %s",
+X        dataset_comments,
+X        (dataset_dsorg == 0 ? "0" : (dataset_dsorg == dsorg_PS ? "PS" :
+X            (dataset_dsorg == dsorg_PO ? "PO" :
+X            (dataset_dsorg == dsorg_DA ? "DA" : "?")))));
+X    comment("dataset_keylen = %d,    dataset_deleted = %d",
+X        dataset_keylen,dataset_deleted);
+X    comment("dataset_KB = %d,    dataset_dir_blks = %d",
+X        dataset_KB,dataset_dir_blks);
+X    comment("");
+X}
+X
+X
+X
+Xvoid process_scanning (void) {
+X
+X/* This handles dataset processing, including some rudimentary error recovery.
+XFor unlabelled tapes, it can do very little about I/O errors except hope that
+Xit has not missed a tape mark.  Ignore the warnings about variables changed by
+Xlongjmp() from 'gcc -Wall'. */
+X
+X    int scanned = 0, byte_count, IO_error_base, max_block, min_block, last_only,
+X        label_in_hand, block_in_hand, seqno, n;
+X
+X/* Start by skipping the TLS dictionary when necessary, and allowing for
+Xrecovery. */
+X
+X    if (tape_type == type_TLS) {
+X        skip_file(1);
+X        skip_file(0);
+X        skip_file(1);
+X        fprintf(listing_file,"1:  [TLS dictionary]\n");
+X        if ((verification&verify_details) || print_lines > 0)
+X            putc('\n',listing_file);
+X        dataset_seqno = 2;
+X    } else
+X        dataset_seqno = 1;
+X    for ( ; dataset_seqno <= max_seqno_matched; ++dataset_seqno) {
+X        if (tape_type == type_NL && tape_mark_count >= tape_marks) break;
+X        if (debug >= 2) display_tape_globals();
+X        block_number = 0;
+X        label_in_hand = 0;
+Xretry:  dataset_name[0] = '\0';
+X        PDS_member_count = -1;
+X        dataset_dsorg = dataset_recfm = dataset_lrecl = dataset_blksize = 0;
+X
+X/* If the tape is TLS, we can do simple scanning from the dictionary alone. */
+X
+X        if (tape_type == type_TLS) {
+X            if (! read_header_labels(1)) break;
+X            tape_file_count = dataset_seqno;
+X            if (debug) display_label_globals();
+X            print_headers();
+X            if (! (verification&verify_details) && print_lines <= 0) continue;
+X        }
+X        scanned = 1;
+X
+X/* TLS and labelled tape processing takes a sledge-hammer approach to any
+Xproblems during header label processing, and skips to the next identifiable
+XHDR1 label. This can recurse in extreme cases, but not indefinitely.  It
+Xinteracts horribly with the code in labels.c. */
+X
+X        if (tape_type != type_NL) {
+X            IO_jump_set = 1;
+X            if (setjmp(IO_error_jump)) {
+X                if ((seqno = find_good_header()) == 0) {
+X                    comment("end-of-tape reached while looking for a file");
+X                    break;
+X                }
+X                n = seqno-dataset_seqno-1;
+X                if (n != 0)
+X                    warn("%d other datasets missed because of I/O errors",
+X                        ERR_private,n);
+X                dataset_seqno = seqno;
+X                block_number = 1;
+X                label_in_hand = 1;
+X                goto retry;
+X
+X/* The main code reads the labels and checks the sequence number is what is
+Xexpected; if not, it assumes that the tape is right. */
+X
+X            } else {
+X                if ((seqno = read_header_labels(label_in_hand ? -1 : 0)) == 0)
+X                    break;
+X                if (debug && tape_type != type_TLS) display_label_globals();
+X                if (seqno != dataset_seqno) {
+X                    warn("expected sequence number %d, but found %d in label",
+X                        ERR_private,dataset_seqno,seqno);
+X                    if (++IO_error_count >= IO_error_limit) stop(EXIT_FAILURE);
+X                    dataset_seqno = seqno;
+X                    label_in_hand = 1;
+X                    goto retry;
+X                } else
+X                    if (tape_type != type_TLS) print_headers();
+X            }
+X            IO_jump_set = 0;
+X        }
+X
+X/* See if we actually need to read this file, and skip if not.  Then detect
+XIEBCOPY unloaded PDSs. */
+X
+X        if (debug >= 2) display_tape_globals();
+X        tape_file_count = dataset_seqno;
+X        block_number = 0;
+X        if (! (verification&verify_details) && print_lines <= 0) {
+X            skip_file(0);
+X            if (tape_type != type_NL) skip_file(1);
+X            continue;
+X        }
+X        IO_error_base = IO_error_count;
+X        IO_jump_set = 1;
+X        if (setjmp(IO_error_jump)) {
+X            if (! following_EOF) skip_file(0);
+X            if (tape_type != type_NL) skip_file(1);
+X            continue;
+X        } else
+X            block_in_hand = (tape_type != type_TLS && check_IEB_unloaded());
+X        IO_jump_set = 0;
+X        if (tape_type == type_NL)
+X            fprintf(listing_file,"File %d\n",dataset_seqno);
+X        if (debug >= 2) display_tape_globals();
+X    
+X/* If contents printing is requested, do it.  Otherwise read the first block
+Xto simplify the later code. */
+X
+X        if (dataset_dsorg == dsorg_PO || print_lines > 0) {
+X            IO_jump_set = 1;
+X            if (setjmp(IO_error_jump)) {
+X                if (! following_EOF) skip_file(0);
+X                if (tape_type != type_NL) skip_file(1);
+X                continue;
+X            } else if (dataset_dsorg == dsorg_PO) {
+X                if (tape_type == type_TLS)
+X                    read_TLS_directory();
+X                else
+X                    read_IEB_directory();
+X                if (print_lines > 0) print_PDS_directory();
+X                read_actual_block();
+X            } else {
+X                if (! block_in_hand) read_actual_block();
+X                if (block_length == 0)
+X                    ;
+X                else if (block_length < 0) {
+X                    if (! (verification&verify_details))
+X                        IO_error("I/O error while printing start of file",
+X                            ERR_ignore,ERR_tapeio);
+X                } else
+X                    print_contents();
+X            }
+X            IO_jump_set = 0;
+X            if (! (verification&verify_details)) {
+X                putc('\n',listing_file);
+X                if (! following_EOF) skip_file(0);
+X                if (tape_type != type_NL) skip_file(1);
+X                continue;
+X            }
+X        } else
+X            if (! block_in_hand) read_actual_block();
+X
+X/* Now scan the file, if requested, updating the statistics. */
+X
+X        if (verification&verify_details) {
+X            byte_count = max_block = min_block = last_only = 0;
+X            while (block_length != 0) {
+X                if (block_length < 0)
+X                    IO_error("I/O error while scanning file",
+X                        ERR_ignore,ERR_tapeio);
+X                else if (byte_count == 0)
+X                    byte_count = max_block = min_block = block_length;
+X                else {
+X                    byte_count += block_length;
+X                    if (block_length > max_block) max_block = block_length;
+X                    last_only = 0;
+X                    if (block_length < min_block || min_block == 0) {
+X                        last_only = (min_block == max_block);
+X                        min_block = block_length;
+X                    }
+X                }
+X                read_actual_block();
+X            }
+X            print_trailers(byte_count,block_number,IO_error_count-IO_error_base,
+X                max_block,min_block,last_only);
+X            putc('\n',listing_file);
+X        }
+X
+X/* Check or skip the trailer labels. */
+X
+X        if (debug >= 2) display_tape_globals();
+X        n = block_number;
+X        block_number = 0;
+X        if (tape_type != type_NL) {
+X            if (dataset_dsorg == dsorg_PS)
+X                read_trailer_labels(n);
+X            else
+X                skip_file(1);
+X        }
+X    }
+X    if (! scanned)
+X        fprintf(listing_file,
+X            "\nListing used TLS dictionary alone - %s\n",
+X            "use -w option to check files");
+X}
+X
+X
+X
+Xvoid IO_error (const char *message, int fatality, int errtype) {
+X
+X/* This is called after any non-fatal I/O error on the tape, but is not called
+Xduring initial volume label processing.  The error may be anything from a
+Xhardware error to a format error in the file.  It may return if fatality is
+XERR_ignore, but not if it is ERR_skip.  Note that there are only four functions
+Xthat use setjmp(), in this module and control.c, and all calls to IO_error with
+XERR_skip must be shielded by one of these sections. */
+X
+X    warn(message,errtype);
+X    if (dataset_name[0] != '\0')
+X        warn("while reading file %d ('%s') block %d",ERR_private,
+X            dataset_seqno,dataset_name,block_number);
+X    else
+X        warn("while reading file %d block %d",ERR_private,
+X            dataset_seqno,block_number);
+X    if (debug >= 2 && block_length > 0)
+X        display_buffer(stderr,block_buffer,block_length,block_length);
+X
+X/* Decide what to do with this error. */
+X
+X    if (++IO_error_count >= IO_error_limit)
+X        stop(EXIT_FAILURE);
+X    else if (fatality == ERR_ignore)
+X        return;
+X    else if (! IO_jump_set)
+X        fatal("internal error - unexpected I/O error with ERR_skip",
+X            ERR_private);
+X    else
+X        longjmp(IO_error_jump,1);
+X}
+END_OF_FILE
+if test 16106 -ne `wc -c <'scanning.c'`; then
+    echo shar: \"'scanning.c'\" unpacked with wrong size!
+fi
+# end of 'scanning.c'
+fi
+if test -f 'unpick.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'unpick.c'\"
+else
+echo shar: Extracting \"'unpick.c'\" \(17499 characters\)
+sed "s/^X//" >'unpick.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xunpick.c  -  unpick MVS file formats and convert to UNIX formats.  Note that
+Xit checks allow_errors and lets the most ridiculous junk through if it is set 
+X(though it does warn about it, once per file). */
+X
+X
+X
+X#include <fcntl.h>
+X#include <sys/stat.h>
+X#include <sys/types.h>
+X
+X#include "mvstape.h"
+X#include "command.h"
+X#include "control.h"
+X
+X
+X
+X/* Constants and global variables used only in this module. */
+X
+X#define VBS_not_end      0x01    /* MVS flags for VBS records */
+X#define VBS_not_begin    0x02
+X#define VBS_buffsize     4096    /* This is entirely arbitrary */
+X
+Xstatic int read_mode = 0, pending_block = 0, block_ptr = 0,
+X    bad_block_count = 0, bad_block_skipped = 0,
+X    overlong_records = 0, EBCDIC_ccs = 0, bad_chars = 0,
+X    format_errors = 0, skip_or_ignore = ERR_skip, VBS_EOF = 0;
+Xstatic char VBS_buffer[VBS_buffsize] = "";
+X
+X
+X
+XSTATIC int read_good_block (void) {
+X
+X/* Read until a good block is found and return its length.  It returns -1 for
+Xend-of-file. */
+X
+X    int m, n;
+X
+X    bad_block_skipped = 0;
+X    while (pending_block ? block_length < 0 : read_basic_block() < 0) {
+X        pending_block = 0;
+X        bad_block_skipped = 1;
+X        ++bad_block_count;
+X        IO_error("I/O error on tape while copying file",ERR_ignore,ERR_tapeio);
+X    }
+X    pending_block = 0;
+X    if (block_length == 0) {
+X        block_ptr = 0;
+X        return -1;
+X    }
+X
+X/* Check that the block is correctly formatted, unless we are just reading
+Xblocks.  Ignore FBS checking, as it is often generated incorrectly by MVS
+Xutilities. */
+X
+X    if (read_mode == command_opt_blocks) {
+X        block_ptr = 0;    /* Don't strip the header! */
+X        return 0;
+X    } else if (dataset_recfm&recfm_F &&
+X            (dataset_recfm&recfm_B ? block_length%dataset_lrecl != 0 :
+X                block_length != dataset_lrecl)) {
+X        block_length = (block_length/dataset_lrecl)*dataset_lrecl;
+X        if (! format_errors) {
+X            IO_error("invalid fixed length block",skip_or_ignore,ERR_private);
+X            comment("subsequent format errors on this file will be ignored");
+X        }
+X        format_errors = 1;
+X    } else if (dataset_recfm&recfm_V) {
+X        n = get_BE_short(block_buffer);
+X        m = get_BE_short(block_buffer+4);
+X        if ( n < 8 || n != block_length ||
+X                block_buffer[2] != 0 || block_buffer[3] != 0 ||
+X                (! (dataset_recfm&recfm_B) && m != n-4)) {
+X            if (block_length > n) block_length = n;
+X            if (block_length < 4) block_length = 4;
+X           if (! format_errors) {
+X                IO_error("invalid variable length or variable spanned block",
+X                    skip_or_ignore,ERR_private);
+X                comment(
+X                    "subsequent format errors on this file will be ignored");
+X            }
+X            format_errors = 1;
+X        }
+X    }
+X
+X/* Set up the pointers and return the result. */
+X
+X    block_ptr = (dataset_recfm&recfm_V ? 4 : 0);
+X    return 0;
+X}
+X
+X
+X
+XSTATIC int read_spanned (int start, int *end) {
+X
+X/* Read a VBS segment, write it to the work file and return its length.
+XRemember that a previous bad block may cause trouble. */
+X
+X    int flags, length;
+X
+X    if (block_ptr >= block_length && read_good_block() < 0) {
+X        *end = VBS_EOF = 1;
+X        if (! start && ! bad_block_skipped && ! format_errors)
+X            IO_error("unexpected end of file in variable spanned file",
+X                ERR_ignore,ERR_private);
+X        return 0;
+X    }
+X
+X/* Check that the segment is correctly formatted. */
+X
+X    length = get_BE_short(block_buffer+block_ptr);
+X    flags = block_buffer[block_ptr+2]&(VBS_not_begin|VBS_not_end);
+X    if (length < 4 || block_ptr+length > block_length ||
+X            block_buffer[block_ptr+3] != 0 ||
+X            (block_buffer[block_ptr+2]&~(VBS_not_begin|VBS_not_end)) != 0 ||
+X            (! bad_block_skipped && start == ((flags&VBS_not_begin) != 0))) {
+X        if (block_ptr+length > block_length) length = block_length-block_ptr;
+X        if (length < 4) length = 4;
+X        if (! format_errors) {
+X            IO_error("invalid variable spanned record",skip_or_ignore,
+X                ERR_private);
+X            comment("subsequent format errors on this file will be ignored");
+X        }
+X        format_errors = 1;
+X    }
+X    *end = ((flags&VBS_not_end) == 0);
+X
+X/* Now write the segment and return the length. */
+X
+X    errno = 0;
+X    if (length > 4 &&
+X            Write(temp_VBS_fileno,&block_buffer[block_ptr+4],length-4) !=
+X                length-4)
+X        fatal("unable to write to VBS work file",ERR_system);
+X    block_ptr += length;
+X    return length-4;
+X}
+X
+X
+X
+XSTATIC int read_record (char **recptr, int strip, int minlen) {
+X
+X/* Read a record and return its length and, except for V[B]S[A] files, a
+Xpointer to its data.  It returns -1 for end-of-file. */
+X
+X    int start, end,
+X        length = 0;    /* Silencing 'gcc -Wall' */
+X    char *ptr;
+X
+X    if (VBS_EOF || (block_ptr >= block_length && read_good_block() < 0))
+X        return -1;
+X
+X/* Unpick the block, starting with undefined and fixed length records. */
+X
+X    if (dataset_recfm&recfm_U) {
+X        if (block_ptr != 0)
+X            fatal("(internal error) non-zero block_ptr for RECFM=U",
+X                ERR_private);
+X        *recptr = block_buffer;
+X        length = block_ptr = block_length;
+X    } else if (dataset_recfm&recfm_F) {
+X        *recptr = &block_buffer[block_ptr];
+X        block_ptr += (length = dataset_lrecl);
+X
+X/* Variable length records are a little more complex. */
+X
+X    } else if (dataset_recfm&recfm_V && ! (dataset_recfm&recfm_S)) {
+X        length = get_BE_short(block_buffer+block_ptr);
+X        if (length < 4 || block_ptr+length > block_length ||
+X                block_buffer[block_ptr+2] != 0 ||
+X                block_buffer[block_ptr+3] != 0) {
+X            if (block_ptr+length > block_length)
+X                length = block_length-block_ptr;
+X            if (length < 4) length = 4;
+X            if (! format_errors) {
+X                IO_error("invalid variable length record",ERR_skip,ERR_private);
+X                comment(
+X                    "subsequent format errors on this file will be ignored");
+X            }
+X            format_errors = 1;
+X        }
+X        if (length > dataset_lrecl || length > 32756) ++overlong_records;
+X        *recptr = &block_buffer[block_ptr+4];
+X        block_ptr += length;
+X        length -= 4;
+X
+X/* Variable spanned records are written to an intermediate file. */
+X
+X    } else if ((dataset_recfm&(recfm_V|recfm_S)) == (recfm_V|recfm_S)) {
+X        errno = 0;
+X        if (temp_VBS_fileno < 0) {
+X            if (tmpnam(temp_VBS_filename) == NULL ||
+X                    (temp_VBS_fileno = Open(temp_VBS_filename,
+X                            O_SCRATCH,O_WRMODE)) < 0) {
+X                temp_VBS_filename[0] = '\0';
+X                fatal("unable to open VBS work file",ERR_system);
+X            }
+X        } else if (Lseek(temp_VBS_fileno,0l,SEEK_SET) < 0)
+X            fatal("unable to rewind VBS work file",ERR_system);
+X
+X/* Read all of the segments, and do not try to strip trailing spaces. */
+X
+X        length = end = 0;
+X        start = 1;
+X        while (! end) {
+X            length += read_spanned(start,&end);
+X            start = 0;
+X        }
+X        if (length+4 > dataset_lrecl) ++overlong_records;
+X        errno = 0;
+X        if (Lseek(temp_VBS_fileno,0l,SEEK_SET) < 0)
+X            fatal("unable to rewind VBS work file",ERR_system);
+X        *recptr = NULL;
+X        return length;
+X
+X/* We shouldn't be able to get here. */
+X
+X    } else
+X        fatal("(internal error) unknown record format",ERR_private);
+X
+X/* Strip trailing spaces if appropriate. */
+X
+X    if (strip) {
+X        ptr = &(*recptr)[length];
+X        while (length > minlen && *--ptr == EBCDIC_SPACE) --length;
+X    }
+X    return length;
+X}
+X
+X
+X
+XSTATIC int read_ANSI_CC (char **pptr, int *length) {
+X
+X/* Read the ANSI CC from the internal form of a record and return it. */
+X
+X    unsigned char cc;
+X
+X    errno = 0;
+X    if (*pptr != NULL)    /* i.e. not V[B]S[A] */
+X        cc = ((*pptr)++)[0];
+X    else if (Read(temp_VBS_fileno,&cc,1) != 1)
+X        fatal("unable to read VBS work file",ERR_system);
+X    if (--*length < 0) {
+X        cc = ' ';
+X        *length = 0;
+X    }
+X    return cc;
+X}
+X
+X
+X
+XSTATIC int write_buffer (int fileno, char *buffer, int length,
+X    int translate) {
+X
+X/* Write some data to the output file, translating it if necessary, and
+Xchecking for errors.  The buffer is assumed writable if and only if translate
+Xis set.  It returns 0 for success and 1 for failure. */
+X
+X    int len, maxseg, c, i;
+X    char *buff, *ptr;
+X
+X/* Read some of the VBS file into store, if necessary. */
+X
+X    while (length > 0) {
+X        if (buffer != NULL) {
+X            buff = ptr = buffer;
+X            len = length;
+X        } else {
+X            buff = ptr = VBS_buffer;
+X            errno = 0;
+X            maxseg = (length < VBS_buffsize ? length : VBS_buffsize);
+X            len = Read(temp_VBS_fileno,VBS_buffer,maxseg);
+X            if (len != maxseg) fatal("unable to read VBS work file",ERR_system);
+X        }
+X        length -= len;
+X
+X/* Translate the buffer, if requested, and map all untranslatable characters to
+XSUB (or X'FF' for MS-DOS and derivatives!) */
+X
+X        if (translate)
+X            for (i = 0; i < len; ++i) {
+X                c = EBCDIC_to_ASCII(*ptr);
+X                if (read_mode == command_opt_lines) {
+X                    if (strchr(GOOD_EBCDIC_CCS,c) != NULL)
+X                        ++EBCDIC_ccs;
+X                    else if (strchr(BAD_EBCDIC_CCS,c) != NULL)
+X                        c = -1;;
+X                }
+X                if (c < 0) {
+X                    c = SUB_CHAR;
+X                    ++bad_chars;
+X                }
+X                *ptr++ = c;
+X            }
+X
+X/* Write the buffer to the output file, checking for errors. */
+X
+X        errno = 0;
+X        if (Write(fileno,buff,len) != len) {
+X            if (tar_fileno >= 0)
+X                fatal("unable to write to tar work file",ERR_system);
+X            else {
+X                warn("unable to write to output file '%s'",
+X                    ERR_system,UNIX_filename);
+X                if (++disk_IO_errors >= disk_IO_error_limit) stop(EXIT_FAILURE);
+X                return 1;
+X            }
+X        }
+X    }
+X    return 0;
+X}
+X
+X
+X
+Xint copy_file (int fileno, const command *cmdptr, int block_in_hand) {
+X
+X/* This copies a file, converting its format if necessary, and returns its
+Xtotal length in bytes or -1 for failure.  Note the horrible kludge to do with 
+XANSI_CC_TABLE, which is imposed by C restrictions. */
+X
+X    int total = 0, initial = 1, missing_ccs = 0, bad_ccs = 0, sig_ccs = 0,
+X        DA_lines, VBS_strip, MC_ccs, hasccs, trans, strip, transcc, ignorecc,
+X        length, MVS_cc;
+X    char ascii_ccs[10];
+X    char *pointer;
+X#ifdef ANSI_CC_TABLE
+X    static ANSI_CC_TABLE_TYPE cc_table = ANSI_CC_TABLE;
+X#else
+X#define cc_table ANSI_CC_TABLE
+X#endif
+X
+X/* Set the numerous variables and constants that are concerned with file
+Xunpicking and diagnostics. */
+X
+X    if (select_code_page(cmdptr->code_page->name) == NULL)
+X        fatal("(internal error) unable to reset code page",ERR_private);
+X    read_mode = cmdptr->command_opt;
+X    if (! block_in_hand) block_length = 0;
+X    block_ptr = block_length;
+X    bad_block_count = overlong_records = EBCDIC_ccs = bad_chars = 0;
+X    format_errors = VBS_EOF = 0;
+X    skip_or_ignore = (allow_errors ? ERR_ignore : ERR_skip);
+X    VBS_strip = ((cmdptr->command_flags&command_flags_strip) &&
+X        (dataset_recfm&(recfm_V|recfm_S)) == (recfm_V|recfm_S));
+X    DA_lines = (dataset_dsorg == dsorg_DA &&
+X            (cmdptr->command_opt == command_opt_lines ||
+X                (cmdptr->command_flags&command_flags_strip)));
+X    MC_ccs = dataset_recfm&recfm_M;
+X    hasccs = (dataset_recfm&(recfm_A|recfm_M) ? 1 : 0);    /* Note! */
+X    trans = cmdptr->command_flags&command_flags_trans;
+X    strip = cmdptr->command_flags&command_flags_strip;
+X    transcc = cmdptr->command_flags&command_flags_transcc;
+X    ignorecc = ((cmdptr->command_flags&command_flags_ignorecc) && hasccs);
+X    pending_block = block_in_hand;
+X    for ( ; ; ) {
+X        switch (cmdptr->command_opt) {
+X
+X/* For lines, we usually have to interpret the control character, if any,
+Xthough we may also ignore it and include it.  Set it to a space if absent,
+Xignored or machine code. */
+X
+Xcase command_opt_lines:
+X            if ((length = read_record(&pointer,strip,hasccs)) < 0)
+X                goto finished;
+X            if (hasccs && length == 0) {
+X                ++missing_ccs;
+X                MVS_cc = EBCDIC_SPACE;
+X            } else if (hasccs && (transcc|ignorecc)) {
+X                MVS_cc = read_ANSI_CC(&pointer,&length);
+X                if (MC_ccs)
+X                    MVS_cc = EBCDIC_SPACE;
+X                else if (ignorecc) {
+X                    if (MVS_cc != EBCDIC_SPACE) ++sig_ccs;
+X                    MVS_cc = EBCDIC_SPACE;
+X                }
+X            } else
+X                MVS_cc = EBCDIC_SPACE;
+X
+X/* Now convert the extended ANSI CCs used by MVS into the ASCII ones used by
+Xother systems, changing them from the start to the end of lines. */
+X
+X            switch((unsigned char)MVS_cc) {
+Xcase EBCDIC_PLUS:
+X                if (initial) ++bad_ccs;
+X                strcpy(ascii_ccs,cc_table[initial][0]);
+X                break;
+Xcase EBCDIC_ONE:
+X                strcpy(ascii_ccs,cc_table[initial][1]);
+X                break;
+Xcase EBCDIC_MINUS:
+X                strcpy(ascii_ccs,cc_table[initial][2]);
+X                break;
+Xcase EBCDIC_ZERO:
+X                strcpy(ascii_ccs,cc_table[initial][3]);
+X                break;
+Xcase EBCDIC_SPACE:
+X                strcpy(ascii_ccs,cc_table[initial][4]);
+X                break;
+Xdefault:        strcpy(ascii_ccs,cc_table[initial][5]);
+X                ++bad_ccs;
+X                break;
+X            }
+X            if (write_buffer(fileno,ascii_ccs,strlen(ascii_ccs),0)) return -1;
+X            total += strlen(ascii_ccs);
+X            goto write_record;
+X
+X/* STREAM and RECORDS have similar code as far as reading is concerned, but
+Xthen STREAM joins LINES and RECORDS joins BLOCKS. */
+X
+Xcase command_opt_stream:
+Xcase command_opt_records:
+X            if ((length = read_record(&pointer,strip,hasccs)) < 0)
+X                goto finished;
+X            if (hasccs && length == 0)
+X                ++missing_ccs;
+X            else if (ignorecc && read_ANSI_CC(&pointer,&length) != EBCDIC_SPACE)
+X                ++sig_ccs;
+X            if (read_mode == command_opt_records) goto BSD_unformatted;
+Xwrite_record:
+X            if (write_buffer(fileno,pointer,length,trans)) return -1;
+X            total += length;
+X            initial = 0;
+X            break;
+X
+X/* RECORDS and BLOCKS are treated like a BSD Fortran unformatted record, though
+XV[B]S[A] records have to be read back from a file.  Note that the length is in
+Xnative order. */
+X
+Xcase command_opt_blocks:
+X            if (read_good_block() < 0) return total;
+X            pointer = &block_buffer[block_ptr];
+X            length = block_length;
+X            /* drop through */
+XBSD_unformatted:
+X            if (write_buffer(fileno,(char *)&length,sizeof(int),0) ||
+X                    write_buffer(fileno,pointer,length,trans) ||
+X                    write_buffer(fileno,(char *)&length,sizeof(int),0))
+X                return -1;
+X            total += length+2*sizeof(int);
+X            break;
+X
+X/* And we shouldn't be able to get here. */
+X
+Xdefault:    fatal("(internal error) unknown type of transfer",ERR_private);
+X        }
+X    }
+X
+X/* Terminate the last line, if necessary. */
+X
+Xfinished:
+X    if (read_mode == command_opt_lines && ! initial) {
+X        if (write_buffer(fileno,strcpy(ascii_ccs,"\n"),1,0)) return -1;
+X        ++total;
+X    }
+X
+X/* Diagnose various minor afflictions, where we want to print out the file
+Xname involved and don't want to issue more than one message per file.  Note
+Xthat transferring a direct access file in mode LINES does not set the error
+Xflag. */
+X
+X    if ((DA_lines || VBS_strip || MC_ccs || bad_block_count ||
+X                overlong_records || missing_ccs || sig_ccs || bad_ccs ||
+X                EBCDIC_ccs || bad_chars) &&
+X            verification == 0)
+X        comment("errors while copying %s to %s",dataset_name,UNIX_filename);
+X    if (DA_lines)
+X        comment("direct access files normally need STREAM mode and NOSTRIP");
+X    if (VBS_strip)
+X        warn("spaces cannot be stripped off V[B]S[A] records",ERR_private);
+X    if (MC_ccs)
+X        warn("machine code control characters cannot be interpreted",
+X            ERR_private);
+X    if (bad_block_count > 0)
+X        warn("%d bad blocks were skipped",ERR_private,bad_block_count);
+X    if (overlong_records > 0)
+X        warn("%d variable or spanned records were too long",ERR_private,
+X            overlong_records);
+X    if (missing_ccs > 0)
+X        warn("%d variable or spanned records were too short",ERR_private,
+X            missing_ccs);
+X    if (sig_ccs > 0)
+X        warn("%d significant ANSI control characters were ignored",ERR_private,
+X            sig_ccs);
+X    if (bad_ccs > 0)
+X        warn("%d invalid ANSI control characters were encountered",ERR_private,
+X            bad_ccs);
+X    if (EBCDIC_ccs > 0)
+X        warn("%d valid EBCDIC control characters were in the data",ERR_private,
+X            EBCDIC_ccs);
+X    if (bad_chars > 0)
+X        warn("%d EBCDIC characters had no local equivalents",ERR_private,
+X            bad_chars);
+X    if (select_code_page(default_code_page->name) == NULL)
+X        fatal("(internal error) unable to reset code page",ERR_private);
+X    return total;
+X}
+END_OF_FILE
+if test 17499 -ne `wc -c <'unpick.c'`; then
+    echo shar: \"'unpick.c'\" unpacked with wrong size!
+fi
+# end of 'unpick.c'
+fi
+echo shar: End of archive 6 \(of 9\).
+cp /dev/null ark6isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 9 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

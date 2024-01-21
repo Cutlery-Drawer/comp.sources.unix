@@ -1,0 +1,1275 @@
+Subject:  v18i017:  Tree-structured data placer/router/plotter, Part03/03
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Jim McBeath <voder!sci!gumby!jimmc>
+Posting-number: Volume 18, Issue 17
+Archive-name: treepar/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 3)."
+# Contents:  par.c
+# Wrapped by rsalz@fig.bbn.com on Thu Mar  9 15:55:43 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'par.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'par.c'\"
+else
+echo shar: Extracting \"'par.c'\" \(26098 characters\)
+sed "s/^X//" >'par.c' <<'END_OF_FILE'
+X/* par.c - the actual placement and routine routines
+X *
+X * 12.Aug.87  jimmc  Initial definition - placement routines
+X * 14.Aug.87  jimmc  More placement, routing routines
+X *  3.Nov.87  jimmc  Add rowdir
+X *  6.Nov.87  jimmc  Use XCALLOC macro
+X * 18.Jan.88  jimmc  lint cleanup
+X * 27.Jan.88  jimmc  Add feedthrough stuff
+X * 29.Feb.88  jimmc  Improve robustness when doing partial place/routes
+X */
+X
+X#include <ctype.h>
+X#include "network.h"
+X#include "xalloc.h"
+X
+X#define SPLITCHAR '#'
+X
+Xextern Nnet *NFindNet(), *NCreateNet();
+Xextern Nbox *NFindBox(), *NCreateBox();
+Xextern Nconn *NCreateConn();
+Xextern NIFreeConn();
+Xextern NClearNetConns(), NClearBoxConns();
+Xextern NLinkConnNet();
+X
+Xextern char *index();
+Xextern char *strsav();
+X
+Xextern Nbase *NCurBase;
+Xextern char Tflag[];
+X
+X#define HROW (NCurBase->rowdir=='H')
+X#define vX cc[HROW?0:1]
+X#define vY cc[HROW?1:0]
+X/* if rows are horizontal, vX is X and vY is Y */
+X#define NorE (HROW?N:E)
+X#define SorW (HROW?S:W)
+X#define NorEstr (HROW?"N":"E")
+X#define SorWstr (HROW?"S":"W")
+X
+Xextern int NPosConn();
+Xextern Nbox *NFindBox();
+X
+Xstatic
+XRUnmarkBox(box)
+XNbox *box;
+X{
+X	box->parflags = 0;
+X}
+X
+Xint
+XRIsFeedBox(box)
+XNbox *box;
+X{
+X	if (index(box->name,SPLITCHAR)) return 1;
+X	return 0;
+X}
+X
+Xstatic
+XRUnSplitBox(box)
+XNbox *box;
+X{
+Xextern int NUnLinkConnNet();
+X
+X	if (!index(box->name,SPLITCHAR)) return;
+X	NDoGroup(&(box->connlist),NUnLinkConnNet);
+X	NFreeGroup(&(box->connlist),NIFreeConn);
+X}
+X
+Xstatic
+XRFreeSplitBox(box)
+XNbox *box;
+X{
+X	if (!index(box->name,SPLITCHAR)) return;
+X	NIFreeBox(box);
+X}
+X
+Xstatic
+XRSelBox(box,rownum)
+XNbox *box;
+X{
+Xint i;
+X
+X	if (box->parflags & ROWSET) return;
+X	box->rownum = rownum;
+X	box->parflags |= ROWSET;
+X	for (i=0; i<box->connlist.count; i++) {
+X		RSelBConn(box->connlist.d.conn[i],rownum);
+X	}
+X}
+X
+Xstatic
+XRSelectBox(box)		/* set the row number in a box */
+XNbox *box;
+X{
+X	RSelBox(box,0);		/* place this box in row 0 */
+X}
+X
+Xstatic
+XRUnsetrowBox(box)
+XNbox *box;
+X{
+X	box->row = 0;
+X}
+X
+Xstatic
+XRSetrowBox(box)		/* set a box into a row */
+XNbox *box;
+X{
+XNrow *row, *RFindRow();
+X
+X	if (box->row) return;	/* nop if already set */
+X	row = RFindRow(NCurBase,box->rownum);
+X	if (!row) {
+X		printf("Can't find row %d for box %s\n",
+X			box->rownum, box->name);
+X		return;
+X	}
+X	box->row = row;
+X	insertp(&(row->boxlist),(char *)box);
+X}
+X
+Xstatic
+XRSetrposBox(box)
+XNbox *box;
+X{
+X	if (!box->row) return;
+X	box->origin.vY = box->row->pos;
+X}
+X
+Xstatic
+XRClearOrderBox(box)
+XNbox *box;
+X{
+X	box->parflags &= ~ORDERSET;
+X}
+X
+Xstatic
+XROrderCBox(box,side,negdir)
+XNbox *box;
+Xint side;
+Xint negdir;
+X{
+XNgroup clist;
+Xint i,j;
+XNnet *net;
+XNconn *cp;
+Xint RCmpConn();
+X
+X	NClearGroup(&clist);
+X	for (i=0; i<box->connlist.count; i++) {
+X		/* collect all conns on the side of interest */
+X		cp = box->connlist.d.conn[i];
+X		if (cp->side==side && cp->net && cp->net->connlist.count>1) {
+X			insertp(&clist,(char *)cp);
+X		}
+X	}
+X	if (clist.count==0) return;
+X	qsort((char *)clist.d.conn,clist.count,
+X		sizeof(clist.d.conn[0]),RCmpConn);
+X	for (i=0; i<clist.count; i++) {		/* see if any nets set yet */
+X		net = clist.d.conn[i]->net;
+X		if (net->parflags & ORDERSET) break;
+X	}
+X	if (i>=clist.count) {		/* no nets set yet */
+X		if (negdir) i=clist.count;
+X		else i=0;
+X	}
+X	for (j=i; j<clist.count; j++) {		/* count up from i */
+X		ROrderNet(clist.d.conn[j]->net,0);
+X	}
+X	for (j=i-1; j>=0; j--) {		/* count down from i */
+X		ROrderNet(clist.d.conn[j]->net,1);
+X	}
+X	if (clist.d.x) tfree((char *)clist.d.x);
+X}
+X
+Xstatic
+XROrderBox(box,negdir)	/* sets orders in neighboring boxes */
+XNbox *box;
+Xint negdir;		/* if set, expand in negative direction */
+X{
+X	if (box->parflags & ORDERSET) return;
+X	box->parflags |= ORDERSET;
+X	if (negdir)
+X		box->rowpos = --(box->row->rowposmin);
+X	else
+X		box->rowpos = (box->row->rowposmax)++;
+X	ROrderCBox(box,NorE,negdir);	/* order the north or east boxes */
+X	ROrderCBox(box,SorW,negdir);	/* order the south or west boxes */
+X}
+X
+Xstatic int
+XRCmpBox(b1,b2)
+XNbox **b1, **b2;
+X{
+X	return (*b1)->rowpos - (*b2)->rowpos;
+X}
+X
+Xstatic
+XRNetForceBox(box,side,pnforce,pncount)
+XNbox *box;
+Xint side;	/* use only connectors on this side */
+Xint *pnforce;	/* return value - total net force */
+Xint *pncount;	/* return value - count of nets */
+X{
+XNgroup clist;
+Xint i;
+Xint nforce, ncount;
+Xint sumnforce, sumncount;
+XNconn *cp, *conn;
+XNnet *net;
+X
+X	NClearGroup(&clist);
+X	for (i=0; i<box->connlist.count; i++) {
+X		/* collect all conns on the side of interest */
+X		cp = box->connlist.d.conn[i];
+X		if (cp->side==side && cp->net && cp->net->connlist.count>1) {
+X			insertp(&clist,(char *)cp);
+X		}
+X	}
+X	sumnforce = 0;
+X	sumncount = 0;
+X	for (i=0; i<clist.count; i++) {
+X		conn = clist.d.conn[i];
+X		net = conn->net;
+X		RNetForceNet(net,conn,&nforce,&ncount);
+X		sumnforce += nforce;
+X		sumncount += ncount;
+X	}
+X	if (clist.d.x) tfree((char *)clist.d.x);
+X	*pnforce = sumnforce;
+X	*pncount = sumncount;
+X}
+X
+Xstatic
+XRUnmarkNet(net)
+XNnet *net;
+X{
+X	net->parflags = 0;		/* clear flag bits */
+X}
+X
+Xstatic
+XRSelNet(net,rownum)
+XNnet *net;
+Xint rownum;
+X{
+Xint i;
+X
+X	if (net->parflags & ROWSET) return;
+X	net->rownum = rownum;
+X	net->parflags |= ROWSET;
+X	for (i=0; i<net->connlist.count; i++) {
+X		RSelNConn(net->connlist.d.conn[i],rownum);
+X	}
+X}
+X
+Xstatic
+XRUnsetrowNet(net)
+XNnet *net;
+X{
+X	net->row = 0;
+X}
+X
+Xstatic
+XRSetrowNet(net)		/* set a net into a row */
+XNnet *net;
+X{
+XNrow *row, *RFindRow();
+X
+X	if (net->row) return;	/* nop if already set */
+X	row = RFindRow(NCurBase,net->rownum);
+X	if (!row) {
+X		printf("Can't find row %d for net %s\n",
+X			net->rownum, net->name);
+X		return;
+X	}
+X	net->row = row;
+X	insertp(&(row->netlist),(char *)net);
+X}
+X
+Xstatic
+XRUnSplitNet(net)
+XNnet *net;
+X{
+Xchar *splitp;
+Xextern int RUnSplitConn();
+X
+X	splitp = index(net->name,SPLITCHAR);
+X	if (!splitp) return;		/* not a split net */
+X	/* OK, it's one of ours, undo it */
+X	NDoGroup(&(net->connlist),RUnSplitConn);
+X	if (net->connlist.count!=0)
+X		fatalerr("net count!=0 for net %s", net->name);
+X}
+X
+Xstatic
+XRFreeSplitNet(net)
+XNnet *net;
+X{
+X	if (!index(net->name,SPLITCHAR)) return;
+X	NIFreeNet(net);
+X}
+X
+Xstatic
+XRSplitNet(net)
+XNnet *net;
+X{
+XNconn *conn;
+Xint cboxrow;
+Xint connside, connrow;
+Xint i;
+Xint minrow,maxrow;
+Xchar namebuf[516];
+Xchar *namebufcpy;
+XNnet *newnet;
+Xchar *thisname, *lastname;
+XNbox *newbox;
+XNconn *newconn;
+X
+X	minrow=maxrow=0;
+X	for (i=0; i<net->connlist.count; i++) {
+X		conn = net->connlist.d.conn[i];
+X		connside = conn->side;	/* NSEW */
+X		cboxrow = conn->box->rownum;
+X		connrow = cboxrow+((connside==N||connside==E)?1:-1);
+X		if (i==0 || connrow<minrow) minrow=connrow;
+X		if (i==0 || connrow>maxrow) maxrow=connrow;
+X	}
+X	if (minrow==maxrow) return;	/* all in one channel */
+X	lastname = "";
+X	for (i=minrow; i<=maxrow; i+=2) {
+X		namebufcpy = 0;
+X		sprintf(namebuf,"%s%c%s%d",net->name,SPLITCHAR,
+X			((i<0)?"m":""),((i<0)?-i:i));
+X		newnet = NFindNet(NCurBase,namebuf);
+X		if (!newnet) {
+X			newnet = NCreateNet(strsav(namebuf),i);
+X		}
+X		thisname = newnet->name;
+X		if (i>minrow) {
+X			newbox = NFindBox(NCurBase,thisname);
+X			if (newbox) {
+X				newbox->rownum = i-1;
+X			} else {
+X				newbox = NCreateBox(strsav(namebuf),0,0,0,0,
+X					"",0,0,"",i-1,0);
+X			}
+X			newbox->parflags |= ROWSET;
+X			NFreeGroup(&(newbox->connlist),NIFreeConn);
+X			newconn = NCreateConn(strsav(newbox->name),
+X				strsav(thisname),
+X				0,0,strsav(NorEstr),strsav(thisname));
+X			NLinkConnBox(newconn);
+X			newconn = NCreateConn(strsav(newbox->name),
+X				strsav(lastname),
+X				0,0,strsav(SorWstr),strsav(lastname));
+X			NLinkConnBox(newconn);
+X		}
+X		lastname = thisname;
+X	}
+X	for (i=0; i<net->connlist.count; i++) {
+X		conn = net->connlist.d.conn[i];
+X		connside = conn->side;	/* NSEW */
+X		cboxrow = conn->box->rownum;
+X		connrow = cboxrow+((connside==N||connside==E)?1:-1);
+X		sprintf(namebuf,"%s%c%s%d",conn->netname,SPLITCHAR,
+X			((connrow<0)?"m":""),((connrow<0)?-connrow:connrow));
+X		namebufcpy = XALLOC(char,strlen(namebuf)+1);
+X		strcpy(namebufcpy,namebuf);
+X		tfree(conn->netname);
+X		conn->netname = namebufcpy;
+X	}
+X}
+X
+Xstatic
+XRClearOrderNet(net)
+XNnet *net;
+X{
+X	net->parflags &= ~ORDERSET;
+X}
+X
+Xstatic
+XROrderCNet(net,side,negdir)
+XNnet *net;
+Xint side;
+Xint negdir;
+X{
+XNgroup clist;
+Xint i,j;
+XNbox *box;
+XNconn *cp;
+X
+X	NClearGroup(&clist);
+X	for (i=0; i<net->connlist.count; i++) {
+X		/* collect all conns on the side of interest */
+X		cp = net->connlist.d.conn[i];
+X		if (cp->side==side && cp->box) {
+X			insertp(&clist,(char *)cp);
+X		}
+X	}
+X	if (clist.count==0) return;
+X	qsort((char *)clist.d.conn,clist.count,
+X		sizeof(clist.d.conn[0]),RCmpConn);
+X	for (i=0; i<clist.count; i++) {		/* see if any boxes set yet */
+X		box = clist.d.conn[i]->box;
+X		if (box->parflags & ORDERSET) break;
+X	}
+X	if (i>=clist.count) {		/* no boxes set yet */
+X		if (negdir) i=clist.count;
+X		else i=0;
+X	}
+X	for (j=i; j<clist.count; j++) {		/* count up from i */
+X		ROrderBox(clist.d.conn[j]->box,0);
+X	}
+X	for (j=i-1; j>=0; j--) {		/* count down from i */
+X		ROrderBox(clist.d.conn[j]->box,1);
+X	}
+X	if (clist.d.x) tfree((char *)clist.d.x);
+X}
+X
+Xstatic
+XROrderNet(net,negdir)	/* sets orders in neighboring boxes */
+XNnet *net;
+Xint negdir;		/* if set, expand in negative direction */
+X{
+X	if (net->parflags & ORDERSET) return;
+X	net->parflags |= ORDERSET;
+X	if (negdir)
+X		net->rowpos = --(net->row->rowposmin);
+X	else
+X		net->rowpos = (net->row->rowposmax)++;
+X	ROrderCNet(net,SorW,negdir); /* order the boxes to our south or west */
+X	ROrderCNet(net,NorE,negdir); /* order the boxes to our north or east */
+X}
+X
+Xstatic
+XRSpanNet(net)	/* calculate the span for a net */
+XNnet *net;
+X{
+Xint i;
+XNconn *conn;
+Xint max,min;
+X
+X	max = min = 0;
+X	for (i=0; i<net->connlist.count; i++) {
+X		conn = net->connlist.d.conn[i];
+X		if (i==0 || conn->apos.vX > max) max=conn->apos.vX;
+X		if (i==0 || conn->apos.vX < min) min=conn->apos.vX;
+X	}
+X	net->maxpos = max;
+X	net->minpos = min;
+X}
+X
+Xstatic int
+XRCmpNet(n1,n2)
+XNnet **n1, **n2;
+X{
+X	return (*n1)->minpos - (*n2)->minpos;
+X}
+X
+Xstatic
+XRNetForceNet(net,orgconn,pnforce,pncount)
+XNnet *net;
+XNconn *orgconn;	/* the source connector to calculate the force from */
+Xint *pnforce;	/* return value - total net force */
+Xint *pncount;	/* return value - count of net runs */
+X{
+Xint i;
+XNconn *conn;
+Xint orgx;
+Xint nforce;
+Xint ncount;
+X
+X	orgx = orgconn->apos.vX;
+X	nforce = 0;
+X	ncount = 0;
+X	for (i=0; i<net->connlist.count; i++) {
+X		conn = net->connlist.d.conn[i];
+X		if (conn==orgconn) continue;
+X		nforce += conn->apos.vX - orgx;
+X		ncount++;
+X	}
+X	*pnforce = nforce;
+X	*pncount = ncount;
+X}
+X
+Xstatic
+XRSetAngleNet(net)
+XNnet *net;
+X{
+Xint i;
+XNconn *conn;
+Xint nconn, sconn, econn, wconn;
+Xint nsum, ssum, esum, wsum;
+X
+X	if (net->connlist.count<=1) return;
+X	nconn = sconn = econn = wconn = 0;
+X	nsum = ssum = esum = wsum = 0;
+X	net->track = 0;
+X	for (i=0; i<net->connlist.count; i++) {
+X		conn = net->connlist.d.conn[i];
+X		switch (conn->side) {
+X		case N:
+X			nconn++;
+X			nsum += conn->apos.X;
+X			break;
+X		case S:
+X			sconn++;
+X			ssum += conn->apos.X;
+X			break;
+X		case E:
+X			econn++;
+X			esum += conn->apos.Y;
+X			break;
+X		case W:
+X			wconn++;
+X			wsum += conn->apos.Y;
+X			break;
+X		default: break;
+X		}
+X	}
+X	if      (nconn>sconn) net->angle = 'S';
+X	else if (sconn>nconn) net->angle = 'N';
+X	else if (econn>wconn) net->angle = 'W';
+X	else if (wconn>econn) net->angle = 'E';
+X	else if (esum>wsum) net->angle = 'L';	/* leans to the left */
+X	else if (wsum>esum) net->angle = 'R';
+X	else if (nsum>ssum) net->angle = 'L';
+X	else if (ssum>nsum) net->angle = 'R';
+X	else net->angle = 0;
+X}
+X
+Xstatic
+XRRouteNet(net)
+XNnet *net;
+X{
+Xint i;
+XNtrack *track;
+XNconn *c1, *c2, *conn;
+Xint cpos;
+Xint NFreeGroupOnly();
+X
+X	NFreeGroup(&(net->pathlist),NFreeGroupOnly);
+X	if (net->connlist.count<=1) return;
+X	track = net->track;
+X	NSetNet(net);		/* so we can use NCeatePath below */
+X	cpos = track->pos;
+X	if (net->connlist.count==2) {	/* common special case */
+X		c1 = net->connlist.d.conn[0];
+X		c2 = net->connlist.d.conn[1];
+X		if (net->minpos==net->maxpos) {		/* no bends! */
+X			NCreatePath(c1->apos.X,c1->apos.Y);
+X			NCreatePath(c2->apos.X,c2->apos.Y);
+X		}
+X		else {
+X			NCreatePath(c1->apos.X,c1->apos.Y);
+X			if (HROW) {
+X				NCreatePath(c1->apos.X,cpos);
+X				NCreatePath(c2->apos.X,cpos);
+X			} else {
+X				NCreatePath(cpos,c1->apos.Y);
+X				NCreatePath(cpos,c2->apos.Y);
+X			}
+X			NCreatePath(c2->apos.X,c2->apos.Y);
+X		}
+X	}
+X	else {		/* more than two points */
+X		if (HROW) {
+X			NCreate1Path(net->minpos,cpos,net->maxpos,cpos);
+X			for (i=0; i<net->connlist.count; i++) {
+X				conn = net->connlist.d.conn[i];
+X				NCreate1Path(conn->apos.X,conn->apos.Y,
+X					conn->apos.X,cpos);
+X			}
+X		} else {
+X			NCreate1Path(cpos,net->minpos,cpos,net->maxpos);
+X			for (i=0; i<net->connlist.count; i++) {
+X				conn = net->connlist.d.conn[i];
+X				NCreate1Path(conn->apos.X,conn->apos.Y,
+X					cpos,conn->apos.Y);
+X			}
+X		}
+X	}
+X}
+X
+Xstatic
+XRUnSplitConn(conn)
+XNconn *conn;
+X{
+Xchar *nnend;
+X
+X	if (!conn->box)
+X		NLinkConnBox(conn);
+X	nnend = index(conn->netname,SPLITCHAR);
+X	if (!nnend) return;
+X	if (conn->net)
+X		removep(&(conn->net->connlist),(char *)conn);
+X			/* remove from old (split) net */
+X	*nnend = 0;	/* strip tail off name */
+X	if (!conn->box) return;
+X	if (!index(conn->box->name,SPLITCHAR)) {
+X		NLinkConnNet(conn);	/* relink the net pointer */
+X	}
+X}
+X
+Xstatic
+XRSelBConn(conn,rownum)
+XNconn *conn;
+Xint rownum;
+X{
+X	if (!conn->net) return;
+X	switch (conn->side) {
+X	case E: case N:
+X		RSelNet(conn->net,rownum+1);
+X		break;
+X	case W: case S:
+X		RSelNet(conn->net,rownum-1);
+X		break;
+X	}
+X}
+X
+Xstatic
+XRSelNConn(conn,rownum)
+XNconn *conn;
+Xint rownum;
+X{
+X	if (!conn->box) return;
+X	switch (conn->side) {
+X	case E: case N:
+X		RSelBox(conn->box,rownum-1);
+X		break;
+X	case W: case S:
+X		RSelBox(conn->box,rownum+1);
+X		break;
+X	}
+X}
+X
+Xstatic int
+XRCmpConn(c1,c2)
+XNconn **c1, **c2;
+X{
+X	return (*c1)->pos.vX - (*c2)->pos.vX;
+X}
+X
+Xstatic
+XNrow *
+XRFindRow(base,num)
+XNbase *base;
+Xint num;
+X{
+Xint i;
+X
+X	for (i=0; i<base->rowlist.count; i++) {
+X		if (base->rowlist.d.row[i]->rownum==num)
+X			return base->rowlist.d.row[i];
+X	}
+X	return 0;
+X}
+X
+Xstatic
+XRSetflagRow(row)
+XNrow *row;
+X{
+X	if (row->boxlist.count)
+X		row->parflags |= BOXROW;
+X	else
+X		row->parflags &= ~BOXROW;
+X}
+X
+Xstatic int
+XRSizeRow(row)
+XNrow *row;
+X{
+Xint i;
+Xint smax,s;
+X
+X	if (!(row->parflags & BOXROW)) return 0;	/* not a box row */
+X	smax=0;
+X	for (i=0; i<row->boxlist.count; i++) {
+X		s = row->boxlist.d.box[i]->size.vY;
+X		if (s>smax) smax=s;
+X	}
+X	row->size = smax;
+X	return smax;
+X}
+X
+Xstatic
+XRClearOrderRow(row)
+XNrow *row;
+X{
+X	row->rowposmin = row->rowposmax = 0;
+X}
+X
+Xstatic
+XRSortRow(row)	/* sorts the boxes in a row */
+XNrow *row;
+X{
+X	if (!(row->parflags & BOXROW)) return;
+X	qsort((char *)row->boxlist.d.box,row->boxlist.count,
+X		sizeof(row->boxlist.d.box[0]),RCmpBox);
+X			/* sort according to rowpos */
+X	RNormalizeRow(row);
+X}
+X
+Xstatic
+XRNormalizeRow(row)
+XNrow *row;
+X{
+XNbox *box;
+Xint i,t;
+X
+X	t = 0;
+X	for (i=0; i<row->boxlist.count; i++) {
+X		box = row->boxlist.d.box[i];
+X		box->origin.vX = t;
+X		t += NCurBase->rowposspace + box->size.vX;
+X	}
+X	row->length = t-NCurBase->rowposspace;
+X}
+X
+Xstatic
+XRPositionRow(row,side)
+XNrow *row;
+Xint side;	/* position based on connectors on this side */
+X{
+X	if (!(row->parflags & BOXROW)) return;
+X	RBalanceRow(row,side);
+X	RSpreadRow(row,side);
+X}
+X
+Xstatic
+XRBalanceRow(row,side)	/* moves the row as a unit to a balanced position */
+XNrow *row;
+Xint side;	/* position based on connectors on this side */
+X{
+Xint i;
+XNbox *box;
+Xint nforce, ncount;
+Xint sumnforce, sumncount;
+Xint dist;
+X
+X	sumnforce = 0;
+X	sumncount = 0;
+X	for (i=0; i<row->boxlist.count; i++) {
+X		box = row->boxlist.d.box[i];
+X		RNetForceBox(box,side,&nforce,&ncount);
+X		sumnforce += nforce;
+X		sumncount += ncount;
+X	}
+X	if (sumncount==0) return;
+X	dist = sumnforce/sumncount;
+X	if (dist<0) return;
+X	if (dist + row->length > NCurBase->maxrowlength)
+X		dist = NCurBase->maxrowlength - row->length;
+X	for (i=0; i<row->boxlist.count; i++) {
+X		box = row->boxlist.d.box[i];
+X		box->origin.vX += dist;
+X		NDoGroup(&(box->connlist),NPosConn);
+X		box->parflags &= ~POSITIONSET;
+X	}
+X}
+X
+Xstatic
+XRSpreadRow(row,side)
+XNrow *row;
+Xint side;	/* position based on connectors on this side */
+X{
+Xint i;
+XNbox *box;
+Xint floor, ceil;
+Xint nforce, ncount;
+Xint dist;
+Xint j;
+XNbox *boxj;
+Xint tfloor;
+X
+X	floor = 0;
+X	for (i=0; i<row->boxlist.count; i++) {
+X		box = row->boxlist.d.box[i];
+X		RNetForceBox(box,side,&nforce,&ncount);
+X		if (ncount==0) {
+X			floor += box->size.vX + NCurBase->rowposspace;
+X				/* raise floor, but place this box later */
+X			continue;
+X		}
+X		dist = nforce/ncount;
+X		if (dist>=0) break;
+X		if (box->origin.vX + dist < floor)
+X			box->origin.vX = floor;
+X		else
+X			box->origin.vX += dist;
+X		NDoGroup(&(box->connlist),NPosConn);
+X		floor = box->origin.vX + box->size.vX + NCurBase->rowposspace;
+X		box->parflags |= POSITIONSET;
+X		tfloor = box->origin.vX;
+X		for (j=i-1; j>=0; j--) {
+X			boxj = row->boxlist.d.box[j];
+X			if (boxj->parflags & POSITIONSET) break;
+X			tfloor -= boxj->size.vX + NCurBase->rowposspace;
+X			boxj->origin.vX = tfloor;
+X			boxj->parflags |= POSITIONSET;
+X		}
+X	}
+X	ceil = NCurBase->maxrowlength;
+X	for (i=row->boxlist.count-1; i>=0; i--) {
+X		box = row->boxlist.d.box[i];
+X		RNetForceBox(box,side,&nforce,&ncount);
+X		if (ncount==0) {
+X			ceil -= box->size.vX + NCurBase->rowposspace;
+X			continue;
+X		}
+X		dist = nforce/ncount;
+X		if (dist<=0) break;
+X		if (box->origin.vX + box->size.vX + dist > ceil)
+X			box->origin.vX = ceil - box->size.vX;
+X		else
+X			box->origin.vX += dist;
+X		NDoGroup(&(box->connlist),NPosConn);
+X		ceil = box->origin.vX - NCurBase->rowposspace;
+X		box->parflags |= POSITIONSET;
+X		tfloor = box->origin.vX + box->size.vX + NCurBase->rowposspace;
+X		for (j=i+1; j<row->boxlist.count; j++) {
+X			boxj = row->boxlist.d.box[j];
+X			if (boxj->parflags & POSITIONSET) break;
+X			boxj->origin.vX = tfloor;
+X			tfloor += boxj->size.vX + NCurBase->rowposspace;
+X			boxj->parflags |= POSITIONSET;
+X		}
+X	}
+X}
+X
+X/* track routines */
+X
+Xstatic Ntrack *
+XRNewTrack(n)
+Xint n;
+X{
+XNtrack *track;
+X
+X	track = XCALLOC(Ntrack,1);
+X	track->n = n;
+X	track->netlist.count = track->netlist.alloc = 0;
+X	track->netlist.d.net = 0;
+X	return track;
+X}
+X
+Xstatic
+XRUseTrack(track,net)
+XNtrack *track;
+XNnet *net;
+X{
+X	track->parflags |= SPANSET;
+X	insertp(&(track->netlist),(char *)net);
+X}
+X
+Xstatic int	/* returns angle of the net which is in the way, 0 if open */
+XRUnAvailTrack(track,min,max)
+XNtrack *track;
+Xint min,max;
+X{
+XNnet *net;
+Xint i;
+X
+X	if (!(track->parflags & SPANSET)) return 0;
+X	for (i=0; i<track->netlist.count; i++) {
+X		net = track->netlist.d.net[i];
+X		if (min>=net->maxpos+NCurBase->trackspace) continue;
+X		if (max<=net->minpos-NCurBase->trackspace) continue;
+X		return net->angle;	/* this net is in the way */
+X	}
+X	return 0;
+X}
+X
+Xstatic Ntrack *
+XRFindTrack(row,min,max,netangle)
+XNrow *row;
+Xint min,max;
+Xint netangle;
+X{
+Xint i;
+XNtrack *track, *lastavail;
+Xint trackangle;
+X
+X/* find the last row in which the route DOES NOT fit, then return the
+X * next row after that! */
+X	lastavail = 0;
+X	for (i=row->tracklist.count-1; i>=0; i--) {
+X		track = row->tracklist.d.track[i];
+X		trackangle = RUnAvailTrack(track,min,max);
+X		if (!trackangle)
+X			lastavail = track;
+X		else
+X			if (trackangle==netangle) break;
+X		/* if angles are different, continue looking */
+X	}
+X	if (lastavail) return lastavail;
+X	return 0;
+X
+X#if 0	/* greedy algorithm - doesn't do quite what we want */
+X	for (i=0; i<row->tracklist.count; i++) {
+X		track = row->tracklist.d.track[i];
+X		if (!(RUnAvailTrack(track,min,max))) return track;
+X	}
+X	return 0;
+X#endif
+X}
+X
+Xstatic
+XRClearTrack(track)
+XNtrack *track;
+X{
+X	NFreeGroupOnly(&(track->netlist));
+X	track->parflags = 0;
+X}
+X
+Xstatic
+XRFreeTrack(track)
+XNtrack *track;
+X{
+X	NFreeGroupOnly(&(track->netlist));
+X	tfree((char *)track);
+X}
+X
+Xstatic
+XRChanSizeRow(row)	/* calculate required number of tracks */
+XNrow *row;
+X{
+Xint i;
+XNnet *net;
+XNtrack *track;
+X
+X	if (row->parflags & BOXROW) return;
+X	NFreeGroup(&(row->tracklist),RFreeTrack);
+X	NDoGroup(&(row->netlist),RSpanNet);	/* find span of each net */
+X	qsort((char *)row->netlist.d.net,row->netlist.count,
+X		sizeof(row->netlist.d.net[0]),RCmpNet);
+X	NDoGroup(&(row->netlist),RSetAngleNet);
+X	for (i=row->netlist.count-1; i>=0; i--) {
+X		net = row->netlist.d.net[i];
+X		if (net->connlist.count<=1) continue;
+X		switch (net->angle) {
+X		case 'W': case 'R': case 'S':
+X			break;
+X		default:
+X			continue;
+X		}
+X		track = RFindTrack(row,net->minpos,net->maxpos,net->angle);
+X			 /* see where it can fit */
+X		if (!track) {		/* have to make a new track */
+X			track = RNewTrack(row->tracklist.count);
+X			insertp(&(row->tracklist),(char *)track);
+X		}
+X		net->track = track;
+X		RUseTrack(track,net);
+X	}
+X	for (i=0; i<row->netlist.count; i++) {
+X		net = row->netlist.d.net[i];
+X		if (net->track || net->connlist.count<=1) continue;
+X		track = RFindTrack(row,net->minpos,net->maxpos,net->angle);
+X			 /* see where it can fit */
+X		if (!track) {		/* have to make a new track */
+X			track = RNewTrack(row->tracklist.count);
+X			insertp(&(row->tracklist),(char *)track);
+X		}
+X		net->track = track;
+X		RUseTrack(track,net);
+X	}
+X	row->size = NCurBase->trackspace * (row->tracklist.count+1);
+X}
+X
+Xstatic
+XRRouteRow(row)
+XNrow *row;
+X{
+Xint i;
+XNtrack *track;
+X
+X	if (row->parflags & BOXROW) return;
+X	for (i=0; i<row->tracklist.count; i++) {
+X		track = row->tracklist.d.track[i];
+X		track->pos = row->pos + NCurBase->trackspace*(1+i);
+X	}
+X	NDoGroup(&(row->tracklist),RClearTrack);	/* clear min/max */
+X	NDoGroup(&(row->netlist),RRouteNet);	/* route all nets */
+X}
+X
+Xint
+XRSelect(boxname)	/* select rows for all boxes and nets */
+Xchar *boxname;
+X{
+XNbox *box;
+X
+X	if (!NCurBase) {
+X		printf("no data to place\n");
+X		return 0;
+X	}
+X	NDoGroup(&(NCurBase->boxlist),RUnmarkBox);
+X	NDoGroup(&(NCurBase->netlist),RUnmarkNet);
+X
+X	if (boxname) {	/* see if preferred root for placement */
+X		box = NFindBox(NCurBase,boxname);
+X		if (box) RSelectBox(box);
+X	}
+X	NDoGroup(&(NCurBase->boxlist),RSelectBox);	/* put in new row */
+X
+X	return 1;
+X}
+X
+X/* UnFeed removes any previously inserted feedthroughs */
+Xint
+XRUnFeed()
+X{
+X	if (!NCurBase) {
+X		printf("no data to place\n");
+X		return 0;
+X	}
+X	NDoGroup(&(NCurBase->boxlist),RUnSplitBox);
+X	NRDoGroup(&(NCurBase->boxlist),RFreeSplitBox);
+X	NDoGroup(&(NCurBase->netlist),RUnSplitNet);
+X	NRDoGroup(&(NCurBase->netlist),RFreeSplitNet);
+X	return 1;
+X}
+X
+Xint
+XRFeed()		/* make feedthroughs */
+X{
+X
+X	if (!NCurBase) {
+X		printf("no data to place\n");
+X		return 0;
+X	}
+X	NDoGroup(&(NCurBase->netlist),RSplitNet);
+X		/* divide nets up when spanning rows */
+X	NDoGroup(&(NCurBase->netlist),NClearNetConns);
+X	NDoGroup(&(NCurBase->connlist),NLinkConnNet);
+X	return 1;
+X}
+X
+Xint
+XRReFeed()	/* remove old feedthroughs and insert new */
+X{
+X	if (!RUnFeed()) return 0;
+X	if (!RFeed()) return 0;
+X	return 1;
+X}
+X
+Xint
+XRSpace()	/* set the spacing for the rows, set one coord in boxes */
+X{
+Xextern int NFreeRow();
+Xint rowmax=0;
+Xint rowmin=0;
+Xint r,rowcount;
+Xint i;
+Xint pos;
+XNrow *row;
+X
+X	if (!NCurBase) {
+X		printf("no data to place\n");
+X		return 0;
+X	}
+X	NSetBase(NCurBase);		/* so we can use NCreateRow */
+X	NFreeGroup(&(NCurBase->rowlist),NFreeRow);	/* dump all old rows */
+X	NDoGroup(&(NCurBase->boxlist),RUnsetrowBox);
+X	NDoGroup(&(NCurBase->netlist),RUnsetrowNet);
+X	for (i=0; i<NCurBase->boxlist.count; i++) {
+X		r = NCurBase->boxlist.d.box[i]->rownum;
+X		if (i==0 || r>rowmax) rowmax=r;
+X		if (i==0 || r<rowmin) rowmin=r;
+X	}
+X	for (i=0; i<NCurBase->netlist.count; i++) {
+X		r = NCurBase->netlist.d.net[i]->rownum;
+X		if (r>rowmax) rowmax=r;
+X		if (r<rowmin) rowmin=r;
+X	}
+X	rowcount = rowmax-rowmin+1;
+X	for (i=0; i<rowcount; i++) {
+X		NCreateRow(i+rowmin,0,0);	/* put in new rows */
+X	}
+X	NDoGroup(&(NCurBase->boxlist),RSetrowBox);
+X	NDoGroup(&(NCurBase->netlist),RSetrowNet);
+X		/* put all the boxes and nets into their rows */
+X	pos = 0;
+X	for (i=0; i<NCurBase->rowlist.count; i++) {
+X		row = NCurBase->rowlist.d.row[i];
+X		row->pos = pos;
+X		if (row->boxlist.count)
+X			row->parflags |= BOXROW;
+X		pos += NCurBase->interrowspace + RSizeRow(row);
+X	}
+X	NDoGroup(&(NCurBase->boxlist),RSetrposBox);
+X	NDoGroup(&(NCurBase->connlist),NPosConn);
+X	return 1;
+X}
+X
+Xstatic
+XRSetPtrs()	/* make sure pointers are set up (for incremental p/r) */
+X{
+X	/* make sure box and net pointers to row are in */
+X	NDoGroup(&(NCurBase->boxlist),RSetrowBox);
+X	NDoGroup(&(NCurBase->netlist),RSetrowNet);
+X	NDoGroup(&(NCurBase->rowlist),RSetflagRow);
+X}
+X
+Xint
+XROrder(boxname)	/* order the boxes in each row */
+Xchar *boxname;
+X{
+Xint i;
+XNbox *box;
+X
+X	if (!NCurBase) {
+X		printf("no data to place\n");
+X		return 0;
+X	}
+X
+X	RSetPtrs();
+X
+X	/* now start the ordering within each row */
+X	NDoGroup(&(NCurBase->boxlist),RClearOrderBox);
+X	NDoGroup(&(NCurBase->netlist),RClearOrderNet);
+X	NDoGroup(&(NCurBase->rowlist),RClearOrderRow);
+X		/* clear out any previous ordering info */
+X
+X	if (boxname) {	/* see if preferred root for placement */
+X		box = NFindBox(NCurBase,boxname);
+X		if (box) ROrderBox(box,0);
+X	}
+X	for (i=0; i<NCurBase->boxlist.count; i++) {
+X		ROrderBox(NCurBase->boxlist.d.box[i],0);
+X	}
+X	NDoGroup(&(NCurBase->rowlist),RSortRow);
+X	NDoGroup(&(NCurBase->connlist),NPosConn);
+X	return 1;
+X}
+X
+Xint
+XRPosition()	/* position the boxes within each row */
+X{
+Xint i;
+XNrow *row;
+Xint maxlength;
+Xint rowi;
+X
+X	if (!NCurBase) {
+X		printf("no data to place\n");
+X		return 0;
+X	}
+X
+X	RSetPtrs();
+X
+X	NDoGroup(&(NCurBase->rowlist),RNormalizeRow);
+X	maxlength = -1;
+X	for (i=0; i<NCurBase->rowlist.count; i++) {
+X		row = NCurBase->rowlist.d.row[i];
+X		if (!(row->parflags & BOXROW)) continue;
+X		if (row->length > maxlength) {
+X			maxlength = row->length;
+X			rowi = i;
+X		}
+X	}
+X	NCurBase->maxrowlength = maxlength;
+X	for (i=rowi-1; i>=0; i--) {
+X		RPositionRow(NCurBase->rowlist.d.row[i],NorE);
+X	}
+X	for (i=rowi+1; i<NCurBase->rowlist.count; i++) {
+X		RPositionRow(NCurBase->rowlist.d.row[i],SorW);
+X	}
+X	return 1;
+X}
+X
+Xint
+XRRoute()	/* do the channel route */
+X{
+Xint i;
+Xint t;
+XNrow *row;
+X
+X	if (!NCurBase) {
+X		printf("no data to place\n");
+X		return 0;
+X	}
+X
+X	RSetPtrs();
+X
+X	NDoGroup(&(NCurBase->connlist),NPosConn);
+X	NDoGroup(&(NCurBase->rowlist),RChanSizeRow);
+X		/* calculate the channel size for each row */
+X	t = 0;
+X	for (i=0; i<NCurBase->rowlist.count; i++) {
+X		row = NCurBase->rowlist.d.row[i];
+X		row->pos = t;
+X		t += row->size;
+X	}
+X	NDoGroup(&(NCurBase->boxlist),RSetrposBox);
+X	NDoGroup(&(NCurBase->connlist),NPosConn);
+X	NDoGroup(&(NCurBase->rowlist),RRouteRow);
+X		/* do the actual channel routing */
+X	return 1;
+X}
+X
+XRSpacepar(boxname)	/* RSpace and the rest */
+Xchar *boxname;
+X{
+X	if (!RSpace()) return 0;
+X	if (!ROrder(boxname)) return 0;
+X	if (!RPosition()) return 0;
+X	if (!RRoute()) return 0;
+X	return 1;
+X}
+X
+XRReFeedpar(boxname)	/* RFeed and the rest */
+Xchar *boxname;
+X{
+X	if (!RReFeed()) return 0;
+X	if (!RSpacepar(boxname)) return 0;
+X	return 1;
+X}
+X
+XRpar(boxname)		/* do it all */
+Xchar *boxname;
+X{
+X	if (!RSelect(boxname)) return 0;
+X	if (!RReFeedpar(boxname)) return 0;
+X	return 1;
+X}
+X
+X/* end */
+END_OF_FILE
+if test 26098 -ne `wc -c <'par.c'`; then
+    echo shar: \"'par.c'\" unpacked with wrong size!
+fi
+# end of 'par.c'
+fi
+echo shar: End of archive 3 \(of 3\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

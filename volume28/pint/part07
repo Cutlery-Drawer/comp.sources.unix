@@ -1,0 +1,3129 @@
+Newsgroups: comp.sources.unix
+From: kstailey@leidecker.gsfc.nasa.gov (Kenneth Stailey)
+Subject: v28i145: pint - PINT is not TWAIN (scanner interface toolset), Part07/07
+References: <1.783771355.23520@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: kstailey@leidecker.gsfc.nasa.gov (Kenneth Stailey)
+Posting-Number: Volume 28, Issue 145
+Archive-Name: pint/part07
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 7)."
+# Contents:  pint/sun/driver/scan.c
+# Wrapped by kstailey@leidecker on Tue Nov  1 12:27:57 1994
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'pint/sun/driver/scan.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'pint/sun/driver/scan.c'\"
+else
+echo shar: Extracting \"'pint/sun/driver/scan.c'\" \(85991 characters\)
+sed "s/^X//" >'pint/sun/driver/scan.c' <<'END_OF_FILE'
+X/*
+X *  PINT Pint Is Not TWAIN - common scanner driver interface for UN*X
+X *  Copyright (C) 1994 Kenneth Stailey ken@spacenet.com
+X *
+X *  This program is free software; you can redistribute it and/or modify
+X *  it under the terms of the GNU General Public License as published by
+X *  the Free Software Foundation; either version 2 of the License, or
+X *  (at your option) any later version.
+X *
+X *  This program is distributed in the hope that it will be useful,
+X *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+X *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X *  GNU General Public License for more details.
+X *
+X *  You should have received a copy of the GNU General Public License
+X *  along with this program; if not, write to the Free Software
+X *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X *  scan.c: PINT scanner device driver for SunOS 4.1 using SCSI scanners
+X *  first release version 0.1
+X */
+X
+X#include "scan.h"
+X#if NSCAN > 0
+X
+X#define FALSE 0
+X#define TRUE 1
+X
+X/*
+X * NOTES
+X *
+X * XXX	Code of interest and places where you might need to make changes
+X *	are marked with 'XXX'.
+X *
+X * XXX	Sequential Access Device Block Size can be fixed or variable,
+X *	depending on the device. The read/write command CDB has a bit,
+X *	'fixed' that's set to 1 for fixed block size when the transfer
+X *	count specifies the # of blocks, or to 0 for variable block
+X *	size when the transfer count specifies the # of bytes. See the
+X *	#ifdef VAR_BLK_SZ section of code.
+X *
+X * XXX Two methods of sending commands to the target are provided: scancmd
+X *	and scansimple. Scansimple is for simple non-DVMA commands; it sends
+X *	a polled (i.e. non-interrupting, synchronous) command via scsi_poll.
+X *	Scancmd is more general; it uses scanstrategy and scan_make_cmd to
+X *	send an 'in band' command, i.e. queued with read/write requests.
+X *	Scancmd can do DVMA; this is handled by DVMA-ing to a local buffer
+X *	(un_tmpbuf) and then copying the data into the user's buffer. Both
+X *	scancmd and scansimple are called from scanioctl. If you want to add
+X *	a new ioctl, you can use either scancmd or scansimple. Since scancmd
+X *	calls scan_make_cmd, any new ioctls must have the appropriate entry
+X *	added to scan_make_cmd's case statement.
+X */
+X
+X#include <scsi/scsi.h>
+X#include <sys/scanio.h>
+X#include "scandd.h"
+X#include <vm/hat.h>
+X#include <vm/seg.h>
+X#include <vm/as.h>
+X
+X#define DNAME		devp->sd_dev->devi_name
+X#define DUNIT		devp->sd_dev->devi_unit
+X#define CNAME		devp->sd_dev->devi_parent->devi_name
+X#define CUNIT		devp->sd_dev->devi_parent->devi_unit
+X
+X/*
+X * the buf struct's back pointer is used for the scsi packet
+X */
+X#define BP_PKT(bp)      ((struct scsi_pkt *)bp->av_back)
+X#define SCBP(pkt)	((struct scsi_status *)(pkt)->pkt_scbp)
+X#define SCBP_C(pkt)	((*(pkt)->pkt_scbp) & STATUS_MASK)
+X#define CDBP(pkt)	((union scsi_cdb *)(pkt)->pkt_cdbp)
+X#define TGT(devp)	(devp->sd_address.a_target)
+X#define LUN(devp)	(devp->sd_address.a_lun)
+X#define SCANPDS		((struct scsi_scan *)(devp)->sd_private)
+X#define SCANUNIT(d)	(minor((d))>>3)
+X
+X#define newstate(s) SCANPDS->un_last_state=SCANPDS->un_state, SCANPDS->un_state=(s)
+X
+X#define SCANTIMEOUT	  2*hz	/* 2sec wait on a busy status return */
+X#define DFLT_SCAN_TIMEOUT 20	/* 20sec should be enough for most operations */
+X#define SCAN_RETRY_COUNT  15	/* max # retries on an operation */
+X
+X#define VIDSZ		8
+X#define PIDSZ		16
+X
+X/*
+X * Maximum single DMA transfer size
+X * 63k is the maximum allowed by SunOS.
+X */
+X#define SCAN_MAXREC	(63 * 1024)
+X
+X/*
+X * Maximum number of scan peripherals
+X * This is set by the structure of the minor device number. E.g. for
+X * a tape device, 1 bit might be used to signal no rewind and 2 or 3
+X * bits for different densities, leaving 4 or 5 bits for the device
+X * number. Theoretically you could have 256 devices, but 8 seems like
+X * a more reasonable number. This defines the length of the scanunits
+X * array for the devices' private data structures.
+X */
+X#define SCAN_MAXUNITS	4
+X
+X/*
+X * Adb-able debug flag/level: 0=off, 1=errors, 2 & 3 more verbose
+X * To set: # adb -kw /vmunix /dev/mem
+X *	   physmem <some value>		<- msg from adb
+X *	   scan_debug/X			<- type this to display scan_debug
+X *	   scan_debug/W <newval>	<- type this to change scan_debug
+X *	   $q				<- type this to exit adb
+X */
+Xint scan_debug = 0;
+X
+X#define DPRINTF(L)	if (scan_debug >= L) printf
+X
+X  /*
+X   * Driver private data struct
+X   */
+X  struct scsi_device *scanunits[SCAN_MAXUNITS];
+X
+Xint		nscans = NSCAN;
+Xstatic int	scanpri;
+Xstatic int	scan_error_reporting = SCANERR_RETRYABLE;
+X
+X/*
+X * other externs
+X */
+Xextern char *scan_cmds[];	/* acutally in this file */
+X
+X/*
+X * Configuration Data
+X */
+X
+X/*
+X * Device driver ops vector
+X */
+Xint scanslave(), scanattach(), scanopen(), scanclose(), scanread();
+Xint scanstrategy(), scanioctl(), scansize();
+Xextern int nulldev(), nodev();
+Xstruct dev_ops scan_ops = {
+X  1,
+X  scanslave,
+X  scanattach,
+X  scanopen,
+X  scanclose,
+X  scanread,
+X  nodev,
+X  scanstrategy,
+X  nodev,
+X  nulldev,
+X  scanioctl,
+X};
+X
+Xstatic void scanintr();
+Xstatic void scandone(), scan_make_cmd(), scanerrmsg();
+Xstatic void clean_print(), find_umax();
+Xstatic int do_object_position();
+Xstatic int calc_umax_row_len();
+Xstatic int umax_has_paper_in_adf();
+Xstatic long window_size();
+X
+Xstatic u_char model_to_type_code();
+X/*
+X *********************************
+X *
+X * Autoconfiguration Routines
+X *
+X *********************************
+X */
+X
+X/*
+X * scanslave
+X * Calls scsi_slave() to see if there's a device at our target id. If
+X * there is, scsi_slave will fill in the sd_inq struct (in the devp
+X * scsi device struct) with the inquiry data. Validate the data here,
+X * and fill in the private data structure.
+X */
+Xint scanslave(devp)
+X     register struct scsi_device *devp;
+X{
+X  char			vpid[VIDSZ+PIDSZ+1];
+X  int			status;
+X  struct scsi_pkt	*rsp, *get_pktiopb();
+X
+X  DPRINTF(4)("scanslave: called\n");
+X
+X  if (DUNIT >= nscans) {
+X    DPRINTF(1)("scanslave: DUNIT (%d) > nscans (%d)\n", DUNIT, nscans);
+X    return(0);
+X  }
+X
+X  scanunits[DUNIT] = devp;	/* fill in our array */
+X
+X  scanpri = MAX(scanpri, ipltospl(devp->sd_dev->devi_intr->int_pri));
+X
+X  scsi_options &= ~(SCSI_OPTIONS_SYNC);
+X
+X#if 0
+X  if (scsi_ifsetcap(&devp->sd_address, "synchronous", FALSE, 1) != 1)
+X    DPRINTF(1)("scanslave: scsi_ifsetcap failed\n");
+X#endif
+X
+X  /*
+X   * scsi_slave() will send test unit ready and inquiry commands,
+X   * with reqest sense if necessary.
+X   */
+X  DPRINTF(4)("scanslave: calling scsi_slave\n");
+X  status = scsi_slave(devp, NULL_FUNC);
+X  switch(status) {
+X  case SCSIPROBE_EXISTS:
+X    /*
+X     * inquiry succeeded, devp->sd_inq is now filled in
+X     * XXX	Check inq_dtype, inq_vid, inq_pid and any other
+X     *	fields to make sure the target/unit is what's
+X     *	expected (sd_inq is a struct scsi_inquiry,
+X     *	defined in scsi/generic/inquiry.h).
+X     * XXX	Put device-specific checking into the appropriate
+X     *	case statement, and change the default: to
+X     *	an error message & return(0).
+X     */
+X    switch(devp->sd_inq->inq_dtype) {
+X    case DTYPE_PROCESSOR:
+X      if (strncmp(devp->sd_inq->inq_pid, "C1750A", 6) == 0)
+X	devp->sd_inq->inq_dtype = DTYPE_SCANNER;
+X      else
+X	goto inq_default;
+X      /* fall through if HP scanner */
+X    case DTYPE_SCANNER:
+X      DPRINTF(4)("%s%d: found %s device (tgt%d, lun%d) on %s%d\n",
+X		 DNAME, DUNIT, scsi_dname((int)devp->sd_inq->inq_dtype),
+X		 TGT(devp), LUN(devp), CNAME, CUNIT);
+X      break;
+X    default:
+X    inq_default:
+X      DPRINTF(1)("%s%d: target is not a scanner\n", DNAME, DUNIT);
+X      return(0);
+X    }
+X    break;
+X  case SCSIPROBE_NONCCS:    /* device doesn't support the inquiry command */
+X    /*
+X     * XXX If you have a non-ccs device, you must fill in the
+X     *     sd_inq structure manually
+X     */
+X    printf("%s%d: found non-CCS device (tgt%d, lun%d) on %s%d\n",
+X	   DNAME, DUNIT, TGT(devp), LUN(devp), CNAME, CUNIT);
+X    break;
+X  case SCSIPROBE_NOMEM:
+X  case SCSIPROBE_FAILURE:
+X  case SCSIPROBE_NORESP:
+X  default:
+X    DPRINTF(1)("scan_findslave: failed, scsi_slave returned 0x%x\n", status);
+X    devp->sd_present = 0;	/* no unit present */
+X    return(0);
+X    break;
+X  }
+X
+X  /*
+X   * The expected device is indeed at the probed target id.
+X   * The rest of this routine fills in as much of the private
+X   * data structure as possible. The attach routine will
+X   * validate the unit (eg read a disk label).
+X   */
+X
+X  /*
+X   * Allocate a request sense packet
+X   */
+X  if (!(rsp = get_pktiopb(&devp->sd_address, (caddr_t *)&devp->sd_sense,
+X			  CDB_GROUP0, 1, SENSE_LENGTH, B_READ, NULL_FUNC))) {
+X    return(0);
+X  }
+X  makecom_g0(rsp, devp, 0, SCMD_REQUEST_SENSE, 0, SENSE_LENGTH);
+X  rsp->pkt_pmon = -1;
+X  rsp->pkt_comp = scanintr;
+X  rsp->pkt_time = DFLT_SCAN_TIMEOUT;
+X
+X  /*
+X   * Allocate and initialize private data
+X   */
+X
+X  SCANPDS = (struct scsi_scan *)kmem_zalloc(sizeof(struct scsi_scan));
+X  if (!SCANPDS) {
+X    printf("%s%d: No memory for device structure\n", DNAME, DUNIT);
+X    free_pktiopb(rsp, (caddr_t)devp->sd_sense, SENSE_LENGTH);
+X    return(0);
+X  }
+X  SCANPDS->un_rbufp = (struct buf *)kmem_zalloc(sizeof (struct buf));
+X  SCANPDS->un_sbufp = (struct buf *)kmem_zalloc(sizeof (struct buf));
+X  if (!SCANPDS->un_rbufp || !SCANPDS->un_sbufp) {
+X    printf("%s%d: can't allocate raw/special buffer\n", DNAME, DUNIT);
+X    if (SCANPDS->un_rbufp) {
+X      (void) kmem_free((caddr_t)SCANPDS->un_rbufp,sizeof (struct buf));
+X    }
+X    free_pktiopb(rsp, (caddr_t)devp->sd_sense, SENSE_LENGTH);
+X    (void) kmem_free((caddr_t)(SCANPDS), sizeof (struct scsi_scan));
+X    return(0);
+X  }
+X  SCANPDS->un_tmpbuf = (caddr_t)kmem_zalloc(UN_TMPBUF_SIZE);
+X  if (!SCANPDS->un_tmpbuf) {
+X    printf("%s%d: can't allocate un_tmpbuf\n", DNAME, DUNIT);
+X    (void) kmem_free((caddr_t)SCANPDS->un_sbufp,sizeof (struct buf));
+X    (void) kmem_free((caddr_t)SCANPDS->un_rbufp,sizeof (struct buf));
+X    (void) kmem_free((caddr_t)(SCANPDS), sizeof (struct scsi_scan));
+X    free_pktiopb(rsp, (caddr_t)devp->sd_sense, SENSE_LENGTH);
+X    return(0);
+X  }
+X  /*
+X   * Fill in private data
+X   */
+X  SCANPDS->sio.scan_window_width  = 10200L;
+X  SCANPDS->sio.scan_window_length = 13200L;
+X  SCANPDS->sio.scan_x_resolution  = 200;
+X  SCANPDS->sio.scan_y_resolution  = 200;
+X  SCANPDS->sio.scan_x_origin      = 0;
+X  SCANPDS->sio.scan_y_origin      = 0;
+X  SCANPDS->sio.scan_image_mode    = (u_char)BINARY_MONOCHROME;
+X  SCANPDS->sio.scan_brightness    = (u_char)128;
+X  SCANPDS->sio.scan_contrast      = (u_char)128;
+X  SCANPDS->sio.scan_scanner_type  = model_to_type_code(devp->sd_inq->inq_pid);
+X
+X  SCANPDS->un_rsp = rsp;
+X  SCANPDS->un_sd = devp;
+X
+X  SCANPDS->adf_state = ADF_UNUSED;
+X
+X  devp->sd_present = 1;	/* mark unit present */
+X
+X  devp->sd_dev->devi_driver = &scan_ops;
+X  return(1);
+X}
+X
+X/*
+X * scanattach
+X * Device-dependent initialization. Scanslave checks that the target
+X * controller is there and responding. This routine initializes the
+X * device attached to the controller (if needed). E.g for a removable
+X * disk you might check that the disk you expect is there. If the
+X * device can go away after boot (e,g, it's removable) you might
+X * want to call scanattach from scanopen.
+X */
+Xint scanattach(devp)
+X     struct scsi_device *devp;
+X{
+X  char scan_id[29], *p, *q;
+X  int count;
+X
+X  if (!SCANPDS) {
+X    DPRINTF(1)("scanattach: no private data struct\n");
+X    return;
+X  }
+X  DPRINTF(4)("scanattach: called\n");
+X
+X  /*
+X   * print vendor, model & version info
+X   */
+X
+X  p = devp->sd_inq->inq_vid;
+X  q = scan_id;
+X  count = 8;
+X  while (*p != ' ' && count--)
+X    *q++ = *p++;
+X
+X  *q++ = ' ';
+X  p = devp->sd_inq->inq_pid;
+X  count = 16;
+X  while (*p != ' ' && count--)
+X    *q++ = *p++;
+X
+X  *q++ = ' ';
+X  p = devp->sd_inq->inq_revision;
+X  count = 4;
+X  while (*p != ' ' && count--)
+X    *q++ = *p++;
+X
+X  *q++ = '\0';
+X
+X  printf("%s%d: <%s>\n", DNAME, DUNIT, scan_id);
+X
+X  /*
+X   * If this is the first time through, mark closed.
+X   */
+X  if (SCANPDS->un_state == SCAN_STATE_NIL) {
+X    newstate(SCAN_STATE_CLOSED);
+X  }
+X  SCANPDS->un_attached = 1;
+X  return;
+X}
+X
+X/*
+X *********************************
+X *
+X * Un!x Entry Points
+X *
+X *********************************
+X */
+X
+X
+X/*
+X * open the device
+X * Make sure the device is present and correct. Do any initialization that's
+X * needed (start it up, load media, etc).
+X */
+Xint scanopen(dev, flag)
+X     dev_t	dev;
+X     int	flag;
+X{
+X  register struct scsi_device *devp;
+X  register int unit, s;
+X  int rc = 0;
+X
+X  DPRINTF(4)("scanopen: SCANUNIT(dev) %d, nscans %d\n", SCANUNIT(dev), nscans);
+X  DPRINTF(4)("scanopen: scanunits[unit] %d\n", scanunits[unit]);
+X
+X  if (((unit = SCANUNIT(dev)) >= nscans) || (!(devp = scanunits[unit]))) {
+X    DPRINTF(1)("scanopen: nodev, unit=%d, devp=0x%x\n", unit, devp);
+X    return(ENODEV);
+X  }
+X  DPRINTF(2)("scanopen: scan%d, devp=0x%x\n", unit, devp);
+X
+X  /*
+X   * If the device isn't attached/online, attach it
+X   */
+X  if (!SCANPDS) {
+X    DPRINTF(2)("scanopen: no PDS\n");
+X    return(ENXIO);
+X  }
+X  if (!SCANPDS->un_attached) {
+X    DPRINTF(2)("scanopen: attach failed\n");
+X    return(ENXIO);
+X  }
+X
+X  /*
+X   * If the device was closed, open and initialize it
+X   */
+X
+X  if (SCANPDS->un_state == SCAN_STATE_CLOSED) {
+X    newstate(SCAN_STATE_OPENING);
+X
+X    /* Test Unit Ready */
+X    while (rc = scansimple(devp, SCMD_TEST_UNIT_READY, 0)) {
+X      int tries = 5;
+X
+X      if (--tries == 0)
+X	goto scanopen_exit;
+X
+X      DPRINTF(2)("scanopen: re-sending TEST_UNIT_READY\n");
+X    }
+X
+X    /* Reserve Unit */
+X    if (SCANPDS->sio.scan_scanner_type != HP_SCANJET_IIC)
+X      if (rc = scansimple(devp, SCMD_RESERVE, 0))
+X	goto scanopen_exit;
+X  } else {
+X    if (SCANPDS->un_state == SCAN_STATE_OPENING ||
+X	SCANPDS->un_state == SCAN_STATE_OPEN) {
+X      DPRINTF(2)("scanopen: device is already open\n");
+X      rc = EBUSY;
+X      goto scanopen_exit;
+X    } else {
+X      DPRINTF(3)("scanopen: SCANPDS->un_state %d\n", SCANPDS->un_state);
+X      rc = EIO;			/* XXX->what should errno be here? */
+X      goto scanopen_exit;
+X    }
+X  }
+X  SCANPDS->un_triggered = FALSE;
+X  newstate(SCAN_STATE_OPEN);
+X
+Xscanopen_exit:
+X  if (rc) {
+X    newstate(SCAN_STATE_CLOSED);
+X    DPRINTF(1)("scanopen: returning %d\n", rc);
+X  }
+X  return(rc);
+X}
+X
+Xstatic int do_object_position(devp, move_type)
+X     struct scsi_device *devp;
+X     int move_type;
+X{
+X  struct scsi_pkt *posp, *rqpkt = SCANPDS->un_rsp;
+X  int err;
+X
+X  /*
+X   * Get a pkt with no dma resources
+X   */
+X  if (!(posp = scsi_pktalloc(&devp->sd_address, CDB_GROUP1, 1, SLEEP_FUNC))) {
+X    return(ENOMEM);
+X  }
+X
+X  if (SCANPDS->sio.scan_scanner_type == RICOH_IS410 ||
+X      SCANPDS->sio.scan_scanner_type == IBM_2456    ||
+X      SCANPDS->sio.scan_scanner_type == RICOH_IS50)
+X    makecom_g1(posp, devp, FLAG_NOINTR, SCMD_OBJECT_POSITION, 0x0100 /* 1 page */, 0);
+X  else
+X    makecom_g1(posp, devp, FLAG_NOINTR, SCMD_OBJECT_POSITION, 0, 0);
+X
+X  if (move_type == LOAD_ADF)
+X    posp->pkt_cdbp[1] = (u_char)1;
+X
+X  if (scsi_poll(posp)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_OBJECT_POSITION %s\n",
+X	       DNAME, DUNIT, (move_type == LOAD_ADF ? "load" : "unload"));
+X    scsi_resfree(posp);
+X    return (EIO);
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(posp)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n", DNAME, DUNIT,
+X		 scsi_cmd_decode(CDBP(posp)->scc_cmd, scan_cmds));
+X    } else {
+X      if (scan_debug > 1)	/* XXX this should determine error type */
+X	scanerrmsg(devp, posp, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(posp)->scc_cmd, scan_cmds),
+X	       SCBP_C(posp));
+X    err = EIO;
+X    break;
+X  }
+X  scsi_resfree(posp);
+X  return(err);
+X}
+X
+Xstatic void do_hp_unload_adf(devp)
+X     struct scsi_device *devp;
+X{
+X  char escape_codes[20];
+X
+X  sprintf(escape_codes, "%c*u0U", '\033');
+X
+X  hp_send_cmd(devp, escape_codes);
+X}
+X
+X/*
+X * close the device
+X */
+Xint scanclose(dev)
+X     dev_t	dev;
+X{
+X  register struct scsi_device *devp;
+X  int	unit;
+X
+X  if (((unit = SCANUNIT(dev)) >= nscans) || (!(devp = scanunits[unit]))) {
+X    DPRINTF(1)("scanclose: nodev, unit=%d, devp=0x%x\n", unit, devp);
+X    return(ENODEV);
+X  }
+X
+X  DPRINTF(2)("scanclose: scan%d, devp=0x%x\n", unit, devp);
+X
+X  if ((!devp->sd_present) || (!SCANPDS) ||
+X      (SCANPDS->un_state < SCAN_STATE_OPEN)) {
+X    DPRINTF(1)("scanclose: sd_present=0x%x, SCANPDS=0x%x, state=%d\n",
+X	       devp->sd_present, SCANPDS, SCANPDS->un_state);
+X    return(ENXIO);
+X  }
+X
+X  newstate(SCAN_STATE_CLOSED);
+X
+X  if (SCANPDS->un_triggered) {
+X
+X    /* if the HP ScanJet IIc was using the ADF as
+X     * the paper source, send an unload request
+X     */
+X    if (SCANPDS->sio.scan_scanner_type == HP_SCANJET_IIC && SCANPDS->using_adf)
+X      do_hp_unload_adf(devp);
+X
+X    /*
+X     * if there is no paper in the UMAX's ADF send an unload to home
+X     * the carriage.
+X     *
+X     * if there is paper in the UMAX's ADF send an unload to eject
+X     * the paper.
+X     */
+X    if (SCANPDS->sio.scan_scanner_type == UMAX_UC630 ||
+X	SCANPDS->sio.scan_scanner_type == UMAX_UG630) {
+X      do_object_position(devp, UNLOAD_ADF);
+X      find_umax(devp);
+X
+X      /*
+X       * If there used to be paper in the ADF and now there's not then the
+X       * last sheet in the ADF just got ejected, so send an unload request
+X       * to home the carriage.
+X       */
+X      if (SCANPDS->using_adf && !umax_has_paper_in_adf(devp)) {
+X	do_object_position(devp, UNLOAD_ADF);
+X	find_umax(devp);
+X      }
+X    }
+X  }
+X
+X  /* if the Ricoh ADF was being used eject the sheet */
+X
+X  if ((SCANPDS->sio.scan_scanner_type == RICOH_IS410 ||
+X       SCANPDS->sio.scan_scanner_type == IBM_2456    ||
+X       SCANPDS->sio.scan_scanner_type == RICOH_IS50)
+X      && SCANPDS->adf_state == ADF_CLEANUP) {
+X
+X    do_object_position(devp, UNLOAD_ADF);
+X    SCANPDS->adf_state = ADF_UNUSED;
+X  }
+X
+X  /* if the Sharp has not read all of the data in the active area
+X   * issue a request to stop scanning
+X   */
+X
+X  /****  do a SCSI release unit on the scanner	***/
+X  if (SCANPDS->sio.scan_scanner_type != HP_SCANJET_IIC)
+X    scansimple(devp, SCMD_RELEASE, 0);
+X
+X  return(0);
+X}
+X
+X/*
+X * Raw i/o operations
+X */
+X
+X/*
+X * Allow a maximum of SCAN_MAXREC bytes per transfer
+X */
+Xstatic void scanminphys(bp)
+X     struct buf	*bp;
+X{
+X}
+X
+X
+Xstatic int do_set_window(devp)
+X     struct scsi_device *devp;
+X{
+X  switch (SCANPDS->sio.scan_scanner_type) {
+X  case UMAX_UC630:
+X  case UMAX_UG630:
+X    return (do_umax_set_window(devp));
+X
+X  case FUJITSU:
+X    return (do_fujitsu_set_window(devp));
+X
+X  case HP_SCANJET_IIC:
+X    return (do_hp_set_window(devp));
+X
+X  case RICOH_IS410:
+X  case IBM_2456:
+X    return (do_ricoh_is410_set_window(devp));
+X
+X  default:
+X    return (EINVAL);
+X  }
+X}
+X
+X#define RICOH_IS410_WD_LEN 72	/* 8+64 */
+X
+Xstatic int do_ricoh_is410_set_window(devp)
+X     struct scsi_device *devp;
+X{
+X  struct scsi_pkt *swp, *rqpkt = SCANPDS->un_rsp;
+X  unsigned char *wd;
+X  int err;
+X
+X  if (!(swp = get_pktiopb(devp->sd_address, (caddr_t)&wd, CDB_GROUP1, 1,
+X			  RICOH_IS410_WD_LEN, B_WRITE, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  /*
+X   * fill out header & window descriptor block
+X   */
+X  bzero(wd, RICOH_IS410_WD_LEN);	/* all fields default to zero */
+X
+X  /* header... */
+X  wd[6] = 0x01;			/* window descriptor block   */
+X  wd[7] = 0x40;			/* must be 0x140 (320) bytes */
+X
+X  /* window descriptor block... */
+X
+X  /* ...resolution... */
+X  wd[8+2] = (uchar)(SCANPDS->sio.scan_x_resolution >> 8 & 0xff);
+X  wd[8+3] = (uchar)(SCANPDS->sio.scan_x_resolution & 0xff);
+X
+X  wd[8+4] = (uchar)(SCANPDS->sio.scan_y_resolution >> 8 & 0xff);
+X  wd[8+5] = (uchar)(SCANPDS->sio.scan_y_resolution & 0xff);
+X
+X  /* ...X origin... */
+X  wd[8+6] = (uchar)(SCANPDS->sio.scan_x_origin >> 24 & 0xff);
+X  wd[8+7] = (uchar)(SCANPDS->sio.scan_x_origin >> 16 & 0xff);
+X  wd[8+8] = (uchar)(SCANPDS->sio.scan_x_origin >>  8 & 0xff);
+X  wd[8+9] = (uchar)(SCANPDS->sio.scan_x_origin & 0xff);
+X
+X  /* ...Y origin... */
+X  wd[8+10] = (uchar)(SCANPDS->sio.scan_y_origin >> 24 & 0xff);
+X  wd[8+11] = (uchar)(SCANPDS->sio.scan_y_origin >> 16 & 0xff);
+X  wd[8+12] = (uchar)(SCANPDS->sio.scan_y_origin >>  8 & 0xff);
+X  wd[8+13] = (uchar)(SCANPDS->sio.scan_y_origin & 0xff);
+X
+X  /* ...width... */
+X  wd[8+14] = (uchar)(SCANPDS->sio.scan_window_width >> 24 & 0xff);
+X  wd[8+15] = (uchar)(SCANPDS->sio.scan_window_width >> 16 & 0xff);
+X  wd[8+16] = (uchar)(SCANPDS->sio.scan_window_width >>  8 & 0xff);
+X  wd[8+17] = (uchar)(SCANPDS->sio.scan_window_width & 0xff);
+X
+X  /* ...length... */
+X  wd[8+18] = (uchar)(SCANPDS->sio.scan_window_length >> 24 & 0xff);
+X  wd[8+19] = (uchar)(SCANPDS->sio.scan_window_length >> 16 & 0xff);
+X  wd[8+20] = (uchar)(SCANPDS->sio.scan_window_length >>  8 & 0xff);
+X  wd[8+21] = (uchar)(SCANPDS->sio.scan_window_length & 0xff);
+X
+X  wd[8+22] = SCANPDS->sio.scan_brightness; /* brightness */
+X  wd[8+23] = SCANPDS->sio.scan_brightness; /* threshold */
+X  wd[8+24] = SCANPDS->sio.scan_contrast;
+X
+X  wd[8+25] = SCANPDS->sio.scan_image_mode;
+X
+X  if (SCANPDS->sio.scan_image_mode < GRAYSCALE)
+X    wd[8+26] = 1;		/* bits-per-pixel */
+X  else
+X    wd[8+26] = 8;		/* bits-per-pixel */
+X
+X  wd[8+27] = 2;			/* halftone code to turn on dithering */
+X  wd[8+28] = 0x0a;		/* 8x8 bayer pattern */
+X
+X  wd[8+29] = 3;			/* padding type, truncate to byte boundary */
+X
+X  wd[8+31] = 7;			/* bit ordering LSB, (set to big-endian) */
+X
+X  wd[8+42] = 0x80;		/* MRIF bit set on, grayscale will be min-is-black */
+X
+X  /*
+X   * Make the CDB, set NOINTR because this is polled, we'll
+X   * wait for the command to complete
+X   */
+X  makecom_g1(swp, devp, FLAG_NOINTR, SCMD_SET_WINDOW, 0, RICOH_IS410_WD_LEN);
+X
+X  if (scsi_poll(swp)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_SET_WINDOW\n", DNAME, DUNIT);
+X    free_pktiopb(swp, wd, RICOH_IS410_WD_LEN);
+X    return (EIO);
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(swp)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n",
+X		 DNAME, DUNIT, scsi_cmd_decode(CDBP(swp)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, swp, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(swp)->scc_cmd, scan_cmds),
+X	       SCBP_C(swp));
+X    err = EIO;
+X    break;
+X  }
+X  free_pktiopb(swp, wd, RICOH_IS410_WD_LEN);
+X  return(err);
+X}
+X
+X#define UMAX_WD_LEN 54
+X
+Xstatic int do_umax_set_window(devp)
+X     struct scsi_device *devp;
+X{
+X  struct scsi_pkt *swp, *rqpkt = SCANPDS->un_rsp;
+X  unsigned char *wd;
+X  int err;
+X
+X  if (!(swp = get_pktiopb(devp->sd_address, (caddr_t)&wd,
+X			  CDB_GROUP1, 1, UMAX_WD_LEN, B_WRITE, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  /*
+X   * fill out header & window descriptor block
+X   */
+X  bzero(wd, UMAX_WD_LEN);		/* all fields default to zero */
+X
+X  /* header... */
+X  wd[7] = 0x2e;			/* window descriptor block len */
+X
+X  /* window descriptor block... */
+X
+X  /* ...resolution... */
+X  wd[8+2] = (uchar)(SCANPDS->sio.scan_x_resolution >> 8 & 0xff);
+X  wd[8+3] = (uchar)(SCANPDS->sio.scan_x_resolution & 0xff);
+X  wd[8+4] = (uchar)(SCANPDS->sio.scan_y_resolution >> 8 & 0xff);
+X  wd[8+5] = (uchar)(SCANPDS->sio.scan_y_resolution & 0xff);
+X
+X  /* ...X origin... */
+X  wd[8+0x6] = (uchar)(SCANPDS->sio.scan_x_origin >> 24 & 0xff);
+X  wd[8+0x7] = (uchar)(SCANPDS->sio.scan_x_origin >> 16 & 0xff);
+X  wd[8+0x8] = (uchar)(SCANPDS->sio.scan_x_origin >>  8 & 0xff);
+X  wd[8+0x9] = (uchar)(SCANPDS->sio.scan_x_origin & 0xff);
+X
+X  /* ...Y origin... */
+X  wd[8+0xA] = (uchar)(SCANPDS->sio.scan_y_origin >> 24 & 0xff);
+X  wd[8+0xB] = (uchar)(SCANPDS->sio.scan_y_origin >> 16 & 0xff);
+X  wd[8+0xC] = (uchar)(SCANPDS->sio.scan_y_origin >>  8 & 0xff);
+X  wd[8+0xD] = (uchar)(SCANPDS->sio.scan_y_origin & 0xff);
+X
+X  /* ...width... */
+X  wd[8+0x0E] = (uchar)(SCANPDS->sio.scan_window_width >> 24 & 0xff);
+X  wd[8+0x0F] = (uchar)(SCANPDS->sio.scan_window_width >> 16 & 0xff);
+X  wd[8+0x10] = (uchar)(SCANPDS->sio.scan_window_width >>  8 & 0xff);
+X  wd[8+0x11] = (uchar)(SCANPDS->sio.scan_window_width & 0xff);
+X
+X  /* ...length... */
+X  wd[8+0x12] = (uchar)(SCANPDS->sio.scan_window_length >> 24 & 0xff);
+X  wd[8+0x13] = (uchar)(SCANPDS->sio.scan_window_length >> 16 & 0xff);
+X  wd[8+0x14] = (uchar)(SCANPDS->sio.scan_window_length >>  8 & 0xff);
+X  wd[8+0x15] = (uchar)(SCANPDS->sio.scan_window_length & 0xff);
+X
+X  wd[8+0x16] = SCANPDS->sio.scan_brightness; /* brightness */
+X  wd[8+0x17] = SCANPDS->sio.scan_brightness; /* threshold */
+X  wd[8+0x18] = SCANPDS->sio.scan_contrast;
+X
+X  switch (SCANPDS->sio.scan_image_mode) {
+X  case RED:
+X  case BLUE:
+X  case GREEN:
+X    wd[8+0x19] = GRAYSCALE;
+X    break;
+X
+X  default:
+X    wd[8+0x19] = SCANPDS->sio.scan_image_mode;
+X    break;
+X  }
+X
+X  if (SCANPDS->sio.scan_image_mode < GRAYSCALE)
+X    wd[8+0x1A] = 1;		/* bits-per-pixel */
+X  else
+X    wd[8+0x1A] = 8;		/* bits-per-pixel */
+X
+X  wd[8+0x1C] = 1;		/* halftone pattern */
+X
+X  wd[8+0x1D] = 3;		/* padding type */
+X
+X  wd[8+0x28] = 1;		/* speed: fastest speed that doesn't smear */
+X
+X  switch (SCANPDS->sio.scan_image_mode) {
+X  case BINARY_MONOCHROME:
+X  case DITHERED_MONOCHROME:
+X  case GRAYSCALE:
+X    wd[8+0x29] = (uchar)0;
+X    break;
+X  case RED:
+X    wd[8+0x29] = (uchar)0x80;
+X    break;
+X  case GREEN:
+X    wd[8+0x29] = (uchar)0x40;
+X    break;
+X  case BLUE:
+X    wd[8+0x29] = (uchar)0x20;
+X    break;
+X  }
+X
+X  wd[8+0x2A] = 50;		/* highlight */
+X
+X  /*
+X   * Make the CDB, set NOINTR because this is polled, we'll
+X   * wait for the command to complete
+X   */
+X  makecom_g1(swp, devp, FLAG_NOINTR, SCMD_SET_WINDOW, 0, UMAX_WD_LEN);
+X
+X  if (scsi_poll(swp)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_SET_WINDOW\n",
+X	       DNAME, DUNIT);
+X    free_pktiopb(swp, wd, UMAX_WD_LEN);
+X    return (EIO);
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(swp)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n",
+X		 DNAME, DUNIT, scsi_cmd_decode(CDBP(swp)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, swp, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(swp)->scc_cmd, scan_cmds),
+X	       SCBP_C(swp));
+X    err = EIO;
+X    break;
+X  }
+X  free_pktiopb(swp, wd, UMAX_WD_LEN);
+X  return(err);
+X}
+X
+X#define FUJITSU_WD_LEN 48
+X
+Xstatic int do_fujitsu_set_window(devp)
+X     struct scsi_device *devp;
+X{
+X  struct scsi_pkt *swp, *rqpkt = SCANPDS->un_rsp;
+X  unsigned char *wd;
+X  int err;
+X
+X  if (!(swp = get_pktiopb(devp->sd_address, (caddr_t)&wd, CDB_GROUP1,
+X			  1, FUJITSU_WD_LEN, B_WRITE, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  /*
+X   * fill out header & window descriptor block
+X   */
+X  bzero(wd, FUJITSU_WD_LEN);		/* all fields default to zero */
+X
+X  /* header... */
+X  wd[7] = (uchar)40;			/* window descriptor block len */
+X
+X  /* window descriptor block... */
+X
+X  /* ...resolution... */
+X  wd[8+2] = (uchar)(SCANPDS->sio.scan_x_resolution >> 8 & 0xff);
+X  wd[8+3] = (uchar)(SCANPDS->sio.scan_x_resolution & 0xff);
+X  wd[8+4] = (uchar)(SCANPDS->sio.scan_y_resolution >> 8 & 0xff);
+X  wd[8+5] = (uchar)(SCANPDS->sio.scan_y_resolution & 0xff);
+X
+X  /* ...X origin... */
+X  wd[8+0x6] = (uchar)(SCANPDS->sio.scan_x_origin >> 24 & 0xff);
+X  wd[8+0x7] = (uchar)(SCANPDS->sio.scan_x_origin >> 16 & 0xff);
+X  wd[8+0x8] = (uchar)(SCANPDS->sio.scan_x_origin >>  8 & 0xff);
+X  wd[8+0x9] = (uchar)(SCANPDS->sio.scan_x_origin & 0xff);
+X
+X  /* ...Y origin... */
+X  wd[8+0xA] = (uchar)(SCANPDS->sio.scan_y_origin >> 24 & 0xff);
+X  wd[8+0xB] = (uchar)(SCANPDS->sio.scan_y_origin >> 16 & 0xff);
+X  wd[8+0xC] = (uchar)(SCANPDS->sio.scan_y_origin >>  8 & 0xff);
+X  wd[8+0xD] = (uchar)(SCANPDS->sio.scan_y_origin & 0xff);
+X
+X  /* ...width... */
+X  wd[8+0x0E] = (uchar)(SCANPDS->sio.scan_window_width >> 24 & 0xff);
+X  wd[8+0x0F] = (uchar)(SCANPDS->sio.scan_window_width >> 16 & 0xff);
+X  wd[8+0x10] = (uchar)(SCANPDS->sio.scan_window_width >>  8 & 0xff);
+X  wd[8+0x11] = (uchar)(SCANPDS->sio.scan_window_width & 0xff);
+X
+X  /* ...length... */
+X  wd[8+0x12] = (uchar)(SCANPDS->sio.scan_window_length >> 24 & 0xff);
+X  wd[8+0x13] = (uchar)(SCANPDS->sio.scan_window_length >> 16 & 0xff);
+X  wd[8+0x14] = (uchar)(SCANPDS->sio.scan_window_length >>  8 & 0xff);
+X  wd[8+0x15] = (uchar)(SCANPDS->sio.scan_window_length & 0xff);
+X
+X#if 0
+X  wd[8+0x16] = 0;  /*SCANPDS->sio.scan_brightness; /* brightness */
+X  wd[8+0x17] = SCANPDS->sio.scan_brightness; /* threshold */
+X  wd[8+0x18] = SCANPDS->sio.scan_contrast;
+X#endif
+X
+X  wd[8+0x19] = SCANPDS->sio.scan_image_mode;
+X
+X  if (SCANPDS->sio.scan_image_mode < GRAYSCALE)
+X    wd[8+0x1A] = 1;		/* bits-per-pixel */
+X  else
+X    wd[8+0x1A] = 8;		/* bits-per-pixel */
+X
+X  wd[8+0x1C] = 1;		/* halftone pattern */
+X
+X  wd[8+0x1D] = 0;		/* padding type */
+X
+X  /*
+X   * Make the CDB, set NOINTR because this is polled, we'll
+X   * wait for the command to complete
+X   */
+X  makecom_g1(swp, devp, FLAG_NOINTR, SCMD_SET_WINDOW, 0, FUJITSU_WD_LEN);
+X
+X  if (scsi_poll(swp)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_SET_WINDOW\n",
+X	       DNAME, DUNIT);
+X    free_pktiopb(swp, wd, FUJITSU_WD_LEN);
+X    return (EIO);
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(swp)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n",
+X		 DNAME, DUNIT, scsi_cmd_decode(CDBP(swp)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, swp, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(swp)->scc_cmd, scan_cmds),
+X	       SCBP_C(swp));
+X    err = EIO;
+X    break;
+X  }
+X  free_pktiopb(swp, wd, FUJITSU_WD_LEN);
+X  return(err);
+X}
+X
+X
+Xstatic int hp_send_cmd(devp, escape_codes)
+X     struct scsi_device *devp;
+X     char *escape_codes;
+X{
+X  struct scsi_pkt *spkt, *rqpkt = SCANPDS->un_rsp;
+X  int code_count, copied;
+X  caddr_t datap;
+X  int err;
+X
+X  code_count = strlen(escape_codes);
+X
+X  if (scan_debug) {
+X    printf("hp_send_cmd: %d escape_codes:\n", code_count);
+X    {
+X      int i = 0;
+X      while (escape_codes[i]) {
+X	if (escape_codes[i] == 033)
+X	  printf("[esc]");
+X	else
+X	  printf("%c", escape_codes[i]);
+X	++i;
+X      }
+X      printf("\n");
+X    }
+X  }
+X
+X  if (!(spkt = get_pktiopb(&devp->sd_address, &datap,
+X			   CDB_GROUP0, 1, code_count,
+X			   B_WRITE, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  makecom_g0_s(spkt, devp, FLAG_NOINTR|FLAG_NODISCON, SCMD_WRITE, code_count, 0);
+X
+X  copystr(escape_codes, datap, code_count, &copied);
+X
+X  if (scsi_poll(spkt)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_WRITE\n", DNAME, DUNIT);
+X    goto hp_send_cmd_out;
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(spkt)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n", DNAME, DUNIT,
+X		 scsi_cmd_decode(CDBP(spkt)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, spkt, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(spkt)->scc_cmd, scan_cmds),
+X	       SCBP_C(spkt));
+X    err = EIO;
+X    break;
+X  }
+X hp_send_cmd_out:
+X  free_pktiopb(spkt, datap, code_count);
+X  return(err);
+X}
+X
+Xstatic int hp_recv_response(devp, escape_codes, code_count)
+X     struct scsi_device *devp;
+X     char *escape_codes;
+X     int code_count;
+X{
+X  struct scsi_pkt *rdpkt, *rqpkt = SCANPDS->un_rsp;
+X  int copied;
+X  caddr_t datap;
+X  int err;
+X
+X  if (!(rdpkt = get_pktiopb(&devp->sd_address, &datap,
+X			   CDB_GROUP0, 1, code_count,
+X			   B_READ, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  makecom_g0_s(rdpkt, devp, FLAG_NOINTR|FLAG_NODISCON, SCMD_READ, code_count, 0);
+X
+X  if (scsi_poll(rdpkt)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_READ\n", DNAME, DUNIT);
+X    goto hp_send_cmd_out;
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(rdpkt)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    copystr(datap, escape_codes, code_count, &copied);
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n", DNAME, DUNIT,
+X		 scsi_cmd_decode(CDBP(rdpkt)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, rdpkt, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(rdpkt)->scc_cmd, scan_cmds),
+X	       SCBP_C(rdpkt));
+X    err = EIO;
+X    break;
+X  }
+X
+X hp_send_cmd_out:
+X  free_pktiopb(rdpkt, datap, code_count);
+X
+X  return(err);
+X}
+X
+Xstatic int do_get_buffer_status(devp)
+X     struct scsi_device *devp;
+X{
+X  struct scsi_pkt *rdpkt, *rqpkt = SCANPDS->un_rsp;
+X  int copied;
+X  caddr_t datap;
+X  int err;
+X
+X  if (!(rdpkt = get_pktiopb(&devp->sd_address, &datap,
+X			   CDB_GROUP1, 1, 12, B_READ, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  makecom_g1(rdpkt, devp, FLAG_NOINTR, SCMD_GET_BUFFER_STATUS, 0, 12);
+X
+X  if (scsi_poll(rdpkt)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_GET_BUFFER_STATUS\n",
+X		DNAME, DUNIT);
+X    goto do_get_buffer_status_out;
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(rdpkt)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    copystr(&datap[9], SCANPDS->buf_status, 3, &copied);
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n", DNAME, DUNIT,
+X		 scsi_cmd_decode(CDBP(rdpkt)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, rdpkt, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(rdpkt)->scc_cmd, scan_cmds),
+X	       SCBP_C(rdpkt));
+X    err = EIO;
+X    break;
+X  }
+X
+Xdo_get_buffer_status_out:
+X  free_pktiopb(rdpkt, datap, 12);
+X
+X  return(err);
+X}
+X
+Xstatic int do_hp_set_window(devp)
+X     struct scsi_device *devp;
+X{
+X  static char escape_codes[128];
+X  char tmp[15];
+X  int copied;
+X
+X  /*
+X   * deal with the fact that the HP ScanJet IIc uses 1/300" not 1/1200"
+X   * as its base unit of measurement
+X   */
+X
+X  if (SCANPDS->sio.scan_scanner_type == HP_SCANJET_IIC) {
+X    SCANPDS->sio.scan_window_length /= 4;
+X    SCANPDS->sio.scan_window_length *= 4;
+X
+X    SCANPDS->sio.scan_window_width /= 4;
+X    SCANPDS->sio.scan_window_width *= 4;
+X  }
+X
+X  sprintf(escape_codes, "%c*f%dP", '\033', SCANPDS->sio.scan_window_width / 4);
+X
+X  sprintf(tmp, "%c*f%dQ", '\033', SCANPDS->sio.scan_window_length / 4);
+X  copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X
+X  sprintf(tmp, "%c*f%dX", '\033', SCANPDS->sio.scan_x_origin / 4);
+X  copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X
+X  sprintf(tmp, "%c*f%dY", '\033', SCANPDS->sio.scan_y_origin / 4);
+X  copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X
+X  sprintf(tmp, "%c*a%dR", '\033', SCANPDS->sio.scan_x_resolution);
+X  copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X
+X  sprintf(tmp, "%c*a%dS", '\033', SCANPDS->sio.scan_y_resolution);
+X  copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X
+X  switch (SCANPDS->sio.scan_image_mode) {
+X  case BINARY_MONOCHROME:
+X    sprintf(tmp, "%c*a%dT", '\033', 0);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    sprintf(tmp, "%c*a%dG", '\033', 1);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    /* make image data be "min-is-white ala PBM */
+X    sprintf(tmp, "%c*a%dI", '\033', 0);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    break;
+X  case DITHERED_MONOCHROME:
+X    sprintf(tmp, "%c*a%dT", '\033', 3);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    sprintf(tmp, "%c*a%dG", '\033', 1);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    /* make image data be "min-is-white ala PBM */
+X    sprintf(tmp, "%c*a%dI", '\033', 0);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    break;
+X  case GRAYSCALE:
+X    sprintf(tmp, "%c*a%dT", '\033', 4);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    sprintf(tmp, "%c*a%dG", '\033', 8);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    /* make image data be "min-is-black ala PGM */
+X    sprintf(tmp, "%c*a%dI", '\033', 1);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    break;
+X  case COLOR:
+X    sprintf(tmp, "%c*a%dT", '\033', 5);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    /* use 24-bit data */
+X    sprintf(tmp, "%c*a%dG", '\033', 24);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    /* make image data be "min-is-black ala PPM */
+X    sprintf(tmp, "%c*a%dI", '\033', 1);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X    /* use pass-through matrix (disable NTSC) */
+X    sprintf(tmp, "%c*u%dT", '\033', 2);
+X    copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X  }
+X
+X  sprintf(tmp, "%c*a%dL", '\033', (int)(SCANPDS->sio.scan_brightness) - 128);
+X  copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X     
+X  sprintf(tmp, "%c*a%dK", '\033', (int)(SCANPDS->sio.scan_contrast) - 128);
+X  copystr(tmp, &escape_codes[strlen(escape_codes)], strlen(tmp) + 1, &copied);
+X
+X  return (hp_send_cmd(devp, escape_codes));
+X}
+X
+Xstatic int do_umax_trigger(devp)
+X     struct scsi_device *devp;
+X{
+X  struct scsi_pkt *trgp, *rqpkt = SCANPDS->un_rsp;
+X  caddr_t window_id;
+X  int err;
+X
+X  if (!(trgp = get_pktiopb(devp->sd_address, &window_id,
+X			   CDB_GROUP0, 1, 1, B_WRITE, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  *window_id = '\0';
+X
+X  /*
+X   * Make the CDB, set NOINTR because this is polled, we'll
+X   * wait for the command to complete
+X   */
+X  makecom_g0_s(trgp, devp, FLAG_NOINTR, SCMD_TRIGGER_SCAN, 1, 0);
+X
+X  if (scsi_poll(trgp)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_TRIGGER_SCAN\n",
+X		DNAME, DUNIT);
+X    free_pktiopb(trgp, window_id, 1);
+X    return (EIO);
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(trgp)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n", DNAME, DUNIT,
+X		 scsi_cmd_decode(CDBP(trgp)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, trgp, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(trgp)->scc_cmd, scan_cmds),
+X	       SCBP_C(trgp));
+X    err = EIO;
+X    break;
+X  }
+X  free_pktiopb(trgp, window_id, 1);
+X  return(err);
+X}
+X
+X#define MODE_SELECT_LEN sizeof(struct ricoh_mode_params)
+X
+Xstatic int do_mode_select(devp)
+X     struct scsi_device *devp;
+X{
+X  struct scsi_pkt *msp, *rqpkt = SCANPDS->un_rsp;
+X  struct ricoh_mode_params *rmp;
+X  int err;
+X
+X  if (!(msp = get_pktiopb(devp->sd_address, (caddr_t)&rmp,
+X			  CDB_GROUP0, 1, MODE_SELECT_LEN, B_WRITE, SLEEP_FUNC))) {
+X    return (EIO);
+X  }
+X
+X  /* mode select parameters... */
+X  bzero(rmp, MODE_SELECT_LEN);
+X
+X  /* measurement page descriptor: */
+X
+X  rmp->page_code = SCANNING_MEASUREMENT_PARAMETERS;
+X  rmp->paramter_length = (uchar)6;
+X  rmp->base_measurement_unit = INCHES;
+X  rmp->measurement_unit_devisor_msb = (uchar)((1200 >> 8) & 0xff);
+X  rmp->measurement_unit_devisor_lsb = (uchar)((1200 & 0xff));
+X
+X  /* ADF support page descriptor */
+X
+X  rmp->adf_page_code = ADF_CONTROL;
+X  rmp->adf_parameter_length = (uchar)6;
+X  if (SCANPDS->adf_state == ADF_ARMED) {
+X    DPRINTF(3)("do_mode_select: ADF is on\n");
+X    rmp->adf_control = '\01';
+X  } else {
+X    DPRINTF(3)("do_mode_select: ADF is off\n");
+X    rmp->adf_control = '\0';
+X  }
+X
+X  /* build CDB */
+X
+X  makecom_g0_s(msp, devp, FLAG_NOINTR, SCMD_MODE_SELECT, MODE_SELECT_LEN, 0x10);
+X
+X  if (scsi_poll(msp)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_MODE_SELECT\n",
+X		DNAME, DUNIT);
+X    free_pktiopb(msp, rmp, MODE_SELECT_LEN);
+X    return (EIO);
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(msp)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n", DNAME, DUNIT,
+X		 scsi_cmd_decode(CDBP(msp)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, msp, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(msp)->scc_cmd, scan_cmds),
+X	       SCBP_C(msp));
+X    err = EIO;
+X    break;
+X  }
+X  free_pktiopb(msp, rmp, MODE_SELECT_LEN);
+X  return(err);
+X}
+X
+Xstatic int do_hp_trigger(devp)
+X     struct scsi_device *devp;
+X{
+X  char escape_codes[20];
+X
+X  sprintf(escape_codes, "%c*f0S", '\033');
+X
+X  return (hp_send_cmd(devp, escape_codes));
+X}
+X
+Xstatic int do_trigger(devp)
+X     struct scsi_device *devp;
+X{
+X  switch (SCANPDS->sio.scan_scanner_type) {
+X  case UMAX_UC630:
+X  case UMAX_UG630:
+X  case RICOH_IS410:
+X  case IBM_2456:
+X    return (do_umax_trigger(devp));
+X
+X  case HP_SCANJET_IIC:
+X    return (do_hp_trigger(devp));
+X
+X  default:
+X    return (EINVAL);
+X  }
+X}
+X
+Xint scanread(dev, uio)
+X      dev_t	  dev;
+X      struct uio *uio;
+X{
+X  register struct scsi_device *devp;
+X  register int unit, rc;
+X
+X  if (((unit = SCANUNIT(dev)) >= nscans) || (!(devp = scanunits[unit]))) {
+X    DPRINTF(1)("scanread: nodev, unit=%d, devp=0x%x\n", unit, devp);
+X    return(ENODEV);
+X  }
+X  DPRINTF(3)("scanread: scan%d, devp=0x%x\n", unit, devp);
+X
+X
+X  if (!SCANPDS->un_triggered) {
+X
+X    /* mode select command */
+X
+X    if (SCANPDS->sio.scan_scanner_type == RICOH_IS410 ||
+X	SCANPDS->sio.scan_scanner_type == IBM_2456) {
+X      DPRINTF(4)("scanread: sending SCMD_MODE_SELECT\n");
+X      if (rc = do_mode_select(devp)) {
+X	DPRINTF(2)("scanread: SCMD_MODE_SELECT failed\n");
+X	goto scanread_exit;
+X      }
+X      DPRINTF(4)("scanread: SCMD_MODE_SELECT ok\n");
+X
+X      /* remember to send an "unload" on scanclose() */
+X
+X      if (SCANPDS->adf_state == ADF_ARMED)
+X	SCANPDS->adf_state = ADF_CLEANUP;
+X    }
+X
+X    /* set window command */
+X
+X    DPRINTF(4)("scanread: sending SCMD_SET_WINDOW\n");
+X    if (rc = do_set_window(devp)) {
+X      DPRINTF(2)("scanread: SCMD_SET_WINDOW failed\n");
+X      goto scanread_exit;
+X    }
+X    DPRINTF(4)("scanread: SCMD_SET_WINDOW ok\n");
+X
+X    /* remember if HP is using ADF so that close routine will eject paper */
+X
+X    if (SCANPDS->sio.scan_scanner_type == HP_SCANJET_IIC)
+X      SCANPDS->using_adf = hp_has_paper_in_adf(devp);
+X
+X    /* read trigger command */
+X
+X    if (SCANPDS->sio.scan_scanner_type != FUJITSU) {
+X      DPRINTF(4)("scanread: sending SCMD_TRIGGER_SCAN\n");
+X      if (rc = do_trigger(devp)) {
+X	DPRINTF(2)("scanread: SCMD_TRIGGER_SCAN failed\n");
+X	goto scanread_exit;
+X      }
+X
+X      /* deal with the UMAX sending "command complete" too soon */
+X
+X      if (SCANPDS->sio.scan_scanner_type == UMAX_UC630 ||
+X	  SCANPDS->sio.scan_scanner_type == UMAX_UG630)
+X	find_umax(devp);
+X
+X      DPRINTF(4)("scanread: SCMD_TRIGGER_SCAN ok\n");
+X    }
+X
+X    /* calculate the window size */
+X
+X    SCANPDS->window_size = calc_window_size(devp);
+X
+X    /* remember if UMAX is using ADF so that close routine will eject paper */
+X
+X    if (SCANPDS->sio.scan_scanner_type == UMAX_UC630 ||
+X	SCANPDS->sio.scan_scanner_type == UMAX_UG630)
+X      SCANPDS->using_adf = umax_has_paper_in_adf(devp);
+X
+X    SCANPDS->un_triggered = TRUE;
+X  }
+X
+X  DPRINTF(3)("scanread: window size is %d\n", SCANPDS->window_size);
+X
+X  /* *********************************************** */
+X  /* trim the transfer down to Sun's measly 63K DVMA */
+X  /* *********************************************** */
+X
+X  if (uio->uio_iov->iov_len > SCAN_MAXREC)
+X    uio->uio_iov->iov_len = SCAN_MAXREC;
+X
+X  /* ***************************************** */
+X  /* trim the transfer down to the window size */
+X  /* ***************************************** */
+X
+X  if (SCANPDS->sio.scan_scanner_type != FUJITSU)
+X    if (uio->uio_iov->iov_len > SCANPDS->window_size) {
+X      uio->uio_iov->iov_len = SCANPDS->window_size;
+X      DPRINTF(3)("scanread: bytes wanted exceeds window size\n");
+X      DPRINTF(3)("scanread: xfer reduced to %d\n", uio->uio_iov->iov_len);
+X    }
+X
+X  /* ************************************************** */
+X  /* trim UMAX reads down to an even scan line boundary */
+X  /* ************************************************** */
+X
+X  if (SCANPDS->sio.scan_scanner_type == UMAX_UC630 ||
+X      SCANPDS->sio.scan_scanner_type == UMAX_UG630) {
+X    int row_len;
+X
+X    if (SCANPDS->sio.scan_image_mode >= GRAYSCALE)
+X      row_len = calc_umax_row_len(SCANPDS->sio.scan_x_resolution,
+X				  SCANPDS->sio.scan_window_width);
+X    else
+X      row_len =
+X	SCANPDS->sio.scan_window_width * SCANPDS->sio.scan_x_resolution / 9600;
+X
+X    if (uio->uio_iov->iov_len < row_len) {
+X      uprintf("%s%d: read requests must be at least one row of image data\n",
+X	      DNAME, DUNIT);
+X      uio->uio_iov->iov_len = 0;
+X      return;
+X    }
+X
+X    if (uio->uio_iov->iov_len % row_len) {
+X      uio->uio_iov->iov_len -= uio->uio_iov->iov_len % row_len;
+X      DPRINTF(3)("scanread: a row is %d bytes\n", row_len);
+X      DPRINTF(3)("scanread: transfer reduced to %d bytes (%d rows)\n",
+X		 uio->uio_iov->iov_len, uio->uio_iov->iov_len / row_len);
+X    }
+X  }
+X
+X  /* *************************************** */
+X  /* trim Ricoh reads down to available data */
+X  /* *************************************** */
+X
+X  if ((SCANPDS->sio.scan_scanner_type == RICOH_IS410 ||
+X       SCANPDS->sio.scan_scanner_type == IBM_2456)
+X      && SCANPDS->window_size) {
+X    int bytes_ready;
+X
+X    do {
+X      do_get_buffer_status(devp);
+X      bytes_ready =
+X	(SCANPDS->buf_status[0] * 65536) +
+X	  (SCANPDS->buf_status[1] * 256) +
+X	    (SCANPDS->buf_status[2]);
+X      DPRINTF(4)("scanread: %d bytes ready\n", bytes_ready);
+X    } while (bytes_ready == 0);
+X      
+X    if (uio->uio_iov->iov_len > bytes_ready) {
+X      uio->uio_iov->iov_len = bytes_ready;
+X      DPRINTF(3)("scanread: bytes wanted exceeds bytes ready\n");
+X      DPRINTF(3)("scanread: xfer reduced to %d\n", uio->uio_iov->iov_len);
+X    }
+X  }
+X
+X  /* ************* */
+X  /* EOF detection */
+X  /* ************* */
+X
+X  if (SCANPDS->window_size <= 0) {
+X    uio->uio_iov++;
+X    uio->uio_iovcnt--;
+X    rc = 0;
+X    goto scanread_exit;
+X  }
+X
+X
+X  rc = scanrw(dev, uio, B_READ);
+X
+Xscanread_exit:
+X  return(rc);
+X}
+X
+X/*
+X * Raw read/write routine
+X * Check uio values, call scanstrategy via physio for the actual transfer
+X */
+Xstatic int scanrw(dev, uio, flag)
+X     dev_t dev;
+X     struct uio *uio;
+X{
+X  struct scsi_device	*devp;
+X  register int		unit;
+X
+X  if (((unit = SCANUNIT(dev)) >= nscans) || (!(devp = scanunits[unit]))) {
+X    DPRINTF(1)("scanrw: nodev, unit=%d, devp=0x%x\n", unit, devp);
+X    return(ENODEV);
+X  }
+X  DPRINTF(2)("scanrw: (%s) scan%d, devp=0x%x\n",
+X	     (flag==B_READ) ? "read" : "write", unit, devp);
+X
+X  if ((!devp->sd_present) || (!SCANPDS)
+X  || (SCANPDS->un_state < SCAN_STATE_OPEN)) {
+X    DPRINTF(1)("scanrw: sd_present=0x%x, SCANPDS=0x%x, state=%d\n",
+X	       devp->sd_present, SCANPDS, SCANPDS->un_state);
+X    return(ENXIO);
+X  }
+X
+X#if 0
+X  /*
+X   * Check that block offset and length are modulo the block size
+X   */
+X  if ((uio->uio_offset & (DEV_BSIZE-1)) ||
+X      (uio->uio_iov->iov_len & (DEV_BSIZE-1))) {
+X    DPRINTF(1)("scanrw: invalid block length=%d, offset=%d\n",
+X	       uio->uio_iov->iov_len, uio->uio_offset);
+X    return(EINVAL);
+X  }
+X#endif
+X
+X  DPRINTF(3)("scanrw: offset = %d, length = %d\n",
+X	     uio->uio_offset, uio->uio_iov->iov_len);
+X
+X  return(physio(scanstrategy, SCANPDS->un_rbufp, dev, flag, scanminphys, uio));
+X}
+X
+X/*
+X * scanstrategy
+X * Main routine for commands to the device.
+X * Put the buf on the pending queue and kick the start routine. The
+X * start routine (scanstart) will allocate scsi command and any dma
+X * resources needed, and send the command off to the host adapter controller.
+X */
+Xint scanstrategy(bp)
+X     register struct buf *bp;
+X{
+X  register struct scsi_device *devp = scanunits[SCANUNIT(bp->b_dev)];
+X  register int s;
+X  struct buf	*ap;
+X
+X  DPRINTF(2)("scanstrategy:\n");
+X
+X  /*
+X   * Check that the unit's really present
+X   */
+X  if (!devp || !devp->sd_present || !SCANPDS) {
+X    DPRINTF(1)("scanstrategy: error, unit not present\n");
+X    bp->b_flags = B_ERROR;
+X    bp->b_resid = bp->b_bcount;
+X    bp->b_error = ENXIO;
+X    iodone(bp);
+X    return(ENXIO);
+X  }
+X
+X  s = splr(scanpri);
+X
+X  /*
+X   * Put the buf on the queue
+X   */
+X  if (SCANPDS->un_quehd) {
+X    SCANPDS->un_quetl->av_forw = bp;
+X  } else {
+X    SCANPDS->un_quehd = bp;
+X  }
+X  SCANPDS->un_quetl = bp;
+X  SCANPDS->un_bufcnt++;
+X
+X  bp->av_forw = 0;
+X  bp->b_flags &= ~(B_DONE|B_ERROR);
+X  bp->b_resid = 0;
+X
+X  /*
+X   * If it's not a special command, scanstart must allocate the packet,
+X   * so zero bp->av_back to warn scanstart.
+X   */
+X  if (bp != SCANPDS->un_sbufp) {
+X    BP_PKT(bp) = 0;
+X  }
+X
+X  /*
+X   * kick the start routine if it's inactive
+X   */
+X  if (SCANPDS->un_active == NULL)
+X    scanstart(devp);
+X  (void)splx(s);
+X
+X  return(0);
+X}
+X
+X/*
+X * ioctl calls.
+X * Called from the device switch table
+X * Ioctls are device specific. Only a generic ioctl is supplied. This
+X * serves as an example, and allows a user program to send an arbitrary
+X * SCSI command to the target.
+X */
+Xint scanioctl(dev, cmd, data, flag)
+X     dev_t dev;
+X     register int cmd;
+X     register caddr_t data;
+X     int flag;
+X{
+X  register struct scsi_device *devp = scanunits[SCANUNIT(dev)];
+X  struct scan_io *s_io;
+X  struct scan_pixel_sizes *pix_size;
+X  int rc;
+X
+X  if (!devp || !devp->sd_present || !SCANPDS) {
+X    DPRINTF(1)("scanioctl: %s%d: target not present\n", DNAME, DUNIT);
+X    return(ENXIO);
+X  }
+X
+X  DPRINTF(2)("scanioctl: %s%d, devp=0x%x\n", DNAME, DUNIT, devp);
+X
+X  switch(cmd) {
+X  case SCANIOC_GETERRC:		/* Get detailed error code */
+X    bcopy((caddr_t)devp->sd_sense, data, sizeof(struct scsi_extended_sense));
+X    break;
+X
+X  case SCANIOC_CMD:		/* run a generic command */
+X    return(scancmd(dev, SCMD_UCMD, data));
+X    break;
+X
+X  case SCAN_GET:
+X    bcopy(&(SCANPDS->sio), data, sizeof(struct scan_io));
+X    return (0);
+X
+X  case SCAN_SET:
+X    s_io = (struct scan_io *)data;
+X
+X    /****  Validate parameters  ***/
+X    switch (SCANPDS->sio.scan_scanner_type) {
+X
+X    case HP_SCANJET_IIC:
+X      
+X      /* size constraints... */
+X
+X      if (s_io->scan_window_width <= 0				||
+X	  s_io->scan_x_origin + s_io->scan_window_width > 10200	|| /* 8.5" */
+X	  s_io->scan_window_length <= 0				||
+X	  s_io->scan_y_origin + s_io->scan_window_length > 16800)   /* 14" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io->scan_x_resolution < 100 || s_io->scan_x_resolution > 400 ||
+X	  s_io->scan_y_resolution < 100 || s_io->scan_y_resolution > 400)
+X	return (EINVAL);
+X
+X      switch (s_io->scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X      case COLOR:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X      break;
+X
+X    case UMAX_UG630:
+X    case UMAX_UC630:
+X      
+X      /* size constraints... */
+X
+X      if (s_io->scan_window_width <= 0				||
+X	  s_io->scan_x_origin + s_io->scan_window_width > 10200	|| /* 8.5" */
+X	  s_io->scan_window_length <= 0				||
+X	  s_io->scan_y_origin + s_io->scan_window_length > 16800)   /* 14" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io->scan_x_resolution < 100 || s_io->scan_x_resolution > 300 ||
+X	  s_io->scan_y_resolution < 100 || s_io->scan_y_resolution > 600)
+X	return (EINVAL);
+X
+X      if (SCANPDS->sio.scan_scanner_type == UMAX_UC630) {
+X	switch (s_io->scan_image_mode) {
+X	case BINARY_MONOCHROME:
+X	case DITHERED_MONOCHROME:
+X	case GRAYSCALE:
+X	case RED:
+X	case GREEN:
+X	case BLUE:
+X	  break;
+X	default:
+X	  return (EINVAL);
+X	}
+X      } else {			/* scanner is a UMAX_UG630 */
+X	switch (s_io->scan_image_mode) {
+X	case BINARY_MONOCHROME:
+X	case DITHERED_MONOCHROME:
+X	case GRAYSCALE:
+X	  break;
+X	default:
+X	  return (EINVAL);
+X	}
+X      }
+X
+X      break;			/* esac UMAX UC630 */
+X
+X    case FUJITSU:
+X      /* size constraints... (these values are taken from the OEM manual) */
+X
+X      if (s_io->scan_window_width <= 0				||
+X	  s_io->scan_x_origin + s_io->scan_window_width > 14592	|| /* 12.16" */
+X	  s_io->scan_window_length <= 0				||
+X	  s_io->scan_y_origin + s_io->scan_window_length > 20736)  /* 17.28" */
+X	return (EINVAL);
+X
+X      /* Fujitsu can only handle 4 Meg windows max */
+X
+X      if ((s_io->scan_window_width / 1200) * s_io->scan_x_resolution *
+X	  (s_io->scan_window_length / 1200) * s_io->scan_y_resolution
+X	  > (s_io->scan_image_mode == GRAYSCALE ? 4063232 : 32505856))
+X	return (EINVAL);
+X
+X      switch (s_io->scan_x_resolution) {
+X      case 200:
+X      case 240:
+X      case 300:
+X      case 400:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      switch (s_io->scan_y_resolution) {
+X      case 200:
+X      case 240:
+X      case 300:
+X      case 400:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      switch (s_io->scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac FUJITSU */
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X
+X      /* size constraints... */
+X
+X      if (s_io->scan_window_width <= 0				||
+X	  s_io->scan_x_origin + s_io->scan_window_width > 13800	|| /* 11.5" */
+X	  s_io->scan_window_length <= 0				||
+X	  s_io->scan_y_origin + s_io->scan_window_length > 20400)    /* 17" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io->scan_x_resolution < 100 || s_io->scan_x_resolution > 400 ||
+X	  s_io->scan_y_resolution < 100 || s_io->scan_y_resolution > 400)
+X	return (EINVAL);
+X
+X      switch (s_io->scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac RICOH_IS410 (IBM_2456) */
+X    }
+X
+X    /****  change the PDS to the new values  ***/
+X
+X    bcopy(s_io, &SCANPDS->sio, sizeof(struct scan_io));
+X
+X    /****  do what it takes to actualize the new values  ***/
+X
+X    switch (SCANPDS->sio.scan_scanner_type) {
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X    case FUJITSU:
+X    case HP_SCANJET_IIC:
+X
+X      /****  send a SCSI_SET_WINDOW ***/
+X      return (do_set_window(devp));
+X    }
+X    DPRINTF(3)("scanioctl: should not be here\n");
+X    return(ENOTTY);
+X
+X  case SCAN_GET_PIXEL_SIZE:
+X    pix_size = (struct scan_pixel_sizes *)data;
+X
+X    if ((SCANPDS->sio.scan_scanner_type == UMAX_UC630 ||
+X	 SCANPDS->sio.scan_scanner_type == UMAX_UG630) &&
+X	SCANPDS->sio.scan_image_mode >= GRAYSCALE)
+X      pix_size->pix_width = calc_umax_row_len(SCANPDS->sio.scan_x_resolution,
+X					     SCANPDS->sio.scan_window_width);
+X    else {
+X      pix_size->pix_width = (SCANPDS->sio.scan_window_width
+X			    * SCANPDS->sio.scan_x_resolution
+X			    / 1200);
+X
+X      if (SCANPDS->sio.scan_image_mode < GRAYSCALE) {
+X	if (SCANPDS->sio.scan_scanner_type == FUJITSU ||/* pad to byte boundary */
+X	    SCANPDS->sio.scan_scanner_type == HP_SCANJET_IIC)
+X	  pix_size->pix_width = (pix_size->pix_width + 7) / 8;
+X	else			                /* truncate to byte boundary */
+X	  pix_size->pix_width /= 8;
+X	pix_size->pix_width *= 8;
+X      }
+X    }
+X    pix_size->pix_height = (SCANPDS->sio.scan_window_length
+X			   * SCANPDS->sio.scan_y_resolution
+X			   / 1200);
+X    return (0);
+X    break;
+X
+X  case SCAN_USE_ADF:
+X
+X    if (SCANPDS->sio.scan_scanner_type == UMAX_UC630 ||
+X	SCANPDS->sio.scan_scanner_type == UMAX_UG630) {
+X      if (umax_has_paper_in_adf(devp))
+X	return (0);
+X      else
+X	return(EIO);
+X    }
+X
+X    if (SCANPDS->sio.scan_scanner_type == HP_SCANJET_IIC) {
+X      if (hp_has_paper_in_adf(devp))
+X	return (0);
+X      else
+X	return(EIO);
+X    }
+X
+X    if (SCANPDS->sio.scan_scanner_type == RICOH_IS410 ||
+X	SCANPDS->sio.scan_scanner_type == IBM_2456    ||
+X	SCANPDS->sio.scan_scanner_type == RICOH_IS50) {
+X
+X      SCANPDS->adf_state = ADF_ARMED;
+X
+X      if (rc = do_mode_select(devp)) {
+X	SCANPDS->adf_state = ADF_UNUSED;
+X	return (rc);
+X      }
+X    }
+X
+X    do_object_position(devp, UNLOAD_ADF); /* "scanner never fails to unload" */
+X
+X    if (rc = do_object_position(devp, LOAD_ADF))
+X      SCANPDS->adf_state = ADF_UNUSED;
+X    else
+X      SCANPDS->adf_state = ADF_ARMED;
+X
+X    return (rc);
+X
+X  default:
+X    /*
+X     * Unknown ioctl
+X     */
+X    DPRINTF(1)("scanioctl: %s%d: unknown ioctl 0x%x\n", DNAME, DUNIT, cmd);
+X    return(ENOTTY);
+X  }
+X}
+X
+X/*
+X * Send a command to the device.
+X * Called by scanioctl, only handles simple commands with no dma.
+X * XXX To add a new command, add a new ioctl to scanioctl and
+X *     call this routine from it.
+X */
+Xstatic int scansimple(devp, cmd, arg)
+X     register struct scsi_device *devp;
+X     int cmd;	/* Actual SCSI command */
+X     int arg;	/* command argument, put into byte 4 of the CDB */
+X{
+X  struct scsi_pkt *pkt, *rqpkt = SCANPDS->un_rsp;
+X  int err;
+X
+X  DPRINTF(2)("scansimple: cmd = 0x%x, arg = 0x%x\n", cmd, arg);
+X
+X  /*
+X   * Get a pkt with no dma resources
+X   */
+X  if (!(pkt = scsi_pktalloc(&devp->sd_address, CDB_GROUP0, 1, SLEEP_FUNC))) {
+X    return(ENOMEM);
+X  }
+X  /*
+X   * Make the CDB, set NOINTR because this is polled, we'll
+X   * wait for the command to complete
+X   */
+X  makecom_g0(pkt, devp, FLAG_NOINTR, cmd, 0, arg);
+X
+X  if (scsi_poll(pkt)) {
+X    DPRINTF(1)("%s%d: Target not responding to <%s> cmd\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(pkt)->scc_cmd, scan_cmds));
+X    scsi_resfree(pkt);
+X    return(EIO);
+X  }
+X
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(pkt)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    err = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n",
+X		 DNAME, DUNIT, scsi_cmd_decode(CDBP(pkt)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, pkt, SCANERR_RETRYABLE);
+X    }
+X    err = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(pkt)->scc_cmd, scan_cmds),
+X	       SCBP_C(pkt));
+X    err = EIO;
+X    break;
+X  }
+X  scsi_resfree(pkt);
+X  return(err);
+X}
+X
+X
+X/*
+X * General command handler. Do any command, with or without DMA.
+X *
+X * XXX	The thread is that this routine is called by scanioctl; it
+X *	sets up the struct buf and calls make_scan_cmd and scanstrategy to
+X *	make and queue the command. Scanstart then dequeues the command
+X *	and calls pkt_transport to send the command. Eventually scanintr
+X *	is called. It figures out whether the command worked OK and what
+X *	to do. If the command worked, scanintr calls scandone which wakes
+X *	us up. If the user wanted data we DVMA it into a local buffer
+X *	(un_tmpbuf) and copy it into the users buffer.
+X *
+X * XXX	For the generic ioctl SCANIOC_CMD, the command data (a struct
+X *	scancmd) is saved in our private data structure. Scan_make_cmd
+X *	spots this and uses the cdb from that instead of creating one.
+X *	Note that this means that if the if the request is for a data
+X *	transfer larger than SCAN_MAXREC, this routine won't work because
+X *	physio will split the request and call scanstrategy more than once,
+X *	and after the first time the CDB will be wrong. Actually the DVMA
+X *	data size is limited to the size of un_tmpbuf. Use scanread
+X *	for large transfers.
+X *
+X * XXX	To add a new command, add a new ioclt to scanioctl calling this
+X *	routine, and add the new SCSI command to scan_make_cmd to fill in
+X *	the CDB.
+X */
+Xstatic int scancmd(dev, cmd, data)
+X     dev_t	dev;
+X     int	cmd;
+X     caddr_t	data;
+X{
+X  register struct scsi_device *devp = scanunits[SCANUNIT(dev)];
+X  register struct buf *bp = SCANPDS->un_sbufp;
+X  register struct scsi_pkt *pkt;
+X  struct scancmd	*args;
+X  register int	s, err;
+X
+X  /*
+X   * Sanity check of arguments
+X   */
+X  args = (struct scancmd *)data;
+X
+X  DPRINTF(2)("scancmd: %s%d Command = 0x%x\n", DNAME, DUNIT, cmd);
+X  if (scan_debug > 2) {
+X    printf("scancmd: args = ");
+X    printf("\tCDB: ");
+X    clean_print(args->sc_cdb, sizeof(union scsi_cdb));
+X    printf("\n");
+X    printf("\tDVMA Address: 0x%x\n", args->sc_bufaddr);
+X    printf("\tDVMA Length: %d\n", args->sc_buflen);
+X    printf("\tTimeout: %d sec\n", args->sc_timeout);
+X    printf("\tDVMA Direction: (%d) %s\n", args->sc_rw,
+X	   (args->sc_rw == B_READ) ? "read" :"write");
+X  }
+X
+X  if ((args->sc_bufaddr && !args->sc_buflen) ||
+X      (!args->sc_bufaddr && args->sc_buflen)) {
+X    DPRINTF(1)("scancmd: %s%d bad buf addr/len\n", DNAME, DUNIT);
+X    return(EINVAL);
+X  }
+X
+X  if (args->sc_buflen > UN_TMPBUF_SIZE) {
+X    DPRINTF(1)("scancmd: %s%d transfer (%d bytes) too large\n",
+X	       DNAME, DUNIT, args->sc_buflen);
+X    return(EINVAL);
+X  }
+X
+X  /*
+X   * Get the special buf
+X   */
+X  s = splr(scanpri);
+X  while (bp->b_flags & B_BUSY) {
+X    bp->b_flags |= B_WANTED;
+X    (void) sleep((caddr_t) bp, PRIBIO);
+X  }
+X  bzero((caddr_t) bp, sizeof (struct buf));
+X  bp->b_flags = B_BUSY;
+X  (void) splx(s);
+X
+X  bp->b_dev = dev;
+X  if (args->sc_buflen) {	/* user wants data */
+X    bp->b_bcount = args->sc_buflen;
+X    bp->b_un.b_addr = SCANPDS->un_tmpbuf;
+X    bp->b_flags |= args->sc_rw;
+X  }
+X  /*
+X   * scan_make_cmd needs to know what command this is to set up the
+X   * CDB, and it also needs the dma parameters.
+X   */
+X  bp->b_forw = (struct buf *)cmd;
+X  bcopy((caddr_t)args, (caddr_t)&SCANPDS->un_ucmd, sizeof(struct scancmd));
+X
+X  scan_make_cmd(devp, bp, SLEEP_FUNC);
+X
+X  scanstrategy(bp);
+X  /*
+X   * Wait for command to complete
+X   */
+X  s = splr(scanpri);
+X  while (!(bp->b_flags & B_DONE)) {
+X    sleep((caddr_t)bp, PRIBIO);
+X  }
+X  (void)splx(s);
+X
+X  err = geterror(bp);
+X
+X  /*
+X   * release resources
+X   */
+X  scsi_resfree(BP_PKT(bp));	/* allocated by scan_make_cmd */
+X
+X  s = splr(scanpri);
+X  if (bp->b_flags & B_WANTED)
+X    wakeup((caddr_t)bp);
+X  bp->b_flags &= ~(B_BUSY|B_WANTED);
+X  (void)splx(s);
+X
+X  /*
+X   * If there was DVMA, copyout to the user's buffer
+X   */
+X  if (args->sc_buflen) {
+X    copyout(SCANPDS->un_tmpbuf, args->sc_bufaddr, args->sc_buflen);
+X  }
+X
+X  return(err);
+X}
+X
+X/*
+X * scanstart - send the next command to the host adapter for transmission.
+X * Call scan_make_cmd (if this is not a special cmd from scancmd) to
+X * create the SCSI CDB and allocate any needed DMA resources.
+X */
+Xint scanstart(devp)
+X     register struct scsi_device *devp;
+X{
+X  register struct buf *bp;
+X  int	scan_retry();
+X  int   err;
+X
+X  DPRINTF(2)("scanstart: %d requests queued\n", SCANPDS->un_bufcnt);
+X
+X  if (SCANPDS->un_active) {
+X    printf("scanstart: called when already busy\n");
+X    return;
+X  }
+X
+X  if ((bp = SCANPDS->un_quehd) == NULL) {
+X    DPRINTF(1)("scanstart: nothing to do\n");
+X    return;
+X  }
+X
+X  /*
+X   * If we need resources, call scan_make_cmd to get them. If there
+X   * are none available, scanretry will be called (automagically)
+X   * when they become available.
+X   */
+X  if (!BP_PKT(bp)) {
+X    DPRINTF(3)("scanstart: calling scan_make_cmd\n");
+X    scan_make_cmd(devp, bp, scan_retry);
+X    if (!BP_PKT(bp)) {
+X      newstate(SCAN_STATE_RWAIT);
+X      return;
+X    }
+X  }
+X
+X  /*
+X   * Adjust the queues: move this command from pending to active.
+X   */
+X  SCANPDS->un_active = bp;
+X  SCANPDS->un_quehd = bp->av_forw;
+X  bp->av_forw = 0;
+X  SCANPDS->un_bufcnt--;
+X
+X  /*
+X   * XXX Linked command support would go here
+X   */
+X
+X  /*
+X   * Send the command
+X   */
+X  DPRINTF(3)("scanstart: calling pkt_transport\n");
+X  err = pkt_transport(BP_PKT(bp));
+X  DPRINTF(3)("scanstart: pkt_transport returned %d\n", err);
+X  if (err == 0) {
+X    printf("%s%d: transport rejected\n", DNAME, DUNIT);
+X    bp->b_resid = bp->b_bcount;
+X    bp->b_flags |= B_ERROR;
+X    bp->b_error = EIO;
+X    scandone(devp);
+X  }
+X  if (err == -1) {
+X    DPRINTF(1)("scanstart: bad packet\n");
+X  }
+X
+X  return;
+X}
+X
+X/*
+X * Retry a command that's been waiting for resources.
+X * Note the difference between this and scanrestart.
+X */
+Xstatic int scan_retry()
+X{
+X  register int	i, s;
+X  register struct scsi_device *devp;
+X
+X  DPRINTF(2)("scanretry: %s%d\n", DNAME, DUNIT);
+X
+X  s = splr(scanpri);
+X  for (i = 0; i < nscans; i++) {
+X    devp = scanunits[i];
+X    if (devp && devp->sd_present && SCANPDS && SCANPDS->un_attached) {
+X      DPRINTF(1)("scan_retry: retrying %s%d\n", DNAME, DUNIT);
+X      scanstart(devp);
+X      if (SCANPDS->un_state == SCAN_STATE_RWAIT) {
+X	(void)splx(s);
+X	DPRINTF(1)("scan_retry: %s%d retry failed\n",
+X		   DNAME, DUNIT);
+X	return(0);
+X      }
+X      DPRINTF(1)("scan_retry: %s%d succeeded\n", DNAME, DUNIT);
+X    }
+X  }
+X  (void)splx(s);
+X  return(1);
+X}
+X
+X/*
+X * Clean up after previous command and start the next one
+X */
+Xstatic void scandone(devp)
+X     register struct scsi_device *devp;
+X{
+X  register struct buf *bp;
+X
+X  DPRINTF(2)("scandone: %s%d\n", DNAME, DUNIT);
+X  bp = SCANPDS->un_active;
+X  SCANPDS->un_active = NULL;	/* this command is no longer active */
+X
+X  if (SCANPDS->sio.scan_scanner_type != FUJITSU)
+X    SCANPDS->window_size -= bp->b_bcount;
+X
+X  if (SCANPDS->un_quehd) {
+X    DPRINTF(2)("scandone: calling scanstart for %s%d\n", DNAME, DUNIT);
+X    scanstart(devp);
+X  }
+X
+X  if (bp != SCANPDS->un_sbufp) {
+X    scsi_resfree(BP_PKT(bp));
+X    iodone(bp);
+X  } else {
+X    bp->b_flags |= B_DONE;
+X    wakeup((caddr_t)bp);
+X  }
+X  return;
+X}
+X
+X/*
+X * scan_make_cmd - create the scsi_pkt to be sent to the host adapter
+X * Scsi_resalloc allocates a comand buffer and if needed also sets up
+X * for DMA (mapping and locking memory).
+X * XXX If you are adding a special command, point allocbp at
+X *     the passed bp if there will be dma, otherwise leave it
+X *     as zero.
+X */
+Xstatic void scan_make_cmd(devp, bp, func)
+X     register struct scsi_device *devp;
+X     register struct buf *bp;
+X     int (*func)();
+X{
+X  register struct scsi_pkt *pkt;
+X  struct buf *allocbp = 0;	/* buf for dma resources, used by
+X				 * scsi_resalloc for special cmd */
+X  long	tval = 30;
+X  int	cmd, flags, fixbit, count, blkno;
+X
+X  flags = (scsi_options & SCSI_OPTIONS_DR) ? 0 : FLAG_NODISCON;
+X
+X  if (bp != SCANPDS->un_sbufp) {	/* not a special command */
+X    if (SCANPDS->sio.scan_scanner_type == HP_SCANJET_IIC) {
+X      pkt = scsi_resalloc(&devp->sd_address, CDB_GROUP0, 1, (opaque_t)bp, func);
+X      if (pkt == (struct scsi_pkt *) 0) {
+X	return;
+X      }
+X      makecom_g0_s(pkt, devp, flags, SCMD_READ, bp->b_bcount, 0);
+X    } else {
+X      pkt = scsi_resalloc(&devp->sd_address, CDB_GROUP1, 1, (opaque_t)bp, func);
+X      if (pkt == (struct scsi_pkt *) 0) {
+X	return;
+X      }
+X      makecom_g1(pkt, devp, flags, SCMD_READ_G1, 0, bp->b_bcount);
+X    }
+X    DPRINTF(2)("%s%d Read, count=%d\n", DNAME, DUNIT, bp->b_bcount);
+X
+X  } else {			/* internal command from scancmd */
+X    cmd = (int) bp->b_forw;
+X
+X    switch(cmd) {
+X    case SCMD_UCMD:	/* User specified command, from scancmd */
+X      tval = SCANPDS->un_ucmd.sc_timeout;
+X      if (SCANPDS->un_ucmd.sc_buflen > 0) {
+X	allocbp = bp;	/* Have DVMA */
+X      }
+X      break;
+X    default:
+X      /*
+X       * Naughty naughty!
+X       * scan_make_cmd only works for commands it knows
+X       * about. For special commands using un_sbufp it
+X       * may only be called from scancmd. Can't recover
+X       * from here.
+X       */
+X      printf("%s%d: unkown cmd 0x%x\n", DNAME, DUNIT, cmd);
+X      panic("scan_make_cmd, bad command\n");
+X    }
+X    /*
+X     * Allocate a packet. This also sets up the
+X     * DMA mapping
+X     */
+X    pkt = scsi_resalloc(&devp->sd_address, CDB_GROUP1, 1,
+X			(opaque_t)allocbp, SLEEP_FUNC);
+X
+X    /*
+X     * If this is a user specified command, use the cdb the
+X     * user gave us, otherwise make one.
+X     */
+X    if (cmd == SCMD_UCMD) {
+X      bcopy((caddr_t)&SCANPDS->un_ucmd.sc_cdb,
+X	    (caddr_t)pkt->pkt_cdbp, sizeof(union scsi_cdb));
+X    } else {
+X      if (devp->sd_inq->inq_dtype == DTYPE_DIRECT) {
+X	makecom_g0(pkt, devp, flags, cmd, (int)blkno, count);
+X      } else {
+X	makecom_g0_s(pkt, devp, flags, cmd, count, fixbit);
+X      }
+X    }
+X  }
+X  pkt->pkt_time = tval;
+X  pkt->pkt_comp = scanintr;	/* completion routine */
+X  pkt->pkt_private = (opaque_t) bp;
+X  BP_PKT(bp) = pkt;
+X  pkt->pkt_pmon = -1;		/* no performance measurement */
+X}
+X
+X
+X/*
+X * Command completion routine. Figure out what to do next based on
+X * the returned status of the scsi command
+X * It's declared static because it is not called directly, but via the
+X * pkt_comp field of the scsi packet.
+X */
+Xstatic void scanintr(pkt)
+X     struct scsi_pkt *pkt;
+X{
+X  struct buf *bp;
+X  struct scsi_device *devp;
+X  int	status;
+X
+X  DPRINTF(3)("scanintr: called\n");
+X
+X  if (!pkt) {
+X    printf("scanintr: Null pkt!\n");
+X    return;
+X  }
+X
+X  if (pkt->pkt_flags & FLAG_NOINTR) {
+X    printf("scanintr: Non-interrupting cmd!\n");
+X    return;
+X  }
+X
+X  /*
+X   * If the buf is not in the packet, things are very wrong.
+X   * strictly, we should panic here, but a scan failing isn't
+X   * necessarily reason to crash.
+X   */
+X  if (!(bp = (struct buf *)pkt->pkt_private)) {
+X    printf("scanintr: Null buffer!\n");
+X    return;
+X  }
+X
+X  if (!(devp = scanunits[SCANUNIT(bp->b_dev)])) {
+X    printf("scanintr: Null devp!\n");
+X    return;
+X  }
+X
+X  /*
+X   * Only one command active at a time. If the completed command
+X   * isn't the command we're waiting for, we have a problem! The
+X   * above comment about panicking applies.
+X   */
+X  if (bp != SCANPDS->un_active) {
+X    printf("scanintr: %s%d: buf not on queue!\n", DNAME, DUNIT);
+X    return;
+X  }
+X
+X  if (pkt->pkt_reason != CMD_CMPLT) {
+X    status = scan_incomplete(devp);
+X  } else {
+X    /*
+X     * Command completed successfully.
+X     * What were we doing?
+X     */
+X    if (SCANPDS->un_state == SCAN_STATE_SENSING) {
+X      /*
+X       * We were runnning a request sense command.
+X       * Restore previous state and find what to
+X       * do next.
+X       */
+X      SCANPDS->un_state = SCANPDS->un_last_state;
+X      SCANPDS->un_last_state = SCAN_STATE_SENSING;
+X      status = scan_handle_sense(devp);
+X    } else {
+X      /*
+X       * Normal command completion. Check for errors.
+X       */
+X      status = scan_check_error(devp);
+X    }
+X  }
+X
+X  switch(status) {
+X  case COMMAND_DONE_ERROR:
+X    SCANPDS->un_err_severe = SCANERR_FATAL;
+X    SCANPDS->un_err_resid = bp->b_resid = bp->b_bcount;
+X    bp->b_flags |= B_ERROR;
+X    /* **FALL THROUGH** */
+X  case COMMAND_DONE:
+X    scandone(devp);
+X    break;
+X  case QUE_SENSE:			/* need to do a request sense */
+X    DPRINTF(2)("scanintr: requesting sense\n");
+X    newstate(SCAN_STATE_SENSING);
+X    SCANPDS->un_rsp->pkt_private = (opaque_t)bp;
+X    bzero((caddr_t)devp->sd_sense, SENSE_LENGTH);
+X    if (pkt_transport(SCANPDS->un_rsp) == 0) {
+X      /*
+X       * request sense transport failed. Big problem.
+X       * Should panic, but it's nicer
+X       * not to, so just close the unit.
+X       */
+X      printf("%s%d: Couldn't send Request Sense, closing unit\n", DNAME, DUNIT);
+X      (void)scanclose(bp->b_dev);
+X    }
+X    break;
+X  case QUE_COMMAND:		/* retry command */
+X    DPRINTF(2)("scanintr: retrying command\n");
+X    if (pkt_transport(BP_PKT(bp)) == 0) {
+X      printf("scanintr: command requeue failed\n");
+X      SCANPDS->un_err_resid = bp->b_resid = bp->b_bcount;
+X      bp->b_flags |= B_ERROR;
+X      scandone(devp);
+X    }
+X    break;
+X  case JUST_RETURN:
+X    break;
+X  }
+X  return;
+X}
+X
+X
+X/*
+X * Clean up after an incomplete command
+X */
+Xstatic int scan_incomplete(devp)
+X     struct scsi_device *devp;
+X{
+X  struct scsi_pkt	*pkt;
+X  struct buf	*bp;
+X  int		rval;
+X
+X  bp = SCANPDS->un_active;
+X  rval = COMMAND_DONE_ERROR;
+X
+X  if (SCANPDS->un_state == SCAN_STATE_SENSING) {
+X    /*
+X     * We're sensing, retry the request sense
+X     */
+X    DPRINTF(2)("scan_incomplete: %s%d retry request sense\n",
+X	       DNAME, DUNIT);
+X    pkt = SCANPDS->un_rsp;
+X    if (SCANPDS->un_retries++ < SCAN_RETRY_COUNT) {
+X      rval = QUE_SENSE;
+X    }
+X  } else {
+X    /*
+X     * Not sensing, retry the command
+X     */
+X    pkt = BP_PKT(bp);
+X    if (SCANPDS->un_retries++ < SCAN_RETRY_COUNT) {
+X      DPRINTF(2)("scan_incomplete: %s%d retry command\n",
+X		 DNAME, DUNIT);
+X      rval = QUE_COMMAND;
+X    }
+X  }
+X
+X  if (pkt->pkt_state == STATE_GOT_BUS && rval == COMMAND_DONE_ERROR) {
+X    /*
+X     * We've exceeded the retry count, and the host adapter
+X     * got the bus but couldn't get the target.
+X     */
+X    printf("%s%d: target not responding to selection\n",
+X	   DNAME,DUNIT);
+X  }
+X
+X  return(rval);
+X}
+X
+X
+X/*
+X * check the status of the request sense command
+X */
+Xstatic int scan_handle_sense(devp)
+X     register struct scsi_device *devp;
+X{
+X  struct scsi_pkt	*pkt = BP_PKT(SCANPDS->un_active),
+X  *rsp = SCANPDS->un_rsp;
+X  struct buf	*bp = SCANPDS->un_active;
+X  int		rval, sdl, severity;
+X  void		scanrestart();
+X
+X  DPRINTF(2)("scan_handle_sense: %s%d\n", DNAME, DUNIT);
+X  if (SCBP(rsp)->sts_busy) {
+X    DPRINTF(1)("%s%d%: busy unit on request sense\n", DNAME, DUNIT);
+X    if (SCANPDS->un_retries++ < SCAN_RETRY_COUNT) {
+X      timeout(scanrestart, (caddr_t)devp, SCANTIMEOUT);
+X      rval = JUST_RETURN;
+X    }
+X    return(rval);
+X  }
+X
+X  if (SCBP(rsp)->sts_chk) {
+X    /*
+X     * Got a 'Check Condition' from a Request Sense command
+X     * - bad news!
+X     */
+X    DPRINTF(1)("%s%d%: check condition on request sense\n", DNAME, DUNIT);
+X    return(COMMAND_DONE_ERROR);
+X  }
+X
+X  sdl = SENSE_LENGTH - rsp->pkt_resid;
+X
+X  if ((rsp->pkt_state & STATE_XFERRED_DATA) == 0 || sdl == 0) {
+X    DPRINTF(1)("%s%d%: not enough Request Sense data\n", DNAME, DUNIT);
+X    return(COMMAND_DONE_ERROR);
+X  }
+X
+X  /*
+X   * If we got here, things are going OK. Look at the
+X   * request sense data.
+X   *
+X   * If the sense data length is less than the length of the
+X   * extended sense struct, check that we got enough data for
+X   * non-extended sense; if not give up.
+X   */
+X
+X  if (sdl < sizeof (struct scsi_extended_sense)) {
+X    if (sdl < sizeof (struct scsi_sense)) {
+X      DPRINTF(1)("%s%d%: not enough sense data\n", DNAME, DUNIT);
+X      return(COMMAND_DONE_ERROR);
+X    }
+X    if (devp->sd_sense->es_class != CLASS_EXTENDED_SENSE) {
+X      /*
+X       * XXX Non-extended sense classes (0-6) are
+X       * vendor-unique. Write a routine to decode
+X       * the error code and call it here. For now,
+X       * print out the undecoded information.
+X       */
+X      printf("%s%d: undecoded sense info:", DNAME, DUNIT);
+X      clean_print((caddr_t)devp->sd_sense, sdl);
+X      printf("; assuming a fatal error\n");
+X      return (COMMAND_DONE_ERROR);
+X    }
+X  }
+X
+X  /*
+X   * We got enough data for extended sense
+X   * XXX	es_code isn't very useful - it's usually 0.
+X   *	Most devices use the additional sense info
+X   *	bytes, it's more useful to put the vendor
+X   *	unique error code into un_err_code.
+X   */
+X
+X  SCANPDS->un_status = devp->sd_sense->es_key;
+X  SCANPDS->un_err_code = devp->sd_sense->es_code;
+X  DPRINTF(2)("Extended sense, status=%x, code=%x\n",
+X	     SCANPDS->un_status, SCANPDS->un_err_code);
+X
+X#if 0
+X  /*
+X   * The information bytes' meaning depends on the device.
+X   * For direct access devices it's the unsigned logical block
+X   * address, for sequential access, printer and processor
+X   * devices it's the residue (requested - actual lengths).
+X   */
+X  if (devp->sd_sense->es_valid) {
+X    SCANPDS->un_err_blkno = (devp->sd_sense->es_info_1 << 24) |
+X      (devp->sd_sense->es_info_2 << 16) |
+X	(devp->sd_sense->es_info_3 << 8)  |
+X	  (devp->sd_sense->es_info_4);
+X  } else {
+X    SCANPDS->un_err_blkno = bp->b_blkno;
+X  }
+X#endif
+X
+X  /* FUJITSU EOM (EOF) detection */
+X  if (SCANPDS->sio.scan_scanner_type == FUJITSU)
+X    if (devp->sd_sense->es_eom) {
+X      SCANPDS->window_size = 0;
+X      return (COMMAND_DONE);
+X    }
+X
+X  switch(SCANPDS->un_status) {
+X  case KEY_NO_SENSE:
+X    severity = SCANERR_RETRYABLE;
+X    rval = QUE_COMMAND;
+X    break;
+X  case KEY_RECOVERABLE_ERROR:
+X    severity = SCANERR_RECOVERED;
+X    rval = COMMAND_DONE;
+X    break;
+X  case KEY_UNIT_ATTENTION:
+X    severity = (SCANPDS->un_state <= SCAN_STATE_OPENING) ?
+X      SCANERR_INFORMATIONAL : SCANERR_FATAL;
+X    rval = COMMAND_DONE_ERROR;
+X    break;
+X  case KEY_ABORTED_COMMAND:
+X    severity = SCANERR_RETRYABLE;
+X    rval = QUE_COMMAND;
+X    break;
+X  case KEY_NOT_READY:
+X  case KEY_MEDIUM_ERROR:
+X  case KEY_HARDWARE_ERROR:
+X  case KEY_ILLEGAL_REQUEST:
+X  case KEY_WRITE_PROTECT:
+X  case KEY_BLANK_CHECK:
+X  case KEY_VENDOR_UNIQUE:
+X  case KEY_COPY_ABORTED:
+X  case KEY_EQUAL:
+X  case KEY_VOLUME_OVERFLOW:
+X  case KEY_MISCOMPARE:
+X  case KEY_RESERVED:
+X    severity = SCANERR_FATAL;
+X    rval = COMMAND_DONE_ERROR;
+X    break;
+X  default:
+X    /*
+X     * Undecoded sense key. Hope that retrying will fix
+X     * the problem, give up if not.
+X     */
+X    printf("%s%d: Sense Key 0x%x\n", DNAME, DUNIT, SCANPDS->un_status);
+X    if (SCANPDS->un_retries++ < SCAN_RETRY_COUNT) {
+X      severity = SCANERR_RETRYABLE;
+X      rval = QUE_COMMAND;
+X    } else {
+X      severity = SCANERR_FATAL;
+X      rval = COMMAND_DONE_ERROR;
+X    }
+X    break;
+X  }
+X
+X  if ((scan_debug > 2) || (severity >= scan_error_reporting)) {
+X    scanerrmsg(devp, pkt, severity);
+X  }
+X  return(rval);
+X}
+X
+X/*
+X * Check a completed command for errors
+X */
+Xstatic int scan_check_error(devp)
+X     register struct scsi_device *devp;
+X{
+X  struct buf	*bp;
+X  struct scsi_pkt	*pkt;
+X  int		rval;
+X
+X  bp = SCANPDS->un_active;
+X  pkt = BP_PKT(bp);
+X
+X  DPRINTF(2)("scan_check_error:\n");
+X
+X  if (SCBP(pkt)->sts_busy) {
+X    printf("%s%d: unit busy\n",DNAME,DUNIT);
+X    if (SCANPDS->un_retries++ < SCAN_RETRY_COUNT) {
+X      DPRINTF(1)("%s%d: retrying (%d)\n",
+X		 DNAME, DUNIT, SCANPDS->un_retries);
+X      timeout(scanrestart, (caddr_t)devp, SCANTIMEOUT);
+X      rval = JUST_RETURN;
+X    } else {
+X      DPRINTF(1)("%s%d: target busy too long\n", DNAME,DUNIT);
+X      rval = COMMAND_DONE_ERROR;
+X    }
+X  } else if (SCBP(pkt)->sts_chk) {
+X    DPRINTF(1)("%s%d: check condition\n", DNAME, DUNIT);
+X    rval = QUE_SENSE;
+X  } else {
+X    DPRINTF(2)("%s%d: Command done\n", DNAME, DUNIT);
+X    rval = COMMAND_DONE;
+X  }
+X  return(rval);
+X}
+X
+X/*
+X * Restart a command. Used to retry a command or request sense after
+X * a BUSY status. Note the difference between this and scan_retry.
+X */
+Xstatic void scanrestart(arg)
+X     caddr_t arg;
+X{
+X  struct scsi_device *devp = (struct scsi_device *) arg;
+X  struct buf	*bp;
+X  struct scsi_pkt	*pkt;
+X  register int	s;
+X
+X  s = splr(scanpri);
+X
+X  if ((bp = SCANPDS->un_active) == NULL) {
+X    printf("%s%d: restart failed - no active command\n",
+X	   DNAME, DUNIT);
+X  }
+X  else {
+X    if (SCANPDS->un_state == SCAN_STATE_SENSING) {
+X      pkt = SCANPDS->un_rsp;
+X    } else {
+X      pkt = BP_PKT(bp);
+X    }
+X    if (pkt_transport(pkt) == 0) {
+X      printf("%s%d: restart transport failed\n", DNAME,DUNIT);
+X      bp->b_resid = bp->b_bcount;
+X      bp->b_flags |= B_ERROR;
+X      scandone(devp);
+X    }
+X  }
+X  (void)splx(s);
+X  return;
+X}
+X
+X/**************************************************
+X *
+X * Error message handling routines
+X *
+X **************************************************/
+X
+X
+Xstatic char *scan_cmds[] = {
+X  "\000test unit ready",	/* 0x00 */
+X  "\003request sense",		/* 0x03 */
+X  "\007reassign",		/* 0x07 */
+X  "\022inquiry",		/* 0x12 */
+X  "\025mode select",		/* 0x15 */
+X  "\026reserve",		/* 0x16 */
+X  "\027release",		/* 0x17 */
+X  "\032mode sense",		/* 0x1a */
+X  "\033trigger scan",		/* 0x1b */
+X  "\044set window",		/* 0x24 */
+X  "\050read data",		/* 0x28 */
+X  "\061medium position",	/* 0x31 */
+X  "\064get buffer status",      /* 0x34 */
+X  NULL,
+X};
+X
+X
+X/*
+X * Print a readable error message
+X */
+Xstatic void scanerrmsg(devp, pkt, level)
+X     register struct scsi_device *devp;
+X     struct scsi_pkt	*pkt;
+X     int level;
+X{
+X  static char *error_classes[] = {
+X    "All          ", "Unknown      ", "Informational",
+X    "Recovered    ", "Retryable    ", "Fatal        ",
+X  };
+X
+X  printf("%s%d: Error on command '%s'\n", DNAME, DUNIT,
+X	 scsi_cmd_decode(CDBP(pkt)->scc_cmd, scan_cmds));
+X  printf("    \tError Level: %s",
+X	 error_classes[level]);
+X  printf("    \tSense Key: %s\n", sense_keys[devp->sd_sense->es_key]);
+X
+X  if (devp->sd_sense->es_code) {
+X   printf("\tExtended error code 0x%x, 0x%x\n",
+X	  devp->sd_sense->es_code, devp->sd_sense->es_qual_code);
+X  }
+X  return;
+X}
+X
+X/*
+X * Print a buffer readably
+X */
+Xstatic void  clean_print(p, l)
+X     char *p;
+X     int l;
+X{
+X  char a[2];
+X  register unsigned i = 0, c;
+X  while (i < l) {
+X    if((c = *p++) < ' ' || c >= 0177)
+X      printf("\\%o",c&0xff);
+X    else {
+X      a[0] = c; a[1] = 0;
+X      printf("%s",a);
+X    }
+X    i++;
+X  }
+X}
+X
+X/*
+X * routine to wakeup find_umax
+X */
+Xwake_find_umax(event)
+X     caddr_t event;
+X{
+X  wakeup(event);
+X}
+X
+X/*
+X * since UMAX scanners return an "operation complete" message even before
+X * finishing an unload or trigger operation, poll the scanner with TEST
+X * UNIT READY until it's really done and comes back online.
+X */
+Xstatic void find_umax(devp)
+X     register struct scsi_device *devp;
+X{
+X  int tries = 50;
+X
+X  while (tries--) {
+X    if (!scansimple(devp, SCMD_TEST_UNIT_READY, 0))
+X      break;
+X    timeout(wake_find_umax, devp, 200);
+X    sleep(devp, scanpri);
+X  }
+X}
+X
+X
+Xstatic int calc_umax_row_len(dpi, ww)
+X     int dpi;
+X     int ww;
+X{
+X  int st[301];
+X  int i;
+X  int rowB = 0;
+X
+X  for (i = 1; i <= 300; i++)
+X    st[i] = 1;
+X
+X  for (i = 1; i <= 300 - dpi; i++)
+X    st[i * 300 / (300 - dpi)] = 0;
+X
+X  for (i = 1; i <= (ww % 1200) / 4; i++) {
+X    if (st[i])
+X      rowB++;
+X  }
+X
+X  return ((ww / 1200) * dpi + rowB);
+X}
+X
+Xstatic int hp_has_paper_in_adf(devp)
+X     register struct scsi_device *devp;
+X{
+X  char escape_codes[20];
+X
+X  sprintf(escape_codes, "%c*s1027E", '\033');
+X
+X  if (hp_send_cmd(devp, escape_codes))
+X    return (0);
+X
+X  if (hp_recv_response(devp, escape_codes, 19))
+X    return (0);
+X
+X  if (escape_codes[8] == '1')
+X    return (1);			/* paper present & ready */
+X  else
+X    return (0);			/* no paper, or ADF not ready */
+X}
+X
+Xstatic int umax_has_paper_in_adf(devp)
+X     register struct scsi_device *devp;
+X{
+X  struct scsi_pkt *inqp, *rqpkt = SCANPDS->un_rsp;
+X  caddr_t response;
+X  int rc;
+X
+X  if (!(inqp = get_pktiopb(devp->sd_address, &response,
+X			 CDB_GROUP0, 1, 0x24, B_READ, SLEEP_FUNC))) {
+X    return (0);
+X  }
+X
+X  /*
+X   * Make the CDB, set NOINTR because this is polled, we'll
+X   * wait for the command to complete
+X   */
+X  makecom_g0_s(inqp, devp, FLAG_NOINTR, SCMD_INQUIRY, 0x24, 0);
+X
+X  if (scsi_poll(inqp)) {
+X    DPRINTF(1)("%s%d: Target not responding to SCMD_INQUIRY\n", DNAME, DUNIT);
+X    free_pktiopb(inqp, response, 0x24);
+X    return (0);
+X  }
+X
+X#if 0
+X  /*
+X   * check the Status Completion Block
+X   */
+X  switch(SCBP_C(inqp)) {
+X  case STATUS_GOOD:	/* command succeeded */
+X    rc = 0;
+X    break;
+X  case STATUS_CHECK:	/* got check condition status */
+X    if (scsi_poll(rqpkt) || SCBP_C(rqpkt) != STATUS_GOOD) {
+X      DPRINTF(1)("%s%d: (cmd %s) Request Sense failed\n",
+X		 DNAME, DUNIT, scsi_cmd_decode(CDBP(inqp)->scc_cmd, scan_cmds));
+X    } else {
+X      scanerrmsg(devp, inqp, SCANERR_RETRYABLE);
+X    }
+X    rc = EIO;
+X    break;
+X  default:		/* command failed */
+X    DPRINTF(1)("%s%d: (cmd %s) command failed, status 0x%x\n",
+X	       DNAME, DUNIT, scsi_cmd_decode(CDBP(inqp)->scc_cmd, scan_cmds),
+X	       SCBP_C(inqp));
+X    rc = EIO;
+X    break;
+X  }
+X#endif
+X
+X  rc = (response[1] == 1);
+X
+X  free_pktiopb(inqp, response, 0x24);
+X  return (rc);
+X}
+X
+Xstatic u_char model_to_type_code(model)
+X     char *model;
+X{
+X  if (strncmp("UC630", model, 5) == 0)
+X    return (UMAX_UC630);
+X
+X  if (strncmp("UG630", model, 5) == 0)
+X    return (UMAX_UG630);
+X
+X  if (strncmp("M3096Gm", model, 7) == 0)
+X    return (FUJITSU);
+X
+X  if (strncmp("IS410", model, 5) == 0)
+X    return (RICOH_IS410);
+X
+X  if (strncmp("IS50", model, 4) == 0)
+X    return (RICOH_IS50);
+X
+X  if (strncmp("2456", model, 4) == 0)
+X    return (IBM_2456);
+X
+X  if (strncmp("C1750A", model, 6) == 0)
+X    return (HP_SCANJET_IIC);
+X
+X  return (0);
+X}
+X
+Xstatic int calc_window_size(devp)
+X     register struct scsi_device *devp;
+X{
+X  /* Fujitsu M3096G uses EOM bit, doesn't use window_size */
+X
+X  if (SCANPDS->sio.scan_scanner_type == FUJITSU)
+X    return (1);
+X
+X  if (SCANPDS->sio.scan_image_mode < GRAYSCALE) { /* if monochrome */
+X
+X    if (SCANPDS->sio.scan_scanner_type == HP_SCANJET_IIC) { /* if pad to byte boundary */
+X
+X      /* this line fails if (wid * xres < 1200) */
+X
+X      return ((((SCANPDS->sio.scan_window_width * SCANPDS->sio.scan_x_resolution / 1200)+7)/8)
+X	      * (SCANPDS->sio.scan_window_length * SCANPDS->sio.scan_y_resolution / 1200));
+X
+X    } else {			/* if truncate to byte boundary */
+X
+X      if (SCANPDS->sio.scan_window_width * SCANPDS->sio.scan_x_resolution < 9600 ||
+X	  SCANPDS->sio.scan_window_length * SCANPDS->sio.scan_y_resolution < 1200) {
+X
+X	/* divide late because (wid:95 * res:100 / 9600 == 0) */
+X
+X	return ((SCANPDS->sio.scan_window_width * SCANPDS->sio.scan_x_resolution *
+X		 SCANPDS->sio.scan_window_length * SCANPDS->sio.scan_y_resolution)
+X		/ 9600 / 1200);
+X      } else {
+X
+X	/* divide early because (wid:13200 * res:400 * wid:20400 * res:400) overflows 2^32 */
+X
+X	return ((SCANPDS->sio.scan_window_width * SCANPDS->sio.scan_x_resolution / 9600)
+X		* (SCANPDS->sio.scan_window_length * SCANPDS->sio.scan_y_resolution / 1200));
+X      }
+X    }
+X  } else {					  /* if grayscale or color */
+X
+X    /* UMAX scaling algorithm makes it a special case */
+X
+X    if (SCANPDS->sio.scan_scanner_type == UMAX_UC630 ||
+X	SCANPDS->sio.scan_scanner_type == UMAX_UG630) {
+X      return (calc_umax_row_len(SCANPDS->sio.scan_x_resolution, SCANPDS->sio.scan_window_width)
+X	      * ((SCANPDS->sio.scan_window_length * SCANPDS->sio.scan_y_resolution) / 1200));
+X    } else {
+X      return ((SCANPDS->sio.scan_window_width    * SCANPDS->sio.scan_x_resolution / 1200)
+X	      * (SCANPDS->sio.scan_window_length * SCANPDS->sio.scan_y_resolution / 1200)
+X	      * (SCANPDS->sio.scan_image_mode == COLOR ? 3 : 1));
+X    }
+X  }
+X}
+X#endif NSCAN > 0
+END_OF_FILE
+if test 85991 -ne `wc -c <'pint/sun/driver/scan.c'`; then
+    echo shar: \"'pint/sun/driver/scan.c'\" unpacked with wrong size!
+fi
+# end of 'pint/sun/driver/scan.c'
+fi
+echo shar: End of archive 7 \(of 7\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 7 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

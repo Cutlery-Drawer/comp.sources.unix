@@ -1,0 +1,6225 @@
+Newsgroups: comp.sources.unix
+From: pmiller@bmr.gov.au (Peter Miller)
+Subject: v27i049: aegis - project change supervisor (V2.1), Part14/19
+References: <1.748951883.12788@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: pmiller@bmr.gov.au (Peter Miller)
+Posting-Number: Volume 27, Issue 49
+Archive-Name: aegis-2.1/part14
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 14 (of 19)."
+# Contents:  aegis/glue.c aegis/project.c aegis/user.c doc/c7.1.so
+# Wrapped by vixie@gw.home.vix.com on Sat Sep 25 03:00:50 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'aegis/glue.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'aegis/glue.c'\"
+else
+echo shar: Extracting \"'aegis/glue.c'\" \(40198 characters\)
+sed "s/^X//" >'aegis/glue.c' <<'END_OF_FILE'
+X/*
+X *	aegis - project change supervisor
+X *	Copyright (C) 1993 Peter Miller.
+X *	All rights reserved.
+X *
+X *	This program is free software; you can redistribute it and/or modify
+X *	it under the terms of the GNU General Public License as published by
+X *	the Free Software Foundation; either version 2 of the License, or
+X *	(at your option) any later version.
+X *
+X *	This program is distributed in the hope that it will be useful,
+X *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+X *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X *	GNU General Public License for more details.
+X *
+X *	You should have received a copy of the GNU General Public License
+X *	along with this program; if not, write to the Free Software
+X *	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X * MANIFEST: functions to perform systems calls in subprocesses
+X *
+X * Most of the functions in this file are only used when
+X * the CONF_NO_seteuid  symbol is defined in common/conf.h.
+X *
+X * The various system calls wgich must be perfomed as a specific user
+X * are given to a "proxy" process to perform, where this proxy process
+X * has the appropriate real (and effective) user id and group id.
+X * These processes terminate when they see end-of-file on their command
+X * streams, which only happens when the parent process exits.
+X *
+X * The overhead of communicating with the proxy process will
+X * naturally result in a performance hit for systems without
+X * a seteuid system call.
+X *
+X * Note that some systems, notably AIX, have a seteuid system call
+X * which is broken.  These systems will also need to use this glue.
+X */
+X
+X#include <sys/types.h>
+X#include <dirent.h>
+X#include <errno.h>
+X#include <fcntl.h>
+X#include <signal.h>
+X#include <stdio.h>
+X#include <stdlib.h>
+X#include <unistd.h>
+X#include <utime.h>
+X
+X#include <error.h>
+X#include <glue.h>
+X#include <mem.h>
+X#include <os.h>
+X#include <trace.h>
+X#include <undo.h>
+X
+X#ifdef CONF_NO_seteuid
+X
+X#define GUARD1 0x416E6479
+X#define GUARD2 0x4C777279
+X
+Xenum
+X{
+X	command_access,
+X	command_catfile,
+X	command_chmod,
+X	command_chown,
+X	command_close,
+X	command_copyfile,
+X	command_creat,
+X	command_fcntl,
+X	command_getcwd,
+X	command_link,
+X	command_lstat,
+X	command_mkdir,
+X	command_open,
+X	command_read,
+X	command_readlink,
+X	command_read_whole_dir,
+X	command_rename,
+X	command_rmdir,
+X	command_stat,
+X	command_unlink,
+X	command_utime,
+X	command_write,
+X};
+X
+X
+Xtypedef struct proxy_ty proxy_ty;
+Xstruct proxy_ty
+X{
+X	int		hash;
+X	int		uid;
+X	int		gid;
+X	int		umask;
+X	int		pid;
+X	FILE		*command;
+X	FILE		*reply;
+X	proxy_ty	*next;
+X
+X};
+X
+X#define proxy_hash(u, g, m) (((u) * 16 + (g) * 4 + (m)) & 0x7FFF)
+X
+X/*
+X * This table will be sparsely filled.
+X * The maximum number of entries expected is 4.
+X * The size MUST be prime.
+X */
+Xstatic proxy_ty	*proxy_table[17];
+X
+X
+X#ifdef DEBUG
+X
+Xstatic char *command_name _((int));
+X
+Xstatic char *
+Xcommand_name(n)
+X	int		n;
+X{
+X	static char	buf[12];
+X
+X	switch (n)
+X	{
+X	case EOF:		return "quit";
+X	case command_access:	return "access";
+X	case command_catfile:	return "catfile";
+X	case command_chmod:	return "chmod";
+X	case command_chown:	return "chown";
+X	case command_close:	return "close";
+X	case command_copyfile:	return "copyfile";
+X	case command_creat:	return "creat";
+X	case command_fcntl:	return "fcntl";
+X	case command_getcwd:	return "getcwd";
+X	case command_link:	return "link";
+X	case command_lstat:	return "lstat";
+X	case command_mkdir:	return "mkdir";
+X	case command_open:	return "open";
+X	case command_read:	return "read";
+X	case command_readlink:	return "readlink";
+X	case command_read_whole_dir: return "read_whole_dir";
+X	case command_rename:	return "rename";
+X	case command_rmdir:	return "rmdir";
+X	case command_stat:	return "stat";
+X	case command_unlink:	return "unlink";
+X	case command_utime:	return "utime";
+X	case command_write:	return "write";
+X	}
+X	sprintf(buf, "%d", n);
+X	return buf;
+X}
+X
+X#endif
+X
+X
+Xstatic void put_int _((FILE *, int));
+X
+Xstatic void
+Xput_int(fp, n)
+X	FILE		*fp;
+X	int		n;
+X{
+X	int		j;
+X	unsigned char	*ptr;
+X
+X	trace(("put_int(%d)\n{\n"/*}*/, n));
+X	ptr = (unsigned char *)&n; 
+X	for (j = 0; j < sizeof(int); ++j)
+X		putc(ptr[j], fp);
+X	if (ferror(fp))
+X		nfatal("writing pipe");
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic int get_int _((FILE *));
+X
+Xstatic int
+Xget_int(fp)
+X	FILE		*fp;
+X{
+X	int		result;
+X	int		j;
+X	unsigned char	*ptr;
+X
+X	trace(("get_int()\n{\n"/*}*/));
+X	ptr = (unsigned char *)&result;
+X	for (j = 0; j < sizeof(int); ++j)
+X	{
+X		int	c;
+X
+X		c = getc(fp);
+X		if (c == EOF)
+X		{
+X			if (ferror(fp))
+X				nfatal("reading pipe");
+X			fatal("reading pipe: proxy protocol error (%d)", getpid());
+X		}
+X		ptr[j] = c;
+X	}
+X	trace(("return %d;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xstatic void put_long _((FILE *, long));
+X
+Xstatic void
+Xput_long(fp, n)
+X	FILE		*fp;
+X	long		n;
+X{
+X	int		j;
+X	unsigned char	*ptr;
+X
+X	trace(("put_long(%ld)\n{\n"/*}*/, n));
+X	ptr = (unsigned char *)&n; 
+X	for (j = 0; j < sizeof(long); ++j)
+X		putc(ptr[j], fp);
+X	if (ferror(fp))
+X		nfatal("writing pipe");
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic long get_long _((FILE *));
+X
+Xstatic long
+Xget_long(fp)
+X	FILE		*fp;
+X{
+X	long		result;
+X	int		j;
+X	unsigned char	*ptr;
+X
+X	trace(("get_long()\n{\n"/*}*/));
+X	ptr = (unsigned char *)&result;
+X	for (j = 0; j < sizeof(long); ++j)
+X	{
+X		int	c;
+X
+X		c = getc(fp);
+X		if (c == EOF)
+X		{
+X			if (ferror(fp))
+X				nfatal("reading pipe");
+X			fatal("reading pipe: proxy protocol error (%d)", getpid());
+X		}
+X		ptr[j] = c;
+X	}
+X	trace(("return %ld;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xstatic void put_binary _((FILE *, void *, size_t));
+X
+Xstatic void
+Xput_binary(fp, ptr, len)
+X	FILE		*fp;
+X	void		*ptr;
+X	size_t		len;
+X{
+X	trace(("put_binary(%ld)\n{\n"/*}*/, len));
+X	fwrite(ptr, 1, len, fp);
+X	if (ferror(fp))
+X		nfatal("writing pipe");
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic void get_binary _((FILE *, void *, size_t));
+X
+Xstatic void
+Xget_binary(fp, ptr, len)
+X	FILE		*fp;
+X	void		*ptr;
+X	size_t		len;
+X{
+X	long		n;
+X
+X	trace(("get_binary(%ld)\n{\n"/*}*/, len));
+X	n = fread(ptr, 1, len, fp);
+X	if (n != len)
+X	{
+X		if (ferror(fp))
+X			nfatal("reading pipe");
+X		fatal("reading pipe: proxy protocol error (%d)", getpid());
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic void put_string _((FILE *, char *));
+X
+Xstatic void
+Xput_string(fp, s)
+X	FILE		*fp;
+X	char		*s;
+X{
+X	trace(("put_string(\"%s\")\n{\n"/*}*/, s));
+X	for (;;)
+X	{
+X		putc(*s, fp);
+X		if (ferror(fp))
+X			nfatal("writing pipe");
+X		if (!*s)
+X			break;
+X		++s;
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic void *get_string _((FILE *));
+X
+Xstatic void *
+Xget_string(fp)
+X	FILE		*fp;
+X{
+X	static char	*result;
+X	static size_t	result_max;
+X	size_t		pos;
+X
+X	trace(("get_string()\n{\n"/*}*/));
+X	if (!result)
+X	{
+X		result_max = (1L << 10 ) - 32;
+X		result = mem_alloc(result_max);
+X	}
+X
+X	pos = 0;
+X	for (;;)
+X	{
+X		int	c;
+X
+X		c = getc(fp);
+X		if (c == EOF)
+X		{
+X			if (ferror(fp))
+X				nfatal("reading pipe");
+X			fatal("reading pipe: proxy protocol error (%d)", getpid());
+X		}
+X		if (pos >= result_max)
+X		{
+X			result_max += (1L << 10);
+X			mem_change_size(&result, result_max);
+X		}
+X		result[pos] = c;
+X		if (!c)
+X			break;
+X		++pos;
+X	}
+X	trace(("return \"%s\";\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xstatic void proxy _((int rd, int wr));
+X
+Xstatic void
+Xproxy(rd_fd, wr_fd)
+X	int		rd_fd;
+X	int		wr_fd;
+X{
+X	FILE		*command;
+X	FILE		*reply;
+X	char		*path;
+X	char		*path1;
+X	int		mode;
+X	struct stat	st;
+X	struct utimbuf	utb;
+X	int		uid;
+X	int		gid;
+X	char		*buf;
+X	int		max;
+X	int		perm;
+X	int		result;
+X	int		fd;
+X	long		nbytes;
+X	long		nbytes2;
+X	struct flock	flock;
+X
+X	trace(("proxy(%d, %d)\n{\n"/*}*/, rd_fd, wr_fd));
+X	errno = 0;
+X	command = fdopen(rd_fd, "r");
+X	if (!command)
+X	{
+X		if (!errno)
+X			errno = ENOMEM;
+X		exit(errno);
+X	}
+X
+X	errno = 0;
+X	reply = fdopen(wr_fd, "w");
+X	if (!reply)
+X	{
+X		if (!errno)
+X			errno = ENOMEM;
+X		exit(errno);
+X	}
+X
+X	for (;;)
+X	{
+X		int	c;
+X
+X		c = getc(command);
+X		trace(("command: %s\n", command_name(c)));
+X		trace(("uid = %d;\n", getuid()));
+X		trace(("gid = %d;\n", getgid()));
+X		switch (c)
+X		{
+X		case EOF:
+X			if (ferror(command))
+X				exit(errno);
+X			exit(0);
+X
+X		default:
+X			fatal("proxy: unknown %d command (bug)", c);
+X
+X		case command_access:
+X			path = get_string(command);
+X			mode = get_int(command);
+X			if (access(path, mode))
+X				result = errno;
+X			else
+X				result = 0;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_catfile:
+X			path = get_string(command);
+X			if (catfile(path))
+X				result = errno;
+X			else
+X				result = 0;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_chmod:
+X			path = get_string(command);
+X			mode = get_int(command);
+X			if (chmod(path, mode))
+X				result = errno;
+X			else
+X				result = 0;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_chown:
+X			path = get_string(command);
+X			uid = get_int(command);
+X			gid = get_int(command);
+X			if (chown(path, uid, gid))
+X				result = errno;
+X			else
+X				result = 0;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_close:
+X			fd = get_int(command);
+X			if (close(fd))
+X				result = errno;
+X			else
+X				result = 0;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_copyfile:
+X			path = get_string(command);
+X			path1 = mem_copy_string(path);
+X			path = get_string(command);
+X			result = copyfile(path1, path);
+X			if (result)
+X				result = errno;
+X			mem_free(path1);
+X			put_int(reply, result);
+X			break;
+X
+X		case command_creat:
+X			path = get_string(command);
+X			mode = get_int(command);
+X			result = creat(path, mode);
+X			put_int(reply, result);
+X			if (result < 0)
+X				put_int(reply, errno);
+X			break;
+X
+X		case command_getcwd:
+X			max = get_int(command);
+X			path = mem_alloc(max);
+X			if (!getcwd(path, max))
+X				put_int(reply, errno);
+X			else
+X			{
+X				put_int(reply, 0);
+X				put_string(reply, path);
+X			}
+X			mem_free(path);
+X			break;
+X
+X		case command_fcntl:
+X			fd = get_int(command);
+X			mode = get_int(command);
+X			get_binary(command, &flock, sizeof(flock));
+X			result = fcntl(fd, mode, &flock);
+X			if (result)
+X				result = errno;
+X			put_int(reply, result);
+X			put_binary(reply, &flock, sizeof(flock));
+X			break;
+X
+X		case command_lstat:
+X			path = get_string(command);
+X#ifdef S_IFLNK
+X			result = lstat(path, &st);
+X#else
+X			result = stat(path, &st);
+X#endif
+X			if (result)
+X				put_int(reply, errno);
+X			else
+X			{
+X				put_int(reply, 0);
+X				put_binary(reply, &st, sizeof(st));
+X			}
+X			break;
+X
+X
+X		case command_link:
+X			path = get_string(command);
+X			path1 = mem_copy_string(path);
+X			path = get_string(command);
+X			result = link(path1, path);
+X			if (result)
+X				result = errno;
+X			mem_free(path1);
+X			put_int(reply, result);
+X			break;
+X
+X		case command_mkdir:
+X			path = get_string(command);
+X			mode = get_int(command);
+X			if (mkdir(path, mode))
+X				result = errno;
+X			else
+X				result = 0;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_open:
+X			path = get_string(command);
+X			mode = get_int(command);
+X			perm = get_int(command);
+X			result = open(path, mode, perm);
+X			put_int(reply, result);
+X			if (result < 0)
+X				put_int(reply, errno);
+X			break;
+X
+X		case command_rename:
+X			path = get_string(command);
+X			path1 = mem_copy_string(path);
+X			path = get_string(command);
+X			result = rename(path1, path);
+X			if (result)
+X				result = errno;
+X			mem_free(path1);
+X			put_int(reply, result);
+X			break;
+X
+X		case command_read:
+X			fd = get_int(command);
+X			nbytes = get_long(command);
+X			buf = mem_alloc(nbytes);
+X			nbytes2 = read(fd, buf, nbytes);
+X			put_long(reply, nbytes2);
+X			if (nbytes2 > 0)
+X				put_binary(reply, buf, nbytes2);
+X			else if (nbytes2 < 0)
+X				put_int(reply, errno);
+X			mem_free(buf);
+X			break;
+X
+X		case command_readlink:
+X			path = get_string(command);
+X			max = get_int(command);
+X			path1 = mem_alloc(max + 1);
+X			result = readlink(path, path1, max);
+X			put_int(reply, result);
+X			if (result < 0)
+X				put_int(reply, errno);
+X			else
+X				put_binary(reply, path1, result);
+X			mem_free(path1);
+X			break;
+X
+X		case command_read_whole_dir:
+X			path = get_string(command);
+X			result = read_whole_dir(path, &buf, &nbytes);
+X			if (result < 0)
+X				put_int(reply, errno);
+X			else
+X			{
+X				put_int(reply, 0);
+X				put_long(reply, nbytes);
+X				put_binary(reply, buf, nbytes);
+X			}
+X			break;
+X
+X		case command_rmdir:
+X			path = get_string(command);
+X			if (rmdir(path))
+X				result = errno;
+X			else
+X				result = 0;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_stat:
+X			path = get_string(command);
+X			result = stat(path, &st);
+X			if (result)
+X				put_int(reply, errno);
+X			else
+X			{
+X				put_int(reply, 0);
+X				put_binary(reply, &st, sizeof(st));
+X			}
+X			break;
+X
+X		case command_unlink:
+X			path = get_string(command);
+X			result = unlink(path);
+X			if (result)
+X				result = errno;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_utime:
+X			path = get_string(command);
+X			get_binary(command, &utb, sizeof(utb));
+X			result = utime(path, &utb);
+X			if (result)
+X				result = errno;
+X			put_int(reply, result);
+X			break;
+X
+X		case command_write:
+X			fd = get_int(command);
+X			nbytes = get_long(command);
+X			buf = mem_alloc(nbytes);
+X			get_binary(command, buf, nbytes);
+X			nbytes2 = write(fd, buf, nbytes);
+X			put_long(reply, nbytes2);
+X			if (nbytes2 < 0)
+X				put_int(reply, errno);
+X			mem_free(buf);
+X			break;
+X		}
+X		fflush(reply);
+X		if (ferror(reply))
+X			exit(errno);
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic void get_pipe _((int *, int *));
+X
+Xstatic void
+Xget_pipe(rd, wr)
+X	int	*rd;
+X	int	*wr;
+X{
+X	int	fd[2];
+X
+X	trace(("get_pipe()\n{\n"/*}*/));
+X	if (pipe(fd))
+X		nfatal("pipe");
+X	*rd = fd[0];
+X	*wr = fd[1];
+X	trace(("read %d\n", fd[0]));
+X	trace(("write %d\n", fd[1]));
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic  void proxy_close _((void));
+X
+Xstatic void
+Xproxy_close()
+X{
+X	proxy_ty	*p;
+X	int		j;
+X
+X	trace(("proxy_close()\n{\n"/*}*/));
+X	trace(("pid = %d;\n", getpid()));
+X	for (j = 0; j < SIZEOF(proxy_table); ++j)
+X	{
+X		for (;;)
+X		{
+X			p = proxy_table[j];
+X			if (!p)
+X				break;
+X			trace(("p->pid %d; uid %d; gid %d\n", p->pid, p->uid, p->gid));
+X			proxy_table[j] = p->next;
+X			fclose(p->command);
+X			fclose(p->reply);
+X			mem_free((char *)p);
+X		}
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic void proxy_spawn _((proxy_ty *));
+X
+Xstatic void
+Xproxy_spawn(pp)
+X	proxy_ty	*pp;
+X{
+X	int		command_read_fd;
+X	int		command_write_fd;
+X	int		reply_read_fd;
+X	int		reply_write_fd;
+X	int		pid;
+X	static int	quitregd;
+X
+X	trace(("proxy_spawn()\n{\n"/*}*/));
+X	if (!quitregd)
+X	{
+X		quitregd = 1;
+X		signal(SIGPIPE, SIG_IGN);
+X		trace(("master pid %d;\n", getpid()));
+X	}
+X
+X	get_pipe(&command_read_fd, &command_write_fd);
+X	get_pipe(&reply_read_fd, &reply_write_fd);
+X	switch (pid = fork())
+X	{
+X	case -1:
+X		nfatal("fork");
+X
+X	case 0:
+X		/*
+X		 * close the ends of the pipes the proxy will not be using
+X		 */
+X		close(command_write_fd);
+X		close(reply_read_fd);
+X		error_set_id_func((error_id_ty)0);
+X
+X		/*
+X		 * the proxy now assumes the appropriate ID
+X		 */
+X		if (setgid(pp->gid))
+X			exit(errno);
+X		if (setuid(pp->uid))
+X			exit(errno);
+X		umask(pp->umask);
+X
+X		/*
+X		 * close all of the master ends of all the other proxys
+X		 * otherwise they will keep each other alive
+X		 * after the master dies
+X		 */
+X		trace_indent_reset();
+X		proxy_close();
+X
+X		/*
+X		 * normally the proxys are silent,
+X		 * returning all errors to the master.
+X		 * Should one of the error functions be called,
+X		 * make sure the proxy does not perform the undo.
+X		 */
+X		undo_cancel();
+X
+X		/*
+X		 * do whatever is asked
+X		 */
+X		proxy(command_read_fd, reply_write_fd);
+X		exit(0);
+X
+X	default:
+X		/*
+X		 * close the ends of the pipes the master will not be using
+X		 */
+X		close(command_read_fd);
+X		close(reply_write_fd);
+X
+X		/*
+X		 * remember who the child is
+X		 * (even though we don't have a use for it at the moment)
+X		 */
+X		pp->pid = pid;
+X		trace(("child pid %d\n", getpid()));
+X
+X		/*
+X		 * open a buffered stream for commands
+X		 */
+X		errno = 0;
+X		pp->command = fdopen(command_write_fd, "w");
+X		if (!pp->command)
+X		{
+X			if (!errno)
+X				errno = ENOMEM;
+X			nfatal("fdopen");
+X		}
+X
+X		/*
+X		 * open a buffered stream for replies
+X		 */
+X		errno = 0;
+X		pp->reply = fdopen(reply_read_fd, "r");
+X		if (!pp->reply)
+X		{
+X			if (!errno)
+X				errno = ENOMEM;
+X			nfatal("fdopen");
+X		}
+X		break;
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic proxy_ty *proxy_find _((void));
+X
+Xstatic proxy_ty *
+Xproxy_find()
+X{
+X	int		uid;
+X	int		gid;
+X	int		um;
+X	int		hash;
+X	int		pix;
+X	proxy_ty	*pp;
+X
+X	/*
+X	 * search for an existing proxy
+X	 */
+X	trace(("proxy_find()\n{\n"/*}*/));
+X	os_become_must_be_active();
+X	os_become_query(&uid, &gid, &um);
+X	hash = proxy_hash(uid, gid, um);
+X	pix = hash % SIZEOF(proxy_table);
+X	for (pp = proxy_table[pix]; pp; pp = pp->next)
+X	{
+X		if (pp->hash != hash)
+X			continue;
+X		if (pp->uid != uid || pp->gid != gid || pp->umask != um)
+X			continue;
+X		goto done;
+X	}
+X
+X	/*
+X	 * no such proxy, so create a new one
+X	 */
+X	trace(("uid = %d; gid = %d; umask = 0%o;\n", uid, gid, um));
+X	pp = (proxy_ty *)mem_alloc(sizeof(proxy_ty));
+X	pp->hash = hash;
+X	pp->uid = uid;
+X	pp->gid = gid;
+X	pp->umask = um;
+X	pp->pid = -1;
+X	pp->command = 0;
+X	pp->reply = 0;
+X	pp->next = 0;
+X	proxy_spawn(pp);
+X
+X	/*
+X	 * glue into the table AFTER the spawn,
+X	 * so the child doesn't close the wrong things.
+X	 */
+X	pp->next = proxy_table[pix];
+X	proxy_table[pix] = pp;
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace(("return %08lX;\n", (long)pp));
+X	trace((/*{*/"}\n"));
+X	return pp;
+X}
+X
+X
+Xstatic void end_of_command _((proxy_ty *));
+X
+Xstatic void
+Xend_of_command(pp)
+X	proxy_ty	*pp;
+X{
+X	trace(("end_of_command()\n{\n"/*}*/));
+X	if (fflush(pp->command))
+X		nfatal("write pipe");
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xint
+Xglue_stat(path, st)
+X	char		*path;
+X	struct stat	*st;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_stat()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_stat, pp->command);
+X	put_string(pp->command, path);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	else
+X		get_binary(pp->reply, st, sizeof(*st));
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_lstat(path, st)
+X	char		*path;
+X	struct stat	*st;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_lstat()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_lstat, pp->command);
+X	put_string(pp->command, path);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	else
+X		get_binary(pp->reply, st, sizeof(*st));
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_mkdir(path, mode)
+X	char		*path;
+X	int		mode;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_mkdir()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_mkdir, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, mode);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_chown(path, uid, gid)
+X	char		*path;
+X	int		uid;
+X	int		gid;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_chown()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_chown, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, uid);
+X	put_int(pp->command, gid);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_catfile(path)
+X	char		*path;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_catfile()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_catfile, pp->command);
+X	put_string(pp->command, path);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_chmod(path, mode)
+X	char		*path;
+X	int		mode;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_chmod()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_chmod, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, mode);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_rmdir(path)
+X	char		*path;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_rmdir()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_rmdir, pp->command);
+X	put_string(pp->command, path);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_rename(p1, p2)
+X	char		*p1;
+X	char		*p2;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_rename()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_rename, pp->command);
+X	put_string(pp->command, p1);
+X	put_string(pp->command, p2);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_unlink(path)
+X	char		*path;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_unlink()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_unlink, pp->command);
+X	put_string(pp->command, path);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_link(p1, p2)
+X	char		*p1;
+X	char		*p2;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_link()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_link, pp->command);
+X	put_string(pp->command, p1);
+X	put_string(pp->command, p2);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_access(path, mode)
+X	char		*path;
+X	int		mode;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_access()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_access, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, mode);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xchar *
+Xglue_getcwd(buf, max)
+X	char		*buf;
+X	int		max;
+X{
+X	proxy_ty	*pp;
+X	char		*s;
+X	int		result;
+X
+X	/*
+X	 * don't bother with the case where buf
+X	 * is the NULL pointer, aegis never uses it.
+X	 */
+X	trace(("glue_getcwd()\n{\n"/*}*/));
+X	assert(buf);
+X	pp = proxy_find();
+X	putc(command_getcwd, pp->command);
+X	put_int(pp->command, max);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		s = 0;
+X		trace(("return NULL; /* errno = %d */\n", result));
+X		errno = result;
+X	}
+X	else
+X	{
+X		s = get_string(pp->reply);
+X		strcpy(buf, s);
+X		s = buf;
+X		trace(("return \"%s\";\n", s));
+X	}
+X	trace((/*{*/"}\n"));
+X	return s;
+X}
+X
+X
+Xint
+Xglue_readlink(path, buf, max)
+X	char		*path;
+X	char		*buf;
+X	int		max;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_readlink()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_readlink, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, max);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result < 0)
+X	{
+X		errno = get_int(pp->reply);
+X		result = -1;
+X	}
+X	else
+X	{
+X		get_binary(pp->reply, buf, result);
+X		trace(("buf = \"%.*s\";\n", result, buf));
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_utime(path, values)
+X	char		*path;
+X	struct utimbuf	*values;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_utime()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_utime, pp->command);
+X	put_string(pp->command, path);
+X	put_binary(pp->command, values, sizeof(*values));
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_copyfile(p1, p2)
+X	char		*p1;
+X	char		*p2;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_copyfile()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_copyfile, pp->command);
+X	put_string(pp->command, p1);
+X	put_string(pp->command, p2);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xtypedef struct glue_file_ty glue_file_ty;
+Xstruct glue_file_ty
+X{
+X	long		guard1;
+X	char		*path;
+X	int		fmode;
+X	char		*buffer_end;
+X	char		*buffer_pos;
+X	int		fd;
+X	int		errno;
+X	int		pushback;
+X	proxy_ty	*pp;
+X	char		buffer[1 << 11]; /* fits within knl pipe buf */
+X	long		guard2;
+X};
+X
+X
+XFILE *
+Xglue_fopen(path, mode)
+X	char		*path;
+X	char		*mode;
+X{
+X	glue_file_ty	*gfp;
+X	proxy_ty	*pp;
+X	int		fmode;
+X	int		fd;
+X
+X	trace(("glue_fopen()\n{\n"/*}*/));
+X	if (!strcmp(mode, "r"))
+X		fmode = O_RDONLY;
+X	else if (!strcmp(mode, "w"))
+X		fmode = O_WRONLY | O_CREAT | O_TRUNC;
+X	else
+X	{
+X		errno = EINVAL;
+X		gfp = 0;
+X		goto done;
+X	}
+X
+X	pp = proxy_find();
+X	putc(command_open, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, fmode);
+X	put_int(pp->command, 0666);
+X	end_of_command(pp);
+X	fd = get_int(pp->reply);
+X	if (fd < 0)
+X	{
+X		errno = get_int(pp->reply);
+X		gfp = 0;
+X		goto done;
+X	}
+X
+X	/*
+X	 * build our file structure
+X	 */
+X	gfp = (glue_file_ty *)mem_alloc(sizeof(glue_file_ty));
+X	gfp->pp = pp;
+X	gfp->path = mem_copy_string(path);
+X	gfp->fmode = fmode;
+X	gfp->fd = fd;
+X	gfp->guard1 = GUARD1;
+X	gfp->guard2 = GUARD2;
+X	if (gfp->fmode == O_RDONLY)
+X	{
+X		gfp->buffer_end = 0;
+X		gfp->buffer_pos = 0;
+X	}
+X	else
+X	{
+X		gfp->buffer_pos = gfp->buffer;
+X		gfp->buffer_end = gfp->buffer + sizeof(gfp->buffer);
+X	}
+X	gfp->errno = 0;
+X	gfp->pushback = EOF;
+X
+X	/*
+X	 * NOTE: this is veeerrry nasty.
+X	 * The return value is not really a valid FILE,
+X	 * but is only useful to the glue file functions.
+X	 */
+X	done:
+X	trace(("return %08lX; /* errno = %d */\n", (long)gfp, errno));
+X	trace((/*{*/"}\n"));
+X	return (FILE *)gfp;
+X}
+X
+X
+Xint
+Xglue_fclose(fp)
+X	FILE		*fp;
+X{
+X	proxy_ty	*pp;
+X	glue_file_ty	*gfp;
+X	int		result;
+X	int		result2;
+X
+X	/*
+X	 * Leave the standard file streams alone.
+X	 * There is a chance these will be seen here.
+X	 */
+X	if (fp == stdout || fp == stdin || fp == stderr)
+X		return fclose(fp);
+X
+X	/*
+X	 * flush the buffers
+X	 */
+X	trace(("glue_fclose()\n{\n"/*}*/));
+X	result = glue_fflush(fp) ? errno : 0;
+X
+X	/*
+X	 * locate the appropriate proxy
+X	 */
+X	gfp = (glue_file_ty *)fp;
+X	assert(gfp->guard1 == GUARD1);
+X	assert(gfp->guard2 == GUARD2);
+X	pp = gfp->pp;
+X
+X	/*
+X	 * tell the proxy to close
+X	 */
+X	putc(command_close, pp->command);
+X	put_int(pp->command, gfp->fd);
+X	end_of_command(pp);
+X	result2 = get_int(pp->reply);
+X	if (!result)
+X		result = result2;
+X
+X	/*
+X	 * Fclose always closes the file,
+X	 * even when the implicit write fails.
+X	 * Always dispose of our data.
+X	 */
+X	mem_free(gfp->path);
+X	mem_free((char *)gfp);
+X	
+X	/*
+X	 * set errno and get out of here
+X	 */
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_fgetc(fp)
+X	FILE		*fp;
+X{
+X	proxy_ty	*pp;
+X	glue_file_ty	*gfp;
+X	int		result;
+X	long		nbytes;
+X
+X	/*
+X	 * Leave the standard file streams alone.
+X	 * There is a chance these will be seen here.
+X	 */
+X	if (fp == stdout || fp == stdin || fp == stderr)
+X		return getc(fp);
+X
+X	/*
+X	 * locate the appropriate proxy
+X	 */
+X#if 0
+X	trace(("glue_fgetc()\n{\n"/*}*/));
+X#endif
+X	gfp = (glue_file_ty *)fp;
+X	assert(gfp->guard1 == GUARD1);
+X	assert(gfp->guard2 == GUARD2);
+X	pp = gfp->pp;
+X
+X	/*
+X	 * complain if we are in an error state,
+X	 * or they asked for something stupid
+X	 */
+X	if (gfp->errno)
+X	{
+X		errno = gfp->errno;
+X		result = EOF;
+X		goto done;
+X	}
+X	if (gfp->fmode != O_RDONLY)
+X	{
+X		gfp->errno = EINVAL;
+X		errno = EINVAL;
+X		result = EOF;
+X		goto done;
+X	}
+X
+X	/*
+X	 * use pushback if there is anything in it
+X	 */
+X	if (gfp->pushback != EOF)
+X	{
+X		result = gfp->pushback;
+X		gfp->pushback = EOF;
+X		goto done;
+X	}
+X
+X	/*
+X	 * use the buffer if there is anything in it
+X	 */
+X	if (gfp->buffer_pos && gfp->buffer_pos < gfp->buffer_end)
+X	{
+X		result = (unsigned char)*gfp->buffer_pos++;
+X		goto done;
+X	}
+X	gfp->buffer_pos = 0;
+X	gfp->buffer_end = 0;
+X
+X	/*
+X	 * tell the proxy to read another buffer-full
+X	 */
+X	pp = gfp->pp;
+X	putc(command_read, pp->command);
+X	put_int(pp->command, gfp->fd);
+X	put_long(pp->command, (long)sizeof(gfp->buffer));
+X	end_of_command(pp);
+X	nbytes = get_long(pp->reply);
+X	if (nbytes < 0)
+X	{
+X		gfp->errno = get_int(pp->reply);
+X		errno = gfp->errno;
+X		result = EOF;
+X		goto done;
+X	}
+X	if (nbytes == 0)
+X	{
+X		errno = 0;
+X		result = EOF;
+X		goto done;
+X	}
+X	assert(nbytes <= sizeof(gfp->buffer));
+X	get_binary(pp->reply, gfp->buffer, nbytes);
+X	gfp->buffer_pos = gfp->buffer;
+X	gfp->buffer_end = gfp->buffer + nbytes;
+X	result = (unsigned char)*gfp->buffer_pos++;
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X#if 0
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X#endif
+X	return result;
+X}
+X
+X
+Xint
+Xglue_ungetc(c, fp)
+X	int		c;
+X	FILE		*fp;
+X{
+X	glue_file_ty	*gfp;
+X	int		result;
+X
+X	/*
+X	 * Leave the standard file streams alone.
+X	 * There is a chance these will be seen here.
+X	 */
+X	if (fp == stdout || fp == stdin || fp == stderr)
+X		return ungetc(c, fp);
+X
+X	/*
+X	 * make a pointer to our data
+X	 */
+X	trace(("glue_ungetc()\n{\n"/*}*/));
+X	result = EOF;
+X	gfp = (glue_file_ty *)fp;
+X	assert(gfp->guard1 == GUARD1);
+X	assert(gfp->guard2 == GUARD2);
+X
+X	/*
+X	 * make sure not too many
+X	 */
+X	if (gfp->pushback != EOF || c == EOF)
+X	{
+X		gfp->errno = EINVAL;
+X		errno = EINVAL;
+X		gfp->pushback = EOF;
+X		goto done;
+X	}
+X
+X	/*
+X	 * stash the returned char
+X	 */
+X	gfp->pushback = (unsigned char)c;
+X	result = (unsigned char)c;
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_fputc(c, fp)
+X	int		c;
+X	FILE		*fp;
+X{
+X	proxy_ty	*pp;
+X	glue_file_ty	*gfp;
+X	int		result;
+X
+X	/*
+X	 * Leave the standard file streams alone.
+X	 * There is a chance these will be seen here.
+X	 */
+X	if (fp == stdout || fp == stdin || fp == stderr)
+X		return putc(c, fp);
+X
+X	/*
+X	 * locate the appropriate proxy
+X	 */
+X#if 0
+X	trace(("glue_fputc()\n{\n"/*}*/));
+X#endif
+X	result = EOF;
+X	gfp = (glue_file_ty *)fp;
+X	assert(gfp->guard1 == GUARD1);
+X	assert(gfp->guard2 == GUARD2);
+X	pp = gfp->pp;
+X
+X	/*
+X	 * if the stream is in an error state,
+X	 * or we were asked to do something stupid,
+X	 * return the error
+X	 */
+X	if (gfp->errno)
+X	{
+X		errno = gfp->errno;
+X		goto done;
+X	}
+X	if (gfp->fmode == O_RDONLY)
+X	{
+X		gfp->errno = EINVAL;
+X		errno = EINVAL;
+X		goto done;
+X	}
+X
+X	/*
+X	 * if there is no room in the buffer,
+X	 * flush it to the proxy
+X	 */
+X	assert(gfp->buffer_pos);
+X	if (gfp->buffer_pos >= gfp->buffer_end)
+X	{
+X		long	nbytes;
+X		long	nbytes2;
+X
+X		putc(command_write, pp->command);
+X		put_int(pp->command, gfp->fd);
+X		nbytes = gfp->buffer_pos - gfp->buffer;
+X		put_long(pp->command, nbytes);
+X		put_binary(pp->command, gfp->buffer, nbytes);
+X		end_of_command(pp);
+X		nbytes2 = get_long(pp->reply);
+X		if (nbytes2 < 0)
+X		{
+X			gfp->errno = get_int(pp->reply);
+X			errno = gfp->errno;
+X			goto done;
+X		}
+X		if (nbytes2 != nbytes)
+X		{
+X			gfp->errno = EIO;
+X			errno = EIO;
+X			goto done;
+X		}
+X		gfp->buffer_pos = gfp->buffer;
+X		gfp->buffer_end = gfp->buffer + sizeof(gfp->buffer);
+X	}
+X
+X	/*
+X	 * stash the character
+X	 */
+X	*gfp->buffer_pos++ = c;
+X	result = (unsigned char)c;
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X#if 0
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X#endif
+X	return result;
+X}
+X
+X
+Xint
+Xglue_ferror(fp)
+X	FILE		*fp;
+X{
+X	glue_file_ty	*gfp;
+X
+X	/*
+X	 * Leave the standard file streams alone.
+X	 * There is a chance these will be seen here.
+X	 */
+X	if (fp == stdout || fp == stdin || fp == stderr)
+X		return ferror(fp);
+X
+X	/*
+X	 * locate the appropriate proxy
+X	 */
+X	gfp = (glue_file_ty *)fp;
+X	assert(gfp->guard1 == GUARD1);
+X	assert(gfp->guard2 == GUARD2);
+X
+X	/*
+X	 * set errno depending on
+X	 * the error for this stream.
+X	 */
+X	if (gfp->errno)
+X	{
+X		errno = gfp->errno;
+X		gfp->errno = 0;
+X		return 1;
+X	}
+X	return 0;
+X}
+X
+X
+Xint
+Xglue_fflush(fp)
+X	FILE		*fp;
+X{
+X	glue_file_ty	*gfp;
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	/*
+X	 * Leave the standard file streams alone.
+X	 * There is a chance these will be seen here.
+X	 */
+X	if (fp == stdout || fp == stdin || fp == stderr)
+X		return fflush(fp);
+X
+X	/*
+X	 * locate the appropriate proxy
+X	 */
+X	trace(("glue_fflush()\n{\n"/*}*/));
+X	result = EOF;
+X	gfp = (glue_file_ty *)fp;
+X	assert(gfp->guard1 == GUARD1);
+X	assert(gfp->guard2 == GUARD2);
+X	pp = gfp->pp;
+X
+X	/*
+X	 * if the stream is in an error state,
+X	 * don't do anything
+X	 */
+X	if (gfp->errno)
+X	{
+X		errno = gfp->errno;
+X		goto done;
+X	}
+X	if (gfp->fmode == O_RDONLY)
+X	{
+X		gfp->errno = EINVAL;
+X		errno = EINVAL;
+X		goto done;
+X	}
+X
+X	/*
+X	 * if there is anything in the buffer,
+X	 * send it to the proxy
+X	 */
+X	if (gfp->buffer_pos && gfp->buffer_pos > gfp->buffer)
+X	{
+X		long	nbytes;
+X		long	nbytes2;
+X
+X		putc(command_write, pp->command);
+X		put_int(pp->command, gfp->fd);
+X		nbytes = gfp->buffer_pos - gfp->buffer;
+X		put_long(pp->command, nbytes);
+X		put_binary(pp->command, gfp->buffer, nbytes);
+X		end_of_command(pp);
+X		nbytes2 = get_long(pp->reply);
+X		if (nbytes2 < 0)
+X		{
+X			gfp->errno = get_int(pp->reply);
+X			errno = gfp->errno;
+X			goto done;
+X		}
+X		if (nbytes2 != nbytes)
+X		{
+X			gfp->errno = EIO;
+X			errno = EIO;
+X			goto done;
+X		}
+X		gfp->buffer_pos = gfp->buffer;
+X		gfp->buffer_end = gfp->buffer + sizeof(gfp->buffer);
+X	}
+X	result = 0;
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_open(path, mode, perm)
+X	char		*path;
+X	int		mode;
+X	int		perm;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_open()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_open, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, mode);
+X	put_int(pp->command, perm);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result < 0)
+X		errno = get_int(pp->reply);
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_creat(path, mode)
+X	char		*path;
+X	int		mode;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_creat()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_creat, pp->command);
+X	put_string(pp->command, path);
+X	put_int(pp->command, mode);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result < 0)
+X		errno = get_int(pp->reply);
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_close(fd)
+X	int		fd;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_close()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_close, pp->command);
+X	put_int(pp->command, fd);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_write(fd, buf, len)
+X	int		fd;
+X	char		*buf;
+X	long		len;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_write()\n{\n"/*}*/));
+X	pp = proxy_find();
+X	putc(command_write, pp->command);
+X	put_int(pp->command, fd);
+X	put_long(pp->command, len);
+X	put_binary(pp->command, buf, len);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_fcntl(fd, cmd, data)
+X	int		fd;
+X	int		cmd;
+X	struct flock	*data;
+X{
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_fcntl()\n{\n"/*}*/));
+X	assert(cmd == F_SETLKW || cmd == F_SETLK || cmd == F_UNLCK ||
+X		cmd == F_GETLK);
+X	pp = proxy_find();
+X	putc(command_fcntl, pp->command);
+X	put_int(pp->command, fd);
+X	put_int(pp->command, cmd);
+X	put_binary(pp->command, data, sizeof(*data));
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	get_binary(pp->reply, data, sizeof(*data));
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xglue_read_whole_dir(path, data_p, data_len_p)
+X	char		*path;
+X	char		**data_p;
+X	long		*data_len_p;
+X{
+X	static char	*data;
+X	static long	data_max;
+X	long		data_len;
+X	proxy_ty	*pp;
+X	int		result;
+X
+X	trace(("glue_read_whole_dir(path = \"%s\")\n{\n"/*}*/, path));
+X	pp = proxy_find();
+X	putc(command_read_whole_dir, pp->command);
+X	put_string(pp->command, path);
+X	end_of_command(pp);
+X	result = get_int(pp->reply);
+X	if (result)
+X	{
+X		errno = result;
+X		result = -1;
+X	}
+X	else
+X	{
+X		data_len = get_long(pp->reply);
+X		if (data_len > data_max)
+X		{
+X			data_max = data_len;
+X			if (!data)
+X				data = mem_alloc(data_max);
+X			else
+X				mem_change_size(&data, data_max);
+X		}
+X		get_binary(pp->reply, data, data_len);
+X		*data_len_p = data_len;
+X		*data_p = data;
+X	}
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X#endif /* CONF_NO_seteuid */
+X
+X
+X/*
+X * NAME
+X *	copyfile - copy a file
+X *
+X * SYNOPSIS
+X *	int copyfile(char *src, char *dst);
+X *
+X * DESCRIPTION
+X *	The copyfile function complements the link and rename functions.
+X *
+X * ARGUMENTS
+X *	src	- pathname of source file
+X *	dst	- pathname of destination file
+X *
+X * RETURNS
+X *	0	on success
+X *	-1	on error, setting errno appropriately
+X */
+X
+Xint
+Xcopyfile(src, dst)
+X	char	*src;
+X	char	*dst;
+X{
+X	int	src_fd;
+X	int	dst_fd;
+X	char	*buffer;
+X	long	max;
+X	long	nbytes;
+X	long	nbytes2;
+X	int	err;
+X	int	result;
+X
+X	trace(("copyfile(\"%s\", \"%s\")\n{\n"/*}*/, src, dst));
+X	result = -1;
+X	src_fd = open(src, O_RDONLY, 0666);
+X	if (src_fd < 0)
+X		goto done;
+X	dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+X	if (dst_fd < 0)
+X	{
+X		err = errno;
+X		close(src_fd);
+X		errno = err;
+X		goto done;
+X	}
+X
+X	max = 1L << 13;
+X	errno = 0;
+X	buffer = malloc(max);
+X	if (!buffer)
+X	{
+X		err = errno ? errno : ENOMEM;
+X		close(dst_fd);
+X		close(src_fd);
+X		errno = err;
+X		goto done;
+X	}
+X
+X	for (;;)
+X	{
+X		nbytes = read(src_fd, buffer, max);
+X		if (nbytes < 0)
+X		{
+X			err = errno;
+X			close(src_fd);
+X			close(dst_fd);
+X			free(buffer);
+X			errno = err;
+X			goto done;
+X		}
+X		if (nbytes == 0)
+X			break;
+X		
+X		nbytes2 = write(dst_fd, buffer, nbytes);
+X		if (nbytes2 < 0)
+X		{
+X			err = errno;
+X			close(src_fd);
+X			close(dst_fd);
+X			free(buffer);
+X			errno = err;
+X			goto done;
+X		}
+X		if (nbytes2 != nbytes)
+X		{
+X			close(src_fd);
+X			close(dst_fd);
+X			free(buffer);
+X			errno = EIO; /* weird device, probably */
+X			goto done;
+X		}
+X	}
+X	free(buffer);
+X	if (close(src_fd))
+X	{
+X		err = errno;
+X		close(dst_fd);
+X		errno = err;
+X		goto done;
+X	}
+X	result = close(dst_fd);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X/*
+X * NAME
+X *	catfile - copy a file
+X *
+X * SYNOPSIS
+X *	int catfile(char *path);
+X *
+X * DESCRIPTION
+X *	The catfile function is used to print the contents of
+X *	a file on the standard output.
+X *
+X * ARGUMENTS
+X *	path	- pathname of source file
+X *
+X * RETURNS
+X *	0	on success
+X *	-1	on error, setting errno appropriately
+X */
+X
+Xint
+Xcatfile(path)
+X	char	*path;
+X{
+X	int	fd;
+X	char	*buffer;
+X	long	max;
+X	long	nbytes;
+X	long	nbytes2;
+X	int	err;
+X	int	result;
+X
+X	trace(("catfile(\"%s\")\n{\n"/*}*/, path));
+X	result = -1;
+X	fd = open(path, O_RDONLY, 0666);
+X	if (fd < 0)
+X		goto done;
+X
+X	max = 1L << 13;
+X	errno = 0;
+X	buffer = malloc(max);
+X	if (!buffer)
+X	{
+X		err = errno ? errno : ENOMEM;
+X		close(fd);
+X		errno = err;
+X		goto done;
+X	}
+X
+X	for (;;)
+X	{
+X		nbytes = read(fd, buffer, max);
+X		if (nbytes < 0)
+X		{
+X			err = errno;
+X			close(fd);
+X			free(buffer);
+X			errno = err;
+X			goto done;
+X		}
+X		if (nbytes == 0)
+X			break;
+X		
+X		nbytes2 = write(fileno(stdout), buffer, nbytes);
+X		if (nbytes2 < 0)
+X		{
+X			err = errno;
+X			close(fd);
+X			free(buffer);
+X			errno = err;
+X			goto done;
+X		}
+X		if (nbytes2 != nbytes)
+X		{
+X			close(fd);
+X			free(buffer);
+X			errno = EIO; /* weird device, probably */
+X			goto done;
+X		}
+X	}
+X	free(buffer);
+X	result = close(fd);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace(("return %d; /* errno = %d */\n", result, errno));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xint
+Xread_whole_dir(path, data_p, data_len_p)
+X	char		*path;
+X	char		**data_p;
+X	long		*data_len_p;
+X{
+X	DIR		*dp;
+X	struct dirent	*de;
+X	static char	*data;
+X	static size_t	data_len;
+X	static size_t	data_max;
+X	char		*np;
+X	size_t		len;
+X
+X	errno = ENOMEM;
+X	dp = opendir(path);
+X	if (!dp)
+X		return -1;
+X	errno = 0;
+X	if (!data)
+X	{
+X		data_max = 1000;
+X		data = mem_alloc(data_max);
+X	}
+X	data_len = 0;
+X	for (;;)
+X	{
+X		de = readdir(dp);
+X		if (!de)
+X			break;
+X		np = de->d_name;
+X#ifdef CONF_pyramid_broken_readdir
+X		np -= 2;
+X#endif
+X		if (np[0] == '.' && (!np[1] || (np[1] == '.' && !np[2])))
+X			continue;
+X		len = strlen(np) + 1;
+X		if (data_len + len > data_max)
+X		{
+X			data_max += 1000;
+X			mem_change_size(&data, data_max);
+X		}
+X		memcpy(data + data_len, np, len);
+X		data_len += len;
+X	}
+X	closedir(dp);
+X	*data_p = data;
+X	*data_len_p = data_len;
+X	return 0;
+X}
+END_OF_FILE
+if test 40198 -ne `wc -c <'aegis/glue.c'`; then
+    echo shar: \"'aegis/glue.c'\" unpacked with wrong size!
+fi
+# end of 'aegis/glue.c'
+fi
+if test -f 'aegis/project.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'aegis/project.c'\"
+else
+echo shar: Extracting \"'aegis/project.c'\" \(27441 characters\)
+sed "s/^X//" >'aegis/project.c' <<'END_OF_FILE'
+X/*
+X *	aegis - project change supervisor
+X *	Copyright (C) 1991, 1992, 1993 Peter Miller.
+X *	All rights reserved.
+X *
+X *	This program is free software; you can redistribute it and/or modify
+X *	it under the terms of the GNU General Public License as published by
+X *	the Free Software Foundation; either version 2 of the License, or
+X *	(at your option) any later version.
+X *
+X *	This program is distributed in the hope that it will be useful,
+X *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+X *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X *	GNU General Public License for more details.
+X *
+X *	You should have received a copy of the GNU General Public License
+X *	along with this program; if not, write to the Free Software
+X *	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X * MANIFEST: functions to manipulate project state data
+X */
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <stdlib.h>
+X
+X#include <change.h>
+X#include <commit.h>
+X#include <error.h>
+X#include <gonzo.h>
+X#include <lock.h>
+X#include <mem.h>
+X#include <option.h>
+X#include <os.h>
+X#include <project.h>
+X#include <pstate.h>
+X#include <s-v-arg.h>
+X#include <trace.h>
+X#include <user.h>
+X#include <undo.h>
+X
+X
+Xstatic void improve _((pstate));
+X
+Xstatic void
+Ximprove(pstate_data)
+X	pstate		pstate_data;
+X{
+X	trace(("improve(pstate_data = %08lX)\n{\n"/*}*/, pstate_data));
+X	if (!pstate_data->administrator)
+X		pstate_data->administrator =
+X			(pstate_administrator_list)
+X			pstate_administrator_list_type.alloc();
+X	if (!pstate_data->developer)
+X		pstate_data->developer =
+X			(pstate_developer_list)
+X			pstate_developer_list_type.alloc();
+X	if (!pstate_data->reviewer)
+X		pstate_data->reviewer =
+X			(pstate_reviewer_list)
+X			pstate_reviewer_list_type.alloc();
+X	if (!pstate_data->integrator)
+X		pstate_data->integrator =
+X			(pstate_integrator_list)
+X			pstate_integrator_list_type.alloc();
+X	if (!pstate_data->change)
+X		pstate_data->change =
+X			(pstate_change_list)
+X			pstate_change_list_type.alloc();
+X	if (!pstate_data->src)
+X		pstate_data->src =
+X			(pstate_src_list)
+X			pstate_src_list_type.alloc();
+X	if (!pstate_data->history)
+X		pstate_data->history =
+X			(pstate_history_list)
+X			pstate_history_list_type.alloc();
+X	if (!(pstate_data->mask & pstate_version_major_mask))
+X		pstate_data->version_major = 1;
+X	if (!(pstate_data->mask & pstate_version_minor_mask))
+X		pstate_data->version_minor = 0;
+X	/*
+X	 * owner: always read, always write, always search/exec.
+X	 * group: always read, never write, always search/exec.
+X	 * other: configurable read, never write, configurable search/exec.
+X	 *
+X	 * This means that the X's can be configured:
+X	 *	000 010 X1X
+X	 * and all else is pre-ordained.
+X	 */
+X	if (!pstate_data->umask)
+X		pstate_data->umask = DEFAULT_UMASK;
+X	pstate_data->umask = (pstate_data->umask & 5) | 022;
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xproject_ty *
+Xproject_alloc(s)
+X	string_ty	*s;
+X{
+X	project_ty	*pp;
+X
+X	trace(("project_alloc(s = \"%s\")\n{\n"/*}*/, s->str_text));
+X	pp = (project_ty *)mem_alloc_clear(sizeof(project_ty));
+X	pp->reference_count = 1;
+X	pp->name = str_copy(s);
+X	trace(("return %08lX;\n", pp));
+X	trace((/*{*/"}\n"));
+X	return pp;
+X}
+X
+X
+Xproject_ty *
+Xproject_copy(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_copy(pp = %08lX)\n{\n"/*}*/, pp));
+X	assert(pp->reference_count >= 1);
+X	pp->reference_count++;
+X	trace(("return %08lX;\n", pp));
+X	trace((/*{*/"}\n"));
+X	return pp;
+X}
+X
+X
+Xvoid
+Xproject_free(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_free(pp = %08lX)\n{\n"/*}*/, pp));
+X	assert(pp->reference_count >= 1);
+X	pp->reference_count--;
+X	if (pp->reference_count <= 0)
+X	{
+X		str_free(pp->name);
+X		if (pp->home_path)
+X			str_free(pp->home_path);
+X		if (pp->baseline_path_unresolved)
+X			str_free(pp->baseline_path_unresolved);
+X		if (pp->baseline_path)
+X			str_free(pp->baseline_path);
+X		if (pp->history_path)
+X			str_free(pp->history_path);
+X		if (pp->info_path)
+X			str_free(pp->info_path);
+X		if (pp->pstate_path)
+X			str_free(pp->pstate_path);
+X		if (pp->changes_path)
+X			str_free(pp->changes_path);
+X		if (pp->pstate_data)
+X			pstate_type.free(pp->pstate_data);
+X		mem_free((char *)pp);
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic void lock_sync _((project_ty *));
+X
+Xstatic void
+Xlock_sync(pp)
+X	project_ty	*pp;
+X{
+X	long		n;
+X
+X	n = lock_magic();
+X	if (pp->lock_magic == n)
+X		return;
+X	pp->lock_magic = n;
+X
+X	if (!pp->pstate_data)
+X		return;
+X	if (pp->is_a_new_file)
+X		return;
+X	pstate_type.free(pp->pstate_data);
+X	pp->pstate_data = 0;
+X}
+X
+X
+Xpstate
+Xproject_pstate_get(pp)
+X	project_ty	*pp;
+X{
+X	int		j, k;
+X
+X	trace(("project_pstate_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	lock_sync(pp);
+X	if (!pp->pstate_data)
+X	{
+X		string_ty	*path;
+X
+X		path = project_pstate_path_get(pp);
+X		pp->is_a_new_file = 0;
+X
+X		/*
+X		 * can't become the project, because don't know who
+X		 * the project is, yet.
+X		 *
+X		 * This also means we can use UNIX system security
+X		 * to exclude unwelcome access.
+X		 */
+X		os_become_orig();
+X		pp->pstate_data = pstate_read_file(path->str_text);
+X		os_become_undo();
+X
+X		if (pp->pstate_data->next_change_number < 1)
+X		{
+X			project_fatal
+X			(
+X				pp,
+X				"%S: corrupted next_change_number field",
+X				pp->pstate_path
+X			);
+X		}
+X		if (pp->pstate_data->next_delta_number < 1)
+X		{
+X			project_fatal
+X			(
+X				pp,
+X				"%S: corrupted next_delta_number field",
+X				pp->pstate_path
+X			);
+X		}
+X		if (!pp->pstate_data->owner_name)
+X		{
+X			project_fatal
+X			(
+X				pp,
+X				"%S: corrupted owner_name field",
+X				pp->pstate_path
+X			);
+X		}
+X		if (!pp->pstate_data->group_name)
+X		{
+X			project_fatal
+X			(
+X				pp,
+X				"%S: corrupted group_name field",
+X				pp->pstate_path
+X			);
+X		}
+X		if (!pp->pstate_data->next_test_number)
+X		{
+X			project_fatal
+X			(
+X				pp,
+X				"%S: corrupted next_test_number field",
+X				pp->pstate_path
+X			);
+X		}
+X		improve(pp->pstate_data);
+X
+X		for (j = 0; j < pp->pstate_data->src->length; ++j)
+X		{
+X			for (k = j + 1; k < pp->pstate_data->src->length; ++k)
+X			{
+X				if
+X				(
+X					str_equal
+X					(
+X				      pp->pstate_data->src->list[j]->file_name,
+X				      pp->pstate_data->src->list[k]->file_name
+X					)
+X				)
+X				{
+X					project_fatal
+X					(
+X						pp,
+X					       "%S: duplicate \"%S\" src entry",
+X						pp->pstate_path,
+X				       pp->pstate_data->src->list[j]->file_name
+X					);
+X				}
+X
+X			}
+X		}
+X	}
+X	trace(("return %08lX;\n", pp->pstate_data));
+X	trace((/*{*/"}\n"));
+X	return pp->pstate_data;
+X}
+X
+X
+Xvoid
+Xproject_pstate_lock_prepare(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_pstate_lock_prepare(pp = %08lX)\n{\n"/*}*/, pp));
+X	lock_prepare_pstate(pp->name);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xproject_build_read_lock_prepare(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_build_read_lock_prepare(pp = %08lX)\n{\n"/*}*/, pp));
+X	lock_prepare_build_read(pp->name);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xproject_build_write_lock_prepare(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_build_write_lock_prepare(pp = %08lX)\n{\n"/*}*/, pp));
+X	lock_prepare_build_write(pp->name);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xproject_bind_existing(pp)
+X	project_ty	*pp;
+X{
+X	string_ty	*s;
+X
+X	/*
+X	 * make sure project exists
+X	 */
+X	trace(("project_bind_existing(pp = %08lX)\n{\n"/*}*/, pp));
+X	assert(!pp->home_path);
+X	s = gonzo_project_home_path_from_name(pp->name);
+X	if (!s)
+X		fatal("project \"%s\" unknown", pp->name->str_text);
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	pp->home_path = str_copy(s);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xproject_bind_new(pp)
+X	project_ty	*pp;
+X{
+X	/*
+X	 * make sure name is appropriate length
+X	 */
+X	trace(("project_bind_new()\n{\n"/*}*/));
+X	if (pp->name->str_length > PATH_ELEMENT_MAX - 4)
+X	{
+X		fatal
+X		(
+X			"project name \"%s\" too long (by %d)",
+X			pp->name->str_text,
+X			pp->name->str_length - (PATH_ELEMENT_MAX - 4)
+X		);
+X	}
+X
+X	/*
+X	 * make sure does not already exist
+X	 */
+X	if (gonzo_project_home_path_from_name(pp->name))
+X		fatal("project name \"%s\" already in use", pp->name->str_text);
+X
+X	/*
+X	 * allocate data structures
+X	 */
+X	assert(!pp->pstate_data);
+X	assert(!pp->pstate_path);
+X	pp->is_a_new_file = 1;
+X	pp->pstate_data = (pstate)pstate_type.alloc();
+X	pp->pstate_data->next_change_number = 1;
+X	pp->pstate_data->next_delta_number = 1;
+X	pp->pstate_data->next_test_number = 1;
+X	pp->pstate_data->version_major = 1;
+X	improve(pp->pstate_data);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic int src_cmp _((const void *, const void *));
+X
+Xstatic int
+Xsrc_cmp(s1p, s2p)
+X	const void	*s1p;
+X	const void	*s2p;
+X{
+X	pstate_src	s1;
+X	pstate_src	s2;
+X
+X	s1 = *(pstate_src *)s1p;
+X	s2 = *(pstate_src *)s2p;
+X	return strcmp(s1->file_name->str_text, s2->file_name->str_text);
+X}
+X
+X
+Xvoid
+Xproject_pstate_write(pp)
+X	project_ty	*pp;
+X{
+X	string_ty	*filename;
+X	string_ty	*filename_new;
+X	string_ty	*filename_old;
+X	static int	count;
+X
+X	trace(("project_pstate_write(pp)\n{\n"/*}*/, pp));
+X	assert(pp->pstate_data);
+X	filename = project_pstate_path_get(pp);
+X
+X	/*
+X	 * sort the file names
+X	 */
+X	assert(pp->pstate_data->src);
+X	if (pp->pstate_data->src->length >= 2)
+X	{
+X		assert(pp->pstate_data->src->list);
+X		qsort
+X		(
+X			pp->pstate_data->src->list,
+X			pp->pstate_data->src->length,
+X			sizeof(*pp->pstate_data->src->list),
+X			src_cmp
+X		);
+X	}
+X
+X	/*
+X	 * write it out
+X	 */
+X	filename_new = str_format("%S,%d", filename, ++count);
+X	filename_old = str_format("%S,%d", filename, ++count);
+X	project_become(pp);
+X	if (pp->is_a_new_file)
+X	{
+X		undo_unlink_errok(filename_new);
+X		pstate_write_file(filename_new->str_text, pp->pstate_data);
+X		commit_rename(filename_new, filename);
+X	}
+X	else
+X	{
+X		undo_unlink_errok(filename_new);
+X		pstate_write_file(filename_new->str_text, pp->pstate_data);
+X		commit_rename(filename, filename_old);
+X		commit_rename(filename_new, filename);
+X		commit_unlink_errok(filename_old);
+X	}
+X
+X	/*
+X	 * Change so the project owns it.
+X	 * (Only needed for new files, but be paranoid.)
+X	 */
+X	os_chmod(filename_new, 0644 & ~project_umask(pp));
+X	project_become_undo();
+X	str_free(filename_new);
+X	str_free(filename_old);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstring_ty *
+Xproject_home_path_get(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_home_path_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	if (!pp->home_path)
+X	{
+X		string_ty	*s;
+X
+X		/*
+X		 * it is an error if the project name is not known
+X		 */
+X		s = gonzo_project_home_path_from_name(pp->name);
+X		if (!s)
+X			fatal("project \"%s\" unknown", pp->name->str_text);
+X		/*
+X		 * To cope with automounters, directories are stored as given,
+X		 * or are derived from the home directory in the passwd file.
+X		 * Within aegis, pathnames have their symbolic links resolved,
+X		 * and any comparison of paths is done on this "system idea"
+X		 * of the pathname.
+X		 */
+X		pp->home_path = str_copy(s);
+X	}
+X	trace(("return \"%s\";\n", pp->home_path->str_text));
+X	trace((/*{*/"}\n"));
+X	return pp->home_path;
+X}
+X
+X
+Xvoid
+Xproject_home_path_set(pp, s)
+X	project_ty	*pp;
+X	string_ty	*s;
+X{
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	trace(("project_home_path_set(pp = %08lX, s = \"%s\")\n{\n"/*}*/, pp, s->str_text));
+X	if (pp->home_path)
+X		fatal("duplicate -DIRectory option");
+X	pp->home_path = str_copy(s);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstring_ty *
+Xproject_info_path_get(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_info_path_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	if (!pp->info_path)
+X	{
+X		pp->info_path =
+X			str_format("%S/info", project_home_path_get(pp));
+X	}
+X	trace(("return \"%s\";\n", pp->info_path->str_text));
+X	trace((/*{*/"}\n"));
+X	return pp->info_path;
+X}
+X
+X
+Xstring_ty *
+Xproject_changes_path_get(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_changes_path_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	if (!pp->changes_path)
+X	{
+X		pp->changes_path =
+X			str_format("%S/change", project_info_path_get(pp));
+X	}
+X	trace(("return \"%s\";\n", pp->changes_path->str_text));
+X	trace((/*{*/"}\n"));
+X	return pp->changes_path;
+X}
+X
+X
+Xstring_ty *
+Xproject_change_path_get(pp, n)
+X	project_ty	*pp;
+X	long		n;
+X{
+X	string_ty	*s;
+X
+X	trace(("project_change_path_get(pp = %08lX, n = %ld)\n{\n"/*}*/, pp, n));
+X	s = str_format("%S/%d/%3.3d", project_changes_path_get(pp), n / 100, n);
+X	trace(("return \"%s\";\n", s->str_text));
+X	trace((/*{*/"}\n"));
+X	return s;
+X}
+X
+X
+Xstring_ty *
+Xproject_pstate_path_get(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_pstate_path_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	if (!pp->pstate_path)
+X	{
+X		pp->pstate_path =
+X			str_format("%S/state", project_info_path_get(pp));
+X	}
+X	trace(("return \"%s\";\n", pp->pstate_path->str_text));
+X	trace((/*{*/"}\n"));
+X	return pp->pstate_path;
+X}
+X
+X
+Xstring_ty *
+Xproject_baseline_path_get(pp, resolve)
+X	project_ty	*pp;
+X	int		resolve;
+X{
+X	string_ty	*result;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	trace(("project_baseline_path_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	if (!pp->baseline_path_unresolved)
+X	{
+X		pp->baseline_path_unresolved =
+X			str_format("%S/baseline", project_home_path_get(pp));
+X	}
+X	if (!resolve)
+X		result = pp->baseline_path_unresolved;
+X	else
+X	{
+X		if (!pp->baseline_path)
+X		{
+X			project_become(pp);
+X			pp->baseline_path =
+X				os_pathname(pp->baseline_path_unresolved, 1);
+X			project_become_undo();
+X		}
+X		result = pp->baseline_path;
+X	}
+X	trace(("return \"%s\";\n", result->str_text));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xstring_ty *
+Xproject_history_path_get(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_history_path_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	if (!pp->history_path)
+X	{
+X		pp->history_path =
+X			str_format("%S/history", project_home_path_get(pp));
+X	}
+X	trace(("return \"%s\";\n", pp->history_path->str_text));
+X	trace((/*{*/"}\n"));
+X	return pp->history_path;
+X}
+X
+X
+Xstring_ty *
+Xproject_name_get(pp)
+X	project_ty	*pp;
+X{
+X	trace(("project_name_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	trace(("return \"%s\";\n", pp->name->str_text));
+X	trace((/*{*/"}\n"));
+X	return pp->name;
+X}
+X
+X
+Xpstate_src
+Xproject_src_find(pp, file_name)
+X	project_ty	*pp;
+X	string_ty	*file_name;
+X{
+X	pstate		pstate_data;
+X	int		j;
+X	pstate_src	src_data;
+X
+X	trace(("project_src_find(pp = %08lX, file_name = \"%s\")\n{\n"/*}*/, pp, file_name->str_text));
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->src);
+X	for (j = 0; j < pstate_data->src->length; ++j)
+X	{
+X		src_data = pstate_data->src->list[j];
+X		if (str_equal(src_data->file_name, file_name))
+X			goto ret;
+X	}
+X	src_data = 0;
+X	ret:
+X	trace(("return %08lX;\n", src_data));
+X	trace((/*{*/"}\n"));
+X	return src_data;
+X}
+X
+X
+Xpstate_src
+Xproject_src_new(pp, file_name)
+X	project_ty	*pp;
+X	string_ty	*file_name;
+X{
+X	pstate		pstate_data;
+X	pstate_src	src_data;
+X	pstate_src	*addr;
+X	type_ty		*type_p;
+X
+X	trace(("project_src_new(pp = %08lX, file_name = \"%s\")\n{\n"/*}*/, pp, file_name->str_text));
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->src);
+X	pstate_src_list_type.list_parse(pstate_data->src, &type_p, (void **)&addr);
+X	src_data = (pstate_src)pstate_src_type.alloc();
+X	*addr = src_data;
+X	src_data->file_name = str_copy(file_name);
+X	trace(("return %08lX;\n", src_data));
+X	trace((/*{*/"}\n"));
+X	return src_data;
+X}
+X
+X
+Xvoid
+Xproject_src_remove(pp, file_name)
+X	project_ty	*pp;
+X	string_ty	*file_name;
+X{
+X	pstate		pstate_data;
+X	pstate_src	src_data;
+X	int		j;
+X
+X	trace(("project_src_remove(pp = %08lX, file_name = \"%s\")\n{\n"/*}*/, pp, file_name->str_text));
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->src);
+X	for (j = 0; ; ++j)
+X	{
+X		if (j >= pstate_data->src->length)
+X			goto ret;
+X		src_data = pstate_data->src->list[j];
+X		if (str_equal(src_data->file_name, file_name))
+X			break;
+X	}
+X	pstate_data->src->list[j] =
+X		pstate_data->src->list[--pstate_data->src->length];
+X	pstate_src_type.free(src_data);
+X	ret:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xint
+Xproject_administrator_query(pp, user)
+X	project_ty	*pp;
+X	string_ty	*user;
+X{
+X	pstate		pstate_data;
+X	int		j;
+X
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->administrator);
+X	for (j = 0; j < pstate_data->administrator->length; ++j)
+X	{
+X		if (str_equal(user, pstate_data->administrator->list[j]))
+X			return 1;
+X	}
+X	return 0;
+X}
+X
+X
+Xvoid
+Xproject_administrator_add(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	pstate		pstate_data;
+X	type_ty		*type_p;
+X	string_ty	**who_p;
+X
+X	trace(("project_administrator_add(pp = %08lX, name = \"%s\")\n{\n"/*}*/, pp, name->str_text));
+X	pstate_data = project_pstate_get(pp);
+X	pstate_administrator_list_type.list_parse
+X	(
+X		pstate_data->administrator,
+X		&type_p,
+X		(void **)&who_p
+X	);
+X	*who_p = str_copy(name);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xproject_administrator_delete(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	size_t		k;
+X	pstate		pstate_data;
+X
+X	pstate_data = project_pstate_get(pp);
+X	for (k = 0; k < pstate_data->administrator->length; ++k)
+X	{
+X		if (str_equal(name, pstate_data->administrator->list[k]))
+X		{
+X			str_free(pstate_data->administrator->list[k]);
+X			pstate_data->administrator->list[k] =
+X				pstate_data->administrator->list
+X				[
+X					--pstate_data->administrator->length
+X				];
+X			--k;
+X		}
+X	}
+X}
+X
+X
+Xint
+Xproject_developer_query(pp, user)
+X	project_ty	*pp;
+X	string_ty	*user;
+X{
+X	pstate		pstate_data;
+X	size_t		j;
+X
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->developer);
+X	for (j = 0; j < pstate_data->developer->length; ++j)
+X	{
+X		if (str_equal(user, pstate_data->developer->list[j]))
+X			return 1;
+X	}
+X	return 0;
+X}
+X
+X
+Xvoid
+Xproject_developer_add(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	pstate		pstate_data;
+X	type_ty		*type_p;
+X	string_ty	**who_p;
+X
+X	pstate_data = project_pstate_get(pp);
+X	pstate_developer_list_type.list_parse
+X	(
+X		pstate_data->developer,
+X		&type_p,
+X		(void **)&who_p
+X	);
+X	*who_p = str_copy(name);
+X}
+X
+X
+Xvoid
+Xproject_developer_delete(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	size_t		k;
+X	pstate		pstate_data;
+X
+X	pstate_data = project_pstate_get(pp);
+X	for (k = 0; k < pstate_data->developer->length; ++k)
+X	{
+X		if (str_equal(name, pstate_data->developer->list[k]))
+X		{
+X			str_free(pstate_data->developer->list[k]);
+X			pstate_data->developer->list[k] =
+X				pstate_data->developer->list
+X				[
+X					--pstate_data->developer->length
+X				];
+X			--k;
+X		}
+X	}
+X}
+X
+X
+Xint
+Xproject_integrator_query(pp, user)
+X	project_ty	*pp;
+X	string_ty	*user;
+X{
+X	pstate		pstate_data;
+X	size_t		j;
+X
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->integrator);
+X	for (j = 0; j < pstate_data->integrator->length; ++j)
+X	{
+X		if (str_equal(user, pstate_data->integrator->list[j]))
+X			return 1;
+X	}
+X	return 0;
+X}
+X
+X
+Xvoid
+Xproject_integrator_add(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	pstate		pstate_data;
+X	type_ty		*type_p;
+X	string_ty	**who_p;
+X
+X	pstate_data = project_pstate_get(pp);
+X	pstate_integrator_list_type.list_parse
+X	(
+X		pstate_data->integrator,
+X		&type_p,
+X		(void **)&who_p
+X	);
+X	*who_p = str_copy(name);
+X}
+X
+X
+Xvoid
+Xproject_integrator_delete(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	size_t		k;
+X	pstate		pstate_data;
+X
+X	pstate_data = project_pstate_get(pp);
+X	for (k = 0; k < pstate_data->integrator->length; ++k)
+X	{
+X		if (str_equal(name, pstate_data->integrator->list[k]))
+X		{
+X			str_free(pstate_data->integrator->list[k]);
+X			pstate_data->integrator->list[k] =
+X				pstate_data->integrator->list
+X				[
+X					--pstate_data->integrator->length
+X				];
+X			--k;
+X		}
+X	}
+X}
+X
+X
+Xint
+Xproject_reviewer_query(pp, user)
+X	project_ty	*pp;
+X	string_ty	*user;
+X{
+X	pstate		pstate_data;
+X	size_t		j;
+X
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->reviewer);
+X	for (j = 0; j < pstate_data->reviewer->length; ++j)
+X	{
+X		if (str_equal(user, pstate_data->reviewer->list[j]))
+X			return 1;
+X	}
+X	return 0;
+X}
+X
+X
+Xvoid
+Xproject_reviewer_add(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	pstate		pstate_data;
+X	type_ty		*type_p;
+X	string_ty	**who_p;
+X
+X	pstate_data = project_pstate_get(pp);
+X	pstate_reviewer_list_type.list_parse
+X	(
+X		pstate_data->reviewer,
+X		&type_p,
+X		(void **)&who_p
+X	);
+X	*who_p = str_copy(name);
+X}
+X
+X
+Xvoid
+Xproject_reviewer_delete(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	size_t		k;
+X	pstate		pstate_data;
+X
+X	pstate_data = project_pstate_get(pp);
+X	for (k = 0; k < pstate_data->reviewer->length; ++k)
+X	{
+X		if (str_equal(name, pstate_data->reviewer->list[k]))
+X		{
+X			str_free(pstate_data->reviewer->list[k]);
+X			pstate_data->reviewer->list[k] =
+X				pstate_data->reviewer->list
+X				[
+X					--pstate_data->reviewer->length
+X				];
+X			--k;
+X		}
+X	}
+X}
+X
+X
+Xpstate_history
+Xproject_history_new(pp)
+X	project_ty	*pp;
+X{
+X	pstate		pstate_data;
+X	pstate_history	history_data;
+X	pstate_history	*history_data_p;
+X	type_ty		*type_p;
+X
+X	trace(("project_history_new()\n{\n"/*}*/));
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->history);
+X	pstate_history_list_type.list_parse
+X	(
+X		pstate_data->history,
+X		&type_p,
+X		(void **)&history_data_p
+X	);
+X	history_data = (pstate_history)pstate_history_type.alloc();
+X	*history_data_p = history_data;
+X	trace(("return %08lX;\n", history_data));
+X	trace((/*{*/"}\n"));
+X	return history_data;
+X}
+X
+X
+Xlong
+Xproject_last_change_integrated(pp)
+X	project_ty	*pp;
+X{
+X	pstate		pstate_data;
+X	pstate_history	history_data;
+X
+X	pstate_data = project_pstate_get(pp);
+X	if (!pstate_data->history || !pstate_data->history->length)
+X		return -1;
+X	history_data =
+X		pstate_data->history->list[pstate_data->history->length - 1];
+X	return history_data->change_number;
+X}
+X
+X
+Xvoid
+Xproject_error(pp, s sva_last)
+X	project_ty	*pp;
+X	char		*s;
+X	sva_last_decl
+X{
+X	va_list		ap;
+X	string_ty	*msg;
+X
+X	sva_init(ap, s);
+X	msg = str_vformat(s, ap);
+X	va_end(ap);
+X	error
+X	(
+X		"project \"%s\": %s",
+X		project_name_get(pp)->str_text,
+X		msg->str_text
+X	);
+X	str_free(msg);
+X}
+X
+X
+Xvoid
+Xproject_fatal(pp, s sva_last)
+X	project_ty	*pp;
+X	char		*s;
+X	sva_last_decl
+X{
+X	va_list		ap;
+X	string_ty	*msg;
+X
+X	sva_init(ap, s);
+X	msg = str_vformat(s, ap);
+X	va_end(ap);
+X	fatal
+X	(
+X		"project \"%s\": %s",
+X		project_name_get(pp)->str_text,
+X		msg->str_text
+X	);
+X}
+X
+X
+Xvoid
+Xproject_verbose(pp, s sva_last)
+X	project_ty	*pp;
+X	char		*s;
+X	sva_last_decl
+X{
+X	va_list		ap;
+X	string_ty	*msg;
+X
+X	sva_init(ap, s);
+X	msg = str_vformat(s, ap);
+X	va_end(ap);
+X	verbose
+X	(
+X		"project \"%s\": %s",
+X		project_name_get(pp)->str_text,
+X		msg->str_text
+X	);
+X	str_free(msg);
+X}
+X
+X
+Xvoid
+Xproject_change_append(pp, cn)
+X	project_ty	*pp;
+X	long		cn;
+X{
+X	pstate		pstate_data;
+X	long		*change_p;
+X	type_ty		*type_p;
+X
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->change);
+X	pstate_change_list_type.list_parse
+X	(
+X		pstate_data->change,
+X		&type_p,
+X		(void **)&change_p
+X	);
+X	*change_p = cn;
+X}
+X
+X
+Xvoid
+Xproject_change_delete(pp, cn)
+X	project_ty	*pp;
+X	long		cn;
+X{
+X	pstate		pstate_data;
+X	long		j, k;
+X
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->change);
+X	for (j = 0; j < pstate_data->change->length; ++j)
+X	{
+X		if (pstate_data->change->list[j] != cn)
+X			continue;
+X		for (k = j + 1; k < pstate_data->change->length; ++k)
+X			pstate_data->change->list[k - 1] =
+X				pstate_data->change->list[k];
+X		pstate_data->change->length--;
+X		break;
+X	}
+X}
+X
+X
+Xstring_ty *
+Xproject_version_get(pp)
+X	project_ty	*pp;
+X{
+X	string_ty	*s;
+X	pstate		pstate_data;
+X	pstate_history	history_data;
+X
+X	trace(("project_version_get(pp = %08lX)\n{\n"/*}*/, pp));
+X	pstate_data = project_pstate_get(pp);
+X	assert(pstate_data->history);
+X	assert(pstate_data->history->length > 0);
+X	history_data =
+X		pstate_data->history->list[pstate_data->history->length - 1];
+X	s =
+X		str_format
+X		(
+X			"%ld.%ld.D%3.3ld",
+X			pstate_data->version_major,
+X			pstate_data->version_minor,
+X			history_data->delta_number
+X		);
+X	trace(("return \"%s\";\n", s->str_text));
+X	trace((/*{*/"}\n"));
+X	return s;
+X}
+X
+X
+Xstring_ty *
+Xproject_owner(pp)
+X	project_ty	*pp;
+X{
+X	return project_pstate_get(pp)->owner_name;
+X}
+X
+X
+Xstring_ty *
+Xproject_group(pp)
+X	project_ty	*pp;
+X{
+X	return project_pstate_get(pp)->group_name;
+X}
+X
+X
+Xstring_ty *
+Xproject_default_development_directory(pp)
+X	project_ty	*pp;
+X{
+X	pstate		pstate_data;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	pstate_data = project_pstate_get(pp);
+X	return pstate_data->default_development_directory;
+X}
+X
+X
+Xuser_ty *
+Xproject_user(pp)
+X	project_ty	*pp;
+X{
+X	user_ty		*up;
+X
+X	trace(("project_user(pp = %08lX)\n{\n"/*}*/, pp));
+X	up = user_symbolic(pp, project_owner(pp));
+X	trace(("return %08lX;\n", up));
+X	trace((/*{*/"}\n"));
+X	return up;
+X}
+X
+X
+Xvoid
+Xproject_become(pp)
+X	project_ty	*pp;
+X{
+X	user_ty		*up;
+X
+X	trace(("project_become(pp = %08lX)\n{\n"/*}*/, pp));
+X	up = project_user(pp);
+X	user_become(up);
+X	user_free(up);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xproject_become_undo()
+X{
+X	trace(("project_become_undo()\n{\n"/*}*/));
+X	user_become_undo();
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xint
+Xproject_umask(pp)
+X	project_ty	*pp;
+X{
+X	return project_pstate_get(pp)->umask;
+X}
+X
+X
+Xint
+Xproject_delta_exists(pp, delta_number)
+X	project_ty	*pp;
+X	long		delta_number;
+X{
+X	int		result;
+X	pstate		pstate_data;
+X	long		j;
+X	pstate_history	history_data;
+X
+X	trace(("project_delta_exists(pp = %08lX, delta_number = %ld)\n{\n"/*}*/, pp, delta_number));
+X	pstate_data = project_pstate_get(pp);
+X	if
+X	(
+X		pstate_data->history->length > 0
+X	&&
+X		pstate_data->history->list[pstate_data->history->length - 1]
+X			->delta_number == delta_number
+X	)
+X		result = -1;
+X	else
+X	{
+X		result = 0;
+X		for (j = 0; j < pstate_data->history->length; ++j)
+X		{
+X			history_data = pstate_data->history->list[j];
+X			if (history_data->delta_number == delta_number)
+X			{
+X				result = 1;
+X				break;
+X			}
+X		}
+X	}
+X	trace(("return %d;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X/*
+X * NAME
+X *	project_delta_to_edit
+X *
+X * SYNOPSIS
+X *	string_ty *project_delta_to_edit(project_ty *pp, long delta_number,
+X *		string_ty *file_name);
+X *
+X * DESCRIPTION
+X *	The project_delta_to_edit function is used to map a delta number
+X *	into a specific edit number for a project source file.  This requires
+X *	roll-forward of the edits to the named file, until the relevant
+X *	delta is reached.
+X *
+X * ARGUMENTS
+X *	pp		- project file is in
+X *	delta_number	- delta number wanted
+X *	file_name	- name of file
+X *
+X * RETURNS
+X *	string_ty *;	string containing edit number,
+X *			NULL if file does not exist at this delta.
+X *
+X * CAVEAT
+X *	It is the caller's responsibility to free the string returned
+X *	when not futher required.
+X */
+X
+Xstring_ty *
+Xproject_delta_to_edit(pp, delta_number, file_name)
+X	project_ty	*pp;
+X	long		delta_number;
+X	string_ty	*file_name;
+X{
+X	string_ty	*edit_number;
+X	pstate		pstate_data;
+X	pstate_history	history_data;
+X	long		j;
+X	change_ty	*cp;
+X	cstate_src	src_data;
+X
+X	trace(("project_delta_exists(pp = %08lX, delta_number = %ld)\n{\n"/*}*/, pp, delta_number));
+X	edit_number = 0;
+X	pstate_data = project_pstate_get(pp);
+X	for (j = 0; j < pstate_data->history->length; ++j)
+X	{
+X		history_data = pstate_data->history->list[j];
+X		cp = change_alloc(pp, history_data->change_number);
+X		src_data = change_src_find(cp, file_name);
+X		if (src_data)
+X		{
+X			if (src_data->action == file_action_remove)
+X			{
+X				if (edit_number)
+X					str_free(edit_number);
+X				edit_number = 0;
+X			}
+X			else
+X			{
+X				/*
+X				 * there should always be an edit number,
+X				 * because it is checked for when the file
+X				 * is read in.
+X				 */
+X				assert(src_data->edit_number);
+X				if (edit_number)
+X					str_free(edit_number);
+X				edit_number = str_copy(src_data->edit_number);
+X			}
+X		}
+X		change_free(cp);
+X		if (history_data->delta_number == delta_number)
+X			break;
+X	}
+X	trace(("return %s;\n", edit_number ? edit_number->str_text : "NULL"));
+X	trace((/*{*/"}\n"));
+X	return edit_number;
+X}
+END_OF_FILE
+if test 27441 -ne `wc -c <'aegis/project.c'`; then
+    echo shar: \"'aegis/project.c'\" unpacked with wrong size!
+fi
+# end of 'aegis/project.c'
+fi
+if test -f 'aegis/user.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'aegis/user.c'\"
+else
+echo shar: Extracting \"'aegis/user.c'\" \(30882 characters\)
+sed "s/^X//" >'aegis/user.c' <<'END_OF_FILE'
+X/*
+X *	aegis - project change supervisor
+X *	Copyright (C) 1991, 1992, 1993 Peter Miller.
+X *	All rights reserved.
+X *
+X *	This program is free software; you can redistribute it and/or modify
+X *	it under the terms of the GNU General Public License as published by
+X *	the Free Software Foundation; either version 2 of the License, or
+X *	(at your option) any later version.
+X *
+X *	This program is distributed in the hope that it will be useful,
+X *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+X *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X *	GNU General Public License for more details.
+X *
+X *	You should have received a copy of the GNU General Public License
+X *	along with this program; if not, write to the Free Software
+X *	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X * MANIFEST: functions to manage information about users
+X */
+X
+X#include <ctype.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <pwd.h>
+X#include <grp.h>
+X#include <unistd.h>
+X
+X#include <commit.h>
+X#include <conf.h>
+X#include <error.h>
+X#include <gonzo.h>
+X#include <lock.h>
+X#include <mem.h>
+X#include <option.h>
+X#include <os.h>
+X#include <project.h>
+X#include <trace.h>
+X#include <user.h>
+X#include <undo.h>
+X#include <word.h>
+X
+X
+Xstatic	size_t	nusers;
+Xstatic	user_ty	**user;
+X
+X
+X/*
+X * NAME
+X *	user_numeric
+X *
+X * SYNOPSIS
+X *	user_ty *user_numeric(project_ty *pp, int uid);
+X *
+X * DESCRIPTION
+X *	The user_numeric function is used to
+X *	create a user structure from a uid.
+X *
+X *	The default group is derived from the project group,
+X *	or the password file if a NULL project pointer is supplied.
+X *
+X * ARGUMENTS
+X *	pp	- project user is associated with
+X *	uid	- system user id
+X *
+X * RETURNS
+X *	pointer to user structure in dynamic memory
+X *
+X * CAVEAT
+X *	Release the user structure with the user_free() function when done.
+X */
+X
+Xuser_ty *
+Xuser_numeric(pp, uid)
+X	project_ty	*pp;
+X	int		uid;
+X{
+X	size_t		j;
+X	user_ty		*up;
+X	struct passwd	*pw;
+X	struct group	*gr;
+X
+X	/*
+X	 * see if we already know her
+X	 */
+X	trace(("user_numeric(pp = %08lX, uid = %d)\n{\n"/*}*/, pp, uid));
+X	for (j = 0; j < nusers; ++j)
+X	{
+X		up = user[j];
+X		if (up->uid == uid)
+X		{
+X			up = user_copy(up);
+X			goto ret;
+X		}
+X	}
+X
+X	/*
+X	 * first time we have met her
+X	 *	group always binds to the project
+X	 *
+X	 * Always use the number as the primary reference:
+X	 * system treats the first entry as cannonical, so do we.
+X	 */
+X	pw = getpwuid(uid);
+X	if (!pw)
+X		fatal("uid %d unknown", uid);
+X	up = (user_ty *)mem_alloc_clear(sizeof(user_ty));
+X	up->reference_count = 1;
+X	if (pp)
+X		up->pp = project_copy(pp);
+X	up->uid = uid;
+X	up->gid = pw->pw_gid;
+X	up->umask = DEFAULT_UMASK;
+X	up->name = str_from_c(pw->pw_name);
+X	up->home = str_from_c(pw->pw_dir);
+X	if (pw->pw_gecos && pw->pw_gecos[0])
+X		up->full_name = str_from_c(pw->pw_gecos);
+X#ifndef CONF_NO_pw_comment
+X	else if (pw->pw_comment && pw->pw_comment[0])
+X		up->full_name = str_from_c(pw->pw_comment);
+X#endif
+X	else
+X		up->full_name = str_from_c(pw->pw_name);
+X	if (pp)
+X	{
+X		gr = getgrnam(project_group(pp)->str_text);
+X		if (!gr)
+X		{
+X			fatal
+X			(
+X				"group \"%s\" unknown",
+X				project_group(pp)->str_text
+X			);
+X		}
+X		up->gid = gr->gr_gid;
+X	}
+X	gr = getgrgid(up->gid);
+X	if (!gr)
+X		fatal("gid %d unknown", up->gid);
+X	up->group = str_from_c(gr->gr_name);
+X
+X	/*
+X	 * add it to the list
+X	 */
+X	*(user_ty **)enlarge(&nusers, (char **)&user, sizeof(user_ty *)) = up;
+X
+X	/*
+X	 * Find the umask.
+X	 *
+X	 * Only do this AFTER adding it to the list,
+X	 * because the project may construct the same user
+X	 * when it reads it's state file to find the umask.
+X	 */
+X	if (pp)
+X		up->umask = project_umask(pp);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	ret:
+X	trace(("return %08lX;\n", up));
+X	trace((/*{*/"}\n"));
+X	return up;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_symbolic
+X *
+X * SYNOPSIS
+X *	user_ty *user_symbolic(project_ty *pp, string_ty *name);
+X *
+X * DESCRIPTION
+X *	The user_symbolic function is used to
+X *	create a user structure from a login name.
+X *
+X *	The login name is mapped to a uid.  The password file is searched
+X *	from beginning to end, so the cannonical name is the first found
+X *	in the password file.  The cannonical name is used even for user
+X *	structures created with this function.
+X *
+X * ARGUMENTS
+X *	pp	- project user is associated with
+X *	name	- user's login name
+X *
+X * RETURNS
+X *	pointer to user structure in dynamic memory
+X *
+X * CAVEAT
+X *	Release the user structure with the user_free() function when done.
+X */
+X
+Xuser_ty *
+Xuser_symbolic(pp, name)
+X	project_ty	*pp;
+X	string_ty	*name;
+X{
+X	struct passwd	*pw;
+X	user_ty		*result;
+X
+X	trace(("user_symbolic(pp = %08lX, name = \"%s\")\n{\n"/*}*/, pp,
+X		name->str_text));
+X	pw = getpwnam(name->str_text);
+X	if (!pw)
+X		fatal("user \"%s\" unknown", name->str_text);
+X	result = user_numeric(pp, pw->pw_uid);
+X	trace(("return %08lX;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_executing
+X *
+X * SYNOPSIS
+X *	user_ty *user_executing(project_ty *pp);
+X *
+X * DESCRIPTION
+X *	The user_executing function is used to
+X *	create a user structure based on the user who invoked
+X *	the currently executing program.
+X *
+X * ARGUMENTS
+X *	pp	- project user is operating on
+X *
+X * RETURNS
+X *	pointer to user structure in dynamic memory
+X *
+X * CAVEAT
+X *	Release the user structure with the user_free() function when done.
+X */
+X
+Xuser_ty *
+Xuser_executing(pp)
+X	project_ty	*pp;
+X{
+X	user_ty		*result;
+X	int		uid;
+X	int		gid;
+X
+X	trace(("user_executing(pp = %08lX)\n{\n"/*}*/, pp));
+X	os_become_orig_query(&uid, &gid, (int *)0);
+X	result = user_numeric(pp, uid);
+X	trace(("return %08lX;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_free
+X *
+X * SYNOPSIS
+X *	void user_free(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_free function is used to
+X *	release memory when a user structure is done with.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure in dynamic memory
+X */
+X
+Xvoid
+Xuser_free(up)
+X	user_ty		*up;
+X{
+X	trace(("user_free(up = %08lX)\n{\n"/*}*/, up));
+X	up->reference_count--;
+X	if (up->reference_count <= 0)
+X	{
+X		size_t	j;
+X
+X		/*
+X		 * remove from cache
+X		 */
+X		for (j = 0; j < nusers; ++j)
+X		{
+X			if (user[j] == up)
+X			{
+X				user[j] = user[--nusers];
+X				break;
+X			}
+X		}
+X
+X		/*
+X		 * release memory references
+X		 */
+X		if (up->pp)
+X			project_free(up->pp);
+X		str_free(up->name);
+X		str_free(up->full_name);
+X		str_free(up->home);
+X		str_free(up->group);
+X		if (up->ustate_path)
+X			str_free(up->ustate_path);
+X		if (up->ustate_data)
+X			ustate_type.free(up->ustate_data);
+X		if (up->uconf_path)
+X			str_free(up->uconf_path);
+X		if (up->uconf_data)
+X			uconf_type.free(up->uconf_data);
+X		mem_free((char *)up);
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+X/*
+X * NAME
+X *	user_copy
+X *
+X * SYNOPSIS
+X *	user_ty *user_copy(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_copy function is used to
+X *	make a logical copy of a user structure.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure in dynamic memory.
+X *
+X * RETURNS
+X *	pointer to user structure in dynamic memory
+X *
+X * CAVEAT
+X *	Release the user structure with the user_free() function when done.
+X */
+X
+Xuser_ty *
+Xuser_copy(up)
+X	user_ty		*up;
+X{
+X	trace(("user_copy(up = %08lX)\n{\n"/*}*/, up));
+X	up->reference_count++;
+X	trace(("return %08lX;\n", up));
+X	trace((/*{*/"}\n"));
+X	return up;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_name
+X *
+X * SYNOPSIS
+X *	string_ty *user_name(user_ty *);
+X *
+X * DESCRIPTION
+X *	The user_name function is used to
+X *	return the login name of the user described by the user structure.
+X *
+X * ARGUMENTS
+X *	up	- user structure describing user
+X *
+X * RETURNS
+X *	pointer to string containing user's login name
+X */
+X
+Xstring_ty *
+Xuser_name(up)
+X	user_ty		*up;
+X{
+X	trace(("user_name(up = %08lX)\n{\n"/*}*/, up));
+X	trace(("return \"%s\";\n", up->name->str_text));
+X	trace((/*{*/"}\n"));
+X	return up->name;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_id
+X *
+X * SYNOPSIS
+X *	int user_id(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_id function is used to
+X *	determine the uid of the user described by the user structure.
+X *
+X * ARGUMENTS
+X *	up	- user structure describing user
+X *
+X * RETURNS
+X *	the system uid of the user
+X */
+X
+Xint
+Xuser_id(up)
+X	user_ty		*up;
+X{
+X	trace(("user_id(up = %08lX)\n{\n"/*}*/, up));
+X	trace(("return %d;\n", up->uid));
+X	trace((/*{*/"}\n"));
+X	return up->uid;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_group
+X *
+X * SYNOPSIS
+X *	string_ty *user_group(user_ty *);
+X *
+X * DESCRIPTION
+X *	The user_group function is used to
+X *	determine the name of the default group of a user.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * RETURNS
+X *	pointer to string naming default group
+X */
+X
+Xstring_ty *
+Xuser_group(up)
+X	user_ty		*up;
+X{
+X	trace(("user_group(up = %08lX)\n{\n"/*}*/, up));
+X	trace(("return \"%s\";\n", up->group->str_text));
+X	trace((/*{*/"}\n"));
+X	return up->group;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_gid
+X *
+X * SYNOPSIS
+X *	int user_gid(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_gid function is used to
+X *	determine the system gid of the user.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * RETURNS
+X *	the default system gid of the user
+X */
+X
+Xint
+Xuser_gid(up)
+X	user_ty		*up;
+X{
+X	trace(("user_gid(up = %08lX)\n{\n"/*}*/, up));
+X	trace(("return %d;\n", up->gid));
+X	trace((/*{*/"}\n"));
+X	return up->gid;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_umask
+X *
+X * SYNOPSIS
+X *	int user_umask(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_umask function is used to
+X *	determine the umask (file creation mask) of the user.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * RETURNS
+X *	the default system umask of the user
+X */
+X
+Xint
+Xuser_umask(up)
+X	user_ty		*up;
+X{
+X	trace(("user_umask(up = %08lX)\n{\n"/*}*/, up));
+X	trace(("return %05o;\n", up->umask));
+X	trace((/*{*/"}\n"));
+X	return up->umask;
+X}
+X
+X
+X/*
+X * NAME
+X *	lock_sync
+X *
+X * SYNOPSIS
+X *	void lock_sync(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The lock_sync function is used to
+X *	flush any out-of-date data caching
+X *	associated with the user structure.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X */
+X
+Xstatic void lock_sync _((user_ty *));
+X
+Xstatic void
+Xlock_sync(up)
+X	user_ty		*up;
+X{
+X	long		n;
+X
+X	trace(("lock_sync(up = %08lX)\n{\n"/*}*/, up));
+X	n = lock_magic();
+X	if (up->lock_magic != n)
+X	{
+X		up->lock_magic = n;
+X		if (up->ustate_data && !up->ustate_is_new)
+X		{
+X			ustate_type.free(up->ustate_data);
+X			up->ustate_data = 0;
+X		}
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+X/*
+X * NAME
+X *	user_ustate_get
+X *
+X * SYNOPSIS
+X *	ustate user_ustate_get(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_ustate_get function is used to
+X *	fetch the ``ustate'' file for this user,
+X *	caching for future reference.
+X *
+X * ARGUMENTS
+X *	up	-pointer to user structure
+X *
+X * RETURNS
+X *	pointer to ustate structure in dynamic memory
+X */
+X
+Xstatic ustate user_ustate_get _((user_ty *));
+X
+Xstatic ustate
+Xuser_ustate_get(up)
+X	user_ty		*up;
+X{
+X	trace(("user_ustate_get(up = %08lX)\n{\n"/*}*/, up));
+X	lock_sync(up);
+X	if (!up->ustate_path)
+X		up->ustate_path =
+X			gonzo_ustate_path(project_name_get(up->pp), up->name);
+X	if (!up->ustate_data)
+X	{
+X		gonzo_become();
+X		if (os_exists(up->ustate_path))
+X		{
+X			up->ustate_data =
+X				ustate_read_file(up->ustate_path->str_text);
+X		}
+X		else
+X		{
+X			up->ustate_data = (ustate)ustate_type.alloc();
+X			up->ustate_is_new = 1;
+X		}
+X		gonzo_become_undo();
+X		if (!up->ustate_data->own)
+X			up->ustate_data->own =
+X				(ustate_own_list)
+X				ustate_own_list_type.alloc();
+X	}
+X	trace(("return %08lX;\n", up->ustate_data));
+X	trace((/*{*/"}\n"));
+X	return up->ustate_data;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_uconf_get
+X *
+X * SYNOPSIS
+X *	void user_uconf_get(void);
+X *
+X * DESCRIPTION
+X *	The user_uconf_get function is used to
+X *	fetch the ``uconf'' file for this user,
+X *	caching for future reference.
+X *
+X * ARGUMENTS
+X *	up	-pointer to user structure
+X *
+X * RETURNS
+X *	pointer to uconf structure in dynamic memory
+X */
+X
+Xstatic uconf user_uconf_get _((user_ty *up));
+X
+Xstatic uconf
+Xuser_uconf_get(up)
+X	user_ty		*up;
+X{
+X	trace(("user_uconf_get(up = %08lX)\n{\n"/*}*/, up));
+X	lock_sync(up);
+X	if (!up->uconf_path)
+X		up->uconf_path =
+X			str_format("%S/.%src", up->home, option_progname_get());
+X	if (!up->uconf_data)
+X	{
+X		user_become(up);
+X		if (os_exists(up->uconf_path))
+X		{
+X			up->uconf_data =
+X				uconf_read_file(up->uconf_path->str_text);
+X		}
+X		else
+X			up->uconf_data = (uconf)uconf_type.alloc();
+X		user_become_undo();
+X	}
+X	trace(("return %08lX;\n", up->uconf_data));
+X	trace((/*{*/"}\n"));
+X	return up->uconf_data;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_home
+X *
+X * SYNOPSIS
+X *	string_ty *user_home(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_home function is used to
+X *	fetch the home directory of the user.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * RETURNS
+X *	pointer to string containing absolute path
+X *
+X * CAVEAT
+X *	If the path isn't absolute in /etc/passwd,
+X *	it won't be here, either.
+X */
+X
+Xstring_ty *
+Xuser_home(up)
+X	user_ty		*up;
+X{
+X	trace(("user_home(up = %08lX)\n{\n"/*}*/, up));
+X	assert(up->home);
+X	trace(("return \"%s\";\n", up->home->str_text));
+X	trace((/*{*/"}\n"));
+X	return up->home;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_full_name
+X *
+X * SYNOPSIS
+X *	char *user_full_name(string_ty *login);
+X *
+X * DESCRIPTION
+X *	The user_full_name function is used to
+X *	find the full name of a user, given their login name.
+X *
+X * ARGUMENTS
+X *	login	- pointer to string containing login name
+X *
+X * RETURNS
+X *	pointer to string containing user's full name
+X *
+X * CAVEAT
+X *	Will return the empty string if the user can't be found.
+X *	NEVER modify the data pointed to by the return value.
+X *	The returned data is volatile, it will not remain stable for long.
+X */
+X
+Xchar *
+Xuser_full_name(name)
+X	string_ty	*name;
+X{
+X	struct passwd	*pw;
+X	char		*result;
+X
+X	trace(("user_full_name(name = \"%s\")\n{\n"/*}*/, name->str_text));
+X	pw = getpwnam(name->str_text);
+X	if (!pw)
+X		result = "";
+X	else if (pw->pw_gecos && pw->pw_gecos[0])
+X		result = pw->pw_gecos;
+X#ifndef CONF_NO_pw_comment
+X	else if (pw->pw_comment && pw->pw_comment[0])
+X		result = pw->pw_comment;
+X#endif
+X	else
+X		result = "";
+X	trace(("return \"%s\";\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_ustate_write
+X *
+X * SYNOPSIS
+X *	void user_ustate_write(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_ustate_write function is used to
+X *	write any modified ustate file contents back to disk.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X */
+X
+Xvoid
+Xuser_ustate_write(up)
+X	user_ty		*up;
+X{
+X	string_ty	*filename_new;
+X	string_ty	*filename_old;
+X	static int	count;
+X
+X	trace(("user_ustate_write(up = %08lX)\n{\n"/*}*/, up));
+X	assert(up->ustate_data);
+X	assert(up->ustate_path);
+X	if (!up->ustate_modified)
+X		goto ret;
+X
+X	/*
+X	 * write it out
+X	 */
+X	filename_new = str_format("%S,%d", up->ustate_path, ++count);
+X	filename_old = str_format("%S,%d", up->ustate_path, ++count);
+X	gonzo_become();
+X	if (up->ustate_is_new)
+X	{
+X		undo_unlink_errok(filename_new);
+X		ustate_write_file(filename_new->str_text, up->ustate_data);
+X		commit_rename(filename_new, up->ustate_path);
+X	}
+X	else
+X	{
+X		undo_unlink_errok(filename_new);
+X		ustate_write_file(filename_new->str_text, up->ustate_data);
+X		commit_rename(up->ustate_path, filename_old);
+X		commit_rename(filename_new, up->ustate_path);
+X		commit_unlink_errok(filename_old);
+X	}
+X	os_chmod(filename_new, 0644);
+X	gonzo_become_undo();
+X	str_free(filename_new);
+X	str_free(filename_old);
+X	up->ustate_modified = 0;
+X	up->ustate_is_new = 0;
+X	ret:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+X/*
+X * NAME
+X *	user_own_add
+X *
+X * SYNOPSIS
+X *	void user_own_add(user_ty *up, string_ty *project_name,
+X *		long change_number);
+X *
+X * DESCRIPTION
+X *	The user_own_add function is used to
+X *	add a change to the user's list of owned changes.
+X *
+X * ARGUMENTS
+X *	up		- pointer to user structure
+X *	project_name	- project of the change
+X *	change_number	- number of the change
+X *
+X * CAVEAT
+X *	The change is assumed to be unique.
+X */
+X
+Xvoid
+Xuser_own_add(up, project_name, change_number)
+X	user_ty		*up;
+X	string_ty	*project_name;
+X	long		change_number;
+X{
+X	ustate		ustate_data;
+X	int		j;
+X	ustate_own	own_data = 0;
+X	ustate_own	*own_data_p;
+X	long		*change_p;
+X	type_ty		*type_p;
+X
+X	trace(("user_own_add()\n{\n"/*}*/));
+X	ustate_data = user_ustate_get(up);
+X	assert(ustate_data->own);
+X
+X	/*
+X	 * See if the project is already known.
+X	 */
+X	for (j = 0; j < ustate_data->own->length; ++j)
+X	{
+X		own_data = ustate_data->own->list[j];
+X		if (str_equal(own_data->project_name, project_name))
+X			break;
+X	}
+X
+X	/*
+X	 * If the project isn't known, append it to the list.
+X	 */
+X	if (j >= ustate_data->own->length)
+X	{
+X		ustate_own_list_type.list_parse
+X		(
+X			ustate_data->own,
+X			&type_p,
+X			(void **)&own_data_p
+X		);
+X		own_data = (ustate_own)ustate_own_type.alloc();
+X		*own_data_p = own_data;
+X		own_data->project_name = str_copy(project_name);
+X	}
+X
+X	/*
+X	 * Create a changes for the project, if necessary.
+X	 */
+X	if (!own_data->changes)
+X		own_data->changes =
+X			(ustate_own_changes_list)
+X			ustate_own_changes_list_type.alloc();
+X
+X	/*
+X	 * Add another item to the changes list for the project.
+X	 */
+X	ustate_own_changes_list_type.list_parse
+X	(
+X		own_data->changes,
+X		&type_p,
+X		(void **)&change_p
+X	);
+X	*change_p = change_number;
+X	up->ustate_modified = 1;
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+X/*
+X * NAME
+X *	user_own_nth
+X *
+X * SYNOPSIS
+X *	int user_own_nth(user_ty *up, long n, long *change_number);
+X *
+X * DESCRIPTION
+X *	The user_own_nth function is used to fetch the n'th
+X *	change owned by a user.
+X *	The project name is derived from the user structure.
+X *
+X * ARGUMENTS
+X *	up		- pointer to user structure
+X *	n		- selector
+X *	change_number	- pointer to where to put number of the change
+X *
+X * RETURNS
+X *	1 on sucess, 0 if no such n.
+X */
+X
+Xint
+Xuser_own_nth(up, n, change_number)
+X	user_ty		*up;
+X	long		n;
+X	long		*change_number;
+X{
+X	ustate		ustate_data;
+X	int		j;
+X	int		result;
+X
+X	trace(("user_own_nth(up = %08lX, n = %ld)\n{\n"/*}*/, (long)up, n));
+X	result = 0;
+X	assert(n >= 0);
+X	assert(up->pp);
+X	if (n < 0 || !up->pp)
+X		goto done;
+X	ustate_data = user_ustate_get(up);
+X	assert(ustate_data->own);
+X
+X	/*
+X	 * find the relevant project
+X	 *	and extract the n'th change
+X	 */
+X	for (j = 0; j < ustate_data->own->length; ++j)
+X	{
+X		ustate_own	own_data;
+X
+X		own_data = ustate_data->own->list[j];
+X		if (str_equal(project_name_get(up->pp), own_data->project_name))
+X		{
+X			if (n < own_data->changes->length)
+X			{
+X				*change_number = own_data->changes->list[n];
+X				result = 1;
+X			}
+X			break;
+X		}
+X	}
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace(("return %d;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_own_remove
+X *
+X * SYNOPSIS
+X *	void user_own_remove(user_ty *up, string_ty *project_name,
+X *		long change_number);
+X *
+X * DESCRIPTION
+X *	The user_own_remove function is used to
+X *	remove a change from the user's owned change list.
+X *
+X * ARGUMENTS
+X *	up		- pointer to user structure
+X *	project_name	- project of the change
+X *	change_number	- number of the change
+X *
+X * CAVEAT
+X *	The change is assumed to be unique.
+X */
+X
+Xvoid
+Xuser_own_remove(up, project_name, change_number)
+X	user_ty		*up;
+X	string_ty	*project_name;
+X	long		change_number;
+X{
+X	ustate		ustate_data;
+X	int		j, k;
+X	ustate_own	own_data;
+X
+X	trace(("usate_own_remove()\n{\n"/*}*/));
+X	ustate_data = user_ustate_get(up);
+X	assert(ustate_data->own);
+X
+X	/*
+X	 * Search for the project in the ``own'' list.
+X	 */
+X	for (j = 0; ; ++j)
+X	{
+X		if (j >= ustate_data->own->length)
+X			goto ret;
+X		own_data = ustate_data->own->list[j];
+X		if (str_equal(own_data->project_name, project_name))
+X			break;
+X	}
+X
+X	/*
+X	 * Create the ``changes'' list for the project, if necessary.
+X	 */
+X	if (!own_data->changes)
+X		own_data->changes =
+X			(ustate_own_changes_list)
+X			ustate_own_changes_list_type.alloc();
+X
+X	/*
+X	 * Search for the change in the ``changes'' list.
+X	 */
+X	for (k = 0; k < own_data->changes->length; ++k)
+X	{
+X		if (own_data->changes->list[k] == change_number)
+X			break;
+X	}
+X
+X	/*
+X	 * If the change was there, remove it from the list.
+X	 */
+X	if (k < own_data->changes->length)
+X	{
+X		own_data->changes->list[k] =
+X			own_data->changes->list[own_data->changes->length - 1];
+X		own_data->changes->length--;
+X		up->ustate_modified = 1;
+X	}
+X
+X	/*
+X	 * If the changes list for the project is now empty,
+X	 * remove the project from the ``own'' list.
+X	 */
+X	if (!own_data->changes->length)
+X	{
+X		ustate_own_type.free(own_data);
+X		ustate_data->own->list[j] =
+X			ustate_data->own->list[ustate_data->own->length - 1];
+X		ustate_data->own->length--;
+X		up->ustate_modified = 1;
+X	}
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	ret:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+X/*
+X * NAME
+X *	user_ustate_lock_prepare
+X *
+X * SYNOPSIS
+X *	void user_ustate_lock_prepare(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_ustate_lock_prepare function is used to
+X *	notify the lock manager that a ustate lock will be required.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X */
+X
+Xvoid
+Xuser_ustate_lock_prepare(up)
+X	user_ty		*up;
+X{
+X	trace(("user_ustate_lock_prepare(up = %08lX)\n{\n"/*}*/, up));
+X	lock_prepare_ustate(up->uid);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+X/*
+X * NAME
+X *	user_default_change
+X *
+X * SYNOPSIS
+X *	long user_default_change(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_default_change function is used to
+X *	find the default change number.  The project is taken from the
+X *	user structure's notion of the set project.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * RETURNS
+X *	the change number.
+X *
+X * CAVEAT
+X *	it is a fatal error if there is no default change number
+X */
+X
+Xstatic long is_a_change_number _((char *));
+X
+Xstatic long
+Xis_a_change_number(s)
+X	char		*s;
+X{
+X	long		n;
+X
+X	while (isspace(*s))
+X		++s;
+X	n = 0;
+X	while (isdigit(*s))
+X		n = n * 10 + *s++ - '0';
+X	if (n < 1)
+X		return 0;
+X	while (isspace(*s))
+X		++s;
+X	if (*s)
+X		return 0;
+X	return n;
+X}
+X
+X
+Xstatic long project_dot_change _((string_ty *, string_ty *));
+X
+Xstatic long
+Xproject_dot_change(s, p)
+X	string_ty	*s;
+X	string_ty	*p;
+X{
+X	if
+X	(
+X		s->str_length > p->str_length + 1
+X	&&
+X		!memcmp(s->str_text, p->str_text, p->str_length)
+X	&&
+X		s->str_text[p->str_length] == '.'
+X	)
+X		return is_a_change_number(s->str_text + p->str_length + 1);
+X	return 0;
+X}
+X
+X
+Xlong
+Xuser_default_change(up)
+X	user_ty		*up;
+X{
+X	long		change_number;
+X	string_ty	*s1;
+X	string_ty	*s2;
+X	char		*cp;
+X
+X	trace(("user_default_change(up = %08lX)\n{\n"/*}*/, up));
+X	change_number = 0;
+X
+X	/*
+X	 * check the AEGIS_CHANGE environment variable
+X	 */
+X	s1 = str_format("%s_change", option_progname_get());
+X	s2 = str_upcase(s1);
+X	str_free(s1);
+X	cp = getenv(s2->str_text);
+X	if (cp)
+X	{
+X		change_number = is_a_change_number(cp);
+X		if (!change_number)
+X		{
+X			fatal
+X			(
+X		"the %s environment variable must be a positive decimal number",
+X				s2->str_text
+X			);
+X		}
+X	}
+X	str_free(s2);
+X
+X	/*
+X	 * check the $HOME/.aegisrc file
+X	 */
+X	if (!change_number)
+X	{
+X		uconf		uconf_data;
+X
+X		uconf_data = user_uconf_get(up);
+X		if (uconf_data->mask & uconf_default_change_number_mask)
+X			change_number = uconf_data->default_change_number;
+X	}
+X
+X	/*
+X	 * If the user is only working on one change within the given
+X	 * project, then that is the change.
+X	 */
+X	if (!change_number)
+X	{
+X		ustate		ustate_data;
+X		int		j;
+X
+X		ustate_data = user_ustate_get(up);
+X		assert(ustate_data->own);
+X		for (j = 0; j < ustate_data->own->length; ++j)
+X		{
+X			ustate_own	own_data;
+X			string_ty	*project_name;
+X	
+X			own_data = ustate_data->own->list[j];
+X			project_name = project_name_get(up->pp);
+X			if (str_equal(own_data->project_name, project_name))
+X			{
+X				if (own_data->changes->length == 1)
+X					change_number = own_data->changes->list[0];
+X				break;
+X			}
+X		}
+X	}
+X
+X	/*
+X	 * examine the pathname of the current directory
+X	 * to see if we can extract the change number
+X	 *
+X	 * This only works if the development directory was created
+X	 * by aegis, and not specified by the -DIRectory option.
+X	 * It doesn't work at all for IntDir or BL.
+X	 */
+X	if (!change_number)
+X	{
+X		string_ty	*cwd;
+X		wlist		part;
+X		long		j;
+X
+X		/*
+X		 * get the current directory
+X		 */
+X		os_become_orig();
+X		cwd = os_curdir();
+X		os_become_undo();
+X		assert(cwd);
+X
+X		/*
+X		 * break it into file names
+X		 */
+X		str2wl(&part, cwd, "/");
+X		str_free(cwd);
+X
+X		/*
+X		 * search for <proj>.<num>
+X		 */
+X		for (j = 0; j < part.wl_nwords; ++j)
+X		{
+X			change_number =
+X				project_dot_change
+X				(
+X					part.wl_word[j],
+X					project_name_get(up->pp)
+X				);
+X			if (change_number)
+X				break;
+X		}
+X		wl_free(&part);
+X	}
+X
+X	/*
+X	 * It is an error if no change number has been given.
+X	 */
+X	if (!change_number)
+X		project_fatal(up->pp, "no -Change option specified");
+X	trace(("return %d;\n", change_number));
+X	trace((/*{*/"}\n"));
+X	return change_number;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_default_project
+X *
+X * SYNOPSIS
+X *	void user_default_project(void);
+X *
+X * DESCRIPTION
+X *	The user_default_project function is used to
+X *	determine the default project of the user who invoked the program.
+X *
+X * RETURNS
+X *	pointer to string containing project name
+X *
+X * CAVEAT
+X *	it is a fatal error if there is no default project name
+X */
+X
+Xstring_ty *
+Xuser_default_project()
+X{
+X	string_ty	*result;
+X	user_ty		*up;
+X	string_ty	*s1;
+X	string_ty	*s2;
+X	char		*cp;
+X
+X	/*
+X	 * build a temporary user
+X	 */
+X	trace(("user_default_project()\n{\n"/*}*/));
+X	up = user_executing((project_ty *)0);
+X	result = 0;
+X
+X	/*
+X	 * from the AEGIS_PROJECT environment variable.
+X	 */
+X	s1 = str_format("%s_project", option_progname_get());
+X	s2 = str_upcase(s1);
+X	str_free(s1);
+X	cp = getenv(s2->str_text);
+X	str_free(s2);
+X	if (cp && *cp)
+X		result = str_from_c(cp);
+X
+X	/*
+X	 * From the $HOME/.aegisrc file.
+X	 */
+X	if (!result)
+X	{
+X		uconf		uconf_data;
+X
+X		uconf_data = user_uconf_get(up);
+X		if (uconf_data->default_project_name)
+X			result = str_copy(uconf_data->default_project_name);
+X	}
+X
+X	/*
+X	 * check the search path, see if we use just one
+X	 *
+X	 * else check the current dirctory to see if we are within one
+X	 *
+X	 * This only works if the development directory was created
+X	 * by aegis, and not specified by the -DIRectory option.
+X	 * It doesn't work at all for IntDir or BL.
+X	 */
+X	if (!result)
+X	{
+X		wlist		name;
+X
+X		gonzo_project_list_user(up->name, &name);
+X		if (name.wl_nwords == 1)
+X			result = str_copy(name.wl_word[0]);
+X		else
+X		{
+X			string_ty	*cwd;
+X			wlist		part;
+X			long		j;
+X			long		k;
+X		    
+X			/*
+X			 * get pathname of the current directory
+X			 */
+X			os_become_orig();
+X			cwd = os_curdir();
+X			os_become_undo();
+X			assert(cwd);
+X
+X			/*
+X			 * break into pieces
+X			 */
+X			str2wl(&part, cwd, "/");
+X			str_free(cwd);
+X
+X			/*
+X			 * search the path
+X			 * looking for <proj>.<num>
+X			 */
+X			for (j = 0; j < part.wl_nwords && !result; ++j)
+X			{
+X				for (k = 0; k < name.wl_nwords; ++k)
+X				{
+X					if
+X					(
+X						project_dot_change
+X						(
+X							part.wl_word[j],
+X							name.wl_word[k]
+X						)
+X					)
+X					{
+X						result =
+X						      str_copy(name.wl_word[k]);
+X						break;
+X					}
+X				}
+X			}
+X			wl_free(&part);
+X		}
+X		wl_free(&name);
+X	}
+X
+X	/*
+X	 * It is an error if no project name has been given.
+X	 */
+X	if (!result)
+X		fatal("no -Project option specified");
+X
+X	/*
+X	 * clean up and go home
+X	 */
+X	user_free(up);
+X	trace(("return \"%s\";\n", result->str_text));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_default_development_directory_get
+X *
+X * SYNOPSIS
+X *	string_ty *user_default_development_directory_get(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_default_development_directory_get function is used to
+X *	determine the absolute path of the user's default development directory.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * RETURNS
+X *	pointer to string containing path
+X *
+X * CAVEAT
+X *	If the user has not explicitly set one,
+X *	and the project does not have one set,
+X *	the user's home directory will be returned.
+X */
+X
+Xstring_ty *
+Xuser_default_development_directory(up)
+X	user_ty		*up;
+X{
+X	uconf		uconf_data;
+X	string_ty	*path;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	uconf_data = user_uconf_get(up);
+X	path = uconf_data->default_development_directory;
+X	if (path)
+X	{
+X		if (path->str_text[0] == '/')
+X			path = str_copy(path);
+X		else
+X			path = str_format("%S/%S", user_home(up), path);
+X	}
+X	else
+X	{
+X		path = project_default_development_directory(up->pp);
+X		if (!path)
+X			path = user_home(up);
+X		path = str_copy(path);
+X	}
+X	return path;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_default_project_directory
+X *
+X * SYNOPSIS
+X *	void user_default_project_directory(void);
+X *
+X * DESCRIPTION
+X *	The user_default_project_directory function is used to
+X *	determine the absolute path for where to place new projects.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * RETURNS
+X *	pointer to string containing path
+X *
+X * CAVEAT
+X *	if the user has not explicitly set one,
+X *	the user's home directory will be returned.
+X */
+X
+Xstring_ty *
+Xuser_default_project_directory(up)
+X	user_ty		*up;
+X{
+X	uconf		uconf_data;
+X	string_ty	*path;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	trace(("user_default_project_directory(up = %08lX)\n{\n"/*}*/, up));
+X	uconf_data = user_uconf_get(up);
+X	path = uconf_data->default_project_directory;
+X	if (path)
+X	{
+X		if (path->str_text[0] == '/')
+X			path = str_copy(path);
+X		else
+X			path = str_format("%S/%S", user_home(up), path);
+X	}
+X	else
+X		path = str_copy(user_home(up));
+X	trace(("return \"%s\";\n", path->str_text));
+X	trace((/*{*/"}\n"));
+X	return path;
+X}
+X
+X
+X/*
+X * NAME
+X *	user_uid_check
+X *
+X * SYNOPSIS
+X *	int user_uid_check(char *name);
+X *
+X * DESCRIPTION
+X *	The user_uid_check function is used to
+X *	see if the named user exists, and if they do,
+X *	wether they have a non-system uid (i.e. 100 or over).
+X *
+X * ARGUMENTS
+X *	name	- string containing name to check
+X *
+X * RETURNS
+X *	zero if the login name is a system login,
+X *	non-zero if the login name is a mortal.
+X *
+X * CAVEAT
+X *	it is a fatal error if the user does not exist
+X */
+X
+Xint
+Xuser_uid_check(name)
+X	string_ty	*name;
+X{
+X	struct passwd	*pw;
+X
+X	pw = getpwnam(name->str_text);
+X	if (!pw)
+X		fatal("user \"%s\" unknown", name->str_text);
+X	return (pw->pw_uid >= AEGIS_MIN_UID);
+X}
+X
+X
+X/*
+X * NAME
+X *	user_gid_check
+X *
+X * SYNOPSIS
+X *	int user_gid_check(char *name);
+X *
+X * DESCRIPTION
+X *	The user_gid_check function is used to
+X *	see if the named group exists, and if it does,
+X *	wether it is a non-system gid (i.e. 10 or over).
+X *
+X * ARGUMENTS
+X *	name	- string containing name to check
+X *
+X * RETURNS
+X *	zero if the name is a system group,
+X *	non-zero if the group is a mortal.
+X *
+X * CAVEAT
+X *	it is a fatal error if the group does not exist
+X */
+X
+Xint
+Xuser_gid_check(name)
+X	string_ty	*name;
+X{
+X	struct group	*gr;
+X
+X	gr = getgrnam(name->str_text);
+X	if (!gr)
+X		fatal("group \"%s\" unknown", name->str_text);
+X	return (gr->gr_gid >= AEGIS_MIN_GID);
+X}
+X
+X
+X/*
+X * NAME
+X *	user_become
+X *
+X * SYNOPSIS
+X *	void user_become(user_ty *up);
+X *
+X * DESCRIPTION
+X *	The user_become function is used to
+X *	set user and group to the given user.
+X *
+X * ARGUMENTS
+X *	up	- pointer to user structure
+X *
+X * CAVEAT
+X *	cancel with user_become_undo() when finished imitating this user.
+X */
+X
+Xvoid
+Xuser_become(up)
+X	user_ty		*up;
+X{
+X	trace(("user_become(up = %08lX)\n{\n"/*}*/, up));
+X	os_become(up->uid, up->gid, up->umask);
+X	trace((/*{*/"}\n"));
+X}
+X
+Xvoid
+Xuser_become_undo()
+X{
+X	trace(("user_become_undo()\n{\n"/*}*/));
+X	os_become_undo();
+X	trace((/*{*/"}\n"));
+X}
+END_OF_FILE
+if test 30882 -ne `wc -c <'aegis/user.c'`; then
+    echo shar: \"'aegis/user.c'\" unpacked with wrong size!
+fi
+# end of 'aegis/user.c'
+fi
+if test -f 'doc/c7.1.so' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'doc/c7.1.so'\"
+else
+echo shar: Extracting \"'doc/c7.1.so'\" \(29686 characters\)
+sed "s/^X//" >'doc/c7.1.so' <<'END_OF_FILE'
+X.\"
+X.\"	aegis - project change supervisor
+X.\"	Copyright (C) 1991, 1992, 1993 Peter Miller.
+X.\"	All rights reserved.
+X.\"
+X.\"	This program is free software; you can redistribute it and/or modify
+X.\"	it under the terms of the GNU General Public License as published by
+X.\"	the Free Software Foundation; either version 2 of the License, or
+X.\"	(at your option) any later version.
+X.\"
+X.\"	This program is distributed in the hope that it will be useful,
+X.\"	but WITHOUT ANY WARRANTY; without even the implied warranty of
+X.\"	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X.\"	GNU General Public License for more details.
+X.\"
+X.\"	You should have received a copy of the GNU General Public License
+X.\"	along with this program; if not, write to the Free Software
+X.\"	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X.\"
+X.\" MANIFEST: User Guide, How Aegis Works, The Model
+X.\"
+X.nh 2 "The Model"
+X.LP
+XThe model of the software development process
+Xused by aegis was not plucked from thin air in some ivory tower.
+XIt evolved and grew with time in a real-live software development environment,
+Xand it has continued to be used and developed.
+XUnfortunately,
+Xthis environment was the largest experienced by the author to date,
+Xand consisted of only about forty software engineers hammering away
+Xat a project.\**
+X.FS
+X"Unfortunately,"
+Xbecause many real-world projects are far larger,
+Xbut the author has yet to experience,
+Xand understand,
+Xthe issues and procedures required.
+X(Think of problems,
+Xyes;
+Xthink of real-world solutions,
+Xno.)
+X.FE
+X.nh 3 "The Baseline"
+X.LP
+XMost CASE systems revolve around a repository.
+XA place where
+X.I stuff
+Xis kept.
+XThis
+X.I stuff
+Xis the raw data that is chewed over to produce the final
+Xproduct,
+Xwhatever that may be.
+XThis
+X.I stuff
+Xis the preferred form for
+Xediting or composing or whatever.
+X.LP
+XIn the aegis program,
+Xthe repository is known as the
+X.I baseline
+Xand the units of
+X.I stuff
+Xare 
+X.UX
+Xfiles.
+XThe aegis program makes no distinction between
+Xtext and binary files,
+Xso both are supported.
+X.LP
+XThe history mechanism which must be included in any repository function is not
+Xprovided by the aegis program.
+XIt is instead provided by some other
+Xper-project configurable software,
+Xsuch as RCS.
+XThis means that the
+Xuser may select the history tool most suited to any given project.
+XIt also means that aegis is that much smaller to test and maintain.
+XYou will not be able to have binary files in your baseline if the
+Xhistory tool of your choice can't cope with them.
+X.LP
+XThe structure of the baseline is dictated by the nature of each project,
+Xwith some minor exceptions.
+XThe aegis program attempts to make as few
+Xarbitrary rules as possible.
+XThere is one mandatory file in the
+Xbaseline,
+Xand one mandatory directory.
+XThe file is called
+X.I config ,
+Xand
+Xcontains the per-project configuration information;
+Xthe directory is
+Xcalled
+X.I test ,
+Xand contains all of the the tests.
+XThe contents and structure of the
+X.I test
+Xdirectory are also dictated by aegis.
+XTests are treated just like any other source file,
+Xand are subject to the same process.
+X.LP
+XThe baseline in aegis has one particular attribute:
+Xit always works.
+XIt is
+Xalways there to show off to visiting big-wigs,
+Xit is always there to
+Xgrab a copy of and ship a "pre-release snapshot" to some overly anxious
+Xcustomer,
+Xit is always there to let upper management "touch and feel"
+Xthe progress being made towards the next release.
+X.LP
+XYou may claim that "works" is comfortably fuzzy,
+Xbut it is not.
+XThe baseline contains not only the source of a project,
+Xbut also the tests for a project.
+XTests are treated just like any other source file,
+Xand are subject to the same process.
+XA baseline is defined to "work" if and only if it passes all
+Xof its own tests.
+XThe aegis program has mandatory testing,
+Xto ensure
+Xthat all changes to the baseline are accompanied by tests,
+Xand that
+Xthose tests have been run and are known to pass.
+XThis means that no
+Xchange to the baseline may result in the baseline ceasing to work\**.
+X.FS
+XWell,
+Xmostly.
+XIt is possible for this restriction to be relaxed if you feel
+Xthere are special circumstances for a particular change.
+XThe danger is that a change
+Xwill be integrated with the baseline when that change
+Xis not actually of acceptable quality.
+X.FE
+X.LP
+XThe model may be summarised briefly:
+Xit consists of a
+X.I baseline
+X(master source),
+Xupdated through the agency of an
+X.I integrator ,
+Xwho is in turn fed
+X.I changes
+Xby a team of
+X.I developers .
+XThese terms will be explained in the following sections.
+XSee figure 1 for a picture of how files flow around the system.
+X.KF
+X.PS
+Xdown
+XB1: box "baseline"
+Xmove left down
+XB2: box "development" "directory"
+Xmove right down
+XE1: ellipse "integrator"
+Xarrow "integrate " rjust "begin " rjust
+XB3: box "integration" "directory"
+XS1: spline -> from B3.s then down then right 1.25 then up then to B1.n right 1.25 then to B1.n up right 1.25 then to B1.n up then to B1.n
+X"integrate " rjust "pass " rjust at S1.c+(1.25,-0.75)
+Xarrow from B2.s to E1.nw
+Xarrow from 1/3<B1.sw,B1.se> to B2.n
+X
+Xmove to B1.s
+Xmove right down
+XB4: box "development" "directory"
+Xarrow from 1/3<B1.se,B1.sw> to B4.n
+Xarrow from B4.s to E1.ne
+X.PE
+X.ce 1
+X\fBFigure 1:\fP Flow of Files through the Model
+X.sp
+X\|
+X.KE
+X.LP
+XThe baseline is a set of files
+Xincluding the source files for a projects,
+Xand also all derived files (such as generated code,
+Xbinary files from the compiler,
+Xetc),
+Xand all of the tests.
+XTests are treated just like any other source file,
+Xand are subject to the same process.
+XAll files in the baseline are consistent with each other.
+X.LP
+XThus the baseline may be considered to the the 
+X.I closure
+Xof the source files,
+Xin mathematical terms.
+XThat is,
+Xit is the source files
+Xand all implications flowing from those source files,
+Xsuch as object files and executables.
+XAll files in the baseline are consistent with each other;
+Xthis means that development builds may expect to be able to take
+Xobjects files from the baseline rather than rebuild them
+Xwithin the development directory.
+X.LP
+XThe baseline is readable by all staff,
+Xand usually writable by none.
+X.LP
+XIn many ways,
+Xthe baseline may be thought of as a database,
+Xand all derived files are projections (views) of the source files.
+XPassing its own tests may be thought of as input validation of fields.
+XThis is a powerful concept,
+Xand indeed the implementation of the aegis program performs many
+Xof the locking and synchronization tasks demanded of a database
+Xengine.
+X.LP
+XAll of the files forming this database are text files.
+XThis means that they may be repaired with an ordinary text editor,
+Xshould remedial action be necessary.
+XThe format is documented in section 5 of the reference manual.
+XShould you wish to perform some query not yet available in aegis,
+Xthe files are readily accessible to members of the appropriate
+X.UX
+Xgroup.
+X.LP
+XTests are treated just like any other source file,
+Xand are subject to the same process.
+X.nh 3 "The Change Mechanism"
+X.LP
+XAny changes to the baseline are made by atomic increments,
+Xknown (unoriginally)
+Xas "changes".
+XA change is a collection of files to be added to,
+Xmodified in,
+Xor deleted from,
+Xthe baseline.
+XThese files must all be so altered
+Xsimultaneously for the baseline to continue to "work".\**
+X.FS
+XWhether to allow several logically independent changes to be included in the
+Xone change is a policy decision for individual projects to make,
+Xand is not dictated by the aegis program.
+XIt is a responsibility of reviewers
+Xto ensure that all new and changed functionality is tested and
+Xdocumented.
+X.FE
+X.LP
+XFor example,
+Xif the calling interface to a function were changed in one file,
+Xall calls to that function in any other file must also change for the
+Xbaseline to continue to work.
+XAll of the files must be changed simultaneously,
+Xand thus must all be included in the one change.
+XOther
+Xfiles which would logically be included in such an change include the
+Xreference manual entry for the function,
+Xthe design document relating
+Xto that area of functionality,
+Xthe relevant user documentation,
+Xtests
+Xwould have to be included for the functionality,
+Xand existing tests may
+Xneed to be revised.
+X.LP
+XChanges must be accompanied by tests.
+XThese tests will either establish that a bug has been fixed
+X(in the case of a bug fix)
+Xor will establish that new functionality works
+X(in the case of an enhancement).
+X.LP
+XTests are shell scripts,
+Xand as such are capable of testing anything which has functionality
+Xaccessable from the command line.
+Xthe ability to run background processes allows even client-server
+Xmodels to be tested.
+XTests are thus text files, and are treated as source files;
+Xthey may be modified by the same process as any other source file.
+XTests usually need to be revised as a project grows and adapts
+Xto changing requirements,
+Xor to be extended as functionality is extended.
+XTests can even be deleted if the functionality they tests has been deleted;
+Xtests are deleted by the same process as any other source file.
+X.nh 3 "Change States"
+X.LP
+XAs a change is developed using aegis,
+Xit passes through six states.
+XMany aegis
+Xcommands relate to transitions between these states,
+Xand aegis performs
+Xany validation at these times.
+X.LP
+XThe six states of a change are described as follows,
+Xalthough the various state
+Xtransitions,
+Xand their conditions,
+Xwill be described later.
+X.nh 4 "Awaiting Development"
+X.LP
+XA change is in this state after it has been created,
+Xbut before it has been assigned to a developer.
+XThis state can't be skipped:
+Xa change can't be immediately assigned to a developer
+Xby an administrator,
+Xbecause this disempowers the staff.
+X.LP
+XThe aegis program is not a progress tracking tool,
+Xnor is it a work scheduling tool;
+Xplenty of both already exist.
+X.nh 4 "Being Developed"
+X.LP
+XA change is in this state after it has been assigned to a developer,
+Xby the developer.
+XThis is the coal face:
+Xall development is carried out in this state.
+XFiles can be edited in no other state,
+Xthis particularly means that only developers can develop,
+Xreviewers and integrators only have the power to veto a change.
+XStaff roles will be described more fully in a later section.
+X.LP
+XTo advance to the next state,
+Xthe change must build successfully,
+Xit must have tests,
+Xand it must pass those tests.\**
+X.FS
+XIt is possible for these testing requirements to be waived on either a
+Xper-project or per-change basis.
+XHow is described in a later section.
+XThe power to waive this requirement is not automatically granted to developers,
+Xas experience has shown that it is usually abused.
+X.FE
+X.LP
+XThe new tests must also
+X.I fail
+Xagainst the baseline;
+Xthis is to establish that tests for bug-fixes actually reproduce the bug
+Xand then demonstrate that it is gone.
+XNew functionality added by a change
+Xwill naturally fail when tested in the old baseline,
+Xbecause it is not there.
+X.LP
+XWhen these conditions are met,
+Xthe aegis program marks all of the changes files as locked,
+Xsimultaneously.
+XIf any one of them is already locked,
+Xyou can't leave the
+X.I "being developed"
+Xstate,
+Xbecause the file is part of a change which is somewhere
+Xbetween
+X.I "being reviewed"
+Xand
+X.I "being integrated" .
+X.LP
+XIf any one of them is out-of-date with respect to the baseline,
+Xthe lock is not taken,
+Xeither.
+XLocking the files at this state transition means that popular files may be
+Xmodified simultaneously in many changes,
+Xbut that only differences to the latest version are ever submitted for
+Xintegration.
+XThe aegis program provides a mechanism,
+Xdescribed later,
+Xfor bringing out-of-date files in changes up-to-date without losing the
+Xedits made by the developer.
+X.nh 4 "Being Reviewed"
+X.LP
+XA change is in this state after a developer has indicated that development is
+Xcomplete.
+XThe change is inspected,
+Xusually by a second party (or parties),
+Xto ensure that it matches the  what it is meant to be doing,
+Xand meets other project or company standards you may have.
+X.LP
+XThe style of review,
+Xand who may review,
+Xis not dictated by the aegis program.
+XA number of alternative have been observed:
+X.LP
+X\(bu 
+XYou may have a single person who coordinates review panels of,
+Xsay,
+X4 peers,
+Xwith this coordinator the only person allowed to sign-off review passes or
+Xfails.
+X.LP
+X\(bu
+XYou may allow any of the developers to review any other developer's changes.
+X.LP
+X\(bu
+XYou may require that only senior staff,
+Xfamiliar with large portions of the code,
+Xbe allowed to review.
+X.LP
+XThe aegis program enforces that a developer may not review their own code.
+XThis ensures that at least one person other than the developer
+Xhas scrutinized the code,
+Xand eliminates a rather obvious conflict of interest.
+XIt is possible to turn this requirement off on a per-project basis,
+Xbut this is only desirable for projects with a one person team (or maybe two).
+XThe aegis program has no way of knowing that the user
+Xpassing a review has actually looked at,
+Xand understood,
+Xthe code.
+X.LP
+XThe reviewer knows certain things about a change for it to reach this state:
+Xit has passed all of the conditions required to reach this state.
+XThe change compiles,
+Xit has tests and it passes those tests,
+Xand the changes are to the current version of the baseline.
+XThe reviewer may thus concentrate on issues of completeness,
+Xdesign,
+Xand standards - to name only a few.
+XCheck lists can be very helpful.
+X.nh 4 "Awaiting Integration"
+X.LP
+XA change is in this state after a reviewer has indicated that a change is
+Xacceptable to the reviewer(s).
+XThis is essentially a queue,
+Xas there may be many developers,
+Xbut only one integration may proceed at any one time.
+X.LP
+XThe issue of one integration at a time is a philosophical one:
+Xall of the changes in the queue are physically independent;
+Xbecause of the
+X.I "Develop End"
+Xlocking rules they do not have
+Xintersecting sets of files.
+XThe problem comes when one change would break another,
+Xin these cases the integrator needs to know which to bounce
+Xand which to accept.
+XIntegrating one change at a time greatly simplifies this,
+Xand enforces the "only change one thing at a time" maxim,
+Xoccasionally at the expense of integrator throughput.
+X.nh 4 "Being Integrated"
+X.LP
+XA change is in this state when the integration of the change back into the
+Xbaseline is commenced.
+XA (logical) copy of the baseline is taken,
+Xand the change is applied to that copy.
+XIn this state,
+Xthe change is compiled and tested once again.
+X.LP
+XThe additional compilation has two purposes:
+Xit ensures that the successful compile performed by the developer was
+Xnot a fluke of the developer's environment,
+Xand it also allows the baseline to be the closure of the sources files.
+XThat is,
+Xall of the implications flowing from the source files,
+Xsuch as object files and linked programs or libraries.
+XIt is not possible for aegis to know which files these are
+Xin the development directory,
+Xbecause aegis is decoupled from the build
+Xmechanism (this will discussed later).
+X.LP
+XTo advance to the next state,
+Xthe integration copy must have been compiled,
+Xand the tests included in the change must have been run and passed.
+X.LP
+XThe integrator also has the power of veto.
+XA change may fail an integration because it fails to build or fails tests,
+Xand also just because the integrator says so.
+XThis allows the
+X.I "being integrated"
+Xstate to be another review state,
+Xif desired.
+XThe
+X.I "being integrated"
+Xstate is also the place to monitor the quality
+Xof reviews and reviewers.
+X.LP
+XShould a faulty change manage to reach this point,
+Xit is to be hoped that the integration process,
+Xand the integrator's sharp eyes,
+Xwill detect it.
+X.LP
+XWhile most of this task is automated,
+Xthis step is necessary to ensure that some strange
+Xquirk of the developer's environment was not
+Xresponsible for the change reaching this stage.
+XThe change is built once more,
+Xand tested once more.
+XIf a change fails to build or test,
+Xit is returned to the developer for further work;
+Xthe integrator may also choose to fail it for other reasons.
+XIf the integrator passes that change,
+Xthe integrated version becomes the new baseline.
+X.nh 4 "Completed"
+X.LP
+XA change reaches this state when integration is complete.
+XThe (logical) copy of the baseline used during integration has replaced the
+Xprevious copy of the baseline,
+Xand the file histories have been updated.
+XOnce in this state,
+Xa change may never leave it,
+Xunlike all other states.
+X.LP
+XIf you wish to remove a change
+Xwhich is in this state
+Xfrom the baseline,
+Xyou will have to submit another change.
+X.nh 3 "The Software Engineers"
+X.LP
+XThe model of software development used by aegis has four different roles
+Xfor software engineers to fill.
+XThese four roles may be overlapping sets of people,
+Xor be distinct,
+Xas appropriate for your project.
+X.nh 4 "Developer"
+X.LP
+XThis is the coal-face.
+XThis role is where almost everything is done.
+XThis is
+Xthe only role allowed to edit a source file of a project.
+X.LP
+XMost staff will be developers.
+XThere is nothing stopping a developer from also
+Xbeing an administrator,
+Xexcept for the possible conflict of interests
+Xwith respect to testing exemptions.
+X.LP
+XA developer may edit many of the attributes of a change while it is being
+Xdeveloped.
+XThis is mostly useful to update the description of the
+Xchange to say why it was done and what was actually done.
+XA developer
+Xmay not grant testing exemptions (but they may be relinquished).
+X.nh 4 "Reviewer"
+X.LP
+XThe role of the reviewer is to check a developer's work.
+XThis review may
+Xconsist of a peer examining the code,
+Xor it may be handled by a single
+Xmember of staff setting up and scheduling multi-person review panels.
+XThe aegis program does not mandate what style of review,
+Xit only
+Xrequires that a reviewer pass or fail each change.
+XIf it passes,
+Xan
+Xintegrator will handle it next,
+Xotherwise it is returned to the
+Xdeveloper for further work.
+X.LP
+XIn a large team,
+Xthe reviewers are usually selected from the more senior
+Xmembers of the team,
+Xbecause of their depth of experience at spotting
+Xproblems,
+Xbut also because this is an opportunity for more senior
+Xmembers of staff to coach juniors on the finer points of the art.
+X.LP
+XThe aegis programs makes some of the reviewer's task easier,
+Xbecause the
+Xreviewer knows several specific things about a change before it comes
+Xup for review:
+Xit builds,
+Xit has tests,
+Xand they have run successfully.
+XThere is also optional (per project) additional conditions imposed at
+Xthe end of development,
+Xsuch as line length limits,
+Xor anything else
+Xwhich is automatically testable.
+XThe aegis program also provides a
+Xdifference listing to the reviewer,
+Xso that each and every edit,
+Xto each and every file,
+Xcan be pointed out to the reviewer.
+X.LP
+XThere is nothing stopping a reviewer from being either an administrator or a
+Xdeveloper.
+XThe aegis program specifically prevents a developer from
+Xreviewing his own work,
+Xto avoid conflicts of interest.
+X(It is possible for this
+Xrestriction to be waived,
+Xbut that only makes sense for one person
+Xprojects.)
+X.LP
+XIt will occasionally be necessary to arbitrate between a developer and a
+Xreviewer.
+XThe appropriate person to do this would have line
+Xresponsibility above both staff involved.
+XThus it is desirable that
+Xsupervisors/managers not be reviewers,
+Xexcept in very small teams.
+X.nh 4 "Integrator"
+X.LP
+XThe role of the integrator is to take a change which has already been reviewed
+Xand integrate it with the baseline,
+Xto form a new baseline.
+XThe
+Xintegrator is thus the last line of defence for the baseline.
+X.LP
+XThere is nothing preventing an administrator from being an administrator,
+Xa
+Xdeveloper or a reviewer.
+XThe aegis program specifically prevents a
+Xdeveloper or reviewer from integrating his own work,
+Xeliminating any conflict of interests.
+X(It is possible for this restriction to be waived,
+Xbut that
+Xonly makes sense for one and two person projects.)
+X.LP
+XIt will occasionally be necessary to arbitrate between an integrator and a
+Xreviewer and/or a developer.
+XThe appropriate person to do this would
+Xhave line responsibility above all of the staff involved.
+XThus it is
+Xdesirable that supervisors/mangers not be integrators,
+Xexcept in very
+Xsmall teams.
+X.LP
+XThe baseline is readable by all developers,
+Xbut not writable.
+XAll updates of the baseline to reflect changes produced by developers
+Xare performed through the agency of the integrator.
+X.nh 4 "Administrator"
+X.LP
+XThe project administrator has the following duties:
+X.LP
+X\(bu Create new changes.
+XThese may be the result of some customer bug
+Xreporting mechanism,
+Xit may be the result of new functionality being
+Xrequested.
+X.LP
+X\(bu Grant testing exemptions.
+XBy default,
+Xaegis insists that all changes be
+Xaccompanied by tests.
+XThe project administrator may grant case-by-case
+Xexemptions,
+Xor a project-wide exemption.
+X.LP
+X\(bu Add or remove staff.
+XThe four roles described in this section may be
+Xassigned to,
+Xor removed from,
+Xspecific 
+X.UX
+Xlogins by the project
+Xadministrator.
+X.LP
+X\(bu Edit project attributes.
+XThere are many attributes attached to a project,
+Xonly a project administrator may alter them.
+X.LP
+X\(bu Edit change attributes.
+XThere are many attributes attached to a change,
+Xonly a project administrator may alter all of them.
+X.LP
+XA project usually has only one or two administrators at any one time.
+X.nh 3 "The Change Process"
+X.LP
+XThis section will examine the progression of a change through the six change
+Xstates.
+XMost of the attention will be given to the conditions which
+Xmust be met in order to progress from one state to the next,
+Xas this is
+Xwhere the software development model employed by aegis is most often
+Xexpressed.
+X.LP
+XSee figure 2 for a picture of how all of the states and
+Xtransitions fit together.
+X.KF
+X.PS
+Xboxwid = 1
+Xdown
+XS0: arrow " new" ljust " change" ljust
+XS1: box "awaiting" "development"
+Xarrow " develop" ljust " begin" ljust
+XS2: box ht 1 "being" "developed"
+Xarrow " develop" ljust " end" ljust
+XS3: box "being" "reviewed"
+Xarrow " review" ljust " pass" ljust
+XS4: box "awaiting" "integration"
+Xarrow " integrate" ljust " begin" ljust
+XS5: box "being" "integrated"
+Xarrow " integrate" ljust " pass" ljust
+XS6: box "completed"
+Xspline -> from 1/3<S1.nw,S1.sw> then left 0.75 then up 2/3 "new" "change" "undo"
+XT1: spline -> from 1/2<S2.nw,S2.w> then left 0.75 then up 11/12 \
+X	then to 1/3<S1.sw,S1.nw>
+X" develop" ljust " begin" ljust " undo" ljust at T1.c - (0.75,0)
+XT2: spline -> from S3.w then left 0.5 then up 1 \
+X	then to 1/2<S2.sw,S2.w>
+X" develop" ljust " end" ljust " undo" ljust at T2.c - (0.5,0)
+XT3: spline -> from 1/3<S4.nw,S4.sw> then left 1 then up 2.25-1/12 \
+X	then to S2.w
+X"" "" " develop" ljust " end" ljust " undo" ljust at T3.c - (1,0)
+XT4: spline -> from S5.w then left 0.75 then up 11/12 then to 1/3<S4.sw,S4.nw>
+X" integrate" ljust " begin" ljust " undo" ljust at T4.c - (0.75,0)
+XT5: spline -> from 1/3<S3.ne,S3.se> then right 0.5 then up 1 then to 1/3<S2.se,S2.ne>
+X"review " rjust "fail " rjust at T5.c + (0.5,0)
+XT6: spline -> from S4.e then right 0.5 then up 11/12 then to 1/3<S3.se,S3.ne>
+X"review " rjust "pass " rjust "undo " rjust at T6.c + (0.5,0)
+XT7: spline -> from S5.e then right 1 then up 3.5-1/12 then to 1/3<S2.ne,S2.se>
+X"integrate " rjust "fail " rjust "" "" at T7.c + (1,0)
+X.PE
+X.ce 1
+X\fBFigure 2:\fP Change States and Transitions
+X.sp 2
+X.KE
+X.nh 4 "New Change"
+X.LP
+XA project administrator creates a change.
+XThis change will consist mostly of a
+Xdescription at this time.
+XThe project administrator is not able
+X(through aegis) to assign it to a specific developer.
+X.LP
+XThe change is awaiting development;
+Xit is in the awaiting development state.
+X.nh 4 "New Change Undo"
+X.LP
+XIt is possible to abandon a change if it is in the
+X.I "awaiting development"
+Xstate.
+XAll record of the change,
+Xincluding its description,
+Xwill be deleted.
+X.LP
+XIt is called
+X.I "new change undo"
+Xto emphasize the state it must be in
+Xto delete it.
+X.nh 4 "Develop Begin"
+X.LP
+XA developer,
+Xfor whatever reason,
+Xscans the list of changes awaiting
+Xdevelopment.
+XHaving selected a change,
+Xthe developer then assigns
+Xthat change to herself.
+X.LP
+XThe change is now being developed;
+Xit is in the being developed state.
+X.LP
+XA number of aegis commands only work in this state,
+Xincluding commands to
+Xinclude files and tests in the change (be they new files to be added to
+Xthe baseline,
+Xfiles in the baseline to be modified,
+Xor files to be
+Xdeleted from the baseline),
+Xcommands to build the change,
+Xcommands to
+Xtest the change,
+Xand commands to difference the change.
+X.LP
+XThe process of taking sources files,
+Xthe preferred form for editing of a
+Xproject,
+Xand transforming them,
+Xthrough various manipulations and
+Xtranslations,
+Xinto a "finished" product is known as building.
+XIn
+Xthe 
+X.UX
+Xworld this usually means things like compiling and linking a
+Xprogram,
+Xbut as fancy graphical programs become more wide-spread,
+Xthe
+Xsource files could a binary output from a graphical
+XEntity-Relationship-Diagram editor,
+Xwhich would then be run through a
+Xdatabase schema generator.
+X.LP
+XThe process of testing a change has three aspects.
+XThe most intuitive is that
+Xa test must be run to determine of the functionality works.
+XThe second
+Xrequirement is that the test be run against the baseline and fail;
+Xthis
+Xis to ensure that bugs are not just fixed,
+Xbut reproduced as well.
+XThe
+Xthird requirement is optional:
+Xall or some of the tests already in the
+Xbaseline may also be run.
+XTests consist of 
+X.UX
+Xshell scripts -
+Xanything that can be done in a shell script can be tested.
+X.LP
+XIn preparation for review,
+Xa change is differenced.
+XThis usually consists of
+Xautomatically comparing the present contents of the baseline with what
+Xthe change proposes to do to the baseline,
+Xon a file-by-file basis.
+XThe
+Xresults of the difference,
+Xsuch as 
+X.UX
+X.I "diff -c"
+Xoutput,
+Xis kept
+Xin a difference file,
+Xfor examination by the reviewer(s).
+XThe benefit
+Xof this procedure is that reviewers may examine these file to see every
+Xchange the developer made,
+Xrather than only the obvious ones.
+XThe
+Xdifferencing commands are per-project configurable,
+Xand other
+Xvalidations,
+Xsuch as line length restrictions,
+Xmay also be imposed at
+Xthis time.
+X.LP
+XTo leave this state,
+Xthe change must have source files,
+Xit must have tests,
+Xit
+Xmust have built successfully,
+Xit must have passed all its own tests,
+Xand
+Xit must have been differenced.
+X.nh 4 "Develop Begin Undo"
+X.LP
+XIt is possible to return a change from the being developed state to the
+Xawaiting development state if it has no source files and has no tests.
+XThis is usually desired if a developer selected the wrong
+Xchange by mistake.
+X.nh 4 "Develop End"
+X.LP
+XWhen the conditions for the end of development
+Xhave been met (the change must have source files,
+Xit must have tests,
+Xit must have built successfully,
+Xit must have passed all its own tests,
+Xand it must have been
+Xdifferenced) the developer may cause the change to leave the being
+Xdeveloped state and enter the being reviewed state.
+XThe aegis program
+Xwill check to see that all the conditions are met at this time.
+XThere
+Xis no history kept of unsuccessful develop end attempts.
+X.nh 4 "Develop End Undo"
+X.LP
+XThere are many times when a developer thinks that a change is completed,
+Xand goes hunting for a reviewer.
+XHalf way down the hall,
+Xshe thinks of something that should have been included.
+X.LP
+XIt is possible for a developer to rescind a
+X.I "Develop End"
+Xto allow further work on a change.
+XNo reason need be given.
+XThis request may be issued to a change in either the
+X.I "being reviewed"
+Xor
+X.I "awaiting integration"
+Xstates.
+X.nh 4 "Review Pass"
+X.LP
+XThis event is used to notify aegis that the change has been examined,
+Xby a method unspecified as discussed above,
+Xand has been found to be acceptable.
+X.nh 4 "Review Pass Undo"
+X.LP
+XThe reviewer of a change may rescind a
+X.I "Review Pass"
+Xwhile the change remains in the
+X.I "awaiting integration"
+Xstate.
+XNo reason must be supplied.
+XThe change will be returned to the
+X.I "being reviewed"
+Xstate.
+X.nh 4 "Review Fail"
+X.LP
+XThis event is used to notify aegis that the change has been examined,
+Xby a method unspecified as discussed above,
+Xand has been found to be unacceptable.
+X.LP
+XA file containing a brief summary of the problems must be given,
+Xand will be included in the change's history.
+X.LP
+XThe change will be returned to the
+X.I "being developed"
+Xstate for further work.
+X.LP
+XIt is not the responsibility of any reviewer to fix a defective change.
+X.nh 4 "Integrate Begin"
+X.LP
+XThis command is used to
+Xcommence integration of a change into the project baseline.
+X.LP
+XWhether a physical copy of the baseline is used,
+Xor a logical copy using hard links,
+Xis controlled by the project configuration file.
+XThe change is then applied to this copy.
+X.LP
+XThe integrator must then issue build and test commands as appropriate.
+XThis is not automated as some integrator tasks may be required in and around
+Xthese commands.
+X.nh 4 "Integrate Begin Undo"
+X.LP
+XThis command is used to
+Xreturn a change to the integration queue,
+Xwith out prejudice.
+XNo reason need be given.
+X.LP
+XThis is usually done when a particularly important change is in the queue,
+Xand the current integration is expected to take a long time.
+X.nh 4 "Integrate Pass"
+X.LP
+XThis command is used to
+Xnotify aegis that the change being integrated is acceptable.
+X.LP
+XThe current baseline is replaced with the integration copy,
+Xand the history is updated.
+X.nh 4 "Integrate Fail"
+X.LP
+XThis command is used to
+Xnotify aegis that an integration is unacceptable,
+Xusually because it failed to build or test in some way,
+Xor sometimes because the integrator found a deficiency.
+X.LP
+XA file containing a
+X.I brief
+Xsummary of the problems must be given,
+Xand the summary will be included in the change's history.
+X.LP
+XThe change will be returned to the
+X.I "being developed"
+Xstate for further work.
+XThe integration copy of the baseline is deleted,
+Xleaving the original baseline unchanged.
+X.LP
+XIt is not the responsibility of any integrator to fix a defective change,
+Xor even diagnose what the defect may be.
+END_OF_FILE
+if test 29686 -ne `wc -c <'doc/c7.1.so'`; then
+    echo shar: \"'doc/c7.1.so'\" unpacked with wrong size!
+fi
+# end of 'doc/c7.1.so'
+fi
+echo shar: End of archive 14 \(of 19\).
+cp /dev/null ark14isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 19 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

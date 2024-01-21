@@ -1,0 +1,1213 @@
+Newsgroups: comp.sources.unix
+From: deraadt@cpsc.ucalgary.ca (Theo Deraadt)
+Subject: v25i154: permissions - access control library for YP/NIS environments, Part03/03
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: deraadt@cpsc.ucalgary.ca (Theo Deraadt)
+Posting-Number: Volume 25, Issue 154
+Archive-Name: permissions/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 3)."
+# Contents:  in.ftpd/ftpd.c
+# Wrapped by vixie@cognition.pa.dec.com on Tue Mar 10 23:11:21 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'in.ftpd/ftpd.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'in.ftpd/ftpd.c'\"
+else
+echo shar: Extracting \"'in.ftpd/ftpd.c'\" \(24225 characters\)
+sed "s/^X//" >'in.ftpd/ftpd.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1985, 1988 Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms are permitted
+X * provided that the above copyright notice and this paragraph are
+X * duplicated in all such forms and that any documentation,
+X * advertising materials, and other materials related to such
+X * distribution and use acknowledge that the software was developed
+X * by the University of California, Berkeley.  The name of the
+X * University may not be used to endorse or promote products derived
+X * from this software without specific prior written permission.
+X */
+X
+X#ifndef lint
+char copyright[] =
+X"@(#) Copyright (c) 1985, 1988 Regents of the University of California.\n\
+X All rights reserved.\n";
+X#endif not lint
+X
+X#ifndef lint
+static char sccsid[] = "@(#)ftpd.c	5.2 (Berkeley) 12/7/88";
+X#endif not lint
+X
+X/*
+X * FTP server.
+X */
+X#include <sys/param.h>
+X#include <sys/stat.h>
+X#include <sys/ioctl.h>
+X#include <sys/socket.h>
+X#include <sys/file.h>
+X#include <sys/wait.h>
+X
+X#include <netinet/in.h>
+X
+X#include <arpa/ftp.h>
+X#include <arpa/inet.h>
+X#include <arpa/telnet.h>
+X
+X#include <stdio.h>
+X#include <signal.h>
+X#include <pwd.h>
+X#ifdef PERMS
+X#include <string.h>
+X#include <grp.h>
+X#endif
+X#include <setjmp.h>
+X#include <netdb.h>
+X#include <errno.h>
+X#include <strings.h>
+X#include <syslog.h>
+X#include <varargs.h>
+X
+X/*
+X * File containing login names
+X * NOT to be used on this machine.
+X * Commonly used to disallow uucp.
+X */
+X#define	FTPUSERS	"/etc/ftpusers"
+X
+extern	int errno;
+extern	char *sys_errlist[];
+extern	int sys_nerr;
+extern	char *crypt();
+extern	char version[];
+extern	char *home;		/* pointer to home directory for glob */
+extern	FILE *ftpd_popen(), *fopen(), *freopen();
+extern	int  ftpd_pclose(), fclose();
+extern	char *getline();
+extern	char cbuf[];
+X
+struct	sockaddr_in ctrl_addr;
+struct	sockaddr_in data_source;
+struct	sockaddr_in data_dest;
+struct	sockaddr_in his_addr;
+X
+int	data;
+jmp_buf	errcatch, urgcatch;
+int	logged_in;
+struct	passwd *pw;
+int	debug;
+int	timeout = 900;    /* timeout after 15 minutes of inactivity */
+int	logging;
+int	guest;
+int	type;
+int	form;
+int	stru;			/* avoid C keyword */
+int	mode;
+int	usedefault = 1;		/* for data transfers */
+int	pdata = -1;		/* for passive mode */
+int	transflag;
+int	socksize = 24 * 1024;	/* larger socket window size for data */
+char	tmpline[7];
+char	hostname[MAXHOSTNAMELEN];
+char	remotehost[MAXHOSTNAMELEN];
+char	buf[BUFSIZ*8];		/* larger buffer to speed up binary xfers */
+X
+X/*
+X * Timeout intervals for retrying connections
+X * to hosts that don't accept PORT cmds.  This
+X * is a kludge, but given the problems with TCP...
+X */
+X#define	SWAITMAX	90	/* wait at most 90 seconds */
+X#define	SWAITINT	5	/* interval between retries */
+X
+int	swaitmax = SWAITMAX;
+int	swaitint = SWAITINT;
+X
+int	lostconn();
+int	myoob();
+XFILE	*getdatasock(), *dataconn();
+X
+main(argc, argv)
+X	int argc;
+X	char *argv[];
+X{
+X	int addrlen, on = 1;
+X	char *cp;
+X#ifdef PERMS
+X	char domainname[MAXHOSTNAMELEN];
+X#endif
+X	openlog("ftpd", LOG_PID, LOG_DAEMON);
+X	addrlen = sizeof (his_addr);
+X	if (getpeername(0, (struct sockaddr *)&his_addr, &addrlen) < 0) {
+X		syslog(LOG_ERR, "getpeername (%s): %m",argv[0]);
+X		exit(1);
+X	}
+X	addrlen = sizeof (ctrl_addr);
+X	if (getsockname(0, (struct sockaddr *)&ctrl_addr, &addrlen) < 0) {
+X		syslog(LOG_ERR, "getsockname (%s): %m",argv[0]);
+X		exit(1);
+X	}
+X	data_source.sin_port = htons(ntohs(ctrl_addr.sin_port) - 1);
+X	debug = 0;
+X	argc--, argv++;
+X	while (argc > 0 && *argv[0] == '-') {
+X		for (cp = &argv[0][1]; *cp; cp++) switch (*cp) {
+X
+X		case 'v':
+X			debug = 1;
+X			break;
+X
+X		case 'd':
+X			debug = 1;
+X			break;
+X
+X		case 'l':
+X			logging = 1;
+X			break;
+X
+X		case 't':
+X			timeout = atoi(++cp);
+X			goto nextopt;
+X			break;
+X
+X		default:
+X			fprintf(stderr, "ftpd: Unknown flag -%c ignored.\n",
+X			     *cp);
+X			break;
+X		}
+nextopt:
+X		argc--, argv++;
+X	}
+X	(void) freopen("/dev/null", "w", stderr);
+X	(void) signal(SIGPIPE, lostconn);
+X	(void) signal(SIGCHLD, SIG_IGN);
+X	if (signal(SIGURG, myoob) == BADSIG)
+X		syslog(LOG_ERR, "signal: %m");
+X	/* handle urgent data inline */
+X#ifdef SO_OOBINLINE
+X	if (setsockopt(0, SOL_SOCKET, SO_OOBINLINE, (char *)&on, sizeof(on)) < 0)
+X		syslog(LOG_ERR, "setsockopt: %m");
+X#endif
+X	if (fcntl(fileno(stdin), F_SETOWN, getpid()) == -1)
+X		syslog(LOG_ERR, "fcntl F_SETOWN: %m");
+X	dolog(&his_addr);
+X	/* do telnet option negotiation here */
+X	/*
+X	 * Set up default state
+X	 */
+X	data = -1;
+X	type = TYPE_A;
+X	form = FORM_N;
+X	stru = STRU_F;
+X	mode = MODE_S;
+X	tmpline[0] = '\0';
+X	(void) gethostname(hostname, sizeof (hostname));
+X#ifdef PERMS
+X	if( Getdomainname(domainname, sizeof(domainname)) ) {
+X		reply(220, "%s.%s FTP server (%s) ready.",
+X			hostname, domainname, version);
+X	} else {
+X		reply(220, "%s FTP server (%s) ready.",
+X			hostname, version);
+X	}
+X#else
+X	reply(220, "%s FTP server (%s) ready.", hostname, version);
+X#endif
+X	(void) setjmp(errcatch);
+X	for (;;)
+X		(void) yyparse();
+X}
+X
+lostconn()
+X{
+X
+X	if (debug)
+X		syslog(LOG_DEBUG, "lost connection");
+X	dologout(-1);
+X}
+X
+static char ttyline[20];
+X
+X/*
+X * Helper function for sgetpwnam().
+X */
+char *
+sgetsave(s)
+X	char *s;
+X{
+X	char *malloc();
+X	char *new = malloc((unsigned) strlen(s) + 1);
+X	
+X	if (new == NULL) {
+X		reply(553, "Local resource failure: malloc");
+X		dologout(1);
+X	}
+X	(void) strcpy(new, s);
+X	return (new);
+X}
+X
+X/*
+X * Save the result of a getpwnam.  Used for USER command, since
+X * the data returned must not be clobbered by any other command
+X * (e.g., globbing).
+X */
+struct passwd *
+sgetpwnam(name)
+X	char *name;
+X{
+X	static struct passwd save;
+X	register struct passwd *p;
+X	char *sgetsave();
+X
+X	if ((p = getpwnam(name)) == NULL)
+X		return (p);
+X	if (save.pw_name) {
+X		free(save.pw_name);
+X		free(save.pw_passwd);
+X		free(save.pw_comment);
+X		free(save.pw_gecos);
+X		free(save.pw_dir);
+X		free(save.pw_shell);
+X	}
+X	save = *p;
+X	save.pw_name = sgetsave(p->pw_name);
+X	save.pw_passwd = sgetsave(p->pw_passwd);
+X	save.pw_comment = sgetsave(p->pw_comment);
+X	save.pw_gecos = sgetsave(p->pw_gecos);
+X	save.pw_dir = sgetsave(p->pw_dir);
+X	save.pw_shell = sgetsave(p->pw_shell);
+X	return (&save);
+X}
+X
+int login_attempts;		/* number of failed login attempts */
+int askpasswd;			/* had user command, ask for passwd */
+X
+X/*
+X * USER command.
+X * Sets global passwd pointer pw if named account exists
+X * and is acceptable; sets askpasswd if a PASS command is
+X * expected. If logged in previously, need to reset state.
+X * If name is "ftp" or "anonymous" and ftp account exists,
+X * set guest and pw, then just return.
+X * If account doesn't exist, ask for passwd anyway.
+X * Otherwise, check user requesting login privileges.
+X * Disallow anyone who does not have a standard
+X * shell returned by getusershell() (/etc/shells).
+X * Disallow anyone mentioned in the file FTPUSERS
+X * to allow people such as root and uucp to be avoided.
+X */
+user(name)
+X	char *name;
+X{
+X	register char *cp;
+X	FILE *fd;
+X	char *shell;
+X	char line[BUFSIZ], *index(), *getusershell();
+X
+X	if (logged_in) {
+X		if (guest) {
+X			reply(530, "Can't change user from guest login.");
+X			return;
+X		}
+X		end_login();
+X	}
+X
+X	guest = 0;
+X	if (strcmp(name, "ftp") == 0 || strcmp(name, "anonymous") == 0) {
+X		if ((pw = sgetpwnam("ftp")) != NULL) {
+X#ifdef PERMS
+X			if( checkuser(pw) ) {
+X				reply(530, "Anon FTP not permitted here.");
+X				pw = (struct passwd *) NULL;
+X				return;
+X			}
+X#endif
+X			guest = 1;
+X			askpasswd = 1;
+X			reply(331, "Guest login ok, send ident as password.");
+X		} else
+X			reply(530, "User %s unknown.", name);
+X		return;
+X	}
+X	if (pw = sgetpwnam(name)) {
+X#ifdef PERMS
+X		if( checkuser(pw)) {
+X			reply(530, "User %s access denied.", name);
+X			pw = (struct passwd *) NULL;
+X			return;
+X		}
+X#endif
+X		if ((shell = pw->pw_shell) == NULL || *shell == 0)
+X			shell = "/bin/sh";
+X		while ((cp = getusershell()) != NULL)
+X			if (strcmp(cp, shell) == 0)
+X				break;
+X		endusershell();
+X		if (cp == NULL) {
+X			reply(530, "User %s access denied.", name);
+X			pw = (struct passwd *) NULL;
+X			return;
+X		}
+X		if ((fd = fopen(FTPUSERS, "r")) != NULL) {
+X		    while (fgets(line, sizeof (line), fd) != NULL) {
+X			if ((cp = index(line, '\n')) != NULL)
+X				*cp = '\0';
+X			if (strcmp(line, name) == 0) {
+X				reply(530, "User %s access denied.", name);
+X				pw = (struct passwd *) NULL;
+X				return;
+X			}
+X		    }
+X		}
+X		(void) fclose(fd);
+X	}
+X	reply(331, "Password required for %s.", name);
+X	askpasswd = 1;
+X	/*
+X	 * Delay before reading passwd after first failed
+X	 * attempt to slow down passwd-guessing programs.
+X	 */
+X	if (login_attempts)
+X		sleep((unsigned) login_attempts);
+X}
+X
+X/*
+X * Terminate login as previous user, if any, resetting state;
+X * used when USER command is given or login fails.
+X */
+end_login()
+X{
+X
+X	(void) seteuid((uid_t)0);
+X	if (logged_in)
+X		logwtmp(ttyline, "", "");
+X	pw = NULL;
+X	logged_in = 0;
+X	guest = 0;
+X}
+X
+pass(passwd)
+X	char *passwd;
+X{
+X	char *xpasswd, *salt;
+X
+X	if (logged_in || askpasswd == 0) {
+X		reply(503, "Login with USER first.");
+X		return;
+X	}
+X	askpasswd = 0;
+X	if (!guest) {		/* "ftp" is only account allowed no password */
+X		if (pw == NULL)
+X			salt = "xx";
+X		else
+X			salt = pw->pw_passwd;
+X		xpasswd = crypt(passwd, salt);
+X		/* The strcmp does not catch null passwords! */
+X		if (pw == NULL || *pw->pw_passwd == '\0' ||
+X		    strcmp(xpasswd, pw->pw_passwd)) {
+X			reply(530, "Login incorrect.");
+X			pw = NULL;
+X			if (login_attempts++ >= 5) {
+X				syslog(LOG_ERR,
+X				    "repeated login failures from %s",
+X				    remotehost);
+X				exit(0);
+X			}
+X			return;
+X		}
+X	}
+X	login_attempts = 0;		/* this time successful */
+X	(void) setegid((gid_t)pw->pw_gid);
+X	(void) initgroups(pw->pw_name, pw->pw_gid);
+X	if (chdir(pw->pw_dir)) {
+X		if (chdir("/")) {
+X			reply(550, "User %s: can't change directory to %s.",
+X				pw->pw_name, pw->pw_dir);
+X			goto bad;
+X		}
+X	}
+X
+X	/* open wtmp before chroot */
+X	(void)sprintf(ttyline, "ftp%d", getpid());
+X	logwtmp(ttyline, pw->pw_name, remotehost);
+X	logged_in = 1;
+X
+X	if (guest && chroot(pw->pw_dir) < 0) {
+X		reply(550, "Can't set guest privileges.");
+X		goto bad;
+X	}
+X	if (seteuid((uid_t)pw->pw_uid) < 0) {
+X		reply(550, "Can't set uid.");
+X		goto bad;
+X	}
+X	if (guest)
+X		reply(230, "Guest login ok, access restrictions apply.");
+X	else
+X		reply(230, "User %s logged in.", pw->pw_name);
+X	home = pw->pw_dir;		/* home dir for globbing */
+X	return;
+bad:
+X	/* Forget all about it... */
+X	end_login();
+X}
+X
+X/*
+X * return a printable type string
+X */
+char *print_type(t)
+X{
+X	switch (t)
+X	{
+X	  case TYPE_A:	return("ASCII ");
+X	  case TYPE_L:
+X	  case TYPE_I:	return("Binary ");
+X	}
+X	return("");
+X}
+X
+retrieve(cmd, name)
+X	char *cmd, *name;
+X{
+X	FILE *fin, *dout;
+X	struct stat st;
+X	int (*closefunc)(), tmp;
+X	void (*oldpipe)();	/* Hold value of SIGPIPE during close */
+X
+X	if (cmd == 0) {
+X		fin = fopen(name, "r"), closefunc = fclose;
+X	} else {
+X		char line[BUFSIZ];
+X
+X		(void) sprintf(line, cmd, name), name = line;
+X		fin = ftpd_popen(line, "r"), closefunc = ftpd_pclose;
+X	}
+X	if (fin == NULL) {
+X		if (errno != 0)
+X			perror_reply(550, name);
+X		return;
+X	}
+X	st.st_size = 0;
+X	if (cmd == 0 &&
+X	    (stat(name, &st) < 0 || (st.st_mode&S_IFMT) != S_IFREG)) {
+X		reply(550, "%s: not a plain file.", name);
+X		goto done;
+X	}
+X	dout = dataconn(name, st.st_size, "w");
+X	if (dout == NULL)
+X		goto done;
+X	if ((tmp = send_data(fin, dout)) > 0 || ferror(dout) > 0) {
+X		perror_reply(550, name);
+X	}
+X	else if (tmp == 0) {
+X		reply(226, "%sTransfer complete.", print_type(type));
+X	}
+X	/*
+X	 * If the transfer failed because the data connection got aborted,
+X	 * then the fclose may cause a SIGPIPE trying to flush the buffers
+X	 * and abort the whole session.  Ignore SIGPIPEs during the fclose.
+X	 */
+X	oldpipe = signal(SIGPIPE, SIG_IGN);
+X	(void) fclose(dout);
+X	data = -1;
+X	pdata = -1;
+X	signal(SIGPIPE, oldpipe);
+done:
+X	(*closefunc)(fin);
+X}
+X
+store(name, mode, unique)
+X	char *name, *mode;
+X	int unique;
+X{
+X	FILE *fout, *din;
+X	int (*closefunc)(), tmp;
+X	char *gunique();
+X
+X	{
+X		struct stat st;
+X
+X		if (unique && stat(name, &st) == 0 &&
+X		    (name = gunique(name)) == NULL)
+X			return;
+X		fout = fopen(name, mode), closefunc = fclose;
+X	}
+X	if (fout == NULL) {
+X		perror_reply(553, name);
+X		return;
+X	}
+X	din = dataconn(name, (off_t)-1, "r");
+X	if (din == NULL)
+X		goto done;
+X	if ((tmp = receive_data(din, fout)) > 0 || ferror(fout) > 0)
+X		perror_reply(552, name);
+X	else if (tmp == 0) {
+X		if (ferror(fout) > 0)
+X			perror_reply(552, name);
+X		else if (unique)
+X			reply(226, "Transfer complete (unique file name:%s).",
+X			    name);
+X		else
+X			reply(226, "%sTransfer complete.", print_type(type));
+X	}
+X	(void) fclose(din);
+X	data = -1;
+X	pdata = -1;
+done:
+X	(*closefunc)(fout);
+X}
+X
+XFILE *
+getdatasock(mode)
+X	char *mode;
+X{
+X	int s, on = 1;
+X
+X	if (data >= 0)
+X		return (fdopen(data, mode));
+X	s = socket(AF_INET, SOCK_STREAM, 0);
+X	if (s < 0)
+X		return (NULL);
+X	(void) seteuid((uid_t)0);
+X	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char *) &on, sizeof (on)) < 0)
+X		goto bad;
+X	/* anchor socket to avoid multi-homing problems */
+X	data_source.sin_family = AF_INET;
+X	data_source.sin_addr = ctrl_addr.sin_addr;
+X	if (bind(s, (struct sockaddr *)&data_source, sizeof (data_source)) < 0)
+X		goto bad;
+X	(void) seteuid((uid_t)pw->pw_uid);
+X	return (fdopen(s, mode));
+bad:
+X	(void) seteuid((uid_t)pw->pw_uid);
+X	(void) close(s);
+X	return (NULL);
+X}
+X
+XFILE *
+dataconn(name, size, mode)
+X	char *name;
+X	off_t size;
+X	char *mode;
+X{
+X	char sizebuf[32];
+X	FILE *file;
+X	int retry = 0;
+X
+X	if (size != (off_t) -1)
+X		(void) sprintf (sizebuf, " (%ld bytes)", size);
+X	else
+X		(void) strcpy(sizebuf, "");
+X	if (pdata >= 0) {
+X		struct sockaddr_in from;
+X		int s, fromlen = sizeof(from);
+X
+X		s = accept(pdata, (struct sockaddr *)&from, &fromlen);
+X		if (s < 0) {
+X			reply(425, "Can't open data connection.");
+X			(void) close(pdata);
+X			pdata = -1;
+X			return(NULL);
+X		}
+X		(void) close(pdata);
+X		pdata = s;
+X		reply(150, "%sdata connection for %s (%s,%d)%s.",
+X		     print_type(type),
+X		     name, inet_ntoa(from.sin_addr),
+X		     ntohs(from.sin_port), sizebuf);
+X		return(fdopen(pdata, mode));
+X	}
+X	if (data >= 0) {
+X		reply(125, "Using existing %sdata connection for %s%s.",
+X		    print_type(type),
+X		    name, sizebuf);
+X		usedefault = 1;
+X		return (fdopen(data, mode));
+X	}
+X	if (usedefault)
+X		data_dest = his_addr;
+X	usedefault = 1;
+X	file = getdatasock(mode);
+X	if (file == NULL) {
+X		reply(425, "Can't create data socket (%s,%d): %s.",
+X		    inet_ntoa(data_source.sin_addr),
+X		    ntohs(data_source.sin_port),
+X		    errno < sys_nerr ? sys_errlist[errno] : "unknown error");
+X		return (NULL);
+X	}
+X	data = fileno(file);
+X	(void) setsockopt(data, SOL_SOCKET, SO_SNDBUF, (char *)&socksize, 
+X				sizeof (socksize));
+X	(void) setsockopt(data, SOL_SOCKET, SO_RCVBUF, (char *)&socksize, 
+X				sizeof (socksize));
+X	while (connect(data, &data_dest, sizeof (data_dest)) < 0) {
+X		if (errno == EADDRINUSE && retry < swaitmax) {
+X			sleep((unsigned) swaitint);
+X			retry += swaitint;
+X			continue;
+X		}
+X		perror_reply(425, "Can't build data connection");
+X		(void) fclose(file);
+X		data = -1;
+X		return (NULL);
+X	}
+X	reply(150, "%sdata connection for %s (%s,%d)%s.",
+X	    print_type(type),
+X	    name, inet_ntoa(data_dest.sin_addr),
+X	    ntohs(data_dest.sin_port), sizebuf);
+X	return (file);
+X}
+X
+X/*
+X * Envelope for 'send_data_body'.  Allow data connections to fail without
+X * terminating the daemon, but SIGPIPE is set to be ignored so that if
+X * one occurs on the data channel we'll just catch the error return on
+X * the write rather than causing the whole session to abort.
+X */
+X
+send_data(instr, outstr)
+X	FILE *instr;		/* Data being sent */
+X	FILE *outstr;		/* Connection being transmitted upon */
+X{
+X	int value;		/* Return value from send_data_body */
+X	void (*oldpipe)();	/* Old handler for SIGPIPE */
+X
+X	oldpipe = signal(SIGPIPE, SIG_IGN);
+X	value = send_data_body(instr, outstr);
+X	signal(SIGPIPE, oldpipe);
+X	return (value);	
+X}
+X
+X/*
+X * Tranfer the contents of "instr" to
+X * "outstr" peer using the appropriate
+X * encapulation of the date subject
+X * to Mode, Structure, and Type.
+X *
+X * NB: Form isn't handled.
+X */
+send_data_body(instr, outstr)
+X	FILE *instr, *outstr;
+X{
+X	register int c;
+X	int netfd, filefd, cnt;
+X
+X	transflag++;
+X	if (setjmp(urgcatch)) {
+X		transflag = 0;
+X		return(-1);
+X	}
+X	switch (type) {
+X
+X	case TYPE_A:
+X		while ((c = getc(instr)) != EOF) {
+X			if (c == '\n') {
+X				if (ferror (outstr)) {
+X					transflag = 0;
+X					return (1);
+X				}
+X				(void) putc('\r', outstr);
+X			}
+X			(void) putc(c, outstr);
+X		}
+X		transflag = 0;
+X		if (ferror (instr) || ferror (outstr)) {
+X			return (1);
+X		}
+X		return (0);
+X		
+X	case TYPE_I:
+X	case TYPE_L:
+X		netfd = fileno(outstr);
+X		filefd = fileno(instr);
+X
+X		while ((cnt = read(filefd, buf, sizeof (buf))) > 0) {
+X			if (write(netfd, buf, cnt) < 0) {
+X				transflag = 0;
+X				return (1);
+X			}
+X		}
+X		transflag = 0;
+X		return (cnt < 0);
+X	}
+X	reply(550, "Unimplemented TYPE %d in send_data", type);
+X	transflag = 0;
+X	return (-1);
+X}
+X
+X/*
+X * Transfer data from peer to
+X * "outstr" using the appropriate
+X * encapulation of the data subject
+X * to Mode, Structure, and Type.
+X *
+X * N.B.: Form isn't handled.
+X */
+receive_data(instr, outstr)
+X	FILE *instr, *outstr;
+X{
+X	register int c;
+X	int cnt;
+X
+X
+X	transflag++;
+X	if (setjmp(urgcatch)) {
+X		transflag = 0;
+X		return(-1);
+X	}
+X	switch (type) {
+X
+X	case TYPE_I:
+X	case TYPE_L:
+X		while ((cnt = read(fileno(instr), buf, sizeof buf)) > 0) {
+X			if (write(fileno(outstr), buf, cnt) < 0) {
+X				transflag = 0;
+X				return (1);
+X			}
+X		}
+X		transflag = 0;
+X		return (cnt < 0);
+X
+X	case TYPE_E:
+X		reply(553, "TYPE E not implemented.");
+X		transflag = 0;
+X		return (-1);
+X
+X	case TYPE_A:
+X		while ((c = getc(instr)) != EOF) {
+X			while (c == '\r') {
+X				if (ferror (outstr)) {
+X					transflag = 0;
+X					return (1);
+X				}
+X				if ((c = getc(instr)) != '\n')
+X					(void) putc ('\r', outstr);
+X			}
+X			(void) putc (c, outstr);
+X		}
+X		transflag = 0;
+X		if (ferror (instr) || ferror (outstr))
+X			return (1);
+X		return (0);
+X	}
+X	transflag = 0;
+X	fatal("Unknown type in receive_data.");
+X	/*NOTREACHED*/
+X}
+X
+fatal(s)
+X	char *s;
+X{
+X	reply(451, "Error in server: %s\n", s);
+X	reply(221, "Closing connection due to server error.");
+X	dologout(0);
+X}
+X
+X/*VARARGS2*/
+reply(n, s, va_alist)
+X	int n;
+X	char *s;
+X	va_dcl
+X{
+X	va_list ap;
+X
+X	va_start(ap);
+X	printf("%d ", n);
+X	_doprnt(s, ap, stdout);
+X	printf("\r\n");
+X	(void) fflush(stdout);
+X	if (debug) {
+X		syslog(LOG_DEBUG, "<--- %d ", n);
+X		vsyslog(LOG_DEBUG, s, ap);
+X	}
+X	va_end(ap);
+X}
+X
+X/*VARARGS2*/
+lreply(n, s, va_alist)
+X	int n;
+X	char *s;
+X	va_dcl
+X{
+X	va_list ap;
+X
+X	va_start(ap);
+X	printf("%d-", n);
+X	_doprnt(s, ap, stdout);
+X	printf("\r\n");
+X	(void) fflush(stdout);
+X	if (debug) {
+X		syslog(LOG_DEBUG, "<--- %d- ", n);
+X		vsyslog(LOG_DEBUG, s, ap);
+X	}
+X	va_end(ap);
+X}
+X
+ack(s)
+X	char *s;
+X{
+X	reply(250, "%s command successful.", s);
+X}
+X
+nack(s)
+X	char *s;
+X{
+X	reply(502, "%s command not implemented.", s);
+X}
+X
+X/* ARGSUSED */
+yyerror(s)
+X	char *s;
+X{
+X	char *cp;
+X
+X	cp = index(cbuf,'\n');
+X	*cp = '\0';
+X	reply(500, "'%s': command not understood.",cbuf);
+X}
+X
+delete(name)
+X	char *name;
+X{
+X	struct stat st;
+X
+X	if (stat(name, &st) < 0) {
+X		perror_reply(550, name);
+X		return;
+X	}
+X	if ((st.st_mode&S_IFMT) == S_IFDIR) {
+X		if (rmdir(name) < 0) {
+X			perror_reply(550, name);
+X			return;
+X		}
+X		goto done;
+X	}
+X	if (unlink(name) < 0) {
+X		perror_reply(550, name);
+X		return;
+X	}
+done:
+X	ack("DELE");
+X}
+X
+cwd(path)
+X	char *path;
+X{
+X
+X	if (chdir(path) < 0) {
+X		perror_reply(550, path);
+X		return;
+X	}
+X	ack("CWD");
+X}
+X
+makedir(name)
+X	char *name;
+X{
+X	if (mkdir(name, 0777) < 0)
+X		perror_reply(550, name);
+X	else
+X		reply(257, "MKD command successful.");
+X}
+X
+removedir(name)
+X	char *name;
+X{
+X
+X	if (rmdir(name) < 0) {
+X		perror_reply(550, name);
+X		return;
+X	}
+X	ack("RMD");
+X}
+X
+pwd()
+X{
+X	char path[MAXPATHLEN + 1];
+X	extern char *getwd();
+X
+X	if (getwd(path) == (char *)NULL) {
+X		reply(550, "%s.", path);
+X		return;
+X	}
+X	reply(257, "\"%s\" is current directory.", path);
+X}
+X
+char *
+renamefrom(name)
+X	char *name;
+X{
+X	struct stat st;
+X
+X	if (stat(name, &st) < 0) {
+X		perror_reply(550, name);
+X		return ((char *)0);
+X	}
+X	reply(350, "File exists, ready for destination name");
+X	return (name);
+X}
+X
+renamecmd(from, to)
+X	char *from, *to;
+X{
+X
+X	if (rename(from, to) < 0) {
+X		perror_reply(550, "rename");
+X		return;
+X	}
+X	ack("RNTO");
+X}
+X
+dolog(sin)
+X	struct sockaddr_in *sin;
+X{
+X	struct hostent *hp = gethostbyaddr((char *)&sin->sin_addr,
+X		sizeof (struct in_addr), AF_INET);
+X	time_t t, time();
+X	extern char *ctime();
+X
+X	if (hp)
+X		(void) strncpy(remotehost, hp->h_name, sizeof (remotehost));
+X	else
+X		(void) strncpy(remotehost, inet_ntoa(sin->sin_addr),
+X		    sizeof (remotehost));
+X	if (!logging)
+X		return;
+X	t = time((time_t *) 0);
+X	syslog(LOG_INFO, "connection from %s at %s",
+X	    remotehost, ctime(&t));
+X}
+X
+X/*
+X * Record logout in wtmp file
+X * and exit with supplied status.
+X */
+dologout(status)
+X	int status;
+X{
+X	if (logged_in) {
+X		(void) seteuid((uid_t)0);
+X		logwtmp(ttyline, "", "");
+X	}
+X	/* beware of flushing buffers after a SIGPIPE */
+X	_exit(status);
+X}
+X
+myoob()
+X{
+X	char *cp;
+X
+X	/* only process if transfer occurring */
+X	if (!transflag)
+X		return;
+X	cp = tmpline;
+X	if (getline(cp, 7, stdin) == NULL) {
+X		reply(221, "You could at least say goodbye.");
+X		dologout(0);
+X	}
+X	upper(cp);
+X	if (strcmp(cp, "ABOR\r\n"))
+X		return;
+X	tmpline[0] = '\0';
+X	reply(426,"Transfer aborted. Data connection closed.");
+X	reply(226,"Abort successful");
+X	longjmp(urgcatch, 1);
+X}
+X
+X/*
+X * Note: The 530 reply codes could be 4xx codes, except nothing is
+X * given in the state tables except 421 which implies an exit.  (RFC959)
+X */
+passive()
+X{
+X	int len;
+X	struct sockaddr_in tmp;
+X	register char *p, *a;
+X
+X	pdata = socket(AF_INET, SOCK_STREAM, 0);
+X	if (pdata < 0) {
+X		reply(530, "Can't open passive connection");
+X		return;
+X	}
+X	tmp = ctrl_addr;
+X	tmp.sin_port = 0;
+X	(void) seteuid((uid_t)0);
+X	if (bind(pdata, (struct sockaddr *) &tmp, sizeof(tmp)) < 0) {
+X		(void) seteuid((uid_t)pw->pw_uid);
+X		(void) close(pdata);
+X		pdata = -1;
+X		reply(530, "Can't open passive connection");
+X		return;
+X	}
+X	(void) seteuid((uid_t)pw->pw_uid);
+X	len = sizeof(tmp);
+X	if (getsockname(pdata, (struct sockaddr *) &tmp, &len) < 0) {
+X		(void) close(pdata);
+X		pdata = -1;
+X		reply(530, "Can't open passive connection");
+X		return;
+X	}
+X	if (listen(pdata, 1) < 0) {
+X		(void) close(pdata);
+X		pdata = -1;
+X		reply(530, "Can't open passive connection");
+X		return;
+X	}
+X	a = (char *) &tmp.sin_addr;
+X	p = (char *) &tmp.sin_port;
+X
+X#define UC(b) (((int) b) & 0xff)
+X
+X	reply(227, "Entering Passive Mode (%d,%d,%d,%d,%d,%d)", UC(a[0]),
+X		UC(a[1]), UC(a[2]), UC(a[3]), UC(p[0]), UC(p[1]));
+X}
+X
+X/*
+X * Generate unique name for file with basename "local".
+X * The file named "local" is already known to exist.
+X * Generates failure reply on error.
+X */
+char *
+gunique(local)
+X	char *local;
+X{
+X	static char new[MAXPATHLEN];
+X	struct stat st;
+X	char *cp = rindex(local, '/');
+X	int d, count=0;
+X
+X	if (cp)
+X		*cp = '\0';
+X	d = stat(cp ? local : ".", &st);
+X	if (cp)
+X		*cp = '/';
+X	if (d < 0) {
+X		perror_reply(553, local);
+X		return((char *) 0);
+X	}
+X	(void) strcpy(new, local);
+X	cp = new + strlen(new);
+X	*cp++ = '.';
+X	for (count = 1; count < 100; count++) {
+X		(void) sprintf(cp, "%d", count);
+X		if (stat(new, &st) < 0)
+X			return(new);
+X	}
+X	reply(452, "Unique file name cannot be created.");
+X	return((char *) 0);
+X}
+X
+X/*
+X * Format and send reply containing system error number.
+X */
+perror_reply(code, string)
+X	int code;
+X	char *string;
+X{
+X
+X	if (errno < sys_nerr)
+X		reply(code, "%s: %s.", string, sys_errlist[errno]);
+X	else
+X		reply(code, "%s: unknown error %d.", string, errno);
+X}
+X
+X#ifdef PERMS
+int
+Getdomainname(s, n)
+char *s;
+X{
+X	FILE *f;
+X	char buf[200], *p;
+X	int i = 0;
+X
+X	f = fopen("/etc/resolv.conf", "r");
+X	if(!f)
+X		return 0;
+X	while( fgets(buf, sizeof buf, f) ) {
+X		p = buf;
+X		while(*p==' ' || *p=='\t')
+X			p++;
+X		if( strncmp(p, "domain", 6))
+X			continue;
+X		p+= 6;
+X		while(*p==' ' || *p=='\t')
+X			p++;
+X		while(*p!=' ' && *p!='\t' && *p!='\n' && *p!='\0' ) {
+X			s[i++] = *p++;
+X			if(i==n)
+X				return 0;
+X		}
+X		s[i] = '\0';
+X		return 1;
+X	}
+X}
+X
+checkuser(pwd)
+struct passwd *pwd;
+X{
+X	char *grpnames[NGROUPS+1];
+X	int ngrps, lp;
+X	struct group *grp;
+X	extern int permcheck();
+X
+X	setgrent();
+X	ngrps = 0;
+X	if(!(grp=getgrgid(pwd->pw_gid))) {
+X		syslog(LOG_CRIT,
+X			"cannot find group name for %d\n", pwd->pw_gid);
+X		goto broken_groups;
+X	}
+X	grpnames[ngrps++] = strdup(grp->gr_name);
+X	while( grp=getgrent() ) {
+X		if(pwd->pw_gid == grp->gr_gid)
+X			continue;
+X		while(*grp->gr_mem) {
+X			if( !strcmp(pwd->pw_name, *grp->gr_mem)) {
+X				grpnames[ngrps++] = strdup(grp->gr_name);
+X			}
+X			grp->gr_mem++;
+X		}
+X	}
+X	endgrent();
+X	grpnames[ngrps] = NULL;
+X	if( !permcheck(pw->pw_name, "ftp", grpnames, NULL) ) {
+X		syslog(LOG_CRIT,
+X			"%s:%s not permitted", "ftp", pw->pw_name);
+X		return 1;
+X	}
+broken_groups:
+X	return 0;
+X}
+X#endif
+END_OF_FILE
+if test 24225 -ne `wc -c <'in.ftpd/ftpd.c'`; then
+    echo shar: \"'in.ftpd/ftpd.c'\" unpacked with wrong size!
+fi
+# end of 'in.ftpd/ftpd.c'
+fi
+echo shar: End of archive 3 \(of 3\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+

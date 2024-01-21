@@ -1,0 +1,2376 @@
+Subject:  v24i058:  Purdue shell turbo charger and manual installer, Part02/06
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: 2860dad0 69d21f52 6a03653e c3baab22
+
+Submitted-by: Kevin Braunsdorf <ksb@cc.purdue.edu>
+Posting-number: Volume 24, Issue 58
+Archive-name: pucc-mk/part02
+
+#!/bin/sh
+# This is part 02 of pucc-1c
+# ============= mk/mk.c ==============
+if test ! -d 'mk'; then
+    echo 'x - creating directory mk'
+    mkdir 'mk'
+fi
+if test -f 'mk/mk.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping mk/mk.c (File already exists)'
+else
+echo 'x - extracting mk/mk.c (Text)'
+sed 's/^X//' << 'Purdue' > 'mk/mk.c' &&
+/*
+X * mk: detect and execute a compilation command 
+X *	(formerly called 'compile')
+X *
+X * example marker line:
+X *	$Compile: cc -c -O %f
+X *	$Compile (TEKECS): cc -c -DLOG -O %f
+X *	$Compile (DEBUG): cc -c -g -DDEBUG %f
+X *	$Compile=1: cc ....
+X *	$Compile,cpu=100: ....
+X *
+X * marker lines can also be drawn from a standard template
+X *
+X * This program searches for the first occurence of a marker (DEFLTMARK)
+X * in the first block of the named file(s), grabs the line on which
+X * the marker occurs, performs some filename substitutions on the line,
+X * and prints the line (typically a shell command line) on the stdout.
+X * It can also set resource limits for valid(1L).
+X *
+X * this programs currently makes lots of substitutions (see the man page).
+X *
+X * command-line switches:
+X *	see mk.m or main.c (or run mk -h)
+X *
+X * (c) Copyright 1983, Steven McGeady.  All rights reserved.
+X *
+X * Written by S. McGeady, Intel, Inc., mcg@mipon2.intel.com		(sm)
+X *	      Kevin S Braunsdorf, ksb@cc.purdue.edu, purdue!ksb		(ksb)
+X *
+X * This software is not subject to any license of the American Telephone
+X * and Telegraph Company or the Regents of the University of California.
+X *
+X * Permission is granted to anyone to use this software for any purpose on
+X * any computer system, and to alter it and redistribute it freely, subject
+X * to the following restrictions:
+X *
+X * 1. The authors are not held responsible for any consequences of the
+X *    use of this software.
+X *
+X * 2. The origin of this software must not be misrepresented, either by
+X *    explicit claim or by omission.  Credit to the authors must appear
+X *    in documentation and sources.
+X *
+X * 3. Altered versions must be plainly marked as such, and must not be
+X *    misrepresented as being the original software.
+X *
+X * 4. This notice may not be removed or altered.
+X *
+X * All bug fixes and improvements should be mailed to the authors,
+X * if you can find them.
+X */
+X
+#include <sys/param.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <stdio.h>
+#include <ctype.h>
+X
+#include "machine.h"
+#include "getopt.h"
+#include "main.h"
+#include "mk.h"
+#include "rlimsys.h"
+X
+#if !defined(MAXPATHLEN)
+#define MAXPATHLEN	1024
+#endif
+X
+#if RESOURCE
+#include <sys/resource.h>
+#include <sys/wait.h>
+#endif
+X
+#if defined(S_IFLNK)
+#define LSTAT lstat
+#else
+#define LSTAT stat
+#endif
+X
+extern char *strcpy(), *strrchr(), *strchr();
+extern char *getenv(), *rcsname();
+extern int errno;
+extern char *sys_errlist[];
+#define strerror(Me) (sys_errlist[Me])
+X
+char acOutMem[] = "%s: out of memory!\n";
+static int marklen, sublen;
+static char *curfile, chFType;
+static char acSearch[MAXPATHLEN+1];
+X
+#define	MAXLINE		BUFSIZ
+#define	LEADCHAR	'$'
+X
+#if defined(AUXDIR)
+static char acAuxDir[] = AUXDIR;
+#endif	/* mk's default home	*/
+X
+#if defined(BEFORE)
+static char acDefBefore[] = BEFORE;
+#endif	/* default pre-scan	*/
+X
+#if defined(TEMPL)
+static char acDefAfter[] = TEMPL;
+#endif	/* default post-scan	*/
+X
+/*
+X * option a good version description					(ksb)
+X */
+void
+Version()
+{
+X	fprintf(stdout, "%s: %s\n", progname, "$Id: mk.c,v 4.6 90/11/19 14:06:30 ksb Exp $");
+X	fprintf(stdout, "%s: %%~ `%s\'\n", progname, acAuxDir);
+X	fprintf(stdout, "%s: -e `%s\'\n", progname,
+X		(char *)0 != pchExamine ? pchExamine :
+X	
+#if defined(BEFORE)
+X		acDefBefore
+#else
+X		""
+#endif	/* default pre-scan	*/
+X	);
+X	fprintf(stdout, "%s: -t `%s\'\n", progname,
+X		(char *)0 != pchTemplates ? pchTemplates :
+#if defined(TEMPL)
+X		acDefAfter
+#else
+X		""
+#endif	/* default post-scan	*/
+X	);
+}
+X
+/*
+X * strip the case from an ident upto len or a char in pchStop		(ksb)
+X */
+void
+stripc(pchIdent, len, pchStop)
+char *pchIdent, *pchStop;
+int len;
+{
+X	register int i;
+X
+X	for (i = 0; i < len; ++i, ++pchIdent) {
+X		if ((char *)0 != strchr(pchStop, *pchIdent))
+X			break;
+X		if (isupper(*pchIdent))
+X			*pchIdent = tolower(*pchIdent);
+X	}
+}
+X
+/*
+X * eat the submark portion 						(sm)
+X */
+char *
+eatsub(pch, smark)
+char *pch;
+char *smark;
+{
+X	while (isspace(*pch)) {
+X		++pch;
+X	}
+X
+X	if ((char *)0 != smark) {
+X		if ('(' != *pch) {
+X			return (char *)0;
+X		}
+X
+X		do
+X			++pch;
+X		while (isspace(*pch));
+X		if (fCase)
+X			stripc(pch, sublen, "):");
+X		if ('*' == smark[0] && '\000' == smark[1]) {
+X			while (')' != pch[0] && '\000' != pch[0])
+X				++pch;
+X		} else if ('*' == pch[0]) {
+X			++pch;
+X		} else if (0 != strncmp(pch, smark, sublen)) {
+X			return (char *)0;
+X		} else {
+X			pch += sublen;
+X		}
+X
+X		while (isspace(*pch)) {
+X			++pch;
+X		}
+X		if (')' != *pch) {
+X			return (char *)0;
+X		}
+X		do {
+X			++pch;
+X		} while (isspace(*pch));
+X	} else if ('(' == *pch) {
+X		while (')' != *pch)
+X			++pch;
+X		++pch;
+X		while (isspace(*pch))
+X			++pch;
+X	}
+X	return pch;
+}
+X
+/*
+X * find the end of the command string					(ksb)
+X */
+void
+cut(pch)
+char *pch;
+{
+X	register char *q;
+X	register int c;
+X
+X	for (q = pch; '\000' != (c = *q); ++q) {
+X		switch (c) {
+X		case LEADCHAR:
+X			if (LEADCHAR == q[1]) {
+X		case '\n':
+X				q[0] = '\000';
+X				return;
+X			}
+X			break;
+X		case '\\':
+X			if ('\000' != q[1])
+X				++q;
+X			break;
+X		default:
+X			break;
+X		}
+X	}
+}
+X
+/*
+X * copy chars with C escapes etc...					(sm/ksb)
+X * since ANSI C won't let us write on constant strings we need fColon
+X * to stop on a colon durring template expansions
+X */
+char *
+translit(dst, src, fColon)
+register char *dst;
+register char *src;
+int fColon;
+{
+X	register char *tp;
+X	register char *xp, *pcParam;
+X	auto char sbPath[MAXPATHLEN+1];
+X	auto char acTemp[8];		/* buf for recursive calls	*/
+X	register int i;
+X	register int num;
+X	auto int fGrave;		/* change %`name` into ${name}	*/
+X
+#ifdef DEBUG
+X	fprintf(stderr, "translit(%s)\n", src);
+#endif
+X
+X	fGrave = 0;
+X	pcParam = (char *)0;
+X	while (*src) {
+X		switch (*src) {
+X		case '%':
+X			switch (*++src) {
+X			case 'A':
+X			case 'a':
+X				if (fAll || fFirst) {
+X					if ('a' == *src)
+X						*dst++ = '-';
+X					*dst++ = fFirst ? 'A' : 'a';
+X				}
+X				break;
+X
+X			case 'B':
+X				strcpy(dst, progname);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'b':
+X				strcpy(dst, pathname);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'C':
+X			case 'c':	/* mk command line flags */
+X				if (fConfirm) {
+X					if ('c' == *src)
+X						*dst++ = '-';
+X					*dst++ = 'c';
+X				}
+X				break;
+X
+X			case 'D':	/* if not remote, fail	*/
+X			case 'd':	/* directory part	*/
+X				if ((tp = strrchr(curfile, '/')) == NULL) {
+X					if ('D' == *src)
+X						if (debug)
+X							fprintf(stderr, "%s: %s is not remote\n", progname, curfile);
+X						return (char*)0;
+X					break;
+X				}
+X				*tp = '\000';
+X				strcpy(dst, curfile);
+X				dst += strlen(curfile);
+X				*tp = '/';
+X				break;
+X
+X			case 'e':
+X				if ((char *)0 == pchExamine)
+X					break;
+X				*dst++ = '-';
+X				*dst++ = 'e';
+X			case 'E':
+X				if ((char *)0 == pchExamine)
+X					break;
+X				strcpy(dst, pchExamine);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'f':	/* full filename */
+X				strcpy(dst, curfile);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'F':	/* file part only */
+X				if ((tp = strrchr(curfile, '/')) != NULL) {
+X					tp++;
+X				} else {
+X					tp = curfile;
+X				}
+X				if ((xp = strrchr(tp, '.')) != NULL) {
+X					*xp = '\000';
+X					strcpy(dst, tp);
+X					*xp = '.';
+X				} else {
+X					strcpy(dst, tp);
+X				}
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'I':
+X			case 'i':
+X				if (fCase) {
+X					if ('i' == *src)
+X						*dst++ = '-';
+X					*dst++ = 'i';
+X				}
+X				break;
+X
+X			case 'l':
+X				*dst++ = '-';
+X				*dst++ = 'l';
+X			case 'L':
+X				sprintf(dst, "%d", lines);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'm':	/* marker we need */
+X			case 'M':	/* lower case marker for make rules */
+X				if ('*' == markstr[0])
+X					*dst++ = '\\';
+X				strcpy(dst, markstr);
+X				if ('M' == *src && !fCase)
+X					stripc(dst, marklen, "");
+X				dst += marklen;
+X				break;
+X
+X			case 'N':
+X			case 'n':
+X				if (!fExec) {
+X					if ('n' == *src)
+X						*dst++ = '-';
+X					*dst++ = 'n';
+X				}
+X				break;
+X
+X			case 'o':
+X				*dst++ = '-';
+X			case 'O': /* all switches, none can fail */
+X				(void)translit(dst, "%A%C%I%N%V", 0);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'P':
+X			case 'p':	/* prefix		*/
+X				acTemp[0] = '%';
+X				acTemp[1] = *src + ('Q' - 'P');
+X				acTemp[2] = '.';
+X				acTemp[3] = '\000';
+X				if ((tp = translit(dst, acTemp, 0)) == NULL) {
+X					return (char *)0;
+X				}
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'Q':
+X			case 'q':	/* prefix-x, mostly internal	*/
+X				if ((tp = strrchr(curfile, '/')) != NULL) {
+X					++tp;
+X				} else {
+X					tp = curfile;
+X				}
+X				if ('\000' == *++src)
+X					break;
+X				if ((xp = strrchr(tp, *src)) != NULL) {
+X					*xp = '\000';
+X					strcpy(dst, curfile);
+X					*xp = *src;
+X				} else {
+X					if ('Q' == src[-1])
+X						return (char *)0;
+X					strcpy(dst, curfile);
+X				}
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'R':	/* rcsbasename	*/
+X				if ((tp = strrchr(curfile, '/')) != NULL) {
+X					tp++;
+X				} else {
+X			case 'r':	/* rcsname	*/
+X					tp = curfile;
+X				}
+X				tp = rcsname(tp);
+X				if ((char *)0 == tp) {
+X					if (debug)
+X						fprintf(stderr, "%s: no rcsfile for %s\n", progname, curfile);
+X					return (char *)0;
+X				}
+X				strcpy(dst, tp);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 's': /* submarker we need */
+X			case 'S': /* lower case submarker for make rules */
+X				if ((char *)0 == submark) {
+X					if (debug)
+X						fprintf(stderr, "%s: no submarker for %s\n", progname, curfile);
+X					return (char *)0;
+X				}
+X				if ('*' == submark[0])
+X					*dst++ = '\\';
+X				strcpy(dst, submark);
+X				if ('S' == *src && !fCase)
+X					stripc(dst, sublen, "");
+X				dst += sublen;
+X				break;
+X
+X			case 't':
+X				if ((char *)0 == pchTemplates)
+X					break;
+X				*dst++ = '-';
+X				*dst++ = 't';
+X			case 'T':
+X				if ((char *)0 == pchTemplates)
+X					break;
+X				strcpy(dst, pchTemplates);
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'U':
+X			case 'u':	/* extender-x, mostly internal	*/
+X				if ((tp = strrchr(curfile, '/')) != NULL) {
+X					++tp;
+X				} else {
+X					tp = curfile;
+X				}
+X				if ('\000' == *++src)
+X					break;
+X				if ((xp = strrchr(tp, *src)) != NULL) {
+X					++xp;
+X					strcpy(dst, xp);
+X					dst += strlen(dst);
+X				} else if ('U' == src[-1]) {
+X					return (char *)0;
+X				}
+X				break;
+X
+X			case 'v':
+X				*dst++ = '-';
+X			case 'V':
+X				*dst++ = fVerbose ? 'v' : 's';
+X				if (debug)
+X					*dst++ = 'V';
+X				break;
+X
+X			case 'W':
+X			case 'w':
+X				if ((tp = strrchr(acSearch, '/')) == NULL) {
+X					if ('W' == *src)
+X						if (debug)
+X							fprintf(stderr, "%s: %s is not remote\n", progname, acSearch);
+X						return (char*)0;
+X					break;
+X				}
+X				*tp = '\000';
+X				strcpy(dst, acSearch);
+X				dst += strlen(dst);
+X				*tp = '/';
+X				break;
+X
+X			case 'X':
+X			case 'x':	/* extension		*/
+X				acTemp[0] = '%';
+X				acTemp[1] = *src + ('U' - 'X');
+X				acTemp[2] = '.';
+X				acTemp[3] = '\000';
+X				if ((tp = translit(dst, acTemp, 0)) == NULL) {
+X					return (char *)0;
+X				}
+X				dst += strlen(dst);
+X				break;
+X
+X			case 'Y':
+X				if ((*++src == '~') ? *++src == chFType : *src != chFType) {
+X					if (debug)
+X						fprintf(stderr, "%s: %s fails file type\n", progname, curfile);
+X					return (char*)0;
+X				}
+X				break;
+X
+X			case 'y':	/* file type checks	*/
+X				*dst++ = chFType;
+X				break;
+X
+X			case 'Z':
+X			case 'z':
+X				if ((char *)0 == (tp = strrchr(acSearch, '/'))) {
+X					tp = acSearch;
+X				} else {
+X					++tp;
+X				}
+X				if ('\000' == *tp) {
+X					if (debug)
+X						fprintf(stderr, "%s: %s: not a template\n", progname, curfile);
+X					return (char*)0;
+X				}
+X				strcpy(dst, tp);
+X				dst += strlen(dst);
+X				break;
+X
+X			case '~':	/* mk's home directory, so to speak */
+X				strcpy(dst, acAuxDir);
+X				dst += strlen(dst);
+X				break;
+X				
+X			case '\"':
+X			case '`':
+X				fGrave = 1;
+X				/* FALLTHROUGH */
+X			case '{':	/* } */
+X				*dst++ = '$';
+X				*dst++ = '{';	/* } */
+X				pcParam = dst;
+X				break;
+X			default:	/* unrecognized chars are copied thru */
+X				*dst++ = *src;
+X				break;
+X			}
+X			src++;
+X			break;
+X
+X		case '\\':
+X			switch (*++src) {
+X			case '\n':	/* how would this happen? */
+X				++src;
+X				break;
+X			case 'n':	/* newline */
+X				*dst++ = '\n';
+X				++src;
+X				break;
+X			case 't':
+X				*dst++ = '\t';
+X				++src;
+X				break;
+X			case 'b':
+X				*dst++ = '\b';
+X				++src;
+X				break;
+X			case 'r':
+X				*dst++ = '\r';
+X				++src;
+X				break;
+X			case 'f':
+X				*dst++ = '\f';
+X				++src;
+X				break;
+X			case 'v':
+X				*dst++ = '\013';
+X				++src;
+X				break;
+X			case '\\':
+X				++src;
+X			case '\000':
+X				*dst++ = '\\';
+X				break;
+X
+X			case '0': case '1': case '2': case '3':
+X			case '4': case '5': case '6': case '7':
+X				num = *src++ - '0';
+X				for (i = 0; i < 2; i++) {
+X					if (! isdigit(*src)) {
+X						break;
+X					}
+X					num <<= 3;
+X					num += *src++ - '0';
+X				}
+X				*dst++ = num;
+X				break;
+X			case '8': case '9':
+X				/* 8 & 9 are bogus octals,
+X				 * cc makes them literals
+X				 */
+X				/*fallthrough*/
+X			default:
+X				*dst++ = *src++;
+X				break;
+X			}
+X			break;
+X		case '\"':
+X		case '`':
+X			if (fGrave) {
+X		case /*{*/ '}':
+X				*dst = '\000';
+X				if ((char *)0 != pcParam && (char *)0 == getenv(pcParam)) {
+X					if (debug)
+X						fprintf(stderr, "%s: %s: %s: not set\n", progname, curfile, pcParam);
+X					return (char *)0;
+X				}
+X				pcParam = (char *)0;
+X				*dst++ = /*{*/ '}';
+X				++src, fGrave = 0;
+X				break;
+X			}
+X			*dst++ = *src++;
+X			break;
+X		case ':':
+X			if (fColon) {
+X				src = "";
+X				break;
+X			}
+X			/*FALLTHROUGH*/
+X		default:
+X			*dst++ = *src++;
+X			break;
+X		}
+X	}
+X
+X	*dst = '\000';
+X	return dst;
+}
+X
+#define EXIT_EXACT	0x00	/* an exact match			*/
+#define EXIT_ANY	0x01	/* any value				*/
+#define EXIT_NOT	0x02	/* not what was given			*/
+typedef struct ECnode {
+X	int ekey;		/* key for a match			*/
+X	int ivalue;		/* value to match			*/
+} CODE;
+X
+/*
+X * Find a marker line in the given file, put it in a buffer and		(sm/ksb)
+X * return a pointer to it.  Limitted to count lines.
+X */
+char *
+findmarker(fin, buf, pexitcode, count)
+register FILE *fin;
+char *buf;
+int count;
+CODE *pexitcode;
+{
+X	register char *pch;
+X	extern long atol();
+X
+X	if ((FILE *)0 == fin)
+X		return (char *)0;
+X	while ((char *)0 != (pch = fgets(buf, MAXLINE, fin))) {
+X		if (--count < 0) {
+X			pch = (char *)0;
+X			if (debug)
+X				fprintf(stderr, "%s: out of lines\n", progname);
+X			break;
+X		}
+X		pch = strchr(buf, LEADCHAR);
+X		if ((char *)0 == pch)
+X			continue;
+X
+X		do {
+X			++pch;
+X		} while (isspace(*pch));
+X
+X		if (fCase)
+X			stripc(pch, marklen, ":("/*)*/);
+X		if ('*' == markstr[0] && '\000' == markstr[1]) {
+X			while ('(' != pch[0] && ':' != pch[0] && '\000' != pch[0])
+X				++pch;
+X		} else if ('*' == pch[0]) {
+X			++pch;
+X		} else if (0 != strncmp(markstr, pch, marklen)) {
+X			continue;
+X		} else {
+X			pch += marklen;
+X		}
+X
+X		pch = eatsub(pch, submark);
+X		if ((char *)0 == pch) {
+X			continue;
+X		}
+X
+X		/* set exit code */
+X		pexitcode->ekey = EXIT_EXACT;
+X		if ('=' == *pch) {
+X			++pch;
+X			while (isspace(*pch))
+X				++pch;
+X			if ('~' == *pch) { 	/* ~code	*/
+X				pexitcode->ekey = EXIT_NOT;
+X				++pch;
+X			}
+X			while (isspace(*pch))
+X				++pch;
+X			if ('*' == *pch) { 	/* any code	*/
+X				pexitcode->ekey |= EXIT_ANY;
+X				++pch;
+X			} else {
+X				pexitcode->ivalue = atol(pch);
+X				if ('-' == *pch || '+' == *pch)
+X					++pch;
+X				while (isdigit(*pch))
+X					++pch;
+X			}
+X			while (isspace(*pch))
+X				++pch;
+X		} else {
+X			pexitcode->ivalue = 0;
+X		}
+X
+#if RESOURCE
+X		/* get resource limits		*/
+X		do {
+X			if (',' == *pch)
+X				++pch;
+X			stripc(pch, MAXLINE, ",:");
+X			pch = rparse(pch);
+X		} while (',' == *pch);
+#else
+X		/* try to eat resource limits	*/
+X		pch = strchr(pch, ':');
+X		if ((char *)0 == pch)
+X			continue;
+#endif /* resource limits */
+X
+X		if (':' != *pch)
+X			continue;
+X
+X		/* found mk marker */
+X		do {
+X			++pch;
+X		} while (isspace(*pch));
+X		cut(pch);
+X		break;
+X	}
+X	return pch;
+}
+X
+/*
+X * place a variable in the environment					(ksb)
+X */
+int
+define(pch)
+char *pch;
+{
+X	register char *p;
+X
+X	p = strchr(pch, '=');
+X	if ((char *)0 == p) {
+X		fprintf(stderr, "%s: missing `=\' for define of %s\n", progname, pch);
+X		return;
+X	}
+X	p[0] = '\000';
+X	setenv(pch, p+1);
+X	p[0] = '=';
+}
+X
+/*
+X * remove a variable from the environment				(ksb)
+X */
+int
+undefine(pch)
+char *pch;
+{
+X	setenv(pch, (char *)0);
+}
+X
+/*
+X * we have a filename and are ready to open and find a marker in it	(sm/ksb)
+X */
+int
+process(arg)
+char *arg;
+{
+X	auto FILE *fin, *fpSrc;
+X	auto char *pch, *pchSecond, *pchBefore, *pchLoop, *pchTrans;
+X	auto int count, fFoundOne;
+X	auto CODE exitcode;
+X	auto char buf[MAXLINE];
+X	auto char combuf[MAXLINE];
+X	auto struct stat stIn;
+X
+#if RESOURCE
+X	rinit();
+X	r_fTrace = debug;
+#endif /* resource limits */
+X
+X	curfile = arg;
+X	if ('-' == curfile[0] && '\000' == curfile[1]) {
+X		fprintf(stderr, "%s: stdin not supported\n", progname);
+X		return 1;
+X	}
+X	if (-1 == LSTAT(curfile, & stIn)) {
+X		fprintf(stderr, "%s: stat: %s: %s\n", progname, curfile, strerror(errno));
+X		return 1;
+X	}
+X	switch (stIn.st_mode & S_IFMT) {
+#if defined(S_IFLNK)
+X	case S_IFLNK:	/* symbolic link */
+X		chFType = 'l';
+X		break;
+#endif
+#if defined(S_IFIFO)
+X	case S_IFIFO:	/* fifo */
+X		chFType = 'p';
+X		break;
+#endif	/* no fifos */
+#if defined(S_IFSOCK)
+X	case S_IFSOCK:	/* socket */
+X		chFType = 's';
+X		break;
+#endif	/* no sockets */
+X	case S_IFDIR:	/* directory */
+X		chFType = 'd';
+X		break;
+X	case S_IFCHR:	/* character special */
+X		chFType = 'c';
+X		break;
+X	case S_IFBLK:	/* block special */
+X		chFType = 'b';
+X		break;
+X	case 0:
+X	case S_IFREG:	/* regular */
+X		chFType = 'f';
+X		break;
+X	default:
+X		fprintf(stderr, "%s: stat: %s: unknown file type?\n", progname, curfile);
+X		return 1;
+X	}
+X	if ('s' == chFType || 'd' == chFType) {
+X		/* dirs and sockets don't have text to read */
+X		fpSrc = (FILE *)0;
+X	} else if (NULL == (fpSrc = fopen(curfile, "r"))) {
+X		fprintf(stderr, "%s: fopen: %s: %s\n", progname, curfile, strerror(errno));
+X		return 1;
+X	}
+X
+X	if ((char *)0 == markstr) {
+X		if ('m' == progname[0] && 'k' == progname[1] && '\000' == progname[2])
+X			markstr = /*0m*/"Compile";
+X		else
+X			markstr = progname;
+X	}
+X	while (isspace(*markstr)) {
+X		++markstr;
+X	}
+X	marklen = strlen(markstr);
+X	if (fCase)
+X		stripc(markstr, marklen, "");
+X
+X	if ((char *)0 != submark) {
+X		while (isspace(*submark)) {
+X			++submark;
+X		}
+X		sublen = strlen(submark);
+X		if (fCase)
+X			stripc(submark, sublen, "");
+X	} else {
+X		sublen = 0;
+X	}
+X
+X	pchBefore = pchExamine;
+#if defined(BEFORE)
+X	if ((char *)0 == pchBefore) {
+X		pchBefore = acDefBefore;
+X	}
+#endif	/* default pre-scan	*/
+X	pchSecond = pchTemplates;
+#if defined(TEMPL)
+X	if ((char *)0 == pchSecond) {
+X		pchSecond = acDefAfter;
+X	}
+#endif /* default templates	*/
+X
+X	if (! fExec)
+X		fVerbose = 1;
+X	count = fFoundOne = 0;
+X	fin = (FILE *)0;
+X	do {
+X		pch = findmarker(fin, & buf[0], & exitcode, lines);
+X		if ((char *)0 == pch && (char *)0 != pchBefore) {
+X			do {
+X				pchLoop = strchr(pchBefore, ':');
+X				if ((char *)0 != pchLoop)
+X					++pchLoop;
+X				pchTrans = translit(acSearch, pchBefore, 1);
+X				pchBefore = pchLoop;
+X				if ((FILE *)0 != fin)
+X					fclose(fin);
+X				fin = (char *)0 == pchTrans ? (FILE *)0 : fopen(acSearch, "r");
+X			} while ((FILE *)0 == fin && (char *)0 != pchBefore);
+X			if (debug && (FILE *)0 != fin) {
+X				fprintf(stderr, "%s: searching template %s\n", progname, acSearch);
+X			}
+X			if ((FILE *)0 != fin)
+X				continue;
+X		}
+X		if ((char *)0 == pch && (FILE *)0 != fpSrc) {
+X			if ((FILE*)0 != fin)
+X				fclose(fin);
+X			fin = fpSrc;
+X			fpSrc = (FILE *)0;
+X			acSearch[0] = '\000';
+X			if (debug) {
+X				fprintf(stderr, "%s: searching file %s\n", progname, curfile);
+X			}
+X			continue;
+X		}
+X		if ((char *)0 == pch && (char *)0 != pchSecond) {
+X			do {
+X				pchLoop = strchr(pchSecond, ':');
+X				if ((char *)0 != pchLoop)
+X					++pchLoop;
+X				pchTrans = translit(acSearch, pchSecond, 1);
+X				pchSecond = pchLoop;
+X				if ((FILE *)0 != fin)
+X					fclose(fin);
+X				fin = (char *)0 == pchTrans ? (FILE *)0 : fopen(acSearch, "r");
+X			} while ((FILE *)0 == fin && (char *)0 != pchSecond);
+X			if (debug && (FILE *)0 != fin) {
+X				fprintf(stderr, "%s: searching template %s\n", progname, acSearch);
+X			}
+X			continue;
+X		}
+X		if ((char *)0 == pch) {
+X			break;
+X		}
+X		if ((char *)0 == translit(combuf, pch, 0)) {
+X			continue;
+X		}
+X		fFoundOne = 1;
+X		if (fConfirm) {
+X			fprintf(stderr, "\t%s  [fnyq]? ", combuf);
+X			fflush(stderr);
+X			gets(buf);
+X
+X			for (pch = buf; '\000' != *pch && isspace(*pch); ++pch)
+X				/* empty */;
+X			switch (*pch) {
+X			case 'q':
+X			case 'Q':
+X				exit(0);
+X			case 'y':
+X			case 'Y':
+X				break;
+X			case 'f':
+X			case 'F':
+X			default:
+X				continue;
+X			case 'n':
+X			case 'N':
+X				if ((FILE *)0 != fin)
+X					fclose(fin);
+X				return 0;
+X			}
+X		} else if (fVerbose) {
+X			fprintf(stderr, "\t%s\n", combuf);
+X		}
+X		fflush(stderr);
+X		if (fExec) {
+X			auto int cur, code;
+#if RESOURCE
+X			code = rlimsys(combuf);
+#else /* use vanilla system */
+X			code = system(combuf);
+X			if (0177 == (code & 0xff)) {		/* stopped */
+X				code = (code >> 8) & 0xff;
+X			} else if (0 != (code & 0xff)) {	/* killed */
+X				code = code & 0x7f;
+X			} else {				/* exit */
+X				code = (code >> 8) & 0xff;
+X			}
+#endif /* check for resource limits */
+X			if (debug)
+X				fprintf(stderr, "%s: command exits %d\n", progname, code);
+X			switch (exitcode.ekey) {
+X			case EXIT_EXACT:
+X				cur = code != exitcode.ivalue;
+X				break;
+X			case EXIT_EXACT|EXIT_NOT:
+X				cur = code == exitcode.ivalue;
+X				break;
+X			case EXIT_ANY:
+X				cur = 0;
+X				break;
+X			case EXIT_ANY|EXIT_NOT:
+X				cur = 1;
+X				break;
+X			}
+X			if (fFirst && 0 == cur) {
+X				if ((FILE *)0 != fin)
+X					fclose(fin);
+X				return 0;
+X			}
+X			count += cur;
+X		}
+X		if (fAll || fFirst) {
+X			continue;
+X		}
+X		if ((FILE *)0 != fin) {
+X			fclose(fin);
+X		}
+X		return count;
+X	} while ((FILE *)0 != fin);
+X	if (fVerbose && !fFoundOne) {
+X		fprintf(stderr, "%s: no marker \"%c%s", progname, LEADCHAR, markstr);
+X		if ((char *)0 != submark) {
+X			fprintf(stderr, "(%s)", submark);
+X		}
+X		fprintf(stderr, ":\" %s %s\n", fFoundOne ? "selected from" : "in", curfile);
+X	}
+X	if (!fFoundOne)
+X		++count;
+X	return count;
+}
+Purdue
+chmod 0444 mk/mk.c ||
+echo 'restore of mk/mk.c failed'
+Wc_c="`wc -c < 'mk/mk.c'`"
+test 21421 -eq "$Wc_c" ||
+	echo 'mk/mk.c: original size 21421, current size' "$Wc_c"
+fi
+# ============= mk/Makefile ==============
+if test -f 'mk/Makefile' -a X"$1" != X"-c"; then
+	echo 'x - skipping mk/Makefile (File already exists)'
+else
+echo 'x - extracting mk/Makefile (Text)'
+sed 's/^X//' << 'Purdue' > 'mk/Makefile' &&
+# Written by S. McGeady, Intel, Inc., mcg@mipon2.intel.com		(sm)
+#	     Kevin S Braunsdorf, ksb@cc.purdue.edu, purdue!ksb		(ksb)
+#
+# This software is not subject to any license of the American Telephone
+# and Telegraph Company or the Regents of the University of California.
+#
+# Permission is granted to anyone to use this software for any purpose on
+# any computer system, and to alter it and redistribute it freely, subject
+# to the following restrictions:
+#
+# 1. The authors are not held responsible for any consequences of the
+#    use of this software.
+#
+# 2. The origin of this software must not be misrepresented, either by
+#    explicit claim or by omission.  Credit to the authors must appear
+#    in documentation and sources.
+#
+# 3. Altered versions must be plainly marked as such, and must not be
+#    misrepresented as being the original software.
+#
+# 4. This notice may not be removed or altered.
+#
+# Makefile for mk
+#
+# $Id: Makefile.plain,v 4.6 90/11/19 13:57:12 ksb Exp $
+X
+PROG=	mk
+BIN=	${DESTDIR}/usr/local/bin
+X
+L=../libopt
+#L=/usr/include/local
+I=/usr/include
+S=/usr/include/sys
+P=
+X
+INCLUDE= -I$L
+DEBUG=	-O
+CDEFS= 	
+CFLAGS= ${DEBUG} ${CDEFS} ${INCLUDE}
+X
+HDR=	main.h mk.h optaccum.h machine.h rlimsys.h
+SRC=	main.c mk.c rcsname.c setenv.c optaccum.c rlimsys.c
+GENc=
+GENh=
+GEN=	${GENh} ${GENc}
+DEP=	${SRC} ${GENc}
+OBJ=	main.o mk.o rcsname.o setenv.o optaccum.o rlimsys.o
+MAN=	mk.1l
+SOURCE=	Makefile Makefile.mkcmd README mk.m ${MAN} ${HDR} ${SRC}
+X
+all: ${PROG}
+X
+${PROG}:$P ${OBJ}
+#	${CC} -o $@ ${CFLAGS} ${OBJ} -lopt
+#	${CC} -o $@ ${CFLAGS} ${OBJ} -L /usr/local/lib -lopt
+X	${CC} -o $@ ${CFLAGS} ${OBJ} ../libopt/libopt.a
+X
+self-test: ${PROG}
+X	cd Tests; ../${PROG} -mCompile *
+X
+swap: ${HDR} ${SRC} ${GEN} Makefile.mkcmd
+X	mkcmd std_help.m mk.m
+X	-(cmp -s prog.c main.c || echo main.c changed)
+X	-(cmp -s prog.h main.h || echo main.h changed)
+X	mv Makefile Makefile.plain
+X	mv Makefile.mkcmd Makefile
+X
+clean: FRC
+X	rm -f Makefile.bak *.o prog.[ch] ${GEN} ${PROG} a.out core errs tags
+X
+depend: ${HDR} ${SRC} ${GEN} FRC
+X	maketd ${CDEFS} ${INCLUDE} ${DEP}
+X
+install: all FRC
+X	install -cs ${PROG} ${BIN}/${PROG}
+X
+lint: ${HDR} ${SRC} ${GEN} FRC
+X	lint -h ${CDEFS} ${INCLUDE} ${DEP}
+X
+mkcat: ${MAN}
+X	mkcat ${MAN}
+X
+print: source FRC
+X	lpr -J'${PROG} source' ${SOURCE}
+X
+source: ${SOURCE}
+X
+spotless: clean
+X	rcsclean ${SOURCE}
+X
+tags: ${HDR} ${SRC} ${GEN}
+X	ctags -t ${HDR} ${SRC} ${GEN}
+X
+${SOURCE}:
+X	co -q $@
+X
+FRC:
+X
+# DO NOT DELETE THIS LINE - maketd DEPENDS ON IT
+X
+main.o: machine.h main.c optaccum.h
+X
+mk.o: machine.h main.h mk.c mk.h rlimsys.h
+X
+rcsname.o: machine.h rcsname.c
+X
+setenv.o: machine.h setenv.c
+X
+optaccum.o: machine.h optaccum.c
+X
+rlimsys.o: machine.h mk.h rlimsys.c rlimsys.h
+X
+# *** Do not add anything here - It will go away. ***
+Purdue
+chmod 0644 mk/Makefile ||
+echo 'restore of mk/Makefile failed'
+Wc_c="`wc -c < 'mk/Makefile'`"
+test 2737 -eq "$Wc_c" ||
+	echo 'mk/Makefile: original size 2737, current size' "$Wc_c"
+fi
+# ============= mk/Tests/ExitCodes ==============
+if test ! -d 'mk/Tests'; then
+    echo 'x - creating directory mk/Tests'
+    mkdir 'mk/Tests'
+fi
+if test -f 'mk/Tests/ExitCodes' -a X"$1" != X"-c"; then
+	echo 'x - skipping mk/Tests/ExitCodes (File already exists)'
+else
+echo 'x - extracting mk/Tests/ExitCodes (Text)'
+sed 's/^X//' << 'Purdue' > 'mk/Tests/ExitCodes' &&
+# This file checks mk's exit code traps				(ksb)
+# $Id$
+X
+mk -s $0
+exit $?
+X
+$Compile:\nfor group in True False Any None Number Sig;\ndo\n\t%b %v -m$group %f || (echo failed $group );\ndone\necho OK
+X
+X
+These tests check for the different ways to say `zero is a good value'
+X
+$True=0: \n%b -a%V -t/dev/null -mOK %f
+$OK(1)   : :
+$OK(2)=0 : :
+$OK(3)=1 : exit 1
+$OK(4)=~0: exit 1
+$OK(5)=~1: :
+$OK(6)   : :
+$OK(7)=0 : :
+$OK(8)=~1: :
+X
+These thests check for the different fail under `zero is a good value'
+$False=7: \n%b -a%V -t/dev/null -mBAD %f
+$BAD(1)   : exit 1
+$BAD(2)=0 : exit 1
+$BAD(3)=1 : :
+$BAD(4)=~0: :
+$BAD(5)=~1: exit 1
+$BAD(6)=1 : exit 0
+$BAD(7)=~0: exit 0
+X
+These tests must all always succeed
+$Any=0: \n%b -a%V -t/dev/null -mANY %f
+$ANY(1)=*: :
+$ANY(2)=*: exit 0
+$ANY(3)=*: exit 1
+$ANY(4)=*: exit 5
+X
+These tests should all always fail
+$None=4: \n%b -a%V -t/dev/null -mNONE %f
+$NONE(1)=~*: :
+$NONE(2)=~*: exit 0
+$NONE(3)=~*: exit 1
+$NONE(4)=~*: exit 5
+X
+$Number=0: \n%b -a%V -t/dev/null -mVALUE %f
+$VALUE(0)=0: exit 0
+$VALUE(1)=1: exit 1
+$VALUE(2)=2: exit 2
+$VALUE(3)=3: exit 3
+$VALUE(4)=4: exit 4
+X
+$Sig=0: \n%b -a%V -t/dev/null -mSIG %f
+$SIG=1: kill -1 \$$
+$SIG=15: kill -15 \$$
+Purdue
+chmod 0644 mk/Tests/ExitCodes ||
+echo 'restore of mk/Tests/ExitCodes failed'
+Wc_c="`wc -c < 'mk/Tests/ExitCodes'`"
+test 1182 -eq "$Wc_c" ||
+	echo 'mk/Tests/ExitCodes: original size 1182, current size' "$Wc_c"
+fi
+# ============= mk/Tests/compat ==============
+if test -f 'mk/Tests/compat' -a X"$1" != X"-c"; then
+	echo 'x - skipping mk/Tests/compat (File already exists)'
+else
+echo 'x - extracting mk/Tests/compat (Text)'
+sed 's/^X//' << 'Purdue' > 'mk/Tests/compat' &&
+$Compile:  MK=-t/dev/null %b -a%C%I%N%V -mVars -Dfalse="exit 0" %f && echo Vars test OK
+X
+# the OLD mk used to expand shell variable and some other strange
+# command line variables.  These have been passed off to the shell
+# to do.  This test makes sure OLD style calls get converted into
+# shell variable substitutions correctly.  (ksb)
+X
+$Vars(1): %`false`
+$Vars(2): %{false}
+Purdue
+chmod 0644 mk/Tests/compat ||
+echo 'restore of mk/Tests/compat failed'
+Wc_c="`wc -c < 'mk/Tests/compat'`"
+test 376 -eq "$Wc_c" ||
+	echo 'mk/Tests/compat: original size 376, current size' "$Wc_c"
+fi
+# ============= mk/rlimsys.h ==============
+if test -f 'mk/rlimsys.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping mk/rlimsys.h (File already exists)'
+else
+echo 'x - extracting mk/rlimsys.h (Text)'
+sed 's/^X//' << 'Purdue' > 'mk/rlimsys.h' &&
+/*
+X * include file for rlimited system
+X */
+X
+#if RESOURCE
+extern int rlimsys();
+extern char *rparse();
+extern void rinit();
+extern int r_fTrace;	/* use shell -cx for verbose trace		*/
+#endif
+Purdue
+chmod 0444 mk/rlimsys.h ||
+echo 'restore of mk/rlimsys.h failed'
+Wc_c="`wc -c < 'mk/rlimsys.h'`"
+test 190 -eq "$Wc_c" ||
+	echo 'mk/rlimsys.h: original size 190, current size' "$Wc_c"
+fi
+# ============= mkcat/scan.c ==============
+if test ! -d 'mkcat'; then
+    echo 'x - creating directory mkcat'
+    mkdir 'mkcat'
+fi
+if test -f 'mkcat/scan.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping mkcat/scan.c (File already exists)'
+else
+echo 'x - extracting mkcat/scan.c (Text)'
+sed 's/^X//' << 'Purdue' > 'mkcat/scan.c' &&
+/*
+X * Copyright 1990 Purdue Research Foundation, West Lafayette, Indiana
+X * 47907.  All rights reserved.
+X *
+X * Written by Kevin S Braunsdorf, ksb@cc.purdue.edu, purdue!ksb
+X *
+X * This software is not subject to any license of the American Telephone
+X * and Telegraph Company or the Regents of the University of California.
+X *
+X * Permission is granted to anyone to use this software for any purpose on
+X * any computer system, and to alter it and redistribute it freely, subject
+X * to the following restrictions:
+X *
+X * 1. Neither the authors nor Purdue University are responsible for any
+X *    consequences of the use of this software.
+X *
+X * 2. The origin of this software must not be misrepresented, either by
+X *    explicit claim or by omission.  Credit to the authors and Purdue
+X *    University must appear in documentation and sources.
+X *
+X * 3. Altered versions must be plainly marked as such, and must not be
+X *    misrepresented as being the original software.
+X *
+X * 4. This notice may not be removed or altered.
+X */
+X
+/*  $Id: scan.c,v 3.7 90/11/28 09:54:33 ksb Exp $
+X *
+X * scan -- look for trouble in the cat dirs (mostly)			(ksb)
+X */
+#include "machine.h"
+X
+#include <stdio.h>
+#include <ctype.h>
+#include <math.h>
+#include <errno.h>
+#include <sys/file.h>
+#include <sys/types.h>
+#include <sys/param.h>
+#if defined(SYSV)
+#include <ndir.h>
+#else
+#include <sys/dir.h>
+#endif
+#include <sys/stat.h>
+#include <fcntl.h>
+X
+#if !defined(MAXPATHLEN)
+#define MAXPATHLEN	1024
+#endif
+X
+#include "main.h"
+#include "pt.h"
+#include "genwhatis.h"
+#include "format.h"
+#include "readman.h"
+#include "mkcat.h"
+X
+extern FILE *popen();
+extern long atol();
+extern int errno;
+extern char *sys_errlist[];
+#define strerror(Me) sys_errlist[Me]
+X
+extern char *strrchr(), *strcat(), *strcpy(), *malloc(), *realloc();
+X
+#if !defined(F_OK)
+#define F_OK	0
+#endif
+X
+#if !defined(R_OK)
+#define R_OK	4
+#endif
+X
+X
+/*
+X * are these two files the same?					(ksb)
+X *	same inode
+X *		return yes
+X *	same compress status?
+X *		return system("cmp -s file1 file2");
+X *	diff compress status
+X *		return system("zcat file.Z | cmp -s - file");
+X */
+int
+CmpFile(pcFile1, pcFile2)
+char *pcFile1, *pcFile2;
+{
+X	register char *pcComp1, *pcComp2;
+X	auto struct stat stat1, stat2;
+X	auto char acCmd[MAXPATHLEN*4];
+X
+X	if (-1 == stat(pcFile1, & stat1) || -1 == stat(pcFile2, & stat2)) {
+X		return 0;
+X	}
+X	if (stat1.st_ino == stat2.st_ino && stat1.st_dev == stat2.st_dev) {
+X		return 1;
+X	}
+X	pcComp1 = strrchr(pcFile1, acDotZ[0]);
+X	if ((char *)0 != pcComp1 && 0 != strcmp(acDotZ, pcComp1)) {
+X		pcComp1 = (char *)0;
+X	}
+X	pcComp2 = strrchr(pcFile2, acDotZ[0]);
+X	if ((char *)0 != pcComp2 && 0 != strcmp(acDotZ, pcComp2)) {
+X		pcComp2 = (char *)0;
+X	}
+X	if (((char *)0 != pcComp1) == ((char *)0 != pcComp2)) {
+X		sprintf(acCmd, "exec cmp -s \'%s\' \'%s\'", pcFile1, pcFile2);
+X	} else if ((char *)0 == pcComp2) {
+X		sprintf(acCmd, "zcat \'%s\' |exec cmp -s - \'%s\'", pcFile1, pcFile2);
+X	} else {
+X		sprintf(acCmd, "zcat \'%s\' |exec cmp -s - \'%s\'", pcFile2, pcFile1);
+X	}
+X	return 0 == system(acCmd);
+}
+X
+/*
+X * if we find a compress'd file uncompress if (fCompress)		(ksb)
+X * if we find an uncompress'd file coompress if (!fCompress)
+X * make symboliclinks point to correct version.
+X *
+X * piNeed is a count of how many we would change
+X */
+static int
+FixCompress(npg, ppDE, piNeed)
+int npg, *piNeed;
+struct direct **ppDE;
+{
+X	auto char acOther[MAXPATHLEN+1];
+X	auto char acCmd[MAXPATHLEN*2+100];
+X	auto char acLink[MAXPATHLEN+1];
+X	struct direct *pDEThis;
+X	register int i, j;
+X	auto int iLinkLen;
+X	auto PATH PTThis, PTLink;
+X	auto struct stat stThis;
+X
+X	*piNeed = 0;
+X	for (i = 0; i < npg; ++i) {
+X		if ((struct direct *)0 == (pDEThis = ppDE[i]))
+X			continue;
+X		ppDE[i] = (struct direct *)0;
+X		PTInit(&PTThis, pDEThis->d_name);
+X		if (fCompress) {
+X			if (PTIsComp(&PTThis))
+X				continue;
+X			(void)strcpy(acOther, PTFull(&PTThis));
+X			(void)PTComp(&PTThis);
+X		} else {
+X			if (!PTIsComp(&PTThis))
+X				continue;
+X			(void)strcpy(acOther, PTFull(&PTThis));
+X			(void)PTUnComp(&PTThis);
+X		}
+X
+X		/* now Other has the wrong one, and PTThis is correct
+X		 */
+X		if (-1 == LSTAT(acOther, & stThis)) {
+X			/* someone removed it, ouch */
+X			continue;
+X		}
+X		if (0 == access(PTFull(&PTThis), F_OK)) {
+X			if (0 == CmpFile(PTFull(&PTThis), acOther)) {
+X				if (fVerbose) {
+X					(void)printf("%s: rm -f %s\n", progname, acOther);
+X				}
+X				if (fExec && -1 == unlink(acOther)) {
+X					fprintf(stderr, "%s: unlink: %s: %s\n", progname, acOther, strerror(errno));
+X					exit(22);
+X				}
+X			} else {
+X				(void)printf("%s: %s ~ %s, both exist; delete one and retry\n", progname, PTFull(&PTThis), acOther);
+X				exit(88);
+X			}
+X		}
+X		switch (stThis.st_mode & S_IFMT) {
+X		case S_IFREG:
+X			(void)sprintf(acCmd, "%scompress -f -c \"%s\" >\"%s\"", fCompress ? "" : "un", acOther, PTFull(&PTThis));
+X			if (fVerbose)
+X				printf("%s: %s\n", progname, acCmd);
+X			if (fExec && 0 != system(acCmd))
+X				continue;
+X			++*piNeed;
+X			for (j = i+1; j < npg; ++j) {
+X				if ((struct direct *)0 == ppDE[j])
+X					continue;
+X				if (ppDE[j]->d_ino != pDEThis->d_ino)
+X					continue;
+X				PTInit(&PTLink, ppDE[j]->d_name);
+X				if (fVerbose)
+X					printf("%s: rm -f %s\n", progname, PTFull(&PTLink));
+X				if (fExec)
+X					(void)unlink(PTFull(&PTLink));
+X				if (fCompress)
+X					(void)PTComp(&PTLink);
+X				else
+X					(void)PTUnComp(&PTLink);
+X				if (fVerbose)
+X					printf("%s: ln %s %s\n", progname, PTFull(&PTThis), PTFull(&PTLink));
+X				if (fExec && 0 != link(PTFull(&PTThis), PTFull(&PTLink))) {
+X					fprintf(stderr, "%s: link: %s: %s\n", progname, PTFull(&PTLink), strerror(errno));
+X				}
+X				ppDE[j] = (struct direct *)0;
+X			}
+X			if (fVerbose) {
+X				printf("%s: rm -f %s\n", progname, acOther);
+X			}
+X			if (fExec && 0 != unlink(acOther)) {
+X				fprintf(stderr, "%s: unlink: %s: %s\n", progname, acOther, strerror(errno));
+X			}
+X			break;
+#if HAVE_SLINKS
+X		case S_IFLNK:
+X			if (-1 == (iLinkLen = readlink(acOther, acLink, MAXPATHLEN))) {
+X				fprintf(stderr, "%s: readlink: %s: %s\n", progname, acOther, strerror(errno));
+X				continue;
+X			}
+X			acLink[iLinkLen] = '\000';
+X			printf("%s: %s -> %s\n", progname, acOther, acLink);
+X			if ('/' == acLink[0])
+X				continue;
+X			PTInit(& PTLink, acLink);
+X			if (fCompress)
+X				(void)PTComp(&PTLink);
+X			else
+X				(void)PTUnComp(&PTLink);
+X			if (fVerbose)
+X				(void)printf("%s: rm -f \"%s\"\n", progname, acOther);
+X			if (fExec && 0 != unlink(acOther))
+X				fprintf(stderr, "%s: unlink: %s: %s\n", progname, acOther, strerror(errno));
+X			if (fVerbose)
+X				(void)printf("%s: ln -s \"%s\" \"%s\"\n", progname, PTFull(&PTLink), PTFull(&PTThis));
+X			if (fExec && symlink(PTFull(&PTThis), PTFull(&PTLink)))
+X				fprintf(stderr, "%s: link: %s\n", progname, strerror(errno));;
+X			break;
+#endif
+X		case S_IFDIR:
+X			/* OLD, for instance */
+X			continue;
+X		default:
+X			(void)fprintf(stderr, "%s: %s: unknown file type\n", progname, PTFull(&PTThis));
+X			continue;
+X		}
+X	}
+X	return 0;
+}
+X
+/*
+X * In this alphasorted list of (struct direct *) [some nil] find	(ksb)
+X * (via a binary search) the named file... return a pointer to
+X * the entry so we may remove it in the caller
+X *
+X * This allows the caller to `shoot' the return array from scandir
+X * a few files at a time and still have a list of the files left.
+X */
+static struct direct **
+FindDEnt(pcName, ppDE, n)
+char *pcName;
+struct direct **ppDE;
+int n;
+{
+X	register int i, mid;
+X	register int cmp;
+X
+X	if (0 == n)
+X		return (struct direct **)0;
+X	for (i = 0; i < n; ++i) {
+X		if ((struct direct *)0 != ppDE[i])
+X			break;
+X	}
+X	if (n == i) {
+X		return (struct direct **)0;
+X	}
+X
+X	if (0 == strcmp(pcName, (ppDE[i])->d_name)) {
+X		return & ppDE[i];
+X	}
+X
+X	do {
+X		--n;
+X		if ((struct direct *)0 != ppDE[n])
+X			break;
+X	} while (n > i);
+X	if (0 == strcmp(pcName, (ppDE[n])->d_name)) {
+X		return & ppDE[n];
+X	}
+X
+X	while (i != n) {
+X		mid = (n+i)/2;
+X		while (mid < n && (struct direct *)0 == ppDE[mid])
+X			++mid;
+X		if (mid == n) {
+X			mid = (n+i)/2;
+X			while (mid > i && (struct direct *)0 == ppDE[mid])
+X				--mid;
+X			if (mid == i)
+X				break;
+X		}
+X		cmp = strcmp(pcName, (ppDE[mid])->d_name);
+X		if (cmp == 0) {
+X			return & ppDE[mid];
+X		}
+X		if (cmp < 0) {
+X			n = mid;
+X		} else {
+X			i = mid;
+X		}
+X		if (i+1 == n)
+X			break;
+X	}
+X	return (struct direct **)0;
+}
+X
+/*
+X * remove a link entry from something					(ksb)
+X *	 1 == OK to build
+X *	 0 == done for us already
+X *	-1 == error on rm
+X *	 2 == just struke link from list, fMkLinks is not set!
+X */
+static int
+FixLink(pcEnt, ppDEPages, npg, pcDest, pstCat)
+char *pcEnt, *pcDest;	/* ZZZ where the link points */
+struct direct **ppDEPages;
+int npg;
+struct stat *pstCat;
+{
+X	register struct direct **ppDE;
+X	int iLinkLen;
+X	auto char acContents[MAXPATHLEN+1];
+X	auto struct stat stDest;
+X
+X	if ((struct direct **)0 != ppDEPages && (struct direct **)0 != (ppDE = FindDEnt(pcEnt, ppDEPages, npg))) {
+X		*ppDE = (struct direct *)0;
+X	}
+X	if (!fMkLinks)
+X		return 2;
+X
+X	if (-1 == LSTAT(pcEnt, & stDest)) {
+X		if (ENOENT != errno) {
+X			fprintf(stderr, "%s: stat: %s: %s\n", progname, pcEnt, strerror(errno));
+X			return -1;
+X		}
+X		return 1;
+X	}
+X	switch (stDest.st_mode & S_IFMT) {
+X	case 0:
+X	case S_IFREG:	/* regular */
+X		if (fUseHards) {
+X			if ((struct stat *)0 != pstCat && stDest.st_ino == pstCat->st_ino && stDest.st_dev == pstCat->st_dev) {
+X				/* OK */
+X				return 0;
+X			}
+X			if (stDest.st_nlink < 2) {
+X				fprintf(fpOut, "%s: `%s\' is a unique file, not removed\n", progname, pcEnt);
+X				return -1;
+X			}
+X			fprintf(fpOut, "%s: hard moved: %s@ -> %s\n", progname, pcEnt, pcDest);
+X		} else {
+X			/* if this is not the old cat page, and
+X			 * a unique file that is not a clone of the page
+X			 * remove it.
+X			 */
+X			if ((struct stat *)0 != pstCat && (stDest.st_ino == pstCat->st_ino && stDest.st_dev == pstCat->st_dev)) {
+X				/* it is an OK hard link, dink it */;
+X			} else if (stDest.st_nlink < 2 && 0 != CmpFile(pcEnt, acCat)) {
+X				fprintf(fpOut, "%s: `%s\' is a unique file, not removed\n", progname, pcEnt);
+X				return -1;
+X			}
+X			fprintf(fpOut, "%s: hard link changed to symbolic link: %s@ -> %s\n", progname, pcEnt, pcDest);
+X		}
+X		break;
+X
+#if HAVE_SLINKS
+X	case S_IFLNK:	/* symbolic link */
+X		if (-1 == (iLinkLen = readlink(pcEnt, acContents, MAXPATHLEN))) {
+X			fprintf(stderr, "%s: readlink: %s: %s\n", progname, pcEnt, strerror(errno));
+X			return -1;
+X		}
+X		acContents[iLinkLen] = '\000';
+X		if (fUseHards) {
+X			if (0 != strcmp(acContents, pcDest) && 0 != CmpFile(pcEnt, acContents)) {
+X				return -1;
+X			}
+X			fprintf(fpOut, "%s: symbolic link changed to a hard link: %s -> %s\n", progname, pcEnt, pcDest);
+X		} else {
+X			if (0 == strcmp(acContents, pcDest)) {
+X				return 0;
+X			}
+X			fprintf(fpOut, "%s: symbolic link moved: %s@ -> %s\n", progname, pcEnt, pcDest);
+X		}
+X		break;
+X	default:
+X		fprintf(fpOut, "%s: `%s\' is a special file, cannot change to a symlink\n", progname, pcEnt);
+X		return -1;
+X
+#else
+X	default:
+X		fprintf(fpOut, "%s: `%s\' is a special file, cannot change to a link\n", progname, pcEnt);
+X		return -1;
+#endif
+X	}
+X	/* link was ok to remove and pointed the wrong place
+X	 */
+X	if (fVerbose) {
+X		fprintf(fpOut, "%s: rm -f \"%s\"\n", progname, pcEnt);
+X	}
+X	if (fExec) {
+X		(void)unlink(pcEnt);
+X	}
+X	return 1;
+}
+X
+/*
+X * update all the links that point to this page				(ksb)
+X *
+X * We chdir() to the target dir and chdir back when done.
+X *
+X * Passed a list of links to make, a file to link them to,
+X * the stat buffer for an `OK' previous file that links may
+X * have been hard linked to, and a list of files in that directory
+X * that we should `punch out' as they are claimed as links
+X * (so we don't have to do this again).
+X *
+X * Optionally, remove the links...
+X */
+static void
+MkLinks(pcBase, pWU, ppDEPages, npg, pstCat, fRemove)
+WHATIS *pWU;
+char *pcBase;
+struct direct **ppDEPages;
+int npg, fRemove;
+struct stat *pstCat;
+{
+X	extern char *getwd();
+X	register int k;
+X	auto char acCLink[MAXPATHLEN+1];
+X
+X	for (k = 0; k < pWU->ilen; ++k) {
+X		/* do not link file to itself */
+X		(void)sprintf(acCLink, "%s.%s%s", pWU->ppclist[k], pWU->pcext, fCompress ? acDotZ : "");
+X		if (0 == strcmp(pcBase, acCLink)) {
+X			continue;
+X		}
+X
+X		switch (FixLink(acCLink, ppDEPages, npg, pcBase, pstCat)) {
+X		case 1:	/* make it -- it is not there			*/
+X			if (fRemove) {
+X				continue;
+X			}
+X			/* make it below */
+X			break;
+X
+X		case 0: /* it is there already				*/
+X			if (!fRemove) {
+X				continue;
+X			}
+X			if (fVerbose) {
+X				fprintf(fpOut, "%s: rm -f \"%s\"\n", progname, acCLink);
+X			}
+X			if (fExec) {
+X				(void)unlink(acCLink);
+X			}
+X			continue;
+X
+X		case -1: /* error on remove/check of link -- forget it	*/
+X			continue;
+X		case 2:	/* fMkLinks is 0 */
+X			continue;
+X		}
+X
+X		/* make a link
+X		 */
+X		if (fUseHards) {
+X			if (fVerbose) {
+X				fprintf(fpOut, "%s: ln \"%s\" \"%s\"\n", progname, pcBase, acCLink);
+X			}
+X			if (fExec && 0 != link(pcBase, acCLink)) {
+X				fprintf(stderr, "%s: link: %s to %s: %s\n", progname, pcBase, acCLink, strerror(errno));
+X				continue;
+X			}
+X		} else {
+X			if (fVerbose) {
+X				fprintf(fpOut, "%s: ln -s \"%s\" \"%s\"\n", progname, pcBase, acCLink);
+X			}
+X			if (fExec && 0 != symlink(pcBase, acCLink)) {
+X				fprintf(stderr, "%s: symlink: %s to %s: %s\n", progname, pcBase, acCLink, strerror(errno));
+X				continue;
+X			}
+X		}
+X	}
+}
+X
+/*
+X * select routine for scandir						(ksb)
+X */
+static int
+catSelect(pEnt)
+struct direct *pEnt;
+{
+X	if ('.' == pEnt->d_name[0] && ('\000' == pEnt->d_name[1] ||
+X	    ('.' == pEnt->d_name[1] && '\000' == pEnt->d_name[2]))) {
+X		return 0;
+X	}
+X	return 1;
+}
+X
+/*
+X * scan the read directory for pages that differ only			(ksb)
+X * in extender or case
+X */
+static void
+ScanDups(npg, ppDEPages, pWU)
+int npg;
+register struct direct **ppDEPages;
+register WHATIS *pWU;
+{
+X	register int k, l;
+X	register int ck, cl;
+X	register char *pcCompk, *pcCompl;
+X	register char *pcSectionk, *pcSectionl;
+X
+X	for (k = 0; k < npg; ++k) {
+X		pWU[k].isection = 1;
+X	}
+X
+X	pcSectionk = pcCompk = (char *)0;
+X	pcSectionl = pcCompl = (char *)0;
+X	for (k = 0; k < npg;
+X	     ((char *)0 != pcCompk && (*pcCompk = acDotZ[0])),
+X	     ((char *)0 != pcSectionk && (*pcSectionk = '.')),
+X	     (pWU[k++].isection = 0)) {
+X		if ((struct direct *)0 == ppDEPages[k]) {
+X			continue;
+X		}
+X		pcCompk = strrchr(ppDEPages[k]->d_name, acDotZ[0]);
+X		if ((char *)0 != pcCompk && 0 != strcmp(pcCompk, acDotZ)) {
+X			pcCompk = (char *)0;
+X		}
+X		if ((char *)0 != pcCompk) {
+X			*pcCompk = '\000';
+X		}
+X		pcSectionk = strrchr(ppDEPages[k]->d_name, '.');
+X		if ((char *)0 == pcSectionk) {
+X			continue;
+X		}
+X		*pcSectionk = '\000';
+X		if (IsOKBase(ppDEPages[k]->d_name)) {
+X			continue;
+X		}
+X		ck = ppDEPages[k]->d_name[0];
+X		if (isalpha(ck) && isupper(ck)) {
+X			ck = tolower(ck);
+X		}
+X
+X		for (l = k+1; l < npg;
+X		     ((char *)0 != pcCompl && (*pcCompl = acDotZ[0])),
+X		     ((char *)0 != pcSectionl && (*pcSectionl = '.')),
+X		     ++l) {
+X			if ((struct direct *)0 == ppDEPages[l] || 0 == pWU[l].isection)
+X				continue;
+X			cl = ppDEPages[l]->d_name[0];
+X			if (isalpha(cl) && isupper(cl))
+X				cl = tolower(cl);
+X			if (cl != ck) {
+X				continue;
+X			}
+X			pcCompl = strrchr(ppDEPages[l]->d_name, acDotZ[0]);
+X			if ((char *)0 != pcCompl && 0 != strcmp(pcCompl, acDotZ)) {
+X				pcCompl = (char *)0;
+X			}
+X			if ((char *)0 != pcCompl) {
+X				*pcCompl = '\000';
+X			}
+X			pcSectionl = strrchr(ppDEPages[l]->d_name, '.');
+X			if ((char *)0 == pcSectionl) {
+X				continue;
+X			}
+X			*pcSectionl = '\000';
+X			if (0 != strcasecmp(ppDEPages[k]->d_name, ppDEPages[l]->d_name)) {
+X				continue;
+X			}
+X			fprintf(fpOut, "%s: `%s.%s%s\' and `%s.%s%s\' differ ", progname,
+X			    ppDEPages[k]->d_name, pcSectionk+1, (char *)0 != pcCompk ? acDotZ : "",
+X			    ppDEPages[l]->d_name, pcSectionl+1, (char *)0 != pcCompl ? acDotZ : "");
+X			pWU[l].isection = 0;
+X			if (0 == strcmp(ppDEPages[k]->d_name, ppDEPages[l]->d_name) && 0 == strcmp(pcSectionk+1, pcSectionl+1)) {
+X				fprintf(fpOut, "only in compression\n");
+X			} else if (0 == strcasecmp(pcSectionk+1, pcSectionl+1)) {
+X				if (((char *)0 == pcCompl) == ((char *)0 == pcCompk)) {
+X					fprintf(fpOut, "only in case\n");
+X				} else {
+X					fprintf(fpOut, "in case and compression\n");
+X				}
+X			} else if (((char *)0 == pcCompl) == ((char *)0 == pcCompk)) {
+X				fprintf(fpOut, "only in section\n");
+X			} else {
+X				fprintf(fpOut, "in section and compression\n");
+X			}
+X		}
+X	}
+}
+X
+/* remove the case from a file name, but don't touch the acDotZ if	(ksb)
+X * it has one
+X */
+void
+DropCase(pc, fComp)
+char *pc;
+int fComp;
+{
+X	for (/* done*/; '\000' != *pc; ++pc) {
+X		if (fComp && *pc == acDotZ[0] && 0 == strcmp(acDotZ, pc))
+X			break;
+X		if (isalpha(*pc) && isupper(*pc))
+X			*pc = tolower(*pc);
+X	}
+}
+X
+/*
+X * check a SEE ALSO entry for format, then check the manual page	(ksb)
+X * it points to (if the format is correct).
+X */
+void
+AlsoCheck(pWUThis, pcSee)
+WHATIS *pWUThis;
+char *pcSee;
+{
+X	register char *pcOpen, *pcClose, *pcTail, *pcDot;
+X	register DIR *pDI;
+X	register struct direct *pDE;
+X	register int iBase;
+X	extern char *strchr();
+X	auto struct stat stPage;
+X	auto char acLookFor[2*MAXPATHLEN+4];
+X	auto char acWrong[MAXPATHLEN+1];
+X
+X	if ((char *)0 == (pcOpen = strchr(pcSee, '('/*)*/)) || pcSee == pcOpen || !isdigit(pcOpen[1]))
+X		return;
+X	if ((char *)0 == (pcClose = strchr(pcSee, /*(*/')')) || '\000' != pcClose[1])
+X		return;
+X	*pcOpen++ = '\000';
+X	*pcClose = '\000';
+X
+X	if ('/' == pcCat[0] || ('.' == pcCat[0] && '/' == pcCat[1]))
+X		sprintf(acLookFor, "%s%ld/", pcCat, atol(pcOpen));
+X	else
+X		sprintf(acLookFor, "%s/%s%ld/", pcRoot, pcCat, atol(pcOpen));
+X	StripFmt(acLookFor);
+X	pcTail = acLookFor + strlen(acLookFor);
+X
+X	sprintf(pcTail, "%s.%s", pcSee, pcOpen);
+X	StripFmt(pcTail);
+X	if ((char *)0 == (pcDot = strrchr(pcTail, '.'))) {
+X		fprintf(stderr, "%s: %s: no dot in this string?\n", progname, pcTail);
+X		exit(60);
+X	}
+X	iBase = pcDot - pcTail;
+X	if (fCompress) {
+X		(void)strcat(pcTail, acDotZ);
+X	}
+X
+X	if (-1 != stat(acLookFor, &stPage) && S_IFREG == (stPage.st_mode&S_IFMT)) {
+X		/* found it */;
+X	} else if (DropCase(pcTail, fCompress), -1 != stat(acLookFor, &stPage) && S_IFREG == (stPage.st_mode&S_IFMT)) {
+X		/* found it */;
+X	} else if (pcTail[-1] = '\000', (DIR *)0 == (pDI = opendir(acLookFor))) {
+X		fprintf(stderr, "%s: opendir: %s: %s\n", progname, acLookFor, strerror(errno));
+X	} else {
+X		/* printf("\tscan for %s in %s:\n", pcTail, acLookFor); */
+X		/* if the name appears in any case we quit,
+X		 * if it has the wrong section we record it,
+X		 */
+X		if (fCompress && (char *)0 != (pcDot = strrchr(pcTail, acDotZ[0])) && 0 == strcmp(acDotZ, pcDot)) {
+X			*pcDot = '\000';
+X		}
+X		acWrong[0] = '\000';
+X		while ((struct direct *)0 != (pDE = readdir(pDI))) {
+X			if ((char *)0 != (pcDot = strrchr(pDE->d_name, acDotZ[0])) && 0 == strcmp(acDotZ, pcDot))
+X				*pcDot = '\000';
+X			else
+X				pcDot = (char *)0;
+X			if (0 == strcasecmp(pcTail, pDE->d_name)) {
+X				break;
+X			}
+X			if (0 == strncasecmp(pcTail, pDE->d_name, iBase) && '.' == pDE->d_name[iBase]) {
+X				(void)strcpy(acWrong, pDE->d_name);
+X			}
+X		}
+X		closedir(pDI);
+X		if ((struct direct *)0 != pDE) {
+X			/* found it*/ ;
+X		} else if ('\000' != acWrong[0]) {
+X			printf("%s: %s.%s: SEE ALSO sites `%s\' found `%s\'\n", progname, pWUThis->pcbase, pWUThis->pcext, pcTail, acWrong);
+X		
+X		} else {
+X			printf("%s: %s.%s: SEE ALSO sites `%s\', no such page\n", progname, pWUThis->pcbase, pWUThis->pcext, pcTail);
+X		}
+X	}
+X
+X	*--pcOpen = '(';
+X	*pcClose = ')';
+}
+X
+/*
+X * scan the whatis structures for manual pages that don't exist		(ksb)
+X * that are referenced in SEE ALSO lines
+X */
+int
+AlsoScan(pWU, iCount)
+WHATIS *pWU;
+int iCount;
+{
+X	register int i, ch;
+X	register char *pcAlso, *pcStart;
+X
+X	for (i = 0; i < iCount; ++i) {
+X		if ((char *)0 == pWU[i].pcalso) {
+X			/* no see also line in this page, skip it */
+X			continue;
+X		}
+X		
+X		pcStart = (char *)0;
+X		/* printf("%s.%s:\n", pWU[i].pcbase, pWU[i].pcext); */
+X		for (pcAlso = pWU[i].pcalso; '\000' != *pcAlso; ++pcAlso) {
+X			if (',' != *pcAlso && !isspace(*pcAlso)) {
+X				if ((char *)0 == pcStart) {
+X					pcStart = pcAlso;
+X				}
+X				continue;
+X			}
+X			if ((char *)0 == pcStart) {
+X				continue;
+X			}
+X			ch = *pcAlso;
+X			*pcAlso = '\000';
+X			AlsoCheck(& pWU[i], pcStart);
+X			*pcAlso = ch;
+X			pcStart = (char *)0;
+X		}
+X		if ((char *)0 != pcStart) {
+X			AlsoCheck(& pWU[i], pcStart);
+X		}
+X	}
+X	return 1;
+}
+X
+X
+/*
+X * look at all the manual pages in a directory				(ksb)
+X *
+X * Make sure they are compress'd or not...
+X * When we find a symbolic link we verify it.
+X * When we find a file we read it for makelinks, with that list in
+X * hand we will rebuild the hard an symbols links later.
+X * We delete lost links.
+X */
+int
+AllDir(iSection, ppWU, piCount)
+WHATIS **ppWU;
+int iSection, *piCount;
+{
+X	extern int alphasort();
+X	static char acDir[] = ".";
+X	register struct direct *pDEPage, **ppDE;
+X	register char *pcBase;
+X	auto int i, l, k, npg;
+X	auto FILE *fpFmt;
+X	auto struct direct **ppDEPages;
+X	auto char acLink[MAXPATHLEN+1];
+X	auto char acName[MAXPATHLEN+1];
+X	auto struct stat stCat;
+X	auto int iw, iNeedFix;
+X	auto WHATIS *pWU;
+X	auto PATH PTTemp;
+X
+X	*ppWU = (WHATIS *)0;
+X	*piCount = iw = 0;
+X	if (-1 == (npg = scandir(acDir, & ppDEPages, catSelect, alphasort))) {
+X		fprintf(stderr, "%s: scandir: %s: %s\n", progname, acDir, strerror(errno));
+X		return 1;
+X	}
+X	if (0 == npg) {
+#if 0
+X		/* we don't output this because it makes all inits look broken
+X		 */
+X		fprintf(fpOut, "%s: no pages in section %d\n", progname, iSection);
+#endif
+X		return 1;
+X	}
+X
+X	if (0 != FixCompress(npg, ppDEPages, & iNeedFix) || fJustComp) {
+X		free((char *)ppDEPages);
+X		return 0;
+X	}
+X	free((char *)ppDEPages);
+X
+X	/* we cannot do the rest becuase FixCompress need to exec something
+X	 */
+X	if (!fExec && 0 != iNeedFix) {
+X		return 0;
+X	}
+X
+X	if (-1 == (i = scandir(acDir, & ppDEPages, catSelect, alphasort))) {
+X		fprintf(stderr, "%s: scandir: %s: %s\n", progname, acDir, strerror(errno));
+X		return 1;
+X	}
+X
+X	if (i > npg) {
+X		fprintf(stderr, "%s: active manual system number of pages grew (%d > %d)\n", progname, i, npg);
+X	}
+X	npg = i;
+X
+X	/* this might be a gross over allocation, sigh
+X	 * we will patch it with realloc later...
+X	 */
+X	if (0 == (pWU = (WHATIS *)malloc((unsigned)sizeof(WHATIS)*npg))) {
+X		free((char *)ppDEPages);
+X		fprintf(stderr, acNoMem, progname);
+X		return 0;
+X	}
+X
+X	if (fVerbose) {
+X		ScanDups(npg, ppDEPages, pWU);
+X	}
+X
+X	for (k = 0; k < npg; ++k) {
+X		if ((struct direct *)0 == (pDEPage = ppDEPages[k])) {
+X			continue;
+X		}
+X		if (-1 == LSTAT(pDEPage->d_name, & stCat)) {
+X			continue;
+X		}
+X		/* ignore or bitch aboutr special files */
+X		switch (stCat.st_mode & S_IFMT) {
+#if defined(S_IFIFO)
+X		case S_IFIFO:	/* fifo */
+X			(void)fprintf(stderr, "%s: `%s\' is a fifo\n", progname, pDEPage->d_name);
+X			ppDEPages[k] = 0;
+X			free((char *)pDEPage);
+X			continue;
+#endif	/* no fifos		*/
+X
+#if defined(S_IFSOCK)
+X		case S_IFSOCK:	/* socket */
+X			(void)fprintf(stderr, "%s: `%s\' is a socket\n", progname, pDEPage->d_name);
+X			ppDEPages[k] = 0;
+X			free((char *)pDEPage);
+X			continue;
+#endif	/* no sockets		*/
+X		case S_IFCHR:	/* character special */
+X		case S_IFBLK:	/* block special */
+X			fprintf(stderr, "%s: `%s\' is a special device\n", progname, pDEPage->d_name);
+X			ppDEPages[k] = 0;
+X			free((char *)pDEPage);
+X			continue;
+X		case S_IFDIR:	/* directory */
+X			/* should get ., .., and OLD */
+X			ppDEPages[k] = 0;
+X			free((char *)pDEPage);
+X			continue;
+X
+#if defined(S_IFLNK)
+X		case S_IFLNK:	/* symbolic link */
+X			/* check later... */
+X			continue;
+#endif	/* we can catch symbolic links for other reasons		*/
+X
+X		case 0:
+X		case S_IFREG:	/* regular */
+X			pcBase = pDEPage->d_name;
+X			ppDEPages[k] = 0;
+X			break;
+X		}
+X
+X		PTInit(&PTTemp, pcBase);
+X
+X		/* skip bad extenders		*/
+X		if (! PTHasExt(&PTTemp)) {
+X			fprintf(stdout, "%s: `%s\' has no section extension\n", progname, pcBase);
+X			continue;
+X		}
+X
+X		/* open and read link info	*/
+X		if (PTIsComp(&PTTemp)) {
+X			auto char acCmd[MAXPATHLEN+200];
+X
+X			sprintf(acCmd, "exec zcat \'%s\'", pcBase);
+X			(void)fflush(stderr);
+X			(void)fflush(stdout);
+X			if (NULL == (fpFmt = popen(acCmd, "r"))) {
+X				fprintf(stderr, "%s: popen: %s: %s\n", progname, acCmd, strerror(errno));
+X				continue;
+X			}
+X			i = WUGrok(fpFmt, &PTTemp, & pWU[iw]);
+X			(void)pclose(fpFmt);
+X		} else {
+X			if (NULL == (fpFmt = fopen(pcBase, "r"))) {
+X				fprintf(stderr, "%s: fopen: %s: %s\n", progname, pcBase, strerror(errno));
+X				continue;
+X			}
+X			i = WUGrok(fpFmt, &PTTemp, & pWU[iw]);
+X			(void)fclose(fpFmt);
+X		}
+X		if (i != 0) {
+X			/* cannot grok this page, skip it */
+X			continue;
+X		}
+X
+X		(void)sprintf(acName, "%s.%s%s", pWU[iw].pcbase, pWU[iw].pcext, fCompress ? acDotZ : "");
+X
+X		if (pWU[iw].isection != iSection) {
+X			fprintf(fpOut, "%s: `%s\' might be in the wrong section\n", progname, pcBase);
+X		}
+X
+X
+X		/* here we've found (in pcBase) either
+X		 *	a/ the primary link to a page (good)
+X		 *	b/ a hard link to a page (fair)
+X		 *	c/ link to out of date page (yucko)
+X		 *	d/ a page whoose primary link is gone? (ouch!)
+X		 */
+X		if (0 != strcmp(pcBase, acName)) {	/* (b)? */
+X			ppDE = FindDEnt(acName, ppDEPages, npg);
+X			if ((struct direct **)0 != ppDE) {
+#if HAVE_SLINKS
+X				if (0 == LSTAT(acName, &stCat)) {
+X					switch ((stCat.st_mode & S_IFMT)) {
+X					case S_IFLNK:
+X						if (fExec && fMkLinks) {
+X							sym2Hard(acName);
+X						}
+X						break;
+X					case S_IFREG:
+X						break;
+X					default:
+X						fprintf(stderr, "%s: type type error\n", progname);
+X						abort();
+X					}
+X				}
+#endif
+X				if (!CmpFile(pcBase, acName)) {
+X					fprintf(fpOut, "%s: would have scanned `%s\' as `%s\', but they are not identical\n", progname, pcBase, acName);
+X				} else {
+X					fprintf(fpOut, "%s: scan `%s\' as `%s\'\n", progname, pcBase, acName);
+X					ppDEPages[k] = pDEPage;
+X					pDEPage = *ppDE;
+X					*ppDE = 0;
+X					pcBase = pDEPage->d_name;
+X				}
+X			} else { /* (d) */
+X				fprintf(stderr, "%s: primary link to %s should be %s\n", progname, pcBase, acName);
+X				if (fVerbose) {
+X					(void)printf("%s: ln \"%s\" \"%s\"\n", progname, pcBase, acName);
+X				}
+X				if (fExec && fMkLinks && -1 == link(pcBase, acName)) {
+X					fprintf(stderr, "%s: link: %s: %s\n", progname, acName, strerror(errno));
+X				}
+X			}
+X		}
+X		MkLinks(acName, pWU+iw, ppDEPages, npg, &stCat, 0);
+X		++iw;
+X	}
+X
+#if HAVE_SLINKS
+X	/* the files left are links that point nowhere, or to files
+X	 * that do not what them (lost a subcommand?)
+X	 */
+X	for (l = 0; l < npg; ++l) {
+X		if ((struct direct *)0 == (pDEPage = ppDEPages[l])) {
+X			continue;
+X		}
+X		if (-1 == (i = readlink(pDEPage->d_name, acLink, MAXPATHLEN))) {
+X			if (errno == EINVAL) {
+X				(void)printf("%s: %s: manual page under the wrong name?\n", progname, pDEPage->d_name);
+X				continue;
+X			}
+X			fprintf(stderr, "%s: readlink: %s: %s\n", progname, pDEPage->d_name, strerror(errno));
+X			continue;
+X		}
+X		acLink[i] = '\000';
+X		fprintf(fpOut, "%s: `%s\' is an unclaimed symbolic link", progname, pDEPage->d_name);
+X		if (0 == access(acLink, R_OK)) {
+X			fprintf(fpOut, " to `%s\'\n", acLink);
+X		} else {
+X			fprintf(fpOut, ", leading nowhere\n");
+X		}
+X	}
+#endif
+X
+X	/* now we can realloc the WHATIS array to the correct size
+X	 */
+X	if (iw < npg) {
+X		if (0 == (pWU = (WHATIS *)realloc((char *)pWU, (unsigned)sizeof(WHATIS)*iw))) {
+X			fprintf(stderr, "%s: realloc compression failed\n", progname);
+X			return 0;
+X		}
+X		*ppWU = pWU;
+X	}
+X	*piCount = iw;
+X
+X	return 1;
+}
+X
+/*
+X * this routine is kinda kludge.  MkLinks wants to be in the dir it	(ksb)
+X * is making the links for, so be cd there, do it, and come back.
+X *
+X * We could fork and wait if that would be more `safe'
+X * (this breaks if we are in a directory we cannot read, for example)
+X */
+void
+ModLinks(pPTDest, pWU, ppDEPages, npg, pstCat, fRemove)
+PATH *pPTDest;
+WHATIS *pWU;
+struct direct **ppDEPages;
+int npg, fRemove;
+struct stat *pstCat;
+{
+X	extern char *getwd();
+X	auto char acPwd[MAXPATHLEN+1];
+X	auto int fSave;
+X
+X	(void)fflush(stdout);
+X	if ((char *)0 == getwd(acPwd)) {
+X		fprintf(stderr, "%s: %s\n", progname, acPwd);
+X		return;
+X	}
+X	if (-1 == chdir(PTDir(pPTDest))) {
+X		fprintf(stderr, "%s: chdir: %s: %s\n", progname, PTDir(pPTDest), strerror(errno));
+X		return;
+X	}
+X
+X	fSave = fMkLinks;
+X	fMkLinks = 1;
+X	MkLinks(PTLocal(pPTDest), pWU, ppDEPages, npg, pstCat, fRemove);
+X	fMkLinks = fSave;
+X
+X	if (-1 == chdir(acPwd)) {
+X		fprintf(stderr, "%s: chdir: %s: %s\n", progname, acPwd, strerror(errno));
+X		exit(1);
+X	}
+}
+Purdue
+chmod 0444 mkcat/scan.c ||
+echo 'restore of mkcat/scan.c failed'
+Wc_c="`wc -c < 'mkcat/scan.c'`"
+test 27828 -eq "$Wc_c" ||
+	echo 'mkcat/scan.c: original size 27828, current size' "$Wc_c"
+fi
+true || echo 'restore of mkcat/genwhatis.c failed'
+echo End of part 2, continue with part 3
+exit 0
+
+exit 0 # Just in case...

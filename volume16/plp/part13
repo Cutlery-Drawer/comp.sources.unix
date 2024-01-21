@@ -1,0 +1,1395 @@
+Subject:  v16i026:  Public lineprinter spooler package, Part13/16
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: papowell@julius.cs.umn.edu
+Posting-number: Volume 16, Issue 26
+Archive-name: plp/part13
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 13 (of 16)."
+# Contents:  src/print_support.c src/recvfiles.c
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'src/print_support.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/print_support.c'\"
+else
+echo shar: Extracting \"'src/print_support.c'\" \(17575 characters\)
+sed "s/^X//" >'src/print_support.c' <<'END_OF_FILE'
+X/***************************************************************************
+X * U. Minnesota LPD Software * Copyright 1987, 1988, Patrick Powell
+X ***************************************************************************
+X * MODULE: Print_support.c
+X * handle the actual output to the Printer
+X ***************************************************************************
+X * Revision History: Created Wed Jan 13 16:21:39 CST 1988
+X * $Log:	print_support.c,v $
+X * Revision 3.1  88/06/18  09:35:18  papowell
+X * Version 3.0- Distributed Sat Jun 18 1988
+X * 
+X * Revision 2.4  88/05/27  08:28:01  papowell
+X * Added a SIGCONT to start up the output filter.
+X * 
+X * Revision 2.3  88/05/19  10:34:19  papowell
+X * Fixed open() calls to have a 0 parameter, ie: open(f, perms, 0), where needed
+X * 
+X * Revision 2.2  88/05/14  10:21:16  papowell
+X * Modified -X flag handling
+X * 
+X * Revision 2.1  88/05/09  10:09:44  papowell
+X * PLP: Released Version
+X * 
+X * Revision 1.4  88/03/25  15:01:04  papowell
+X * Debugged Version:
+X * 1. Added the PLP control file first transfer
+X * 2. Checks for MX during file transfers
+X * 3. Found and fixed a mysterious bug involving the SYSLOG facilities;
+X * 	apparently they open files and then assume that they will stay
+X * 	open.
+X * 4. Made sure that stdin, stdout, stderr was available at all times.
+X * 
+X * Revision 1.3  88/03/11  19:29:04  papowell
+X * Minor Changes, Updates
+X * 
+X * Revision 1.2  88/03/05  15:01:11  papowell
+X * Minor Corrections,  Lint Problems
+X * 
+X * Revision 1.1  88/03/01  11:09:01  papowell
+X * Initial revision
+X * 
+X ***************************************************************************
+X * void Print_open(): opens the Printer
+X * static int Print_of_fd(): makes an 'of' filter if needed
+X * void Print_close(): closes the Printer
+X * int Print_ready(): combines Print_open() and Print_of_fd()
+X * static int of_stop(): stops the 'of' filter
+X * int Print_string( str ): prints a string through 'of' or to Printer
+X * int Print_copy( fd ): copies a file through 'of' or to Printer
+X * int Print_filter( file, cmd ): makes a filter and copies file
+X * int Print_banner(): prints a banner through 'of' or to Printer
+X * Note: the above procedures which return values return JSUCC on success,
+X *   and JFAIL or JABORT on failure
+X ***************************************************************************/
+X
+X#ifndef lint
+static char id_str1[] =
+X	"$Header: print_support.c,v 3.1 88/06/18 09:35:18 papowell Exp $ PLP Copyright 1988 Patrick Powell";
+X#endif lint
+X
+X#include "lp.h"
+X
+X/***************************************************************************
+X * Print_open()
+X * 	Open the Printer, and set the Print_fd variables
+X * 	If the RW printcap flag is set, output is opened RW, otherwise
+X * 	opened writeonly in append mode.
+X * 
+X * 	If the Printer is a tty (i.e.- isatty returns non-zero),
+X * 	then the baud rate is set.  The baud rate table is stolen from
+X * 	the original LPD code, which stole it from STTY, etc.
+X * Side Effect:
+X * 	sets the Print_fd variable to a non-zero value
+X *  terminates if Printer is unable to be opened
+X ****************************************************************************/
+struct bauds {
+X	char *string;
+X	int	baud;
+X	int	speed;
+X} bauds[] = {
+X	"110", 110,	B110,
+X	"134", 134,	B134,
+X	"150", 150,	B150,
+X	"300", 300,	B300,
+X	"600", 600,	B600,
+X	"1200", 1200,	B1200,
+X	"1800", 1800,	B1800,
+X	"2400", 2400,	B2400,
+X	"4800", 4800,	B4800,
+X	"9600", 9600,	B9600,
+X	"19200", 19200,	B19200,
+X	"38400", 38400,	B38400,
+X	(char *)0, 0,	0
+X};
+X
+static int of_pid;		/* OF process pid */
+static int of_fd;		/* pipe to OF process */
+static int of_running;	/* of filter running */
+static char filter_stop[] = "\031\001";	/* what to send filter */
+X
+Print_open()
+X{
+X	int err;
+X
+X	/*
+X	 * check to see if it is open
+X	 */
+X	if( Print_fd ){
+X		return;
+X	}
+X	if( LP == 0 || *LP == 0 ){
+X		fatal( XLOG_INFO, "Missing LP value for local Printer");
+X	}
+X	setstatus("waiting for %s to become ready since %s (offline?)",
+X		Printer, Time_str());
+X	Print_fd = open(LP, RW ? ( O_RDWR|O_APPEND ) : ( O_WRONLY|O_APPEND ), 0);
+X	if( Print_fd < 0 ){
+X		err = errno;
+X		setstatus("Print_open: '%s' open(%s) failed, %s",Printer,LP,
+X			Errormsg(err));
+X		errno = err;
+X		logerr_die( XLOG_INFO, "Print_open: cannot open %s", LP);
+X	} else if( Print_fd == 0 ){
+X		fatal( XLOG_INFO, "Print_open: cannot happen- Print_fd == 0");
+X	}
+X	/*
+X	 * if it is a tty, set the baud rates and control information
+X	 */
+X	if (isatty(Print_fd)){
+X		Do_stty(Print_fd);
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"Print_open: %s is fd %d", LP, Print_fd );
+X}
+X
+X/*
+X * Start up an output filter, if needed.
+X */
+Print_of_fd()
+X{
+X	int p[2];
+X	char *cmd;
+X
+X	if( OF == 0 || *OF == 0 || of_pid ){
+X		return;
+X	}
+X	/*
+X	 * set OF command line
+X	 */
+X	cmd = Setup_filter('o',OF);
+X	if( cmd == 0 || *cmd == 0 ){
+X		fatal(XLOG_INFO, "bad OF entry");
+X	}
+X	if(Debug>2)log( XLOG_DEBUG, "starting OF, '%s'", cmd);
+X	/*
+X	 * create pipe and fork
+X	 */
+X	if( pipe(p) < 0 ){
+X		logerr_die( XLOG_NOTICE, "Print_of_of: pipe failed" );
+X	}
+X	if( p[0] < 3 || p[1] < 3 ){
+X		fatal( XLOG_INFO, "Print_of_fd: IMPOSSIBLE- pipe fd %d %d", p[0], p[1]);
+X	}
+X	if ((of_pid = fork()) == 0) {	/* child */
+X		if( dup2(p[0], 0) < 0		/* pipe is std in */
+X		 || dup2(Print_fd, 1) < 0 ){		/* Printer is std out */
+X			logerr_die( XLOG_NOTICE, "Print_of_fd: dup2 failed" );
+X		}
+X		if(Debug>3)log( XLOG_DEBUG, "Print_of_fd: forked %d OF: %s",
+X			getpid(), cmd );
+X		if( geteuid() == 0 && setreuid( Daemon_uid, Daemon_uid ) < 0 ){
+X			logerr_die( XLOG_NOTICE, "Print_of_fd: setreuid failed" );
+X		}
+X		mexecv( cmd );
+X		logerr_die( XLOG_NOTICE,"Print_of_fd: execv failed %s", cmd);
+X	} else if( of_pid < 0 ){
+X		logerr_die( XLOG_NOTICE, "Print_of_fd: fork failed" );
+X	}
+X	(void)close(p[0]);		/* close input side */
+X	of_fd = p[1];
+X	of_running = of_pid;
+X	if(Debug>3)log(XLOG_DEBUG,"started OF process %d, fd %d", of_pid, of_fd);
+X}
+X
+X/***************************************************************************
+X * Print_close()
+X * 1. Close the pipes and outputs.
+X * 2. Signal the of process that it is to do something.
+X *	Note that there is a Reapchild() call that will collect the
+X *	children;  this will make sure that there is a minimal number of
+X *	outstanding processes active.
+X ***************************************************************************/
+X
+void
+Print_close()
+X{
+X	if( of_fd ){
+X		(void)close(of_fd);
+X		of_fd = 0;
+X	}
+X	if( Print_fd ){
+X		(void)close(Print_fd);	/* close Printer */
+X		Print_fd = 0;
+X	}
+X	/*
+X	 * when you kill the printer, make sure that you do it neatly
+X	 */
+X	if( of_pid ){
+X		(void)kill(of_pid, SIGCONT);
+X	}
+X	of_pid = 0;
+X}
+X
+X/***************************************************************************
+X * Print_ready()
+X * 1. open the Printer if neccessary
+X * 2. start up the output filter
+X * 3. if the filter has been stopped, start it
+X * Return: JSUCC if started, JFAIL if not
+X ***************************************************************************/
+Print_ready()
+X{
+X	/*
+X	 * open the Printer
+X	 */
+X	Print_open();
+X	Print_of_fd();
+X	if( of_pid && of_running == 0 ){
+X		if (kill(of_pid, SIGCONT) < 0) {
+X			logerr( XLOG_INFO,"cannot restart output filter");
+X			Print_close();
+X			return( JFAIL );
+X		}
+X		of_running = of_pid;
+X	}
+X	return( JSUCC );
+X}
+X
+X/***************************************************************************
+X * of_stop()
+X * stop the output filter if neccessary
+X * 1. open and create the filter
+X * 2. flush output
+X * 3. kill(SIGSTOP) it
+X * Return: JSUCC if stopped, JFAIL if not
+X ***************************************************************************/
+X
+int
+of_stop()
+X{
+X	union wait statb;
+X	int pid;
+X
+X	Print_open();
+X	Print_of_fd();
+X	/*
+X	 * stop the OF filter
+X	 */
+X	if( of_pid && of_running ){
+X		if(Debug>3)log( XLOG_DEBUG, "stopping output filter" );
+X		if( write( of_fd, filter_stop, strlen(filter_stop))
+X			!= strlen(filter_stop) ){
+X			logerr( XLOG_NOTICE,"of_stop: cannot write to OF");
+X			Print_close();
+X			return( JFAIL );
+X		}
+X		/*
+X		 * wait until OF blocks
+X		 */
+X		if(Debug>3)log( XLOG_DEBUG, "of_stop: waiting for OF %d", of_pid );
+X		while ((pid = wait3(&statb,WUNTRACED,(struct rusage *)0)) != -1
+X			&& pid != of_pid) ;
+X		if( pid < 0 || statb.w_stopval != WSTOPPED ){
+X			logerr( XLOG_INFO, "of_stop: OF %d died (%s)", of_pid,
+X				Decode_status( &statb ) );
+X			Print_close();
+X			return( JFAIL );
+X		}
+X		if(Debug>3)log( XLOG_DEBUG, "of_stop: output filter stopped" );
+X		of_running = 0;
+X	}
+X	return( JSUCC );
+X}
+X
+X/***************************************************************************
+X * Print_string( char *str )
+X * print a string through a filter 
+X * 1. Enable the line Printer
+X * 2. get the filter or device fd;
+X * 3. put out the string
+X * 4. if unsuccessful, close the Printer
+X * Return: JSUCC if successful, JFAIL otherwise
+X ***************************************************************************/
+int
+Print_string( str )
+X	char *str;
+X{
+X	int f;
+X	int l;
+X
+X	if( Print_ready() != JSUCC ){
+X		return( JFAIL );
+X	}
+X	if( of_fd ){
+X		f = of_fd;
+X	} else {
+X		f = Print_fd;
+X	}
+X	l = strlen( str );
+X	if( write( f, str, l ) != l ){
+X		logerr( XLOG_INFO, "Print_string: write error");
+X		Print_close();
+X		return( JFAIL );
+X	}
+X	return( JSUCC );
+X}
+X
+X
+X/***************************************************************************
+X * Print_copy( int fd )
+X * copy a file through a filter
+X * 1. ready the Printer
+X * 2. copy the file to the appropriate output device
+X * 3. if an error, close the Printer
+X ***************************************************************************/
+int
+Print_copy( fd )
+X	int fd;
+X{
+X	int f;
+X	long cnt;
+X	char buf[BUFSIZ];
+X	int in;			/* bytes read */
+X	int out;		/* bytes written out */
+X
+X	cnt = 0;
+X	if( Print_ready() != JSUCC ){
+X		return( JFAIL );
+X	}
+X	if( of_fd ){
+X		f = of_fd;
+X	} else {
+X		f = Print_fd;
+X	}
+X	while( (in = read( fd, buf, sizeof(buf) )) > 0 ){
+X		out = write( f, buf, in );
+X		if( in != out ){
+X			logerr( XLOG_INFO, "Print_copy: write error");
+X			Print_close();
+X			return( JFAIL );
+X		}
+X		cnt = cnt + out;
+X	}
+X	/*
+X	 * completed the reading
+X	 */
+X	if( in < 0 ){
+X		logerr( XLOG_INFO, "Print_copy: read error");
+X		Print_close();
+X		return( JFAIL );
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"Print_copy: printed %d bytes", cnt);
+X	return( JSUCC );
+X}
+X
+X/***************************************************************************
+X *Print_filter( int fd, char *cmd )
+X *  spawn a subprocess to do the printing
+X * 1. stop the Printer
+X * 2. fork a process
+X * 3. wait for process to complete
+X * 4. restart the process
+X * Return: JSUCC if successful, JFAIL otherwise
+X ***************************************************************************/
+int
+Print_filter( file, cmd )
+X	int file;
+X	char *cmd;
+X{
+X	int succ;			/* success code */
+X	int filter_pid;		/* filter process */
+X	int pid;			/* daughter pid */
+X	union wait status;	/* daughter status */
+X	int err;			/* saved value of errno */
+X	
+X	/*
+X	 * stop the Printer
+X	 */
+X	succ = of_stop();
+X	if( succ != JSUCC ){
+X		return( succ );
+X	}
+X	/*
+X	 * fork a process,  and connect file to fd 0, Printer to fd 1.
+X	 */
+X	if ((filter_pid = fork()) == 0) {	/* daughter */
+X		/*
+X		 * dup input file to standard in and Printer to stdout
+X		 */
+X		if( dup2(file, 0)<0 || dup2(Print_fd, 1)<0 ){
+X			logerr_die(XLOG_NOTICE,"Print_filter: dup2 failed filter %s",cmd);
+X		}
+X		mexecv(cmd);
+X		logerr_die( XLOG_NOTICE,"Print_filter: cannot execv %s", cmd);
+X	} else if( filter_pid < 0 ){
+X		logerr( XLOG_NOTICE, "Print_filter: fork failed" );
+X		Print_close();
+X		return( JFAIL );
+X	}
+X	/*
+X	 *	Wait for filter to complete 
+X	 */
+X	if(Debug>2)log(XLOG_DEBUG,"Print_filter: waiting for pid %d",filter_pid);
+X	while ((pid = wait(&status)) > 0 && pid != filter_pid){
+X		if(Debug>3)log( XLOG_DEBUG, "Print_filter:caught %d (%s)",
+X			pid, Decode_status(&status) );
+X	}
+X	err = errno;
+X	if(Debug>2)log( XLOG_DEBUG, "Print_filter: filter %d finished (%s)",
+X		pid,Decode_status(&status));
+X	errno = err;
+X	/*
+X	 * Check to see how filter terminated
+X	 */
+X	if( pid < 0 || !WIFEXITED(status)
+X		|| (unsigned)status.w_retcode > 1 ){
+X		/*
+X		 * died for bad reasons, don't run this again
+X		 */
+X		log(XLOG_INFO,"Print_filter:Filter '%s' Malfunction (%s)",
+X			cmd, Decode_status(&status));
+X		Print_close();
+X		return( JABORT );
+X	} else if (status.w_retcode != 0){
+X		/*
+X		 * try again
+X		 */
+X		log( XLOG_INFO, "Print_filter:Filter '%s' Retry wanted", cmd );
+X		Print_close();
+X		return(JFAIL);
+X	}
+X	return(JSUCC);
+X}
+X
+X/*
+X * Print_banner()
+X * 1. get the Printer ready
+X * 2. call the banner() routine with the correct parameter
+X */
+Print_banner()
+X{
+X	int f;
+X
+X	if(Debug>3)log(XLOG_DEBUG,"Print_banner: printing banner");
+X	if( Print_ready() != JSUCC ){
+X		return( JFAIL );
+X	}
+X	if( of_fd ){
+X		f = of_fd;
+X	} else {
+X		f = Print_fd;
+X	}
+X	if( banner(f) != JSUCC ){
+X		if(Debug>3)log(XLOG_DEBUG,"Print_banner: banner failed");
+X		Print_close();
+X		return( JFAIL );
+X	}
+X	return( JSUCC );
+X}
+X
+X/*
+X * Fri Feb 26 08:44:53 CST 1988 Patrick Powell
+X * set terminal modes
+X * This code was based on a public domain version of public domain version
+X * of stty. I suppose that I could have created if from scratermctrlh,
+X * but I have seen the same table appearing
+X * in many "public domain" display terminal modes programs.
+X */
+X
+struct tchars termctrl;
+struct ltchars linectrl;
+struct sgttyb mode;
+struct
+X{
+X	char	*string;
+X	int	set;
+X	int	reset;
+X	int	lset;
+X	int	lreset;
+X} modes[] = {
+X	"bs0",		BS0, BS1, 0, 0,
+X	"bs1",		BS1, BS1, 0, 0,
+X	"cbreak",	CBREAK, 0, 0, 0,
+X	"-cbreak",	0, CBREAK, 0, 0,
+X	"cooked",	0, RAW, 0, 0,
+X	"cr0",		CR0, CR3, 0, 0,
+X	"cr1",		CR1, CR3, 0, 0,
+X	"cr2",		CR2, CR3, 0, 0,
+X	"cr3",		CR3, CR3, 0, 0,
+X	"decctlq",	0, 0, LDECCTQ, 0,
+X	"-decctlq",	0, 0, 0, LDECCTQ,
+X	"echo",		ECHO, 0, 0, 0,
+X	"-echo",	0, ECHO, 0, 0,
+X	"even",		EVENP, 0, 0, 0,
+X	"-even",	0, EVENP, 0, 0,
+X	"ff0",		FF0, FF1, 0, 0,
+X	"ff1",		FF1, FF1, 0, 0,
+X	"lcase",	LCASE, 0, 0, 0,
+X	"-lcase",	0, LCASE, 0, 0,
+X	"litout",	0, 0, LLITOUT, 0,
+X	"-litout",	0, 0, 0, LLITOUT,
+X	"nl",		0, CRMOD, 0, 0,
+X	"-nl",		CRMOD, 0, 0, 0,
+X	"nl0",		NL0, NL3, 0, 0,
+X	"nl1",		NL1, NL3, 0, 0,
+X	"nl2",		NL2, NL3, 0, 0,
+X	"nl3",		NL3, NL3, 0, 0,
+X	"noflsh",	0, 0, LNOFLSH, 0,
+X	"-noflsh",	0, 0, 0, LNOFLSH,
+X	"nohang",	0, 0, LNOHANG, 0,
+X	"-nohang",	0, 0, 0, LNOHANG,
+X	"odd",		ODDP, 0, 0, 0,
+X	"-odd",		0, ODDP, 0, 0,
+X	"raw",		RAW, 0, 0, 0,
+X	"-raw",		0, RAW, 0, 0,
+X	"tab0",		TAB0, XTABS, 0, 0,
+X	"tab1",		TAB1, XTABS, 0, 0,
+X	"tab2",		TAB2, XTABS, 0, 0,
+X	"tabs",		0, XTABS, 0, 0,
+X	"-tabs",	XTABS, 0, 0, 0,
+X	"tandem",	TANDEM, 0, 0, 0,
+X	"-tandem",	0, TANDEM, 0, 0,
+X	"tilde",	0, 0, LTILDE, 0,
+X	"-tilde",	0, 0, 0, LTILDE,
+X	"tn300",	CR1, ALLDELAY, 0, 0,
+X	"tty33",	CR1, ALLDELAY, 0, 0,
+X	"tty37",	FF1+CR2+TAB1+NL1, ALLDELAY, 0, 0,
+X	"vt05",		NL2, ALLDELAY, 0, 0,
+X	0,
+X};
+X
+X
+struct	special {
+X	char	*name;
+X	char	*cp;
+X	char	def;
+X} special[] = {
+X	"stop",		&termctrl.t_stopc,		CSTOP,
+X	"start",	&termctrl.t_startc,		CSTART,
+X	0
+X};
+X
+Do_stty( fd )
+X	int fd;
+X{
+X	int i;
+X	int	localmode;
+X	int	linedisc;
+X	char buf[BUFSIZ], *bp, *ep, *arg;
+X
+X	if( ioctl(fd, TIOCGETP, &mode) < 0
+X	 || ioctl(fd, TIOCGETC, &termctrl) < 0
+X	 || ioctl(fd, TIOCLGET, &localmode) < 0
+X	 || ioctl(fd, TIOCGLTC, &linectrl) < 0 ){
+X		logerr_die( XLOG_INFO,"cannot get tty parameters");
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"stty: before mode 0x%x, lmode 0x%x, speed 0x%x",
+X			mode.sg_flags, localmode, mode.sg_ispeed );
+X	if( BR ){
+X	  for(i=0; bauds[i].baud && BR != bauds[i].baud; i++);
+X	  if( i == 0){
+X		  fatal(XLOG_INFO,"illegal baud rate %d", BR);
+X	  }
+X	  mode.sg_ispeed = mode.sg_ospeed = bauds[i].speed;
+X	}
+X	mode.sg_flags &= ~FC;
+X	mode.sg_flags |= FS;
+X	localmode &= ~XC;
+X	localmode |= XS;
+X 
+X
+X	if( TY && *TY ){
+X		(void)strcpy(buf, TY);
+X		ep = buf;
+X	} else {
+X		ep = 0;
+X	}
+X	while( ep && *ep ){
+X		for( ; *ep && isspace(*ep) ; ++ ep );
+X		for( arg = ep; *ep && !isspace(*ep) ; ++ ep );
+X		if( *ep ){
+X			*ep = 0;
+X			++ep;
+X		}
+X		for(i=0; modes[i].string && strcmp(modes[i].string,arg); i++);
+X		if(modes[i].string) {
+X			if(Debug>4)log(XLOG_DEBUG,
+X				"stty: modes %s, mc 0x%x ms 0x%x lc 0x%x ls 0x%x",
+X				modes[i].string, modes[i].reset, modes[i].set,
+X				modes[i].lreset, modes[i].lset );
+X			mode.sg_flags &= ~modes[i].reset;
+X			mode.sg_flags |= modes[i].set;
+X			localmode &= ~modes[i].lreset;
+X			localmode |= modes[i].lset;
+X			continue;
+X		}
+X		for (i = 0; special[i].name && strcmp(special[i].name,arg); i++);
+X		if( special[i].name ){
+X			for( ; *ep && isspace(*ep) ; ++ ep );
+X			for( bp = ep; *ep && !isspace(*ep) ; ++ ep );
+X			if( *ep ){
+X				*ep = 0;
+X				++ep;
+X			}
+X			if( *bp == 0 ){
+X				fatal( XLOG_INFO, "stty: missing parameter for %s", arg );
+X			}
+X			if (bp[0] == '^'){
+X				if( bp[1] == '?' ){
+X					*special[i].cp = 0177;
+X				} else {
+X					*special[i].cp = 037 & bp[1];
+X				}
+X			} else {
+X				*special[i].cp = bp[0];
+X			}
+X			if(Debug>4)log(XLOG_DEBUG,"stty: special %s %s", arg, bp );
+X			continue;
+X		}
+X		for(i=0; bauds[i].string && strcmp(bauds[i].string,arg); i++);
+X		if(bauds[i].string) {
+X			if(Debug>4)log(XLOG_DEBUG,"stty: speed %s", arg );
+X			mode.sg_ispeed = mode.sg_ospeed = bauds[i].speed;
+X			continue;
+X		}
+X		if (!strcmp("new", arg)){
+X			if(Debug>4)log(XLOG_DEBUG,"stty: ldisc %s", arg );
+X			linedisc = NTTYDISC;
+X			if (ioctl(fd, TIOCSETD, &linedisc)<0)
+X				logerr_die(XLOG_INFO,"stty: TIOCSETD ioctl failed");
+X			continue;
+X		}
+X		if (!strcmp("old",arg)){
+X			if(Debug>4)log(XLOG_DEBUG,"stty: ldisc %s", arg );
+X			linedisc = 0;
+X			if (ioctl(fd, TIOCSETD, &linedisc)<0)
+X				logerr_die(XLOG_INFO,"stty: TIOCSETD ioctl failed");
+X			continue;
+X		}
+X		fatal(XLOG_INFO,"unknown mode: %s\n", arg);
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"stty: after mode 0x%x, lmode 0x%x, speed 0x%x",
+X			mode.sg_flags, localmode, mode.sg_ispeed );
+X	if( ioctl(fd, TIOCSETN, &mode) < 0
+X		|| ioctl(fd, TIOCSETC, &termctrl) < 0
+X		|| ioctl(fd, TIOCSLTC, &linectrl) < 0
+X		|| ioctl(fd, TIOCLSET, &localmode) < 0 ){
+X		logerr_die( XLOG_NOTICE,"cannot set tty parameters");
+X	}
+X}
+END_OF_FILE
+if test 17575 -ne `wc -c <'src/print_support.c'`; then
+    echo shar: \"'src/print_support.c'\" unpacked with wrong size!
+fi
+# end of 'src/print_support.c'
+fi
+if test -f 'src/recvfiles.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/recvfiles.c'\"
+else
+echo shar: Extracting \"'src/recvfiles.c'\" \(18372 characters\)
+sed "s/^X//" >'src/recvfiles.c' <<'END_OF_FILE'
+X/***************************************************************************
+X * U. Minnesota LPD Software * Copyright 1987, 1988, Patrick Powell
+X ***************************************************************************
+X * MODULE: recvfiles.c
+X * Receive files from a remote site
+X ***************************************************************************
+X * Revision History: Created Sat Jan 16 07:10:12 CST 1988
+X * $Log:	recvfiles.c,v $
+X * Revision 3.1  88/06/18  09:35:25  papowell
+X * Version 3.0- Distributed Sat Jun 18 1988
+X * 
+X * Revision 2.4  88/05/21  10:28:14  papowell
+X * Minor editing
+X * 
+X * Revision 2.3  88/05/14  10:18:01  papowell
+X * Use long format for job file names;
+X * Added 'fd', no forward flag;
+X * Control file has to have hostname and origination agree.
+X * 
+X * Revision 2.2  88/05/11  09:52:55  papowell
+X * Remote printer file transfer error fixed.
+X * 
+X * Revision 2.1  88/05/09  10:09:55  papowell
+X * PLP: Released Version
+X * 
+X * Revision 1.5  88/04/28  09:52:40  papowell
+X * added casts to shut up lint
+X * 
+X * Revision 1.4  88/04/26  15:53:39  papowell
+X * Fixed up a horribly silly bug in the add_files and File_name
+X * routines;  sigh.  Would you believe an L (l) and a one (1) got mixed
+X * up?
+X * 
+X * Revision 1.3  88/03/25  15:01:17  papowell
+X * Debugged Version:
+X * 1. Added the PLP control file first transfer
+X * 2. Checks for MX during file transfers
+X * 3. Found and fixed a mysterious bug involving the SYSLOG facilities;
+X * 	apparently they open files and then assume that they will stay
+X * 	open.
+X * 4. Made sure that stdin, stdout, stderr was available at all times.
+X * 
+X * Revision 1.2  88/03/05  15:01:07  papowell
+X * Minor Corrections,  Lint Problems
+X * 
+X * Revision 1.1  88/03/01  11:09:06  papowell
+X * Initial revision
+X * 
+X ***************************************************************************/
+X#ifndef lint
+static char id_str1[] =
+X	"$Header: recvfiles.c,v 3.1 88/06/18 09:35:25 papowell Exp $ PLP Copyright 1988 Patrick Powell";
+X#endif lint
+X
+X#include "lp.h"
+X
+X/***************************************************************************
+X * This module implements the file transfer protocol at the receiving
+X * site. For each job:
+X * 1.  The data files are transferred.
+X * 2.  The control files are transferred.
+X *     If the transfer is unsuccessful,  all job files are removed.
+X * 
+X * Individual files are transferred using the following protocol.
+X * 
+X * 1.  The sending site sends a line with the size and name of the file,
+X * 	and a flag indicating if it is a data or control file.
+X * 2.  The receiving site will acknowledge reception.
+X * 3.  The remote site will send the file.
+X * 4.  The receiving site will acknowledge reception.
+X * 
+X * The transfer protocol is implemented by a simple FSM:
+X * INIT:  no files transferred
+X * DATA:  data file transferred
+X * CONTROL: control file transferred
+X * 
+X * A list of all files associated with the job is maintained,
+X * and if any errors result,  the list of files will be deleted.
+X * 
+X ***************************************************************************/
+X
+X/***************************************************************************
+X * recvfiles()
+X *
+X * Gets a job from the remote end.
+X * 
+X * The old Berkeley protocol was to send data files and then the control
+X * file.  The PLP protocol will send the control file first, then the data
+X * files, followed by the name of the control file.
+X * 
+X * If there is an error during transfer, all the jobs associated with the
+X * file are removed.
+X * 
+X * In order to be compatible with the Berkeley LPD, old Berkeley format is
+X * also supported.
+X ***************************************************************************/
+recvfiles()
+X{
+X	int i;					/* ACME Integers */
+X	int succ;				/* success flag */
+X	int flag;				/* file kind */
+X	long size;				/* file size */
+X	char fname[CFNAMELEN+1];	/* file fname */
+X	char cfname[CFNAMELEN+1];	/* file fname */
+X	char tfname[CFNAMELEN+1];	/* file fname */
+X	int fd;					/* file descriptor */
+X	FILE *cfp;				/* FILE descriptor */
+X	int state;				/* state: IDLE, BDATA, BCNTRL, PCNTRL, PDATA */
+X	long jobsize;			/* job size */
+X#define IDLE	0	/* nothing doing */
+X#define BDATA	1	/* transferring Berkeley data file */
+X#define BCNTRL	2	/* transferring Berkeley control file */
+X#define PCNTRL	3	/* transferring PLP control file */
+X#define PDATA	4	/* transferring PLP data file */
+X#define PLAST	5	/* last file has been transferred */
+X
+X	/*
+X	 * get the printcap entry
+X	 */
+X	if( Get_pc_entry(Printer, Status_pc_vars, Status_pc_len ) == 0){
+X		log( XLOG_INFO, "revcfiles: trying to start non-existent Printer" );
+X	}
+X	if( SD == 0 || *SD == 0 ){
+X		/*
+X		 * no spooling directory, not a Printer
+X		 */
+X		if(Debug>0)log(XLOG_DEBUG, "revcfiles: not a Printer");
+X		return;
+X	}
+X	/* chdir to spool directory */
+X	if (chdir(SD) < 0) {
+X		logerr_die( XLOG_NOTICE,"revcfiles: cannot chdir to %s", SD);
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"recvfiles: setting up log");
+X	Setuplog( LF, 1 );
+X	if(Debug>3)log(XLOG_DEBUG,"recvfiles: sending confirm");
+X	if( send_ack(0) != JSUCC ){
+X		if(Debug>3)log(XLOG_DEBUG,"recvfiles: confirm failed");
+X		goto error;
+X	}
+X
+X	/*
+X	 * set up the file transfers
+X	 */
+X	state = IDLE;
+X	while( (succ = get_file_xfer(&flag, &size, fname )) == JSUCC && flag ){
+X		if(Debug>3)log(XLOG_DEBUG,"recvfiles: state %d, flag %d, file %s",
+X			state,flag,fname);
+X		switch( state ){
+X		case IDLE:
+X			cfp = NULL;
+X			Rec_cnt = 0;
+X			(void)strcpy( cfname, fname );
+X			jobsize = 0;
+X			for( i = 0; i < 26; ++i ){
+X				CFparm[i][0] = 0;
+X			}
+X			switch( flag ){
+X			case CNAME:
+X				state = PCNTRL; break;
+X			case DFILE:
+X				state = BDATA;	break;
+X			default:
+X				goto protocol;
+X			}
+X			break;
+X		case BDATA:
+X			switch( flag ){
+X			case DFILE:
+X				break;
+X			case CFILE:
+X				state = BCNTRL;
+X				break;
+X			default:
+X				goto protocol;
+X			}
+X			break;
+X		case PCNTRL:
+X			switch( flag ){
+X			case DFILE:
+X				state = PDATA;	break;
+X			default:
+X				goto protocol;
+X			}
+X			break;
+X		case PDATA:
+X			switch( flag ){
+X			case DFILE:
+X				break;
+X			case CEND:
+X				state = PLAST;
+X				break;
+X			default:
+X				goto protocol;
+X			}
+X			break;
+X		default:
+X			goto protocol;
+X		}
+X		/*
+X		 * trying to send a file with a different sequence number?
+X		 */
+X		if( Job_match( cfname, fname ) == 0 ){
+X			log( XLOG_INFO, "recvfiles: file with bad format %s", fname );
+X			succ = JFAIL;
+X			goto error;
+X		}
+X		switch( state ){
+X		case PDATA:
+X			/*
+X			 * add names to list
+X			 */
+X			if( Find_name( fname ) < 0 ){
+X				log( XLOG_INFO,
+X					"recvfiles: data file not in job '%s'", fname );
+X				succ = JFAIL;
+X				goto error;
+X			}
+X			break;
+X		case BCNTRL:
+X		case PCNTRL:
+X			(void)strcpy(tfname, fname );
+X			fname[0] = 't';
+X			break;
+X		}
+X		/*
+X		 * add the file name to the temporary list
+X		 */
+X		if( (i = add_recfiles( fname )) < 0 ){
+X			log( XLOG_INFO, "recvfiles: too many files (%s)", fname );
+X			succ = JFAIL;
+X			goto error;
+X		}
+X		/*
+X		 * check to see that file size does not exceed the total
+X		 */
+X		Parms[i].num = 1;
+X		Parms[i].size = ((size+1023)/1024);
+X		jobsize = jobsize + Parms[i].size;
+X		if( MX && jobsize > MX ){
+X			log( XLOG_INFO, "recvfiles: file (%s) exceeds MX",fname, MX);
+X			succ = JFAIL;
+X			goto error;
+X		}
+X		/*
+X		 * check to see if we have opened the file already
+X		 */
+X		if( state != PLAST ){
+X			/*
+X			 * we lock the file
+X			 */
+X			fd = Exlockcf( fname );
+X			if( fd < 0 ){
+X				/*
+X				 * The file is locked.  This can only happen if some other
+X				 * process  got hold of the file.  We either have several
+X				 * processes transferring files or horrible collision course.
+X				 * DONT remove already transferred files.
+X				 */
+X				logerr(XLOG_NOTICE,"recvfiles: %s IMPOSSIBLE collision %s",
+X					fname,From);
+X				exit(1);
+X			}
+X			succ = get_file( size, fd, fname );
+X			if( succ != JSUCC ){
+X				goto error;
+X			}
+X		}
+X		/*
+X		 * open a FILE for the control file, and check the entries in it.
+X		 * If we have just got the file in PLP, just scan for entries.
+X		 * Otherwise check to see that all are present.
+X		 */
+X		switch( state ){
+X		case BCNTRL:
+X		case PCNTRL:
+X			if( (cfp = fdopen( fd, "r" ) ) < 0 ){
+X				logerr_die( XLOG_INFO,"recvfiles: fdopen failed" );
+X			}
+X			if( Validate_cf( state == PCNTRL, cfp, fname ) == 0 ){
+X				goto error;
+X			}
+X			break;
+X		case PLAST:
+X			if( Validate_cf( 0, cfp, fname ) == 0 ){
+X				goto error;
+X			}
+X			break;
+X		}
+X		switch( state ){
+X		case PLAST:
+X		case BCNTRL:
+X			Rename_cf( fname );
+X			Rec_cnt = 0;
+X			(void)fclose(cfp);
+X			state = IDLE;
+X			break;
+X		case PCNTRL:
+X			break;
+X		default:
+X			(void)close( fd );
+X			break;
+X		}
+X		/*
+X		 * We can confirm transfer to the other end
+X		 */
+X		if( send_ack( 0 ) != JSUCC ){
+X			goto error;
+X		}
+X	}
+X	if( succ == JSUCC && flag == 0 && state == IDLE ){
+X		/*
+X		 * finished! start up Printer
+X		 */
+X		if(Debug>3)log(XLOG_DEBUG,"recvfiles: done, starting Printer");
+X		Link_close();
+X		Startprinter();
+X		return;
+X	}
+X	/*
+X	 * Error conditions
+X	 * 1. remove files
+X	 * 2. reply with error status to remote end
+X	 */
+protocol:
+X	log(XLOG_INFO,
+X	"recvfiles: protocol violation, state %d, flag %d, file %s",
+X		state, flag, fname );
+error:
+X	rm_recfiles();
+X	(void)send_ack(1);
+X	Startprinter();
+X	return;
+X}
+X
+X/***************************************************************************
+X * add_recfiles(char * Name)
+X * add a file Name to the received files
+X ***************************************************************************/
+X
+add_recfiles( filename )
+X	char *filename;
+X{
+X	int i;
+X
+X	if(Debug>4)log(XLOG_DEBUG,"add_recfiles: %s", filename );
+X	/*
+X	 * add a control file name to the parameter list entries
+X	 * if there is nothing in the list, clobber the entry.
+X	 */
+X	if( Rec_cnt ==  0 ){
+X		Parmcount = 0;
+X	}
+X	if( (i = Add_name( filename )) < 0 ){
+X		return( -1 );
+X	}
+X	Rec_cnt = Parmcount;
+X	return( i );
+X}
+X
+X/***************************************************************************
+X * rm_recfiles()
+X * remove the files that are in the receive list;
+X ***************************************************************************/
+X
+rm_recfiles()
+X{
+X	int i;		/* ACME Integer, Inc. */
+X
+X	if(Debug>4)log(XLOG_DEBUG,"rm_recfiles: removing files" );
+X	for( i = 0; i < Rec_cnt; ++i ){
+X		if(Debug>4)log(XLOG_DEBUG,"rm_recfiles: %s", Parms[i].filename );
+X		(void)unlink_daemon( Parms[i].filename );
+X	}
+X	Rec_cnt = 0;
+X}
+X
+X/***************************************************************************
+X * get_file_xfer(int *flag; long *size; char *name )
+X * 1. read a line from the far end
+X * 2. the line has the format <flag><size> <name>\n
+X *      "%c%d %s\n" format
+X * 3. extract the information from the line
+X * 4. acknowledge the information
+X ***************************************************************************/
+get_file_xfer( flag, size, name )
+X	int *flag;
+X	long *size;
+X	char *name;
+X{
+X	char buf[BUFSIZ];		/* buffer for reading */
+X	int i;					/* ACME Integers, Inc. */
+X	char *cp;				/* ACME Pointers, Inc. */
+X
+X	/*
+X	 * read a line from the remote end
+X	 * use Bomb-proof Read (bpread), which reads up to the first \n
+X	 */
+X	if(Debug>3)log(XLOG_DEBUG,"get_file_xfer: starting", buf );
+X	if( (i = bpread(1, buf, sizeof(buf)) ) < 0 ){
+X		logerr(XLOG_INFO, "get_file_xfer: read error from remote");
+X		*flag = 0;
+X		goto error;
+X	} else if( i == 0 ){
+X		if(Debug>3)log(XLOG_DEBUG,"get_file_xfer: end of input");
+X		*flag = 0;
+X		return( JSUCC );
+X	}
+X	/*
+X	 * UGLY UGLY UGLY:
+X	 * what I wanted to do is:
+X	 *    if( sscanf( buf, "%c%d %s", flag, size, name ) != 3 )...
+X	 * but the guilty-of-incestuous-rape sscanf is not portable across
+X	 * several implementations.
+X	 */
+X	if(Debug>3)log(XLOG_DEBUG,"get_file_xfer: %d'%s'", buf[0], &buf[1]);
+X	/*
+X	 * pull off the flag information
+X	 */
+X	i = buf[0];
+X	if( i != DFILE && i != CFILE && i != CNAME && i != CEND){
+X		log(XLOG_INFO, "get_file_xfer: bad first char (%d)", i);
+X		goto error;
+X	}
+X	*flag = i;
+X	/*
+X	 * now pull off the size information
+X	 */
+X	*size = 0;
+X	for( cp = &buf[1]; (i = *cp) && isdigit( i ); ++cp ){
+X		*size = 10*(*size) + (i - '0');
+X	}
+X	if( *cp != ' '){
+X		log(XLOG_INFO, "get_file_xfer: no space separator (%d)", *cp);
+X		goto error;
+X	}
+X	while( *cp == ' ' ) ++cp;
+X	if( Job_match( cp, cp ) == 0 ){
+X		log(XLOG_INFO, "get_file_xfer: bad job name '%s'", cp);
+X		goto error;
+X	}
+X	/*
+X	 * must be a data or control file only
+X	 */
+X	(void)strcpy( name, cp );
+X	/*
+X	 * send a confirmation
+X	 */
+X	if( send_ack( 0 ) != JSUCC ){
+X		goto error;
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"get_file_xfer: flag %d, size %d, name '%s'",
+X		*flag, *size, name );
+X	return( JSUCC );
+X	/*
+X	 * error, give up
+X	 */
+error:
+X	Link_close();
+X	return( JFAIL );
+X}
+X
+X/***************************************************************************
+X * get_file(long size; int fd; char *name)
+X * 1. copy size bytes from fd 1 to fd
+X * 2. the next byte read should be 0; if not, then you have error
+X ***************************************************************************/
+get_file( size, fd, name )
+X	long size;
+X	int fd;
+X	char *name;
+X{
+X	char buf[BUFSIZ];		/* buffer for reading */
+X	long cnt;				/* number of bytes */
+X	int i;					/* ACME Integers, Inc. */
+X
+X	/*
+X	 * we simply copy the file from the remote end
+X	 */
+X	if(Debug>3)log(XLOG_DEBUG,"get_file: get %d (%s) from %s",size,name,From);
+X	cnt = size;
+X	while( cnt > 0 ){
+X		if( cnt > sizeof(buf) ){
+X			i = sizeof(buf);
+X		} else {
+X			i = cnt;
+X		}
+X		i = read(1, buf, i);
+X		if( i < 0 ){
+X			logerr(XLOG_INFO, "get_file: read from %s failed", From );
+X			goto error;
+X		}
+X		if( i == 0 ){
+X			log(XLOG_INFO,"get_file: read 0 bytes from %s, assume dead",From);
+X			goto error;
+X		}
+X		if( write( fd, buf, i ) != i ){
+X			logerr(XLOG_INFO, "write to %s failed", name );
+X			goto error;
+X		}
+X		cnt = cnt - i;
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"get_file: success %d (%s) from %s",
+X		size,name,From);
+X	i = read(1, buf, 1);
+X	if( i < 0 ){
+X		logerr(XLOG_INFO, "get_file: end from %s failed", From );
+X		goto error;
+X	}
+X	if( i == 0 ){
+X		log(XLOG_INFO, "get_file: end, 0 bytes from %s, assume dead", From );
+X		goto error;
+X	}
+X	if( buf[0] != 0 ){
+X		log(XLOG_INFO, "get_file: bad end confirm, %d from %s",buf[0],From);
+X		goto error;
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"get_file: read %s from %s", name, From );
+X	return( JSUCC );
+error:
+X	Link_close();
+X	return( JFAIL );
+X}
+X
+X/***************************************************************************
+X * send_ack( int c )
+X * acknowledge by sending back single char c
+X ***************************************************************************/
+send_ack( c )
+X	int c;
+X{
+X	char buf[1];
+X
+X	buf[0] = c;
+X	if( write( 1, buf, 1 ) != 1 ){
+X		logerr(XLOG_INFO,"send_ack: %d to %s failed", c, From );
+X		return( JFAIL );
+X	}
+X	if(Debug>3)log(XLOG_DEBUG,"send_ack: %d to %s succeeded", c, From );
+X	return( JSUCC );
+X}
+X
+X/***************************************************************************
+X * Validate_cf( scan, fp, fname )
+X * Check to ensure that the files contained in this control file
+X * were actually sent as part of the control file.
+X * 1. fseek to the start of the file
+X * 2. read the file, looking data file entries
+X * 3. Check that the names of the data files are consistent with the
+X *    name of the control file
+X * 4. Check that the file was sent
+X ***************************************************************************/
+Validate_cf( scan, fp, fname )
+X	int scan;
+X	FILE *fp;
+X	char *fname;
+X{
+X	char buf[BUFSIZ];	/* Buffer, Inc. */
+X	int c, l;			/* AMCE Aluminum Siding and Integers, Inc. */
+X	char *bp;			/* Buffer */
+X	long size;			/* total job size */
+X	int perms;			/* permissions */
+X	int name_len;		/* length of hostname to check */
+X
+X	if(Debug>6){
+X		(void)fprintf( stderr,"Validate_cf: files %d", Parmcount );
+X		for( c = 0; c < Parmcount; ++c ){
+X			(void)fprintf(stderr,", %d '%s'(%d)",c,
+X				Parms[c].filename,Parms[c].num);
+X		}
+X		(void)fprintf( stderr, "\n" );
+X	}
+X	size = 0;
+X	if( fseek( fp, 0L, 0 ) < 0 ){
+X		logerr_die( XLOG_INFO, "Validate_cf: fseek failed '%s'", fname );
+X	}
+X	while( fgets( buf, sizeof(buf), fp ) ){
+X		l = strlen( buf );
+X		if( l > MAXPARMLEN ){
+X			log( XLOG_INFO, "Validate_cf: '%s' line too long '%s'",fname,buf);
+X			return( 0 );
+X		}
+X		if( buf[l-1] != '\n' ){
+X			log( XLOG_INFO, "Validate_cf: '%s', missing \\n", fname );
+X			return( 0 );
+X		}
+X		buf[l-1] = 0;
+X		c = *buf;
+X		bp = buf+1;
+X		if( !isascii(c) || !isalnum(c)){
+X			log( XLOG_INFO, "Validate_cf: file %s, bad line'%s'",fname,bp);
+X			return( 0 );
+X		}
+X		/*
+X		 * Check to see that data file information is OK
+X		 */
+X		if( isupper(c) && c != 'L' && c != 'U' ){
+X			(void)strcpy( CFparm[c-'A'], bp );
+X		}
+X		if( islower(c) || c == 'U' ){
+X			/*
+X			 * check to see that the file is in the list
+X			 */
+X			if( Job_match( fname, bp ) == 0 ){
+X				log( XLOG_INFO,"Validate_cf: file %s, bad data file '%s'",
+X					fname,bp);
+X				return( 0 );
+X			}
+X			/*
+X			 * if we are scanning, just enter name in list, otherwise
+X			 * check to see that file is in the Parms[] list and that the
+X			 * total job size is within limits
+X			 */
+X			if( scan ){
+X				if( Add_name( bp ) < 0 ){
+X					log( XLOG_INFO,"Validate_cf: too many files in job %s (%s)",
+X						fname,bp);
+X					return( 0 );
+X				}
+X			} else if( (l = Find_name( bp )) < 0 ){
+X				log(XLOG_INFO,
+X					"Validate_cf: file %s, data file '%s' not in list",
+X					fname,bp);
+X				return( 0 );
+X			} else if( Parms[l].num == 0 ){
+X				log( XLOG_INFO,
+X					"Validate_cf: file %s, data file '%s' not transferred",
+X					fname,bp);
+X				return( 0 );
+X			} else if( islower( c ) ){
+X				size = size + Parms[l].size;
+X				if( MX && size > MX ){
+X					log( XLOG_INFO,"Validate_cf: job %s too large", fname);
+X					return( 0 );
+X				}
+X			}
+X		}
+X	}
+X	/*
+X	 * check to see if the remote submitter has valid authorizations
+X	 */
+X	if( LOGNAME[0] == 0 ){
+X		log( XLOG_INFO,"Validate_cf: job %s missing username", fname);
+X		return( 0 );
+X	}
+X	/*
+X	 * check for long or short name
+X	 */
+X	if( LH ){
+X		name_len = strlen( From );
+X	} else {
+X		name_len = strlen( &fname[STARTFR] );
+X	}
+X	if( strncmp( FROMHOST, &fname[STARTFR], name_len ) ){
+X		log( XLOG_INFO,"Validate_cf: bad filename '%s' FROMHOST '%s'",
+X			fname, FROMHOST);
+X		return( 0 );
+X	}
+X	/*
+X	 * check to see if you will accept forwarded files
+X	 * if FD is set, then no forwarded files allowed
+X	 */
+X	if( FD && strcmp( FROMHOST, From ) ){
+X		log( XLOG_INFO,"Validate_cf: forwarded job '%s' FROMHOST '%s'",
+X			fname, FROMHOST);
+X		return( 0 );
+X	}
+X	perms = 'R';
+X	if((Permfile && *Permfile &&
+X			!Checkperm(Permfile,FROMHOST,LOGNAME,First_name,&perms,(int *)0,0))
+X       ||(XU && *XU &&
+X			!Checkperm(XU,FROMHOST,LOGNAME,First_name,&perms,(int *)0,0 ) )){
+X		log(XLOG_INFO, "Validate_cf: %s@%s cannot use '%s'",
+X			LOGNAME, FROMHOST, First_name );
+X			return( 0 );
+X	}
+X	return( 1 );
+X}
+END_OF_FILE
+if test 18372 -ne `wc -c <'src/recvfiles.c'`; then
+    echo shar: \"'src/recvfiles.c'\" unpacked with wrong size!
+fi
+# end of 'src/recvfiles.c'
+fi
+echo shar: End of archive 13 \(of 16\).
+cp /dev/null ark13isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 16 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+

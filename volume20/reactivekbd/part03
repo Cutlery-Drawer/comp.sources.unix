@@ -1,0 +1,873 @@
+Subject:  v20i031:  Command-line editor with predictions, Part03/04
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Mark James <jamesm@cpsc.UCalgary.CA>
+Posting-number: Volume 20, Issue 31
+Archive-name: reactivekbd/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 4)."
+# Contents:  file+rk.c
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'file+rk.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'file+rk.c'\"
+else
+echo shar: Extracting \"'file+rk.c'\" \(21384 characters\)
+sed "s/^X//" >'file+rk.c' <<'END_OF_FILE'
+X/* LINTLIBRARY */
+X
+X#include "file+rk.h"		/* JJD 3-89 */
+X#include "rk_button.h"		/* JJD 9-86 */
+X#include "functions.h"		/* MLJ 5-89 */
+X#include <sys/types.h>
+X#include <sys/time.h>
+X#include <sys/errno.h>
+X#include <sys/stat.h>  
+X#include <signal.h>
+X#include <sys/wait.h>
+X#include <sys/ioctl.h>
+X#include <fcntl.h>
+X#include <stdio.h>
+X#include <sys/file.h>
+Xchar           *getenv();
+X#include <pwd.h>
+X
+X/* struct passwd *pwd; */
+X
+X/* Global Variables */
+X
+Xextern          errno;
+X
+Xint             pty_master, pty_slave, tty;
+Xstruct sgttyb   new_stdin, old_stdin;
+X
+Xstruct sgttyb   pty_sgtty;
+X
+Xchar            tc_ent[1024], tc_seq_buf[1024], *clear_to_eol;
+Xchar           *cursor_left, *cursor_right;
+Xchar           *enter_insert_mode, *exit_insert_mode;
+Xchar           *pre_insert_char, *post_insert_char;
+Xchar           *enter_delete_mode, *exit_delete_mode, *delete_a_char;
+Xchar           *clear_screen;
+Xchar           *enter_standout_mode, *exit_standout_mode;	/* JJD 9-86 */
+X
+Xchar            pred_buff[MAX_CMD_LINE_LENGTH];	/* JJD 9-86 */
+Xchar            pred_on_display = 0;	/* JJD 9-86 */
+Xchar            pred_mode = 1;	/* JJD 9-86 */
+Xint             pred_number = 0;/* JJD 9-86 */
+Xchar		show_eol_mode = 1;
+Xchar            nl_truncate_mode = 1;	/* JJD 9-86 */
+Xchar            eol_only_mode = 1;	/* JJD 9-86 */
+Xchar            eol_longer_mode = 1;	/* JJD 9-86 */
+Xchar            lisp_mode = 0;
+Xchar		add_space_mode = 0;
+Xchar		silent=0;
+Xchar		login=1;
+X
+Xint             (*keymap[128][MAXEXTENSIONS]) ();
+Xchar            meta_prefixes[MAXEXTENSIONS][MAXEXTENSIONS];
+Xint		meta_map[MAXEXTENSIONS][MAXEXTENSIONS];
+Xint		current_key_map=0;
+Xchar		next_free_map=1;
+Xchar	       *shellname;
+X
+XED_STRUCT       editor_data;
+X
+Xchar            output_string[1024], temp_str[1024];
+Xint             output_string_length;
+Xint 		finished=0;
+Xint		childid;
+X
+Xint		num_buffers=64;
+X
+X
+Xvoid childdied()
+X{
+X	union wait      w;
+X	register int    pid;
+X
+X	while ((pid = wait3(&w, WUNTRACED | WNOHANG, 0)) > 0) {
+X		if (WIFSTOPPED(w)) {
+X			fprintf(stderr,"Stopped.\r\n");
+X		} else if (WIFEXITED(w)) {
+X		} else if (WIFSIGNALED(w)) {
+X			fprintf(stderr,"Killed.\r\n");
+X		}
+X
+X				/* if this is our shell who died, shut down */
+X		if(pid==childid){	
+X			abortit("\r\n",0);
+X		}
+X	}
+X	return;
+X}
+X
+Xvoid cleanup()
+X{
+X	abortit("Segmentation fault, aborting...\n",-1);
+X}
+X
+X
+X
+Xint READ(d, buf, nbytes)
+Xint d;
+Xchar *buf;
+Xint nbytes;
+X{
+X	int ret;
+X	static int count=0;
+X	
+X	if((ret=read(d,buf,nbytes))<-1){
+X		if(errno==EBADF){
+X			if(count){
+X				perror("Read");
+X				abortit("",-1);
+X			} else {
+X				count++;
+X				sleep(1);  /* wait for the signal */
+X			}
+X		} else {
+X			perror("Read");
+X			abortit("",-1);
+X		}
+X	} else {
+X		return(ret);
+X	}
+X}
+X
+Xmain(argc, argv)
+X	int             argc;
+X	char          *argv[];
+X{
+X
+X	char           *getenv();	/* JJD 3-89 added */
+X	get_termcap_stuff();
+X	get_command_line_arguments(argc,argv);
+X	set_up_keymap();
+X	get_key_bindings(); 
+X	init();
+X	set_up_buffers();
+X	file();
+X	/*NOTREACHED*/
+X	shutdown_pty_and_tty();
+X	shutdown_();
+X	abortit("",1);		/* JJD 3-89 added 1 */
+X}
+X
+X
+Xget_termcap_stuff()
+X{
+X
+X	char           *termname, *tbuf, *getenv(), *tgetstr();
+X
+X	termname = getenv("TERM");
+X	if (!termname) {
+X		enter_insert_mode = exit_insert_mode = pre_insert_char =
+X			post_insert_char = 0;
+X		enter_delete_mode = exit_delete_mode = delete_a_char = 0;
+X		cursor_right = 0;
+X		cursor_left = "\010";
+X		clear_screen = 0;
+X		enter_standout_mode = exit_standout_mode = 0;	/* JJD 9-86 */
+X		return;
+X	}
+X	tbuf = tc_seq_buf;
+X	if (tgetent(tc_ent, termname) != 1) {
+X		enter_insert_mode = exit_insert_mode = pre_insert_char = 0;
+X		post_insert_char = enter_delete_mode = exit_delete_mode = 0;
+X		delete_a_char = cursor_right = clear_screen = 0;
+X		cursor_left = "\010";
+X		enter_standout_mode = exit_standout_mode = 0;	/* JJD 9-86 */
+X		return;
+X	}
+X	if (tgetflag("bs"))
+X		cursor_left = "\010";
+X	else
+X		cursor_left = tgetstr("bc", &tbuf);
+X
+X	clear_to_eol = tgetstr("ce", &tbuf);
+X	cursor_right = tgetstr("nd", &tbuf);
+X	enter_insert_mode = tgetstr("im", &tbuf);
+X	exit_insert_mode = tgetstr("ei", &tbuf);
+X	pre_insert_char = tgetstr("ic", &tbuf);
+X	post_insert_char = tgetstr("ip", &tbuf);
+X	enter_delete_mode = tgetstr("dm", &tbuf);
+X	exit_delete_mode = tgetstr("ed", &tbuf);
+X	delete_a_char = tgetstr("dc", &tbuf);
+X	clear_screen = tgetstr("cl", &tbuf);
+X	enter_standout_mode = tgetstr("so", &tbuf);	/* JJD 9-86 */
+X	exit_standout_mode = tgetstr("se", &tbuf);	/* JJD 9-86 */
+X
+X	if (!enter_standout_mode || !exit_standout_mode)	/* JJD 9-86 */
+X		enter_standout_mode = exit_standout_mode = 0;
+X
+X	if (!enter_delete_mode || !exit_delete_mode)
+X		enter_delete_mode = exit_delete_mode = 0;
+X
+X	if (!enter_insert_mode || !exit_insert_mode)
+X		enter_insert_mode = exit_insert_mode = 0;
+X}
+X
+X#define LETTERS "pqr"
+X
+Xinit()
+X{
+X	int             i = 48, c = 0;
+X	char            buf[100];
+X	struct sgttyb   master_sgttyb,slave_sgttyb;
+X	int             pid;
+X
+X
+X
+X
+X	while (--i >= 0) {
+X		sprintf(buf, "/dev/pty%c%x", LETTERS[c >> 4], c & 15);
+X		if ((pty_master = open(buf, (O_RDWR | O_EXCL))) != -1)
+X			break;
+X		c++;
+X	}
+X	if (i <= 0) {
+X		printf("Unable to open a pty, aborting...\r\n");
+X		abortit("",-1);
+X	}
+X	ioctl(0, TIOCGETP, &old_stdin);
+X	ioctl(0, TIOCGETP, &new_stdin);
+X	new_stdin.sg_flags |= (CBREAK|RAW|CRMOD);
+X	new_stdin.sg_flags &= ~(ECHO);
+X	ioctl(0, TIOCSETP, &new_stdin);
+X
+X	ioctl(pty_master, TIOCGETP, &master_sgttyb);
+X	master_sgttyb.sg_flags &= ~(RAW | CBREAK| LCASE);
+X	master_sgttyb.sg_flags |= (ECHO | CRMOD | FF0);
+X	master_sgttyb.sg_ospeed = old_stdin.sg_ospeed;
+X	master_sgttyb.sg_ispeed = old_stdin.sg_ispeed;
+X	ioctl(pty_master, TIOCSETP, &master_sgttyb);
+X
+X	switch (pid = fork()) {
+X	case -1:
+X		perror("Fork");
+X		abortit("",-1);
+X		break;
+X	case 0:
+X		signal(SIGINT, SIG_DFL);
+X		signal(SIGQUIT, SIG_DFL);
+X		if ((tty = open("/dev/tty", O_RDWR)) < 0) {
+X			perror("/dev/tty");
+X			abortit("",-1);
+X		}
+X		ioctl(tty, TIOCNOTTY, &pid);
+X		close(tty);
+X		close(pty_master);
+X		close(0);
+X		sprintf(buf, "/dev/tty%c%x", LETTERS[c >> 4], c & 15);
+X		if ((pty_slave = open(buf, (O_RDWR | O_EXCL))) < 0) {
+X			perror(buf);
+X			abortit("",-1);
+X		}
+X		dup2(0, 1);
+X		dup2(0, 2);
+X		ioctl(0, TIOCGETP, &slave_sgttyb);
+X		slave_sgttyb.sg_flags &= ~(RAW | CBREAK| LCASE);
+X		slave_sgttyb.sg_flags |= (ECHO | FF0 | CRMOD );
+X		slave_sgttyb.sg_ospeed = old_stdin.sg_ospeed;
+X		slave_sgttyb.sg_ispeed = old_stdin.sg_ispeed;
+X		ioctl(0, TIOCSETP, &slave_sgttyb);
+X		pid = getpid();
+X		if (setpgrp(0, pid) < 0) {
+X			perror("Setpgrp");
+X			abortit("",-1);
+X		}
+X		ioctl(0, TIOCSPGRP, &pid);
+X		shellname = (char *)getenv ("SHELL");
+X		if(!shellname)
+X			shellname="/bin/csh";
+X		if(login){
+X			if (execl(shellname, "-", (char *) 0) < 0) {
+X				perror("execl");
+X				abortit("",-1);
+X			}
+X		} else {
+X			if (execl(shellname, "csh", (char *) 0) < 0) {
+X				perror("execl");
+X				abortit("",-1);
+X			}
+X		}
+X			
+X		break;
+X
+X	default:childid=pid;
+X		break;
+X	}
+X}
+X
+Xset_up_buffers()
+X{
+X
+X	int             num_buffs;
+X	struct ed_buffs *prev_ptr;
+X
+X	editor_data.current_ed_buff_ptr =
+X		(struct ed_buffs *) malloc(sizeof(struct ed_buffs));
+X
+X	prev_ptr = editor_data.current_ed_buff_ptr;
+X	prev_ptr->dot = prev_ptr->string;
+X	prev_ptr->mark = prev_ptr->string;	/* JJD 3-89 added */
+X
+X	for (num_buffs = num_buffers - 1; num_buffs; --num_buffs) {
+X		prev_ptr->next_ptr =
+X			(struct ed_buffs *) malloc(sizeof(struct ed_buffs));
+X		prev_ptr->next_ptr->prev_ptr = prev_ptr;
+X		prev_ptr = prev_ptr->next_ptr;
+X		prev_ptr->dot = prev_ptr->string;
+X		prev_ptr->mark = prev_ptr->string;	/* JJD 3-89 added */
+X		*(prev_ptr->dot) = '\0';
+X	}
+X
+X	prev_ptr->next_ptr = editor_data.current_ed_buff_ptr;
+X	editor_data.current_ed_buff_ptr->prev_ptr = prev_ptr;
+X
+X	editor_data.current_input_char = '\0';
+X	editor_data.universal_argument = 1;
+X	editor_data.current_buffer = editor_data.current_ed_buff_ptr->string;
+X	editor_data.dot = editor_data.current_buffer;
+X	/* JJD 3-89 added */
+X	editor_data.mark = editor_data.current_ed_buff_ptr->mark;
+X	editor_data.current_buffer[0] = '\0';
+X	output_string[0] = '\0';
+X	output_string_length = 0;
+X	temp_str[0] = '\0';
+X}
+X
+X
+Xset_up_keymap()
+X{
+X	int x,y;
+X	char buf[4];
+X
+X	buf[1]=0;
+X
+X	for(y=0;y<MAXEXTENSIONS;y++){
+X		for(x=0;x<MAXEXTENSIONS;x++){
+X			meta_prefixes[x][y]=0;
+X			meta_map[x][y]=0;
+X		}
+X	}
+X
+X	for(y=0;y<MAXEXTENSIONS;y++){
+X		for(x=0;x<128;x++){
+X			keymap[x][y]=BOGUS;
+X		}
+X	}
+X
+X
+X
+X	bind_to_key("^@",set_mark);/* CTRL-@ or CTRL-sp *//* JJD 3-89 */
+X   	bind_to_key("^A",beginning_of_line);	/* CTRL-A */
+X	bind_to_key("^B",backward_char);	/* CTRL-B */
+X	bind_to_key("^C",file_completion);	/* CTRL-C *//* JJD 2-89 */
+X	bind_to_key("^D",delete_char);	/* CTRL-D */
+X	bind_to_key("^E",end_of_line);	/* CTRL-E */
+X	bind_to_key("^F",forward_char);	/* CTRL-F */
+X	bind_to_key("^G",backspace_word);	/* CTRL-G *//* JJD 2-89 */
+X	bind_to_key("^H",backspace_char);	/* CTRL-H & backspace key */
+X	bind_to_key("^I",self_insert);	/* CTRL-I & TAB key       */
+X	bind_to_key("^J",finish_editing_line);	/* CTRL-J */
+X	bind_to_key("^K",discard_rest_of_line);	/* CTRL-K */
+X	bind_to_key("^L",clear_display);	/* CTRL-L */
+X	bind_to_key("^M",finish_editing_line);	/* CTRL-M */
+X	bind_to_key("^N",next_line);	/* CTRL-N */
+X	bind_to_key("^O",previous_pred);	/* CTRL-O *//* JJD 9-86 */
+X	bind_to_key("^P",previous_line);	/* CTRL-P */
+X	bind_to_key("^Q",accept_forward_char);	/* CTRL-Q *//* JJD 9-86 */
+X	bind_to_key("^R",next_pred);	/* CTRL-R *//* JJD 9-86 */
+X	bind_to_key("^S",accept_to_end_of_line);	/* CTRL-S *//* JJD 9-86 */
+X	bind_to_key("^T",twiddle_chars);	/* CTRL-T */
+X	bind_to_key("^U",increment_universal_argument);	/* CTRL-U */
+X	bind_to_key("^V",quote_char);	/* CTRL-V *//* JJD 9-86 */
+X	bind_to_key("^W",accept_forward_word);	/* CTRL-W *//* JJD 9-86 */
+X	bind_to_key("^X",show_mark);	/* CTRL-X *//* JJD 3-89 */
+X	bind_to_key("^Y",yank_from_kill_buffer);	/* CTRL-Y */
+X	bind_to_key("^Z",insert_suspend_char);	/* CTRL-Z */
+X	bind_to_key("^\\",command_completion);	/* CTRL-\ */ 
+X	bind_to_key("\035",BOGUS);
+X	bind_to_key("^^",insert_stop_char);	/* CTRL-^ *//* JJD 9-86 */
+X	bind_to_key("^_",insert_start_char);	/* CTRL-_ *//* JJD 9-86 */
+X	for(x=' ';x<'(';x++){
+X		buf[0]=x;
+X		bind_to_key(buf,self_insert);
+X	}
+X	bind_to_key("(",open_paren);	/* electric-( *//* Elec-( */
+X	bind_to_key(")",close_paren);	/* electric-) *//* Elec-) */
+X	for(x='*';x< '\\';x++){
+X		buf[0]=x;
+X		bind_to_key(buf,self_insert);
+X	}
+X	bind_to_key("\\\\",self_insert); /* need 4 \'s ! */
+X	bind_to_key("]",self_insert);
+X	bind_to_key("\\^",self_insert);
+X	for(x='_';x<= '~';x++){
+X		buf[0]=x;
+X		bind_to_key(buf,self_insert);
+X	}
+X
+X	bind_to_key("\177",insert_interrupt_char);	/* DEL key *//* JJD 2-89 */
+X	
+X
+X	bind_to_key("^[^[",discard_current_edit_line);	/* ESC-ESC */
+X	bind_to_key("^[ ",toggle_add_space_mode);	/* ESC-space */
+X	bind_to_key("^[(",backward_paren);	/* ESC-( */
+X	bind_to_key("^[)",forward_paren);	/* ESC-) */
+X	bind_to_key("^[-",ul_to_dash_word);	/* ESC--  */
+X	bind_to_key("^[=",previous_line);	/* ESC-=  */
+X	bind_to_key("^[?",describe_bindings);	/* ESC-?  */
+X	bind_to_key("^[E",toggle_eol_only_mode);	/* ESC-E  *//* JJD 9-86 */
+X	bind_to_key("^[C",describe_arguments);
+X	bind_to_key("^[F",toggle_eol_longer_mode);	/* ESC-F  *//* JJD 9-86 */
+X	bind_to_key("^[L",toggle_lisp_mode);	/* ESC-L  */
+X	bind_to_key("^[N",toggle_nl_truncate_mode);	/* ESC-N  *//* JJD 9-86 */
+X	bind_to_key("^[P",toggle_pred_mode);	/* ESC-P  *//* JJD 9-86 */
+X	bind_to_key("^[Q",insert_quit_char);	/* ESC-Q  *//* JJD 3-89 */
+X	bind_to_key("^[S",toggle_show_eol_mode);
+X	bind_to_key("^[_",dash_to_ul_word);	/* ESC-_  */
+X	bind_to_key("^[b",backward_word);	/* ESC-b  */
+X	bind_to_key("^[c",capitalize_word);	/* ESC-c  */
+X	bind_to_key("^[d",delete_word);	/* ESC-d  */
+X	bind_to_key("^[e",toggle_eol_only_mode);	/* ESC-e  *//* JJD 9-86 */
+X	bind_to_key("^[f",forward_word);	/* ESC-f  */
+X	bind_to_key("^[g",prime_from_file);	/* ESC-g  *//* JJD 9-86 */
+X	bind_to_key("^[h",backspace_word);	/* ESC-h  */
+X	bind_to_key("^[k",delete_region_to_killbuffer);	/* ESC-k  *//* JJD 3-89 */
+X	bind_to_key("^[l",lowercase_word);	/* ESC-l  */
+X	bind_to_key("^[m",run_mesg);	/* ESC-m  */
+X	bind_to_key("^[o",run_pp);/* ESC-o  *//* JJD 9-86 */
+X	bind_to_key("^[p",toggle_pred_mode);	/* ESC-p  *//* JJD 9-86 */
+X	bind_to_key("^[q",show_free_nodes);	/* ESC-q  *//* JJD 1-87 */
+X	bind_to_key("^[r",run_tty_program);	/* ESC-r  */
+X	bind_to_key("^[t",BOGUS);
+X	bind_to_key("^[t",run_talk);	/* ESC-t  */
+X	bind_to_key("^[u",uppercase_word);	/* ESC-u  */
+X	bind_to_key("^[v",show_version);	/* ESC-v  *//* JJD 3-89 */
+X	bind_to_key("^[w",run_write);	/* ESC-w  */
+X	bind_to_key("^[z",run_ruptime);	/* ESC-z  *//* JJD 2-89 */
+X
+X	bind_termcap_key("ku",previous_line);	/* ESC-[-A */
+X	bind_termcap_key("kd",next_line);	/* ESC-[-B */
+X	bind_termcap_key("kl",backward_char);	/* ESC-[-C */
+X	bind_termcap_key("kr",forward_char);	/* ESC-[-D */
+X}
+X
+X
+Xfile()
+X{
+X	int             status;
+X
+X	fd_set readfd;
+X	int num;
+X	char buf[1024];
+X
+X	if(!silent){
+X		printf("Welcome to the Reactive Keyboard. \r\n");
+X		printf("Written at the University of Calgary. \r\n");
+X		printf("Version:%s\r\n",VERSION);
+X		printf("Please wait until your shell prompt appears (ESC-? for help).\r\n");
+X	}
+X	init_reactive();	/* MAY TAKE TIME CREATING FREE LIST,     JJD
+X				 * 9-86 */
+X	signal(SIGCHLD, childdied);
+X	signal(SIGSEGV, cleanup);
+X	if (pred_mode) make_a_prediction (pred_buff); 
+X	while(1){
+X		if (pred_mode && pred_buff[0]) {
+X			/*
+X			 * if (pred_mode && !(eol_only_mode &&
+X			 * *(editor_data.dot))) JJD 9-86
+X			 */
+X			ioctl(pty_master, TIOCGETP, &pty_sgtty);
+X			if ((pty_sgtty.sg_flags & ECHO) &&
+X			    !(pty_sgtty.sg_flags & (RAW | CBREAK)))
+X				display_pred_buffer(&editor_data);
+X		}
+X		FD_ZERO(&readfd);
+X		FD_SET(0,&readfd);
+X		FD_SET(pty_master,&readfd);
+X		if(select(getdtablesize(),&readfd,0,0,0)<0){
+X			if( errno == EINTR ){
+X				errno = 0;
+X				continue;
+X			}
+X			else
+X				perror("Select");
+X		}
+X		if( FD_ISSET(0,&readfd)){
+X			ioctl(pty_master, TIOCGETP, &pty_sgtty);
+X			if ((pty_sgtty.sg_flags & ECHO) &&
+X			  !(pty_sgtty.sg_flags & (RAW | CBREAK))) {
+X				num = edit_line(buf);
+X			} else
+X			num = READ(0, buf, 1024);
+X			write(pty_master, buf, num);
+X		}
+X		if( FD_ISSET(pty_master,&readfd)){
+X			if (pred_on_display)
+X				erase_pred_buffer(&editor_data);	/* JJD9-86 */
+X			erase_current_edit_line (&editor_data);
+X			/* JJD: no FILE, keep bigger read size */
+X			num = READ(pty_master, buf, 1024);
+X			write(1, buf, num);
+X		}	
+X	}
+X}
+X
+X
+Xshutdown_pty_and_tty()
+X{
+X	close(pty_master);
+X	ioctl(0, TIOCSETP, &old_stdin);
+X}
+X
+X
+Xint 
+Xedit_line(c)
+X	char           *c;
+X{
+X
+X	char            ch;
+X	int             status, num;
+X	fd_set readfd;
+X	char            tstring[1024], *cptr;
+X	int             count;
+X	struct stat     buf;	/* JJD 3-89 was 512 */
+X
+X	struct ed_buffs *buf_to_use, *cur_line;
+X	FILE           *from, *popen();
+X
+X	status = OK;
+X
+X	buf_to_use = editor_data.current_ed_buff_ptr;
+X	while ((status == OK) || (status == HAVE_CHAR)) {
+X		FD_ZERO(&readfd);
+X		FD_SET(0,&readfd);
+X		FD_SET(pty_master,&readfd);
+X		if(select(getdtablesize(),&readfd,0,0,0)<0){
+X			if( errno == EINTR ){
+X				errno = 0;
+X				continue;
+X			}
+X			else
+X				perror("Select");
+X		}
+X		if( FD_ISSET(0,&readfd)){
+X			READ(0, &ch, 1);
+X			ch &= 127;	/* Must do this due to parity bit
+X					 * over dial-up lines */
+X			/* Possibly needed for other lines too.          */
+X			editor_data.current_input_char = ch;
+X			if (pred_on_display)
+X					erase_pred_buffer(&editor_data);
+X				status = keymap[(int) ch][0] (&editor_data);
+X			if (pred_mode && ((status == OK) || (status == HAVE_CHAR))) {
+X				make_a_prediction(pred_buff);
+X				if (pred_buff[0])
+X					display_pred_buffer(&editor_data);
+X			}
+X		}else{
+X			num = READ(pty_master, temp_str, 32);
+X			if(num){
+X				erase_current_edit_line(&editor_data);
+X				write(1, temp_str, num);
+X				draw_current_edit_line (&editor_data);
+X				if (pred_buff[0]&&pred_mode)
+X					display_pred_buffer(&editor_data);
+X			}
+X
+X		}
+X		/* MOVED if (pred_mode... up into if (readfds... above */
+X	}
+X
+X	switch (status) {
+X	case FINISHED_EDITING:
+X		strcpy(c, editor_data.current_buffer);
+X		if ((strlen(c) != 0)) {
+X			if (stat(c, &buf) != -1) {	/* if just a directory
+X							 * name on command line,
+X							 * assume cd  */
+X
+X				/*
+X				 * JJD: this is kind of dicey as is, assumes
+X				 * a bit too much about dir names
+X				 */
+X				/*
+X				 * it should check that it is the only thing
+X				 * on the line for one thing
+X				 */
+X
+X				if ((buf.st_mode & S_IFMT) == S_IFDIR) {
+X					if (strcmp(".", c) != 0) {	/* JJD 3-89 del . case
+X									 * for ed... */
+X						strcpy(tstring, "cd ");
+X						strcat(tstring, c);
+X						strcpy(c, tstring);
+X					}
+X				}
+X			}
+X		}
+X		/*
+X		 * JJD: to be really useful, this should also know about
+X		 * pushd and popd
+X		 */
+X
+X		if ((strncmp(c, "cd ", 3) == 0) ||
+X		    (strncmp(c, "chdir ", 6) == 0) ||
+X		    (strcmp(c, "cd") == 0) ||
+X		    (strcmp(c, "chdir") == 0)) {
+X			if (strncmp(c, "cd ", 3) == 0)
+X				cptr = &c[2];	/* JJD 3-89, c[-1]  */
+X			else
+X				cptr = &c[5];
+X			while ((*cptr == ' ') || (*cptr == '\t'))
+X				cptr++;
+X			if ((*cptr == '\0') ||
+X			    (strcmp(c, "chdir") == 0) ||
+X			    (strcmp(c, "cd") == 0))
+X				strcpy(tstring, getenv("HOME"));
+X			else {
+X				tstring[0] = '\0';
+X				if (*cptr == '~') {	/* JJD 3-89 added
+X							 * abspath, rewrote */
+X					char           *optr = cptr;
+X					if (*(++cptr)) {
+X						while ((*cptr != '\0') && (*cptr != ';'))
+X							cptr++;
+X						*cptr = '\0';
+X						if(myabspath(optr, tstring))
+X							strcpy(tstring,".");
+X							/* we have an error so stay in the current dir */
+X					} else {
+X						strcpy(tstring, getenv("HOME"));
+X					}	/* ... to here */
+X					count = strlen(tstring);
+X				} else 
+X					count = 0;
+X				for (; (*cptr != '\0') && (*cptr != ';'); cptr++, count++)
+X					tstring[count] = *cptr;
+X				tstring[count] = '\0';
+X	
+X			}
+X			chdir(tstring);
+X		}
+X		strcat(c, "\n");/* JJD 2-89 changed ^M to \n */
+X		cur_line = editor_data.current_ed_buff_ptr;
+X		cur_line->dot = editor_data.dot;
+X		cur_line->mark = editor_data.mark;
+X		if (cur_line != buf_to_use) {
+X			strcpy(buf_to_use->string, cur_line->string);
+X			buf_to_use->dot =
+X				&buf_to_use->string[cur_line->dot - cur_line->string];
+X			buf_to_use->mark =
+X				&buf_to_use->string[cur_line->mark - cur_line->string];
+X
+X		}
+X		if (*(buf_to_use->string)) {
+X			editor_data.current_ed_buff_ptr = buf_to_use->next_ptr;
+X			editor_data.current_ed_buff_ptr->dot =
+X				editor_data.current_ed_buff_ptr->string;
+X			editor_data.dot = editor_data.current_ed_buff_ptr->dot;
+X			/*
+X			 * editor_data.current_ed_buff_ptr->mark =
+X			 * editor_data.current_ed_buff_ptr->string;
+X			 */
+X			editor_data.mark = editor_data.current_ed_buff_ptr->mark;
+X			*editor_data.dot = '\0';
+X			editor_data.current_buffer = editor_data.dot;
+X		} else {
+X			editor_data.current_ed_buff_ptr = buf_to_use;
+X			editor_data.current_buffer = buf_to_use->string;
+X			editor_data.dot = buf_to_use->dot;
+X			editor_data.mark = buf_to_use->mark;
+X		}
+X
+X		strcat(c, "");
+X		update_the_model(c);	/* JJD 9-86 */
+X		if (pred_mode)
+X			make_a_prediction(pred_buff);	/* JJD 9-86 */
+X		return strlen(c);
+X		break;
+X
+X	case FINISHED_BUT_DONT_ADD_CTRL_M:
+X		strcpy(c, editor_data.current_buffer);
+X		editor_data.dot = editor_data.current_buffer;
+X		editor_data.mark = editor_data.current_buffer;
+X		*editor_data.dot = '\0';
+X		return (strlen(c));
+X		break;
+X	}
+X	strcpy(c, "");
+X	return 0;
+X}
+X
+X
+Xint 
+Xget_display_length(s)
+X	char           *s;
+X{
+X
+X	char           *cptr;
+X	int             len;
+X
+X	cptr = s;
+X	len = 0;
+X	while (*cptr) {
+X		if ((*cptr < 32) || (*cptr == 127))
+X			len += 2;
+X		else
+X			len++;
+X		++cptr;
+X	}
+X	return len;
+X}
+X
+Xint 
+Xget_char_display_length(c)
+X	char            c;
+X{
+X
+X	int             len;
+X
+X	len = 0;
+X	if ((c < 32) || (c == 127))
+X		len = 2;
+X	else
+X		len++;
+X	return len;
+X}
+X
+Xint 
+Xdisplay_string_into_output_string(s)
+X	char           *s;
+X{
+X
+X	int             len;
+X	char           *cptr;
+X
+X	cptr = s;
+X	len = 0;
+X	while (*cptr) {
+X		if (*cptr < 32) {
+X			len += 2;
+X			output_string[output_string_length++] = '^';
+X			output_string[output_string_length++] =
+X				*cptr++ + '@';
+X		} else if (*cptr == 127) {
+X			len += 2;
+X			output_string[output_string_length++] = '^';
+X			output_string[output_string_length++] = '?';
+X			++cptr;
+X		} else {
+X			len++;
+X			output_string[output_string_length++] = *cptr++;
+X		}
+X	}
+X
+X	return len;
+X}
+X
+Xint 
+Xdisplay_char_into_output_string(c)
+X	char            c;
+X{
+X
+X	int             len;
+X
+X	len = 0;
+X	if (c < 32) {
+X		len += 2;
+X		output_string[output_string_length++] = '^';
+X		output_string[output_string_length++] = c + '@';
+X	} else if (c == 127) {
+X		len += 2;
+X		output_string[output_string_length++] = '^';
+X		output_string[output_string_length++] = '?';
+X	} else {
+X		len++;
+X		output_string[output_string_length++] = c;
+X	}
+X
+X	return len;
+X}
+X
+Xint 
+Xerase_current_edit_line(e)
+X	ED_STRUCT      *e;
+X{
+X
+X	int             num_to_erase, count;
+X	char           *old_dot;
+X
+X	/*
+X	 * added to deal with META-prefixes which turn pred display on...may
+X	 * not work for all cases
+X	 */
+X	if (pred_on_display)
+X		erase_pred_buffer(e);	/* JJD 9-86 */
+X	old_dot = e->dot;
+X	beginning_of_line(e);
+X	e->dot = old_dot;
+X	output_string_length = 0;
+X
+X	num_to_erase = get_display_length(e->current_buffer);
+X	for (count = num_to_erase; count; --count)
+X		output_string[output_string_length++] = ' ';
+X	for (count = num_to_erase; count; --count)
+X		tputs(cursor_left, ONE_LINE, append_to_output_string);
+X	write(1, output_string, output_string_length);
+X
+X	return OK;
+X}
+X
+Xint 
+Xdraw_current_edit_line(e)
+X	ED_STRUCT      *e;
+X{
+X
+X	int             count;
+X
+X	output_string_length = 0;
+X	display_string_into_output_string(e->current_buffer);
+X	count = get_display_length(e->dot);
+X	for (; count; --count)
+X		tputs(cursor_left, ONE_LINE, append_to_output_string);
+X	write(1, output_string, output_string_length);
+X
+X	return OK;
+X}
+END_OF_FILE
+if test 21384 -ne `wc -c <'file+rk.c'`; then
+    echo shar: \"'file+rk.c'\" unpacked with wrong size!
+fi
+# end of 'file+rk.c'
+fi
+echo shar: End of archive 3 \(of 4\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 4 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+

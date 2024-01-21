@@ -1,0 +1,966 @@
+Newsgroups: comp.sources.unix
+From: panos@cs.colorado.edu (Panos Tsirigotis)
+Subject: v26i264: xinetd-2.1.1 - inetd replacement with access control and logging, Part20/31
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: panos@cs.colorado.edu (Panos Tsirigotis)
+Posting-Number: Volume 26, Issue 264
+Archive-Name: xinetd-2.1.1/part20
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 20 (of 31)."
+# Contents:  xinetd/sconf.c xinetd/shutdown.c
+# Wrapped by panos@mystique on Mon Jun 21 14:51:26 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'xinetd/sconf.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xinetd/sconf.c'\"
+else
+echo shar: Extracting \"'xinetd/sconf.c'\" \(11251 characters\)
+sed "s/^X//" >'xinetd/sconf.c' <<'END_OF_FILE'
+X/*
+X * (c) Copyright 1992 by Panagiotis Tsirigotis
+X * All rights reserved.  The file named COPYRIGHT specifies the terms 
+X * and conditions for redistribution.
+X */
+X
+Xstatic char RCSid[] = "$Id: sconf.c,v 6.7 1993/06/15 23:25:57 panos Exp $" ;
+X
+X#include "misc.h"
+X
+X#include "state.h"
+X#include "defs.h"
+X#include "attr.h"
+X#include "sconf.h"
+X#include "addr.h"
+X
+Xchar *malloc() ;
+Xint free() ;
+X
+X#define NEW_SCONF()					NEW( struct service_config )
+X#define FREE_SCONF( scp )			FREE( scp )
+X
+X/*
+X * Conditional free; checks if the pointer is NULL
+X */
+X#define COND_FREE( x )           if ( x )                   \
+X                                 {                          \
+X                                    free( (char *) x ) ;    \
+X                                    x = NULL ;              \
+X                                 }
+X
+Xextern struct name_value success_log_options[] ;
+Xextern struct name_value failure_log_options[] ;
+Xextern struct name_value service_types[] ;
+Xextern struct name_value service_flags[] ;
+Xextern struct name_value socket_types[] ;
+Xextern struct name_value syslog_facilities[] ;
+Xextern struct name_value syslog_levels[] ;
+X
+Xvoid tabprint() ;
+Xvoid out_of_memory() ;
+X
+X
+X/*
+X * Allocate a new service_config and initialize the service name field
+X * with 'name'; the rest of the fields are set to 0 which gives them
+X * their default values.
+X */
+Xstruct service_config *sc_alloc( name )
+X	char *name ;
+X{
+X	struct service_config *scp ;
+X	char *func = "sc_alloc" ;
+X
+X	scp = NEW_SCONF() ;
+X	if ( scp == NULL )
+X	{
+X		out_of_memory( func ) ;
+X		return( NULL ) ;
+X	}
+X	CLEAR( *scp ) ;
+X	scp->sc_name = name ;
+X	return( scp ) ;
+X}
+X
+X
+XPRIVATE void release_string_pset( pset )
+X	pset_h pset ;
+X{
+X	pset_apply( pset, free, NULL ) ;
+X	pset_destroy( pset ) ;
+X}
+X
+X
+X
+X/*
+X * Free all malloc'ed memory for the specified service
+X */
+Xvoid sc_free( scp )
+X   register struct service_config *scp ;
+X{
+X	void ti_free() ;
+X
+X   COND_FREE( scp->sc_name ) ;
+X   COND_FREE( scp->sc_id ) ;
+X   COND_FREE( scp->sc_protocol.name ) ;
+X   COND_FREE( scp->sc_server ) ;
+X   if ( scp->sc_server_argv )
+X   {
+X      register char **pp ;
+X
+X		/*
+X		 * argv[ 0 ] is a special case because it may not have been allocated yet
+X		 */
+X		if ( scp->sc_server_argv[ 0 ] != NULL)
+X			free( scp->sc_server_argv[ 0 ] ) ;
+X      for ( pp = &scp->sc_server_argv[ 1 ] ; *pp != NULL ; pp++ )
+X         free( *pp ) ;
+X      free( (char *) scp->sc_server_argv ) ;
+X   }
+X   COND_FREE( log_filelog( SC_LOG( scp ) )->fl_filename ) ;
+X
+X	if ( scp->sc_access_times != NULL )
+X	{
+X		ti_free( scp->sc_access_times ) ;
+X		pset_destroy( scp->sc_access_times ) ;
+X	}
+X
+X	if ( scp->sc_only_from != NULL )
+X	{
+X		addrlist_free( scp->sc_only_from ) ;
+X		pset_destroy( scp->sc_only_from ) ;
+X	}
+X
+X	if ( scp->sc_no_access != NULL )
+X	{
+X		addrlist_free( scp->sc_no_access ) ;
+X		pset_destroy( scp->sc_no_access ) ;
+X	}
+X
+X   if ( scp->sc_env_var_defs != NULL )
+X		release_string_pset( scp->sc_env_var_defs ) ;
+X	if ( scp->sc_pass_env_vars != NULL )
+X		release_string_pset( scp->sc_pass_env_vars ) ;
+X	if ( SC_ENV( scp )->env_type == CUSTOM_ENV && 
+X												SC_ENV( scp )->env_handle != ENV_NULL )
+X		env_destroy( SC_ENV( scp )->env_handle ) ;
+X	
+X	FREE_SCONF( scp ) ;
+X}
+X
+X
+X/*
+X * Create a configuration for one of the special services
+X */
+Xstruct service_config *sc_make_special( service_name, bp, instances )
+X	char *service_name ;
+X	builtin_s *bp ;
+X	int instances ;
+X{
+X	char *name ;
+X	struct service_config *scp ;
+X	char *func = "sc_make" ;
+X
+X	name = make_string( 1, service_name ) ;
+X	if ( name == NULL )
+X	{
+X		out_of_memory( func ) ;
+X		return( NULL ) ;
+X	}
+X
+X	if ( ( scp = sc_alloc( name ) ) == NULL )
+X	{
+X		free( name ) ;
+X		return( NULL ) ;
+X	}
+X
+X   scp->sc_id = make_string( 1, scp->sc_name ) ;
+X   if ( scp->sc_id == NULL )
+X   {
+X      free( name ) ;
+X      out_of_memory( func ) ;
+X      return( NULL ) ;
+X   }
+X   SC_SPECIFY( scp, A_ID ) ;
+X
+X	/*
+X	 * All special services are internal
+X	 */
+X   M_SET( scp->sc_type, ST_SPECIAL ) ;
+X   M_SET( scp->sc_type, ST_INTERNAL ) ;
+X	scp->sc_builtin = bp ;
+X   SC_SPECIFY( scp, A_TYPE ) ;
+X
+X   M_SET( scp->sc_flags, SF_NORETRY ) ;
+X   SC_SPECIFY( scp, A_FLAGS ) ;
+X
+X   scp->sc_instances = instances ;
+X   SC_SPECIFY( scp, A_INSTANCES ) ;
+X
+X   scp->sc_wait = NO ;
+X   SC_SPECIFY( scp, A_WAIT ) ;
+X
+X	return( scp ) ;
+X}
+X
+X
+X
+XPRIVATE void dump_log_data( fd, scp, tab_level )
+X	int fd ;
+X	register struct service_config *scp ;
+X	int tab_level ;
+X{
+X	register struct log *lp = SC_LOG( scp ) ;
+X	register struct filelog *flp ;
+X	int i ;
+X
+X	switch ( log_get_type( lp ) )
+X	{
+X		case L_NONE:
+X			tabprint( fd, tab_level, "No logging\n" ) ;
+X			return ;
+X
+X		case L_COMMON_FILE:
+X			tabprint( fd, tab_level, "Logging to common log file\n" ) ;
+X			break ;
+X
+X		case L_FILE:
+X			flp = log_filelog( lp ) ;
+X			tabprint( fd, tab_level, "Logging to file: %s", flp->fl_filename ) ;
+X
+X			if ( FILELOG_SIZE_CONTROL( flp ) )
+X				Sprint( fd, " (soft=%d hard=%d)\n",
+X								flp->fl_soft_limit, flp->fl_hard_limit ) ;
+X			else
+X				Sprint( fd, " (no limits)\n" ) ;
+X			break ;
+X		
+X		case L_SYSLOG:
+X			tabprint( fd, tab_level,
+X				"Logging to syslog. Facility = %s, level = %s\n",
+X					nv_get_name( syslog_facilities, log_syslog( lp )->sl_facility ),
+X					nv_get_name( syslog_levels, log_syslog( lp )->sl_level ) ) ;
+X			break ;
+X	}
+X
+X	tabprint( fd, tab_level, "Log_on_success flags =" ) ;
+X	for ( i = 0 ; success_log_options[ i ].name != NULL ; i++ )
+X		if ( M_IS_SET( scp->sc_log_on_success, success_log_options[ i ].value ) )
+X			Sprint( fd, " %s", success_log_options[ i ].name ) ;
+X	Sputchar( fd, '\n' ) ;
+X
+X	tabprint( fd, tab_level, "Log_on_failure flags =" ) ;
+X	for ( i = 0 ; failure_log_options[ i ].name != NULL ; i++ )
+X		if ( M_IS_SET( scp->sc_log_on_failure, failure_log_options[ i ].value ) )
+X			Sprint( fd, " %s", failure_log_options[ i ].name ) ;
+X	Sputchar( fd, '\n' ) ;
+X}
+X
+X
+X/*
+X * Print info about service scp to file descriptor fd
+X */
+Xvoid sc_dump( scp, fd, tab_level, is_defaults )
+X	register struct service_config *scp ;
+X	register int fd ;
+X	int tab_level ;
+X	bool_int is_defaults ;
+X{
+X	register struct name_value		*nvp ;
+X	register unsigned 				u ;
+X	register char 						**pp ;
+X	void 									ti_dump() ;
+X
+X	if ( is_defaults )
+X		tabprint( fd, tab_level, "Service defaults\n" ) ;
+X	else
+X		tabprint( fd, tab_level, "Service configuration: %s\n", scp->sc_name ) ;
+X
+X	if ( ! is_defaults )
+X	{
+X		tabprint( fd, tab_level+1, "id = %s\n", scp->sc_id ) ;
+X
+X		if ( ! M_ARE_ALL_CLEAR( scp->sc_flags ) )
+X		{
+X			tabprint( fd, tab_level+1, "flags =" ) ;
+X			for ( nvp = &service_flags[ 0 ] ; nvp->name != NULL ; nvp++ )
+X				if ( M_IS_SET( scp->sc_flags, nvp->value ) )
+X					Sprint( fd, " %s", nvp->name ) ;
+X			Sputchar( fd, '\n' ) ;
+X		}
+X
+X		if ( ! M_ARE_ALL_CLEAR( scp->sc_type ) )
+X		{
+X			tabprint( fd, tab_level+1, "type =" ) ;
+X			for ( nvp = &service_types[ 0 ] ; nvp->name != NULL ; nvp++ )
+X				if ( M_IS_SET( scp->sc_type, nvp->value ) )
+X					Sprint( fd, " %s", nvp->name ) ;
+X			Sputchar( fd, '\n' ) ;
+X		}
+X
+X		tabprint( fd, tab_level+1, "socket_type = %s\n",
+X			nv_get_name( socket_types, scp->sc_socket_type ) ) ;
+X
+X		if ( SC_SPECIFIED( scp, A_PORT ) )
+X			tabprint( fd, tab_level+1, "port = %d\n", scp->sc_port ) ;
+X
+X		tabprint( fd, tab_level+1, "Protocol (name,number) = (%s,%d)\n",
+X				scp->sc_protocol.name, scp->sc_protocol.value ) ;
+X	}
+X
+X	if ( SC_SPECIFIED( scp, A_INSTANCES ) )
+X		if ( scp->sc_instances == UNLIMITED )
+X			tabprint( fd, tab_level+1, "Instances = UNLIMITED\n" ) ;
+X		else
+X			tabprint( fd, tab_level+1, "Instances = %d\n", scp->sc_instances ) ;
+X		
+X	if ( SC_SPECIFIED( scp, A_NICE ) )
+X		tabprint( fd, tab_level+1, "Nice = %d\n", scp->sc_nice ) ;
+X
+X	if ( ! is_defaults )
+X	{
+X		if ( ! SC_IS_INTERNAL( scp ) )
+X		{
+X			tabprint( fd, tab_level+1, "Server = %s\n", scp->sc_server ) ;
+X			tabprint( fd, tab_level+1, "Server argv =" ) ;
+X			for ( pp = scp->sc_server_argv ; *pp ; pp++ )
+X				Sprint( fd, " %s", *pp ) ;
+X			Sputchar( fd, '\n' ) ;
+X		} 
+X
+X		if ( SC_IS_RPC( scp ) )
+X		{
+X			struct rpc_data *rdp = SC_RPCDATA( scp ) ;
+X
+X			tabprint( fd, tab_level+1, "RPC data\n" ) ;
+X			tabprint( fd, tab_level+2,
+X									"program number = %ld\n", rdp->rd_program_number ) ;
+X			tabprint( fd, tab_level+2, "rpc_version = " ) ;
+X			if ( rdp->rd_min_version == rdp->rd_max_version )
+X				Sprint( fd, "%ld\n", rdp->rd_min_version ) ;
+X			else
+X				Sprint( fd, "%ld-%ld\n",
+X									rdp->rd_min_version, rdp->rd_max_version ) ;
+X		}
+X
+X		if ( SC_SPECIFIED( scp, A_ACCESS_TIMES ) )
+X		{
+X			tabprint( fd, tab_level+1, "Access times =" ) ;
+X			ti_dump( scp->sc_access_times, fd ) ;
+X			Sputchar ( fd, '\n' ) ;
+X		}
+X	}
+X
+X	if ( SC_SPECIFIED( scp, A_ONLY_FROM ) )
+X	{
+X		tabprint( fd, tab_level+1, "Only from: " ) ;
+X		addrlist_dump( scp->sc_only_from, fd ) ;
+X		Sputchar( fd, '\n' ) ;
+X	}
+X
+X	if ( SC_SPECIFIED( scp, A_NO_ACCESS ) )
+X	{
+X		tabprint( fd, tab_level+1, "No access: " ) ;
+X		addrlist_dump( scp->sc_no_access, fd ) ;
+X		Sputchar( fd, '\n' ) ;
+X	}
+X	
+X	dump_log_data( fd, scp, tab_level+1 ) ;
+X
+X	if ( SC_SPECIFIED( scp, A_PASSENV ) )
+X	{
+X		tabprint( fd, tab_level+1, "Passenv =" ) ;
+X		for ( u = 0 ; u < pset_count( scp->sc_pass_env_vars ) ; u++ )
+X			Sprint( fd, " %s",
+X						(char *) pset_pointer( scp->sc_pass_env_vars, u ) ) ;
+X		Sputchar ( fd, '\n' ) ;
+X	}
+X
+X	if ( ! is_defaults )
+X		if ( SC_SPECIFIED( scp, A_ENV ) )
+X		{
+X			tabprint( fd, tab_level+1, "Environment additions:\n" ) ;
+X			for ( u = 0 ; u < pset_count( scp->sc_env_var_defs ) ; u++ )
+X				tabprint( fd, tab_level+2,
+X						"%s\n", (char *) pset_pointer( scp->sc_env_var_defs, u ) ) ;
+X		}
+X	
+X	if ( SC_ENV( scp )->env_type == CUSTOM_ENV )
+X	{
+X		tabprint( fd, tab_level+1, "Environment strings:\n" ) ;
+X		for ( pp = env_getvars( SC_ENV( scp )->env_handle ) ; *pp ; pp++ )
+X			tabprint( fd, tab_level+2, "%s\n", *pp ) ;
+X	}
+X	Sflush( fd ) ;
+X}
+X
+X
+X#define SC_RPCPROGNUM( s )    RD_PROGNUM( SC_RPCDATA( s ) )
+X#define SAME_RPC( s1, s2 )    ( SC_RPCPROGNUM( s1 ) == SC_RPCPROGNUM( s2 ) )
+X#define SAME_NONRPC( s1, s2 ) ( (s1)->sc_socket_type == (s2)->sc_socket_type \
+X                                 && (s1)->sc_port == (s2)->sc_port )
+X
+X/*
+X * Two service configurations are considered different if any of the
+X * following is TRUE:
+X *		1) only one is unlisted
+X *		2) only one is internal
+X *		3) only one is RPC
+X *		4) they have different values for the 'wait' attribute
+X *		5) they use different protocols
+X *		6) they are both RPC services but have different program numbers
+X *		7) neither is an RPC service and they have different socket_types or
+X *			use diffent ports
+X *
+X * This function returns TRUE if the specified configurations are different.
+X *
+X * Note that this function is closely related to the 'readjust' function
+X * that is invoked on reconfiguration; that function will not change 
+X * attributes that this function checks to determine if two configurations
+X * are different.
+X */
+Xbool_int sc_different_confs( scp1, scp2 )
+X	struct service_config *scp1, *scp2 ;
+X{
+X   if ( SC_IS_UNLISTED( scp1 ) != SC_IS_UNLISTED( scp2 ) ||
+X				SC_IS_INTERNAL( scp1 ) != SC_IS_INTERNAL( scp2 ) ||
+X					SC_IS_RPC( scp1 ) != SC_IS_RPC( scp2 ) )
+X      return( TRUE ) ;
+X
+X   if ( scp1->sc_wait != scp2->sc_wait )
+X      return( TRUE ) ;
+X  
+X	if ( scp1->sc_protocol.value != scp2->sc_protocol.value )
+X      return( TRUE ) ;
+X
+X   if ( SC_IS_RPC( scp1 ) )
+X   {
+X		if ( ! SAME_RPC( scp1, scp2 ) )
+X         return( TRUE ) ;
+X   }
+X   else
+X   {
+X		if ( ! SAME_NONRPC( scp1, scp2 ) )
+X         return( TRUE ) ;
+X   }
+X   return( FALSE ) ;
+X}
+X
+END_OF_FILE
+if test 11251 -ne `wc -c <'xinetd/sconf.c'`; then
+    echo shar: \"'xinetd/sconf.c'\" unpacked with wrong size!
+fi
+# end of 'xinetd/sconf.c'
+fi
+if test -f 'xinetd/shutdown.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xinetd/shutdown.c'\"
+else
+echo shar: Extracting \"'xinetd/shutdown.c'\" \(10894 characters\)
+sed "s/^X//" >'xinetd/shutdown.c' <<'END_OF_FILE'
+X/*
+X * (c) Copyright 1992 by Panagiotis Tsirigotis
+X * All rights reserved.  The file named COPYRIGHT specifies the terms 
+X * and conditions for redistribution.
+X */
+X
+Xstatic char RCSid[] = "$Id: shutdown.c,v 6.4 1993/06/13 01:47:17 panos Exp $" ;
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <netdb.h>
+X#include <pwd.h>
+X#include <string.h>
+X#include <syslog.h>
+X
+X#include "sio.h"
+X#include "str.h"
+X
+X#include "defs.h"
+X
+Xchar *malloc() ;
+Xchar *crypt() ;
+X
+Xvoid msg() ;
+X
+Xtypedef enum { SD_LOGIN, SD_SHELL, SD_EXEC, SD_FINGER } shutdown_e ;
+X
+Xstruct shutdown_function
+X{
+X	char			*sf_service ;
+X	voidfunc 	sf_func ;
+X	char			*sf_function_name ;
+X} ;
+X
+X
+XPRIVATE void rlogin_shutdown() ;
+XPRIVATE void rexec_shutdown() ;
+XPRIVATE void rsh_shutdown() ;
+XPRIVATE void finger_shutdown() ;
+X
+Xstatic struct shutdown_function shutdown_functions[] =
+X   {
+X      { "login",		rlogin_shutdown,	"rlogin_shutdown"	},
+X		{ "shell",		rsh_shutdown,		"rsh_shutdown"		},
+X		{ "exec",		rexec_shutdown,	"rexec_shutdown"	},
+X		{ "finger",		finger_shutdown,	"finger_shutdown"	},
+X      { CHAR_NULL }
+X   } ;
+X
+X
+Xtypedef enum
+X	{
+X		RS_OK, RS_EOF, RS_IOERR, RS_NOMEM, RS_TOOLONG, RS_BADCONN
+X	} read_status_e ;
+X
+Xstatic struct name_value read_status_names[] =
+X	{
+X		{ "Error: out of memory",		(int) RS_NOMEM		},
+X		{ "Error: input too long",		(int) RS_TOOLONG	},
+X		{ "Error: I/O",					(int) RS_IOERR  	},
+X		{ "Error: end-of-file",			(int) RS_EOF		},
+X		{ "Error: bad connection",		(int) RS_BADCONN	},
+X		{ CHAR_NULL,						1						},
+X		{ "UNKNOWN",						0						}
+X	} ;
+X
+X#define rs_explain( s )			nv_get_name( read_status_names, (int) (s) )
+X
+X
+X/*
+X * NOTE: All shutdown functions assume that the process will exit
+X * 		very soon, so they don't bother to deallocate any malloc'ed
+X *			memory. In particular, it is not guaranteed that the memory 
+X *			returned by these functions will point to malloc'ed memory
+X */
+X
+X
+X/*
+X * Locate and return the shutdown function for the given service
+X */
+Xvoidfunc get_shutdown_by_name( service ) 
+X	register char *service ;
+X{
+X	register struct shutdown_function *sfp ;
+X
+X	for ( sfp = &shutdown_functions[ 0 ] ; sfp->sf_service ; sfp++ )
+X		if ( EQ( service, sfp->sf_service ) )
+X			return( sfp->sf_func ) ;
+X	return( NULL ) ;
+X}
+X
+X
+Xchar *get_shutdown_by_addr( func )
+X	register voidfunc func ;
+X{
+X	register struct shutdown_function *sfp ;
+X
+X	for ( sfp = &shutdown_functions[ 0 ] ; sfp->sf_service ; sfp++ )
+X		if ( func == sfp->sf_func )
+X			break ;
+X	return( sfp->sf_function_name ) ;
+X}
+X
+X
+X/*
+X * Read a string of length at most max_len from socket sd.
+X * The string is placed in buf (if buf is not NULL). If buf
+X * is NULL, the input is drained.
+X * The input string is always read even if the allowed length
+X * is exceeded (the extra characters are ignored).
+X * max_len is the maximum length of the input string excluding the
+X * terminating NUL.
+X * The actual length is returned in lenp.
+X */
+XPRIVATE read_status_e read_string( sd, max_len, buf, lenp )
+X	int					sd ;
+X	register unsigned max_len ;
+X	char					*buf ;
+X	unsigned				*lenp ;
+X{
+X	char						c ;
+X	register char			*p ;
+X	int						cc ;
+X	read_status_e			read_status ;
+X	register status_e		status		= OK ;
+X	register int			len			= 0 ;
+X	int						drain_input = ( buf == NULL ) ;
+X
+X	if ( drain_input )
+X	{
+X		status = FAILED ;
+X		p = &c ;
+X	}
+X	else
+X	{
+X		p = buf ;
+X		status = OK ;
+X	}
+X
+X	for ( ;; )
+X	{
+X		/*
+X		 * Keep reading characters one by one (ugly !!!)
+X		 * If status == FAILED, don't store them
+X		 * Interesting side-effect: since we stop increasing p in
+X		 * this case, *p will be used for storing all subsequent input
+X		 * until the NUL. So we get a NUL terminated string with
+X		 * the extra characters ignored.
+X		 */
+X		if ( len > max_len )
+X		{
+X			status = FAILED ;
+X			read_status = RS_TOOLONG ;
+X		}
+X
+X		/*
+X		 * If an I/O error occurs, end the loop
+X		 */
+X		if ( ( cc = read( sd, p, 1 ) ) != 1 )
+X		{
+X			if ( cc == -1 )
+X				if ( errno == EINTR )
+X					continue ;
+X				else
+X					read_status = RS_IOERR ;
+X			else
+X				read_status = RS_EOF ;
+X			status = FAILED ;
+X			break ;
+X		}
+X		if ( *p == NUL )
+X			break ;
+X		if ( status == OK )
+X		{
+X			len++ ;
+X			p++ ;
+X		}
+X	}
+X	if ( status == OK )
+X	{
+X		*lenp = len ;
+X		read_status = RS_OK ;
+X	}
+X	return( drain_input ? RS_OK : read_status ) ;
+X}
+X
+X
+X/*
+X * Allocates a single buffer big enough to hold <count> strings whose
+X * maximum lengths are given in the <limits> array
+X * The pointers in the <strings> array will point to the part
+X * of the buffer for each string.
+X */
+XPRIVATE char *setup( count, limits, strings )
+X	register unsigned		count ;
+X	unsigned					limits[] ;
+X	char						*strings[] ;
+X{
+X	register unsigned		total_len ;
+X	register unsigned		index ;
+X	register unsigned		u ;
+X	char						*buf ;
+X
+X	for ( u = 0, total_len = 0 ; u < count ; u++ )
+X		total_len += limits[ u ] ;
+X	
+X	buf = malloc( total_len + count ) ;		/* count the NULs */
+X	if ( buf == NUL )
+X		return( NULL ) ;
+X	
+X	for ( u = 0, index = 0 ; u < count ; u++ )
+X	{
+X		strings[ u ] = &buf[ index ] ;
+X		index += limits[ u ] + 1 ;
+X	}
+X	return( buf ) ;
+X}
+X
+X
+X
+XPRIVATE int connect_back( id, sd, port )
+X	shutdown_e			id ;
+X	int					sd ;
+X	unsigned short 	port ;
+X{
+X	int						new_sd ;
+X	struct sockaddr_in	sin ;
+X	int						sin_len	= sizeof( sin ) ;
+X	char						*func		= "connect_back" ;
+X
+X	/*
+X	 * Get the remote address
+X	 */
+X	if ( getpeername( sd, SA( &sin ), &sin_len ) == -1 )
+X	{
+X		if ( debug.on )
+X			msg( LOG_DEBUG, func, "id=%d, getpeername: %m", (int) id ) ;
+X		return( -1 ) ;
+X	}
+X
+X	/*
+X	 * Get a socket for the new connection.
+X	 * For the shell service, the socket must have a proviliged local port
+X	 */
+X	if ( id == SD_SHELL )
+X	{
+X		int local_port = IPPORT_RESERVED - 1 ;
+X		unsigned short client_port = ntohs( sin.sin_port ) ;
+X
+X		if ( ! ( client_port >= IPPORT_RESERVED/2 &&
+X											client_port < IPPORT_RESERVED ) )
+X		return( -1 ) ;
+X
+X		if ( ( new_sd = rresvport( &local_port ) ) == -1 )
+X			return( -1 ) ;
+X	}
+X	else if ( id == SD_EXEC )
+X	{
+X		if ( ( new_sd = socket( AF_INET, SOCK_STREAM, 0 ) ) == -1 )
+X			return( -1 ) ;
+X	}
+X	else
+X		return( -1 ) ;
+X
+X	sin.sin_port = htons( port ) ;
+X	sin.sin_family = AF_INET ;
+X	if ( connect( new_sd, SA( &sin ), sizeof( sin ) ) == -1 )
+X	{
+X		if ( debug.on )
+X			msg( LOG_DEBUG, func, "connect: %m (port=%d)", port ) ;
+X		(void) close( new_sd ) ;
+X		return( -1 ) ;
+X	}
+X	return( new_sd ) ;
+X}
+X
+X
+XPRIVATE status_e rservices_common( id, sd, nargs, 
+X										limits, strings, total_lenp, pp )
+X	shutdown_e	id ;				/* service id 											*/
+X	unsigned		nargs ;			/* number of expected args. args are 			*/
+X										/* NUL-terminated strings							*/
+X	unsigned		limits[] ;		/* max length of each arg							*/
+X	char			*strings[] ;	/* array of arg pointers							*/
+X	unsigned		*total_lenp ;	/* total length of args								*/
+X	char			**pp ;			/* pointer to string to put error message		*/
+X{
+X	read_status_e	rs ;
+X	char				*store_buf ;
+X	unsigned			total_len ;
+X	unsigned			len ;
+X	int				i ;
+X	char				*func = "rservices_common" ;
+X
+X	store_buf = setup( nargs, limits, strings ) ;
+X	if ( store_buf == NULL )
+X	{
+X		*pp = rs_explain( RS_NOMEM ) ;
+X		return( FAILED ) ;
+X	}
+X
+X	for ( i = 0, total_len = 0 ; i < nargs ; i++ )
+X	{
+X		rs = read_string( sd, limits[ i ], strings[ i ], &len ) ;
+X		if ( rs != RS_OK )
+X		{
+X			*pp = rs_explain( rs ) ;
+X			return( FAILED ) ;
+X		}
+X
+X		if ( i == 0 && ( id == SD_SHELL || id == SD_EXEC ) )
+X		{
+X			unsigned short port = atoi( strings[ 0 ] ) ;
+X
+X			if ( debug.on )
+X				msg( LOG_DEBUG, func, "port for new connection = %d", port ) ;
+X
+X			if ( port != 0 && connect_back( id, sd, port ) == -1 )
+X			{
+X				*pp = rs_explain( RS_BADCONN ) ;
+X				return( FAILED ) ;
+X			}
+X		}
+X		else
+X			total_len += len ;
+X	}
+X	*total_lenp = total_len ;
+X	return( OK ) ;
+X}
+X
+X
+X#define RLOGIN_ARGS 		4
+X
+XPRIVATE void rlogin_shutdown( sd, pp )
+X	int sd ;
+X	char **pp ;
+X{
+X	char					*print_buf ;
+X	unsigned				print_buf_size ;
+X	unsigned				total_len ;
+X	char					*strings[ RLOGIN_ARGS ] ;
+X	static unsigned	limits[ RLOGIN_ARGS ] = { 0, 16, 16, 4096 } ;
+X
+X	(void) write( sd, "", 1 ) ;
+X
+X	if ( pp == NULL )
+X		return ;
+X
+X	if ( rservices_common( SD_LOGIN, sd,
+X				RLOGIN_ARGS, limits, strings, &total_len, pp ) == FAILED )
+X		return ;
+X
+X	print_buf_size = total_len + 100 ;
+X	print_buf = malloc( print_buf_size ) ;
+X	if ( print_buf != NULL )
+X		*pp = strx_sprint( print_buf, print_buf_size,
+X						"remote_user=%s local_user=%s tty=%s",
+X							strings[ 1 ], strings[ 2 ], strings[ 3 ] ) ;
+X	else
+X		*pp = rs_explain( RS_NOMEM ) ;
+X}
+X
+X
+X	
+X#define REXEC_ARGS			4
+X#define SALT_LEN				2
+X
+XPRIVATE void rexec_shutdown( sd, pp )
+X	int sd ;
+X	char **pp ;
+X{
+X	char					*print_buf ;
+X	unsigned				print_buf_size ;
+X	char					*password ;
+X	char					salt[ SALT_LEN ] ;
+X	struct passwd		*pw ;
+X	char					*verify ;
+X	unsigned				total_len ;
+X	char					*strings[ REXEC_ARGS ] ;
+X	char					error_indication		= '\1' ;
+X	char					*error_message			= "Permission denied.\n" ;
+X	static unsigned	limits[ REXEC_ARGS ] = { 5, 16, 16, 4096 } ;
+X
+X	(void) write( sd, &error_indication, 1 ) ;
+X	(void) write( sd, error_message, strlen( error_message ) + 1 ) ;
+X	
+X	if ( pp == NULL )
+X		return ;
+X
+X	if ( rservices_common( SD_EXEC, sd,
+X				REXEC_ARGS, limits, strings, &total_len, pp ) == FAILED )
+X		return ;
+X
+X	/*
+X	 * Verify the password
+X	 */
+X	password = strings[ 2 ] ;
+X	pw = getpwnam( strings[ 1 ] ) ;
+X	if ( pw != NULL )
+X	{
+X		strncpy( salt, pw->pw_passwd, SALT_LEN )[ SALT_LEN ] = NUL ;
+X		if ( EQ( crypt( password, salt ), pw->pw_passwd ) )
+X			verify = "ok" ;
+X		else
+X			verify = "failed" ;
+X	}
+X	else
+X		verify = "baduser" ;
+X
+X	str_fill( password, ' ' ) ;		/* clear the password */
+X
+X	print_buf_size = total_len + 100 ;
+X	print_buf = malloc( print_buf_size ) ;
+X	if ( print_buf != NULL )
+X		*pp = strx_sprint( print_buf, print_buf_size, 
+X							"remote_user=%s verify=%s command=%s",
+X											strings[ 1 ], verify, strings[ 3 ] ) ;
+X	else
+X		*pp = rs_explain( RS_NOMEM ) ;
+X}
+X
+X
+X
+X#define RSH_ARGS			4
+X
+XPRIVATE void rsh_shutdown( sd, pp )
+X	int sd ;
+X	char **pp ;
+X{
+X	char					*print_buf ;
+X	unsigned				print_buf_size ;
+X	unsigned				total_len ;
+X	char					*strings[ RSH_ARGS ] ;
+X	char					error_indication		= '\1' ;
+X	char					*error_message			= "Permission denied.\n" ;
+X	static unsigned	limits[ RSH_ARGS ]	= { 5, 16, 16, 4096 } ;
+X
+X	(void) write( sd, &error_indication, 1 ) ;
+X	(void) write( sd, error_message, strlen( error_message ) + 1 ) ;
+X
+X	if ( pp == NULL )
+X		return ;
+X	
+X	if ( rservices_common( SD_SHELL, sd,
+X					RSH_ARGS, limits, strings, &total_len, pp ) == FAILED )
+X		return ;
+X	
+X	print_buf_size = total_len + 100 ;
+X	print_buf = malloc( print_buf_size ) ;
+X	if ( print_buf != NULL )
+X		*pp = strx_sprint( print_buf, print_buf_size,
+X					"remote_user=%s local_user=%s command=%s",
+X							strings[ 1 ], strings[ 2 ], strings[ 3 ] ) ;
+X	else
+X		*pp = rs_explain( RS_NOMEM ) ;
+X}
+X
+X
+XPRIVATE void finger_shutdown( sd, pp )
+X	int sd ;
+X	char **pp ;
+X{
+X	char *line ;
+X	int line_len ;
+X
+X	if ( pp == NULL )
+X		return ;
+X	
+X	line = Srdline( sd ) ;
+X	line_len = SIOLINELEN( sd ) ;
+X
+X	if ( line_len > 0 && line[ line_len-1 ] == '\r' )
+X		line[ --line_len ] = NUL ;
+X
+X	*pp = ( line_len == 0 ) ? "EMPTY-LINE" : line ;
+X}
+X
+END_OF_FILE
+if test 10894 -ne `wc -c <'xinetd/shutdown.c'`; then
+    echo shar: \"'xinetd/shutdown.c'\" unpacked with wrong size!
+fi
+# end of 'xinetd/shutdown.c'
+fi
+echo shar: End of archive 20 \(of 31\).
+cp /dev/null ark20isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 31 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

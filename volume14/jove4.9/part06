@@ -1,0 +1,2346 @@
+Subject:  v14i062:  Jove, an emacs variant, version 4.9, Part06/21
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Jonathan Payne <jpayne@cs.rochester.edu>
+Posting-number: Volume 14, Issue 62
+Archive-name: jove4.9/part06
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 6 (of 21)."
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f './ask.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'./ask.c'\"
+else
+echo shar: Extracting \"'./ask.c'\" \(12125 characters\)
+sed "s/^X//" >'./ask.c' <<'END_OF_FILE'
+X/***************************************************************************
+X * This program is Copyright (C) 1986, 1987, 1988 by Jonathan Payne.  JOVE *
+X * is provided to you without charge, and with no warranty.  You may give  *
+X * away copies of JOVE, including sources, provided that this notice is    *
+X * included in all the files.                                              *
+X ***************************************************************************/
+X
+X#include "jove.h"
+X#include "termcap.h"
+X#include "ctype.h"
+X#include <signal.h>
+X
+X#ifdef MAC
+X#	include "mac.h"
+X#else
+X#	include <varargs.h>
+X#	ifdef F_COMPLETION
+X#   	include <sys/stat.h>
+X#	endif
+X#endif /* MAC */
+X
+X#ifdef MAC
+X#	undef private
+X#	define private
+X#endif
+X
+X#ifdef	LINT_ARGS
+private Buffer * get_minibuf(void);
+private char * real_ask(char *, int (*)(), char *, char *);
+X
+private int
+X	f_complete(int),
+X	bad_extension(char *, char *),
+X	crush_bads(char **, int),
+X	isdir(char *);
+private void
+X	fill_in(char **, int),
+X	EVexpand(void);
+X#else
+private Buffer * get_minibuf();
+private char * real_ask();
+X
+private int
+X	f_complete(),
+X	bad_extension(),
+X	crush_bads(),
+X	isdir();
+private void
+X	fill_in(),
+X	EVexpand();
+X#endif	/* LINT_ARGS */
+X
+X#ifdef MAC
+X#	undef private
+X#	define private static
+X#endif
+X
+int	AbortChar = CTL('G'),
+X	DoEVexpand = NO;	/* should we expand evironment variables? */
+X
+int	Asking = NO;
+char	Minibuf[LBSIZE];
+private Line	*CurAskPtr = 0;	/* points at some line in mini-buffer */
+private Buffer	*AskBuffer = 0;	/* Askbuffer points to actual structure */
+X
+X/* The way the mini-buffer works is this:  The first line of the mini-buffer
+X   is where the user does his stuff.  The rest of the buffer contains
+X   strings that the user often wants to use, for instance, file names, or
+X   common search strings, etc.  If he types C-N or C-P while in ask(), we
+X   bump the point up or down a line and extract the contents (we make sure
+X   is somewhere in the mini-buffer). */
+X
+static Buffer *
+get_minibuf()
+X{
+X	if (AskBuffer) {		/* make sure ut still exists */
+X		register Buffer	*b;
+X
+X		for (b = world; b != 0; b = b->b_next)
+X			if (b == AskBuffer)
+X				return b;
+X	}
+X	AskBuffer = do_select((Window *) 0, "*minibuf*");
+X	AskBuffer->b_type = B_SCRATCH;
+X	return AskBuffer;
+X}
+X
+X/* Add a string to the mini-buffer. */
+X
+void
+minib_add(str, movedown)
+char	*str;
+X{
+X	register Buffer	*saveb = curbuf;
+X
+X	SetBuf(get_minibuf());
+X	LineInsert(1);
+X	ins_str(str, NO);
+X	if (movedown)
+X		CurAskPtr = curline;
+X	SetBuf(saveb);
+X}
+X
+X/* look for any substrings of the form $foo in linebuf, and expand
+X   them according to their value in the environment (if possible) -
+X   this munges all over curchar and linebuf without giving it a second
+X   thought (I must be getting lazy in my old age) */
+private void
+EVexpand()
+X{
+X	register int	c;
+X	register char	*lp = linebuf,
+X			*ep;
+X	char	varname[128],
+X		*vp,
+X		*lp_start;
+X	Mark	*m = MakeMark(curline, curchar, M_FLOATER);
+X
+X	while (c = *lp++) {
+X		if (c != '$')
+X			continue;
+X		lp_start = lp - 1;	/* the $ */
+X		vp = varname;
+X		while (c = *lp++) {
+X			if (!isword(c))
+X				break;
+X			*vp++ = c;
+X		}
+X		*vp = '\0';
+X		/* if we find an env. variable with the right
+X		   name, we insert it in linebuf, and then delete
+X		   the variable name that we're replacing - and
+X 		   then we continue in case there are others ... */
+X		if (ep = getenv(varname)) {
+X			curchar = lp_start - linebuf;
+X			ins_str(ep, NO);
+X			del_char(FORWARD, strlen(varname) + 1);
+X			lp = linebuf + curchar;
+X		}
+X	}
+X	ToMark(m);
+X	DelMark(m);
+X}
+X
+private char *
+real_ask(delim, d_proc, def, prompt)
+char	*delim,
+X	*def,
+X	*prompt;
+int	(*d_proc)();
+X{
+X	static int	InAsk = 0;
+X	jmp_buf	savejmp;
+X	int	c,
+X		prompt_len;
+X	Buffer	*saveb = curbuf;
+X	int	abort = 0,
+X		no_typed = 0;
+X	data_obj	*push_cmd = LastCmd;
+X	int	o_a_v = arg_value(),
+X		o_i_an_a = is_an_arg();
+X#ifdef MAC
+X		menus_off();
+X#endif
+X
+X	if (InAsk)
+X		complain((char *) 0);
+X	push_env(savejmp);
+X	InAsk += 1;
+X	SetBuf(get_minibuf());
+X	if (!inlist(AskBuffer->b_first, CurAskPtr))
+X		CurAskPtr = curline;
+X	prompt_len = strlen(prompt);
+X	ToFirst();	/* Beginning of buffer. */
+X	linebuf[0] = '\0';
+X	modify();
+X	makedirty(curline);
+X
+X	if (setjmp(mainjmp))
+X		if (InJoverc) {		/* this is a kludge */
+X			abort = YES;
+X			goto cleanup;
+X		}
+X
+X	for (;;) {
+X		clr_arg_value();
+X		last_cmd = this_cmd;
+X		init_strokes();
+cont:		s_mess("%s%s", prompt, linebuf);
+X		Asking = curchar + prompt_len;
+X		c = getch();
+X		if ((c == EOF) || index(delim, c)) {
+X			if (DoEVexpand)
+X				EVexpand();
+X			if (d_proc == (int(*)())0 || (*d_proc)(c) == 0)
+X				goto cleanup;
+X		} else if (c == AbortChar) {
+X			message("[Aborted]");
+X			abort = YES;
+X			goto cleanup;
+X		} else switch (c) {
+X		case CTL('N'):
+X		case CTL('P'):
+X			if (CurAskPtr != 0) {
+X				int	n = (c == CTL('P') ? -arg_value() : arg_value());
+X				CurAskPtr = next_line(CurAskPtr, n);
+X				if (CurAskPtr == curbuf->b_first && CurAskPtr->l_next != 0)
+X					CurAskPtr = CurAskPtr->l_next;
+X				(void) ltobuf(CurAskPtr, linebuf);
+X				modify();
+X				makedirty(curline);
+X				Eol();
+X				this_cmd = 0;
+X			}
+X			break;
+X
+X		case CTL('R'):
+X			if (def)
+X				ins_str(def, NO);
+X			else
+X				rbell();
+X			break;
+X
+X		default:
+X			dispatch(c);
+X			break;
+X		}
+X		if (curbuf != AskBuffer)
+X			SetBuf(AskBuffer);
+X		if (curline != curbuf->b_first) {
+X			CurAskPtr = curline;
+X			curline = curbuf->b_first;	/* with whatever is in linebuf */
+X		}
+X		if (this_cmd == ARG_CMD)
+X			goto cont;
+X	}
+cleanup:
+X	pop_env(savejmp);
+X
+X	LastCmd = push_cmd;
+X	set_arg_value(o_a_v);
+X	set_is_an_arg(o_i_an_a);
+X	no_typed = (linebuf[0] == '\0');
+X	strcpy(Minibuf, linebuf);
+X	SetBuf(saveb);
+X	InAsk = Asking = Interactive = NO;
+X	if (!abort) {
+X		if (!charp()) {
+X			Placur(ILI, 0);
+X			flusho();
+X		}
+X		if (no_typed)
+X			return 0;
+X	} else
+X		complain(mesgbuf);
+X	return Minibuf;
+X}
+X
+X/* VARARGS2 */
+X
+char *
+ask(def, fmt, va_alist)
+char	*def,
+X	*fmt;
+va_dcl
+X{
+X	char	prompt[128];
+X	char	*ans;
+X	va_list	ap;
+X
+X	va_start(ap);
+X	format(prompt, sizeof prompt, fmt, ap);
+X	va_end(ap);
+X	ans = real_ask("\r\n", (int (*)()) 0, def, prompt);
+X	if (ans == 0) {		/* Typed nothing. */
+X		if (def == 0)
+X			complain("[No default]");
+X		return def;
+X	}
+X	return ans;
+X}
+X
+X/* VARARGS1 */
+X
+char *
+do_ask(delim, d_proc, def, fmt, va_alist)
+char	*delim,
+X	*def,
+X	*fmt;
+int	(*d_proc)();
+va_dcl
+X{
+X	char	prompt[128];
+X	va_list	ap;
+X
+X	va_start(ap);
+X	format(prompt, sizeof prompt, fmt, ap);
+X	va_end(ap);
+X	return real_ask(delim, d_proc, def, prompt);
+X}
+X
+X/* VARARGS1 */
+X
+int
+yes_or_no_p(fmt, va_alist)
+char	*fmt;
+va_dcl
+X{
+X	char	prompt[128];
+X	int	c;
+X	va_list	ap;
+X
+X	va_start(ap);
+X	format(prompt, sizeof prompt, fmt, ap);
+X	va_end(ap);
+X	for (;;) {
+X		message(prompt);
+X		Asking = strlen(prompt);	/* so redisplay works */
+X		c = getch();
+X		Asking = NO;
+X		if (c == AbortChar)
+X			complain("[Aborted]");
+X		switch (CharUpcase(c)) {
+X		case 'Y':
+X			return YES;
+X
+X		case 'N':
+X			return NO;
+X
+X		default:
+X			add_mess("[Type Y or N]");
+X			SitFor(10);
+X		}
+X	}
+X	/* NOTREACHED */
+X}
+X
+X#ifdef F_COMPLETION
+static char	*fc_filebase;
+int	DispBadFs = YES;	/* display bad file names? */
+X#ifndef MSDOS
+char	BadExtensions[128] = ".o";
+X#else /* MSDOS */
+char	BadExtensions[128] = ".obj .exe .com .bak .arc .lib .zoo";
+X#endif /* MSDOS */
+X
+static
+bad_extension(name, bads)
+char	*name,
+X	*bads;
+X{
+X	char	*ip;
+X	int	namelen = strlen(name),
+X		ext_len,
+X		stop = 0;
+X
+X	do {
+X		if (ip = index(bads, ' '))
+X			*ip = 0;
+X		else {
+X			ip = bads + strlen(bads);
+X			stop = YES;
+X		}
+X		if ((ext_len = ip - bads) == 0)
+X			continue;
+X		if ((ext_len < namelen) &&
+X		    (strcmp(&name[namelen - ext_len], bads) == 0))
+X			return YES;
+X	} while ((bads = ip + 1), !stop);
+X	return NO;
+X}
+X
+int
+f_match(file)
+char	*file;
+X{
+X	int	len = strlen(fc_filebase);
+X	char	bads[128];
+X
+X	if (DispBadFs == NO) {
+X		strcpy(bads, BadExtensions);
+X		/* bad_extension() is destructive */
+X		if (bad_extension(file, bads))
+X			return NO;
+X	}
+X
+X	return ((len == 0) ||
+X#ifdef MSDOS
+X		(casencmp(file, fc_filebase, strlen(fc_filebase)) == 0)
+X#else
+X		(strncmp(file, fc_filebase, strlen(fc_filebase)) == 0)
+X#endif
+X		);
+X}
+X
+static
+isdir(name)
+char	*name;
+X{
+X	struct stat	stbuf;
+X	char	filebuf[FILESIZE];
+X
+X	PathParse(name, filebuf);
+X	return ((stat(filebuf, &stbuf) != -1) &&
+X		(stbuf.st_mode & S_IFDIR) == S_IFDIR);
+X}
+X
+private void
+fill_in(dir_vec, n)
+register char	**dir_vec;
+X{
+X	int	minmatch = 0,
+X    		numfound = 0,
+X    		lastmatch = -1,
+X		i,
+X		the_same = TRUE, /* After filling in, are we the same
+X				    as when we were called? */
+X		is_ntdir;	/* Is Newly Typed Directory name */
+X	char	bads[128];
+X
+X	for (i = 0; i < n; i++) {
+X		/* if it's no, then we have already filtered them out
+X		   in f_match() so there's no point in doing it again */
+X		if (DispBadFs == YES) {
+X			strcpy(bads, BadExtensions);
+X			/* bad_extension() is destructive */
+X			if (bad_extension(dir_vec[i], bads))
+X				continue;
+X		}
+X		if (numfound)
+X			minmatch = min(minmatch,
+X				       numcomp(dir_vec[lastmatch], dir_vec[i]));
+X		else
+X			minmatch = strlen(dir_vec[i]);
+X		lastmatch = i;
+X		numfound += 1;
+X	}
+X	/* Ugh.  Beware--this is hard to get right in a reasonable
+X	   manner.  Please excuse this code--it's past my bedtime. */
+X	if (numfound == 0) {
+X		rbell();
+X		return;
+X	}
+X	Eol();
+X	if (minmatch > strlen(fc_filebase)) {
+X		the_same = FALSE;
+X		null_ncpy(fc_filebase, dir_vec[lastmatch], minmatch);
+X		Eol();
+X		makedirty(curline);
+X	}
+X	is_ntdir = ((numfound == 1) &&
+X		    (curchar > 0) &&
+X		    (linebuf[curchar - 1] != '/') &&
+X		    (isdir(linebuf)));
+X	if (the_same && !is_ntdir) {
+X		add_mess((n == 1) ? " [Unique]" : " [Ambiguous]");
+X		SitFor(7);
+X	}
+X	if (is_ntdir)
+X		insert_c('/', 1);
+X}
+X
+extern int	alphacomp();
+X
+X/* called from do_ask() when one of "\r\n ?" is typed.  Does the right
+X   thing, depending on which. */
+X
+static
+f_complete(c)
+X{
+X	char	dir[FILESIZE],
+X		**dir_vec;
+X	int	nentries,
+X		i;
+X
+X	if (c == CR || c == LF)
+X		return 0;	/* tells ask to return now */
+X#ifndef MSDOS		/* kg */
+X	if ((fc_filebase = rindex(linebuf, '/')) != 0) {
+X#else /* MSDOS */
+X	fc_filebase = rindex(linebuf, '/');
+X	if (fc_filebase == (char *)0)
+X		fc_filebase = rindex(linebuf, '\\');
+X	if (fc_filebase == (char *)0)
+X		fc_filebase = rindex(linebuf, ':');
+X	if (fc_filebase != (char *)0) {
+X#endif /* MSDOS */
+X		char	tmp[FILESIZE];
+X
+X		fc_filebase += 1;
+X		null_ncpy(tmp, linebuf, (fc_filebase - linebuf));
+X		if (tmp[0] == '\0')
+X			strcpy(tmp, "/");
+X		PathParse(tmp, dir);
+X	} else {		
+X		fc_filebase = linebuf;
+X		strcpy(dir, ".");
+X	}
+X	if ((nentries = scandir(dir, &dir_vec, f_match, alphacomp)) == -1) {
+X		add_mess(" [Unknown directory: %s]", dir);
+X		SitFor(7);
+X		return 1;
+X	}
+X	if (nentries == 0) {
+X		add_mess(" [No match]");
+X		SitFor(7);
+X	} else if (c == ' ' || c == '\t')
+X		fill_in(dir_vec, nentries);
+X	else {
+X		/* we're a '?' */
+X		int	maxlen = 0,
+X			ncols,
+X			col,
+X			lines,
+X			linespercol;
+X
+X		TOstart("Completion", FALSE);	/* false means newline only on request */
+X		Typeout("(! means file will not be chosen unless typed explicitly)");
+X		Typeout((char *) 0);
+X		Typeout("Possible completions (in %s):", dir);
+X		Typeout((char *) 0);
+X
+X		for (i = 0; i < nentries; i++)
+X			maxlen = max(strlen(dir_vec[i]), maxlen);
+X		maxlen += 4;	/* pad each column with at least 4 spaces */
+X		ncols = (CO - 2) / maxlen;
+X		linespercol = 1 + (nentries / ncols);
+X
+X		for (lines = 0; lines < linespercol; lines++) {
+X			for (col = 0; col < ncols; col++) {
+X				int	isbad,
+X					which;
+X				char	bads[128];
+X
+X				which = (col * linespercol) + lines;
+X				if (which >= nentries)
+X					break;
+X				if (DispBadFs == YES) {
+X					strcpy(bads, BadExtensions);
+X					isbad = bad_extension(dir_vec[which], bads);
+X				} else
+X					isbad = NO;
+X				Typeout("%s%-*s", isbad ? "!" : NullStr,
+X					maxlen - isbad, dir_vec[which]);
+X			}
+X			Typeout((char *) 0);
+X		}
+X		TOstop();
+X	}
+X	freedir(&dir_vec, nentries);
+X	return 1;
+X}
+X
+X#endif
+X
+char *
+ask_file(prmt, def, buf)
+char	*prmt,
+X	*def,
+X	*buf;
+X{
+X	char	*ans,
+X		prompt[128],
+X		*pretty_name = pr_name(def, YES);
+X	if (prmt)
+X		sprintf(prompt, prmt);
+X	else {
+X		if (def != 0 && *def != '\0')
+X			sprintf(prompt, ": %f (default %s) ", pretty_name);
+X		else
+X			sprintf(prompt, ProcFmt);
+X	}
+X#ifdef F_COMPLETION
+X  	ans = real_ask("\r\n \t?", f_complete, pretty_name, prompt);
+X	if (ans == 0 && (ans = pretty_name) == 0)
+X		complain("[No default file name]");
+X#else
+X	ans = ask(pretty_name, prompt);
+X#endif
+X	PathParse(ans, buf);
+X
+X	return buf;
+X}
+END_OF_FILE
+if test 12125 -ne `wc -c <'./ask.c'`; then
+    echo shar: \"'./ask.c'\" unpacked with wrong size!
+fi
+# end of './ask.c'
+fi
+if test -f './buf.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'./buf.c'\"
+else
+echo shar: Extracting \"'./buf.c'\" \(13403 characters\)
+sed "s/^X//" >'./buf.c' <<'END_OF_FILE'
+X/***************************************************************************
+X * This program is Copyright (C) 1986, 1987, 1988 by Jonathan Payne.  JOVE *
+X * is provided to you without charge, and with no warranty.  You may give  *
+X * away copies of JOVE, including sources, provided that this notice is    *
+X * included in all the files.                                              *
+X ***************************************************************************/
+X
+X/* Contains commands that deal with creating, selecting, killing and
+X   listing buffers, and buffer modes, and find-file, etc. */
+X
+X#include "jove.h"
+X
+X#ifdef MAC
+X#	include "mac.h"
+X#else
+X#	include <sys/stat.h>
+X#endif
+X
+X#ifdef MAC
+X#	undef private
+X#	define private
+X#endif
+X
+X#ifdef	LINT_ARGS
+private Buffer
+X	* buf_alloc(void),
+X	* mak_buf(void);
+X
+private char * line_cnt(Buffer *, char *);
+X
+private void	
+X	BufNSelect(int),
+X	defb_wind(Buffer *),
+X	kill_buf(Buffer *),
+X	mkbuflist(char **);
+X#else
+private Buffer
+X	* buf_alloc(),
+X	* mak_buf();
+X
+private char * line_cnt();
+X
+private void
+X	BufNSelect(),
+X	defb_wind(),
+X	kill_buf(),
+X	mkbuflist();
+X#endif	/* LINT_ARGS */
+X
+X#ifdef MAC
+X#	undef private
+X#	define private static
+X#endif
+X
+char	*Mainbuf = "Main",
+X	*NoName = "Sans un nom!";
+X
+Buffer	*world = 0,		/* First in the list */
+X	*curbuf = 0,
+X	*lastbuf = 0;	/* Last buffer we were in so we have a default
+X			   buffer during a select buffer. */
+X
+X/* Toggle BIT in the current buffer's minor mode flags.  If argument is
+X   supplied, a positive one always turns on the mode and zero argument
+X   always turns it off. */
+X
+void
+TogMinor(bit)
+X{
+X	if (is_an_arg()) {
+X		if (arg_value() == 0)
+X			curbuf->b_minor &= ~bit;
+X		else
+X			curbuf->b_minor |= bit;
+X	} else
+X		curbuf->b_minor ^= bit;
+X	UpdModLine = YES;
+X}
+X
+X/* Creates a new buffer, links it at the end of the buffer chain, and
+X   returns it. */
+X
+static Buffer *
+buf_alloc()
+X{
+X	register Buffer	*b,
+X			*lastbp;
+X
+X	lastbp = 0;
+X	for (b = world; b != 0; lastbp = b, b = b->b_next)
+X		;
+X
+X	b = (Buffer *) emalloc(sizeof (Buffer));
+X	if (lastbp)
+X		lastbp->b_next = b;
+X	else
+X		world = b;
+X	b->b_first = 0;
+X	b->b_next = 0;
+X#ifdef MAC
+X	b->Type = BUFFER;	/* kludge, but simplifies menu handlers */
+X	b->Name = 0;
+X#endif
+X	return b;
+X}
+X
+X/* Makes a buffer and initializes it.  Obsolete.  Used to take two
+X   arguments, a buffer name and a file name. */
+X
+static Buffer *
+mak_buf()
+X{
+X	register Buffer	*newb;
+X	register int	i;
+X
+X	newb = buf_alloc();
+X	newb->b_fname = 0;
+X	newb->b_name = NoName;
+X	set_ino(newb);
+X	newb->b_marks = 0;
+X	newb->b_themark = 0;		/* Index into markring */
+X	/* No marks yet */
+X	for (i = 0; i < NMARKS; i++)
+X		newb->b_markring[i] = 0;
+X	newb->b_modified = 0;
+X	newb->b_type = B_FILE;  /* File until proven SCRATCH */
+X	newb->b_ntbf = 0;
+X	newb->b_minor = 0;
+X	newb->b_major = TEXT;
+X	newb->b_first = 0;
+X	newb->b_keybinds = 0;
+X#ifdef IPROCS
+X	newb->b_process = 0;
+X#endif
+X	initlist(newb);
+X#ifdef MAC
+X	Bufchange = 1;
+X#endif
+X	return newb;
+X}
+X
+void
+ReNamBuf()
+X{
+X	register char	*new = 0,
+X			*prompt = ProcFmt,
+X			*second = "%s already exists; new name? ";
+X
+X	for (;;) {
+X		new = ask((char *) 0, prompt, new);
+X		if (!buf_exists(new))
+X			break;
+X		prompt = second;
+X	}
+X	setbname(curbuf, new);
+X}
+X
+void
+FindFile()
+X{
+X	register char	*name;
+X	char	fnamebuf[FILESIZE];
+X
+X	name = ask_file((char *) 0, curbuf->b_fname, fnamebuf);
+X	SetABuf(curbuf);
+X	SetBuf(do_find(curwind, name, 0));
+X}
+X
+private void
+mkbuflist(bnamp)
+register char	**bnamp;
+X{
+X	register Buffer	*b;
+X
+X	for (b = world; b != 0; b = b->b_next)
+X		if (b->b_name != 0)
+X			*bnamp++ = b->b_name;
+X	*bnamp = 0;
+X}
+X
+char *
+ask_buf(def)
+Buffer	*def;
+X{
+X	char	*bnames[100];
+X	register char	*bname;
+X	register int	offset;
+X	char	prompt[100];
+X
+X	if (def != 0 && def->b_name != 0)
+X		sprintf(prompt, ": %f (default %s) ", def->b_name);
+X	else
+X		sprintf(prompt, ProcFmt);
+X	mkbuflist(bnames);
+X	offset = complete(bnames, prompt, RET_STATE);
+X	if (offset == EOF)
+X		complain((char *) 0);
+X	if (offset == ORIGINAL || offset == AMBIGUOUS)
+X		bname = Minibuf;
+X	else if (offset == NULLSTRING) {
+X		if (def)
+X			bname = def->b_name;
+X		else
+X			complain((char *) 0);
+X	} else if (offset < 0)
+X		complain((char *) 0);
+X	else
+X		bname = bnames[offset];
+X
+X	return bname;
+X}
+X
+void
+BufSelect()
+X{
+X	register char	*bname;
+X
+X	bname = ask_buf(lastbuf);
+X	SetABuf(curbuf);
+X	SetBuf(do_select(curwind, bname));
+X}
+X
+X#ifdef MSDOS
+X
+private void
+BufNSelect(n)
+X{
+X	char *bnames[100];
+X	char *bname;
+X	int i;
+X
+X	mkbuflist(bnames);
+X   	for (i=0; i<n; i++)
+X	    if (bnames[i] == 0)
+X	       complain("[No such buffer]");
+X	bname = bnames[n-1];
+X	SetABuf(curbuf);
+X	SetBuf(do_select(curwind, bname));
+X}
+X
+void Buf1Select() { BufNSelect(1); }
+void Buf2Select() { BufNSelect(2); }
+void Buf3Select() { BufNSelect(3); }
+void Buf4Select() { BufNSelect(4); }
+void Buf5Select() { BufNSelect(5); }
+void Buf6Select() { BufNSelect(6); }
+void Buf7Select() { BufNSelect(7); }
+void Buf8Select() { BufNSelect(8); }
+void Buf9Select() { BufNSelect(9); }
+void Buf10Select() { BufNSelect(10); }
+X
+X#endif /* MSDOS */
+X
+private void
+defb_wind(b)
+register Buffer *b;
+X{
+X	register Window	*w = fwind;
+X	char	*alt;
+X
+X	if (lastbuf == b || lastbuf == 0) {
+X		lastbuf = 0;
+X		alt = (b->b_next != 0) ? b->b_next->b_name : Mainbuf;
+X	} else
+X		alt = lastbuf->b_name;
+X
+X	do {
+X		if (w->w_bufp == b) {
+X			if (one_windp() || alt != Mainbuf)
+X				(void) do_select(w, alt);
+X			else {
+X				Window	*save = w->w_next;
+X				del_wind(w);
+X				w = save->w_prev;
+X			}
+X		}
+X		w = w->w_next;
+X	} while (w != fwind || w->w_bufp == b);
+X}
+X
+Buffer *
+getNMbuf()
+X{
+X	register Buffer	*delbuf;
+X	register char	*bname;
+X
+X	bname = ask_buf(curbuf);
+X	if ((delbuf = buf_exists(bname)) == 0)
+X		complain("[No such buffer]");
+X	if (delbuf->b_modified)
+X		confirm("%s modified, are you sure? ", bname);
+X	return delbuf;
+X}
+X
+void
+BufErase()
+X{
+X	register Buffer	*delbuf;
+X
+X	if (delbuf = getNMbuf()) {
+X		initlist(delbuf);
+X		delbuf->b_modified = 0;
+X	}
+X}
+X
+private void
+kill_buf(delbuf)
+register Buffer	*delbuf;
+X{
+X	register Buffer	*b,
+X			*lastb = 0;
+X#ifndef MAC
+X	extern Buffer	*perr_buf;
+X#endif
+X
+X#ifdef IPROCS
+X	pbuftiedp(delbuf);	/* check for lingering processes */
+X#endif
+X	for (b = world; b != 0; lastb = b, b = b->b_next)
+X		if (b == delbuf)
+X			break;
+X	if (lastb)
+X		lastb->b_next = delbuf->b_next;
+X	else
+X		world = delbuf->b_next;
+X
+X#define okay_free(ptr)	if (ptr) free(ptr)
+X
+X	lfreelist(delbuf->b_first);
+X	okay_free(delbuf->b_name);
+X	okay_free(delbuf->b_fname);
+X	flush_marks(delbuf);
+X	free((char *) delbuf);
+X
+X	if (delbuf == lastbuf)
+X		SetABuf(curbuf);
+X#ifndef MAC
+X	if (perr_buf == delbuf) {
+X		ErrFree();
+X		perr_buf = 0;
+X	}
+X#endif
+X	defb_wind(delbuf);
+X	if (curbuf == delbuf)
+X		SetBuf(curwind->w_bufp);
+X#ifdef MAC
+X	Bufchange = 1;
+X#endif
+X}
+X
+X/* offer to kill some buffers */
+X
+void
+KillSome()
+X{
+X	register Buffer	*b,
+X			*next;
+X	Buffer	*oldb;
+X	register char	*y_or_n;
+X
+X	for (b = world; b != 0; b = next) {
+X		next = b->b_next;
+X		if (yes_or_no_p("Kill %s? ", b->b_name) == NO)
+X			continue;
+X		if (IsModified(b)) {
+X			y_or_n = ask("No", "%s modified; should I save it? ", b->b_name);
+X			if (CharUpcase(*y_or_n) == 'Y') {
+X				oldb = curbuf;
+X				SetBuf(b);
+X				SaveFile();
+X				SetBuf(oldb);
+X			}
+X		}
+X		kill_buf(b);
+X	}
+X}
+X
+void
+BufKill()
+X{
+X	Buffer	*b;
+X
+X	if ((b = getNMbuf()) == 0)
+X		return;
+X	kill_buf(b);
+X}
+X
+private char *
+line_cnt(b, buf)
+register Buffer	*b;
+char	*buf;
+X{
+X	register int	nlines = 0;
+X	register Line	*lp;
+X
+X	for (lp = b->b_first; lp != 0; lp = lp->l_next, nlines++)
+X		;
+X	sprintf(buf, "%d", nlines);
+X	return buf;
+X}
+X
+private char	*TypeNames[] = {
+X	0,
+X	"Scratch",
+X	"File",
+X	"Process",
+X};
+X
+void
+BufList()
+X{
+X	register char	*format = "%-2s %-5s %-11s %-1s %-*s  %-s";
+X	register Buffer	*b;
+X	int	bcount = 1,		/* To give each buffer a number */
+X		buf_width = 11;
+X	char	nbuf[10];
+X
+X	for (b = world; b != 0; b = b->b_next)
+X		buf_width = max(buf_width, strlen(b->b_name));
+X
+X	TOstart("Buffer list", TRUE);	/* true means auto-newline */
+X
+X	Typeout("(* means buffer needs saving)");
+X	Typeout("(+ means file hasn't been read yet)");
+X	Typeout(NullStr);
+X	Typeout(format, "NO", "Lines", "Type", NullStr, buf_width, "Name", "File");
+X	Typeout(format, "--", "-----", "----", NullStr, buf_width, "----", "----");
+X	for (b = world; b != 0; b = b->b_next) {
+X		Typeout(format, itoa(bcount++),
+X				line_cnt(b, nbuf),
+X				TypeNames[b->b_type],
+X				IsModified(b) ? "*" :
+X					 b->b_ntbf ? "+" : NullStr,
+X				buf_width,
+X				/* For the * (variable length field) */
+X				b->b_name,
+X				filename(b));
+X
+X		if (TOabort)
+X			break;
+X	}
+X	TOstop();
+X}
+X
+void
+bufname(b)
+register Buffer	*b;
+X{
+X	char	tmp[100],
+X		*cp;
+X	int	try = 1;
+X
+X	if (b->b_fname == 0)
+X		complain("[No file name]");
+X	cp = basename(b->b_fname);
+X	strcpy(tmp, cp);
+X	while (buf_exists(tmp)) {
+X		sprintf(tmp, "%s.%d", cp, try);
+X		try += 1;
+X	}
+X	setbname(b, tmp);
+X}
+X
+void
+initlist(b)
+register Buffer	*b;
+X{
+X	lfreelist(b->b_first);
+X	b->b_first = b->b_dot = b->b_last = 0;
+X	(void) listput(b, b->b_first);
+X	
+X	SavLine(b->b_dot, NullStr);
+X	b->b_char = 0;
+X	AllMarkSet(b, b->b_dot, 0);
+X	if (b == curbuf)
+X		getDOT();
+X}
+X
+X/* Returns pointer to buffer with name NAME, or if NAME is a string of digits
+X   returns the buffer whose number equals those digits.  Otherwise, returns
+X   0. */
+X
+Buffer *
+buf_exists(name)
+register char	*name;
+X{
+X	register Buffer	*bp;
+X	int	n;
+X
+X	if (name == 0)
+X		return 0;
+X
+X	for (bp = world; bp != 0; bp = bp->b_next)
+X		if (strcmp(bp->b_name, name) == 0)
+X			return bp;
+X
+X	/* Doesn't match any names.  Try for a buffer number... */
+X
+X	if (chr_to_int(name, 10, YES, &n) != INT_BAD) {
+X		for (bp = world; n > 1; bp = bp->b_next) {
+X			if (bp == 0)
+X				break;
+X			n -= 1;
+X		}
+X		return bp;
+X	}
+X
+X	return 0;
+X}
+X
+X/* Returns buffer pointer with a file name NAME, if one exists.  Stat's the
+X   file and compares inodes, in case NAME is a link, as well as the actual
+X   characters that make up the file name. */
+X
+Buffer *
+file_exists(name)
+register char	*name;
+X{
+X	struct stat	stbuf;
+X	register struct stat	*s = &stbuf;
+X	register Buffer	*b = 0;
+X	char	fnamebuf[FILESIZE];
+X
+X#ifdef MSDOS
+X	strlwr(name);
+X#endif /* MSDOS */
+X	if (name) {
+X		PathParse(name, fnamebuf);
+X		if (stat(fnamebuf, s) == -1)
+X			s->st_ino = 0;
+X		for (b = world; b != 0; b = b->b_next) {
+X#ifndef MSDOS
+X			if ((b->b_ino != 0 && b->b_ino == s->st_ino &&
+X			     b->b_dev != 0 && b->b_dev == s->st_dev) ||
+X#else /* MSDOS */
+X			if ( /* (b->b_ino != 0 && b->b_ino == s->st_ino) || */
+X#endif /* MSDOS */
+X			    (strcmp(b->b_fname, fnamebuf) == 0))
+X				break;
+X		}
+X	}
+X	return b;
+X}
+X
+char *
+ralloc(obj, size)
+register char	*obj;
+X{
+X	register char	*new;
+X
+X	if (obj)
+X		new = realloc(obj, (unsigned) size);
+X	if (new == 0 || !obj)
+X		new = emalloc(size);
+X	return new;
+X}
+X
+void
+setbname(b, name)
+register Buffer	*b;
+register char	*name;
+X{
+X	UpdModLine = YES;	/* Kludge ... but speeds things up considerably */
+X	if (name) {
+X		if (b->b_name == NoName)
+X			b->b_name = 0;
+X		b->b_name = ralloc(b->b_name, strlen(name) + 1);
+X		strcpy(b->b_name, name);
+X	} else
+X		b->b_name = 0;
+X#ifdef MAC
+X	Bufchange = 1;
+X#endif
+X}
+X
+void
+setfname(b, name)
+register Buffer	*b;
+register char	*name;
+X{
+X	char	wholename[FILESIZE],
+X		oldname[FILESIZE],
+X		*oldptr = oldname;
+X	Buffer	*save = curbuf;
+X
+X	SetBuf(b);
+X	UpdModLine = YES;	/* Kludge ... but speeds things up considerably */
+X	if (b->b_fname == 0)
+X		oldptr = 0;
+X	else
+X		strcpy(oldname, b->b_fname);
+X	if (name) {
+X#ifdef MSDOS
+X		strlwr(name);
+X#endif /* MSDOS */
+X		PathParse(name, wholename);
+X		curbuf->b_fname = ralloc(curbuf->b_fname, strlen(wholename) + 1);
+X		strcpy(curbuf->b_fname, wholename);
+X	} else
+X		b->b_fname = 0;
+X	DoAutoExec(curbuf->b_fname, oldptr);
+X	curbuf->b_mtime = curbuf->b_dev = curbuf->b_ino = 0;	/* until they're known. */
+X	SetBuf(save);
+X#ifdef MAC
+X	Bufchange = 1;
+X#endif
+X}
+X
+void
+set_ino(b)
+register Buffer	*b;
+X{
+X	struct stat	stbuf;
+X
+X	if (b->b_fname == 0 || stat(pr_name(b->b_fname, NO), &stbuf) == -1) {
+X 		b->b_dev = 0;
+X		b->b_ino = 0;
+X		b->b_mtime = 0;
+X	} else {
+X 		b->b_dev = stbuf.st_dev;
+X		b->b_ino = stbuf.st_ino;
+X		b->b_mtime = stbuf.st_mtime;
+X	}
+X}
+X
+X/* Find the file `fname' into buf and put in in window `w' */
+X
+Buffer *
+do_find(w, fname, force)
+register Window	*w;
+register char	*fname;
+X{
+X	register Buffer	*b;
+X
+X	b = file_exists(fname);
+X	if (b == 0) {
+X		b = mak_buf();
+X		setfname(b, fname);
+X		bufname(b);
+X		set_ino(b);
+X		b->b_ntbf = 1;
+X	}
+X	if (force) {
+X		Buffer	*oldb = curbuf;
+X
+X		SetBuf(b);	/* this'll read the file */
+X		SetBuf(oldb);
+X	}
+X	if (w)
+X		tiewind(w, b);
+X	return b;
+X}
+X
+X/* set alternate buffer */
+X
+void
+SetABuf(b)
+Buffer	*b;
+X{
+X	if (b != 0)
+X		lastbuf = b;
+X}
+X
+X
+X/* check to see if BP is a valid buffer pointer */
+int
+valid_bp(bp)
+register Buffer	*bp;
+X{
+X	register Buffer	*b;
+X
+X	for (b = world; b != 0; b = b->b_next)
+X		if (b == bp)
+X			break;
+X	return b != 0;
+X}
+X
+void
+SetBuf(newbuf)
+register Buffer	*newbuf;
+X{
+X	register Buffer	*oldb = curbuf,
+X			*b;
+X
+X	if (newbuf == curbuf || newbuf == 0)
+X		return;
+X
+X	if (!valid_bp(newbuf))
+X		complain("Internal error: (0x%x) is not a valid buffer pointer!", newbuf);
+X	lsave();
+X	curbuf = newbuf;
+X	curline = newbuf->b_dot;
+X	curchar = newbuf->b_char;
+X	getDOT();
+X	/* do the read now ... */
+X	if (curbuf->b_ntbf)
+X		read_file(curbuf->b_fname, 0);
+X#ifdef MAC
+X	Modechange = 1;
+X#endif
+X
+X#ifdef IPROCS
+X	if (oldb != 0 && ((oldb->b_process == 0) != (curbuf->b_process == 0))) {
+X		if (curbuf->b_process)
+X			PushPBs();		/* Push process bindings */
+X		else if (oldb->b_process)
+X			PopPBs();
+X	}
+X#endif
+X}
+X
+Buffer *
+do_select(w, name)
+register Window	*w;
+register char	*name;
+X{
+X	register Buffer	*new;
+X
+X	if ((new = buf_exists(name)) == 0) {
+X		new = mak_buf();
+X		setfname(new, (char *) 0);
+X		setbname(new, name);
+X	}
+X	if (w)
+X		tiewind(w, new);
+X	return new;
+X}
+END_OF_FILE
+if test 13403 -ne `wc -c <'./buf.c'`; then
+    echo shar: \"'./buf.c'\" unpacked with wrong size!
+fi
+# end of './buf.c'
+fi
+if test -f './doc/jove.3' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'./doc/jove.3'\"
+else
+echo shar: Extracting \"'./doc/jove.3'\" \(13470 characters\)
+sed "s/^X//" >'./doc/jove.3' <<'END_OF_FILE'
+X.NH 1
+Directory Handling
+X.XS \n(PN
+X\*(SN Directory Handling
+X.XE
+X.LP
+To save having to use absolute pathnames when you want to edit a nearby file
+X\s-2JOVE\s0 allows you to move around the
+X.UX
+filesystem just as the c-shell does.
+These commands are:
+X.IP "cd dir" 15n
+Change to the specified directory.
+X.IP "pushd [dir]"
+Like \fIcd\fP, but save the old directory on the directory stack.
+With no directory argument, simply exchange the top two directories
+on the stack and \fIcd\fP to the new top.
+X.IP "popd"
+Take the current directory off the stack and \fIcd\fP to the directory now
+at the top.
+X.IP "dirs"
+Display the contents of the directory stack.
+X.LP
+The names and behavior of these commands were chosen to mimic those in the c-shell.
+X.NH 1
+Editing C Programs
+X.XS \n(PN
+X\*(SN Editing C Programs
+X.XE
+X.LP
+This section details the support provided by \s-2JOVE\s0
+for working on C programs.
+X.NH 2
+Indentation Commands
+X.XS \n(PN 5n
+X\*(SN Indentation Commands
+X.XE
+X.LP
+To save having to lay out C programs "by hand", \s-2JOVE\s0
+has an idea of the correct indentation of a line,
+based on the surrounding context.
+When you are in C Mode, \s-2JOVE\s0 treats tabs specially \(em
+typing a tab at the beginning of a new line means "indent to
+the right place".
+Closing braces are also handled specially, and are indented
+to match the corresponding open brace.
+X.NH 2
+Parenthesis and Brace Matching
+X.XS \n(PN 5n
+X\*(SN Parenthesis and Brace Matching
+X.XE
+X.LP
+To check that parentheses and braces match the way you think they do,
+turn on \fIShow Match\fP mode (ESC X show-match-mode).  Then, whenever
+you type a close brace or parenthesis, the cursor moves momentarily to
+the matching opener, if it's currently visible.  If it's not visible,
+X\s-2JOVE\s0 displays the line containing the matching opener on the message
+line.
+X.NH 2
+C Tags
+X.XS \n(PN 5n
+X\*(SN C Tags
+X.XE
+X.LP
+Often when you are editing a C program,
+especially someone else's code,
+you see a function call and wonder what that function does.
+You then search for the function within the current file and if you're
+lucky find
+the definition, finally returning to the original spot when you are done.
+However, if are unlucky, the function turns out to be external
+X(defined in another file) and
+you have to suspend the edit,
+X\fIgrep\fP for the function name in every .c that might contain it,
+and finally visit the appropriate file.
+X.LP
+To avoid this diversion or the need to remember which
+function is defined in which file,
+Berkeley 
+X.UX
+has a program called \fIctags(1)\fP, which
+takes a set of source files and looks for function
+definitions, producing a file called \fItags\fP as its output.
+X.LP
+X\s-2JOVE\s0 has a command called C-X T (\fIfind-tag\fP)
+that prompts you for the name of a function (a \fItag\fP), looks up
+the tag reference in the previously constructed tags file, 
+then visits the file containing that tag in a new buffer,
+with point positioned at the definition of the function.
+There is another version of this command, namely \fIfind-tag-at-point\fP,
+that uses the identifier at 
+X.I point.
+X.LP
+So, when you've added new functions to a module, or moved some old
+ones around, run the \fIctags\fP program to regenerate the \fItags\fP file.
+X\s-2JOVE\s0 looks in the file specified in the \fItag-file\fP variable.  The
+default is "./tags", that is, the tag file in the current directory.  If you
+wish to use an alternate tag file, you use C-U\ C-X\ T, and \s-2JOVE\s0 will
+prompt for a file name.  If you find yourself specifying the same file again
+and again, you can set \fItag-file\fP to that file, and run
+X\fIfind-tag\fP with no numeric argument.
+X.LP
+To begin an editing session looking for a particular tag, use
+the \fI\-t tag\fP command line option to \s-2JOVE\s0.
+For example, say you wanted to look at the file containing the tag
+X\fISkipChar\fP, you would invoke \s-2JOVE\s0 as:
+X.DS I
+X.I
+X% jove \-t SkipChar
+X.R
+X.DE
+X.NH 2
+Compiling Your Program
+X.XS \n(PN 5n
+X\*(SN Compiling Your Program
+X.XE
+X.LP
+You've typed in a program or altered an existing one and now you
+want to run it through the compiler to check for errors.
+To save having to suspend the edit,
+run the compiler,
+scribble down error messages, and then resume the edit,
+X\s-2JOVE\s0 allows you to compile your code while in the editor.
+This is done with the C-X C-E (\fIcompile-it\fP) command.
+If you run \fIcompile-it\fP with no argument
+it runs the
+X.UX
+X\fImake\fP
+program into a buffer;
+If you need a special command or want to pass arguments to \fImake\fP,
+run \fIcompile-it\fP with any argument (C-U is good enough) and you
+will be prompted for the command to execute.
+X.LP
+If any error messages are produced, they are treated specially by \s-2JOVE\s0.
+That treatment is the subject of the next section.
+X.NH 2
+Error Message Parsing and Spelling Checking
+X.XS \n(PN
+X\*(SN Error Message Parsing
+X\*(SN Spelling Checking
+X.XE
+X.LP
+X\s-2JOVE\s0 knows how to interpret the error messages from many
+X.UX
+commands;
+In particular,
+the messages from \fIcc\fP,
+X\fIgrep\fP and \fIlint\fP can be understood.
+After running the \fIcompile-it\fP command,
+the \fIparse-errors\fP command is automatically executed,
+and any errors found are displayed in a new buffer.
+The files whose names are found in parsing the error messages are each
+brought into \s-2JOVE\s0 buffers and the point is positioned at the first error
+in the first file.
+The commands \fIcurrent-error\fP, C-X C-N (\fInext-error\fP), and
+C-X C-P (\fIprevious-error\fP)
+can be used to traverse the list of errors.
+X.LP
+If you already have a file called
+X\fIerrs\fP containing, say, c compiler messages then you can get \s-2JOVE\s0 to interpret the messages by
+invoking it as:
+X.DS I
+X.I
+X% jove \-p errs
+X.R
+X.DE
+X.LP
+X\s-2JOVE\s0 has a special mechanism for checking the the spelling of a document;
+It runs the
+X.UX
+spell program into a buffer.
+You then delete from this buffer all those words that are not spelling
+errors and then \s-2JOVE\s0 runs the \fIparse-spelling-errors\fP command to
+yield a list of errors just as in the last section.
+X.NH 1
+Simple Customization
+X.XS \n(PN
+X\*(SN Simple Customization
+X.XE
+X.LP
+X.NH 2
+Major Modes
+X.XS \n(PN 5n
+X\*(SN Major Modes
+X.XE
+X.LP
+To help with editing particular types of file, say a paper or a C program,
+X\s-2JOVE\s0 has several \fImajor modes\fP.
+These are as follows:
+X.NH 3
+Text mode
+X.XS \n(PN 10n
+X\*(SN Text mode
+X.XE
+X.LP
+This is the default major mode.  Nothing special is done.
+X.NH 3
+C mode
+X.XS \n(PN 10n
+X\*(SN C mode
+X.XE
+X.LP
+This mode affects the behavior of the tab and parentheses characters.
+Instead of just inserting the tab, \s-2JOVE\s0 determines
+where the text "ought" to line up for the C language and tabs to that position
+instead.  The same thing happens with the close brace and close parenthesis;
+they are tabbed to the "right" place and then inserted.
+Using the \fIauto-execute-command\fP command, you can make \s-2JOVE\s0 enter
+X\fIC Mode\fP whenever you edit a file whose name ends in \fI.c\fP.
+X.NH 3
+Lisp mode
+X.XS \n(PN 10n
+X\*(SN Lisp mode
+X.XE
+X.LP
+This mode is analogous to \fIC Mode\fP,
+but performs the indentation needed to lay out Lisp programs properly.
+Note also the \fIgrind-s-expr\fP command that prettyprints an
+X\fIs-expression\fP and the \fIkill-mode-expression\fP command.
+X.NH 2
+Minor Modes
+X.XS \n(PN 5n
+X\*(SN Minor Modes
+X.XE
+X.LP
+In addition to the major modes,
+X\s-2JOVE\s0 has a set of minor modes.
+These are as follows:
+X.NH 3
+Auto Indent
+X.XS \n(PN 10n
+X\*(SN Auto Indent
+X.XE
+X.LP
+In this mode,
+X\s-2JOVE\s0 indents each line the same way as that above it.  That is,
+the Return key in this mode acts as the Linefeed key ordinarily does.
+X.NH 3
+Show Match
+X.XS \n(PN 10n
+X\*(SN Show Match
+X.XE
+X.LP
+Move the cursor momentarily to the matching opening parenthesis when a closing
+parenthesis is typed.
+X.NH 3
+Auto Fill
+X.XS \n(PN 10n
+X\*(SN Auto Fill
+X.XE
+X.LP
+In \fIAuto Fill\fP mode,
+a newline is automatically inserted when the line length
+exceeds the right margin.
+This way,
+you can type a whole paper without having to use the Return key.
+X.NH 3
+Over Write
+X.XS \n(PN 10n
+X\*(SN Over Write
+X.XE
+X.LP
+In this mode,
+any text typed in will replace the previous contents.
+X(The default is for new text to be inserted and "push" the old along.)
+This is useful for editing an already-formatted diagram in which you
+want to change some things without moving other things around on the
+screen.
+X.NH 3
+Word Abbrev
+X.XS \n(PN 10n
+X\*(SN Word Abbrev
+X.XE
+X.LP
+In this mode, every word you type is compared to a list of word
+abbreviations; whenever you type an abbreviation, it is replaced
+by the text that it abbreviates.
+This can save typing if a particular word or phrase must be entered
+many times.
+The abbreviations and their expansions are held in a file that looks like:
+X.DS I
+abbrev:phrase
+X.DE
+This file can be set up in your \fI~/.\|joverc\fP with the \fIread-word-abbrev-file\fP command.
+Then, whenever you are editing a buffer in \fIWord Abbrev\fP mode,
+X\s-2JOVE\s0 checks for the abbreviations you've given.
+See also the commands
+X\fIread-word-abbrev-file\fP,
+X\fIwrite-word-abbrev-file\fP,
+X\fIedit-word-abbrevs\fP,
+X\fIdefine-global-word-abbrev\fP,
+X\fIdefine-mode-word-abbrev\fP,
+and \fIbind-macro-to-word-abbrev\fP,
+and the variable \fIauto-case-abbrev\fP.
+X.NH 2
+Variables
+X.XS \n(PN 5n
+X\*(SN Variables
+X.XE
+X.LP
+X\s-2JOVE\s0 can be tailored to suit your needs by changing the
+values of variables.
+A \s-2JOVE\s0 variable can be given a value with the \fIset\fP command,
+and its value displayed with the \fIprint\fP command.
+X.LP
+The variables \s-2JOVE\s0 understands are listed along with the commands
+in the alphabetical list at the end of this document.
+X.NH 2
+Key Re-binding
+X.XS \n(PN 5n
+X\*(SN Key Re-binding
+X.XE
+X.LP
+Many of the commands built into \s-2JOVE\s0 are not bound to
+specific keys.
+The command handler in
+X\s-2JOVE\s0 is used to invoke these commands and is activated
+by the \fIexecute-extended-command\fP command (ESC X).
+When the name of a command typed in is unambiguous,
+that command will be executed.
+Since it is very slow to have
+to type in the name of each command every time it is needed,
+X\s-2JOVE\s0 makes it possible to \fIbind\fP commands to keys.
+When a command is
+X\fIbound\fP to a key any future hits on that key will invoke that command.
+All the printing characters are initially bound to the
+command \fIself-insert\fP.
+Thus, typing any printing character causes it to be inserted into the text.
+Any of the existing commands can be bound to any key.
+X(A \fIkey\fP may actually be a \fIcontrol character\fP
+or an \fIescape sequence\fP as explained previously under
+X\fICommand Input Conventions\fP).
+X.LP
+Since there are more commands than there are keys,
+two keys are treated as \fIprefix\fP commands.
+When a key bound to one of the prefix commands is typed,
+the next character
+typed is interpreted on the basis that it was preceded by one of the
+prefix keys.
+Initially ^X and ESC are the prefix keys and
+many of the built in commands are initially bound to these "two stroke" keys.
+X(For historical reasons, the Escape key is often referred to as "Meta").
+X.NH 2
+Keyboard Macros
+X.XS \n(PN 5n
+X\*(SN Keyboard Macros
+X.XE
+X.LP
+Although \s-2JOVE\s0 has many powerful commands,
+you often find that you have a task that no individual command can do.
+X\s-2JOVE\s0 allows you to define your own commands from sequences
+of existing ones "by example";
+Such a sequence is termed a \fImacro\fP.
+The procedure is as follows:
+First you type the \fIstart-remembering\fP command,
+usually bound to C-X (.
+Next you "perform" the commands which as they are being executed are
+also 
+remembered, which will constitute the body of the macro.
+Then you give the \fIstop-remembering\fP command, usually bound to
+C-X ).
+You now have a \fIkeyboard macro\fP.
+To run this command sequence again,
+use the command \fIexecute-keyboard-macro\fP, usually bound to
+C-X E.
+You may find this bothersome to type and re-type,
+so there is a way to bind the macro to a key.
+First,
+you must give the keyboard macro a name using the
+X\fIname-keyboard-macro\fP command.
+Then the binding is made with the \fIbind-macro-to-key\fP command.
+We're still not finished because all this hard work will be lost
+if you leave \s-2JOVE\s0.
+What you do is to save your macros into a file
+with the \fIwrite-macros-to-file\fP command.
+To retrieve your macros in the next editing session (but not their bindings),
+you can simply execute the \fIsource\fP command on that file.
+X.NH 2
+Initialization Files
+X.XS \n(PN 5n
+X\*(SN Initialization Files
+X.XE
+X.LP
+Users will likely want to modify the default key bindings to their liking.
+Since it would be quite annoying to have to set up the bindings
+each time \s-2JOVE\s0 is started up,
+X\s-2JOVE\s0 has the ability to read in a "startup" file.
+Whenever \s-2JOVE\s0 is started,
+it reads commands from the file \fI.\|joverc\fP in the user's home directory.
+These commands are read as
+if they were typed to the command handler (ESC X) during an edit.
+There can be only one command per line in the startup file.
+If there is a file \fI/usr/lib/jove/joverc\fP,
+then this file will be read before the user's
+X.I .\|joverc
+file.
+This can be used to set up a system-wide default startup mode for
+X\s-2JOVE\s0
+that is tailored to the needs of that system.
+X.LP
+The \fIsource\fP command can be used to read commands from a specified file
+at any time during an editing session,
+even from inside the \fI.\|joverc\fP file.
+This means that a macro can be used to change the key bindings,
+e.g., to enter a mode,
+by reading from a specified file which contains all the necessary bindings.
+END_OF_FILE
+if test 13470 -ne `wc -c <'./doc/jove.3'`; then
+    echo shar: \"'./doc/jove.3'\" unpacked with wrong size!
+fi
+# end of './doc/jove.3'
+fi
+if test -f './paragraph.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'./paragraph.c'\"
+else
+echo shar: Extracting \"'./paragraph.c'\" \(14011 characters\)
+sed "s/^X//" >'./paragraph.c' <<'END_OF_FILE'
+X/***************************************************************************
+X * This program is Copyright (C) 1986, 1987, 1988 by Jonathan Payne.  JOVE *
+X * is provided to you without charge, and with no warranty.  You may give  *
+X * away copies of JOVE, including sources, provided that this notice is    *
+X * included in all the files.                                              *
+X ***************************************************************************/
+X
+X#include "jove.h"
+X
+X#ifdef MAC
+X#	undef private
+X#	define private
+X#endif
+X
+X#ifdef	LINT_ARGS
+private int	get_indent(Line *);
+private Line	* tailrule(Line *);
+X#else
+private int	get_indent();
+private Line	* tailrule();
+X#endif
+X
+X#ifdef MAC
+X#	undef private
+X#	define private static
+X#endif
+X
+X/* Thanks to Brian Harvey for this paragraph boundery finding algorithm.
+X   It's really quite hairy figuring it out.  This deals with paragraphs that
+X   are seperated by blank lines, lines beginning with a Period (assumed to
+X   be an nroff command), lines beginning with BackSlash (assumed to be Tex
+X   commands).  Also handles paragraphs that are separated by lines of
+X   different indent; and it deals with outdented paragraphs, too.  It's
+X   really quite nice.  Here's Brian's algorithm.
+X
+X   Definitions:
+X   
+X   THIS means the line containing the cursor.
+X   PREV means the line above THIS.
+X   NEXT means the line below THIS.
+X   
+X   BLANK means empty, empty except for spaces and tabs, starts with a period
+X   or a backslash, or nonexistent (because the edge of the buffer is
+X   reached).  ((BH 12/24/85 A line starting with backslash is blank only if
+X   the following line also starts with backslash.  This is so that \noindent
+X   is part of a paragraph, but long strings of TeX commands don't get
+X   rearranged.  It still isn't perfect but it's better.))
+X
+X   BSBLANK means BLANK or starts with a backslash.  (BH 12/24/85)
+X   
+X   HEAD means the first (nonblank) line of the paragraph containing THIS.
+X   BODY means all other (nonblank) lines of the paragraph.
+X   TAIL means the last (nb) line of the paragraph.  (TAIL is part of BODY.)
+X   
+X   HEAD INDENT means the indentation of HEAD.  M-J should preserve this.
+X   BODY INDENT means the indentation of BODY.  Ditto.
+X   
+X   Subprocedures:
+X   
+X   TAILRULE(BODYLINE)
+X   If BODYLINE is BLANK, the paragraph has only one line, and there is no
+X   BODY and therefore no TAIL.  Return.  Otherwise, starting from BODYLINE,
+X   move down until you find a line that either is BSBLANK or has a different
+X   indentation from BODYLINE.  The line above that different line is TAIL.
+X   Return.
+X   
+X   Rules:
+X   
+X   1.  If THIS is BLANK, which command are you doing?  If M-J or M-[, then go
+X   up to the first non-BLANK line and start over.  (If there is no non-BLANK
+X   line before THIS, ring the bell.)  If M-], then the first non-BLANK line
+X   below THIS is HEAD, and the second consecutive non-BSBLANK line (if any) is
+X   the beginning of BODY.  (If there is no non-BLANK line after THIS, ring
+X   the bell.)  Do TAILRULE(beginning-of-BODY).  Go to rule A.
+X
+X   2.  If PREV is BLANK or THIS is BSBLANK, then THIS is HEAD, and NEXT (if
+X   not BSBLANK) is in BODY.  Do TAILRULE(NEXT).  Go to rule A.
+X
+X   3.  If NEXT is BSBLANK, then THIS is TAIL, therefore part of BODY.  Go to
+X   rule 5 to find HEAD.
+X   
+X   4.  If either NEXT or PREV has the same indentation as THIS, then THIS is
+X   part of BODY.  Do TAILRULE(THIS).  Go to rule 5 to find HEAD.  Otherwise,
+X   go to rule 6.
+X   
+X   5.  Go up until you find a line that is either BSBLANK or has a different
+X   indentation from THIS.  If that line is BLANK, the line below it is HEAD.
+X   If that line is non-BLANK, then call that new line THIS for what follows.
+X   If (the new) PREV has the same indent as THIS, then (the new) NEXT is
+X   HEAD.  If PREV has a different indent from THIS, then THIS is HEAD.  Go to
+X   rule A.
+X   
+X   6.  If you got here, then both NEXT and PREV are nonblank and are
+X   differently indented from THIS.  This is a tricky case and there is no
+X   guarantee that you're going to win.  The most straightforward thing to do
+X   is assume that we are not using hanging indentation.  In that case:
+X   whichever of PREV and THIS is indented further is HEAD.  Do
+X   TAILRULE(HEAD+1).  Go to rule A.
+X   
+X   6+.  A more complicated variant would be this: if THIS is indented further
+X   than PREV, we are using regular indentation and rule 6 applies.  If PREV
+X   is indented further than THIS, look at both NEXT and the line after NEXT.
+X   If those two lines are indented equally, and more than THIS, then we are
+X   using hanging indent, THIS is HEAD, and NEXT is the first line of BODY.
+X   Do TAILRULE(NEXT).  Otherwise, rule 6 applies.
+X   
+X   A.  You now know where HEAD and TAIL are.  The indentation of HEAD is HEAD
+X   INDENT; the indentation of TAIL is BODY INDENT.
+X   
+X   B.  If you are trying to M-J, you are now ready to do it.
+X   
+X   C.  If you are trying to M-], leave point after the newline that ends
+X   TAIL.  In other words, leave the cursor at the beginning of the line
+X   after TAIL.  It is not possible for this to leave point where it started
+X   unless it was already at the end of the buffer.
+X   
+X   D.  If you are trying to M-[, if the line before HEAD is not BLANK, then
+X   leave point just before HEAD.  That is, leave the cursor at the beginning
+X   of HEAD.  If the line before HEAD is BLANK, then leave the cursor at the
+X   beginning of that line.  If the cursor didn't move, go up to the first
+X   earlier non-BLANK line and start over.
+X
+X
+X   End of Algorithm.  I implemented rule 6+ because it seemed nicer.  */
+X
+int	RMargin = 78,
+X	LMargin = 0;
+Line	*para_head,
+X	*para_tail;
+int	head_indent,
+X	body_indent;
+static int	use_lmargin;
+X
+X/* some defines for paragraph boundery checking */
+X#define I_EMPTY		-1	/* line "looks" empty (spaces and tabs) */
+X#define I_PERIOD	-2	/* line begins with "." or "\" */
+X#define I_BUFEDGE	-3	/* line is nonexistent (edge of buffer) */
+X
+static int	bslash;		/* Nonzero if get_indent finds line starting
+X				   with backslash */
+X
+int
+i_bsblank(lp)
+Line	*lp;
+X{
+X	if (i_blank(lp))
+X		return 1;
+X	return bslash;
+X}
+X
+int
+i_blank(lp)
+Line	*lp;
+X{
+X	return (get_indent(lp) < 0);
+X}
+X
+private int
+get_indent(lp)
+register Line	*lp;
+X{
+X	Bufpos	save;
+X	register int	indent;
+X
+X	bslash = 0;
+X	if (lp == 0)
+X		return I_BUFEDGE;
+X	DOTsave(&save);
+X	SetLine(lp);
+X	if (blnkp(linebuf))
+X		indent = I_EMPTY;
+X 	else if (linebuf[0] == '.')
+X		indent = I_PERIOD;
+X	else if (linebuf[0] == '\\') {
+X		/* BH 12/24/85.  Backslash is BLANK only if next line
+X		   also starts with Backslash. */
+X		bslash += 1;
+X		SetLine(lp->l_next);
+X		if (linebuf[0] == '\\')
+X			indent = I_PERIOD;
+X		else
+X			indent = 0;
+X	} else {
+X		ToIndent();
+X		indent = calc_pos(linebuf, curchar);
+X	}
+X	SetDot(&save);
+X
+X	return indent;
+X}
+X
+private Line *
+tailrule(lp)
+register Line	*lp;
+X{
+X	int	i;
+X
+X	i = get_indent(lp);
+X	if (i < 0)
+X		return lp;	/* one line paragraph */
+X	do {
+X		if ((get_indent(lp->l_next) != i) || bslash)
+X			/* BH line with backslash is head of next para */
+X			break;
+X	} while ((lp = lp->l_next) != 0);
+X	if (lp == 0)
+X		complain((char *) 0);
+X	return lp;
+X}
+X
+X/* Finds the beginning, end and indent of the current paragraph, and sets
+X   the above global variables.  HOW says how to behave when we're between
+X   paragraphs.  That is, it's either FORWARD or BACKWARD depending on which
+X   way we're favoring. */
+X
+void
+find_para(how)
+X{
+X	Line	*this,
+X		*prev,
+X		*next,
+X		*head = 0,
+X		*body = 0,
+X		*tail = 0;
+X	int	this_indent;
+X	Bufpos	orig;		/* remember where we were when we started */
+X
+X	DOTsave(&orig);
+strt:
+X	this = curline;
+X	prev = curline->l_prev;
+X	next = curline->l_next;
+X	this_indent = get_indent(this);
+X
+X	if (i_blank(this)) {		/* rule 1 */
+X		if (how == BACKWARD) {
+X			while (i_blank(curline))
+X				if (firstp(curline))
+X					complain((char *) 0);
+X				else
+X					line_move(BACKWARD, 1, NO);
+X			goto strt;
+X		} else {
+X			while (i_blank(curline))
+X				if (lastp(curline))
+X					complain((char *) 0);
+X				else
+X					line_move(FORWARD, 1, NO);
+X			head = curline;
+X			next = curline->l_next;
+X			if (!i_bsblank(next))
+X				body = next;
+X			else
+X				body = head;
+X		}
+X	} else if (i_bsblank(this) || i_blank(prev)) {	/* rule 2 */
+X		head = this;
+X		if (!i_bsblank(next))
+X			body = next;
+X	} else if (i_bsblank(next)) {	/* rule 3 */
+X		tail = this;
+X		body = this;
+X	} else if ((get_indent(next) == this_indent) ||	/* rule 4 */
+X		   (get_indent(prev) == this_indent))
+X		body = this;
+X	else {		/* rule 6+ */
+X		if (get_indent(prev) > this_indent) {
+X			/* hanging indent maybe? */
+X			if ((next != 0) &&
+X			    (get_indent(next) == get_indent(next->l_next))) {
+X				head = this;
+X				body = next;
+X			}
+X		}
+X		/* Now we handle hanging indent else and the other
+X		   case of this_indent > get_indent(prev).  That is,
+X		   if we didn't resolve HEAD in the above if, then
+X		   we are not a hanging indent. */
+X		if (head == 0) {	/* still don't know */
+X			if (this_indent > get_indent(prev))
+X				head = this;
+X			else
+X				head = prev;
+X			body = head->l_next;
+X		}
+X	}
+X	/* rule 5 -- find the missing parts */
+X	if (head == 0) {    /* haven't found head of paragraph so do so now */
+X		Line	*lp;
+X		int	i;
+X
+X		lp = this;
+X		do {
+X			i = get_indent(lp->l_prev);
+X			if (i < 0)	/* is blank */
+X				head = lp;
+X			else if (i != this_indent || bslash) {
+X				Line	*this = lp->l_prev;
+X
+X				if (get_indent(this->l_prev) == i)
+X					head = this->l_next;
+X				else
+X					head = this;
+X			}
+X		} while (head == 0 && (lp = lp->l_prev) != 0);
+X		if (lp == 0)
+X			complain((char *) 0);
+X	}
+X	if (body == 0)		/* this must be a one line paragraph */
+X		body = head;
+X	if (tail == 0)
+X		tail = tailrule(body);
+X	if (tail == 0 || head == 0 || body == 0)
+X		complain("BUG! tail(%d),head(%d),body(%d)!", tail, head, body);
+X	para_head = head;
+X	para_tail = tail;
+X	head_indent = get_indent(head);
+X	body_indent = get_indent(body);
+X
+X	SetDot(&orig);
+X}
+X
+void
+Justify()
+X{
+X	use_lmargin = is_an_arg();
+X	find_para(BACKWARD);
+X	DoJustify(para_head, 0, para_tail, length(para_tail), NO,
+X		  use_lmargin ? LMargin : body_indent);
+X}
+X
+Line *
+max_line(l1, l2)
+Line	*l1,
+X	*l2;
+X{
+X	if (inorder(l1, 0, l2, 0))
+X		return l2;
+X	return l1;
+X}
+X
+Line *
+min_line(l1, l2)
+Line	*l1,
+X	*l2;
+X{
+X	if (inorder(l1, 0, l2, 0))
+X		return l1;
+X	return l2;
+X}
+X
+void
+RegJustify()
+X{
+X	Mark	*mp = CurMark(),
+X		*tailmark;
+X	Line	*l1 = curline,
+X		*l2 = mp->m_line;
+X	int	c1 = curchar,
+X		c2 = mp->m_char;
+X	Line	*rl1,
+X		*rl2;
+X
+X	use_lmargin = is_an_arg();
+X	(void) fixorder(&l1, &c1, &l2, &c2);
+X	do {
+X		DotTo(l1, c1);
+X		find_para(FORWARD);
+X		rl1 = max_line(l1, para_head);
+X		rl2 = min_line(l2, para_tail);
+X		tailmark = MakeMark(para_tail, 0, M_FLOATER);
+X		DoJustify(rl1, (rl1 == l1) ? c1 : 0, rl2,
+X			  (rl2 == l2) ? c2 : length(rl2),
+X			  NO, use_lmargin ? LMargin : body_indent);
+X		l1 = tailmark->m_line->l_next;
+X		DelMark(tailmark);
+X		c1 = 0;
+X	} while (l1 != 0 && l2 != rl2);
+X}
+X
+void
+do_rfill(ulm)
+X{
+X	Mark	*mp = CurMark();
+X	Line	*l1 = curline,
+X		*l2 = mp->m_line;
+X	int	c1 = curchar,
+X		c2 = mp->m_char;
+X
+X	use_lmargin = ulm;
+X	(void) fixorder(&l1, &c1, &l2, &c2);
+X	DoJustify(l1, c1, l2, c2, NO, use_lmargin ? LMargin : 0);
+X}
+X
+void
+do_space()
+X{
+X	int	c1 = curchar,
+X		c2 = c1,
+X		diff,
+X		nspace;
+X	char	ch;
+X
+X	while (c1 > 0 && ((ch = linebuf[c1 - 1]) == ' ' || ch == '\t'))
+X		c1 -= 1;
+X	while ((ch = linebuf[c2]) == ' ' || ch == '\t')
+X		c2 += 1;
+X	diff = (c2 - c1);
+X	curchar = c2;
+X
+X	if (diff == 0)
+X		return;
+X	if (c1 > 0) {
+X		int	topunct = c1 - 1;
+X
+X		nspace = 1;
+X		if (diff >= 2) {
+X			while (index("\")]", linebuf[topunct])) {
+X				if (topunct == 0)
+X					break;
+X				topunct -= 1;
+X			}
+X			if (index("?!.:", linebuf[topunct]))
+X				nspace = 2;
+X		}
+X	} else
+X		nspace = 0;
+X
+X	if (diff > nspace)
+X		del_char(BACKWARD, (diff - nspace));
+X	else if (diff < nspace)
+X		insert_c(' ', (nspace - diff));
+X}
+X
+X#ifdef MSDOS
+X/*#pragma loop_opt(off) */
+X#endif
+X
+void
+DoJustify(l1, c1, l2, c2, scrunch, indent)
+Line	*l1,
+X	*l2;
+X{
+X	int	okay_char = -1;
+X	char	*cp;
+X	Mark	*savedot = MakeMark(curline, curchar, M_FLOATER),
+X		*endmark;
+X
+X	(void) fixorder(&l1, &c1, &l2, &c2);	/* l1/c1 will be before l2/c2 */
+X	DotTo(l1, c1);
+X	if (get_indent(l1) >= c1) {
+X		if (use_lmargin) {
+X			n_indent(indent + (head_indent - body_indent));
+X			use_lmargin = 0;	/* turn this off now */
+X		}
+X		ToIndent();
+X	}
+X	endmark = MakeMark(l2, c2, M_FLOATER);
+X
+X	for (;;) {
+X		while (calc_pos(linebuf, curchar) < RMargin) {
+X			if (curline == endmark->m_line && curchar >= endmark->m_char)
+X				goto outahere;
+X			okay_char = curchar;
+X			if (eolp()) {
+X				del_char(FORWARD, 1);	/* Delete line separator. */
+X				ins_str("  ", NO);
+X			} else {
+X				cp = StrIndex(1, linebuf, curchar + 1, ' ');
+X				if (cp == 0)
+X					Eol();
+X				else
+X					curchar = (cp - linebuf);
+X			}
+X			do_space();
+X		}
+X		if (okay_char > 0)
+X			curchar = okay_char;			
+X		if (curline == endmark->m_line && curchar >= endmark->m_char)
+X			goto outahere;
+X
+X		/* Can't fit in small margin, so we do the best we can. */
+X		if (eolp()) {
+X			line_move(FORWARD, 1, NO);
+X			n_indent(indent);
+X		} else {
+X			DelWtSpace();
+X			LineInsert(1);
+X			if (scrunch && TwoBlank()) {
+X				Eol();
+X				del_char(FORWARD, 1);
+X			}
+X			n_indent(indent);
+X		}
+X	}
+outahere:
+X	ToMark(savedot);	/* Back to where we were */
+X	DelMark(endmark);	/* Free up marks */
+X	DelMark(savedot);
+X	this_cmd = last_cmd = 0; /* So everything is under control */
+X	f_mess("");
+X}
+X
+X#ifdef MSDOS
+X/*#pragma loop_opt() */
+X#endif
+X
+extern Line	*para_head,
+X		*para_tail;
+X
+void
+DoPara(dir)
+X{
+X	register int	num = arg_value(),
+X			first_time = TRUE;	
+X
+X	while (--num >= 0) {
+tryagain:	find_para(dir);		/* find paragraph bounderies */
+X		if ((dir == BACKWARD) &&
+X		    ((!first_time) || ((para_head == curline) && bolp()))) {
+X		    	if (bobp())
+X		    		complain((char *) 0);
+X			b_char(1);
+X			first_time = !first_time;
+X			goto tryagain;
+X		}
+X		SetLine((dir == BACKWARD) ? para_head : para_tail);
+X		if (dir == BACKWARD && !firstp(curline) &&
+X		    i_blank(curline->l_prev))
+X			line_move(BACKWARD, 1, NO);
+X		else if (dir == FORWARD) {
+X			if (lastp(curline)) {
+X				Eol();
+X				break;
+X			}
+X			/* otherwise */
+X			line_move(FORWARD, 1, NO);
+X		}
+X	}
+X}
+X
+void
+BackPara()
+X{
+X	DoPara(BACKWARD);
+X}
+X
+void
+ForPara()
+X{
+X	DoPara(FORWARD);
+X}
+END_OF_FILE
+if test 14011 -ne `wc -c <'./paragraph.c'`; then
+    echo shar: \"'./paragraph.c'\" unpacked with wrong size!
+fi
+# end of './paragraph.c'
+fi
+echo shar: End of archive 6 \(of 21\).
+cp /dev/null ark6isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 21 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

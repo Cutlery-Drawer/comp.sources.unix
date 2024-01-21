@@ -1,0 +1,1550 @@
+Subject:  v11i098:  Graphcs editor for Suns, Part02/06
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rs@uunet.UU.NET
+
+Submitted-by: steinmetz!sbcs!nyfca1!chan (Douglas Chan)
+Posting-number: Volume 11, Issue 98
+Archive-name: graphedit/part02
+
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Contents:  draw.c.shar1 /tmp/catshar
+ 
+echo x - draw.c.shar1
+sed 's/^@//' > "draw.c.shar1" <<'@//E*O*F draw.c.shar1//'
+
+static char SccsId[] = "@(#)draw.c	1.2 6/8/87 Copyright 1987 SBCS-chan";
+
+/*****************************************************************************
+
+          (c) Copyright 1987 
+
+          Lap-Tak Chan
+          Computer Science Department
+          State University of New York at Stony Brook
+          Stony Brook, NY 11794
+
+    This software and its documentation may be used, copied, and
+  distributed, provided that this legend appear in all copies and
+  that it is not copied or distributed for a profit.
+
+  No representations is made about the suitability of this software
+  for any purpose.  It is provided "as is" with no support and no
+  express or implied warranty.
+
+*****************************************************************************/
+
+/*****************************************************************************
+
+                         Graphic Editor
+                         ==============
+
+   This file contains all the editing routines in the graphic editor.
+
+*****************************************************************************/
+
+#include <math.h>
+#include <sys/param.h>
+#include <sun/fbio.h>
+#include <sys/types.h>
+#include <sys/dir.h>
+#include <strings.h>
+#include <errno.h>
+#include <sys/file.h>
+#include <suntool/sunview.h>
+#include <suntool/panel.h>
+#include <suntool/icon.h>
+#include "display.h"
+#include <stdio.h>
+#include <sys/file.h>
+#include <sunwindow/notify.h>
+#include <sys/time.h>
+
+static int newseg = GE_MIN_SEG, segopen=0, opensegment;
+static struct list *curr_dlist;
+static float xlist[100], ylist[100];
+static int pointcount;
+static float gridxintv=GE_DEFAULT_GRID, gridyintv=GE_DEFAULT_GRID;
+double sin(), cos();
+
+struct saveattr save_attr =
+  { 0,1,75,100, 1, 5, 5 };
+
+int segnam, pickid;
+Frame base_frame;
+static int basefd;
+
+static int align=0;
+static int show_sample=1;
+static char curr_dir[MAXPATHLEN];
+static int deleted[MAXUNDELETE];
+static int lastdeleted;
+static struct attr curr_attr;
+static int attr_changed;
+
+extern Panel_item text_filen, text_dirn, text_textstr;
+extern Panel_item menu_font, cycle_newseg, cycle_fill, cycle_cont;
+extern Panel_item menu_linestyle, slider_color, slider_linewidth, slider_charsize;
+extern int do_message();
+
+/*****************************************************************************
+
+    Main will initialize the display list, create the control pad and
+  SunCore view surface, create the attribute samples, and pass control
+  to window_main_loop to do all the editing.  When control is returned
+  after the control pad is quitted, it will call do_exit to terminate the
+  view surface and exit.
+
+*****************************************************************************/
+
+main(argc, argv)
+int argc;
+char *argv[];
+{
+    char frame_label[80]; /* label for control pad */
+
+    /* define icon for the control pad */
+    static short edit_icon_image[]={
+#include "images/graphedit.icon"
+    };
+    DEFINE_ICON_FROM_IMAGE(edit_icon, edit_icon_image);
+
+    /* initialize the display list */
+    ge_init_display();
+
+    /* create the Suncore view surface */
+    set_up_core(argv);
+
+    /* create the control pad */
+    sprintf(frame_label,"graphedit %s - control pad", GE_VERSION);
+    base_frame=(window_create(NULL, FRAME,
+                              WIN_SHOW,TRUE,
+                              FRAME_LABEL, frame_label,
+                              FRAME_ARGC_PTR_ARGV, &argc, argv,
+                              FRAME_ICON, &edit_icon,
+                              0));
+    basefd = ( int ) window_get(base_frame, WIN_FD);
+    make_control_panel(base_frame);
+
+    ge_make_samples();
+
+    /* start the interval timer for blinking the current segment */
+    start_timer(1);
+
+    /* initialize the data structure to undelete segments */
+    ge_init_undelete();
+
+    /* pass control to SunView */
+    window_main_loop(base_frame);
+
+    /* terminate the view surface */
+    do_exit();
+
+    /* done */
+    exit(0);
+
+} /* main */
+
+static int ge_client_id;
+static int *ge_id = &ge_client_id;
+
+/*****************************************************************************
+
+     ge_blinker is the real time timer handling routine to blink the
+  current segment.
+
+*****************************************************************************/
+
+Notify_value ge_blinker(id, which)
+int *id;
+int which;
+{
+  if ( segopen && (! curr_dlist->attr.deleted) && curr_dlist->attr.drawn )
+    ge_redisplay(curr_dlist);
+} /* ge_blinker */
+
+/*****************************************************************************
+
+    start_timer will start or stop the real time interval timer via the Sun
+  notifier to blink the current segment at two seconds intervals.
+
+  Input
+    start - whether to start blinking
+
+*****************************************************************************/
+
+start_timer(start)
+int start;
+{
+  struct itimerval timer;
+
+  if ( start ) {
+    /* start timer */
+    timer.it_interval.tv_usec = 0;
+    timer.it_interval.tv_sec = 2;
+    timer.it_value.tv_usec = 0;
+    timer.it_value.tv_sec =2;
+
+    (void) notify_set_itimer_func(ge_id, ge_blinker, ITIMER_REAL, &timer, 0);
+  }
+  else {
+    /* stop timer */
+    (void) notify_set_itimer_func(ge_id, ge_blinker, ITIMER_REAL, 0, 0);
+  }
+
+} /* start_timer */
+
+/*****************************************************************************
+
+    do_set_timer is the notify procedure for the blink current segment option.
+  It start/stop the timer according to the value of the option.
+
+  Input
+    value - value of the option
+
+*****************************************************************************/
+
+do_set_timer(item, value, event)
+Panel_item item;
+int value;
+Event *event;
+{
+
+  start_timer(value);
+
+} /* do_set_timer */
+
+/*****************************************************************************
+
+    make_new_seg is called to create a new segment and initialize the 
+  attributes of the segment.  When segno is 0, it will assign the next
+  segment number available and make it the current segment.
+
+  Input
+    segno - segment number for the created segment
+
+  Output
+    Return the segment number of the segment created
+
+*****************************************************************************/
+
+make_new_seg(segno)
+int segno;
+{
+    struct list *dlist, *ge_display_list();
+
+    /* assign the next segment number available and make it the current
+       segment when segno is 0 */
+    if ( ! segno ) {
+      opensegment = newseg++;
+      segno = opensegment;
+      segopen = TRUE;
+      attr_changed = 0;
+    }
+
+    /* add segment on display list */
+    ge_new_segment(segno);
+
+    /* initialize attributes for segment */
+    dlist=ge_display_list(segno);
+    dlist->attr.color=(int)panel_get_value(slider_color);
+    dlist->attr.linestyle=(int)panel_get_value(menu_linestyle);
+    dlist->attr.linewidth=(int)panel_get_value(slider_linewidth);
+    dlist->attr.font=(int)panel_get_value(menu_font);
+    dlist->attr.charsize=(int)panel_get_value(slider_charsize);
+    dlist->attr.drawn=0;
+    dlist->attr.deleted=0;
+    dlist->attr.tx=0.; dlist->attr.ty=0.;
+    dlist->attr.sx=1.; dlist->attr.sy=1.;
+    dlist->attr.ang=0.;
+
+    /* update reference to the current segment */
+    if ( segno >= GE_MIN_SEG ) {
+      curr_dlist=dlist;
+      curr_attr = dlist->attr;
+    }
+
+    /* return segment number */
+    return(segno);
+
+} /* make_new_seg */
+
+/*****************************************************************************
+
+    do_new_seg will create a new segment with an assigned segment number
+  and give message in the panel.
+
+*****************************************************************************/
+
+do_new_seg()
+{
+    make_new_seg(0);
+    do_message("New segment created.");
+    do_usage("","","");
+} /* do_new_seg */
+
+/*****************************************************************************
+
+    unxform will determine the coordinate of a point from which a world
+  coordinate is transformed according to the transformation of the current
+  segment.
+
+  Input
+    x,y - world coordinate
+
+  Output
+    ux,uy - coordinate relative to current segment
+
+*****************************************************************************/
+
+unxform(x,y,ux,uy)
+float x,y, *ux, *uy;
+{
+    float sina, cosa;
+
+    sina=sin((double)curr_dlist->attr.ang);
+    cosa=cos((double)curr_dlist->attr.ang);
+    *ux=((x-curr_dlist->attr.tx)*cosa + (y-curr_dlist->attr.ty)*sina)
+        /curr_dlist->attr.sx;
+    *uy=((y-curr_dlist->attr.ty)*cosa - (x-curr_dlist->attr.tx)*sina)
+        /curr_dlist->attr.sy;
+
+} /* unxform */
+
+/*****************************************************************************
+
+    ge_initdraw do the necessary initializion before a primitive can be
+  added.  It create a new segment if necessary, flush previous mouse
+  input, and update the attributes of the current segment if they are
+  different from the attributes chosen.
+
+*****************************************************************************/
+
+ge_initdraw()
+{
+  struct attr newattr;
+
+  /* create new segment if necessary */
+  if ( (! segopen) || (int)panel_get_value(cycle_newseg))
+    do_new_seg();
+
+  /* flush previous mouse input */
+  ge_flush();
+
+  /* clear any previous message */
+  do_message("");
+
+  /* update any changed attributes */
+  if ( attr_changed ) {
+
+    /* get attributes chosen */
+    newattr.color=(int)panel_get_value(slider_color);
+    newattr.linestyle=(int)panel_get_value(menu_linestyle);
+    newattr.linewidth=(int)panel_get_value(slider_linewidth);
+    newattr.font=(int)panel_get_value(menu_font);
+    newattr.charsize=(int)panel_get_value(slider_charsize);
+
+    /* update attributes */
+    if ( newattr.color != curr_attr.color ) {
+      ge_graph(opensegment, GE_SETCOLOR, (float)newattr.color, 0.);
+      curr_attr.color = newattr.color;
+    }
+    if ( newattr.linestyle != curr_attr.linestyle ) {
+      ge_graph(opensegment, GE_SETTYPELINE, (float)newattr.linestyle, 0.);
+      curr_attr.linestyle = newattr.linestyle;
+    }
+    if ( newattr.linewidth != curr_attr.linewidth ) {
+      ge_graph(opensegment, GE_SETLINEWIDTH, (float)newattr.linewidth, 0.);
+      curr_attr.linewidth = newattr.linewidth;
+    }
+    if ( newattr.font != curr_attr.font ) {
+      ge_graph(opensegment, GE_SETFONT, (float)newattr.font, 0.);
+      curr_attr.font = newattr.font;
+    }
+    if ( newattr.charsize != curr_attr.charsize ) {
+      ge_graph(opensegment, GE_SETCHARSIZE, (float)newattr.charsize, 0.);
+      curr_attr.charsize = newattr.charsize;
+    }
+
+    attr_changed = 0;
+  } /* if */
+
+} /* ge_initdraw */
+
+/*****************************************************************************
+
+    do_text is used to add text primitive to the current segment.  The content
+  of the text is supposed to be in the text field on the control pad.  It will
+  ask for the position to put the text.
+
+*****************************************************************************/
+
+do_text()
+{
+    int butnum;
+    float x, y, ux, uy;
+    char *string;
+    int length;
+
+    /* get text from text field on control pad */
+    string=(char *)panel_get_value(text_textstr);
+
+    /* abort if text field is empty */
+    if ( string[0] == '\0' ) {
+      do_message("Empty text.");
+      return;
+    }
+
+    /* initialize for primitive */
+    ge_initdraw();
+
+    /* get position to put text */
+    do_usage("Put Text", "", "Cancel");
+    do {
+        ge_locator(1,&butnum, &x, &y);
+	if (butnum == 3) return(0);
+        ge_align(&x, &y);
+    } while (butnum != 1);
+    unxform(x,y,&ux,&uy);
+
+    /* add primitive to display list of segment */
+    ge_graph(opensegment, GE_MOVE, ux, uy);
+    ge_graph(opensegment, GE_TEXT,
+      (float)((int)strcpy((char *)malloc(strlen(string)),string)), 0.);
+
+    /* redraw segment */
+    ge_draw(opensegment);
+
+    /* clear usage */
+    do_usage("","","");
+
+    /* repeat if continous option is on */
+    if ( panel_get_value(cycle_cont) ) do_text();
+
+} /* do_text */
+
+/*****************************************************************************
+
+    do_rect is used to add a rectangle to the current segment.  It will ask
+  for the diagonal corners of the rectangle.
+ 
+*****************************************************************************/
+
+do_rect()
+{
+    int butnum, tmp;
+    float c1x, c1y, c2x, c2y, u1x, u1y, u2x, u2y, u3x, u3y, u4x, u4y;
+
+    /* initialize to add primitive */
+    ge_initdraw();
+
+    /* ask for first corner */
+    do_usage("Corner", "", "Cancel");
+    do {
+        ge_locator(1,&butnum, &c1x, &c1y);
+        if (butnum == 3) return(0);
+    } while (butnum != 1);
+    ge_align(&c1x, &c1y);
+
+    /* ask for the diagonal corners */
+    do_usage("", "", "Done");
+    ge_locator(-1,&butnum, &c2x, &c2y);
+    ge_align(&c2x, &c2y);
+    do {
+      /* draw current rectangle */
+      ge_tmp_new(c1x, c1y, curr_attr);
+      ge_tmp_line(c1x, c2y);
+      ge_tmp_line(c2x, c2y);
+      ge_tmp_line(c2x, c1y);
+      ge_tmp_line(c1x, c1y);
+      /* get location of other corner */
+      ge_locator(-1,&butnum, &c2x, &c2y);
+      ge_align(&c2x, &c2y);
+      ge_tmp_delete();
+    } while ( butnum != 3 );
+
+    /* get coordinates of the four corners for the current segment */
+    unxform(c1x, c1y, &u1x, &u1y);
+    unxform(c1x, c2y, &u2x, &u2y);
+    unxform(c2x, c2y, &u3x, &u3y);
+    unxform(c2x, c1y, &u4x, &u4y);
+
+    /* check when retangle has to be filled */
+    tmp = (int)panel_get_value(cycle_fill);
+    if ( tmp )
+      ge_graph(opensegment, GE_FILL, (float)tmp, 0.);
+
+    /* add rectangle to current segment as polygon */
+    ge_graph(opensegment, GE_POLYGON, u1x, u1y);
+    ge_graph(opensegment, GE_CONT, u2x, u2y);
+    ge_graph(opensegment, GE_CONT, u3x, u3y);
+    ge_graph(opensegment, GE_CONT, u4x, u4y);
+    ge_draw(opensegment);
+
+    do_usage("","","");
+
+    /* repeat if continous option is on */
+    if ( panel_get_value(cycle_cont) ) do_rect();
+
+} /* do_rect */
+
+/*****************************************************************************
+
+    do_arc is used to add an arc to the current segment.  It will ask for
+  the two end points of the arc and a third point which the arc will pass
+  through.
+
+*****************************************************************************/
+
+do_arc()
+{
+  int butnum;
+  float x1, y1, x2, y2, x3, y3, x, y;
+  float ux1, uy1, ux2, uy2, ux3, uy3, radius, ang1, ang2, angs1, angs2, tmp;
+  extern float ge_radius2();
+  struct list *arc_dlist;
+  static int drawn  = 0;
+
+  /* initailize to add primitive */
+  ge_initdraw();
+
+  /* ask for start point */
+  do_usage("Start Point", "", "Cancel");
+  do {
+    ge_locator(1,&butnum, &x1, &y1);
+    if (butnum == 3) return(0);
+    ge_align(&x1,&y1);
+  } while (butnum != 1);
+  unxform(x1,y1,&ux1,&uy1);
+
+  /* ask for end point */
+  do_usage("End point", "", "Cancel");
+  do {
+    x2=x1;
+    y2=y1;
+    ge_locator(2,&butnum, &x2, &y2);
+    if (butnum == 3) return(0);
+  } while (butnum != 1);
+  ge_align(&x2, &y2);
+  unxform(x2,y2,&ux2,&uy2);
+
+  /* ask for where the arc will pass */
+  do_usage("","","Done");
+  do {
+    /* create sample */
+    if ( drawn )
+      ge_delete_segment(GE_ARC_SAMPLE);
+    make_new_seg(GE_ARC_SAMPLE);
+
+    /* set attributes of sample */
+    arc_dlist=ge_display_list(GE_ARC_SAMPLE);
+    arc_dlist->attr=curr_dlist->attr;
+    arc_dlist->attr.linestyle = curr_attr.linestyle;
+    arc_dlist->attr.linewidth = curr_attr.linewidth;
+    arc_dlist->attr.drawn = drawn;
+
+    /* get location of mouse where the three points together can
+       form an arc */
+    do {
+      ge_locator(-1,&butnum, &x3, &y3);
+      ge_align(&x3,&y3);
+      unxform(x3,y3,&ux3,&uy3);
+      radius=ge_radius2(ux1,uy1,ux3,uy3,ux2,uy2,&x,&y);
+    } while ( radius == 0. );
+
+    /* determine the start and end angles of the start and
+       end points */
+    ang1=atan2((double)(uy1-y), (double)(ux1-x));
+    ang2=atan2((double)(uy2-y), (double)(ux2-x));
+
+    /* make sure the angles are in the range of 0 and 2PI */
+    if (ang1 < 0.) ang1 += 2*PI;
+    if (ang2 < 0.) ang2 += 2*PI;
+
+    /* check whether the arc is clockwise or counterclockwise from
+       the angles between the two lines */
+    angs1=atan2((double)(uy3-uy1),(double)(ux3-ux1));
+    angs2=atan2((double)(uy2-uy3),(double)(ux2-ux3));
+    tmp = angs2-angs1;
+
+    /* swap the angles if the arc is clockwise */
+    if ( (tmp > PI) ||
+         (tmp < 0 && tmp > -PI) ) {
+      tmp=ang1;
+      ang1=ang2;
+      ang2=tmp;
+    }
+
+    /* draw sample arc */
+    ge_graph(GE_ARC_SAMPLE, GE_MOVE, x, y);
+    ge_graph(GE_ARC_SAMPLE, GE_ARC, ang1, ang2);
+    ge_graph(GE_ARC_SAMPLE, GE_ARCEXT, radius, 0.);
+    ge_draw(GE_ARC_SAMPLE);
+    drawn = 1;
+  } while (butnum != 3);
+
+  /* delete sample */
+  arc_dlist->attr.deleted=1;
+  ge_draw(GE_ARC_SAMPLE);
+
+  /* add arc primitive to current segment */
+  ge_graph(opensegment, GE_MOVE, x, y);
+  ge_graph(opensegment, GE_ARC, ang1, ang2);
+  ge_graph(opensegment, GE_ARCEXT, radius, 0.);
+  ge_draw(opensegment);
+
+  do_usage("","","");
+
+  /* repeat if continous mode is on */
+  if ( panel_get_value(cycle_cont) ) do_arc();
+
+} /* do_arc */
+
+/*****************************************************************************
+
+    do_draw_circle is used to add a circle or ellipse primitive to the
+  current segment.  It will ask for the center of the circle/ellipse.
+  Then it will ask for where the circle/ellipse will pass through while
+  drawing the circle for the current location of the mouse.
+
+  Input
+    instr - either GE_CIRCLE or GE_ELLIPSE to indicate what it is drawing
+
+*****************************************************************************/
+
+do_draw_circle(instr)
+int instr;
+{
+    int butnum, tmp;
+    float cx, cy, x, y, ux, uy, ux2, uy2, x2, y2, radius, a, b;
+    float sina, cosa, sqrt2;
+    struct list *cir_dlist;
+
+    /* initialize to add primitive */
+    ge_initdraw();
+
+    /* ask for center */
+    do_usage("Center", "", "Cancel");
+    do {
+        ge_locator(1,&butnum, &x, &y);
+        if (butnum == 3) return(0);
+        ge_align(&x,&y);
+    } while (butnum != 1);
+    unxform(x,y,&ux,&uy);
+
+    /* create sample circle if it is not there yet */
+    if ( ! (cir_dlist=ge_display_list(GE_CIRCLE_SAMPLE)) ){
+      float i;
+
+      make_new_seg(GE_CIRCLE_SAMPLE);
+      cir_dlist=ge_display_list(GE_CIRCLE_SAMPLE);
+      ge_graph(GE_CIRCLE_SAMPLE,GE_MOVE, 0.,0.);
+      ge_graph(GE_CIRCLE_SAMPLE,GE_CIRCLE, GE_DEFAULT_RADIUS, 0.);
+    }
+
+    /* set the attributes for the sample circle */
+    cir_dlist->attr.ang=curr_dlist->attr.ang;
+    cir_dlist->attr.linestyle=curr_dlist->attr.linestyle;
+    cir_dlist->attr.linewidth=curr_dlist->attr.linewidth;
+    cir_dlist->attr.deleted=0;
+    sina = sin((double)curr_dlist->attr.ang);
+    cosa = cos((double)curr_dlist->attr.ang);
+
+    /* get location of mouse */
+    ge_locator(-1,&butnum, &x2, &y2);
+    ge_align(&x2, &y2);
+    unxform(x2,y2,&ux2,&uy2);
+
+    /* draw circle/ellipse passing through location */
+    if ( (instr == GE_CIRCLE) ) {
+      radius=sqrt((double)((ux2-ux)*(ux2-ux)+(uy2-uy)*(uy2-uy)));
+      if ( radius < 1.0 ) radius=1.0;
+      cir_dlist->attr.sx=curr_dlist->attr.sx*radius/GE_DEFAULT_RADIUS;
+      cir_dlist->attr.sy=curr_dlist->attr.sy*radius/GE_DEFAULT_RADIUS;
+      cir_dlist->attr.tx = x;
+      cir_dlist->attr.ty = y;
+    }
+    else {
+      sqrt2 = sqrt((double)2.);
+      a=fabs((double)(ux2-ux))*sqrt2;
+      b=fabs((double)(uy2-uy))*sqrt2;
+      if (a < 1.0) a=1.0;
+      if (b < 1.0) b=1.0;
+      cir_dlist->attr.sx=curr_dlist->attr.sx*a/GE_DEFAULT_RADIUS;
+      cir_dlist->attr.sy=curr_dlist->attr.sy*b/GE_DEFAULT_RADIUS;
+      cir_dlist->attr.ang=curr_dlist->attr.ang;
+      cir_dlist->attr.tx = x;
+      cir_dlist->attr.ty = y;
+    }
+    ge_draw(GE_CIRCLE_SAMPLE);
+
+
+    do_usage("","","Done");
+
+    do {
+
+      /* get current location */
+      ge_locator(-1,&butnum, &x2, &y2);
+      ge_align(&x2, &y2);
+      unxform(x2,y2,&ux2,&uy2);
+
+      /* redraw circle sample passing through location */
+      if ( (instr == GE_CIRCLE) ) {
+        radius=sqrt((double)((ux2-ux)*(ux2-ux)+(uy2-uy)*(uy2-uy)));
+        if ( radius < 1.0 ) radius=1.0;
+        cir_dlist->attr.sx=curr_dlist->attr.sx*radius/GE_DEFAULT_RADIUS;
+        cir_dlist->attr.sy=curr_dlist->attr.sy*radius/GE_DEFAULT_RADIUS;
+      }
+      else {
+        a=fabs((double)(ux2-ux))*sqrt2;
+        b=fabs((double)(uy2-uy))*sqrt2;
+        if (a < 1.0) a=1.0;
+        if (b < 1.0) b=1.0;
+        cir_dlist->attr.sx=curr_dlist->attr.sx*a/GE_DEFAULT_RADIUS;
+        cir_dlist->attr.sy=curr_dlist->attr.sy*b/GE_DEFAULT_RADIUS;
+      }
+      ge_redisplay(cir_dlist);
+
+    } while (butnum != 3);
+
+    /* add circle/ellipse to current segment */
+    ge_graph(opensegment, GE_MOVE, ux, uy);
+    tmp=(int)panel_get_value(cycle_fill);
+    if ( tmp )
+      ge_graph(opensegment, GE_FILL, (float)tmp, 0.);
+    if ( instr == GE_CIRCLE ) {
+      ge_graph(opensegment, GE_CIRCLE, radius, 0.);
+    }
+    else {
+      ge_graph(opensegment, GE_ELLIPSE, a, b);
+    }
+
+    /* make sample circle/ellipse invisible */
+    cir_dlist->attr.deleted=1;
+    ge_draw(GE_CIRCLE_SAMPLE);
+
+    /* redraw current segment */
+    ge_draw(opensegment);
+    do_usage("","","");
+
+    /* repeat if continous option is on */
+    if ( panel_get_value(cycle_cont) ) do_draw_circle(instr);
+
+} /* do_draw_circle */
+
+/*****************************************************************************
+
+    do_circle just call do_draw_circle to draw a circle.
+
+*****************************************************************************/
+
+do_circle()
+{
+
+  do_draw_circle(GE_CIRCLE);
+
+}
+
+/*****************************************************************************
+
+    do_ellipse just call do_draw_circle to draw a ellipse.
+
+*****************************************************************************/
+
+do_ellipse()
+{
+
+  do_draw_circle(GE_ELLIPSE);
+
+}
+
+/*****************************************************************************
+
+     do_trace is used to add to the current segment a number of lines
+  following the movement of the mouse.
+
+*****************************************************************************/
+
+do_trace()
+{
+  int butnum;
+  float x, y, ux, uy, cx, cy;
+
+  /* do necessary initialization */
+  ge_initdraw();
+
+  /* ask for starting point */
+  do_usage("Start point", "", "Cancel");
+  do {
+    ge_locator(1, &butnum, &x, &y);
+      if (butnum == 3) {
+        do_usage("","","");
+        return(0);
+      }
+      ge_align(&x,&y);
+  } while (butnum != 1);
+  unxform(x,y,&ux,&uy);
+
+  /* add starting point to current segment */
+  ge_graph(opensegment, GE_MOVE, ux, uy);
+  ge_tmp_new(x,y, curr_attr);
+
+  do_usage("","","Done");
+  cx=x;
+  cy=y;
+  do {
+
+    /* ask for current location */
+    ge_locator(-1,&butnum, &x, &y);
+    if (butnum == 3) {
+      ge_tmp_delete();
+      ge_draw(opensegment);
+      do_usage("","","");
+
+      /* repeat if continous mode is on */
+      if ( panel_get_value(cycle_cont) ) do_trace();
+      return;
+    }
+
+    /* add line from last location to current location if the distance
+       between them is significant enough */
+    if ( (fabs((double)x-cx) + fabs((double)y-cy)) > 5. ) {
+
+      unxform(x,y,&ux,&uy);
+      ge_graph(opensegment, GE_LINE, ux, uy);
+      ge_tmp_line(x,y);
+
+      cx=x;
+      cy=y;
+
+    } /* if */
+
+  } while (TRUE);
+
+} /* do_trace */
+
+/*****************************************************************************
+
+     do_polyline is used to add a list of connected lines to the current
+  segment.
+
+*****************************************************************************/
+
+do_polyline()
+{
+    int butnum;
+    float cx, cy, x, y, ux, uy;
+
+    /* initialize for adding primitive */
+    ge_initdraw();
+
+    /* get starting location */
+    do_usage("Start point","","Cancel");
+    do {
+      ge_locator(1, &butnum, &x, &y);
+	if (butnum == 3) {
+          do_usage("","","");
+          return(0);
+        }
+        ge_align(&x,&y);
+      } while (butnum != 1);
+    unxform(x,y,&ux,&uy);
+    ge_graph(opensegment, GE_MOVE, ux, uy);
+    ge_tmp_new(x, y, curr_attr);
+
+    do_usage("Next point","","Done");
+    cx=x;
+    cy=y;
+    do {
+
+        /* ask for next point */
+	do {
+
+            x=cx;
+            y=cy;
+            ge_locator(2,&butnum, &x, &y);
+            ge_align(&x,&y);
+	    if (butnum == 3) {
+                /* delete echo */
+                ge_tmp_delete();
+
+                /* draw current segment */
+                ge_draw(opensegment);
+                do_usage("","","");
+
+                /* repeat if continous option is on */
+                if ( panel_get_value(cycle_cont) ) do_polyline();
+                return;
+	    } /* if */
+
+	} while (butnum != 1);
+        unxform(x,y,&ux,&uy);
+
+        /* add line to next point */
+        ge_graph(opensegment, GE_LINE, ux, uy);
+
+        /* echo line */
+        ge_tmp_line(x,y);
+
+        cx=x;
+        cy=y;
+
+    } while (TRUE);
+
+} /* do_polyline */
+
+/*****************************************************************************
+
+    do_polygon is used to add a polygon primitive to the current segment.
+  It will ask for a starting point and a number of other points.  It will
+  also connect automatically connect from the last point to the first point.
+
+*****************************************************************************/
+
+do_polygon()
+{
+    int butnum,tmp;
+    float cx, cy, x, y, ux, uy;
+
+    /* initialize for adding primitive */
+    ge_initdraw();
+
+    /* ask for starting poitn */
+    do_usage("Start point","","Cancel");
+    do {
+	ge_locator(1, &butnum, &x, &y);
+	if (butnum == 3) {
+          do_usage("","","");
+          return(0);
+        }
+        ge_align(&x,&y);
+    } while (butnum != 1);
+    unxform(x,y,&ux,&uy);
+
+    /* check the fill option and update display list of current segment */
+    tmp=(int)panel_get_value(cycle_fill);
+    if ( tmp )
+      ge_graph(opensegment, GE_FILL, (float)tmp, 0.);
+
+    /* add polygon to display list and initialize for other points */
+    ge_graph(opensegment, GE_POLYGON, ux, uy);
+    ge_tmp_new(x,y,curr_attr);
+    cx=x; cy=y;
+    pointcount = 1;
+
+    /* ask for the other points */
+    do_usage("Next point","","Done");
+    do {
+        /* get next point */
+	do {
+            x=cx; y=cy;
+            ge_locator(2, &butnum, &x, &y);
+	    if (butnum == 3 || pointcount > 98) {
+                /* delete echo */
+                ge_tmp_delete();
+
+                /* draw current segment */
+                ge_draw(opensegment);
+                do_usage("","","");
+
+                /* repeat if continous option is on */
+                if ( panel_get_value(cycle_cont) )
+                  do_polygon();
+		return;
+            } /* if */
+            ge_align(&x,&y);
+	} while (butnum != 1);
+        unxform(x,y,&ux,&uy);
+
+        /* add point to display list of current segment */
+        ge_graph(opensegment, GE_CONT, ux, uy);
+
+        /* echo */
+        ge_tmp_line(x,y);
+        pointcount++;
+        cx=x; cy=y;
+
+    } while (TRUE);
+
+} /* do_polygon */
+
+/*****************************************************************************
+
+    do_del_seg is used to delete a segment, which may be undeleted later.
+  It will ask for the segment to delete.
+
+*****************************************************************************/
+
+do_del_seg()
+{
+  struct list *dlist;
+  int segnam;
+
+  /* ask for segment to delete */
+  do_message("");
+  do_usage("Select segment","","");
+
+  /* get segment number and ask for confirm */
+  if ( (segnam=ge_pick()) && 
+       wmgr_confirm(basefd, "Press the left mouse button to confirm Delete.  To cancel, press the right mouse button now.")) {
+
+    /* mark segment as deleted */
+    dlist=ge_display_list(segnam);
+    dlist->attr.deleted = 1;
+    ge_draw(segnam);
+
+    /* close current segment if segment is current segment */
+    if (opensegment == segnam) segopen = FALSE;
+
+    /* add segment to list of deleted segment */
+    lastdeleted = (lastdeleted + 1) % MAXUNDELETE;
+    deleted[lastdeleted] = segnam;
+
+    do_message("Segment deleted");
+  }
+  else do_message("No segment selected.");
+  do_usage("","","");
+
+  /* repeat if continous option is on */
+  if ( segnam && panel_get_value(cycle_cont) )
+    do_del_seg();
+
+} /* do_del_seg */
+
+/*****************************************************************************
+
+    ge_init_undelete initialize the circular stack storing the segment
+  numbers of the deleted segments.
+
+*****************************************************************************/
+
+ge_init_undelete()
+{
+  int i;
+
+  for ( i=0; i < MAXUNDELETE; i++ )
+    deleted[i]=0;
+  lastdeleted=0;
+
+} /* ge_init_undelete */
+
+/*****************************************************************************
+
+    do_undelete will undelete the last segment deleted, which is at the top
+  of the circular stack.  It will not delete if the stack is empty.
+
+*****************************************************************************/
+
+do_undelete()
+{
+  struct list *dlist;
+
+  /* do not delete if stack is empty */
+  if ( ! deleted[lastdeleted] ) {
+    do_message("Cannot undelete");
+    return;
+  }
+
+  /* unmark segment as deleted */
+  dlist=ge_display_list(deleted[lastdeleted]);
+  dlist->attr.deleted = 0;
+
+  /* draw segment on view surface */
+  ge_draw(deleted[lastdeleted]);
+
+  /* pop segment number off stack */
+  deleted[lastdeleted]=0;
+  lastdeleted = (lastdeleted + MAXUNDELETE - 1) % MAXUNDELETE;
+  do_message("Undeleted.");
+
+} /* do_undelete */
+
+/*****************************************************************************
+
+     do_edit_seg is used to choose an existing segment to become the current
+  segment.  It will ask the user to pick a segment, and update the
+  attributes in curr_attr according to the initial attribute and any changes
+  in the display list.
+
+*****************************************************************************/
+
+do_edit_seg()
+{
+  int segnam;
+  struct list_item *ptr;
+
+  /* ask user to pick a segment */
+  do_message("");
+  do_usage("Select segment", "", "");
+
+  if (segnam=ge_pick() ) {
+    /* make it the current segment */
+    opensegment=segnam;
+    segopen=TRUE;
+    curr_dlist=ge_display_list(segnam);
+
+    /* update curr_attr */
+    curr_attr=curr_dlist->attr;
+    if ((ptr=curr_dlist->d_list)) {
+
+      ptr=ptr->next;
+      /* scan display list for change of attributes */
+      do {
+        switch (ptr->instr){
+          case GE_SETCOLOR:
+            curr_attr.color = (int) ptr->x;
+            break;
+          case GE_SETTYPELINE:
+            curr_attr.linestyle = (int) ptr->x;
+            break;
+          case GE_SETLINEWIDTH:
+            curr_attr.linewidth = (int) ptr->x;
+            break;
+          case GE_SETFONT:
+            curr_attr.font = (int) ptr->x;
+            break;
+          case GE_SETCHARSIZE:
+            curr_attr.charsize = (int) ptr->x;
+            break;
+          default: break;
+        } /* switch */
+        ptr=ptr->next;
+      } while ( ptr != curr_dlist->d_list->next );
+
+    } /* if */
+    do_message("Segment selected");
+
+  }
+  else do_message("No segment selected.");
+  do_usage("","","");
+
+} /* do_edit_seg */
+
+/*****************************************************************************
+
+    do_transform_segment is used to move, rotate or scale a segment.  It
+  will ask the user to pick a segment, and then let the user adjust the
+  transformation with the mouse while eching the current transformation.
+  The transformation will be done on the point where the segment is picked.
+
+  Input
+    mode - 0: move
+           1: rotate
+           2: scale
+
+*****************************************************************************/
+
+do_transform_segment( mode)
+int mode;
+{
+    int segnam, pickid, butnum;
+    float sx0, sy0, ang0, tx0, ty0;
+    float x, y;
+    float dx, dy, nx, ny, sina, cosa;
+    float wx, wy;
+    struct list *dlist;
+
+    /* ask the user to pick a segment */
+    do_usage("Select segment","","");
+    do_message("");
+    if ((segnam=ge_pick()) < GE_MIN_SEG) {
+      do_message("No segment selected.");
+      return;
+    }
+
+    /* get location where segment is picked */
+    ge_locator( -1, &butnum, &wx, &wy);
+
+    /* save current transformation of segment */
+    dlist=ge_display_list(segnam);
+    ang0=dlist->attr.ang;
+    sx0=dlist->attr.sx; sy0=dlist->attr.sy;
+    tx0=dlist->attr.tx; ty0=dlist->attr.ty;
+
+    sina = sin(ang0); cosa = cos(ang0);
+
+    /* keep doing transformation until it is done */
+    do_usage("","Cancel","Done");
+    do {
+	ge_locator( -1, &butnum, &x, &y);
+        if ( butnum==2 ) {
+            /* cancel transformation */
+            dlist->attr.tx=tx0;
+            dlist->attr.ty=ty0;
+            dlist->attr.sx=sx0;
+            dlist->attr.sy=sy0;
+            dlist->attr.ang=ang0;
+            ge_redisplay(dlist);
+            do_usage("","","");
+            do_message("Cancelled");
+            return;
+        }
+
+        /* determine new transformation */
+	switch (mode) {
+	case 0:
+	    {
+              /* move */
+              float tx, ty;
+
+              /* determine amount of move */
+              tx = x-wx;
+              ty = y-wy;
+              ge_align(&tx,&ty);
+              dlist->attr.tx = tx0 + tx;
+              dlist->attr.ty = ty0 + ty;
+            }
+	    break;
+
+	case 1:
+            /* rotate */
+
+            /* determine angle to rotate */
+	    dlist->attr.ang = ang0 + (x-wx) * 0.012;
+
+            /* calculate adjustment necessary to rotate at (wx,wy) */
+	    sina = sin(dlist->attr.ang-ang0);
+            cosa = cos(dlist->attr.ang-ang0);
+	    nx = wx - (cosa * wx - sina * wy);
+	    ny = wy - (sina * wx + cosa * wy);
+            dlist->attr.tx = tx0 * cosa - ty0 * sina + nx;
+            dlist->attr.ty = tx0 * sina + ty0 * cosa + ny;
+	    break;
+	case 2:
+          {
+            /* scale */
+            extern Panel_item cycle_scale;
+
+            /* determine how much to scale */
+	    dlist->attr.sx = sx0 + (x-wx) * 0.02 * fabs((double)cosa)
+                                 + (y-wy) * 0.02 * fabs((double)sina);
+            if ( (int)panel_get_value(cycle_scale) ) {
+              /* scale uniformly when option is on */
+              dlist->attr.sy = dlist->attr.sx/sx0*sy0;
+            }
+            else {
+              dlist->attr.sy = sy0 + (y-wy) * 0.02 * fabs((double)cosa)
+                                   + (x-wx) * 0.02 * fabs((double)sina);
+            } /* else */
+
+            /* calculate adjustment necessary to scale at (wx,wy).
+               it is difficult to adjust */
+            nx = ((wx-tx0)*cosa + (wy-ty0)*sina)/sx0;
+            ny = ((wy-ty0)*cosa - (wx-tx0)*sina)/sy0;
+            dlist->attr.tx = tx0 + nx*cosa*(sx0 - dlist->attr.sx) -
+                                   ny*sina*(sy0 - dlist->attr.sy);
+            dlist->attr.ty = ty0 + nx*sina*(sx0 - dlist->attr.sx) +
+                                   ny*cosa*(sy0 - dlist->attr.sy);
+          } /* case scale */
+          break;
+	default:;
+	} /* switch */
+
+      /* redraw segment */
+      ge_redisplay(dlist);
+    } while (butnum != 3);
+
+    do_usage("","","");
+
+    /* repeat if continous option is on */
+    if ( panel_get_value(cycle_cont) )
+      do_transform_segment(mode);
+
+} /* do_transform_segment */
+
+/*****************************************************************************
+
+    do_pos call do_transform_segment to move a segment.
+
+*****************************************************************************/
+
+do_pos()
+{
+
+  do_transform_segment(0);
+
+} /* do_pos */
+
+/*****************************************************************************
+
+    do_rot calls do_transform_segment to move a segment.
+
+*****************************************************************************/
+
+do_rot()
+{
+
+  do_transform_segment(1);
+
+} /* do_rot */
+
+/*****************************************************************************
+
+    do_size calls do_transform_segment to move a segment.
+
+*****************************************************************************/
+
+do_size()
+{
+
+  do_transform_segment(2);
+
+} /* do_size */
+
+/*****************************************************************************
+
+    do_confirm_exit is used by the quit function to confirm the quit, and
+  actually destroy the control pad upon confirmation.
+
+*****************************************************************************/
+
+do_confirm_exit()
+{
+   if ( wmgr_confirm(basefd, "Press the left mouse button to confirm Quit.  To cancel, press the right mouse button now.") ) {
+
+     /* destroy the control pad */
+     window_set(base_frame,
+       FRAME_NO_CONFIRM, TRUE,
+       0);
+     window_destroy(base_frame);
+   } /* if */
+
+} /* do_confirm_exit */
+
+/*****************************************************************************
+
+    do_align is the notify procedure of the align on/off option.  It just
+  change align to the value.
+
+*****************************************************************************/
+
+do_align(item, value, event)
+Panel_item item;
+int value;
+Event *event;
+{
+
+  align=value;
+
+} /* do_align */
+
+/*****************************************************************************
+
+    ge_align will change (x,y) by any necessary alignment.
+
+    Input
+      x,y - pointer to coordinate to be aligned
+
+    Output
+      x,y - pointer to aligned coordinate
+
+*****************************************************************************/
+
+ge_align(x,y)
+float *x, *y;
+{
+
+  if ( align ) {
+    *x = floor(*x/gridxintv + 0.5) * gridxintv;
+    *y = floor(*y/gridyintv + 0.5) * gridyintv;
+  }
+
+} /* ge_align */
+
+/*****************************************************************************
+
+    do_change_grid is the notify procedure for the sliders of the grid interval
+  along the x and y axis.  It change the grid interval by changing the
+  scale of the sample grid.
+
+*****************************************************************************/
+
+do_change_grid(item, value, event)
+Panel_item item;
+int value;
+Event *event;
+{
+  struct list *dlist;
+  extern Panel_item slider_gridx, slider_gridy;
+
+  dlist=ge_display_list(GE_GRID);
+
+  /* change scale of the grid according to the value.
+  if ( item == slider_gridx ) {
+    gridxintv=value;
+    dlist->attr.sx=gridxintv/GE_DEFAULT_GRID;
+  }
+  else {
+    gridyintv=value;
+    dlist->attr.sy=gridyintv/GE_DEFAULT_GRID;
+  }
+
+  /* redraw grid */
+  if ( ! dlist->attr.deleted )
+    ge_redisplay(dlist);
+
+} /* do_change_grid */
+
+/*****************************************************************************
+
+    do_grid is the notify procedure for the grid on/off option.  It will
+  create the segment for the grid if it is not there and either display it
+  or make it invisible according to value.
+
+*****************************************************************************/
+
+do_grid(item, value, event)
+Panel_item item;
+int value;
+Event *event;
+{
+  struct list *dlist;
+  int i;
+
+  /* create grid segment if it is not there */
+  if ( ! (dlist=ge_display_list(GE_GRID)) ) {
+
+    /* create grid */
+    make_new_seg(GE_GRID);
+    dlist=ge_display_list(GE_GRID);
+    dlist->attr.linestyle=1;
+
+    /* draw vertical lines */
+    for ( i=1; i <= (GE_WIN_X/GE_MIN_GRID); i++ ) {
+      ge_graph(GE_GRID, GE_MOVE, i * GE_DEFAULT_GRID, 0.);
+      ge_graph(GE_GRID, GE_LINE, i * GE_DEFAULT_GRID, GE_WIN_Y/GE_MIN_GRID*GE_DEFAULT_GRID);
+    } /* for */
+
+    /* draw horizontal lines */
+    for ( i=1; i <= (GE_WIN_Y/GE_MIN_GRID); i++ ) {
+      ge_graph(GE_GRID, GE_MOVE, 0., i * GE_DEFAULT_GRID);
+      ge_graph(GE_GRID, GE_LINE, GE_WIN_X/GE_MIN_GRID*GE_DEFAULT_GRID, i * GE_DEFAULT_GRID);
+    } /* for */
+  } /* if */
+
+  /* display/delete grid according to value */
+  dlist->attr.deleted = !value;
+  ge_draw(GE_GRID);
+
+} /* do_grid */
+
+/*****************************************************************************
+
+    ge_make_samples will create the text, color and line samples and the
+  grid.
+
+*****************************************************************************/
+
+ge_make_samples()
+{
+    int i, j;
+
+    do_change_color(0,0,0);
+    do_change_linewidth(0,0,0);
+    do_change_linestyle(0,0,0);
+    do_change_font(0,0,0);
+    do_change_charsize(0,GE_DEFAULT_CHARSIZE,0);
+    do_grid(0,0,0);
+    do_usage("","","");
+
+} /* ge_make_samples */
+
+/*****************************************************************************
+
+    do_change_color is the notify procedure for the color slider.  It will
+  create the color sample if it is not there and update the color of
+  the color sample according to the value from the slider.
+
+*****************************************************************************/
+
+/* define coordinates of the color sample */
+#define COLORX 20.
+#define COLORY 350.
+static float colorbox[4] = {0., 25., 25., 0.};
+static float colorboy[4] = {0., 0., 25., 25.};
+
+do_change_color(item, value,event)
+Panel_item item;
+int value;
+Event *event;
+{
+    struct list *dlist;
+    extern int *font_menu;
+
+    /* create segment for the color sample if it is not there */
+    if ( !(dlist=ge_display_list(GE_COLOR_SAMPLE)) ) {
+
+      /* create segment and draw box as color sample */
+      make_new_seg(GE_COLOR_SAMPLE);
+      dlist=ge_display_list(GE_COLOR_SAMPLE);
+      ge_graph(GE_COLOR_SAMPLE, GE_FILL, (float)GE_FILLONLY, 0.);
+      ge_graph(GE_COLOR_SAMPLE, GE_POLYGON,COLORX+colorbox[0], COLORY+colorboy[0]);
+      ge_graph(GE_COLOR_SAMPLE, GE_CONT,COLORX+colorbox[1], COLORY+colorboy[1]);
+      ge_graph(GE_COLOR_SAMPLE, GE_CONT,COLORX+colorbox[2], COLORY+colorboy[2]);
+      ge_graph(GE_COLOR_SAMPLE, GE_CONT,COLORX+colorbox[3], COLORY+colorboy[3]);
+
+    } /* if */
+
+    /* change color of color sample and draw sample */
+    dlist->attr.color=value;
+    attr_changed = 1;
+    ge_draw(GE_COLOR_SAMPLE);
+
+} /* do_change_color */
+
+/*****************************************************************************
+
+    do_change_font is the notify procedure of the font choice.  It will create
+  the text sample if it is not there and update the font of the text sample
+  according to the value chosen on..
+
+*****************************************************************************/
+
+/* define coordinates and text of the color sample */
+#define TEXTX 160.
+#define TEXTY 370.
+static char *text_sample="A B C a b c";
+
+do_change_font(item, value, event)
+Panel_item item;
+int value;
+Event *event;
+{
+    struct list *dlist;
+
+@//E*O*F draw.c.shar1//
+chmod u=rw,g=r,o=r draw.c.shar1
+ 
+echo x - /tmp/catshar
+sed 's/^@//' > "/tmp/catshar" <<'@//E*O*F /tmp/catshar//'
+#!/bin/csh
+#
+# This script combine draw.c.shar1 and draw.c.shar2 together
+if ( -f draw.c.shar1 && -f draw.c.shar2 ) then
+echo 'Reconstruct draw.c from draw.c.shar1 and draw.c.shar2...'
+cat draw.c.shar1 draw.c.shar2 >> draw.c
+/bin/rm -f draw.c.shar1 draw.c.shar2
+endif
+exit 0
+@//E*O*F /tmp/catshar//
+chmod u=rwx,g=rx,o=rx /tmp/catshar
+ 
+echo Inspecting for damage in transit...
+temp=/tmp/shar$$; dtemp=/tmp/.shar$$
+trap "rm -f $temp $dtemp; exit" 0 1 2 3 15
+cat > $temp <<\!!!
+    1500    4285   42038 draw.c.shar1
+       9      38     275 catshar
+    1509    4323   42313 total
+!!!
+wc  draw.c.shar1 /tmp/catshar | sed 's=[^ ]*/==' | diff -b $temp - >$dtemp
+if [ -s $dtemp ]
+then echo "Ouch [diff of wc output]:" ; cat $dtemp
+else echo "No problems found."
+fi
+/tmp/catshar
+/bin/rm -f /tmp/catshar
+exit 0
+

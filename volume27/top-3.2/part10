@@ -1,0 +1,1750 @@
+Newsgroups: comp.sources.unix
+From: phil@eecs.nwu.edu (William LeFebvre)
+Subject: v27i010: top - a top process display, version 3.2, Part10/13
+References: <1.744843136.4744@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: phil@eecs.nwu.edu (William LeFebvre)
+Posting-Number: Volume 27, Issue 10
+Archive-Name: top-3.2/part10
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 10 (of 13)."
+# Contents:  machine/m_hpux9.c top.c
+# Wrapped by phil@pex on Wed Aug  4 14:22:45 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'machine/m_hpux9.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machine/m_hpux9.c'\"
+else
+echo shar: Extracting \"'machine/m_hpux9.c'\" \(19437 characters\)
+sed "s/^X//" >'machine/m_hpux9.c' <<'END_OF_FILE'
+X/*
+X * top - a top users display for Unix
+X *
+X * SYNOPSIS:  any hp9000 running hpux version 9
+X *
+X * DESCRIPTION:
+X * This is the machine-dependent module for HPUX 9.
+X * This makes top work on (at least) the following systems:
+X *	hp9000s800
+X * This may make top work on the following, but we aren't sure:
+X *	hp9000s300
+X *	hp9000s700
+X *
+X * LIBS: 
+X *
+X * AUTHOR: Kevin Schmidt <kevin@mcl.ucsb.edu> 
+X *         adapted from Christos Zoulas <christos@ee.cornell.edu>
+X */
+X
+X#include <sys/types.h>
+X#include <sys/signal.h>
+X#include <sys/param.h>
+X
+X#include <stdio.h>
+X#include <nlist.h>
+X#include <math.h>
+X#include <sys/dir.h>
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X#include <sys/dk.h>
+X#include <sys/vm.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+X#ifndef hpux
+X# define P_RSSIZE(p) (p)->p_rssize
+X# define P_TSIZE(p) (p)->p_tsize
+X# define P_DSIZE(p) (p)->p_dsize
+X# define P_SSIZE(p) (p)->p_ssize
+X#else
+X# include <sys/pstat.h>
+X# define __PST2P(p, field) \
+X    ((p)->p_upreg ? ((struct pst_status *) (p)->p_upreg)->field : 0)
+X# define P_RSSIZE(p) __PST2P(p, pst_rssize)
+X# define P_TSIZE(p) __PST2P(p, pst_tsize)
+X# define P_DSIZE(p) __PST2P(p, pst_dsize)
+X# define P_SSIZE(p) __PST2P(p, pst_ssize)
+X/* The following 4 #defines are per HPUX-9.0's <sys/proc.h> */
+X# define PCT_NORM 9       /* log2(PCT_BASE) */
+X# define PCT_BASE (1<<PCT_NORM)
+X# define p_percentcpu(p) ((p)->p_fractioncpu/(float)(PCT_BASE*HZ))
+X# define p_time_exact(p) (time.tv_sec-((p)->p_swaptime))
+X#endif
+X
+X#include "top.h"
+X#include "machine.h"
+X
+X#define VMUNIX	"/hp-ux"
+X#define KMEM	"/dev/kmem"
+X#define MEM	"/dev/mem"
+X#ifdef DOSWAP
+X#define SWAP	"/dev/dmem"
+X#endif
+X
+X/* get_process_info passes back a handle.  This is what it looks like: */
+X
+Xstruct handle
+X{
+X    struct proc **next_proc;	/* points to next valid proc pointer */
+X    int remaining;		/* number of pointers remaining */
+X};
+X
+X/* declarations for load_avg */
+X#include "loadavg.h"
+X
+X/* define what weighted cpu is.  */
+X#define weighted_cpu(pct, pp) ((p_time_exact(pp)) == 0 ? 0.0 : \
+X			 ((pct) / (1.0 - exp((p_time_exact(pp)) * logcpu))))
+X
+X/* what we consider to be process size: */
+X#define PROCSIZE(pp) (P_TSIZE(pp) + P_DSIZE(pp) + P_SSIZE(pp))
+X
+X/* definitions for indices in the nlist array */
+X#define X_AVENRUN	0
+X#define X_CCPU		1
+X#define X_NPROC		2
+X#define X_PROC		3
+X#define X_TOTAL		4
+X#define X_CP_TIME	5
+X#define X_MPID		6
+X
+X/*
+X * Steinar Haug from University of Trondheim, NORWAY pointed out that 
+X * the HP 9000 system 800 doesn't have _hz defined in the kernel.  He
+X * provided a patch to work around this.  We've improved on this patch
+X * here and set the constant X_HZ only when _hz is available in the
+X * kernel.  Code in this module that uses X_HZ is surrounded with
+X * appropriate ifdefs.
+X */
+X
+X#ifndef hp9000s300
+X#define X_HZ		7
+X#endif
+X
+X
+Xstatic struct nlist nlst[] = {
+X    { "_avenrun" },		/* 0 */
+X    { "_cexp" },		/* 1 */
+X    { "_nproc" },		/* 2 */
+X    { "_proc" },		/* 3 */
+X    { "_total" },		/* 4 */
+X    { "_cp_time" },		/* 5 */
+X    { "_mpid" },		/* 6 */
+X#ifdef X_HZ
+X    { "_hz" },			/* 7 */
+X#endif
+X    { 0 }
+X};
+X
+X/*
+X *  These definitions control the format of the per-process area
+X */
+X
+Xstatic char header[] =
+X  "  PID X        PRI NICE   SIZE   RES STATE   TIME   WCPU    CPU COMMAND";
+X/* 0123456   -- field to fill in starts at header+6 */
+X#define UNAME_START 6
+X
+X#define Proc_format \
+X	"%5d %-8.8s %3d %4d%6dK %4dK %-5s%4d:%02d %5.2f%% %5.2f%% %.14s"
+X
+X/* process state names for the "STATE" column of the display */
+X/* the extra nulls in the string "run" are for adding a slash and
+X   the processor number when needed */
+X
+Xchar *state_abbrev[] =
+X{
+X    "", "sleep", "WAIT", "run\0\0\0", "start", "zomb", "stop"
+X};
+X
+X
+Xstatic int kmem;
+X
+X/* values that we stash away in _init and use in later routines */
+X
+Xstatic double logcpu;
+X
+X/* these are retrieved from the kernel in _init */
+X
+Xstatic unsigned long proc;
+Xstatic          int  nproc;
+Xstatic          long hz;
+Xstatic load_avg  ccpu;
+Xstatic          int  ncpu = 0;
+X
+X/* these are offsets obtained via nlist and used in the get_ functions */
+Xstatic unsigned long mpid_offset;
+Xstatic unsigned long avenrun_offset;
+Xstatic unsigned long total_offset;
+Xstatic unsigned long cp_time_offset;
+X
+X/* these are for calculating cpu state percentages */
+X
+Xstatic long cp_time[CPUSTATES];
+Xstatic long cp_old[CPUSTATES];
+Xstatic long cp_diff[CPUSTATES];
+X
+X/* these are for detailing the process states */
+X
+Xint process_states[7];
+Xchar *procstatenames[] = {
+X    "", " sleeping, ", " ABANDONED, ", " running, ", " starting, ",
+X    " zombie, ", " stopped, ",
+X    NULL
+X};
+X
+X/* these are for detailing the cpu states */
+X
+Xint cpu_states[9];
+Xchar *cpustatenames[] = {
+X    "usr", "nice", "sys", "idle", "", "", "", "intr", "ker",
+X    NULL
+X};
+X
+X/* these are for detailing the memory statistics */
+X
+Xint memory_stats[8];
+Xchar *memorynames[] = {
+X    "Real: ", "K/", "K act/tot  ", "Virtual: ", "K/",
+X    "K act/tot  ", "Free: ", "K", NULL
+X};
+X
+X/* these are for keeping track of the proc array */
+X
+Xstatic int bytes;
+Xstatic int pref_len;
+Xstatic struct proc *pbase;
+Xstatic struct proc **pref;
+Xstatic struct pst_status *pst;
+X
+X/* these are for getting the memory statistics */
+X
+Xstatic int pageshift;		/* log base 2 of the pagesize */
+X
+X/* define pagetok in terms of pageshift */
+X
+X#define pagetok(size) ((size) << pageshift)
+X
+X/* useful externals */
+Xextern int errno;
+Xextern char *sys_errlist[];
+X
+Xlong lseek();
+Xlong time();
+Xlong percentages();
+X
+Xmachine_init(statics)
+X
+Xstruct statics *statics;
+X
+X{
+X    register int i = 0;
+X    register int pagesize;
+X
+X    if ((kmem = open(KMEM, O_RDONLY)) == -1) {
+X	perror(KMEM);
+X	return(-1);
+X    }
+X#ifdef hp9000s800
+X    /* 800 names don't have leading underscores */
+X    for (i = 0; nlst[i].n_name; nlst[i++].n_name++)
+X	continue;
+X#endif
+X
+X    /* get the list of symbols we want to access in the kernel */
+X    (void) nlist(VMUNIX, nlst);
+X    if (nlst[0].n_type == 0)
+X    {
+X	fprintf(stderr, "top: nlist failed\n");
+X	return(-1);
+X    }
+X
+X    /* make sure they were all found */
+X    if (check_nlist(nlst) > 0)
+X    {
+X	return(-1);
+X    }
+X
+X    /* get the symbol values out of kmem */
+X    (void) getkval(nlst[X_PROC].n_value,   (int *)(&proc),	sizeof(proc),
+X	    nlst[X_PROC].n_name);
+X    (void) getkval(nlst[X_NPROC].n_value,  &nproc,		sizeof(nproc),
+X	    nlst[X_NPROC].n_name);
+X    (void) getkval(nlst[X_CCPU].n_value,   (int *)(&ccpu),	sizeof(ccpu),
+X	    nlst[X_CCPU].n_name);
+X#ifdef X_HZ
+X    (void) getkval(nlst[X_HZ].n_value,     (int *)(&hz),	sizeof(hz),
+X	    nlst[X_HZ].n_name);
+X#else
+X    hz = HZ;
+X#endif
+X
+X    /* stash away certain offsets for later use */
+X    mpid_offset = nlst[X_MPID].n_value;
+X    avenrun_offset = nlst[X_AVENRUN].n_value;
+X    total_offset = nlst[X_TOTAL].n_value;
+X    cp_time_offset = nlst[X_CP_TIME].n_value;
+X
+X    /* this is used in calculating WCPU -- calculate it ahead of time */
+X    logcpu = log(loaddouble(ccpu));
+X
+X    /* allocate space for proc structure array and array of pointers */
+X    bytes = nproc * sizeof(struct proc);
+X    pbase = (struct proc *)malloc(bytes);
+X    pref  = (struct proc **)malloc(nproc * sizeof(struct proc *));
+X    pst   = (struct pst_status *)malloc(nproc * sizeof(struct pst_status));
+X
+X    /* Just in case ... */
+X    if (pbase == (struct proc *)NULL || pref == (struct proc **)NULL)
+X    {
+X	fprintf(stderr, "top: can't allocate sufficient memory\n");
+X	return(-1);
+X    }
+X
+X    /* get the page size with "getpagesize" and calculate pageshift from it */
+X    pagesize = getpagesize();
+X    pageshift = 0;
+X    while (pagesize > 1)
+X    {
+X	pageshift++;
+X	pagesize >>= 1;
+X    }
+X
+X    /* we only need the amount of log(2)1024 for our conversion */
+X    pageshift -= LOG1024;
+X
+X    /* fill in the statics information */
+X    statics->procstate_names = procstatenames;
+X    statics->cpustate_names = cpustatenames;
+X    statics->memory_names = memorynames;
+X
+X    /* all done! */
+X    return(0);
+X}
+X
+Xchar *format_header(uname_field)
+X
+Xregister char *uname_field;
+X
+X{
+X    register char *ptr;
+X
+X    ptr = header + UNAME_START;
+X    while (*uname_field != '\0')
+X    {
+X	*ptr++ = *uname_field++;
+X    }
+X
+X    return(header);
+X}
+X
+Xget_system_info(si)
+X
+Xstruct system_info *si;
+X
+X{
+X    load_avg avenrun[3];
+X    long total;
+X
+X    /* get the cp_time array */
+X    (void) getkval(cp_time_offset, (int *)cp_time, sizeof(cp_time),
+X		   "_cp_time");
+X
+X    /* get load average array */
+X    (void) getkval(avenrun_offset, (int *)avenrun, sizeof(avenrun),
+X		   "_avenrun");
+X
+X    /* get mpid -- process id of last process */
+X    (void) getkval(mpid_offset, &(si->last_pid), sizeof(si->last_pid),
+X		   "_mpid");
+X
+X    /* convert load averages to doubles */
+X    {
+X	register int i;
+X	register double *infoloadp;
+X	register load_avg *sysloadp;
+X
+X	infoloadp = si->load_avg;
+X	sysloadp = avenrun;
+X	for (i = 0; i < 3; i++)
+X	{
+X	    *infoloadp++ = loaddouble(*sysloadp++);
+X	}
+X    }
+X
+X    /* convert cp_time counts to percentages */
+X    total = percentages(CPUSTATES, cpu_states, cp_time, cp_old, cp_diff);
+X
+X    /* sum memory statistics */
+X    {
+X	struct vmtotal total;
+X
+X	/* get total -- systemwide main memory usage structure */
+X	(void) getkval(total_offset, (int *)(&total), sizeof(total),
+X		       "_total");
+X	/* convert memory stats to Kbytes */
+X	memory_stats[0] = -1;
+X	memory_stats[1] = pagetok(total.t_arm);
+X	memory_stats[2] = pagetok(total.t_rm);
+X	memory_stats[3] = -1;
+X	memory_stats[4] = pagetok(total.t_avm);
+X	memory_stats[5] = pagetok(total.t_vm);
+X	memory_stats[6] = -1;
+X	memory_stats[7] = pagetok(total.t_free);
+X    }
+X
+X    /* set arrays and strings */
+X    si->cpustates = cpu_states;
+X    si->memory = memory_stats;
+X}
+X
+Xstatic struct handle handle;
+X
+Xcaddr_t get_process_info(si, sel, compare)
+X
+Xstruct system_info *si;
+Xstruct process_select *sel;
+Xint (*compare)();
+X
+X{
+X    register int i;
+X    register int total_procs;
+X    register int active_procs;
+X    register struct proc **prefp;
+X    register struct proc *pp;
+X
+X    /* these are copied out of sel for speed */
+X    int show_idle;
+X    int show_system;
+X    int show_uid;
+X    int show_command;
+X
+X    /* read all the proc structures in one fell swoop */
+X    (void) getkval(proc, (int *)pbase, bytes, "proc array");
+X    for (i = 0; i < nproc; ++i) {
+X	if (pstat(PSTAT_PROC, &pst[i], sizeof(pst[i]), 0, pbase[i].p_pid) != 1)
+X	    pbase[i].p_upreg = (preg_t *) 0;
+X	else
+X	    pbase[i].p_upreg = (preg_t *) &pst[i];
+X	pbase[i].p_nice = pst[i].pst_nice;
+X	pbase[i].p_cpticks = pst[i].pst_cpticks;
+X    }
+X
+X
+X    /* get a pointer to the states summary array */
+X    si->procstates = process_states;
+X
+X    /* set up flags which define what we are going to select */
+X    show_idle = sel->idle;
+X    show_system = sel->system;
+X    show_uid = sel->uid != -1;
+X    show_command = sel->command != NULL;
+X
+X    /* count up process states and get pointers to interesting procs */
+X    total_procs = 0;
+X    active_procs = 0;
+X    memset((char *)process_states, 0, sizeof(process_states));
+X    prefp = pref;
+X    for (pp = pbase, i = 0; i < nproc; pp++, i++)
+X    {
+X	/*
+X	 *  Place pointers to each valid proc structure in pref[].
+X	 *  Process slots that are actually in use have a non-zero
+X	 *  status field.  Processes with SSYS set are system
+X	 *  processes---these get ignored unless show_sysprocs is set.
+X	 */
+X	if (pp->p_stat != 0 &&
+X	    (show_system || ((pp->p_flag & SSYS) == 0)))
+X	{
+X	    total_procs++;
+X	    process_states[pp->p_stat]++;
+X	    if ((pp->p_stat != SZOMB) &&
+X		(show_idle || (p_percentcpu(pp) != 0) || (pp->p_stat == SRUN)) &&
+X		(!show_uid || pp->p_uid == (uid_t)sel->uid))
+X	    {
+X		*prefp++ = pp;
+X		active_procs++;
+X	    }
+X	}
+X    }
+X
+X    /* if requested, sort the "interesting" processes */
+X    if (compare != NULL)
+X    {
+X	qsort((char *)pref, active_procs, sizeof(struct proc *), compare);
+X    }
+X
+X    /* remember active and total counts */
+X    si->p_total = total_procs;
+X    si->p_active = pref_len = active_procs;
+X
+X    /* pass back a handle */
+X    handle.next_proc = pref;
+X    handle.remaining = active_procs;
+X    return((caddr_t)&handle);
+X}
+X
+Xchar fmt[128];		/* static area where result is built */
+X
+Xchar *format_next_process(handle, get_userid)
+X
+Xcaddr_t handle;
+Xchar *(*get_userid)();
+X
+X{
+X    register struct proc *pp;
+X    register long cputime;
+X    register double pct;
+X    int where;
+X    struct user u;
+X    struct handle *hp;
+X    struct timeval time;
+X    struct timezone timezone;
+X
+X    /* find and remember the next proc structure */
+X    hp = (struct handle *)handle;
+X    pp = *(hp->next_proc++);
+X    hp->remaining--;
+X    
+X
+X    /* get the process's user struct and set cputime */
+X    where = getu(pp, &u);
+X    if (where == -1)
+X    {
+X	(void) strcpy(u.u_comm, "<swapped>");
+X	cputime = 0;
+X    }
+X    else
+X    {
+X
+X	  
+X	/* set u_comm for system processes */
+X	if (u.u_comm[0] == '\0')
+X	{
+X	    if (pp->p_pid == 0)
+X	    {
+X		(void) strcpy(u.u_comm, "Swapper");
+X	    }
+X	    else if (pp->p_pid == 2)
+X	    {
+X		(void) strcpy(u.u_comm, "Pager");
+X	    }
+X	}
+X	if (where == 1) {
+X	    /*
+X	     * Print swapped processes as <pname>
+X	     */
+X	    char buf[sizeof(u.u_comm)];
+X	    (void) strncpy(buf, u.u_comm, sizeof(u.u_comm));
+X	    u.u_comm[0] = '<';
+X	    (void) strncpy(&u.u_comm[1], buf, sizeof(u.u_comm) - 2);
+X	    u.u_comm[sizeof(u.u_comm) - 2] = '\0';
+X	    (void) strncat(u.u_comm, ">", sizeof(u.u_comm) - 1);
+X	    u.u_comm[sizeof(u.u_comm) - 1] = '\0';
+X	}
+X
+X	cputime = __PST2P(pp, pst_cptickstotal) / hz;
+X    }
+X
+X    /* calculate the base for cpu percentages */
+X    pct = pctdouble(p_percentcpu(pp));
+X
+X    /* get time used for calculation in weighted_cpu */
+X    gettimeofday(&time, &timezone);
+X
+X    /* format this entry */
+X    sprintf(fmt,
+X	    Proc_format,
+X	    pp->p_pid,
+X	    (*get_userid)(pp->p_uid),
+X	    pp->p_pri - PZERO,
+X	    pp->p_nice - NZERO,
+X	    pagetok(PROCSIZE(pp)),
+X	    pagetok(P_RSSIZE(pp)),
+X	    state_abbrev[pp->p_stat],
+X	    cputime / 60l,
+X	    cputime % 60l,
+X	    100.0 * weighted_cpu(pct, pp),
+X	    100.0 * pct,
+X	    printable(u.u_comm));
+X
+X    /* return the result */
+X    return(fmt);
+X}
+X
+X/*
+X *  getu(p, u) - get the user structure for the process whose proc structure
+X *	is pointed to by p.  The user structure is put in the buffer pointed
+X *	to by u.  Return 0 if successful, -1 on failure (such as the process
+X *	being swapped out).
+X */
+X
+X
+Xgetu(p, u)
+X
+Xregister struct proc *p;
+Xstruct user *u;
+X
+X{
+X    struct pst_status *ps;
+X    char *s, *c;
+X    int i;
+X
+X    if ((ps = (struct pst_status *) p->p_upreg) == NULL)
+X	return -1;
+X
+X    memset(u, 0, sizeof(struct user));
+X    c = ps->pst_cmd;
+X    ps->pst_cmd[PST_CLEN - 1] = '\0';        /* paranoia */
+X    s = strtok(ps->pst_cmd, "\t \n");
+X
+X    if (c = strrchr(s, '/'))
+X	c++;
+X    else
+X	c = s;
+X    if (*c == '-')
+X	c++;
+X    i = 0;
+X    for (; i < MAXCOMLEN; i++) {
+X	if (*c == '\0' || *c == ' ' || *c == '/')
+X	    break;
+X	u->u_comm[i] = *c++;
+X    }
+X#ifndef DOSWAP
+X    return ((p->p_flag & SLOAD) == 0 ? 1 : 0);
+X#endif
+X    return(0);
+X}
+X
+X/*
+X * check_nlist(nlst) - checks the nlist to see if any symbols were not
+X *		found.  For every symbol that was not found, a one-line
+X *		message is printed to stderr.  The routine returns the
+X *		number of symbols NOT found.
+X */
+X
+Xint check_nlist(nlst)
+X
+Xregister struct nlist *nlst;
+X
+X{
+X    register int i;
+X
+X    /* check to see if we got ALL the symbols we requested */
+X    /* this will write one line to stderr for every symbol not found */
+X
+X    i = 0;
+X    while (nlst->n_name != NULL)
+X    {
+X	if (nlst->n_type == 0)
+X	{
+X	    /* this one wasn't found */
+X	    fprintf(stderr, "kernel: no symbol named `%s'\n", nlst->n_name);
+X	    i = 1;
+X	}
+X	nlst++;
+X    }
+X
+X    return(i);
+X}
+X
+X
+X/*
+X *  getkval(offset, ptr, size, refstr) - get a value out of the kernel.
+X *	"offset" is the byte offset into the kernel for the desired value,
+X *  	"ptr" points to a buffer into which the value is retrieved,
+X *  	"size" is the size of the buffer (and the object to retrieve),
+X *  	"refstr" is a reference string used when printing error meessages,
+X *	    if "refstr" starts with a '!', then a failure on read will not
+X *  	    be fatal (this may seem like a silly way to do things, but I
+X *  	    really didn't want the overhead of another argument).
+X *  	
+X */
+X
+Xgetkval(offset, ptr, size, refstr)
+X
+Xunsigned long offset;
+Xint *ptr;
+Xint size;
+Xchar *refstr;
+X
+X{
+X    if (lseek(kmem, (long)offset, L_SET) == -1) {
+X        if (*refstr == '!')
+X            refstr++;
+X        (void) fprintf(stderr, "%s: lseek to %s: %s\n", KMEM, 
+X		       refstr, strerror(errno));
+X        quit(23);
+X    }
+X    if (read(kmem, (char *) ptr, size) == -1) {
+X        if (*refstr == '!') 
+X            return(0);
+X        else {
+X            (void) fprintf(stderr, "%s: reading %s: %s\n", KMEM, 
+X			   refstr, strerror(errno));
+X            quit(23);
+X        }
+X    }
+X    return(1);
+X}
+X    
+X/* comparison routine for qsort */
+X
+X/*
+X *  proc_compare - comparison function for "qsort"
+X *	Compares the resource consumption of two processes using five
+X *  	distinct keys.  The keys (in descending order of importance) are:
+X *  	percent cpu, cpu ticks, state, resident set size, total virtual
+X *  	memory usage.  The process states are ordered as follows (from least
+X *  	to most important):  WAIT, zombie, sleep, stop, start, run.  The
+X *  	array declaration below maps a process state index into a number
+X *  	that reflects this ordering.
+X */
+X
+Xstatic unsigned char sorted_state[] =
+X{
+X    0,	/* not used		*/
+X    3,	/* sleep		*/
+X    1,	/* ABANDONED (WAIT)	*/
+X    6,	/* run			*/
+X    5,	/* start		*/
+X    2,	/* zombie		*/
+X    4	/* stop			*/
+X};
+X 
+Xproc_compare(pp1, pp2)
+X
+Xstruct proc **pp1;
+Xstruct proc **pp2;
+X
+X{
+X    register struct proc *p1;
+X    register struct proc *p2;
+X    register int result;
+X    register pctcpu lresult;
+X
+X    /* remove one level of indirection */
+X    p1 = *pp1;
+X    p2 = *pp2;
+X
+X    /* compare percent cpu (pctcpu) */
+X    if ((lresult = p_percentcpu(p2) - p_percentcpu(p1)) == 0)
+X    {
+X	/* use cpticks to break the tie */
+X	if ((result = p2->p_cpticks - p1->p_cpticks) == 0)
+X	{
+X	    /* use process state to break the tie */
+X	    if ((result = sorted_state[p2->p_stat] -
+X			  sorted_state[p1->p_stat])  == 0)
+X	    {
+X		/* use priority to break the tie */
+X		if ((result = p2->p_pri - p1->p_pri) == 0)
+X		{
+X		    /* use resident set size (rssize) to break the tie */
+X		    if ((result = P_RSSIZE(p2) - P_RSSIZE(p1)) == 0)
+X		    {
+X			/* use total memory to break the tie */
+X			result = PROCSIZE(p2) - PROCSIZE(p1);
+X		    }
+X		}
+X	    }
+X	}
+X    }
+X    else
+X    {
+X	result = lresult < 0 ? -1 : 1;
+X    }
+X
+X    return(result);
+X}
+X
+X
+Xvoid (*signal(sig, func))()
+X    int sig;
+X    void (*func)();
+X{
+X    struct sigvec osv, sv;
+X
+X    /*
+X     * XXX: we should block the signal we are playing with,
+X     *	    in case we get interrupted in here.
+X     */
+X    if (sigvector(sig, NULL, &osv) == -1)
+X	return BADSIG;
+X    sv = osv;
+X    sv.sv_handler = func;
+X#ifdef SV_BSDSIG
+X    sv.sv_flags |= SV_BSDSIG;
+X#endif
+X    if (sigvector(sig, &sv, NULL) == -1)
+X	return BADSIG;
+X    return osv.sv_handler;
+X}
+X
+Xint getpagesize() { return 1 << PGSHIFT; }
+X
+Xint setpriority(a, b, c) { errno = ENOSYS; return -1; }
+X
+X/*
+X * proc_owner(pid) - returns the uid that owns process "pid", or -1 if
+X *		the process does not exist.
+X *		It is EXTREMLY IMPORTANT that this function work correctly.
+X *		If top runs setuid root (as in SVR4), then this function
+X *		is the only thing that stands in the way of a serious
+X *		security problem.  It validates requests for the "kill"
+X *		and "renice" commands.
+X */
+X
+Xint proc_owner(pid)
+X
+Xint pid;
+X
+X{
+X    register int cnt;
+X    register struct proc **prefp;
+X    register struct proc *pp;
+X
+X    prefp = pref;
+X    cnt = pref_len;
+X    while (--cnt >= 0)
+X    {
+X	if ((pp = *prefp++)->p_pid == (pid_t)pid)
+X	{
+X	    return((int)pp->p_uid);
+X	}
+X    }
+X    return(-1);
+X}
+END_OF_FILE
+if test 19437 -ne `wc -c <'machine/m_hpux9.c'`; then
+    echo shar: \"'machine/m_hpux9.c'\" unpacked with wrong size!
+fi
+# end of 'machine/m_hpux9.c'
+fi
+if test -f 'top.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'top.c'\"
+else
+echo shar: Extracting \"'top.c'\" \(19360 characters\)
+sed "s/^X//" >'top.c' <<'END_OF_FILE'
+Xchar *copyright =
+X    "Copyright (c) 1984 through 1993, William LeFebvre";
+X
+X/*
+X *  Top users/processes display for Unix
+X *  Version 3
+X *
+X *  This program may be freely redistributed,
+X *  but this entire comment MUST remain intact.
+X *
+X *  Copyright (c) 1984, 1989, William LeFebvre, Rice University
+X *  Copyright (c) 1989, 1990, 1992, William LeFebvre, Northwestern University
+X */
+X
+X/*
+X *  See the file "Changes" for information on version-to-version changes.
+X */
+X
+X/*
+X *  This file contains "main" and other high-level routines.
+X */
+X
+X/*
+X * The following preprocessor variables, when defined, are used to
+X * distinguish between different Unix implementations:
+X *
+X *	SIGHOLD  - use SVR4 sighold function when defined
+X *	SIGRELSE - use SVR4 sigrelse function when defined
+X *	FD_SET   - macros FD_SET and FD_ZERO are used when defined
+X */
+X
+X#include "os.h"
+X#include <signal.h>
+X#include <setjmp.h>
+X#include <ctype.h>
+X#include <sys/time.h>
+X
+X/* includes specific to top */
+X#include "display.h"		/* interface to display package */
+X#include "screen.h"		/* interface to screen package */
+X#include "top.h"
+X#include "top.local.h"
+X#include "boolean.h"
+X#include "machine.h"
+X#include "utils.h"
+X
+X/* Size of the stdio buffer given to stdout */
+X#define Buffersize	2048
+X
+X/* The buffer that stdio will use */
+Xchar stdoutbuf[Buffersize];
+X
+X/* build Signal masks */
+X#define Smask(s)	(1 << ((s) - 1))
+X
+X/* for system errors */
+Xextern int errno;
+X
+X/* for getopt: */
+Xextern int  optind;
+Xextern char *optarg;
+X
+X/* imported from screen.c */
+Xextern int overstrike;
+X
+X/* signal handling routines */
+Xsigret_t leave();
+Xsigret_t onalrm();
+Xsigret_t tstop();
+X
+X/* internal routines */
+Xvoid quit();
+X
+X/* miscellaneous things */
+Xchar *myname = "top";
+Xjmp_buf jmp_int;
+X
+X/* system routines that don't return int */
+Xchar *getenv();
+Xcaddr_t malloc();
+X
+X/* routines that don't return int */
+X
+Xchar *username();
+Xchar *ctime();
+Xchar *kill_procs();
+Xchar *renice_procs();
+X
+Xextern int proc_compare();
+Xlong time();
+X
+Xcaddr_t get_process_info();
+X
+X/* different routines for displaying the user's identification */
+X/* (values assigned to get_userid) */
+Xchar *username();
+Xchar *itoa7();
+X
+X/* display routines that need to be predeclared */
+Xint i_loadave();
+Xint u_loadave();
+Xint i_procstates();
+Xint u_procstates();
+Xint i_cpustates();
+Xint u_cpustates();
+Xint i_memory();
+Xint u_memory();
+Xint i_message();
+Xint u_message();
+Xint i_header();
+Xint u_header();
+Xint i_process();
+Xint u_process();
+X
+X/* pointers to display routines */
+Xint (*d_loadave)() = i_loadave;
+Xint (*d_procstates)() = i_procstates;
+Xint (*d_cpustates)() = i_cpustates;
+Xint (*d_memory)() = i_memory;
+Xint (*d_message)() = i_message;
+Xint (*d_header)() = i_header;
+Xint (*d_process)() = i_process;
+X
+X
+Xmain(argc, argv)
+X
+Xint  argc;
+Xchar *argv[];
+X
+X{
+X    register int i;
+X    register int active_procs;
+X    register int change;
+X
+X    struct system_info system_info;
+X    struct statics statics;
+X    caddr_t processes;
+X
+X    static char tempbuf1[50];
+X    static char tempbuf2[50];
+X    int old_sigmask;		/* only used for BSD-style signals */
+X    int topn = Default_TOPN;
+X    int delay = Default_DELAY;
+X    int displays = 0;		/* indicates unspecified */
+X    int max_topn;		/* maximum displayable processes */
+X    long curr_time;
+X    char *(*get_userid)() = username;
+X    char *uname_field = "USERNAME";
+X    char *header_text;
+X    char *env_top;
+X    char **preset_argv;
+X    int  preset_argc = 0;
+X    char **av;
+X    int  ac;
+X    char dostates = No;
+X    char do_unames = Yes;
+X    char interactive = Maybe;
+X    char warnings = 0;
+X#if Default_TOPN == Infinity
+X    char topn_specified = No;
+X#endif
+X    char ch;
+X    char *iptr;
+X    char no_command = 1;
+X    struct timeval timeout;
+X    struct process_select ps;
+X#ifndef FD_SET
+X    /* FD_SET and friends are not present:  fake it */
+X    typedef fd_set int;
+X#define FD_ZERO(x)     (*(x) = 0)
+X#define FD_SET(f, x)   (*(x) = f)
+X#endif
+X    fd_set readfds;
+X
+X    static char command_chars[] = "\f qh?en#sdkriIu";
+X/* these defines enumerate the "strchr"s of the commands in command_chars */
+X#define CMD_redraw	0
+X#define CMD_update	1
+X#define CMD_quit	2
+X#define CMD_help1	3
+X#define CMD_help2	4
+X#define CMD_OSLIMIT	4    /* terminals with OS can only handle commands */
+X#define CMD_errors	5    /* less than or equal to CMD_OSLIMIT	   */
+X#define CMD_number1	6
+X#define CMD_number2	7
+X#define CMD_delay	8
+X#define CMD_displays	9
+X#define CMD_kill	10
+X#define CMD_renice	11
+X#define CMD_idletog     12
+X#define CMD_idletog2    13
+X#define CMD_user	14
+X
+X    /* set the buffer for stdout */
+X#ifdef DEBUG
+X    setbuffer(stdout, NULL, 0);
+X#else
+X    setbuffer(stdout, stdoutbuf, Buffersize);
+X#endif
+X
+X    /* get our name */
+X    if (argc > 0)
+X    {
+X	if ((myname = strrchr(argv[0], '/')) == 0)
+X	{
+X	    myname = argv[0];
+X	}
+X	else
+X	{
+X	    myname++;
+X	}
+X    }
+X
+X    /* initialize some selection options */
+X    ps.idle    = Yes;
+X    ps.system  = No;
+X    ps.uid     = -1;
+X    ps.command = NULL;
+X
+X    /* get preset options from the environment */
+X    if ((env_top = getenv("TOP")) != NULL)
+X    {
+X	av = preset_argv = argparse(env_top, &preset_argc);
+X	ac = preset_argc;
+X
+X	/* set the dummy argument to an explanatory message, in case
+X	   getopt encounters a bad argument */
+X	preset_argv[0] = "while processing environment";
+X    }
+X
+X    /* process options */
+X    do {
+X	/* if we're done doing the presets, then process the real arguments */
+X	if (preset_argc == 0)
+X	{
+X	    ac = argc;
+X	    av = argv;
+X
+X	    /* this should keep getopt happy... */
+X	    optind = 1;
+X	}
+X
+X	while ((i = getopt(ac, av, "SIbinqus:d:U:")) != EOF)
+X	{
+X	    switch(i)
+X	    {
+X	      case 'u':			/* toggle uid/username display */
+X		do_unames = !do_unames;
+X		break;
+X
+X	      case 'U':			/* display only username's processes */
+X		if ((ps.uid = userid(optarg)) == -1)
+X		{
+X		    fprintf(stderr, "%s: unknown user\n", optarg);
+X		    exit(1);
+X		}
+X		break;
+X
+X	      case 'S':			/* show system processes */
+X		ps.system = !ps.system;
+X		break;
+X
+X	      case 'I':                   /* show idle processes */
+X		ps.idle = !ps.idle;
+X		break;
+X
+X	      case 'i':			/* go interactive regardless */
+X		interactive = Yes;
+X		break;
+X
+X	      case 'n':			/* batch, or non-interactive */
+X	      case 'b':
+X		interactive = No;
+X		break;
+X
+X	      case 'd':			/* number of displays to show */
+X		if ((i = atoiwi(optarg)) == Invalid || i == 0)
+X		{
+X		    fprintf(stderr,
+X			"%s: warning: display count should be positive -- option ignored\n",
+X			myname);
+X		    warnings++;
+X		}
+X		else
+X		{
+X		    displays = i;
+X		}
+X		break;
+X
+X	      case 's':
+X		if ((delay = atoi(optarg)) < 0)
+X		{
+X		    fprintf(stderr,
+X			"%s: warning: seconds delay should be non-negative -- using default\n",
+X			myname);
+X		    delay = Default_DELAY;
+X		    warnings++;
+X		}
+X		break;
+X
+X	      case 'q':		/* be quick about it */
+X		/* only allow this if user is really root */
+X		if (getuid() == 0)
+X		{
+X		    /* be very un-nice! */
+X		    (void) nice(-20);
+X		}
+X		else
+X		{
+X		    fprintf(stderr,
+X			"%s: warning: `-q' option can only be used by root\n",
+X			myname);
+X		    warnings++;
+X		}
+X		break;
+X
+X	      default:
+X		fprintf(stderr, "\
+XTop version %s\n\
+XUsage: %s [-ISbinqu] [-d x] [-s x] [-U username] [number]\n",
+X			version_string(), myname);
+X		exit(1);
+X	    }
+X	}
+X
+X	/* get count of top processes to display (if any) */
+X	if (optind < ac)
+X	{
+X	    if ((topn = atoiwi(av[optind])) == Invalid)
+X	    {
+X		fprintf(stderr,
+X			"%s: warning: process display count should be non-negative -- using default\n",
+X			myname);
+X		topn = Default_TOPN;
+X		warnings++;
+X	    }
+X#if Default_TOPN == Infinity
+X            else
+X	    {
+X		topn_specified = Yes;
+X	    }
+X#endif
+X	}
+X
+X	/* tricky:  remember old value of preset_argc & set preset_argc = 0 */
+X	i = preset_argc;
+X	preset_argc = 0;
+X
+X    /* repeat only if we really did the preset arguments */
+X    } while (i != 0);
+X
+X    /* set constants for username/uid display correctly */
+X    if (!do_unames)
+X    {
+X	uname_field = "   UID  ";
+X	get_userid = itoa7;
+X    }
+X
+X    /* initialize the kernel memory interface */
+X    if (machine_init(&statics) == -1)
+X    {
+X	exit(1);
+X    }
+X
+X#ifdef no_initialization_needed
+X    /* initialize the hashing stuff */
+X    if (do_unames)
+X    {
+X	init_hash();
+X    }
+X#endif
+X
+X    /* initialize termcap */
+X    if (interactive == No)
+X    {
+X	smart_terminal = No;
+X    }
+X    else
+X    {
+X	init_termcap();
+X    }
+X
+X    /* get the string to use for the process area header */
+X    header_text = format_header(uname_field);
+X
+X    /* initialize display interface */
+X    if ((max_topn = display_init(&statics)) == -1)
+X    {
+X	fprintf(stderr, "%s: can't allocate sufficient memory\n", myname);
+X	exit(4);
+X    }
+X    
+X    /* print warning if user requested more processes than we can display */
+X    if (topn > max_topn)
+X    {
+X	fprintf(stderr,
+X		"%s: warning: this terminal can only display %d processes.\n",
+X		myname, max_topn);
+X	topn = max_topn;
+X	warnings++;
+X    }
+X
+X    /* adjust for topn == Infinity */
+X    if (topn == Infinity)
+X    {
+X	/*
+X	 *  For smart terminals, infinity really means everything that can
+X	 *  be displayed, or max_topn.
+X	 *  On dumb terminals, infinity means every process in the system!
+X	 *  We only really want to do that if it was explicitly specified.
+X	 *  This is always the case when "Default_TOPN != Infinity".  But if
+X	 *  topn wasn't explicitly specified and we are on a dumb terminal
+X	 *  and the default is Infinity, then (and only then) we use
+X	 *  "Nominal_TOPN" instead.
+X	 */
+X#if Default_TOPN == Infinity
+X	topn = smart_terminal ? max_topn :
+X		    (topn_specified ? Largest : Nominal_TOPN);
+X#else
+X	topn = smart_terminal ? max_topn : Largest;
+X#endif
+X    }
+X
+X    /* set header display accordingly */
+X    display_header(topn > 0);
+X
+X    /* determine interactive state */
+X    if (interactive == Maybe)
+X    {
+X	interactive = smart_terminal;
+X    }
+X
+X    /* if # of displays not specified, fill it in */
+X    if (displays == 0)
+X    {
+X	displays = smart_terminal ? Infinity : 1;
+X    }
+X
+X    /* hold interrupt signals while setting up the screen and the handlers */
+X#ifdef SIGHOLD
+X    sighold(SIGINT);
+X    sighold(SIGQUIT);
+X    sighold(SIGTSTP);
+X#else
+X    old_sigmask = sigblock(Smask(SIGINT) | Smask(SIGQUIT) | Smask(SIGTSTP));
+X#endif
+X    init_screen();
+X    (void) signal(SIGINT, leave);
+X    (void) signal(SIGQUIT, leave);
+X    (void) signal(SIGTSTP, tstop);
+X#ifdef SIGRELSE
+X    sigrelse(SIGINT);
+X    sigrelse(SIGQUIT);
+X    sigrelse(SIGTSTP);
+X#else
+X    (void) sigsetmask(old_sigmask);
+X#endif
+X    if (warnings)
+X    {
+X	fputs("....", stderr);
+X	fflush(stderr);			/* why must I do this? */
+X	sleep((unsigned)(3 * warnings));
+X	fputc('\n', stderr);
+X    }
+X
+X    /* setup the jump buffer for stops */
+X    if (setjmp(jmp_int) != 0)
+X    {
+X	/* control ends up here after an interrupt */
+X	reset_display();
+X    }
+X
+X    /*
+X     *  main loop -- repeat while display count is positive or while it
+X     *		indicates infinity (by being -1)
+X     */
+X
+X    while ((displays == -1) || (displays-- > 0))
+X    {
+X	/* get the current stats */
+X	get_system_info(&system_info);
+X
+X	/* get the current set of processes */
+X	processes =
+X		get_process_info(&system_info, &ps, proc_compare);
+X
+X	/* display the load averages */
+X	(*d_loadave)(system_info.last_pid,
+X		     system_info.load_avg);
+X
+X	/* display the current time */
+X	/* this method of getting the time SHOULD be fairly portable */
+X	time(&curr_time);
+X	i_timeofday(&curr_time);
+X
+X	/* display process state breakdown */
+X	(*d_procstates)(system_info.p_total,
+X			system_info.procstates);
+X
+X	/* display the cpu state percentage breakdown */
+X	if (dostates)	/* but not the first time */
+X	{
+X	    (*d_cpustates)(system_info.cpustates);
+X	}
+X	else
+X	{
+X	    /* we'll do it next time */
+X	    if (smart_terminal)
+X	    {
+X		z_cpustates();
+X	    }
+X	    else
+X	    {
+X		putchar('\n');
+X	    }
+X	    dostates = Yes;
+X	}
+X
+X	/* display memory stats */
+X	(*d_memory)(system_info.memory);
+X
+X	/* handle message area */
+X	(*d_message)();
+X
+X	/* update the header area */
+X	(*d_header)(header_text);
+X    
+X	i = 0;
+X	if (topn > 0)
+X	{
+X	    /* adjust for a lack of processes */
+X	    active_procs = system_info.p_active;
+X	    if (active_procs > topn)
+X	    {
+X		active_procs = topn;
+X	    }
+X
+X	    /* now show the top "n" processes. */
+X	    for (i = 0; i < active_procs; i++)
+X	    {
+X		(*d_process)(i, format_next_process(processes, get_userid));
+X	    }
+X	}
+X
+X	/* do end-screen processing */
+X	u_endscreen(i);
+X
+X	/* now, flush the output buffer */
+X	fflush(stdout);
+X
+X	/* only do the rest if we have more displays to show */
+X	if (displays)
+X	{
+X	    /* switch out for new display on smart terminals */
+X	    if (smart_terminal)
+X	    {
+X		if (overstrike)
+X		{
+X		    reset_display();
+X		}
+X		else
+X		{
+X		    d_loadave = u_loadave;
+X		    d_procstates = u_procstates;
+X		    d_cpustates = u_cpustates;
+X		    d_memory = u_memory;
+X		    d_message = u_message;
+X		    d_header = u_header;
+X		    d_process = u_process;
+X		}
+X	    }
+X    
+X	    no_command = Yes;
+X	    if (!interactive)
+X	    {
+X		/* set up alarm */
+X		(void) signal(SIGALRM, onalrm);
+X		(void) alarm((unsigned)delay);
+X    
+X		/* wait for the rest of it .... */
+X		pause();
+X	    }
+X	    else while (no_command)
+X	    {
+X		/* assume valid command unless told otherwise */
+X		no_command = No;
+X
+X		/* set up arguments for select with timeout */
+X		FD_ZERO(&readfds);
+X		FD_SET(1, &readfds);		/* for standard input */
+X		timeout.tv_sec  = delay;
+X		timeout.tv_usec = 0;
+X
+X		/* wait for either input or the end of the delay period */
+X		if (select(32, &readfds, (fd_set *)NULL, (fd_set *)NULL, &timeout) > 0)
+X		{
+X		    int newval;
+X		    char *errmsg;
+X    
+X		    /* something to read -- clear the message area first */
+X		    clear_message();
+X
+X		    /* now read it and convert to command strchr */
+X		    /* (use "change" as a temporary to hold strchr) */
+X		    (void) read(0, &ch, 1);
+X		    if ((iptr = strchr(command_chars, ch)) == NULL)
+X		    {
+X			/* illegal command */
+X			new_message(MT_standout, " Command not understood");
+X			putchar('\r');
+X			no_command = Yes;
+X		    }
+X		    else
+X		    {
+X			change = iptr - command_chars;
+X			if (overstrike && change > CMD_OSLIMIT)
+X			{
+X			    /* error */
+X			    new_message(MT_standout,
+X			    " Command cannot be handled by this terminal");
+X			    putchar('\r');
+X			    no_command = Yes;
+X			}
+X			else switch(change)
+X			{
+X			    case CMD_redraw:	/* redraw screen */
+X				reset_display();
+X				break;
+X    
+X			    case CMD_update:	/* merely update display */
+X				/* is the load average high? */
+X				if (system_info.load_avg[0] > LoadMax)
+X				{
+X				    /* yes, go home for visual feedback */
+X				    go_home();
+X				    fflush(stdout);
+X				}
+X				break;
+X	    
+X			    case CMD_quit:	/* quit */
+X				quit(0);
+X				/*NOTREACHED*/
+X				break;
+X	    
+X			    case CMD_help1:	/* help */
+X			    case CMD_help2:
+X				reset_display();
+X				clear();
+X				show_help();
+X				standout("Hit any key to continue: ");
+X				fflush(stdout);
+X				(void) read(0, &ch, 1);
+X				break;
+X	
+X			    case CMD_errors:	/* show errors */
+X				if (error_count() == 0)
+X				{
+X				    new_message(MT_standout,
+X					" Currently no errors to report.");
+X				    putchar('\r');
+X				    no_command = Yes;
+X				}
+X				else
+X				{
+X				    reset_display();
+X				    clear();
+X				    show_errors();
+X				    standout("Hit any key to continue: ");
+X				    fflush(stdout);
+X				    (void) read(0, &ch, 1);
+X				}
+X				break;
+X	
+X			    case CMD_number1:	/* new number */
+X			    case CMD_number2:
+X				new_message(MT_standout,
+X				    "Number of processes to show: ");
+X				newval = readline(tempbuf1, 8, Yes);
+X				if (newval > -1)
+X				{
+X				    if (newval > max_topn)
+X				    {
+X					new_message(MT_standout | MT_delayed,
+X					  " This terminal can only display %d processes.",
+X					  max_topn);
+X					newval = max_topn;
+X					putchar('\r');
+X				    }
+X
+X				    if (newval == 0)
+X				    {
+X					/* inhibit the header */
+X					display_header(No);
+X				    }
+X				    else if (newval > topn && topn == 0)
+X				    {
+X					/* redraw the header */
+X					display_header(Yes);
+X					d_header = i_header;
+X				    }
+X				    topn = newval;
+X				}
+X				break;
+X	    
+X			    case CMD_delay:	/* new seconds delay */
+X				new_message(MT_standout, "Seconds to delay: ");
+X				if ((i = readline(tempbuf1, 8, Yes)) > -1)
+X				{
+X				    delay = i;
+X				}
+X				clear_message();
+X				break;
+X	
+X			    case CMD_displays:	/* change display count */
+X				new_message(MT_standout,
+X					"Displays to show (currently %s): ",
+X					displays == -1 ? "infinite" :
+X							 itoa(displays));
+X				if ((i = readline(tempbuf1, 10, Yes)) > 0)
+X				{
+X				    displays = i;
+X				}
+X				else if (i == 0)
+X				{
+X				    quit(0);
+X				}
+X				clear_message();
+X				break;
+X    
+X			    case CMD_kill:	/* kill program */
+X				new_message(0, "kill ");
+X				if (readline(tempbuf2, sizeof(tempbuf2), No) > 0)
+X				{
+X				    if ((errmsg = kill_procs(tempbuf2)) != NULL)
+X				    {
+X					new_message(MT_standout, errmsg);
+X					putchar('\r');
+X					no_command = Yes;
+X				    }
+X				}
+X				else
+X				{
+X				    clear_message();
+X				}
+X				break;
+X	    
+X			    case CMD_renice:	/* renice program */
+X				new_message(0, "renice ");
+X				if (readline(tempbuf2, sizeof(tempbuf2), No) > 0)
+X				{
+X				    if ((errmsg = renice_procs(tempbuf2)) != NULL)
+X				    {
+X					new_message(MT_standout, errmsg);
+X					putchar('\r');
+X					no_command = Yes;
+X				    }
+X				}
+X				else
+X				{
+X				    clear_message();
+X				}
+X				break;
+X
+X			    case CMD_idletog:
+X			    case CMD_idletog2:
+X				ps.idle = !ps.idle;
+X				new_message(MT_standout | MT_delayed,
+X				    " %sisplaying idle processes.",
+X				    ps.idle ? "D" : "Not d");
+X				putchar('\r');
+X				break;
+X
+X			    case CMD_user:
+X				new_message(MT_standout,
+X				    "Username to show: ");
+X				if (readline(tempbuf2, sizeof(tempbuf2), No) > 0)
+X				{
+X				    if (tempbuf2[0] == '+' &&
+X					tempbuf2[1] == '\0')
+X				    {
+X					ps.uid = -1;
+X				    }
+X				    else if ((i = userid(tempbuf2)) == -1)
+X				    {
+X					new_message(MT_standout,
+X					    " %s: unknown user", tempbuf2);
+X					no_command = Yes;
+X				    }
+X				    else
+X				    {
+X					ps.uid = i;
+X				    }
+X				    putchar('\r');
+X				}
+X				else
+X				{
+X				    clear_message();
+X				}
+X				break;
+X	    
+X			    default:
+X				new_message(MT_standout, " BAD CASE IN SWITCH!");
+X				putchar('\r');
+X			}
+X		    }
+X
+X		    /* flush out stuff that may have been written */
+X		    fflush(stdout);
+X		}
+X	    }
+X	}
+X    }
+X
+X    quit(0);
+X    /*NOTREACHED*/
+X}
+X
+X/*
+X *  reset_display() - reset all the display routine pointers so that entire
+X *	screen will get redrawn.
+X */
+X
+Xreset_display()
+X
+X{
+X    d_loadave    = i_loadave;
+X    d_procstates = i_procstates;
+X    d_cpustates  = i_cpustates;
+X    d_memory     = i_memory;
+X    d_message	 = i_message;
+X    d_header	 = i_header;
+X    d_process	 = i_process;
+X}
+X
+X/*
+X *  signal handlers
+X */
+X
+Xsigret_t leave()	/* exit under normal conditions -- INT handler */
+X
+X{
+X    end_screen();
+X    exit(0);
+X}
+X
+Xsigret_t tstop()	/* SIGTSTP handler */
+X
+X{
+X    /* move to the lower left */
+X    end_screen();
+X    fflush(stdout);
+X
+X    /* default the signal handler action */
+X    (void) signal(SIGTSTP, SIG_DFL);
+X
+X    /* unblock the signal and send ourselves one */
+X#ifdef SIGRELSE
+X    sigrelse(SIGTSTP);
+X#else
+X    (void) sigsetmask(sigblock(0) & ~(1 << (SIGTSTP - 1)));
+X#endif
+X    (void) kill(0, SIGTSTP);
+X
+X    /* reset the signal handler */
+X    (void) signal(SIGTSTP, tstop);
+X
+X    /* reinit screen */
+X    reinit_screen();
+X
+X    /* jump to appropriate place */
+X    longjmp(jmp_int, 1);
+X
+X    /*NOTREACHED*/
+X}
+X
+Xvoid quit(status)		/* exit under duress */
+X
+Xint status;
+X
+X{
+X    end_screen();
+X    exit(status);
+X    /*NOTREACHED*/
+X}
+X
+Xsigret_t onalrm()	/* SIGALRM handler */
+X
+X{
+X    /* this is only used in batch mode to break out of the pause() */
+X    /* return; */
+X}
+X
+END_OF_FILE
+if test 19360 -ne `wc -c <'top.c'`; then
+    echo shar: \"'top.c'\" unpacked with wrong size!
+fi
+# end of 'top.c'
+fi
+echo shar: End of archive 10 \(of 13\).
+cp /dev/null ark10isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 13 archives.
+    echo "Now read README and INSTALL, then run Configure"
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

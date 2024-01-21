@@ -1,0 +1,1215 @@
+Subject:  v13i095:  Full featured xmodem program, v3.4, Part03/03
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Steve Grandi <grandi@noao.arizona.edu>
+Posting-number: Volume 13, Issue 95
+Archive-name: xmodem3.4/part03
+
+
+
+: This is a shar archive.  Extract with sh, not csh.
+echo x - receive.c
+sed -e 's/^X//' > receive.c << '!Funky!Stuff!'
+X#include "xmodem.h"
+X
+X/**  receive a file  **/
+X
+X/* returns TRUE if in the midst of a batch transfer */
+X/* returns FALSE if no more files are coming */
+X
+X/* This routine is one HUGE do-while loop with far to many indented levels.
+X * I chose this route to facilitate error processing and to avoid GOTOs.
+X * Given the troubles I've had keeping the nested IF statements straight,
+X * I was probably mistaken...
+X */
+X
+Xrfile(name)
+Xchar *name;
+X    {
+X
+X    char *sectdisp();
+X    char *cpm_unix();
+X    char *strcpy();
+X    char *ctime();
+X    time_t time();
+X
+X    int fd,     /* file descriptor for created file */
+X    checksum,   /* packet checksum */
+X    firstchar,  /* first character of a packet */
+X    sectnum,    /* number of last received packet (modulo 128) */
+X    sectcurr,   /* second byte of packet--should be packet number (mod 128) */
+X    sectcomp,   /* third byte of packet--should be complement of sectcurr */
+X    tmode,      /* text mode if true, binary mode if false */
+X    errors,     /* running count of errors (reset when 1st packet starts */
+X    errorflag,  /* set true when packet (or first char of putative packet) is invalid */
+X    fatalerror, /* set within main "read-packet" Do-While when bad error found */
+X    inchecksum, /* incoming checksum or CRC */
+X    expsect,    /* expected number of sectors (YMODEM batch) */
+X    firstwait,  /* seconds to wait for first character in a packet */
+X    bufsize;    /* packet size (128 or 1024) */
+X    long recvsectcnt;   /* running sector count (128 byte sectors) */
+X    long modtime;   /* Unix style file mod time from YMODEM header */
+X    int filemode; /* Unix style file mode from YMODEM header */
+X    long readbackup;    /* "backup" value for characters read in file */
+X    time_t timep[2];    /* used in setting mod time of received file */
+X    char *p;	/* generic pointer */
+X    int bufctr; /* number of real chars in read packet */
+X    unsigned char *nameptr; /* ptr in filename for MODEM7 protocol */
+X    time_t start;   /* starting time of transfer */
+X    int openflag = FALSE;   /* is file open for writing? */
+X
+X    logit("----\nXMODEM File Receive Function\n");
+X    if (CRCMODE)
+X        logit("CRC mode requested\n");
+X
+X    BATCH = FALSE;          /* don't know if really are in batch mode ! */
+X    fatalerror = FALSE;
+X    firstwait = WAITFIRST;  /* For first packet, wait short time */
+X    sectnum = errors = recvsectcnt = 0;
+X    bufsize = 128;
+X    modtime = 0l; filemode = 0;
+X    filelength = 0l; fileread =0l; CHECKLENGTH = FALSE;
+X
+X    tmode = (XMITTYPE == 't') ? TRUE : FALSE;
+X
+X    /* start up transfer */
+X    if (CRCMODE)        
+X	{
+X        sendbyte(CRCCHR);
+X	if (LONGPACK && !MDM7BAT)
+X	    sendbyte(KCHR);
+X	}
+X    else
+X        sendbyte(NAK);
+X
+X
+X    do                  /* start of MAIN Do-While loop to read packets */
+X        {   
+X        errorflag = FALSE;
+X        do              /* start by reading first byte in packet */
+X            {
+X            firstchar = readbyte(firstwait);
+X            } 
+X            while ((firstchar != SOH) 
+X                && (firstchar != STX) 
+X                && (firstchar != EOT) 
+X                && (firstchar != ACK || recvsectcnt > 0) 
+X                && (firstchar != TIMEOUT) 
+X                && (firstchar != CAN || recvsectcnt > 0));
+X
+X        if (firstchar == EOT)           /* check for REAL EOT */
+X            {
+X			sendbyte(NAK);				/* NAK the EOT */
+X			if ((firstchar = readbyte(3)) != EOT)	/* check next character */
+X				{
+X				logit("Spurious EOT detected; ignored\n");
+X				if ((firstchar == SOH) || (firstchar == STX) ||
+X					(firstchar == ACK && recvsectcnt == 0) ||
+X					(firstchar == CAN && recvsectcnt == 0) ||
+X					(firstchar == TIMEOUT))
+X						break;
+X				else
+X					{
+X					firstchar = 0;
+X					errorflag = TRUE;
+X					}
+X				}
+X            }
+X
+X        if (firstchar == TIMEOUT)       /* timeout? */
+X            {  
+X            if (recvsectcnt > 0)
+X                logitarg("Timeout on Sector %s\n", sectdisp(recvsectcnt,bufsize,1));
+X            errorflag = TRUE;
+X            }
+X
+X        if (firstchar == CAN)           /* bailing out? (only at beginning) */
+X            {
+X            if ((readbyte(3) & 0x7f) == CAN)
+X                error("Reception canceled at user's request",TRUE);
+X            else
+X                {
+X                errorflag = TRUE;
+X                logit("Received single CAN character\n");
+X                }
+X            }
+X
+X        if (firstchar == ACK)           /* MODEM7 batch? (only at beginning) */
+X            {
+X            int i,c; 
+X
+X            logit("MODEM7 Batch Protocol\n");
+X            nameptr = buff;
+X            checksum = 0;
+X
+X            for (i=0; i<NAMSIZ; i++)
+X                {
+X                c = readbyte(3);
+X
+X                if (c == CAN)
+X                    {
+X                    if (readbyte(3) == CAN)
+X                        error("Program Canceled by User", TRUE);
+X                    else
+X                        {
+X                        logit("Received single CAN character in MODEM7 filename\n");
+X                        errorflag = TRUE;
+X                        break;
+X                        }
+X                    }
+X
+X                if (c == EOT && i == 0)
+X                    {
+X		    sendbyte(NAK);	/* NAK the EOT to force verification */
+X		    if ((c=readbyte(3)) != EOT)
+X			{
+X			logit("Spurious EOT detected in MODEM7 filename\n");
+X			errorflag = TRUE;
+X			break;
+X			}
+X                    sendbyte(ACK);			/* acknowledge EOT */
+X                    while (readbyte(1) != TIMEOUT)	/* flush garbage */
+X                        ;
+X                    logit("MODEM7 Batch Receive Complete\n");
+X                    return (FALSE);
+X                    }
+X
+X                if (c == TIMEOUT)
+X                    {
+X                    logit("Timeout waiting for MODEM7 filename character\n");
+X                    errorflag = TRUE;
+X                    break;
+X                    }
+X
+X                if (c == BAD_NAME)
+X                    {
+X                    logit("Error during MODEM7 filename transfer\n");
+X                    errorflag = TRUE;
+X                    break;
+X                    }
+X
+X                *nameptr++ = c;
+X                checksum += c;
+X                sendbyte(ACK);
+X                }
+X
+X            if (!errorflag)
+X                {
+X                c = readbyte(3);
+X                if (c == CTRLZ)     /* OK; end of string found */
+X                    {
+X                    sendbyte(checksum + CTRLZ);
+X                    if (readbyte(15) == ACK)     /* file name found! */
+X                        {
+X                        xmdebug("MODEM7 file name OK");
+X                        *nameptr = '\000';	/* unixify the file name */
+X                        name = cpm_unix(buff);
+X                        BATCH = TRUE;
+X                        logitarg("MODEM7 file name: %s\n", name);
+X			errors = 0;		/* restart crc handshake */
+X			sleep(2);		/* give other side a chance */
+X                        }
+X                    else
+X                        {
+X                        logit("Checksum error in MODEM7 filename\n");
+X                        errorflag = TRUE;
+X                        }
+X                    }
+X                else
+X                    {
+X                    logit("Length error in MODEM7 fielname\n");
+X                    errorflag = TRUE;
+X                    }
+X                }
+X            }
+X            
+X
+X        if (firstchar == SOH || firstchar == STX)  /* start reading packet */
+X            {
+X            bufsize = (firstchar == SOH) ? 128 : 1024;
+X
+X            if (recvsectcnt == 0)           /* 1st data packet, initialize */
+X                {
+X                if (bufsize == 1024)
+X                    logit("1K packet mode chosen\n");
+X                start = time((time_t *) 0);
+X                errors = 0;
+X                firstwait = 5;
+X                }
+X
+X	    sectcurr = readbyte(3);
+X	    sectcomp = readbyte(3);
+X		if ((sectcurr + sectcomp) == 0xff)  /* is packet number checksum correct? */
+X		    {  
+X			if (sectcurr == ((sectnum+1) & 0xff))   /* is packet number correct? */
+X			    {  
+X			    if (DEBUG)
+X			        fprintf(LOGFP,"DEBUG: packet %d started\n", sectnum);
+X
+X            /* Read, process and calculate checksum for a buffer of data */
+X
+X                            readbackup = fileread;
+X			    if (readbuf(bufsize, 1, tmode, recvsectcnt, &checksum, &bufctr) != TIMEOUT) 
+X                                {
+X
+X		    /* verify checksum or CRC */
+X
+X				if (CRCMODE) 
+X                                    {
+X				    checksum &= 0xffff;
+X				    inchecksum = readbyte(3);  /* get 16-bit CRC */
+X				    inchecksum = (inchecksum<<8) | readbyte(3);
+X				    }
+X                        
+X				else
+X				    inchecksum = readbyte(3);  /* get simple 8-bit checksum */
+X
+X				if (inchecksum == checksum) /* good checksum, hence good packet */
+X				    {  
+X				    xmdebug("checksum ok");
+X				    errors = 0;
+X				    recvsectcnt += (bufsize == 128) ? 1 : 8;
+X				    sectnum = sectcurr; 
+X
+X				    if (!openflag)      /* open output file if necessary */
+X					{
+X					openflag = TRUE;
+X					if ((fd = creat(name, CREATMODE)) < 0)
+X					    {
+X					    sendbyte(CAN); sendbyte(CAN); sendbyte(CAN);
+X					    error("Can't create file for receive", TRUE);
+X					    }
+X                                        if (!BATCH)
+X					    logitarg("File Name: %s\n", name);
+X					}
+X
+X				    if (write(fd, (char *) buff, bufctr) != bufctr)
+X					{
+X					close(fd);
+X					unlink(name);
+X					error("File Write Error", TRUE);
+X					}
+X				    else
+X					sendbyte(ACK);      /* ACK the received packet */
+X				    }
+X
+X            /* Start handling various errors and special conditions */
+X
+X				else        /* bad checksum */
+X				    {  
+X				    logitarg("Checksum Error on Sector %s:  ", sectdisp(recvsectcnt,bufsize,1));
+X				    logitarg("sent=%x  ", inchecksum);
+X				    logitarg("recvd=%x\n", checksum);
+X                                    fileread = readbackup;
+X				    errorflag = TRUE;
+X				    }
+X                                }
+X
+X			    else    /* read timeout */
+X				{
+X				logitarg("Timeout while reading sector %s\n",sectdisp(recvsectcnt,bufsize,1));
+X                                fileread = readbackup;
+X				errorflag = TRUE;
+X				}
+X			    }
+X
+X                        else        /* sector number is wrong OR Ymodem filename */
+X                            { 
+X			    if (sectcurr == 0 && recvsectcnt == 0)  /* Ymodem file-name packet */
+X				{
+X				logit("YMODEM Batch Protocol\n");
+X
+X				/* Read and process a file-name packet */
+X
+X				if (readbuf(bufsize, 1, FALSE, recvsectcnt, &checksum, &bufctr) != TIMEOUT) 
+X                                    {
+X
+X				    /* verify checksum or CRC */
+X
+X				    if (CRCMODE) 
+X                                        {
+X					checksum &= 0xffff;
+X					inchecksum = readbyte(3);  /* get 16-bit CRC */
+X					inchecksum = (inchecksum<<8) | readbyte(3);
+X				        }
+X                        
+X				    else
+X					inchecksum = readbyte(3);  /* get simple 8-bit checksum */
+X
+X				    if (inchecksum == checksum) /* good checksum, hence good filename */
+X					{
+X					xmdebug("checksum ok");
+X					strcpy(name, (char *)buff);
+X                                        expsect = ((buff[bufsize-1]<<8) | buff[bufsize-2]);
+X					BATCH = TRUE;
+X					if (strlen(name) == 0)  /* check for no more files */
+X					    {
+X						sendbyte(ACK);      /* ACK the packet */
+X					    logit("YMODEM Batch Receive Complete\n");
+X					    return (FALSE);
+X					    }
+X					unixify(name);       /* make filename canonical */
+X
+X                                        /* read rest of YMODEM header */
+X					p = (char *)buff + strlen((char *)buff) + 1;
+X					sscanf(p, "%ld%lo%o", &filelength, &modtime, &filemode);
+X					logitarg("YMODEM file name: %s\n", name);
+X                                        fileread = 0l;
+X                                        if (filelength)
+X                                            {
+X                                            CHECKLENGTH = TRUE;
+X                                            logitarg("YMODEM file size: %ld\n", filelength);
+X                                            }
+X                                        else
+X					    logitarg("YMODEM estimated file length %d sectors\n", expsect);
+X                                        if (modtime)
+X                                            {
+X                                            logitarg("YMODEM file date: %s", ctime(&modtime));
+X                                            }
+X                                        if (filemode)
+X                                            logitarg("YMODEM file mode: %o", filemode);
+X
+X					sendbyte(ACK);      /* ACK the packet */
+X					}
+X
+X				    else                /* bad filename checksum */
+X					{
+X					logit("checksum error on filename sector\n");
+X					errorflag = TRUE;
+X					}
+X				    }
+X				else
+X				    {
+X				    logit("Timeout while reading filename packet\n");
+X				    errorflag = TRUE;
+X                                    }
+X				}
+X
+X			    else if (sectcurr == sectnum)   /* duplicate sector? */
+X				{  
+X				logitarg("Duplicate sector %s flushed\n", sectdisp(recvsectcnt,bufsize,0));
+X				while(readbyte(3) != TIMEOUT)
+X				    ;
+X				sendbyte(ACK);
+X				}
+X			    else                /* no, real phase error */
+X				{
+X				logitarg("Phase Error - Expected packet is %s\n", sectdisp(recvsectcnt,bufsize,1));
+X				errorflag = TRUE;
+X				fatalerror = TRUE;
+X				}
+X			    }
+X		    }
+X
+X		else        /* bad packet number checksum */
+X		    {  
+X		    logitarg("Header Sector Number Error on Sector %s\n", sectdisp(recvsectcnt, bufsize,1));
+X		    errorflag = TRUE;
+X		    }
+X
+X	    }           /* END reading packet loop */
+X    
+X	if ((errorflag && !fatalerror) ||		/* check on errors or batch transfers */
+X	  ((recvsectcnt == 0) && (firstchar != EOT)))	
+X	    {  
+X	    if (errorflag)
+X	        errors++;
+X	    if (recvsectcnt != 0)
+X		while (readbyte(3) != TIMEOUT)  /* wait for line to settle if not beginning */
+X		    ;
+X
+X	    if (recvsectcnt == 0 && errors >= STERRORMAX)
+X		fatalerror = TRUE;
+X	    else if (CRCMODE && recvsectcnt == 0 && errors == CRCSWMAX)
+X		{
+X		CRCMODE = FALSE;
+X		logit("Sender not accepting CRC request, changing to checksum\n");
+X		sendbyte(NAK);
+X		}
+X	    else if (!CRCMODE && recvsectcnt == 0 && errors == CRCSWMAX)
+X		{
+X		CRCMODE = TRUE;
+X		logit("Sender not accepting checksum request, changing to CRC\n");
+X		sendbyte(CRCCHR);
+X		}
+X	    else if (CRCMODE && recvsectcnt == 0)
+X		sendbyte(CRCCHR);
+X	    else
+X		sendbyte(NAK);
+X	    }
+X
+X        if (errors > ERRORMAX && recvsectcnt != 0)  /* over error limit? */
+X            fatalerror = TRUE;
+X	}
+X        while ((firstchar != EOT) && !fatalerror);   /* end of MAIN Do-While */
+X
+X	if ((firstchar == EOT) && !fatalerror)  /* normal exit? */
+X	    {
+X	    if (openflag)       /* close the file */
+X	        close(fd);
+X	    sendbyte(ACK);	/* ACK the EOT */
+X	    logit("Receive Complete\n");
+X	    prtime (recvsectcnt, time((time_t *) 0) - start);
+X
+X            if (openflag && modtime)   /* set file modification time */
+X                {
+X                timep[0] = time((time_t *) 0);
+X                timep[1] = modtime;
+X                utime(name, timep);
+X                }
+X        
+X	    if (BATCH)          /* send appropriate return code */
+X		return(TRUE);
+X	    else
+X		return(FALSE);
+X	    }
+X	else                /* no, error exit */
+X	    { 
+X	    if (recvsectcnt != 0)
+X		sendbyte(CAN); sendbyte(CAN); sendbyte(CAN); sendbyte(CAN); sendbyte(CAN);
+X		if (openflag)
+X		    {
+X		    close(fd);
+X		    unlink(name);
+X		    }
+X		error("ABORTED -- Too Many Errors--deleting file", TRUE);
+X		return (FALSE);
+X	    }
+X    }
+!Funky!Stuff!
+echo x - misc.c
+sed -e 's/^X//' > misc.c << '!Funky!Stuff!'
+X#include "xmodem.h"
+X
+X/*  Print Help Message  */
+Xhelp()
+X	{
+X	printf("\nUsage:  \n\txmodem ");
+X	printf("-[rb!rt!sb!st][options] filename\n");
+X	printf("\nMajor Commands --");
+X	printf("\n\trb <-- Receive Binary");
+X	printf("\n\trt <-- Receive Text");
+X	printf("\n\tsb <-- Send Binary");
+X	printf("\n\tst <-- Send Text");
+X	printf("\nOptions --");
+X	printf("\n\ty  <-- Use YMODEM Batch Mode on transmit");
+X	printf("\n\tm  <-- Use MODEM7 Batch Mode on transmit");
+X	printf("\n\tk  <-- Use 1K packets on transmit");
+X	printf("\n\tc  <-- Select CRC mode on receive");
+X	printf("\n\tt  <-- Indicate a TOO BUSY Unix system");
+X	printf("\n\td  <-- Delete xmodem.log file before starting");
+X	printf("\n\tl  <-- (ell) Turn OFF Log File Entries");
+X	printf("\n\tx  <-- Include copious debugging information in log file");
+X	printf("\n");
+X	}
+X
+X/* get type of transmission requested (text or binary) */
+Xgettype(ichar)
+Xchar ichar;
+X	{
+X	if (ichar == 't' || ichar == 'T') return('t');
+X	if (ichar == 'b' || ichar == 'B') return('b');
+X	error("Invalid Send/Receive Parameter - not t or b", FALSE);
+X	return(0);
+X	}
+X
+X/* print error message and exit; if mode == TRUE, restore normal tty modes */
+Xerror(msg, mode)
+Xchar *msg;
+Xint mode;
+X	{
+X	if (mode)
+X		restoremodes(TRUE);  /* put back normal tty modes */
+X	printf("\r\n%s\n", msg);
+X	if ((LOGFLAG || DEBUG) && (LOGFP != NULL))
+X		{   
+X		fprintf(LOGFP, "XMODEM Fatal Error:  %s\n", msg);
+X	    	fclose(LOGFP);
+X		}
+X	exit(-1);
+X	}
+X
+X
+X/* Construct a proper (i.e. pretty) sector count for messages */
+X
+Xchar
+X*sectdisp(recvsectcnt, bufsize, plus1)
+Xlong recvsectcnt;
+Xint bufsize, plus1;
+X	{
+X	static char string[20];
+X	if (plus1)
+X		recvsectcnt += (bufsize == 128) ? 1 : 8;
+X	if (bufsize == 128 || recvsectcnt == 0)
+X		sprintf (string, "%d", recvsectcnt);
+X	else
+X		sprintf (string, "%d-%d", recvsectcnt-7, recvsectcnt);
+X	return(string);
+X	}
+X
+X/* type out debugging info */
+Xxmdebug(str)
+Xchar *str;
+X	{
+X	if (DEBUG && (LOGFP != NULL))
+X		fprintf(LOGFP,"DEBUG: '%s'\n",str);
+X	}
+X
+X/* print elapsed time and rate of transfer in logfile */
+X
+Xint quant[] = { 60, 60, 24};	
+Xchar sep[3][10] = { "second", "minute", "hour" };
+X
+Xprtime (numsect, seconds)
+Xlong numsect;
+Xtime_t seconds;
+X
+X{
+X	register int i;
+X	register int Seconds;
+X	int nums[3];
+X	int rate;
+X
+X	if (!LOGFLAG || numsect == 0)
+X		return(0);
+X
+X	Seconds = (int)seconds;
+X	Seconds = (Seconds > 0) ? Seconds : 0;
+X
+X	rate = (Seconds != 0) ? 128 * numsect/Seconds : 0;
+X
+X	for (i=0; i<3; i++) {
+X		nums[i] = (Seconds % quant[i]);
+X		Seconds /= quant[i];
+X	}
+X
+X	fprintf (LOGFP, "%ld Sectors Transfered in ", numsect);
+X
+X	if (rate == 0)
+X		fprintf (LOGFP, "0 seconds");
+X	else
+X		while (--i >= 0)
+X			if (nums[i])
+X				fprintf (LOGFP, "%d %s%c ", nums[i], &sep[i][0],
+X					nums[i] == 1 ? ' ' : 's');
+X	fprintf (LOGFP, "\n");
+X
+X	if (rate != 0)
+X		fprintf (LOGFP, "Transfer Rate = %d Characters per Second\n", rate);
+X
+X	return(0);
+X}
+X
+X/* Print elapsed time estimate */
+X
+Xprojtime (numsect, fd)
+Xlong numsect;
+XFILE *fd;
+X	{
+X	register int i;
+X	register int seconds;
+X	int nums[3];
+X
+X	if (numsect == 0)
+X		return (0);
+X
+X/* constant below should really be 1280; reduced to 90% to account for time lost in overhead */
+X
+X	seconds = 1422 * numsect / ttyspeed + 1;
+X
+X	for (i=0; i<3; i++) {
+X		nums[i] = (seconds % quant[i]);
+X		seconds /= quant[i];
+X	}
+X
+X	fprintf (fd, "Estimated transmission time ");
+X
+X	while (--i >= 0)
+X		if (nums[i])
+X			fprintf (fd, "%d %s%c ", nums[i], &sep[i][0],
+X				nums[i] == 1 ? ' ' : 's');
+X	fprintf (fd, "\n");
+X	return (0);
+X	}
+!Funky!Stuff!
+echo x - tip.diffs
+sed -e 's/^X//' > tip.diffs << '!Funky!Stuff!'
+X
+X*** cmdtab.c.ORIG	Mon May  5 11:01:59 1986
+X--- cmdtab.c	Thu Aug 21 10:08:50 1986
+X***************
+X*** 15,16 ****
+X--- 15,17 ----
+X  extern	int cu_take(), cu_put(), dollar(), genbrk(), suspend();
+X+ extern	int rtfile(), stfile(), rbfile(), sbfile();
+X  
+X***************
+X*** 35,36 ****
+X--- 36,41 ----
+X  	{ '#',	NORM,	"send break",			 genbrk },
+X+ 	{ '{',	NORM,	"receive xmodem text file", 	 rtfile },
+X+ 	{ '}',	NORM,	"send xmodem text file", 	 stfile },
+X+ 	{ '(',	NORM,	"receive xmodem binary file",	 rbfile },
+X+ 	{ ')',	NORM,	"send xmodem binary file", 	 sbfile },
+X  	{ 0, 0, 0 }
+X
+X
+X
+X*** cmds.c.ORIG	Mon May  5 11:01:56 1986
+X--- cmds.c	Tue Sep 30 10:17:11 1986
+X***************
+X*** 855,856 ****
+X--- 865,1412 ----
+X  	return(0);
+X+ }
+X+ 
+X+ 
+X+ /*  XMODEM stuff; sag sept 1984	- Feb 1985
+X+  *	Taken from Brian Kantor's (sdccsu3!brian) xmodem version 1.0
+X+  *	Note that this code will work on version 4.2 ONLY (uses select)
+X+  */
+X+ 
+X+ #include <sys/stat.h>
+X+ #include <sys/time.h>
+X+ 
+X+ /*  ASCII Constants  */
+X+ #define      SOH  	001 
+X+ #define	     STX	002
+X+ #define	     ETX	003
+X+ #define      EOT	004
+X+ #define	     ENQ	005
+X+ #define      ACK  	006
+X+ #define	     LF		012   /* Unix LF/NL */
+X+ #define	     CR		015  
+X+ #define      NAK  	025
+X+ #define	     SYN	026
+X+ #define	     CAN	030
+X+ #define	     ESC	033
+X+ #define	     CTRLZ	032   /* CP/M EOF for text (usually!) */
+X+ 
+X+ /*  XMODEM Constants  */
+X+ #define      TIMEOUT  	-1
+X+ #define      ERRORMAX  	10    /* maximum errors tolerated */
+X+ #define      RETRYMAX  	10    /* maximum retries to be made */
+X+ #define	     BBUFSIZ	128   /* buffer size -- do not change! */
+X+ #define      DEBUG	0     /* 1 for debugging output */
+X+ #define      GETERR	-10   /* error code for getbyte routine */
+X+ 
+X+ char buff[BBUFSIZ];
+X+ 
+X+ int nbchr;	/* number of chars read so far for buffered read */
+X+ 
+X+ /* Receive a text file */
+X+ rtfile(c)
+X+ char c;
+X+ {
+X+ 	putchar (c);
+X+ 	rfile ('t');
+X+ }
+X+ 
+X+ /* Receive a binary file */
+X+ rbfile(c)
+X+ char c;
+X+ {
+X+ 	putchar (c);
+X+ 	rfile ('b');
+X+ }
+X+ 
+X+ /* Send a text file */
+X+ stfile(c)
+X+ char c;
+X+ {
+X+ 	putchar (c);
+X+ 	sfile ('t');
+X+ }
+X+ 
+X+ /* Send a binary file */
+X+ sbfile(c)
+X+ char c;
+X+ {
+X+ 	putchar (c);
+X+ 	sfile ('b');
+X+ }
+X+ 
+X+ /* print error message and cleanup for exit */
+X+ error(msg)
+X+ char *msg;
+X+ 	{
+X+ 	printf("\r\nXMODEM:  %s\n", msg);
+X+ 	ioctl (0, TIOCSETC, &tchars);
+X+ 	write (fildes[1], (char *)&ccc, 1);
+X+ 	signal (SIGINT, SIG_DFL);
+X+ 	}
+X+ 
+X+ /*
+X+  *
+X+  *	Get a byte from the specified file.  Buffer the read so we don't
+X+  *	have to use a system call for each character.
+X+  *
+X+  */
+X+ getbyte(fildes, ch)				/* Buffered disk read */
+X+ int fildes;
+X+ char *ch;
+X+ 
+X+ 	{
+X+ 	static char buf[BUFSIZ];	/* Remember buffer */
+X+ 	static char *bufp = buf;	/* Remember where we are in buffer */
+X+ 	
+X+ 	if (nbchr == 0)			/* Buffer exausted; read some more */
+X+ 		{
+X+ 		if ((nbchr = read(fildes, buf, BUFSIZ)) < 0)
+X+ 			{
+X+ 			error("File Read Error");
+X+ 			return (GETERR);
+X+ 		 	}
+X+ 		bufp = buf;		/* Set pointer to start of array */
+X+ 		}
+X+ 	if (--nbchr >= 0)
+X+ 		{
+X+ 		*ch = *bufp++;
+X+ 		return(0);
+X+ 		}
+X+ 	else
+X+ 		return(EOF);
+X+ 	}
+X+ 
+X+ /**  receive a file  **/
+X+ rfile(mode)
+X+ char mode;
+X+ 	{
+X+ 	register int bufctr, checksum;
+X+ 	register int c;
+X+ 	int j, firstchar, sectnum, sectcurr, tmode;
+X+ 	int sectcomp, errors, errorflag, recfin;
+X+ 	int fatalerror, inchecksum;
+X+ 	long recvsectcnt;
+X+ 
+X+ 	int (*f) ();
+X+ 	char *cp, *expand();
+X+ 	time_t start;
+X+ 
+X+ 	if (prompt (" Receive local file name? ", copyname))
+X+ 		return;
+X+ 	cp = expand (copyname);
+X+ 	if ((sfd = creat (cp, 0666)) < 0)
+X+ 		{
+X+ 		printf ("\r\n%s: Cannot creat\r\n", copyname);
+X+ 		return;
+X+ 		}
+X+ 
+X+ 	kill (pid, SIGIOT);
+X+ 	read (repdes[0], (char *)&ccc, 1); /* wait until read process stops */
+X+ 	ioctl (0, TIOCSETC, &defchars);	   /* set tty modes */
+X+ 	f = signal (SIGINT, intcopy);	   /* intercept control-c */
+X+ 
+X+ 	start = time(0);
+X+ 	quit = 0;
+X+ 	(void) setjmp(intbuf);		   /* set control-c catcher */
+X+ 
+X+ 	if (quit)
+X+ 		{
+X+ 		error("Control-C; Reception canceled");
+X+ 		close (sfd);
+X+ 		return;
+X+ 		}
+X+ 
+X+ 	printf("XMODEM:  Ready to RECEIVE File %s", cp);
+X+ 	puts("\r\nControl-C to cancel.\n");
+X+ 
+X+ 	recfin = FALSE;
+X+ 	sectnum = errors = 0;
+X+ 	fatalerror = FALSE;  /* NO fatal errors */
+X+ 	recvsectcnt = 0;  /* number of received sectors */
+X+ 
+X+ 	if (mode == 't')
+X+ 		tmode = TRUE;
+X+ 	else
+X+ 		tmode = FALSE;
+X+ 
+X+ 	sendbyte(NAK);  /* Start up the sender's first block */
+X+ 
+X+         do
+X+         	{   
+X+ 		errorflag = FALSE;
+X+             	do 
+X+ 			{
+X+                   	firstchar = readbyte(6);
+X+             		} 
+X+ 			while ((firstchar != SOH) 
+X+ 				&& (firstchar != EOT) 
+X+ 				&& (firstchar != TIMEOUT) 
+X+ 				&& ((firstchar & 0x7f) != CAN));
+X+ 
+X+             	if (firstchar == TIMEOUT)
+X+ 	    		{  
+X+ 			printf("\r\nTimeout on Sector %d\n", sectnum+1);
+X+                		errorflag = TRUE;
+X+ 	    		}
+X+ 
+X+             	if ((firstchar & 0x7f) == CAN)
+X+ 	    		{  
+X+ 			error("Reception canceled at user's request");
+X+ 			close (sfd);
+X+ 			return;
+X+ 	    		}
+X+ 
+X+             	if (firstchar == SOH)
+X+ 	   		{
+X+                		sectcurr = readbyte(3);	   /* get sector numbers */
+X+                		sectcomp = readbyte(3);
+X+                		if ((sectcurr + sectcomp) == 0xff)
+X+                			{  
+X+ 				if (sectcurr == ((sectnum+1) & 0xff))
+X+ 		 			{  
+X+ 					checksum = 0;
+X+ 		     			for (j = bufctr = 0; j < BBUFSIZ; j++)
+X+ 	      	     				{  
+X+ 						buff[bufctr] = c = readbyte(3);
+X+ 		        			checksum = ((checksum+c) & 0xff);
+X+ 						if (!tmode)  /* binary mode */
+X+ 							{  
+X+ 							bufctr++;
+X+ 		           				continue;
+X+ 		        				}
+X+ 						if (c == CR)
+X+ 			   				continue;  /* skip CR's */
+X+ 						if (c == CTRLZ)  /* CP/M EOF char */
+X+ 							{  
+X+ 							recfin = TRUE;  /* flag EOF */
+X+ 		           				continue;
+X+ 		        				}
+X+ 		        			if (!recfin)
+X+ 			   				bufctr++;
+X+ 		     				}
+X+ 		     			inchecksum = readbyte(3);  /* get checksum */
+X+ 		    			if (checksum == inchecksum)  /* good checksum */
+X+ 		     				{  
+X+ 						errors = 0;
+X+ 						recvsectcnt++;
+X+ 		        			sectnum = sectcurr; 
+X+ 						if (DEBUG) printf ("\n");
+X+ 						printf ("\rreceived sector %-4d", recvsectcnt);
+X+ 						if (write(sfd, buff, bufctr) < 0) 
+X+ 							{
+X+ 							sendbyte(CAN);
+X+ 			   				error("File Write Error");
+X+ 							close (sfd);
+X+ 							return;
+X+ 							}
+X+ 		        			else 
+X+ 			   				sendbyte(ACK);
+X+ 
+X+ 		     				}
+X+ 		     			else
+X+ 		     				{  
+X+ 						printf("\r\nChecksum Error on Sector %d\n", sectnum+1);
+X+ 		        			errorflag = TRUE;
+X+ 		     				}
+X+                   			}
+X+                   		else
+X+                   			{ 
+X+ 					if (sectcurr == sectnum)
+X+                     				{  
+X+ 						while(readbyte(3) != TIMEOUT)
+X+ 							;
+X+             	       				sendbyte(ACK);
+X+                     				}
+X+                     			else
+X+ 		    				{  
+X+ 						printf("\r\nPhase Error - Received Sector is ");
+X+ 			  			printf("%d while Expected Sector is %d\n",
+X+ 			   				sectcurr, ((sectnum+1) & 0xff));
+X+ 						errorflag = TRUE;
+X+ 						fatalerror = TRUE;
+X+ 						sendbyte(CAN);
+X+ 		    				}
+X+ 	          			}
+X+            			}
+X+ 			else
+X+ 	   			{  
+X+ 				printf("\r\nHeader Sector Number Error on Sector %d\n",
+X+ 		   			sectnum+1);
+X+                			errorflag = TRUE;
+X+ 	   			}
+X+         		}
+X+ 	
+X+         	if (errorflag)
+X+         		{  
+X+ 			errors++;
+X+ 	   		while (readbyte(3) != TIMEOUT)
+X+ 				;
+X+ 			sendbyte(NAK);
+X+         		}
+X+   		}
+X+   		while ((firstchar != EOT) && (errors < ERRORMAX) && !fatalerror);
+X+ 
+X+   	if ((firstchar == EOT) && (errors < ERRORMAX) && !fatalerror)
+X+   		{
+X+      		close(sfd);
+X+ 		sendbyte(ACK);
+X+ 		printf("\n\rReceive Complete");
+X+ 		printf("\n\r%ld CP/M Records ", recvsectcnt);
+X+ 		prtime(" transferred in ", time(0)-start);
+X+ 
+X+ 		ioctl (0, TIOCSETC, &tchars);		/* reset ttys */
+X+ 		write (fildes[1], (char *)&ccc, 1);	/* wakeup tip */
+X+ 		signal (SIGINT, SIG_DFL);		/* reset control-c catcher */
+X+   		}
+X+   	else
+X+   		{ 
+X+ 		sendbyte(CAN);
+X+      		error("\r\nABORTED -- Too Many Errors");
+X+ 		close (sfd);
+X+ 		return;
+X+   		}
+X+ 	}
+X+ 
+X+ /**  send a file  **/
+X+ sfile(mode)
+X+ char mode;
+X+ 	{
+X+ 	register int bufctr, checksum, sectnum;
+X+ 	char blockbuf[134];
+X+ 	int fd, attempts;
+X+ 	int nlflag, sendfin, tmode;
+X+ 	int bbufcnt;
+X+ 	int firstchar;
+X+ 	int getretrn;
+X+ 	char c;
+X+ 	int sendresp;  /* response char to sent block */
+X+ 
+X+ 	int (*f) ();
+X+ 	char *cp, *expand();
+X+ 	time_t start;
+X+ 
+X+ 	if (prompt (" Send local file name? ", copyname))
+X+ 		return;
+X+ 	cp = expand (copyname);
+X+ 	if ((fd = open(cp, 0)) < 0)
+X+ 		{  
+X+      	   	printf("Can't open file for send\n");
+X+ 		return;
+X+ 		}
+X+ 
+X+ 	kill (pid, SIGIOT);
+X+ 	read (repdes[0], (char *)&ccc, 1); /* wait until read process stops */
+X+ 	ioctl (0, TIOCSETC, &defchars);    /* setup tty */
+X+ 	f = signal (SIGINT, intcopy);	   /* prepare to catch control-c */
+X+ 	start = time(0);
+X+ 	quit = 0;
+X+ 	(void) setjmp(intbuf);		   /* setup control-c catcher */
+X+ 
+X+ 	nbchr = 0;  /* clear buffered read char count */
+X+ 		
+X+ 	if (quit)
+X+ 		{
+X+ 		sendbyte(CAN);
+X+ 		error("Control-C; Send canceled");
+X+ 		close (fd);
+X+ 		return;
+X+ 		}
+X+ 
+X+ 	printf("XMODEM:  File %s Ready to SEND", cp);
+X+ 	prfilestat(cp);  /* print file size statistics */
+X+ 	puts("\r\nControl-C to cancel.\n");
+X+ 
+X+ 	if (mode == 't')
+X+ 	   tmode = TRUE;
+X+ 	else
+X+ 	   tmode = FALSE;
+X+ 
+X+         sendfin = nlflag = FALSE;
+X+   	attempts = 0;
+X+ 
+X+ 	while (((firstchar=readbyte(30)) != NAK) && (firstchar != CAN))
+X+ 		{
+X+ 		if (++attempts > RETRYMAX) {
+X+ 			error("Remote System Not Responding");
+X+ 			close (fd);
+X+ 			return;
+X+ 		}
+X+ 		}
+X+ 
+X+ 	if ((firstchar & 0x7f) == CAN)
+X+ 		{
+X+ 		error("Send cancelled at user's request.");
+X+ 		close (fd);
+X+ 		return;
+X+ 		}
+X+ 
+X+ 	sectnum = 1;  /* first sector number */
+X+ 	attempts = 0;
+X+ 
+X+         do 
+X+ 		{   
+X+ 		for (bufctr=0; bufctr < BBUFSIZ;)
+X+ 	    		{
+X+ 			if (nlflag)
+X+ 	        		{  
+X+ 				buff[bufctr++] = LF;  /* leftover newline */
+X+ 	           		nlflag = FALSE;
+X+ 	        		}
+X+ 			getretrn = getbyte(fd, &c);
+X+ 			if (getretrn == GETERR)
+X+ 				{
+X+ 				sendbyte(CAN);
+X+ 				error ("Read error on local file");
+X+ 				close (fd);
+X+ 				return;
+X+ 				}
+X+ 			if (getretrn == EOF)
+X+ 				{ 
+X+ 				sendfin = TRUE;  /* this is the last sector */
+X+ 		   		if (!bufctr)  /* if EOF on sector boundary */
+X+ 		      			break;  /* avoid sending extra sector */
+X+ 		   		if (tmode)
+X+ 		      			buff[bufctr++] = CTRLZ;  /* Control-Z for CP/M EOF */
+X+ 	           		else
+X+ 		      			bufctr++;
+X+ 		   		continue;
+X+ 		      		}
+X+ 
+X+ 			if (tmode && c == LF)  /* text mode & Unix newline? */
+X+ 	    			{
+X+ 				buff[bufctr++] = CR;  /* insert carriage return */
+X+ 		     		if (bufctr < BBUFSIZ)
+X+ 	                		buff[bufctr++] = LF;  /* insert LF */
+X+ 	 	      		else
+X+ 		        		nlflag = TRUE;  /* insert on next sector */
+X+ 	   			}	
+X+ 			else
+X+ 				buff[bufctr++] = c;  /* copy the char without change */
+X+ 	    		}
+X+ 
+X+             	attempts = 0;
+X+ 	
+X+ 	    	if (!bufctr)  /* if EOF on sector boundary */
+X+    	       		break;  /* avoid sending empty sector */
+X+ 
+X+             	do
+X+             		{
+X+ 			bbufcnt = 0;		/* start building block to be sent */
+X+ 			blockbuf[bbufcnt++] = SOH;	    /* start of packet char */
+X+ 			blockbuf[bbufcnt++] = sectnum;	    /* current sector # */
+X+ 			blockbuf[bbufcnt++] = -sectnum-1;   /* and its complement */
+X+ 
+X+                 	checksum = 0;  /* init checksum */
+X+                 	for (bufctr=0; bufctr < BBUFSIZ; bufctr++)
+X+                			{
+X+ 				blockbuf[bbufcnt++] = buff[bufctr];
+X+                  		checksum = ((checksum+buff[bufctr]) & 0xff);
+X+ 	         		}
+X+ 
+X+ 			blockbuf[bbufcnt++] = checksum;
+X+ 			write(FD, blockbuf, 132);  /* write the block */
+X+ 			ioctl(FD,TIOCFLUSH,0);
+X+ 
+X+                 	attempts++;
+X+ 			sendresp = readbyte(10);  /* get response */
+X+ 			if (sendresp != ACK)
+X+ 		   		{
+X+ 		   		printf("\r\nNon-ACK Received on Sector %d\n",sectnum);
+X+ 		   		if (sendresp == TIMEOUT)
+X+ 					printf("\r\nThis Non-ACK was a TIMEOUT\n");
+X+ 		   		}
+X+             		}
+X+ 			while((sendresp != ACK) && (attempts < RETRYMAX));
+X+ 
+X+        		sectnum++;  /* increment to next sector number */
+X+ 		if (DEBUG) printf ("\n");
+X+ 		printf ("\rsent sector %-4d", sectnum-1);
+X+     		}
+X+ 		while (!sendfin && (attempts < RETRYMAX));
+X+ 
+X+     	if (attempts >= RETRYMAX) 
+X+ 		{
+X+ 		error("Remote System Not Responding");
+X+ 		close (fd);
+X+ 		return;
+X+ 		}
+X+ 
+X+     	attempts = 0;
+X+     	sendbyte(EOT);  /* send 1st EOT */
+X+ 	
+X+     	while ((readbyte(15) != ACK) && (attempts++ < RETRYMAX))
+X+ 	   	sendbyte(EOT);
+X+ 
+X+     	if (attempts >= RETRYMAX)
+X+ 	   	error("Remote System Not Responding on Completion");
+X+ 
+X+     	close(fd);
+X+     	printf("\r\nSend Complete\r\n");
+X+ 	prtime("Data transferred in ", time(0)-start);
+X+ 
+X+ 	ioctl (0, TIOCSETC, &tchars);		/* restore tty */
+X+ 	write (fildes[1], (char *)&ccc, 1);	/* wakeup tip */
+X+ 	signal (SIGINT, SIG_DFL);		/* reset control-c catcher */
+X+     	sleep(5);  /* give other side time to return to terminal mode */
+X+ 
+X+ 	}
+X+ 
+X+ /*  print file size status information  */
+X+ prfilestat(name)
+X+ char *name;
+X+ 	{
+X+ 	struct stat filestatbuf; /* file status info */
+X+ 
+X+ 	stat(name, &filestatbuf);  /* get file status bytes */
+X+ 	printf("\r\nEstimated File Size %ldK, %ld Records, %ld Bytes",
+X+ 	  	(filestatbuf.st_size/1024)+1, (filestatbuf.st_size/128)+1,
+X+ 	  	filestatbuf.st_size);
+X+ 		return;
+X+ 	}
+X+ 
+X+ /* get a byte from data stream -- timeout if "seconds" elapses */
+X+ int readbyte(seconds)
+X+ int seconds;
+X+ 	{
+X+ 	int i, readfd;
+X+ 	char c;
+X+ 	struct timeval tmout;
+X+ 
+X+ 	tmout.tv_sec = seconds;
+X+ 	tmout.tv_usec = 0;
+X+ 
+X+ 	readfd = 1 << FD;
+X+ 
+X+ 	if ((i=select(FD+1, &readfd, 0, 0, &tmout)) == 0)
+X+ 		{
+X+ 		return(TIMEOUT);
+X+ 		}
+X+ 
+X+ 	read(FD, &c, 1);
+X+ 
+X+ 	return(c & 0xff);  /* return the char */
+X+ 	}
+X+ 
+X+ /* send a byte to data stream */
+X+ sendbyte(data)
+X+ char data;
+X+ 	{
+X+ 	write(FD, &data, 1);  	/* write the byte */
+X+ 	ioctl(FD,TIOCFLUSH,0);	/* flush so it really happens now! */
+X+ 	return;
+X+ 	}
+X+ 
+X+ /*
+X+  * "nap" for specified time
+X+  */
+X+ nap (milliseconds)
+X+ int	milliseconds;
+X+ {
+X+ 	struct	timeval	timeout;
+X+ 
+X+ 	if (milliseconds == 0)
+X+ 		return;
+X+ 	timeout.tv_sec = 0;
+X+ 	timeout.tv_usec = milliseconds * 1000;
+X+ 
+X+ 	(void) select(1, 0, 0, 0, &timeout);
+X  }
+!Funky!Stuff!
+exit
+

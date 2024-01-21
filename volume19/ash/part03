@@ -1,0 +1,2339 @@
+Subject:  v19i003:  A reimplementation of the System V shell, Part03/08
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: ka@june.cs.washington.edu (Kenneth Almquist)
+Posting-number: Volume 19, Issue 3
+Archive-name: ash/part03
+
+# This is part 3 of ash.  To unpack, feed it into the shell (not csh).
+# The ash distribution consists of eight pieces.  Be sure you get them all.
+# After you unpack everything, read the file README.
+
+echo extracting exec.c
+cat > exec.c <<\EOF
+/*
+ * When commands are first encountered, they are entered in a hash table.
+ * This ensures that a full path search will not have to be done for them
+ * on each invocation.
+ *
+ * We should investigate converting to a linear search, even though that
+ * would make the command name "hash" a misnomer.
+ */
+
+#include "shell.h"
+#include "main.h"
+#include "nodes.h"
+#include "parser.h"
+#include "redir.h"
+#include "eval.h"
+#include "exec.h"
+#include "builtins.h"
+#include "var.h"
+#include "options.h"
+#include "input.h"
+#include "output.h"
+#include "syntax.h"
+#include "memalloc.h"
+#include "error.h"
+#include "init.h"
+#include "mystring.h"
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include "myerrno.h"
+
+
+#define CMDTABLESIZE 31		/* should be prime */
+#define ARB 1			/* actual size determined at run time */
+
+
+
+struct tblentry {
+      struct tblentry *next;	/* next entry in hash chain */
+      union param param;	/* definition of builtin function */
+      short cmdtype;		/* index identifying command */
+      char rehash;		/* if set, cd done since entry created */
+      char cmdname[ARB];	/* name of command */
+};
+
+
+STATIC struct tblentry *cmdtable[CMDTABLESIZE];
+STATIC int builtinloc;		/* index in path of %builtin, or -1 */
+
+
+#ifdef __STDC__
+STATIC void tryexec(char *, char **, char **);
+STATIC void execinterp(char **, char **);
+STATIC void printentry(struct tblentry *);
+STATIC void clearcmdentry(int);
+STATIC struct tblentry *cmdlookup(char *, int);
+STATIC void delete_cmd_entry(void);
+#else
+STATIC void tryexec();
+STATIC void execinterp();
+STATIC void printentry();
+STATIC void clearcmdentry();
+STATIC struct tblentry *cmdlookup();
+STATIC void delete_cmd_entry();
+#endif
+
+
+
+/*
+ * Exec a program.  Never returns.  If you change this routine, you may
+ * have to change the find_command routine as well.
+ */
+
+void
+shellexec(argv, envp, path, index)
+      char **argv, **envp;
+      char *path;
+      {
+      char *cmdname;
+      int e;
+
+      if (strchr(argv[0], '/') != NULL) {
+	    tryexec(argv[0], argv, envp);
+	    e = errno;
+      } else {
+	    e = ENOENT;
+	    while ((cmdname = padvance(&path, argv[0])) != NULL) {
+		  if (--index < 0 && pathopt == NULL) {
+			tryexec(cmdname, argv, envp);
+			if (errno != ENOENT && errno != ENOTDIR)
+			      e = errno;
+		  }
+		  stunalloc(cmdname);
+	    }
+      }
+      error2(argv[0], errmsg(e, E_EXEC));
+}
+
+
+STATIC void
+tryexec(cmd, argv, envp)
+      char *cmd;
+      char **argv;
+      char **envp;
+      {
+      int e;
+      char *p;
+
+#ifdef SYSV
+      do {
+	    execve(cmd, argv, envp);
+      } while (errno == EINTR);
+#else
+      execve(cmd, argv, envp);
+#endif
+      e = errno;
+      if (e == ENOEXEC) {
+	    initshellproc();
+	    setinputfile(cmd, 0);
+	    commandname = arg0 = savestr(argv[0]);
+#ifndef BSD
+	    pgetc(); pungetc();		/* fill up input buffer */
+	    p = parsenextc;
+	    if (parsenleft > 2 && p[0] == '#' && p[1] == '!') {
+		  argv[0] = cmd;
+		  execinterp(argv, envp);
+	    }
+#endif
+	    setparam(argv + 1);
+	    raise(EXSHELLPROC);
+	    /*NOTREACHED*/
+      }
+      errno = e;
+}
+
+
+#ifndef BSD
+/*
+ * Execute an interpreter introduced by "#!", for systems where this
+ * feature has not been built into the kernel.  If the interpreter is
+ * the shell, return (effectively ignoring the "#!").  If the execution
+ * of the interpreter fails, exit.
+ *
+ * This code peeks inside the input buffer in order to avoid actually
+ * reading any input.  It would benefit from a rewrite.
+ */
+
+#define NEWARGS 5
+
+STATIC void
+execinterp(argv, envp)
+      char **argv, **envp;
+      {
+      int n;
+      char *inp;
+      char *outp;
+      char c;
+      char *p;
+      char **ap;
+      char *newargs[NEWARGS];
+      int i;
+      char **ap2;
+      char **new;
+
+      n = parsenleft - 2;
+      inp = parsenextc + 2;
+      ap = newargs;
+      for (;;) {
+	    while (--n >= 0 && (*inp == ' ' || *inp == '\t'))
+		  inp++;
+	    if (n < 0)
+		  goto bad;
+	    if ((c = *inp++) == '\n')
+		  break;
+	    if (ap == &newargs[NEWARGS])
+bad:		  error("Bad #! line");
+	    STARTSTACKSTR(outp);
+	    do {
+		  STPUTC(c, outp);
+	    } while (--n >= 0 && (c = *inp++) != ' ' && c != '\t' && c != '\n');
+	    STPUTC('\0', outp);
+	    n++, inp--;
+	    *ap++ = grabstackstr(outp);
+      }
+      if (ap == newargs + 1) {	/* if no args, maybe no exec is needed */
+	    p = newargs[0];
+	    for (;;) {
+		  if (equal(p, "sh") || equal(p, "ash")) {
+			return;
+		  }
+		  while (*p != '/') {
+			if (*p == '\0')
+			      goto break2;
+			p++;
+		  }
+		  p++;
+	    }
+break2:;
+      }
+      i = (char *)ap - (char *)newargs;		/* size in bytes */
+      if (i == 0)
+	    error("Bad #! line");
+      for (ap2 = argv ; *ap2++ != NULL ; );
+      new = ckmalloc(i + ((char *)ap2 - (char *)argv));
+      ap = newargs, ap2 = new;
+      while ((i -= sizeof (char **)) >= 0)
+	    *ap2++ = *ap++;
+      ap = argv;
+      while (*ap2++ = *ap++);
+      shellexec(new, envp, pathval(), 0);
+}
+#endif
+
+
+
+/*
+ * Do a path search.  The variable path (passed by reference) should be
+ * set to the start of the path before the first call; padvance will update
+ * this value as it proceeds.  Successive calls to padvance will return
+ * the possible path expansions in sequence.  If an option (indicated by
+ * a percent sign) appears in the path entry then the global variable
+ * pathopt will be set to point to it; otherwise pathopt will be set to
+ * NULL.
+ */
+
+char *pathopt;
+
+char *
+padvance(path, name)
+      char **path;
+      char *name;
+      {
+      register char *p, *q;
+      char *start;
+      int len;
+
+      if (*path == NULL)
+	    return NULL;
+      start = *path;
+      for (p = start ; *p && *p != ':' && *p != '%' ; p++);
+      len = p - start + strlen(name) + 2;	/* "2" is for '/' and '\0' */
+      while (stackblocksize() < len)
+	    growstackblock();
+      q = stackblock();
+      if (p != start) {
+	    bcopy(start, q, p - start);
+	    q += p - start;
+	    *q++ = '/';
+      }
+      strcpy(q, name);
+      pathopt = NULL;
+      if (*p == '%') {
+	    pathopt = ++p;
+	    while (*p && *p != ':')  p++;
+      }
+      if (*p == ':')
+	    *path = p + 1;
+      else
+	    *path = NULL;
+      return stalloc(len);
+}
+
+
+
+/*** Command hashing code ***/
+
+
+hashcmd(argc, argv)  char **argv; {
+      struct tblentry **pp;
+      struct tblentry *cmdp;
+      int c;
+      int verbose;
+      struct cmdentry entry;
+      char *name;
+
+      if (argc <= 1) {
+	    for (pp = cmdtable ; pp < &cmdtable[CMDTABLESIZE] ; pp++) {
+		  for (cmdp = *pp ; cmdp ; cmdp = cmdp->next) {
+			printentry(cmdp);
+		  }
+	    }
+	    return 0;
+      }
+      verbose = 0;
+      while ((c = nextopt("rv")) != '\0') {
+	    if (c == 'r') {
+		  clearcmdentry(0);
+	    } else if (c == 'v') {
+		  verbose++;
+	    }
+      }
+      while ((name = *argptr) != NULL) {
+	    if ((cmdp = cmdlookup(name, 0)) != NULL
+	     && (cmdp->cmdtype == CMDNORMAL
+		|| cmdp->cmdtype == CMDBUILTIN && builtinloc >= 0))
+		  delete_cmd_entry();
+	    find_command(name, &entry, 1);
+	    if (verbose) {
+		  if (entry.cmdtype != CMDUNKNOWN) {	/* if no error msg */
+			cmdp = cmdlookup(name, 0);
+			printentry(cmdp);
+		  }
+		  flushall();
+	    }
+	    argptr++;
+      }
+      return 0;
+}
+
+
+STATIC void
+printentry(cmdp)
+      struct tblentry *cmdp;
+      {
+      int index;
+      char *path;
+      char *name;
+
+      if (cmdp->cmdtype == CMDNORMAL) {
+	    index = cmdp->param.index;
+	    path = pathval();
+	    do {
+		  name = padvance(&path, cmdp->cmdname);
+		  stunalloc(name);
+	    } while (--index >= 0);
+	    out1str(name);
+      } else if (cmdp->cmdtype == CMDBUILTIN) {
+	    out1fmt("builtin %s", cmdp->cmdname);
+      } else if (cmdp->cmdtype == CMDFUNCTION) {
+	    out1fmt("function %s", cmdp->cmdname);
+#ifdef DEBUG
+      } else {
+	    error("internal error: cmdtype %d", cmdp->cmdtype);
+#endif
+      }
+      if (cmdp->rehash)
+	    out1c('*');
+      out1c('\n');
+}
+
+
+
+/*
+ * Resolve a command name.  If you change this routine, you may have to
+ * change the shellexec routine as well.
+ */
+
+void
+find_command(name, entry, printerr)
+      char *name;
+      struct cmdentry *entry;
+      {
+      struct tblentry *cmdp;
+      int index;
+      int prev;
+      char *path;
+      char *fullname;
+      struct stat statb;
+      int e;
+      int i;
+
+      /* If name contains a slash, don't use the hash table */
+      if (strchr(name, '/') != NULL) {
+	    entry->cmdtype = CMDNORMAL;
+	    entry->u.index = 0;
+	    return;
+      }
+
+      /* If name is in the table, and not invalidated by cd, we're done */
+      if ((cmdp = cmdlookup(name, 0)) != NULL && cmdp->rehash == 0)
+	    goto success;
+
+      /* If %builtin not in path, check for builtin next */
+      if (builtinloc < 0 && (i = find_builtin(name)) >= 0) {
+	    INTOFF;
+	    cmdp = cmdlookup(name, 1);
+	    cmdp->cmdtype = CMDBUILTIN;
+	    cmdp->param.index = i;
+	    INTON;
+	    goto success;
+      }
+
+      /* We have to search path. */
+      prev = -1;		/* where to start */
+      if (cmdp) {		/* doing a rehash */
+	    if (cmdp->cmdtype == CMDBUILTIN)
+		  prev = builtinloc;
+	    else
+		  prev = cmdp->param.index;
+      }
+
+      path = pathval();
+      e = ENOENT;
+      index = -1;
+loop:
+      while ((fullname = padvance(&path, name)) != NULL) {
+	    stunalloc(fullname);
+	    index++;
+	    if (pathopt) {
+		  if (prefix("builtin", pathopt)) {
+			if ((i = find_builtin(name)) < 0)
+			      goto loop;
+			INTOFF;
+			cmdp = cmdlookup(name, 1);
+			cmdp->cmdtype = CMDBUILTIN;
+			cmdp->param.index = i;
+			INTON;
+			goto success;
+		  } else if (prefix("func", pathopt)) {
+			/* handled below */
+		  } else {
+			goto loop;	/* ignore unimplemented options */
+		  }
+	    }
+	    /* if rehash, don't redo absolute path names */
+	    if (fullname[0] == '/' && index <= prev) {
+		  if (index < prev)
+			goto loop;
+		  TRACE(("searchexec \"%s\": no change\n", name));
+		  goto success;
+	    }
+	    while (stat(fullname, &statb) < 0) {
+#ifdef SYSV
+		  if (errno == EINTR)
+			continue;
+#endif
+		  if (errno != ENOENT && errno != ENOTDIR)
+			e = errno;
+		  goto loop;
+	    }
+	    e = EACCES;	/* if we fail, this will be the error */
+	    if ((statb.st_mode & S_IFMT) != S_IFREG)
+		  goto loop;
+	    if (pathopt) {		/* this is a %func directory */
+		  stalloc(strlen(fullname) + 1);
+		  readcmdfile(fullname);
+		  if ((cmdp = cmdlookup(name, 0)) == NULL || cmdp->cmdtype != CMDFUNCTION)
+			error("%s not defined in %s", name, fullname);
+		  stunalloc(fullname);
+		  goto success;
+	    }
+	    if (statb.st_uid == geteuid()) {
+		  if ((statb.st_mode & 0100) == 0)
+			goto loop;
+	    } else if (statb.st_gid == getegid()) {
+		  if ((statb.st_mode & 010) == 0)
+			goto loop;
+	    } else {
+		  if ((statb.st_mode & 01) == 0)
+			goto loop;
+	    }
+	    TRACE(("searchexec \"%s\" returns \"%s\"\n", name, fullname));
+	    INTOFF;
+	    cmdp = cmdlookup(name, 1);
+	    cmdp->cmdtype = CMDNORMAL;
+	    cmdp->param.index = index;
+	    INTON;
+	    goto success;
+      }
+
+      /* We failed.  If there was an entry for this command, delete it */
+      if (cmdp)
+	    delete_cmd_entry();
+      if (printerr)
+	    outfmt(out2, "%s: %s\n", name, errmsg(e, E_EXEC));
+      entry->cmdtype = CMDUNKNOWN;
+      return;
+
+success:
+      cmdp->rehash = 0;
+      entry->cmdtype = cmdp->cmdtype;
+      entry->u = cmdp->param;
+}
+
+
+
+/*
+ * Search the table of builtin commands.
+ */
+
+int
+find_builtin(name)
+      char *name;
+      {
+      const register struct builtincmd *bp;
+
+      for (bp = builtincmd ; bp->name ; bp++) {
+	    if (*bp->name == *name && equal(bp->name, name))
+		  return bp->code;
+      }
+      return -1;
+}
+
+
+
+/*
+ * Called when a cd is done.  Marks all commands so the next time they
+ * are executed they will be rehashed.
+ */
+
+void
+hashcd() {
+      struct tblentry **pp;
+      struct tblentry *cmdp;
+
+      for (pp = cmdtable ; pp < &cmdtable[CMDTABLESIZE] ; pp++) {
+	    for (cmdp = *pp ; cmdp ; cmdp = cmdp->next) {
+		  if (cmdp->cmdtype == CMDNORMAL
+		   || cmdp->cmdtype == CMDBUILTIN && builtinloc >= 0)
+			cmdp->rehash = 1;
+	    }
+      }
+}
+
+
+
+/*
+ * Called before PATH is changed.  The argument is the new value of PATH;
+ * pathval() still returns the old value at this point.  Called with
+ * interrupts off.
+ */
+
+void
+changepath(newval)
+      char *newval;
+      {
+      char *old, *new;
+      int index;
+      int firstchange;
+      int bltin;
+
+      old = pathval();
+      new = newval;
+      firstchange = 9999;	/* assume no change */
+      index = 0;
+      bltin = -1;
+      for (;;) {
+	    if (*old != *new) {
+		  firstchange = index;
+		  if (*old == '\0' && *new == ':'
+		   || *old == ':' && *new == '\0')
+			firstchange++;
+		  old = new;	/* ignore subsequent differences */
+	    }
+	    if (*new == '\0')
+		  break;
+	    if (*new == '%' && bltin < 0 && prefix("builtin", new + 1))
+		  bltin = index;
+	    if (*new == ':') {
+		  index++;
+	    }
+	    new++, old++;
+      }
+      if (builtinloc < 0 && bltin >= 0)
+	    builtinloc = bltin;		/* zap builtins */
+      if (builtinloc >= 0 && bltin < 0)
+	    firstchange = 0;
+      clearcmdentry(firstchange);
+      builtinloc = bltin;
+}
+
+
+/*
+ * Clear out command entries.  The argument specifies the first entry in
+ * PATH which has changed.
+ */
+
+STATIC void
+clearcmdentry(firstchange) {
+      struct tblentry **tblp;
+      struct tblentry **pp;
+      struct tblentry *cmdp;
+
+      INTOFF;
+      for (tblp = cmdtable ; tblp < &cmdtable[CMDTABLESIZE] ; tblp++) {
+	    pp = tblp;
+	    while ((cmdp = *pp) != NULL) {
+		  if (cmdp->cmdtype == CMDNORMAL && cmdp->param.index >= firstchange
+		   || cmdp->cmdtype == CMDBUILTIN && builtinloc >= firstchange) {
+			*pp = cmdp->next;
+			ckfree(cmdp);
+		  } else {
+			pp = &cmdp->next;
+		  }
+	    }
+      }
+      INTON;
+}
+
+
+/*
+ * Delete all functions.
+ */
+
+#ifdef mkinit
+MKINIT void deletefuncs();
+
+SHELLPROC {
+      deletefuncs();
+}
+#endif
+
+void
+deletefuncs() {
+      struct tblentry **tblp;
+      struct tblentry **pp;
+      struct tblentry *cmdp;
+
+      INTOFF;
+      for (tblp = cmdtable ; tblp < &cmdtable[CMDTABLESIZE] ; tblp++) {
+	    pp = tblp;
+	    while ((cmdp = *pp) != NULL) {
+		  if (cmdp->cmdtype == CMDFUNCTION) {
+			*pp = cmdp->next;
+			freefunc(cmdp->param.func);
+			ckfree(cmdp);
+		  } else {
+			pp = &cmdp->next;
+		  }
+	    }
+      }
+      INTON;
+}
+
+
+
+/*
+ * Locate a command in the command hash table.  If "add" is nonzero,
+ * add the command to the table if it is not already present.  The
+ * variable "lastcmdentry" is set to point to the address of the link
+ * pointing to the entry, so that delete_cmd_entry can delete the
+ * entry.
+ */
+
+struct tblentry **lastcmdentry;
+
+
+STATIC struct tblentry *
+cmdlookup(name, add)
+      char *name;
+      {
+      int hashval;
+      register char *p;
+      struct tblentry *cmdp;
+      struct tblentry **pp;
+
+      p = name;
+      hashval = *p << 4;
+      while (*p)
+	    hashval += *p++;
+      hashval &= 0x7FFF;
+      pp = &cmdtable[hashval % CMDTABLESIZE];
+      for (cmdp = *pp ; cmdp ; cmdp = cmdp->next) {
+	    if (equal(cmdp->cmdname, name))
+		  break;
+	    pp = &cmdp->next;
+      }
+      if (add && cmdp == NULL) {
+	    INTOFF;
+	    cmdp = *pp = ckmalloc(sizeof (struct tblentry) - ARB
+			      + strlen(name) + 1);
+	    cmdp->next = NULL;
+	    cmdp->cmdtype = CMDUNKNOWN;
+	    cmdp->rehash = 0;
+	    strcpy(cmdp->cmdname, name);
+	    INTON;
+      }
+      lastcmdentry = pp;
+      return cmdp;
+}
+
+
+/*
+ * Delete the command entry returned on the last lookup.
+ */
+
+STATIC void
+delete_cmd_entry() {
+      struct tblentry *cmdp;
+
+      INTOFF;
+      cmdp = *lastcmdentry;
+      *lastcmdentry = cmdp->next;
+      ckfree(cmdp);
+      INTON;
+}
+
+
+
+#ifdef notdef
+void
+getcmdentry(name, entry)
+      char *name;
+      struct cmdentry *entry; 
+      {
+      struct tblentry *cmdp = cmdlookup(name, 0);
+
+      if (cmdp) {
+	    entry->u = cmdp->param;
+	    entry->cmdtype = cmdp->cmdtype;
+      } else {
+	    entry->cmdtype = CMDUNKNOWN;
+	    entry->u.index = 0;
+      }
+}
+#endif
+
+
+/*
+ * Add a new command entry, replacing any existing command entry for
+ * the same name.
+ */
+
+void
+addcmdentry(name, entry)
+      char *name;
+      struct cmdentry *entry;
+      {
+      struct tblentry *cmdp;
+
+      INTOFF;
+      cmdp = cmdlookup(name, 1);
+      if (cmdp->cmdtype == CMDFUNCTION) {
+	    freefunc(cmdp->param.func);
+      }
+      cmdp->cmdtype = entry->cmdtype;
+      cmdp->param = entry->u;
+      INTON;
+}
+
+
+/*
+ * Define a shell function.
+ */
+
+void
+defun(name, func)
+      char *name;
+      union node *func;
+      {
+      struct cmdentry entry;
+
+      INTOFF;
+      entry.cmdtype = CMDFUNCTION;
+      entry.u.func = copyfunc(func);
+      addcmdentry(name, &entry);
+      INTON;
+}
+
+
+/*
+ * Delete a function if it exists.
+ */
+
+void
+unsetfunc(name)
+      char *name;
+      {
+      struct tblentry *cmdp;
+
+      if ((cmdp = cmdlookup(name, 0)) != NULL && cmdp->cmdtype == CMDFUNCTION) {
+	    freefunc(cmdp->param.func);
+	    delete_cmd_entry();
+      }
+}
+EOF
+if test `wc -c < exec.c` -ne 16808
+then	echo 'exec.c is the wrong size'
+fi
+echo extracting expand.h
+cat > expand.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+struct strlist {
+      struct strlist *next;
+      char *text;
+};
+
+
+struct arglist {
+      struct strlist *list;
+      struct strlist **lastp;
+};
+
+
+
+#ifdef __STDC__
+void expandarg(union node *, struct arglist *, int);
+void expandhere(union node *, int);
+int patmatch(char *, char *);
+void rmescapes(char *);
+int casematch(union node *, char *);
+#else
+void expandarg();
+void expandhere();
+int patmatch();
+void rmescapes();
+int casematch();
+#endif
+EOF
+if test `wc -c < expand.h` -ne 662
+then	echo 'expand.h is the wrong size'
+fi
+echo extracting expand.c
+cat > expand.c <<\EOF
+/*
+ * Routines to expand arguments to commands.  We have to deal with
+ * backquotes, shell variables, and file metacharacters.
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+
+#include "shell.h"
+#include "main.h"
+#include "nodes.h"
+#include "eval.h"
+#include "expand.h"
+#include "syntax.h"
+#include "parser.h"
+#include "jobs.h"
+#include "options.h"
+#include "var.h"
+#include "input.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include "mystring.h"
+#include <sys/types.h>
+#include <sys/stat.h>
+#include "mydirent.h"
+#include "myerrno.h"
+
+
+
+/*
+ * Structure specifying which parts of the string should be searched
+ * for IFS characters.
+ */
+
+struct ifsregion {
+      struct ifsregion *next;	/* next region in list */
+      int begoff;		/* offset of start of region */
+      int endoff;		/* offset of end of region */
+      int nulonly;		/* search for nul bytes only */
+};
+
+
+char *expdest;			/* output of current string */
+struct nodelist *argbackq;	/* list of back quote expressions */
+struct ifsregion ifsfirst;	/* first struct in list of ifs regions */
+struct ifsregion *ifslastp;	/* last struct in list */
+struct arglist exparg;		/* holds expanded arg list */
+#if UDIR
+/*
+ * Set if the last argument processed had /u/logname expanded.  This
+ * variable is read by the cd command.
+ */
+int didudir;
+#endif
+
+#ifdef __STDC__
+STATIC void argstr(char *, int);
+STATIC void expbackq(union node *, int, int);
+STATIC char *evalvar(char *, int);
+STATIC int varisset(int);
+STATIC void varvalue(int, int, int);
+STATIC void recordregion(int, int, int);
+STATIC void ifsbreakup(char *, struct arglist *);
+STATIC void expandmeta(struct strlist *);
+STATIC void expmeta(char *, char *);
+STATIC void addfname(char *);
+STATIC struct strlist *expsort(struct strlist *);
+STATIC struct strlist *msort(struct strlist *, int);
+STATIC int pmatch(char *, char *);
+#else
+STATIC void argstr();
+STATIC void expbackq();
+STATIC char *evalvar();
+STATIC int varisset();
+STATIC void varvalue();
+STATIC void recordregion();
+STATIC void ifsbreakup();
+STATIC void expandmeta();
+STATIC void expmeta();
+STATIC void addfname();
+STATIC struct strlist *expsort();
+STATIC struct strlist *msort();
+STATIC int pmatch();
+#endif
+#if UDIR
+#ifdef __STDC__
+STATIC char *expudir(char *);
+#else
+STATIC char *expudir();
+#endif
+#endif /* UDIR */
+
+
+
+/*
+ * Expand shell variables and backquotes inside a here document.
+ */
+
+void
+expandhere(arg, fd)
+      union node *arg;	/* the document */
+      int fd;			/* where to write the expanded version */
+      {
+      herefd = fd;
+      expandarg(arg, (struct arglist *)NULL, 0);
+      xwrite(fd, stackblock(), expdest - stackblock());
+}
+
+
+/*
+ * Perform variable substitution and command substitution on an argument,
+ * placing the resulting list of arguments in arglist.  If full is true,
+ * perform splitting and file name expansion.  When arglist is NULL, perform
+ * here document expansion.
+ */
+
+void
+expandarg(arg, arglist, full)
+      union node *arg;
+      struct arglist *arglist;
+      {
+      struct strlist *sp;
+      char *p;
+
+#if UDIR
+      didudir = 0;
+#endif
+      argbackq = arg->narg.backquote;
+      STARTSTACKSTR(expdest);
+      ifsfirst.next = NULL;
+      ifslastp = NULL;
+      argstr(arg->narg.text, full);
+      if (arglist == NULL)
+	    return;			/* here document expanded */
+      STPUTC('\0', expdest);
+      p = grabstackstr(expdest);
+      exparg.lastp = &exparg.list;
+      if (full) {
+	    ifsbreakup(p, &exparg);
+	    *exparg.lastp = NULL;
+	    exparg.lastp = &exparg.list;
+	    expandmeta(exparg.list);
+      } else {
+	    sp = (struct strlist *)stalloc(sizeof (struct strlist));
+	    sp->text = p;
+	    *exparg.lastp = sp;
+	    exparg.lastp = &sp->next;
+      }
+      while (ifsfirst.next != NULL) {
+	    struct ifsregion *ifsp;
+	    INTOFF;
+	    ifsp = ifsfirst.next->next;
+	    ckfree(ifsfirst.next);
+	    ifsfirst.next = ifsp;
+	    INTON;
+      }
+      *exparg.lastp = NULL;
+      if (exparg.list) {
+	    *arglist->lastp = exparg.list;
+	    arglist->lastp = exparg.lastp;
+      }
+}
+
+
+
+/*
+ * Perform variable and command substitution.  If full is set, output CTLESC
+ * characters to allow for further processing.  If full is not set, treat
+ * $@ like $* since no splitting will be performed.
+ */
+
+STATIC void
+argstr(p, full)
+      register char *p;
+      {
+      char c;
+
+      for (;;) {
+	    switch (c = *p++) {
+	    case '\0':
+	    case CTLENDVAR:
+		  goto breakloop;
+	    case CTLESC:
+		  if (full)
+			STPUTC(c, expdest);
+		  c = *p++;
+		  STPUTC(c, expdest);
+		  break;
+	    case CTLVAR:
+		  p = evalvar(p, full);
+		  break;
+	    case CTLBACKQ:
+	    case CTLBACKQ|CTLQUOTE:
+		  expbackq(argbackq->n, c & CTLQUOTE, full);
+		  argbackq = argbackq->next;
+		  break;
+	    default:
+		  STPUTC(c, expdest);
+	    }
+      }
+breakloop:;
+}
+
+
+/*
+ * Expand stuff in backwards quotes.
+ */
+
+STATIC void
+expbackq(cmd, quoted, full)
+      union node *cmd;
+      {
+      struct backcmd in;
+      int i;
+      char buf[128];
+      char *p;
+      char *dest = expdest;
+      struct ifsregion saveifs, *savelastp;
+      struct nodelist *saveargbackq;
+      char lastc;
+      int startloc = dest - stackblock();
+      char const *syntax = quoted? DQSYNTAX : BASESYNTAX;
+      int saveherefd;
+
+      INTOFF;
+      saveifs = ifsfirst;
+      savelastp = ifslastp;
+      saveargbackq = argbackq;
+      saveherefd = herefd;      
+      herefd = -1;
+      p = grabstackstr(dest);
+      evalbackcmd(cmd, &in);
+      ungrabstackstr(p, dest);
+      ifsfirst = saveifs;
+      ifslastp = savelastp;
+      argbackq = saveargbackq;
+      herefd = saveherefd;
+
+      p = in.buf;
+      lastc = '\0';
+      for (;;) {
+	    if (--in.nleft < 0) {
+		  if (in.fd < 0)
+			break;
+		  while ((i = read(in.fd, buf, sizeof buf)) < 0 && errno == EINTR);
+		  TRACE(("expbackq: read returns %d\n", i));
+		  if (i <= 0)
+			break;
+		  p = buf;
+		  in.nleft = i - 1;
+	    }
+	    lastc = *p++;
+	    if (lastc != '\0') {
+		  if (full && syntax[lastc] == CCTL)
+			STPUTC(CTLESC, dest);
+		  STPUTC(lastc, dest);
+	    }
+      }
+      if (lastc == '\n') {
+	    STUNPUTC(dest);
+      }
+      if (in.fd >= 0)
+	    close(in.fd);
+      if (in.buf)
+	    ckfree(in.buf);
+      if (in.jp)
+	    waitforjob(in.jp);
+      if (quoted == 0)
+	    recordregion(startloc, dest - stackblock(), 0);
+      TRACE(("evalbackq: size=%d: \"%.*s\"\n",
+	    (dest - stackblock()) - startloc,
+	    (dest - stackblock()) - startloc,
+	    stackblock() + startloc));
+      expdest = dest;
+      INTON;
+}
+
+
+
+/*
+ * Expand a variable, and return a pointer to the next character in the
+ * input string.
+ */
+
+STATIC char *
+evalvar(p, full)
+      char *p;
+      {
+      int subtype;
+      int flags;
+      char *var;
+      char *val;
+      int c;
+      int set;
+      int special;
+      int startloc;
+
+      flags = *p++;
+      subtype = flags & VSTYPE;
+      var = p;
+      special = 0;
+      if (! is_name(*p))
+	    special = 1;
+      p = strchr(p, '=') + 1;
+again: /* jump here after setting a variable with ${var=text} */
+      if (special) {
+	    set = varisset(*var);
+	    val = NULL;
+      } else {
+	    val = lookupvar(var);
+	    if (val == NULL || (flags & VSNUL) && val[0] == '\0') {
+		  val = NULL;
+		  set = 0;
+	    } else
+		  set = 1;
+      }
+      startloc = expdest - stackblock();
+      if (set && subtype != VSPLUS) {
+	    /* insert the value of the variable */
+	    if (special) {
+		  varvalue(*var, flags & VSQUOTE, full);
+	    } else {
+		  char const *syntax = (flags & VSQUOTE)? DQSYNTAX : BASESYNTAX;
+
+		  while (*val) {
+			if (full && syntax[*val] == CCTL)
+			      STPUTC(CTLESC, expdest);
+			STPUTC(*val++, expdest);
+		  }
+	    }
+      }
+      if (subtype == VSPLUS)
+	    set = ! set;
+      if (((flags & VSQUOTE) == 0 || (*var == '@' && shellparam.nparam != 1))
+       && (set || subtype == VSNORMAL))
+	    recordregion(startloc, expdest - stackblock(), flags & VSQUOTE);
+      if (! set && subtype != VSNORMAL) {
+	    if (subtype == VSPLUS || subtype == VSMINUS) {
+		  argstr(p, full);
+	    } else {
+		  char *startp;
+		  int saveherefd = herefd;
+		  herefd = -1;
+		  argstr(p, 0);
+		  STACKSTRNUL(expdest);
+		  herefd = saveherefd;
+		  startp = stackblock() + startloc;
+		  if (subtype == VSASSIGN) {
+			setvar(var, startp, 0);
+			STADJUST(startp - expdest, expdest);
+			flags &=~ VSNUL;
+			goto again;
+		  }
+		  /* subtype == VSQUESTION */
+		  if (*p != CTLENDVAR) {
+			outfmt(&errout, "%s\n", startp);
+			error((char *)NULL);
+		  }
+		  error("%.*s: parameter %snot set", p - var - 1,
+			var, (flags & VSNUL)? "null or " : nullstr);
+	    }
+      }
+      if (subtype != VSNORMAL) {	/* skip to end of alternative */
+	    int nesting = 1;
+	    for (;;) {
+		  if ((c = *p++) == CTLESC)
+			p++;
+		  else if (c == CTLBACKQ || c == (CTLBACKQ|CTLQUOTE)) {
+			if (set)
+			      argbackq = argbackq->next;
+		  } else if (c == CTLVAR) {
+			if ((*p++ & VSTYPE) != VSNORMAL)
+			      nesting++;
+		  } else if (c == CTLENDVAR) {
+			if (--nesting == 0)
+			      break;
+		  }
+	    }
+      }
+      return p;
+}
+
+
+
+/*
+ * Test whether a specialized variable is set.
+ */
+
+STATIC int
+varisset(name)
+      char name;
+      {
+      char **ap;
+
+      if (name == '!') {
+	    if (backgndpid == -1)
+		  return 0;
+      } else if (name == '@' || name == '*') {
+	    if (*shellparam.p == NULL)
+		  return 0;
+      } else if ((unsigned)(name -= '1') <= '9' - '1') {
+	    ap = shellparam.p;
+	    do {
+		  if (*ap++ == NULL)
+			return 0;
+	    } while (--name >= 0);
+      }
+      return 1;
+}
+
+
+
+/*
+ * Add the value of a specialized variable to the stack string.
+ */
+
+STATIC void
+varvalue(name, quoted, allow_split)
+      char name;
+      {
+      int num;
+      char temp[32];
+      char *p;
+      int i;
+      extern int exitstatus;
+      char sep;
+      char **ap;
+      char const *syntax;
+
+      switch (name) {
+      case '$':
+	    num = rootpid;
+	    goto numvar;
+      case '?':
+	    num = exitstatus;
+	    goto numvar;
+      case '#':
+	    num = shellparam.nparam;
+	    goto numvar;
+      case '!':
+	    num = backgndpid;
+numvar:
+	    p = temp + 31;
+	    temp[31] = '\0';
+	    do {
+		  *--p = num % 10 + '0';
+	    } while ((num /= 10) != 0);
+	    while (*p)
+		  STPUTC(*p++, expdest);
+	    break;
+      case '-':
+	    for (i = 0 ; optchar[i] ; i++) {
+		  if (optval[i])
+			STPUTC(optchar[i], expdest);
+	    }
+	    break;
+      case '@':
+	    if (allow_split) {
+		  sep = '\0';
+		  goto allargs;
+	    }
+	    /* fall through */			
+      case '*':
+	    sep = ' ';
+allargs:
+	    syntax = quoted? DQSYNTAX : BASESYNTAX;
+	    for (ap = shellparam.p ; (p = *ap++) != NULL ; ) {
+		  /* should insert CTLESC characters */
+		  while (*p) {
+			if (syntax[*p] == CCTL)
+			      STPUTC(CTLESC, expdest);
+			STPUTC(*p++, expdest);
+		  }
+		  if (*ap)
+			STPUTC(sep, expdest);
+	    }
+	    break;
+      case '0':
+	    p = arg0;
+string:
+	    syntax = quoted? DQSYNTAX : BASESYNTAX;
+	    while (*p) {
+		  if (syntax[*p] == CCTL)
+			STPUTC(CTLESC, expdest);
+		  STPUTC(*p++, expdest);
+	    }
+	    break;
+      default:
+	    if ((unsigned)(name -= '1') <= '9' - '1') {
+		  p = shellparam.p[name];
+		  goto string;
+	    }
+	    break;
+      }
+}
+
+
+
+/*
+ * Record the the fact that we have to scan this region of the
+ * string for IFS characters.
+ */
+
+STATIC void
+recordregion(start, end, nulonly) {
+      register struct ifsregion *ifsp;
+
+      if (ifslastp == NULL) {
+	    ifsp = &ifsfirst;
+      } else {
+	    ifsp = (struct ifsregion *)ckmalloc(sizeof (struct ifsregion));
+	    ifslastp->next = ifsp;
+      }
+      ifslastp = ifsp;
+      ifslastp->next = NULL;
+      ifslastp->begoff = start;
+      ifslastp->endoff = end;
+      ifslastp->nulonly = nulonly;
+}
+
+
+
+/*
+ * Break the argument string into pieces based upon IFS and add the
+ * strings to the argument list.  The regions of the string to be
+ * searched for IFS characters have been stored by recordregion.
+ */
+
+STATIC void
+ifsbreakup(string, arglist)
+      char *string;
+      struct arglist *arglist;
+      {
+      struct ifsregion *ifsp;
+      struct strlist *sp;
+      char *start;
+      register char *p;
+      char *q;
+      char *ifs;
+
+      start = string;
+      if (ifslastp != NULL) {
+	    ifsp = &ifsfirst;
+	    do {
+		  p = string + ifsp->begoff;
+		  ifs = ifsp->nulonly? nullstr : ifsval();
+		  while (p < string + ifsp->endoff) {
+			q = p;
+			if (*p == CTLESC)
+			      p++;
+			if (strchr(ifs, *p++)) {
+			      if (q > start || *ifs != ' ') {
+				    *q = '\0';
+				    sp = (struct strlist *)stalloc(sizeof *sp);
+				    sp->text = start;
+				    *arglist->lastp = sp;
+				    arglist->lastp = &sp->next;
+			      }
+			      if (*ifs == ' ') {
+				    for (;;) {
+					  if (p >= string + ifsp->endoff)
+						break;
+					  q = p;
+					  if (*p == CTLESC)
+						p++;
+					  if (strchr(ifs, *p++) == NULL) {
+						p = q;
+						break;
+					  }
+				    }
+			      }
+			      start = p;
+			}
+		  }
+	    } while ((ifsp = ifsp->next) != NULL);
+	    if (*start || (*ifs != ' ' && start > string)) {
+		  sp = (struct strlist *)stalloc(sizeof *sp);
+		  sp->text = start;
+		  *arglist->lastp = sp;
+		  arglist->lastp = &sp->next;
+	    }
+      } else {
+	    sp = (struct strlist *)stalloc(sizeof *sp);
+	    sp->text = start;
+	    *arglist->lastp = sp;
+	    arglist->lastp = &sp->next;
+      }
+}
+
+
+
+/*
+ * Expand shell metacharacters.  At this point, the only control characters
+ * should be escapes.  The results are stored in the list exparg.
+ */
+
+char *expdir;
+
+
+STATIC void
+expandmeta(str)
+      struct strlist *str;
+      {
+      char *p;
+      struct strlist **savelastp;
+      struct strlist *sp;
+      char c;
+
+      while (str) {
+	    if (fflag)
+		  goto nometa;
+	    p = str->text;
+#if UDIR
+	    if (p[0] == '/' && p[1] == 'u' && p[2] == '/')
+		  str->text = p = expudir(p);
+#endif
+	    for (;;) {			/* fast check for meta chars */
+		  if ((c = *p++) == '\0')
+			goto nometa;
+		  if (c == '*' || c == '?' || c == '[' || c == '!')
+			break;
+	    }
+	    savelastp = exparg.lastp;
+	    INTOFF;
+	    if (expdir == NULL)
+		  expdir = ckmalloc(1024); /* I hope this is big enough */
+	    expmeta(expdir, str->text);
+	    ckfree(expdir);
+	    expdir = NULL;
+	    INTON;
+	    if (exparg.lastp == savelastp) {
+		  if (! zflag) {
+nometa:
+			*exparg.lastp = str;
+			rmescapes(str->text);
+			exparg.lastp = &str->next;
+		  }
+	    } else {
+		  *exparg.lastp = NULL;
+		  *savelastp = sp = expsort(*savelastp);
+		  while (sp->next != NULL)
+			sp = sp->next;
+		  exparg.lastp = &sp->next;
+	    }
+	    str = str->next;
+      }
+}
+
+
+#if UDIR
+/*
+ * Expand /u/username into the home directory for the specified user.
+ * We could use the getpw stuff here, but then we would have to load
+ * in stdio and who knows what else.
+ */
+
+#define MAXLOGNAME 32
+#define MAXPWLINE 128
+
+char *pfgets();
+
+
+STATIC char *
+expudir(path)
+      char *path;
+      {
+      register char *p, *q, *r;
+      char name[MAXLOGNAME];
+      char line[MAXPWLINE];
+      int i;
+
+      r = path;				/* result on failure */
+      p = r + 3;			/* the 3 skips "/u/" */
+      q = name;
+      while (*p && *p != '/') {
+	    if (q >= name + MAXLOGNAME - 1)
+		  return r;		/* fail, name too long */
+	    *q++ = *p++;
+      }
+      *q = '\0';
+      setinputfile("/etc/passwd", 1);
+      q = line + strlen(name);
+      while (pfgets(line, MAXPWLINE) != NULL) {
+	    if (line[0] == name[0] && prefix(name, line) && *q == ':') {
+		  /* skip to start of home directory */
+		  i = 4;
+		  do {
+			while (*++q && *q != ':');
+		  } while (--i > 0);
+		  if (*q == '\0')
+			break;		/* fail, corrupted /etc/passwd */
+		  q++;
+		  for (r = q ; *r && *r != '\n' && *r != ':' ; r++);
+		  *r = '\0';		/* nul terminate home directory */
+		  i = r - q;		/* i = strlen(q) */
+		  r = stalloc(i + strlen(p) + 1);
+		  scopy(q, r);
+		  scopy(p, r + i);
+		  TRACE(("expudir converts %s to %s\n", path, r));
+		  didudir = 1;
+		  path = r;		/* succeed */
+		  break;
+	    }
+      }
+      popfile();
+      return r;
+}
+#endif
+
+
+/*
+ * Do metacharacter (i.e. *, ?, [...]) expansion.
+ */
+
+STATIC void
+expmeta(enddir, name)
+      char *enddir;
+      char *name;
+      {
+      register char *p;
+      char *q;
+      char *start;
+      char *endname;
+      int metaflag;
+      struct stat statb;
+      DIR *dirp;
+      struct dirent *dp;
+      int atend;
+      int matchdot;
+
+      metaflag = 0;
+      start = name;
+      for (p = name ; ; p++) {
+	    if (*p == '*' || *p == '?')
+		  metaflag = 1;
+	    else if (*p == '[') {
+		  q = p + 1;
+		  if (*q == '!')
+			q++;
+		  for (;;) {
+			if (*q == CTLESC)
+			      q++;
+			if (*q == '/' || *q == '\0')
+			      break;
+			if (*++q == ']') {
+			      metaflag = 1;
+			      break;
+			}
+		  }
+	    } else if (*p == '!' && p[1] == '!'	&& (p == name || p[-1] == '/')) {
+		  metaflag = 1;
+	    } else if (*p == '\0')
+		  break;
+	    else if (*p == CTLESC)
+		  p++;
+	    if (*p == '/') {
+		  if (metaflag)
+			break;
+		  start = p + 1;
+	    }
+      }
+      if (metaflag == 0) {	/* we've reached the end of the file name */
+	    if (enddir != expdir)
+		  metaflag++;
+	    for (p = name ; ; p++) {
+		  if (*p == CTLESC)
+			p++;
+		  *enddir++ = *p;
+		  if (*p == '\0')
+			break;
+	    }
+	    if (metaflag == 0 || stat(expdir, &statb) >= 0)
+		  addfname(expdir);
+	    return;
+      }
+      endname = p;
+      if (start != name) {
+	    p = name;
+	    while (p < start) {
+		  if (*p == CTLESC)
+			p++;
+		  *enddir++ = *p++;
+	    }
+      }
+      if (enddir == expdir) {
+	    p = ".";
+      } else if (enddir == expdir + 1 && *expdir == '/') {
+	    p = "/";
+      } else {
+	    p = expdir;
+	    enddir[-1] = '\0';
+      }
+      if ((dirp = opendir(p)) == NULL)
+	    return;
+      if (enddir != expdir)
+	    enddir[-1] = '/';
+      if (*endname == 0) {
+	    atend = 1;
+      } else {
+	    atend = 0;
+	    *endname++ = '\0';
+      }
+      matchdot = 0;
+      if (start[0] == '.' || start[0] == CTLESC && start[1] == '.')
+	    matchdot++;
+      while (! int_pending() && (dp = readdir(dirp)) != NULL) {
+	    if (dp->d_name[0] == '.' && ! matchdot)
+		  continue;
+	    if (patmatch(start, dp->d_name)) {
+		  if (atend) {
+			scopy(dp->d_name, enddir);
+			addfname(expdir);
+		  } else {
+			char *q;
+			for (p = enddir, q = dp->d_name ; *p++ = *q++ ;);
+			p[-1] = '/';
+			expmeta(p, endname);
+		  }
+	    }
+      }
+      closedir(dirp);
+      if (! atend)
+	    endname[-1] = '/';
+}
+
+
+/*
+ * Add a file name to the list.
+ */
+
+STATIC void
+addfname(name)
+      char *name;
+      {
+      char *p;
+      struct strlist *sp;
+
+      p = stalloc(strlen(name) + 1);
+      scopy(name, p);
+      sp = (struct strlist *)stalloc(sizeof *sp);
+      sp->text = p;
+      *exparg.lastp = sp;
+      exparg.lastp = &sp->next;
+}
+
+
+/*
+ * Sort the results of file name expansion.  It calculates the number of
+ * strings to sort and then calls msort (short for merge sort) to do the
+ * work.
+ */
+
+STATIC struct strlist *
+expsort(str)
+      struct strlist *str;
+      {
+      int len;
+      struct strlist *sp;
+
+      len = 0;
+      for (sp = str ; sp ; sp = sp->next)
+	    len++;
+      return msort(str, len);
+}
+
+
+STATIC struct strlist *
+msort(list, len)
+      struct strlist *list;
+      {
+      struct strlist *p, *q;
+      struct strlist **lpp;
+      int half;
+      int n;
+
+      if (len <= 1)
+	    return list;
+      half = len >> 1;      
+      p = list;
+      for (n = half ; --n >= 0 ; ) {
+	    q = p;
+	    p = p->next;
+      }
+      q->next = NULL;			/* terminate first half of list */
+      q = msort(list, half);		/* sort first half of list */
+      p = msort(p, len - half);		/* sort second half */
+      lpp = &list;
+      for (;;) {
+	    if (strcmp(p->text, q->text) < 0) {
+		  *lpp = p;
+		  lpp = &p->next;
+		  if ((p = *lpp) == NULL) {
+			*lpp = q;
+			break;
+		  }
+	    } else {
+		  *lpp = q;
+		  lpp = &q->next;
+		  if ((q = *lpp) == NULL) {
+			*lpp = p;
+			break;
+		  }
+	    }
+      }
+      return list;
+}
+
+
+
+/*
+ * Returns true if the pattern matches the string.
+ */
+
+int
+patmatch(pattern, string)
+      char *pattern;
+      char *string;
+      {
+      if (pattern[0] == '!' && pattern[1] == '!')
+	    return 1 - pmatch(pattern + 2, string);
+      else
+	    return pmatch(pattern, string);
+}
+
+
+STATIC int
+pmatch(pattern, string)
+      char *pattern;
+      char *string;
+      {
+      register char *p, *q;
+      register char c;
+
+      p = pattern;
+      q = string;
+      for (;;) {
+	    switch (c = *p++) {
+	    case '\0':
+		  goto breakloop;
+	    case CTLESC:
+		  if (*q++ != *p++)
+			return 0;
+		  break;
+	    case '?':
+		  if (*q++ == '\0')
+			return 0;
+		  break;
+	    case '*':
+		  c = *p;
+		  if (c != CTLESC && c != '?' && c != '*' && c != '[') {
+			while (*q != c) {
+			      if (*q == '\0')
+				    return 0;
+			      q++;
+			}
+		  }
+		  do {
+			if (pmatch(p, q))
+			      return 1;
+		  } while (*q++ != '\0');
+		  return 0;
+	    case '[': {
+		  char *endp;
+		  int invert, found;
+		  char chr;
+
+		  endp = p;
+		  if (*endp == '!')
+			endp++;
+		  for (;;) {
+			if (*endp == '\0')
+			      goto dft;		/* no matching ] */
+			if (*endp == CTLESC)
+			      endp++;
+			if (*++endp == ']')
+			      break;
+		  }
+		  invert = 0;
+		  if (*p == '!') {
+			invert++;
+			p++;
+		  }
+		  found = 0;
+		  chr = *q++;
+		  c = *p++;
+		  do {
+			if (c == CTLESC)
+			      c = *p++;
+			if (*p == '-' && p[1] != ']') {
+			      p++;
+			      if (*p == CTLESC)
+				    p++;
+			      if (chr >= c && chr <= *p)
+				    found = 1;
+			      p++;
+			} else {
+			      if (chr == c)
+				    found = 1;
+			}
+		  } while ((c = *p++) != ']');
+		  if (found == invert)
+			return 0;
+		  break;
+	    }
+dft:	    default:
+		  if (*q++ != c)
+			return 0;
+		  break;
+	    }
+      }
+breakloop:
+      if (*q != '\0')
+	    return 0;
+      return 1;
+}
+
+
+
+/*
+ * Remove any CTLESC characters from a string.
+ */
+
+void
+rmescapes(str)
+      char *str;
+      {
+      register char *p, *q;
+
+      p = str;
+      while (*p != CTLESC) {
+	    if (*p++ == '\0')
+		  return;
+      }
+      q = p;
+      while (*p) {
+	    if (*p == CTLESC)
+		  p++;
+	    *q++ = *p++;
+      }
+      *q = '\0';
+}
+
+
+
+/*
+ * See if a pattern matches in a case statement.
+ */
+
+int
+casematch(pattern, val)
+      union node *pattern;
+      char *val;
+      {
+      struct stackmark smark;
+      int result;
+      char *p;
+
+      setstackmark(&smark);
+      argbackq = pattern->narg.backquote;
+      STARTSTACKSTR(expdest);
+      ifslastp = NULL;
+      argstr(pattern->narg.text, 0);
+      STPUTC('\0', expdest);
+      p = grabstackstr(expdest);
+      result = patmatch(p, val);
+      popstackmark(&smark);
+      return result;
+}
+EOF
+if test `wc -c < expand.c` -ne 22554
+then	echo 'expand.c is the wrong size'
+fi
+echo extracting init.h
+cat > init.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+#ifdef __STDC__
+void init(void);
+void reset(void);
+void initshellproc(void);
+#else
+void init();
+void reset();
+void initshellproc();
+#endif
+EOF
+if test `wc -c < init.h` -ne 355
+then	echo 'init.h is the wrong size'
+fi
+echo extracting input.h
+cat > input.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/* PEOF (the end of file marker) is defined in syntax.h */
+
+/*
+ * The input line number.  Input.c just defines this variable, and saves
+ * and restores it when files are pushed and popped.  The user of this
+ * package must set its value.
+ */
+extern int plinno;
+extern int parsenleft;		/* number of characters left in input buffer */
+extern char *parsenextc;	/* next character in input buffer */
+
+
+#ifdef __STDC__
+char *pfgets(char *, int);
+int pgetc(void);
+int preadbuffer(void);
+void pungetc(void);
+void ppushback(char *, int);
+void setinputfile(char *, int);
+void setinputfd(int, int);
+void setinputstring(char *, int);
+void popfile(void);
+void popallfiles(void);
+void closescript(void);
+#else
+char *pfgets();
+int pgetc();
+int preadbuffer();
+void pungetc();
+void ppushback();
+void setinputfile();
+void setinputfd();
+void setinputstring();
+void popfile();
+void popallfiles();
+void closescript();
+#endif
+
+#define pgetc_macro()	(--parsenleft >= 0? *parsenextc++ : preadbuffer())
+EOF
+if test `wc -c < input.h` -ne 1194
+then	echo 'input.h is the wrong size'
+fi
+echo extracting input.c
+cat > input.c <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ *
+ * This file implements the input routines used by the parser.
+ */
+
+#include <stdio.h>	/* defines BUFSIZ */
+#include "shell.h"
+#include "syntax.h"
+#include "input.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include <fcntl.h>
+#include "myerrno.h"
+
+#define EOF_NLEFT -99		/* value of parsenleft when EOF pushed back */
+
+
+/*
+ * The parsefile structure pointed to by the global variable parsefile
+ * contains information about the current file being read.
+ */
+
+MKINIT
+struct parsefile {
+      int linno;		/* current line */
+      int fd;			/* file descriptor (or -1 if string) */
+      int nleft;		/* number of chars left in buffer */
+      char *nextc;		/* next char in buffer */
+      struct parsefile *prev;	/* preceding file on stack */
+      char *buf;		/* input buffer */
+};
+
+
+int plinno = 1;			/* input line number */
+MKINIT int parsenleft;		/* copy of parsefile->nleft */
+char *parsenextc;		/* copy of parsefile->nextc */
+MKINIT struct parsefile basepf;	/* top level input file */
+char basebuf[BUFSIZ];		/* buffer for top level input file */
+struct parsefile *parsefile = &basepf;	/* current input file */
+char *pushedstring;		/* copy of parsenextc when text pushed back */
+int pushednleft;		/* copy of parsenleft when text pushed back */
+
+#ifdef __STDC__
+STATIC void pushfile(void);
+#else
+STATIC void pushfile();
+#endif
+
+
+
+#ifdef mkinit
+INCLUDE "input.h"
+INCLUDE "error.h"
+
+INIT {
+      extern char basebuf[];
+
+      basepf.nextc = basepf.buf = basebuf;
+}
+
+RESET {
+      if (exception != EXSHELLPROC)
+	    parsenleft = 0;            /* clear input buffer */
+      popallfiles();
+}
+
+SHELLPROC {
+      popallfiles();
+}
+#endif
+
+
+/*
+ * Read a line from the script.
+ */
+
+char *
+pfgets(line, len)
+      char *line;
+      {
+      register char *p = line;
+      int nleft = len;
+      int c;
+
+      while (--nleft > 0) {
+	    c = pgetc_macro();
+	    if (c == PEOF) {
+		  if (p == line)
+			return NULL;
+		  break;
+	    }
+	    *p++ = c;
+	    if (c == '\n')
+		  break;
+      }
+      *p = '\0';
+      return line;
+}
+
+
+
+/*
+ * Read a character from the script, returning PEOF on end of file.
+ * Nul characters in the input are silently discarded.
+ */
+
+int
+pgetc() {
+      return pgetc_macro();
+}
+
+
+/*
+ * Refill the input buffer and return the next input character:
+ *
+ * 1) If a string was pushed back on the input, switch back to the regular
+ *    buffer.
+ * 2) If an EOF was pushed back (parsenleft == EOF_NLEFT) or we are reading
+ *    from a string so we can't refill the buffer, return EOF.
+ * 3) Call read to read in the characters.
+ * 4) Delete all nul characters from the buffer.
+ */
+
+int
+preadbuffer() {
+      register char *p, *q;
+      register int i;
+
+      if (pushedstring) {
+	    parsenextc = pushedstring;
+	    pushedstring = NULL;
+	    parsenleft = pushednleft;
+	    if (--parsenleft >= 0)
+		  return *parsenextc++;
+      }
+      if (parsenleft == EOF_NLEFT || parsefile->buf == NULL)
+	    return PEOF;
+      flushout(&output);
+      flushout(&errout);
+retry:
+      p = parsenextc = parsefile->buf;
+      i = read(parsefile->fd, p, BUFSIZ);
+      if (i <= 0) {
+	    if (i < 0) {
+		  if (errno == EINTR)
+			goto retry;
+#ifdef BSD
+		  if (parsefile->fd == 0 && errno == EWOULDBLOCK) {
+			int flags = fcntl(0, F_GETFL, 0);
+			if (flags >= 0 && flags & FNDELAY) {
+			      flags &=~ FNDELAY;
+			      if (fcntl(0, F_SETFL, flags) >= 0) {
+				    out2str("ash: turning off NDELAY mode\n");
+				    goto retry;
+			      }
+			}
+		  }
+#endif
+	    }
+#ifdef SYSV
+	    if (i == 0 && parsefile->fd == 0) {
+		  int flags = fcntl(0, F_GETFL, 0);
+		  if (flags >= 0 && flags & O_NDELAY) {
+			flags &=~ O_NDELAY;
+			if (fcntl(0, F_SETFL, flags) >= 0) {
+			      out2str("ash: turning off NDELAY mode\n");
+			      goto retry;
+			}
+		  }
+	    }
+#endif
+	    parsenleft = EOF_NLEFT;
+	    return PEOF;
+      }
+      parsenleft = i - 1;
+
+      /* delete nul characters */
+      for (;;) {
+	    if (*p++ == '\0')
+		  break;
+	    if (--i <= 0)
+		  return *parsenextc++;		/* no nul characters */
+      }
+      q = p - 1;
+      while (--i > 0) {
+	    if (*p != '\0')
+		  *q++ = *p;
+	    p++;
+      }
+      if (q == parsefile->buf)
+	    goto retry;			/* buffer contained nothing but nuls */
+      parsenleft = q - parsefile->buf - 1;
+      return *parsenextc++;
+}
+
+
+/*
+ * Undo the last call to pgetc.  Only one character may be pushed back.
+ * PEOF may be pushed back.
+ */
+
+void
+pungetc() {
+      parsenleft++;
+      parsenextc--;
+}
+
+
+/*
+ * Push a string back onto the input.  This code doesn't work if the user
+ * tries to push back more than one string at once.
+ */
+
+void
+ppushback(string, length)
+      char *string;
+      {
+      pushedstring = parsenextc;
+      pushednleft = parsenleft;
+      parsenextc = string;
+      parsenleft = length;
+}
+
+
+
+/*
+ * Set the input to take input from a file.  If push is set, push the
+ * old input onto the stack first.
+ */
+
+void
+setinputfile(fname, push)
+      char *fname;
+      {
+      int fd;
+      int fd2;
+
+      INTOFF;
+      if ((fd = open(fname, O_RDONLY)) < 0)
+	    error("Can't open %s", fname);
+      if (fd < 10) {
+	    fd2 = copyfd(fd, 10);
+	    close(fd);
+	    if (fd2 < 0)
+		  error("Out of file descriptors");
+	    fd = fd2;
+      }
+      setinputfd(fd, push);
+      INTON;
+}
+
+
+/*
+ * Like setinputfile, but takes an open file descriptor.  Call this with
+ * interrupts off.
+ */
+
+void
+setinputfd(fd, push) {
+      if (push) {
+	    pushfile();
+	    parsefile->buf = ckmalloc(BUFSIZ);
+      }
+      if (parsefile->fd > 0)
+	    close(parsefile->fd);
+      parsefile->fd = fd;
+      if (parsefile->buf == NULL)
+	    parsefile->buf = ckmalloc(BUFSIZ);
+      parsenleft = 0;
+      plinno = 1;
+}
+
+
+/*
+ * Like setinputfile, but takes input from a string.
+ */
+
+void
+setinputstring(string, push)
+      char *string;
+      {
+      INTOFF;
+      if (push)
+	    pushfile();
+      parsenextc = string;
+      parsenleft = strlen(string);
+      parsefile->buf = NULL;
+      plinno = 1;
+      INTON;
+}
+
+
+
+/*
+ * To handle the "." command, a stack of input files is used.  Pushfile
+ * adds a new entry to the stack and popfile restores the previous level.
+ */
+
+STATIC void
+pushfile() {
+      struct parsefile *pf;
+
+      parsefile->nleft = parsenleft;
+      parsefile->nextc = parsenextc;
+      parsefile->linno = plinno;
+      pf = (struct parsefile *)ckmalloc(sizeof (struct parsefile));
+      pf->prev = parsefile;
+      pf->fd = -1;
+      parsefile = pf;
+}
+
+
+void
+popfile() {
+      struct parsefile *pf = parsefile;
+
+      INTOFF;
+      if (pf->fd >= 0)
+	    close(pf->fd);
+      if (pf->buf)
+	    ckfree(pf->buf);
+      parsefile = pf->prev;
+      ckfree(pf);
+      parsenleft = parsefile->nleft;
+      parsenextc = parsefile->nextc;
+      plinno = parsefile->linno;
+      INTON;
+}
+
+
+/*
+ * Return to top level.
+ */
+
+void
+popallfiles() {
+      while (parsefile != &basepf)
+	    popfile();
+}
+
+
+
+/*
+ * Close the file(s) that the shell is reading commands from.  Called
+ * after a fork is done.
+ */
+
+void
+closescript() {
+      popallfiles();
+      if (parsefile->fd > 0) {
+	    close(parsefile->fd);
+	    parsefile->fd = 0;
+      }
+}
+EOF
+if test `wc -c < input.c` -ne 7288
+then	echo 'input.c is the wrong size'
+fi
+echo Archive 3 unpacked
+exit
+

@@ -1,0 +1,1342 @@
+Subject:  v20i003:  C memory garbage collector, Part02/02
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Hans Boehm <boehm@rice.edu>
+Posting-number: Volume 20, Issue 3
+Archive-name: c-gc/part02
+
+echo 'Start of distribution file ../gc.shar.02:'
+echo 'Extracting README...'
+sed 's/^X//' > README << '/'
+XCopyright 1988, 1989 Hans-J. Boehm, Alan J. Demers
+XThis material may be freely distributed, provided this notice is retained.
+XThis material is provided as is, with no warranty expressed or implied.
+XUse at your own risk.
+X
+X  This collector was developed as a part of research projects supported in
+Xpart by the National Science Foundation and the Defense Advance Research
+XProjects Agency.  The SPARC specific code was contributed by Mark Weiser
+X(weiser.pa@xerox.com).  The Encore Multimax modifications were supplied by
+XKevin Kenny (kenny@m.cs.uiuc.edu).  The adaptation to the RT is largely due
+Xto Vernon Lee, on machines made available by IBM. (Blame for misinstallation
+Xof those modifications goes to the first author, however.) Some of the
+Ximprovements incorporated in this version were suggested by David Chase at
+XOlivetti Research.
+X
+X  This is intended to be a general purpose, garbage collecting storage
+Xallocator.  The algorithms used are described in:
+X
+XBoehm, H., and M. Weiser, "Garbage Collection in an Uncooperative Environment",
+XSoftware Practice & Experience, September 1988, pp. 807-820.
+X
+X  Many of the ideas underlying the collector have previously been explored
+Xby others.  (We discovered recently that Doug McIlroy wrote a more or less
+Xsimilar collector that is part of version 8 UNIX (tm).)  However none of this
+Xwork appears to have been widely disseminated.
+X
+X  The tools for detecting storage leaks described in the above paper
+Xare not included here.  There is some hope that they might be released
+Xby Xerox in the future.
+X
+X  Since the collector does not require pointers to be tagged, it does not
+Xattempt to insure that all inaccessible storage is reclaimed.  However,
+Xin our experience, it is typically more successful at reclaiming unused
+Xmemory than most C programs using explicit deallocation.
+X
+X  In the following, an "object" is defined to be a region of memory allocated
+Xby the routines described below.  
+X
+X  Any objects not intended to be collected must be pointed to either
+Xfrom other such accessible objects, or from the registers,
+Xstack, data, or statically allocated bss segments.  It is usually assumed
+Xthat all such pointers point to the beginning of the object.  (This does
+Xnot disallow interior pointers; it simply requires that there must be a
+Xpointer to the beginning of every accessible object, in addition to any
+Xinterior pointers.  Conditionally compiled code to check for pointers to the
+Xinteriors of objects is supplied.  As explained in "runtime.h", this
+Xmay create other problems, however.)
+X  Note that pointers inside memory allocated by the standard "malloc" are not
+Xseen by the garbage collector.  Thus objects pointed to only from such a
+Xregion may be prematurely deallocated.  It is thus suggested that the
+Xstandard "malloc" be used only for memory regions, such as I/O buffers, that
+Xare guaranteed not to contain pointers.  Pointers in C language automatic,
+Xstatic, or register variables, are correctly recognized.
+X  The collector is designed to minimize stack growth if link fields inside
+Xstructures are allocated first.  (Normally only linked lists of lengths
+Xexceeding about 100000 will cause this to be noticable.)
+X  Signal processing for most signals is deferred during collection. (This
+Xis not done on the MIPS machine under System V, where this seem to require
+Xmany system calls.  If signal handling is desired, the user will probably
+Xfind it necessary to suspend those signals that are actually used.)
+X  As distributed, the collector produces garbage collection statistics
+Xduring every collection.  Once the collector is known to operate properly,
+Xthese can be suppressed by undefining the appropriate macros at the top
+Xof "runtime.h".  (The given statistics exhibit a few peculiarities.
+XThings don't appear to add up for a variety of reasons, most notably
+Xfragmentation losses.  These are probably much more significant for the
+Xcontrived program "test.c" than for your application.)
+X  The collector currently is designed to run essentially unmodified on
+Xthe following machines:
+X
+X	    Sun 3
+X	    Sun 4  (except under some versions of 3.2)
+X	    Vax under Berkeley UNIX
+X	    Sequent Symmetry  (no concurrency)
+X	    Encore Multimax   (no concurrency)
+X	    MIPS M/120 (and presumably M/2000) (System V)
+X	    IBM PC/RT  (Berkeley UNIX)
+X
+X  For these machines you should check the beginning of runtime.h
+Xto verify that the machine type is correctly defined.  On an Encore Multimax,
+XMIPS M/120, or a PC/RT, you will also need to make changes to the
+XMakefile, as described by comments there.
+X  In all cases we assume that pointer alignment is consistent with that
+Xenforced by the standard C compilers.  If you use a nonstandard compiler
+Xyou may have to adjust the alignment parameters defined in runtime.h.
+X  On a MIPS machine or PC/RT, we assume that no calls to sbrk occur during a
+Xcollection. (This is necessary due to the way stack expansion works on these
+Xmachines.) This may become false if certain kinds of I/O calls are inserted
+Xinto the collector.
+X
+X  For machines not already mentioned, the following are likely to require
+Xchange:
+X
+X1.  The parameters at the top of runtime.h and the definition of
+X    TMP_POINTER_MASK further down in the same file.
+X2.  mach_dep.c.  This includes routines to mark from registers,
+X    and to save registers not normally preserved by the C compiler.
+X    (The latter should not be necessary unless assembly language calls
+X    to the allocator are used.)  If your machine does not allow in-line
+X    assembly code, this may be replaced by a .s file (as we did for the MIPS
+X    machine and the PC/RT).
+X
+X  For a different UN*X version or different machine using the Motorola 68000,
+XVax, SPARC, 80386, NS 32000, PC/RT, or MIPS architecture, it should frequently
+Xsuffice to change definitions in runtime.h.
+X
+X  The following routines are intended to be directly called by the user.
+XNote that only gc_malloc and gc_init are necessary.  The remaining routines
+Xare used solely to enhance performance.  It is suggested that they be used
+Xonly after initial debugging.
+X
+X1)  gc_init()
+X    - called once before allocation to initialize the collector.
+X
+X2)  gc_malloc(nbytes)
+X    - allocate an object of size nbytes.  Unlike malloc, the object is
+X      cleared before being returned to the user.  (For even better performance,
+X      it may help to expand the relevant part of gc_malloc in line.
+X      This is done by the Russell compiler, for example.)  Gc_malloc will
+X      invoke the garbage collector when it determines this to be appropriate.
+X      (A number of previous collector bugs resulted in objects not getting
+X      completely cleared.  We claim these are all fixed.  But if you encounter
+X      problems, this is a likely source to check for.  The collector tries
+X      hard to avoid clearing any words that it doesn't have to.  Thus this
+X      is a bit subtle.)
+X      
+X
+X3)  gc_malloc_atomic(nbytes)
+X    - allocate an object of size nbytes that is guaranteed not to contain any
+X      pointers.  The returned object is not guaranteed to be cleeared.
+X      (Can always be replaced by gc_malloc, but results in faster collection
+X      times.  The collector will probably run faster if large character
+X      arrays, etc. are allocated with gc_malloc_atomic than if they are
+X      statically allocated.)
+X
+X4)  gc_free(object)
+X    - explicitly deallocate an object returned by gc_malloc or
+X      gc_malloc_atomic.  Not necessary, but can be used to minimize
+X      collections if performance is critical.
+X
+X5)  expand_hp(number_of_4K_blocks)
+X    - Explicitly increase the heap size.  (This is normally done automatically
+X      if a garbage collection failed to reclaim enough memory.  Explicit
+X      calls to expand_hp may prevent unnecessarily frequent collections at
+X      program startup.)
+X
+X  The global variable dont_gc can be set to a non-zero value to inhibit
+Xcollections, e.g. during a time-critical section of code.  (This may cause
+Xotherwise unnecessary exansion of the process' memory.)
+X  The variable non_gc_bytes, which is normally 0, may be changed to reflect
+Xthe amount of memory allocated by the above routines that should not be
+Xconsidered as a candidate for collection.  Collections are inhibited
+Xif this exceeds a given fraction (currently 3/4) of the total heap size.
+XThe heap is simply expanded instead.  Careless use may, of course, result
+Xin excessive memory consumption.
+X  Some additional tuning is possible through the parameters defined
+Xnear the top of runtime.h.
+X  
+X  The two gc_malloc routines may be declared to return a suitable pointer
+Xtype.  It is not intended that runtime.h be included by the user program.
+XIf only gc_malloc is intended to be used, it might be appropriate to define:
+X
+X#define malloc(n) gc_malloc(n)
+X#define calloc(m,n) gc_malloc((m)*(n))
+X
+X  No attempt is made to use obscure names for garbage collector routines
+Xand data structures.  Name conflicts are possible.  (Running "nm gc.o"
+Xshould identify names to be avoided.)
+X
+X  Please address bug reports to boehm@rice.edu.
+/
+echo 'Extracting allochblk.c...'
+sed 's/^X//' > allochblk.c << '/'
+X#define DEBUG
+X#undef DEBUG
+X#include <stdio.h>
+X#include "runtime.h"
+X/**/
+X/* allocate/free routines for heap blocks
+X/* Note that everything called from outside the garbage collector
+X/* should be prepared to abort at any point as the result of a signal.
+X/**/
+X
+X/*
+X * Free heap blocks are kept on a list sorted by address.
+X * The hb_hdr.hbh_sz field of a free heap block contains the length
+X * (in bytes) of the entire block.
+X * Neighbors are coalesced.
+X */
+X
+Xstruct hblk *savhbp = (struct hblk *)0;  /* heap block preceding next */
+X					 /* block to be examined by   */
+X					 /* allochblk.                */
+X
+X/*
+X * Return 1 if there is a heap block sufficient for object size sz,
+X * 0 otherwise.  Advance savhbp to point to the block prior to the
+X * first such block.
+X */
+Xint sufficient_hb(sz)
+Xint sz;
+X{
+Xregister struct hblk *hbp;
+Xstruct hblk *prevhbp;
+Xint size_needed, size_avail;
+Xint first_time = 1;
+X
+X    size_needed = WORDS_TO_BYTES(sz>0? sz : -sz);
+X    size_needed = (size_needed+sizeof(struct hblkhdr)+HBLKSIZE-1) & ~HBLKMASK;
+X#   ifdef DEBUG
+X	printf("sufficient_hb: sz = %d, size_needed = 0x%X\n", sz, size_needed);
+X#   endif
+X    /* search for a big enough block in free list */
+X	hbp = savhbp;
+X	for(;;) {
+X	    prevhbp = hbp;
+X	    hbp = ((prevhbp == (struct hblk *)0)
+X		    ? hblkfreelist
+X		    : prevhbp->hb_next);
+X
+X	    if( prevhbp == savhbp && !first_time) {
+X		/* no sufficiently big blocks on free list */
+X		return(0);
+X	    }
+X	    first_time = 0;
+X	    if( hbp == (struct hblk *)0 ) continue;
+X	    size_avail = hbp->hb_sz;
+X	    if( size_avail >= size_needed ) {
+X		savhbp = prevhbp;
+X		return(1);
+X	    }
+X	}
+X}
+X
+X/*
+X * Allocate (and return pointer to) a heap block
+X *   for objects of size |sz|.
+X *
+X * NOTE: Caller is responsible for adding it to global hblklist
+X *       and for building an object freelist in it.
+X *
+X * The new block is guaranteed to be cleared if sz > 0.
+X */
+Xstruct hblk *
+Xallochblk(sz)
+Xlong sz;
+X{
+X    register struct hblk *thishbp;
+X    register struct hblk *hbp;
+X    struct hblk *prevhbp;
+X    long size_needed,            /* number of bytes in requested objects */
+X         uninit,                 /* => Found uninitialized block         */
+X         size_avail;
+X    int first_time = 1;
+X
+X    char *sbrk();			/* data segment size increasing	*/
+X    char *brk();			/* functions			*/
+X
+X    size_needed = WORDS_TO_BYTES(sz>0? sz : -sz);
+X    size_needed = (size_needed+sizeof(struct hblkhdr)+HBLKSIZE-1) & ~HBLKMASK;
+X#   ifdef DEBUG
+X	printf("(allochblk) sz = %x, size_needed = 0x%X\n", sz, size_needed);
+X#   endif
+X
+X    /* search for a big enough block in free list */
+X	hbp = savhbp;
+X	for(;;) {
+X
+X	    prevhbp = hbp;
+X	    hbp = ((prevhbp == (struct hblk *)0)
+X                    ? hblkfreelist
+X		    : prevhbp->hb_next);
+X
+X	    if( prevhbp == savhbp && !first_time) {
+X		/* no sufficiently big blocks on free list, */
+X		/* let thishbp --> a newly-allocated block, */
+X		/* free it (to merge into existing block    */
+X		/* list) and start the search again, this   */
+X		/* time with guaranteed success.            */
+X                  int size_to_get = size_needed + hincr * HBLKSIZE;
+X		  extern int holdsigs();
+X		  int Omask;
+X
+X		  /* Don't want to deal with signals in the middle of this */
+X		      Omask = holdsigs();
+X
+X                    update_hincr;
+X		    thishbp = HBLKPTR(((unsigned)sbrk(0))+HBLKSIZE-1 );
+X		    heaplim = (char *) (((unsigned)thishbp) + size_to_get);
+X
+X		    if( (brk(heaplim)) == ((char *)-1) ) {
+X                        write(2,"Out of Memory!  Giving up ...\n", 30);
+X			exit(-1);
+X		    }
+X#                   ifdef PRINTSTATS
+X			printf("Need to increase heap size by %d\n",
+X			       size_to_get);
+X			fflush(stdout);
+X#                   endif
+X		    heapsize += size_to_get;
+X		    thishbp->hb_sz = 
+X			BYTES_TO_WORDS(size_to_get - sizeof(struct hblkhdr));
+X		    freehblk(thishbp);
+X		    /* Reenable signals */
+X		      sigsetmask(Omask);
+X		    hbp = savhbp;
+X		    first_time = 1;
+X		continue;
+X	    }
+X
+X	    first_time = 0;
+X
+X	    if( hbp == (struct hblk *)0 ) continue;
+X
+X	    size_avail = hbp->hb_sz;
+X	    if( size_avail >= size_needed ) {
+X		/* found a big enough block       */
+X		/* let thishbp --> the block      */
+X		/* set prevhbp, hbp to bracket it */
+X		    thishbp = hbp;
+X		    if( size_avail == size_needed ) {
+X			hbp = hbp->hb_next;
+X			uninit = thishbp -> hb_uninit;
+X		    } else {
+X			uninit = thishbp -> hb_uninit;
+X			thishbp -> hb_uninit = 1; 
+X				/* Just in case we get interrupted by a */
+X				/* signal                               */
+X			hbp = (struct hblk *)
+X			    (((unsigned)thishbp) + size_needed);
+X			hbp->hb_uninit = uninit;
+X			hbp->hb_next = thishbp->hb_next;
+X			hbp->hb_sz = size_avail - size_needed;
+X		    }
+X		/* remove *thishbp from hblk freelist */
+X		    if( prevhbp == (struct hblk *)0 ) {
+X			hblkfreelist = hbp;
+X		    } else {
+X			prevhbp->hb_next = hbp;
+X		    }
+X		/* save current list search position */
+X		    savhbp = prevhbp;
+X		break;
+X	    }
+X	}
+X
+X    /* set size and mask field of *thishbp correctly */
+X	thishbp->hb_sz = sz;
+X	thishbp->hb_mask = -1;  /* may be changed by new_hblk */
+X
+X    /* Clear block if necessary */
+X	if (uninit && sz > 0) {
+X	    register word * p = &(thishbp -> hb_body[0]);
+X	    register word * plim;
+X
+X	    plim = (word *)(((char *)thishbp) + size_needed);
+X	    while (p < plim) {
+X		*p++ = 0;
+X	    }
+X	}
+X    /* Clear mark bits */
+X	{
+X	    register word *p = (word *)(&(thishbp -> hb_marks[0]));
+X	    register word * plim = (word *)(&(thishbp -> hb_marks[MARK_BITS_SZ]));
+X	    while (p < plim) {
+X		*p++ = 0;
+X	    }
+X	}
+X
+X#   ifdef DEBUG
+X	printf("Returning 0x%X\n", thishbp);
+X	fflush(stdout);
+X#   endif
+X    return( thishbp );
+X}
+X 
+X/* Clear the header information in a previously allocated heap block p */
+X/* so that it can be coalesced with an initialized heap block.         */
+Xstatic clear_header(p)
+Xregister struct hblk *p;
+X{
+X    p -> hb_sz = 0;
+X#   ifndef HBLK_MAP
+X      p -> hb_index = (struct hblk **)0;
+X#   endif
+X    p -> hb_next = 0;
+X    p -> hb_mask = 0;
+X#   if MARK_BITS_SZ <= 60
+X	/* Since this block was deallocated, only spurious mark      */
+X	/* bits corresponding to the header could conceivably be set */
+X	p -> hb_marks[0] = 0;
+X	p -> hb_marks[1] = 0;
+X#   else
+X	--> fix it
+X#   endif
+X}
+X
+X/*
+X * Free a heap block.
+X *
+X * Assume the block is not currently on hblklist.
+X *
+X * Coalesce the block with its neighbors if possible.
+X
+X * All mark words (except possibly the first) are assumed to be cleared.
+X * The body is assumed to be cleared unless hb_uninit is nonzero.
+X */
+Xvoid
+Xfreehblk(p)
+Xregister struct hblk *p;
+X{
+Xregister struct hblk *hbp, *prevhbp;
+Xregister int size;
+X
+X    /* savhbp may become invalid due to coalescing.  Clear it. */
+X	savhbp = (struct hblk *)0;
+X
+X    size = p->hb_sz;
+X    if( size < 0 ) size = -size;
+X    size = 
+X	((WORDS_TO_BYTES(size)+sizeof(struct hblkhdr)+HBLKSIZE-1)
+X		 & (~HBLKMASK));
+X    p->hb_sz = size;
+X
+X    prevhbp = (struct hblk *) 0;
+X    hbp = hblkfreelist;
+X
+X    while( (hbp != (struct hblk *)0) && (hbp < p) ) {
+X	prevhbp = hbp;
+X	hbp = hbp->hb_next;
+X    }
+X
+X    /* Coalesce with successor, if possible */
+X      if( (((unsigned)p)+size) == ((unsigned)hbp) ) {
+X	(p -> hb_uninit) |= (hbp -> hb_uninit);
+X	p->hb_next = hbp->hb_next;
+X	p->hb_sz += hbp->hb_sz;
+X	if (!p -> hb_uninit) clear_header(hbp);
+X      } else {
+X	p->hb_next = hbp;
+X      }
+X
+X    if( prevhbp == (struct hblk *)0 ) {
+X	hblkfreelist = p;
+X    } else if( (((unsigned)prevhbp) + prevhbp->hb_hdr.hbh_sz) ==
+X	    ((unsigned)p) ) {
+X      /* Coalesce with predecessor */
+X	(prevhbp->hb_uninit) |= (p -> hb_uninit);
+X	prevhbp->hb_next = p->hb_next;
+X	prevhbp->hb_sz += p->hb_sz;
+X	if (!prevhbp -> hb_uninit) clear_header(p);
+X    } else {
+X	prevhbp->hb_next = p;
+X    }
+X}
+X
+X/* Add a heap block to hblklist or hblkmap.  */
+Xvoid add_hblklist(hbp)
+Xstruct hblk * hbp;
+X{
+X# ifdef HBLK_MAP
+X    long size = hbp->hb_sz;
+X    long index = divHBLKSZ(((long)hbp) - ((long)heapstart));
+X    long i;
+X
+X    if( size < 0 ) size = -size;
+X    size = (divHBLKSZ(WORDS_TO_BYTES(size)+sizeof(struct hblkhdr)+HBLKSIZE-1));
+X	   /* in units of HBLKSIZE */
+X    hblkmap[index] = HBLK_VALID;
+X    for (i = 1; i < size; i++) {
+X	if (i < 0x7f) {
+X	    hblkmap[index+i] = i;
+X	} else {
+X	    /* May overflow a char.  Store largest possible value */
+X	    hblkmap[index+i] = 0x7e;
+X	}
+X    }
+X# else
+X    if (last_hblk >= &hblklist[MAXHBLKS]) {
+X	fprintf(stderr, "Not configured for enough memory\n");
+X	exit(1);
+X    }
+X    *last_hblk = hbp;
+X    hbp -> hb_index = last_hblk;
+X    last_hblk++;
+X# endif
+X}
+X
+X/* Delete a heap block from hblklist or hblkmap.  */
+Xvoid del_hblklist(hbp)
+Xstruct hblk * hbp;
+X{
+X# ifdef HBLK_MAP
+X    long size = hbp->hb_sz;
+X    long index = divHBLKSZ(((long)hbp) - ((long)heapstart));
+X    long i;
+X
+X    if( size < 0 ) size = -size;
+X    size = (divHBLKSZ(WORDS_TO_BYTES(size)+sizeof(struct hblkhdr)+HBLKSIZE-1));
+X	   /* in units of HBLKSIZE */
+X    for (i = 0; i < size; i++) {
+X	hblkmap[index+i] = HBLK_INVALID;
+X    }
+X# else
+X    register struct hblk ** list_entry;
+X    last_hblk--;
+X    /* Let **last_hblk use the slot previously occupied by *hbp */
+X	list_entry = hbp -> hb_index;
+X	(*last_hblk) -> hb_index = list_entry;
+X	*list_entry = *last_hblk;
+X# endif
+X}
+X
+X/* Initialize hblklist */
+Xvoid init_hblklist()
+X{
+X#   ifdef DEBUG
+X	printf("Here we are in init_hblklist - ");
+X	printf("last_hblk = %x\n",&(hblklist[0]));
+X#   endif
+X#   ifndef HBLK_MAP
+X      last_hblk = &(hblklist[0]);
+X#   endif
+X}
+/
+echo 'Extracting cons.c...'
+sed 's/^X//' > cons.c << '/'
+X/* Silly implementation of Lisp cons. Intentionally wastes lots of space */
+X/* to test collector.                                                    */
+X# include <stdio.h>
+X# include "cons.h"
+X
+Xint extra_count = 0;        /* Amount of space wasted in cons node */
+X
+Xsexpr cons (x, y)
+Xsexpr x;
+Xsexpr y;
+X{
+X    register sexpr r;
+X    register int i;
+X    register int *p;
+X    
+X    extra_count++;
+X    extra_count %= 3000;
+X    r = (sexpr) gc_malloc(8 + extra_count);
+X    for (p = (int *)r; ((char *)p) < ((char *)r) + extra_count + 8; p++) {
+X	if (*p) {
+X	    fprintf(stderr, "Found nonzero at %X\n", p);
+X	    abort(p);
+X        }
+X        *p = 13;
+X    }
+X    r -> sexpr_car = x;
+X    r -> sexpr_cdr = y;
+X    return(r);
+X}
+/
+echo 'Extracting cons.h...'
+sed 's/^X//' > cons.h << '/'
+Xstruct SEXPR {
+X    struct SEXPR * sexpr_car;
+X    struct SEXPR * sexpr_cdr;
+X};
+X
+Xtypedef struct SEXPR * sexpr;
+X
+Xextern sexpr cons();
+X
+X# define nil ((sexpr) 0)
+X# define car(x) ((x) -> sexpr_car)
+X# define cdr(x) ((x) -> sexpr_cdr)
+X# define null(x) ((x) == nil)
+X
+X# define head(x) car(x)
+X# define tail(x) cdr(x)
+X
+X# define caar(x) car(car(x))
+X# define cadr(x) car(cdr(x))
+X# define cddr(x) cdr(cdr(x))
+X# define cdar(x) cdr(car(x))
+X# define caddr(x) car(cdr(cdr(x)))
+X
+X# define first(x) car(x)
+X# define second(x) cadr(x)
+X# define third(x) caddr(x)
+X
+X# define list1(x) cons(x, nil)
+X# define list2(x,y) cons(x, cons(y, nil))
+X# define list3(x,y,z) cons(x, cons(y, cons(z, nil)))
+/
+echo 'Extracting mach_dep.c...'
+sed 's/^X//' > mach_dep.c << '/'
+X# include "runtime.h"
+X
+X/* Call allocobj or allocaobj after first saving at least those registers */
+X/* not preserved by the C compiler. The register used for return values   */
+X/* is not saved, since it will be clobbered anyway.                       */
+X# ifdef RT
+X    /* This is done in rt_allocobj.s */
+X# else
+Xasm("    .text");
+Xasm("	.globl  __allocobj");
+Xasm("	.globl  __allocaobj");
+Xasm("	.globl  _allocobj");
+Xasm("	.globl  _allocaobj");
+X
+X# ifdef M68K
+X    asm("_allocobj:");
+X    asm("   link    a6,#0");
+X    asm("	movl    d1,sp@-");
+X    asm("	movl    a0,sp@-");
+X    asm("	movl    a1,sp@-");
+X    asm("	movl    sp@(20),sp@-");
+X    asm("	jbsr    __allocobj");
+X    asm("	addl    #4,sp");
+X    asm("	movl    sp@+,a1");
+X    asm("	movl    sp@+,a0");
+X    asm("	movl    sp@+,d1");
+X    asm("	unlk    a6");
+X    asm("	rts");
+X    
+X    asm("_allocaobj:");
+X    asm("	link    a6,#0");
+X    asm("	movl    d1,sp@-");
+X    asm("	movl    a0,sp@-");
+X    asm("	movl    a1,sp@-");
+X    asm("	movl    sp@(20),sp@-");
+X    asm("	jbsr    __allocaobj");
+X    asm("	addl    #4,sp");
+X    asm("	movl    sp@+,a1");
+X    asm("	movl    sp@+,a0");
+X    asm("	movl    sp@+,d1");
+X    asm("	unlk    a6");
+X    asm("	rts");
+X# endif
+X
+X# ifdef I386
+X    asm(".data");
+X    asm("gc_ret_value: .word 0");
+X    asm(".word 0");
+X    asm(".text");
+X
+X    asm("_allocaobj:");
+X    asm("pushl %ebp");
+X    asm("movl %esp,%ebp");
+X    asm("pushal");
+X    asm("pushl 8(%ebp)");          /* Push orignal argument */
+X    asm("call __allocaobj");
+X    asm("popl %ecx");
+X    asm("movl %eax,gc_ret_value");  /* Save return value */
+X    asm("popal");
+X    asm("movl gc_ret_value,%eax");
+X    asm("leave");
+X    asm("ret");
+X
+X    asm("_allocobj:");
+X    asm("pushl %ebp");
+X    asm("movl %esp,%ebp");
+X    asm("pushal");
+X    asm("pushl 8(%ebp)");          /* Push orignal argument */
+X    asm("call __allocobj");
+X    asm("popl %ecx");
+X    asm("movl %eax,gc_ret_value");  /* Save return value */
+X    asm("popal");
+X    asm("movl gc_ret_value,%eax");
+X    asm("leave");
+X    asm("ret");
+X# endif
+X
+X# ifdef SPARC
+X    asm("_allocaobj:");
+X    asm("	ba	__allocaobj");
+X    asm("	nop");
+X    asm("_allocobj:");
+X    asm("	ba	__allocobj");
+X    asm("	nop");
+X    
+X#   include <sun4/trap.h>
+X    asm("	.globl	_save_regs_in_stack");
+X    asm("_save_regs_in_stack:");
+X    asm("	t	0x3   ! ST_FLUSH_WINDOWS");
+X    asm("	mov	%sp,%o0");
+X    asm("	retl");
+X    asm("	nop");
+X# endif
+X
+X# ifdef VAX
+X    asm("_allocobj:");
+X    asm(".word    0x3e");
+X    asm("pushl   4(ap)");
+X    asm("calls   $1,__allocobj");
+X    asm("ret");
+X    asm("_allocaobj:");
+X    asm(".word   0x3e");
+X    asm("pushl   4(ap)");
+X    asm("calls   $1,__allocaobj");
+X    asm("ret");
+X# endif
+X
+X# ifdef NS32K
+X    asm("_allocobj:");
+X    asm("enter [],$0");
+X    asm("movd r1,tos");
+X    asm("movd r2,tos");
+X    asm("movd 8(fp),tos");
+X    asm("bsr ?__allocobj");
+X    asm("adjspb $-4");
+X    asm("movd tos,r2");
+X    asm("movd tos,r1");
+X    asm("exit []");
+X    asm("ret $0");
+X    asm("_allocaobj:");
+X    asm("enter [],$0");
+X    asm("movd r1,tos");
+X    asm("movd r2,tos");
+X    asm("movd 8(fp),tos");
+X    asm("bsr ?__allocaobj");
+X    asm("adjspb $-4");
+X    asm("movd tos,r2");
+X    asm("movd tos,r1");
+X    asm("exit []");
+X    asm("ret $0");
+X# endif
+X
+X
+X# if !defined(VAX) && !defined(M68K) && !defined(SPARC) && !defined(I386) && !defined(NS32K)
+X    --> fix it
+X# endif
+X
+X# endif
+X
+X/* Routine to mark from registers that are preserved by the C compiler */
+Xmark_regs()
+X{
+X#       ifdef RT
+X	  register long TMP_SP; /* must be bound to r11 */
+X#       endif
+X#       ifdef VAX
+X	  /* r1 through r5 are preserved by allocobj, and therefore     */
+X	  /* on the stack.                                              */
+X	  asm("pushl r11");     asm("calls $1,_tl_mark");
+X	  asm("pushl r10"); 	asm("calls $1,_tl_mark");
+X	  asm("pushl r9");	asm("calls $1,_tl_mark");
+X	  asm("pushl r8");	asm("calls $1,_tl_mark");
+X	  asm("pushl r7");	asm("calls $1,_tl_mark");
+X	  asm("pushl r6");	asm("calls $1,_tl_mark");
+X
+X	  asm("movl sp,r11");		/* TMP_SP = stack pointer sp	*/
+X#       endif
+X#       ifdef M68K
+X	  /* a0, a1 and d1 are preserved by allocobj */
+X	  /*  and therefore are on stack             */
+X	
+X	  asm("subqw #0x4,sp");		/* allocate word on top of stack */
+X
+X	  asm("movl a0,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl a1,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl a2,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl a3,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl a4,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl a5,sp@");	asm("jbsr _tl_mark");
+X	  /* Skip frame pointer and stack pointer */
+X	  asm("movl d0,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl d1,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl d2,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl d3,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl d4,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl d5,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl d6,sp@");	asm("jbsr _tl_mark");
+X	  asm("movl d7,sp@");	asm("jbsr _tl_mark");
+X
+X	  asm("addqw #0x4,sp");		/* put stack back where it was	*/
+X
+X	  asm("movl a7,d7");		/* TMP_SP = stack pointer a7	*/
+X#       endif
+X
+X#       ifdef I386
+X	  asm("pushl %eax");  asm("call _tl_mark"); asm("addl $4,%esp");
+X	  asm("pushl %ecx");  asm("call _tl_mark"); asm("addl $4,%esp");
+X	  asm("pushl %edx");  asm("call _tl_mark"); asm("addl $4,%esp");
+X	  asm("pushl %esi");  asm("call _tl_mark"); asm("addl $4,%esp");
+X	  asm("pushl %edi");  asm("call _tl_mark"); asm("addl $4,%esp");
+X	  asm("pushl %ebx");  asm("call _tl_mark"); asm("addl $4,%esp");
+X#       endif
+X
+X#       ifdef NS32K
+X	  asm ("movd r3, tos"); asm ("bsr ?_tl_mark"); asm ("adjspb $-4");
+X	  asm ("movd r4, tos"); asm ("bsr ?_tl_mark"); asm ("adjspb $-4");
+X	  asm ("movd r5, tos"); asm ("bsr ?_tl_mark"); asm ("adjspb $-4");
+X	  asm ("movd r6, tos"); asm ("bsr ?_tl_mark"); asm ("adjspb $-4");
+X	  asm ("movd r7, tos"); asm ("bsr ?_tl_mark"); asm ("adjspb $-4");
+X#       endif
+X
+X#       ifdef SPARC
+X	  save_regs_in_stack();
+X#       endif
+X
+X#	ifdef RT
+X	  /* we used to think this wasn't necessary, but gcollect */
+X	  /* can be called from many places ...                   */
+X	    tl_mark(TMP_SP);	/* tl_mark from r11 */
+X
+X	    asm("cas r11, r6, r0"); tl_mark(TMP_SP);	/* r6 */
+X	    asm("cas r11, r7, r0"); tl_mark(TMP_SP);	/* through */
+X	    asm("cas r11, r8, r0"); tl_mark(TMP_SP);	/* r10 */
+X	    asm("cas r11, r9, r0"); tl_mark(TMP_SP);
+X	    asm("cas r11, r10, r0"); tl_mark(TMP_SP);
+X
+X	    asm("cas r11, r12, r0"); tl_mark(TMP_SP); /* r12 */
+X	    asm("cas r11, r13, r0"); tl_mark(TMP_SP); /* through */
+X	    asm("cas r11, r14, r0"); tl_mark(TMP_SP); /* r15 */
+X	    asm("cas r11, r15, r0"); tl_mark(TMP_SP);
+X#	endif
+X
+X      /* other machines... */
+X#       if !(defined M68K) && !(defined VAX) && !(defined RT) && !(defined SPARC) && !(defined I386) &&!(defined NS32K)
+X	    --> bad news <--
+X#       endif
+X}
+/
+echo 'Extracting mips_mach_dep.s...'
+sed 's/^X//' > mips_mach_dep.s << '/'
+X# define call_mark(x)     move    $4,x;    jal     tl_mark
+X
+X # Mark from machine registers that are saved by C compiler
+X    .globl  mark_regs
+X    .ent    mark_regs
+Xmark_regs:
+X    subu    $sp,4       ## Need to save only return address
+X    sw      $31,4($sp)
+X    .mask   0x80000000,0
+X    .frame  $sp,4,$31
+X    call_mark($2)
+X    call_mark($3)
+X    call_mark($16)
+X    call_mark($17)
+X    call_mark($18)
+X    call_mark($19)
+X    call_mark($20)
+X    call_mark($21)
+X    call_mark($22)
+X    call_mark($23)
+X    call_mark($30)
+X    lw      $31,4($sp)
+X    addu    $sp,4
+X    j       $31
+X    .end    mark_regs
+X
+X    .globl  allocobj
+X    .ent    allocobj
+Xallocobj:
+X    subu    $sp,68
+X    sw      $31,68($sp)
+X    sw      $25,64($sp)
+X    sw      $24,60($sp)
+X    sw      $15,56($sp)
+X    sw      $14,52($sp)
+X    sw      $13,48($sp)
+X    sw      $12,44($sp)
+X    sw      $11,40($sp)
+X    sw      $10,36($sp)
+X    sw      $9,32($sp)
+X    sw      $8,28($sp)
+X    sw      $7,24($sp)
+X    sw      $6,20($sp)
+X    sw      $5,16($sp)
+X    sw      $4,12($sp)
+X    sw      $3,8($sp)
+X    .set    noat
+X    sw      $at,4($sp)
+X    .set    at
+X    .mask   0x8300fffa,0
+X    .frame  $sp,68,$31
+X    jal     _allocobj
+X    lw      $31,68($sp)
+X    lw      $25,64($sp)
+X    lw      $24,60($sp)
+X    lw      $15,56($sp)
+X    lw      $14,52($sp)
+X    lw      $13,48($sp)
+X    lw      $12,44($sp)
+X    lw      $11,40($sp)
+X    lw      $10,36($sp)
+X    lw      $9,32($sp)
+X    lw      $8,28($sp)
+X    lw      $7,24($sp)
+X    lw      $6,20($sp)
+X    lw      $5,16($sp)
+X    lw      $4,12($sp)
+X    lw      $3,8($sp)
+X #  don't restore $2, since it's the return value
+X    .set    noat
+X    lw      $at,4($sp)
+X    .set    at
+X    addu    $sp,68
+X    j       $31
+X    .end    allocobj
+X
+X    .globl  allocaobj
+X    .ent    allocaobj
+Xallocaobj:
+X    subu    $sp,68
+X    sw      $31,68($sp)
+X    sw      $25,64($sp)
+X    sw      $24,60($sp)
+X    sw      $15,56($sp)
+X    sw      $14,52($sp)
+X    sw      $13,48($sp)
+X    sw      $12,44($sp)
+X    sw      $11,40($sp)
+X    sw      $10,36($sp)
+X    sw      $9,32($sp)
+X    sw      $8,28($sp)
+X    sw      $7,24($sp)
+X    sw      $6,20($sp)
+X    sw      $5,16($sp)
+X    sw      $4,12($sp)
+X    sw      $3,8($sp)
+X    .set    noat
+X    sw      $at,4($sp)
+X    .set    at
+X    .mask   0x8300fffa,0
+X    .frame  $sp,68,$31
+X    jal     _allocaobj
+X    lw      $31,68($sp)
+X    lw      $25,64($sp)
+X    lw      $24,60($sp)
+X    lw      $15,56($sp)
+X    lw      $14,52($sp)
+X    lw      $13,48($sp)
+X    lw      $12,44($sp)
+X    lw      $11,40($sp)
+X    lw      $10,36($sp)
+X    lw      $9,32($sp)
+X    lw      $8,28($sp)
+X    lw      $7,24($sp)
+X    lw      $6,20($sp)
+X    lw      $5,16($sp)
+X    lw      $4,12($sp)
+X    lw      $3,8($sp)
+X #  don't restore $2, since it's the return value
+X    .set    noat
+X    lw      $at,4($sp)
+X    .set    at
+X    addu    $sp,68
+X    j       $31
+X    .end    allocaobj
+/
+echo 'Extracting reclaim.c...'
+sed 's/^X//' > reclaim.c << '/'
+X#include <stdio.h>
+X#include "runtime.h"
+X#define DEBUG
+X#undef DEBUG
+X#ifdef PRINTSTATS
+X#  define GATHERSTATS
+X#endif
+X
+Xlong mem_found = 0;     /* Number of longwords of memory reclaimed     */
+X
+Xlong composite_in_use;  /* Number of longwords in accessible composite */
+X			/* objects.                                    */
+X
+Xlong atomic_in_use;     /* Number of longwords in accessible atomic */
+X			/* objects.                                 */
+X
+X/*
+X * reclaim phase
+X *
+X */
+X
+Xreclaim()
+X{
+Xregister struct hblk *hbp;	/* ptr to current heap block		*/
+Xregister int word_no;		/* Number of word in block		*/
+Xregister long i;
+Xregister word *p;		/* pointer to current word in block	*/
+Xregister int mb;		/* mark bit of current word		*/
+Xint sz;				/* size of objects in current block	*/
+Xword *plim;
+Xstruct hblk **nexthbp;		/* ptr to ptr to current heap block	*/
+Xint nonempty;			/* nonempty ^ done with block => block empty*/
+Xstruct obj *list;		/* used to build list of free words in block*/
+Xregister int is_atomic;         /* => current block contains atomic objs */
+X
+X#   ifdef DEBUG
+X        printf("clearing all between %x and %x, %x and %x\n",
+X               objfreelist, &objfreelist[MAXOBJSZ+1],
+X               aobjfreelist,&aobjfreelist[MAXAOBJSZ+1]);
+X#   endif
+X    { register struct obj **fop;
+X	for( fop = objfreelist; fop < &objfreelist[MAXOBJSZ+1]; fop++ ) {
+X	    *fop = (struct obj *)0;
+X	}
+X	for( fop = aobjfreelist; fop < &aobjfreelist[MAXAOBJSZ+1]; fop++ ) {
+X	    *fop = (struct obj *)0;
+X	}
+X    }
+X    
+X    atomic_in_use = 0;
+X    composite_in_use = 0;
+X
+X#   ifdef PRINTBLOCKS
+X        printf("reclaim: current block sizes:\n");
+X#   endif
+X
+X  /* go through all heap blocks (in hblklist) and reclaim unmarked objects */
+X# ifdef HBLK_MAP
+X    hbp = (struct hblk *) heapstart;
+X    for (; ((char *)hbp) < heaplim; hbp++) if (is_hblk(hbp)) {
+X/* fprintf(stderr, "Reclaiming in 0x%X\n", hbp); */
+X# else
+X    nexthbp = hblklist;
+X    while( nexthbp < last_hblk ) {
+X	hbp = *nexthbp++;
+X# endif
+X
+X	nonempty = FALSE;
+X	sz = hbp -> hb_sz;
+X	is_atomic = 0;
+X	if (sz < 0) {
+X	    sz = -sz;
+X	    is_atomic = 1;		/* this block contains atomic objs */
+X	}
+X#	ifdef PRINTBLOCKS
+X            printf("%d(%c",sz, (is_atomic)? 'a' : 'c');
+X#	endif
+X
+X	if( sz > (is_atomic? MAXAOBJSZ : MAXOBJSZ) ) {  /* 1 big object */
+X	    mb = mark_bit(hbp, (hbp -> hb_body) - ((word *)(hbp)));
+X	    if( mb ) {
+X#               ifdef GATHERSTATS
+X		    if (is_atomic) {
+X			atomic_in_use += sz;
+X		    } else {
+X			composite_in_use += sz;
+X		    }
+X#               endif
+X		nonempty = TRUE;
+X	    } else {
+X		mem_found += sz;
+X	    }
+X	} else {				/* group of smaller objects */
+X	    p = (word *)(hbp->hb_body);
+X	    word_no = ((word *)p) - ((word *)hbp);
+X	    plim = (word *)((((unsigned)hbp) + HBLKSIZE)
+X		       - WORDS_TO_BYTES(sz));
+X
+X	    list = (is_atomic) ? aobjfreelist[sz] : objfreelist[sz];
+X
+X	  /* go through all words in block */
+X	    while( p <= plim )  {
+X		mb = mark_bit(hbp, word_no);
+X
+X		if( mb ) {
+X#                   ifdef GATHERSTATS
+X			if (is_atomic) atomic_in_use += sz;
+X			else           composite_in_use += sz;
+X#                   endif
+X#                   ifdef DEBUG
+X                        printf("found a reachable obj\n");
+X#		    endif
+X		    nonempty = TRUE;
+X		    p += sz;
+X		} else {
+X		  mem_found += sz;
+X		  /* word is available - put on list */
+X		    ((struct obj *)p)->obj_link = list;
+X		    list = ((struct obj *)p);
+X		  if (is_atomic) {
+X		    p += sz;
+X		  } else {
+X		    /* Clear object, advance p to next object in the process */
+X			i = (long)(p + sz);
+X                        p++; /* Skip link field */
+X                        while (p < (word *)i) {
+X			    *p++ = 0;
+X			}
+X		  }
+X		}
+X		word_no += sz;
+X	    }
+X
+X	  /*
+X	   * if block has reachable words in it, we can't reclaim the
+X	   * whole thing so put list of free words in block back on
+X	   * free list for this size.
+X	   */
+X	    if( nonempty ) {
+X		if ( is_atomic )	aobjfreelist[sz] = list;
+X		else			objfreelist[sz] = list;
+X	    }
+X	} 
+X
+X#	ifdef PRINTBLOCKS
+X            printf("%c),", nonempty ? 'n' : 'e' );
+X#	endif
+X	if (!nonempty) {
+X            if (!is_atomic && sz <= MAXOBJSZ) {
+X                /* Clear words at beginning of objects */
+X                /* Since most of it is already cleared */
+X		  p = (word *)(hbp->hb_body);
+X		  plim = (word *)((((unsigned)hbp) + HBLKSIZE)
+X			 - WORDS_TO_BYTES(sz));
+X		  while (p <= plim) {
+X		    *p = 0;
+X		    p += sz;
+X		  }
+X		hbp -> hb_uninit = 0;
+X	    } else {
+X		/* Mark it as being uninitialized */
+X		hbp -> hb_uninit = 1;
+X	    }
+X
+X	  /* remove this block from list of active blocks */
+X	    del_hblklist(hbp);	
+X
+X#           ifndef HBLKMAP
+X	      /* This entry in hblklist just got replaced; look at it again  */
+X	      /* This admittedly depends on the internals of del_hblklist... */
+X	      nexthbp--;
+X#           endif
+X
+X	    freehblk(hbp);
+X	}  /* end if (one big object...) */
+X    } /* end while (nexthbp ...) */
+X
+X#   ifdef PRINTBLOCKS
+X        printf("\n");
+X#   endif
+X}
+/
+echo 'Extracting rt_allocobj.s...'
+sed 's/^X//' > rt_allocobj.s << '/'
+X/*
+X * This (assembly) file contains the functions:
+X *	struct obj * allocobj(sz)
+X *	struct obj * allocaobj(sz)
+X */
+X
+X
+X/*
+X * allocobj(i) insures that the free list entry for objects of size
+X * i is not empty.
+X *
+X * Call _allocobj after first saving the registers which
+X * are not guaranteed to be preserved (r0-r5 and r15).
+X *
+X * Note: the reason we have to use this interface between the caller
+X * and the garbage collector is in order to preserve the caller's registers
+X * which the C compiler would normally trash.  We just stick 'em on the stack
+X * so that the mark_all procedure (which marks everything on the stack) will
+X * see them.
+X *
+X * this is the RT version. The 68k version is in 68Kallocobj.s
+X */
+X
+X/* this prolog was copied from a cc-produced .s file */
+X	.text
+X	.align 2
+X	.data
+X	.align 2
+X	.ltorg
+X	.text
+X	.ascii "<allocobj>"
+X	.align 2
+X	.globl _.allocobj
+X_.allocobj:
+X	.data
+X	.globl _allocobj
+X_allocobj: .long _.allocobj	/* text area contains instr ptr	*/
+X	.text
+X    /*
+X     * save registers which will be trashed on the stack in the place
+X     * the RT linkage convention uses for saving registers
+X     */
+X	.using	_allocobj,r14	/* tell assembler r14 is reliable base */
+X	stm	r3, -100+(3*4)(r1)	/* we don't save r1 cause it's sp */
+X	ai	r1,r1,-(36+13*4)
+X	mr	r14, r0		/* initialize data area pointer */
+X
+X	balix	r15, _._allocobj	/* call _allocobj()	*/
+X	get	r0,$.long(__allocobj)	/* get data area pointer */
+X
+X	lm	r3, -100+(36+13*4)+(3*4)(r1)	/* restore regs */
+X	brx	r15		/* return to caller (no restore req'd)	*/
+X	ai	r1, $(36+13*4)	/* restore r1 to where it belongs */
+X
+X/* trace table for allocobj */
+X	.align 2
+X	.byte	0xdf		/* magic1 */
+X	.byte	0x07		/* code */
+X	.byte	0xdf		/* magic2 */
+X	.byte	0x08		/* first_gpr << 4 | opt stuff */
+X	.byte	0x01		/* no. args and stack reg num	*/
+X	.byte	0x3c		/* 0011 1100 ==> stack frame sz = 60	*/
+X	.data
+X	.ltorg
+X
+X	.text
+X	.ascii "<allocaobj>"
+X	.align 2
+X	.globl _.allocaobj
+X_.allocaobj:
+X	.data
+X	.globl _allocaobj
+X_allocaobj: .long _.allocaobj	/* text area contains instr ptr	*/
+X	.text
+X    /*
+X     * save registers which will be trashed on the stack in the place
+X     * the RT linkage convention uses for saving registers
+X     */
+X	.using	_allocaobj,r14	/* tell assembler r14 is reliable base */
+X	stm	r3, -100+(3*4)(r1)	/* we don't save r1 cause it's sp */
+X	ai	r1,r1,-(36+13*4)
+X	mr	r14, r0		/* initialize data area pointer */
+X
+X	balix	r15, _._allocaobj	/* call _allocaobj()	*/
+X	get	r0,$.long(__allocaobj)	/* get data area pointer */
+X
+X	lm	r3, -100+(36+13*4)+(3*4)(r1)	/* restore regs */
+X	brx	r15		/* return to caller (no restore req'd)	*/
+X	ai	r1, $(36+13*4)	/* restore r1 to where it belongs */
+X
+X/* trace table for allocaobj */
+X	.align 2
+X	.byte	0xdf		/* magic1 */
+X	.byte	0x07		/* code */
+X	.byte	0xdf		/* magic2 */
+X	.byte	0x08		/* first_gpr << 4 | opt stuff */
+X	.byte	0x01		/* no. args and stack reg num	*/
+X	.byte	0x3c		/* 0011 1100 ==> stack frame sz = 60	*/
+X	.data
+X	.ltorg
+X
+X
+X.globl .oVpcc
+X.globl .oVncs
+X.set .oVpcc, 0
+X.set .oVncs, 0
+/
+echo 'Extracting test.c...'
+sed 's/^X//' > test.c << '/'
+X/* Somewhat nonconvincing test for garbage collector.                */
+X/* Note that this intentionally uses the worlds worst implementation */
+X/* of cons.  It eats up gobs of memory in an attempt to break the    */
+X/* collector.  Process size should grow to about 1.5 Meg and stay    */
+X/* there.                                                            */
+X/* Should take about 25 seconds (2 minutes) to run on a              */
+X/* Sun 3/60 (Vax 11/750)                                             */
+X/* (The Vax does reasonably well here because the compiler assures   */
+X/* longword pointer alignment.)                                      */
+X
+X# include <stdio.h>
+X# include "cons.h"
+X
+X/* Return reverse(x) concatenated with y */
+Xsexpr reverse1(x, y)
+Xsexpr x, y;
+X{
+X    if (null(x)) {
+X        return(y);
+X    } else {
+X        return( reverse1(cdr(x), cons(car(x), y)) );
+X    }
+X}
+X
+Xsexpr reverse(x)
+Xsexpr x;
+X{
+X    return( reverse1(x, nil) );
+X}
+X
+Xsexpr ints(low, up)
+Xint low, up;
+X{
+X    if (low > up) {
+X	return(nil);
+X    } else {
+X        return(cons(low, ints(low+1, up)));
+X    }
+X}
+X
+Xvoid print_int_list(x)
+Xsexpr x;
+X{
+X    if (null(x)) {
+X        printf("NIL\n");
+X    } else {
+X        printf("%d", car(x));
+X        if (!null(cdr(x))) {
+X            printf(", ");
+X            print_int_list(cdr(x));
+X        } else {
+X            printf("\n");
+X        }
+X    }
+X}
+X
+X/* Try to force a to be strangely aligned */
+Xstruct {
+X  char dummy;
+X  sexpr aa;
+X} A;
+X#define a A.aa
+X
+Xmain()
+X{
+X    int i;
+X    sexpr b;
+X
+X    gc_init();
+X    a = ints(1, 100);
+X    b = ints(1, 50);
+X    print_int_list(a);
+X    print_int_list(b);
+X    print_int_list(reverse(a));
+X    print_int_list(reverse(b));
+X    for (i = 0; i < 100; i++) {
+X        b = reverse(reverse(b));
+X    }
+X    print_int_list(a);
+X    print_int_list(b);
+X    print_int_list(reverse(a));
+X    print_int_list(reverse(b));
+X}
+X
+/
+echo 'Distribution file ../gc.shar.02 complete.'
+

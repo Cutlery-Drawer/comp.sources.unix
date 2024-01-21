@@ -1,0 +1,1449 @@
+Newsgroups: comp.sources.unix
+From: madler@cco.caltech.edu (Mark Adler)
+Subject: v25i148: zip - file compression/archive tool, Part07/07
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: madler@cco.caltech.edu (Mark Adler)
+Posting-Number: Volume 25, Issue 148
+Archive-Name: zip/part07
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 7)."
+# Contents:  im_ctree.c
+# Wrapped by vixie@cognition.pa.dec.com on Sun Mar  1 18:57:39 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'im_ctree.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'im_ctree.c'\"
+else
+echo shar: Extracting \"'im_ctree.c'\" \(45523 characters\)
+sed "s/^X//" >'im_ctree.c' <<'END_OF_FILE'
+X/*
+X
+X Copyright (C) 1990,1991 Mark Adler, Richard B. Wales, and Jean-loup Gailly.
+X Permission is granted to any individual or institution to use, copy, or
+X redistribute this software so long as all of the original files are included
+X unmodified, that it is not sold for profit, and that this copyright notice
+X is retained.
+X
+X*/
+X
+X/*
+X *  im_ctree.c by Richard B. Wales.
+X *
+X *  Includes modifications by Jean-Loup Gailly.
+X *
+X *  PURPOSE
+X *
+X *      Encode various sets of source values using variable-length
+X *      binary code trees.
+X *
+X *  DISCUSSION
+X *
+X *      The PKZIP "implosion" process uses several variable-depth binary
+X *      code trees, similar to Huffman trees.  The more common source
+X *      values are represented by shorter bit sequences.
+X *
+X *      Each code tree is stored in the ZIP file in a compressed form
+X *      that is essentially a run-length-encoded list of the lengths of
+X *      all the code strings (in ascending order by source values).
+X *      The actual code strings are reconstructed from the lengths in
+X *      the UNZIP process, as described in the "application note"
+X *      (APPNOTE.TXT) distributed as part of PKWARE's PKZIP program.
+X *
+X *      Because of the way a code tree is stored in the ZIP file, the
+X *      codes must conform to the following restrictions:
+X *
+X *      (1) No code string may ever exceed 16 bits in length.
+X *
+X *      (2) If all code strings are extended to 16 bits by padding on
+X *          the right (low-order end) with zeros, and then treated as
+X *          unsigned 16-bit integers, then:
+X *
+X *          (a) The arithmetically higher 16-bit values must correspond
+X *              to the shorter code strings.
+X *
+X *          (b) If two source values map into code strings of the same
+X *              length, the higher code string must correspond to the
+X *              lower source value (where source values are treated as
+X *              unsigned).
+X *
+X *      Further, shortcuts taken by PKUNZIP 1.10 in the way it decodes
+X *      the compressed data via the trees impose the following extra
+X *      limitations:
+X *
+X *      (3) No code string in the "distance" tree can be longer than 8
+X *          bits.
+X *
+X *      (4) The maximum length of any code string is limited by the
+X *          number of initial zero bits, as follows:
+X *
+X *          (a) 0-3 leading zeros:  maximum length is 8.
+X *
+X *          (b) 4-5 leading zeros:  maximum length is 12.
+X *
+X *          (c) 6-7 leading zeros:  maximum length is 14.
+X *
+X *      (5) In the "literal" tree, the code string corresponding to the
+X *          source value 255 must be at least 10 bits in length, regard-
+X *          less of the frequency of the value 255 in the file.
+X *
+X *      PKWARE calls the code trees "Shannon-Fano trees".  (Shannon-Fano
+X *      coding was a predecessor to the better-known Huffman coding
+X *      technique; see the references below.)  Although it appears that
+X *      the Shannon-Fano (top-down partitioning) algorithm is in fact
+X *      used by PKZIP in the process of creating the code trees, the
+X *      resulting trees are not in fact "pure" Shannon-Fano, because of
+X *      the extra processing required in order to meet the restrictions
+X *      described above.
+X *
+X *  REFERENCES
+X *
+X *      Lynch, Thomas J.
+X *          Data Compression:  Techniques and Applications, pp. 53-55.
+X *          Lifetime Learning Publications, 1985.  ISBN 0-534-03418-7.
+X *
+X *      Storer, James A.
+X *          Data Compression:  Methods and Theory, pp. 49-50.
+X *          Computer Science Press, 1988.  ISBN 0-7167-8156-5.
+X *
+X *  INTERFACE
+X *
+X *      ImpErr ct_init (void)
+X *          Initialize the code tree routines.  This routine must be
+X *          called before any other code tree routines may be called.
+X *
+X *      ImpErr ct_tally (MATCH *ma)
+X *          Tally a "string match" data set.  The tally results will be
+X *          used to determine how large the imploded result will be.
+X *
+X *      ImpErr ct_mktrees (FDATA *fd)
+X *          Construct all code trees, and then determine how big the
+X *          imploded file will be under both "literal tree" and "no
+X *          literal tree" conditions.  Choose the best option.
+X *
+X *      ImpErr ct_wrtrees (FILE *outfp)
+X *          Output the code trees to the ZIP file.
+X *
+X *      ImpErr ct_wrdata (FILE *outfp)
+X *          Output the file data to the ZIP file.
+X *
+X *      ImpErr ct_windup (void)
+X *          Deallocate all code trees.
+X */
+X
+X
+X#ifdef DEBUG
+X#   define VALIDATE
+X#endif /* DEBUG */
+X
+X#include "implode.h"
+X
+X
+X/***********************************************************************
+X *
+X * Local data used by the "code tree" routines.
+X */
+X
+X
+X/* Data structure describing a single value and its code string. */
+typedef
+struct  ct_data
+X    {   UL_INT  ct_freq;                /* frequency count */
+X        US_INT  ct_code;                /* bit string */
+X        U_CHAR  ct_len;                 /* length of bit string */
+X        U_CHAR  ct_val;                 /* source value */
+X    }
+X    TRDATA;
+X
+X
+X/*
+X * Data structure for re-sorting source values by bit string length;
+X * used during tree generation.
+X */
+typedef
+struct  ct_resort
+X    {   U_CHAR  ct_rlen;                /* length of bit string */
+X        U_CHAR  ct_rval;                /* source value */
+X#ifdef VMS
+X        US_INT  dummy;                  /* because of bug in qsort() */
+X#endif /* VMS */
+X    }
+X    RESORT;
+X
+X
+X/* Header for a code tree. */
+typedef
+struct  ct_desc
+X    {   TRDATA *ct_array;               /* array of TRDATA */
+X        int     ct_size;                /* # of entries in tree */
+X    }
+X    TRDESC;
+X
+X
+X/*
+X * Currently active code trees.
+X * We allow for five trees (one literal tree, two length trees, and
+X * two distance trees) so that we can evaluate the total compression
+X * with or without the use of the literal tree.  Remember that the
+X * minimum matching distance depends on whether or not a literal tree
+X * is used; hence, the "length" and "distance" trees will differ.
+X */
+X#define MAXTREES        5               /* max # of trees at once */
+local   TRDESC  ct_table[MAXTREES];
+X
+X
+X/* Macro to validate a code tree handle. */
+X#define VALID_HANDLE(x) \
+X        ((x) >= 0 && (x) < MAXTREES && ct_table[x].ct_array != NULL)
+X
+X
+X/*
+X * Assorted frequency counts.
+X * The "Minimum Match Length" (MML) is 2 if a "literal character" code
+X * tree is not used, or 3 if a "literal character" tree is used.  Thus,
+X * we need to keep two sets of "length" and "distance" frequency counts.
+X * Also, 2-character matches need to be counted separately; depending
+X * on whether a "literal character" tree is used or not, these will be
+X * processed either as literal characters or as distance/length pairs.
+X */
+X
+X/* Total number of source values from Pass One. */
+local   long    ct_litc_num;            /* total # literal chars */
+local   long    ct_lit2_num;            /* total # of 2-char matches */
+local   long    ct_strg_num;            /* total # of string matches */
+X
+X/* Source value frequencies for the five trees. */
+local   long    ct_litc_freq[256];      /* literal character freqs */
+local   long    ct_len2_freq[64];       /* length freqs (MML=2) */
+local   long    ct_len3_freq[64];       /* length freqs (MML=3) */
+local   long    ct_dst2_freq[64];       /* distance freqs (MML=2) */
+local   long    ct_dst3_freq[64];       /* distance freqs (MML=3) */
+X
+X/* Number of bits saved by using each of the trees. */
+local   long    ct_litc_saved;          /* literal tree */
+local   long    ct_len2_saved;          /* length tree (MML=2) */
+local   long    ct_len3_saved;          /* length tree (MML=3) */
+local   long    ct_dst2_saved;          /* distance tree (MML=2) */
+local   long    ct_dst3_saved;          /* distance tree (MML=3) */
+X
+X/* Handles for the code trees to be used. */
+local   int     ct_litc_tree;           /* temp literal tree */
+local   int     ct_len2_tree;           /* temp length tree (MML=2) */
+local   int     ct_len3_tree;           /* temp length tree (MML=3) */
+local   int     ct_dst2_tree;           /* temp distance tree (MML=2) */
+local   int     ct_dst3_tree;           /* temp distance tree (MML=3) */
+local   int     lit_tree;               /* literal tree (-1 if none) */
+local   int     len_tree;               /* length tree */
+local   int     dst_tree;               /* distance tree */
+X
+X
+X/***********************************************************************
+X *
+X * Local (static) routines in this file.
+X */
+X
+local ImpErr ct_alloc
+X        OF ((int size, int *handle));
+X
+local ImpErr ct_free
+X        OF ((int handle));
+X
+local ImpErr ct_loadf
+X        OF ((int handle, long *freq));
+X
+local ImpErr ct_ziprep
+X        OF ((int handle, U_CHAR **result));
+X
+local ImpErr ct_gencodes
+X        OF ((int handle, int minbits, int maxbits, long *saved));
+X
+local ImpErr ct_split
+X        OF ((TRDATA *part, int size, long freq,
+X             int prefix, int preflen, int minbits, int maxbits));
+X
+local int ct_fsort
+X        OF ((TRDATA *tr1, TRDATA *tr2));
+X
+local int ct_rsort
+X        OF ((RESORT *cr1, RESORT *cr2));
+X
+X
+X/***********************************************************************
+X *
+X * Allocate a code tree.
+X */
+X
+local
+ImpErr
+ct_alloc (size, handle)
+X    int size;
+X    int *handle;
+X{   register TRDATA *ct;
+X    int n;
+X
+X#ifdef VALIDATE
+X    /* Validate the arguments. */
+X    if (size < 2 || size > 256) goto badarg;
+X    if (handle == NULL)         goto badarg;
+X#endif /* VALIDATE */
+X
+X    /* Allocate an available code tree handle. */
+X    for (n = 0;
+X         n < MAXTREES && ct_table[n].ct_array != NULL;
+X         n++) ;
+X    if (n >= MAXTREES) return IM_NOCTBLS;
+X    *handle = n;
+X    ct_table[n].ct_size  = size;
+X
+X    /* Allocate space for the code tree. */
+X    ct = (TRDATA *) malloc ((unsigned) (size * sizeof (TRDATA)));
+X    if (ct == NULL) return IM_NOMEM;
+X    ct_table[n].ct_array = ct;
+X
+X    /* Initialize the code tree. */
+X    for (n = 0; n < size; n++, ct++)
+X    {   ct->ct_freq = 0;
+X        ct->ct_code = 0;
+X        ct->ct_val  = (U_CHAR)n;
+X        ct->ct_len  = 0;
+X    }
+X
+X    /* That's all. */
+X    return IM_OK;
+X
+X#ifdef VALIDATE
+badarg:
+X    fprintf (stderr, "\nError in ct_alloc: bad argument(s)");
+X    return IM_BADARG;
+X#endif /* VALIDATE */
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Free a code tree.
+X */
+X
+local
+ImpErr
+ct_free (handle)
+X    int handle;
+X{
+X#ifdef VALIDATE
+X    /* Validate the argument. */
+X    if (!VALID_HANDLE (handle)) goto badarg;
+X#endif /* VALIDATE */
+X
+X    /* Free the code tree. */
+X    free ((char *) ct_table[handle].ct_array);
+X    ct_table[handle].ct_array = NULL;
+X    ct_table[handle].ct_size  = 0;
+X
+X    /* That's all. */
+X    return IM_OK;
+X
+X#ifdef VALIDATE
+badarg:
+X    fprintf (stderr, "\nError in ct_free: bad argument(s)");
+X    return IM_BADARG;
+X#endif /* VALIDATE */
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Update a code tree with frequency data.
+X *
+X * In order to allow for the later addition of "adaptive" coding,
+X * the new frequencies are added to the existing data.
+X */
+X
+local
+ImpErr
+ct_loadf (handle, freq)
+X    int   handle;
+X    long *freq;
+X{   register long *f;
+X    register TRDATA *ct;
+X    int n;
+X
+X#ifdef VALIDATE
+X    /* Validate the arguments. */
+X    if (!VALID_HANDLE (handle)) goto badarg;
+X#endif /* VALIDATE */
+X
+X    /* Add in the frequencies. */
+X    for (f = freq,
+X             ct = ct_table[handle].ct_array,
+X             n = ct_table[handle].ct_size;
+X         n > 0;
+X         f++, ct++, n--)
+X        ct->ct_freq += *f;
+X
+X    /* That's all. */
+X    return IM_OK;
+X
+X#ifdef VALIDATE
+badarg:
+X    fprintf (stderr, "\nError in ct_loadf: bad argument(s)");
+X    return IM_BADARG;
+X#endif /* VALIDATE */
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Generate the ZIP-file representation for a code tree.
+X *
+X * The returned "result" value points to static data which will be
+X * overwritten on the next call to "ct_ziprep".
+X *
+X * The length of the result string is implicit in the first byte of
+X * the value, as specified in the PKZIP applications note.
+X */
+X
+X#ifdef IMPDEBUG
+char *treename;
+X#endif /* IMPDEBUG */
+X
+local
+ImpErr
+ct_ziprep (handle, result)
+X    int      handle;
+X    U_CHAR **result;
+X{   static U_CHAR buffer[257];          /* result info */
+X    register U_CHAR *c;
+X    register TRDATA *ct;
+X    int s, n, l;
+X
+X#ifdef VALIDATE
+X    /* Validate the arguments. */
+X    if (!VALID_HANDLE (handle)) goto badarg;
+X    if (result == NULL)         goto badarg;
+X#endif /* VALIDATE */
+X
+X#ifdef  IMPDEBUG
+X    if (treename != NULL && treename[0] != 0)
+X    {   /* Print the code tree info. */
+X        fprintf (stderr, "\n%s tree:\n  value      len   string\n",
+X                 treename);
+X        for (ct = ct_table[handle].ct_array,
+X                  s = ct_table[handle].ct_size,
+X                  n = 0;
+X             s > 0;
+X             ct++, n++, s--)
+X            fprintf (stderr, "  %3d (%02x)    %2d    %04x (rev %04x)\n",
+X                     n, n, ct->ct_len,
+X                     bi_reverse(ct->ct_code << (16 - ct->ct_len),
+X                                ct->ct_len) << (16 - ct->ct_len),
+X                     ct->ct_code);
+X    }
+X#endif  /* IMPDEBUG */
+X
+X    /* Generate the returned value. */
+X    for (c = buffer+1,
+X             ct = ct_table[handle].ct_array,
+X             s = ct_table[handle].ct_size,
+X             n = 0,
+X             l = ct->ct_len;
+X         s > 0;
+X         ct++, s--)
+X    {   if (l < 1 || l > 16)
+X        {   fprintf (stderr, "\nError in ct_ziprep: bad code length");
+X            return IM_LOGICERR;
+X        }
+X        if (n >= 16 || (int)ct->ct_len != l)
+X        {   *c++ = (U_CHAR)((((n-1) << 4) & 0xf0) | ((l-1) & 0x0f));
+X            n = 1; l = ct->ct_len;
+X        }
+X        else n++;
+X    }
+X    if (n > 0)
+X        *c++ = (U_CHAR)((((n-1) << 4) & 0xf0) | ((l-1) & 0x0f));
+X    buffer[0] = (U_CHAR)((c - buffer) - 2);
+X
+X    /* That's all. */
+X    *result = buffer;
+X    return IM_OK;
+X
+X#ifdef VALIDATE
+badarg:
+X    fprintf (stderr, "\nError in ct_ziprep: bad argument(s)");
+X    return IM_BADARG;
+X#endif /* VALIDATE */
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Look up the code string for a given value.
+X */
+X
+X#define ct_lookup(handle, value, string, length) \
+X{   register TRDATA *ct; \
+X    ct = ct_table[handle].ct_array + (value); \
+X    string = ct->ct_code; \
+X    length = ct->ct_len; \
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Generate the codes for a code tree.  If old codes already exist for
+X * the tree, they are discarded, and a new set of codes is generated
+X * from scratch.
+X * IN assertion: ma_buf is already allocated and can be overwritten.
+X */
+X
+local
+ImpErr
+ct_gencodes (handle, minbits, maxbits, saved)
+X    int   handle;                       /* which tree */
+X    int   minbits;                      /* min code string bit length */
+X    int   maxbits;                      /* max code string bit length */
+X    long *saved;                        /* how many bits saved */
+X{   register TRDATA *ct;
+X    TRDATA *ct2;
+X    register int n;
+X    UL_INT f;
+X    register RESORT *cr;
+X    int code, srclen;
+X    long totalfreq, totalbits;
+X    ImpErr retcode;
+X    RESORT rbuf[256];
+X    int size; /* alias for ct_table[handle].ct_size */
+X    int z;    /* index of zero frequency element */
+X    int nz;   /* index of non zero frequency element */
+X
+X#ifdef VALIDATE
+X    /* Validate the arguments. */
+X    if (!VALID_HANDLE (handle)) goto badarg;
+X    if (minbits < 1)            goto badarg;
+X    if (maxbits > 16)           goto badarg;
+X    if (maxbits < minbits)      goto badarg;
+X    if (saved == NULL)          goto badarg;
+X#endif /* VALIDATE */
+X    size = ct_table[handle].ct_size;
+X
+X    /*
+X     * Start by sorting the data by frequency.  The source values with
+X     * higher frequency need to get the shorter Shannon-Fano codes.
+X     * First exclude the elements with zero frequency, to speed up the sort.
+X     * This optimization is very important for small files, otherwise the sort
+X     * takes most of the implode time.
+X     *    Also determine the total of all frequencies.  This will be needed in
+X     * order to partition the source values in the Shannon-Fano bit
+X     * string computation. Finally clear the "code" (bit string) and "len"
+X     * (bit string length) fields in the code tree array.
+X     */
+X    totalfreq = 0;
+X    ct = ct_table[handle].ct_array;
+X    /* Copy ct into a tempo */
+X    ct2 = (TRDATA*) ma_buf;
+X    memcpy((char*)ct2, (char*)ct, size * sizeof(TRDATA));
+X    for (nz = 0, z = n = size-1; n >= 0; n--) {
+X        int m;
+X        if (ct2[n].ct_freq != 0L) {
+X            m = nz++;
+X            totalfreq += (ct[m].ct_freq = ct2[n].ct_freq);
+X        } else {
+X            m = z--;
+X            ct[m].ct_freq = 0L;
+X        }
+X        ct[m].ct_code = 0;
+X        ct[m].ct_len = 0;
+X        ct[m].ct_val = (U_CHAR)n; /* ct2[n].ct_val */
+X    }
+X    qsort ((char *) (ct_table[handle].ct_array), nz,
+X           sizeof (TRDATA), (int (*)())ct_fsort);
+X
+X    /*
+X     * Generate the bit strings via a Shannon-Fano (top-down) algorithm.
+X     */
+X    retcode =
+X        ct_split (ct_table[handle].ct_array,    /* partition start */
+X                  size,                         /* partition size */
+X                  totalfreq,                    /* total frequency */
+X                  0,                            /* code string prefix */
+X                  0,                            /* # bits in prefix */
+X                  minbits,                      /* minimum tree depth */
+X                  maxbits);                     /* maximum tree depth */
+X    if (retcode != IM_OK) return retcode;
+X
+X    /*
+X     * The source value 255 needs to be assigned a bit string with a
+X     * length of at least 10, in order to accommodate shortcuts in
+X     * PKUNZIP's decoding algorithm.  If no bit string in the tree is
+X     * of length 10, we assign 255 to the longest string and hope for
+X     * the best.
+X     */
+X    n = size;
+X    if (n == 256)
+X    {   for (ct = ct_table[handle].ct_array;
+X             n > 0 && ct->ct_val != 255;
+X             n--, ct++) ;
+X        if (n == 0)
+X        {   fprintf (stderr, "\nError in ct_gencodes: no value 255");
+X            return IM_LOGICERR;
+X        }
+X        if (ct->ct_len < 10)
+X        {   ct2 = ct;
+X            while (n > 0 && ct->ct_len < 10) n--, ct++;
+X            if (n == 0) ct--;   /* no len>=10 in tree; use longest */
+X            n = ct->ct_val;
+X                ct->ct_val = ct2->ct_val;
+X                ct2->ct_val = (U_CHAR)n;
+X            f = ct->ct_freq;
+X                ct->ct_freq = ct2->ct_freq;
+X                ct2->ct_freq = f;
+X    }   }
+X
+X    /*
+X     * The source values need to be re-sorted so that all source values
+X     * with code strings of the same length will be in ascending order.
+X     * This is because of the compression scheme used to represent the
+X     * tree in the ZIP file.
+X     */
+X    for (n = size,
+X             ct = ct_table[handle].ct_array,
+X             cr = rbuf;
+X         n > 0;
+X         n--, ct++, cr++)
+X    {   cr->ct_rlen = ct->ct_len;
+X        cr->ct_rval = ct->ct_val;
+X    }
+X    n = size;
+X    qsort ((char *) rbuf, n, sizeof (RESORT), (int (*)())ct_rsort);
+X    for (ct = ct_table[handle].ct_array,
+X             cr = rbuf;
+X         n > 0;
+X         n--, ct++, cr++)
+X        ct->ct_val = cr->ct_rval;
+X
+X#ifdef DUMP_TREE
+X    printf ("Finished tree:\n");
+X    for (n = size,
+X             ct = ct_table[handle].ct_array;
+X         n > 0;
+X         n--, ct++)
+X        printf ("  %3d (0x%02x)  l %2d  c 0x%04x f %ld\n",
+X                ct->ct_val, ct->ct_val, ct->ct_len, ct->ct_code, ct->ct_freq);
+X    putchar ('\n');
+X#endif /* DUMP_TREE */
+X
+X    /*
+X     * Finally, sort the tree back in ascending order by source value
+X     * -- which is the order expected by other portions of the program.
+X     */
+X    ct = ct_table[handle].ct_array;
+X    /* Copy ct into a tempo */
+X    ct2 = (TRDATA*)ma_buf;
+X    memcpy((char*)ct2, (char*)ct, size * sizeof(TRDATA));
+X    for (n = size-1; n >= 0; n--) {
+X        U_CHAR v = ct2[n].ct_val;
+X        ct[v].ct_freq = ct2[n].ct_freq;
+X        ct[v].ct_code = ct2[n].ct_code;
+X        ct[v].ct_len = ct2[n].ct_len;
+X        ct[v].ct_val = v;
+X    }
+X
+X    /*
+X     * Determine how many bits will be saved if all the source data is
+X     * encoded using this new set of code strings, as opposed to being
+X     * represented directly in unencoded form.
+X     */
+X    /* # of bits needed for unencoded source values */
+X    n = ct_table[handle].ct_size;
+X    for (code = 1, srclen = 0; code < n; code <<= 1, srclen++) ;
+X    /* # of bits used if all source values encoded via this tree */
+X    for (ct = ct_table[handle].ct_array,
+X             totalbits = 0;
+X         n > 0;
+X         n--, ct++)
+X        totalbits += ct->ct_freq * ct->ct_len;
+X    /* # bits saved by using the tree */
+X    *saved = (totalfreq * srclen) - totalbits;
+X
+X    /* That's all. */
+X    return IM_OK;
+X
+X#ifdef VALIDATE
+badarg:
+X    fprintf (stderr, "\nError in ct_gencodes: bad argument(s)");
+X    return IM_BADARG;
+X#endif /* VALIDATE */
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Split a portion of a code tree into two pieces of approximately equal
+X * total frequency.  This routine calls itself recursively in order to
+X * generate the bit strings for the entire code tree.
+X */
+X
+local
+ImpErr
+ct_split (part, size, freq, prefix, preflen, minbits, maxbits)
+X    TRDATA *part;               /* start of partition */
+X    int     size;               /* # elements in partition */
+X    long    freq;               /* sum of frequencies in partition */
+X    int     prefix;             /* initial code bits for partition */
+X    int     preflen;            /* # bits in prefix */
+X    int     minbits;            /* minimum permissible bit length */
+X    int     maxbits;            /* maximum permissible bit length */
+X{   register TRDATA *ct;
+X    int topmaxbits, botmaxbits, localminbits;
+X    U_INT topmaxvals, botmaxvals;
+X    int topsize, botsize;
+X    long topfreq, botfreq, halffreq, onefreq;
+X    int n, m, leadzeros;
+X    int maxshort, minlong;
+X    ImpErr retcode;
+X    static maxarray[17] =
+X        { 8,8,8,8,12,12,14,14,16,16,16,16,16,16,16,16,16 };
+X
+X#ifdef VALIDATE
+X    if (part == NULL)           goto badarg;
+X    if (size < 1)               goto badarg;
+X    if (freq < 0)               goto badarg;
+X    if (preflen < 0)            goto badarg;
+X    if (preflen > maxbits)      goto badarg;
+X    if (minbits < preflen)      goto badarg;
+X    if (maxbits > 16)           goto badarg;
+X    if (maxbits < minbits)      goto badarg;
+X    /*
+X    putc ('\n', stderr);
+X    for (n = preflen; n > 0; n--) fprintf (stderr, "   ");
+X    fprintf (stderr, "ct_split (sz=%d, pr=%04x[%d], min=%d, max=%d)",
+X             size, prefix, preflen, minbits, maxbits);
+X    */
+X#endif /* VALIDATE */
+X
+X    /*
+X     * If there's only one element in this partition, we simply take
+X     * the "prefix" value as the code string for the single element.
+X     * We reverse the bits of the prefix for more efficient output.
+X     */
+X    if (size == 1)
+X    {   part->ct_code = bi_reverse(prefix, preflen);
+X        part->ct_len  = (U_CHAR)preflen;
+X        return IM_OK;
+X    }
+X
+X    /*
+X     * This partition will be divided into two parts.  The "top" part
+X     * will have a "1" bit appended to its "prefix" bit string; the
+X     * "bottom" part will have a "0" bit appended to its "prefix".
+X     *
+X     * We need to determine the maximum number of source values which
+X     * may be assigned to the two partitions.  The first issue to con-
+X     * sider is that PKUNZIP 1.10's tree-decoding shortcuts require a
+X     * certain number of leading "0" bits in each code string, depending
+X     * on its length.  Code strings of 9-12 bits must have at least 4
+X     * leading zeros; strings of 13 or 14 bits, at least 6 leading
+X     * zeros; and strings of 15 or 16 bits, at least 8 leading zeros.
+X     *
+X     * If the "prefix" is zero, the above limitation is used to restrict
+X     * the maximum size of the top half of the partition.  The bottom
+X     * half does not need to be restricted in this way, since it can be
+X     * extended as far as needed along the path where the "prefix" grows
+X     * in length but remains all zero.
+X     */
+X    botmaxbits = maxbits;
+X    if (prefix != 0) topmaxbits = maxbits;
+X    else
+X    {   for (n = 0, leadzeros = 0x8000;
+X             n < preflen && (prefix & leadzeros) == 0;
+X             n++, leadzeros >>= 1) ;
+X        topmaxbits = maxarray[n];
+X        if (topmaxbits > maxbits) topmaxbits = maxbits;
+X    }
+X    if (topmaxbits < minbits)
+X    {   fprintf (stderr, "\nError in ct_split: ");
+X        fprintf (stderr, "topmaxbits(%d) < minbits(%d)",
+X                 topmaxbits, minbits);
+X        goto oops;
+X    }
+X    if (botmaxbits < minbits)
+X    {   fprintf (stderr, "\nError in ct_split: ");
+X        fprintf (stderr, "botmaxbits(%d) < minbits(%d)",
+X                 botmaxbits, minbits);
+X        goto oops;
+X    }
+X    topmaxvals = 1 << (topmaxbits - preflen - 1);
+X    n = size >> 1; if (topmaxvals > n) topmaxvals = n;
+X    botmaxvals = 1 << (botmaxbits - preflen - 1);
+X    n = size - 1;  if (botmaxvals > n) botmaxvals = n;
+X    if (topmaxvals + botmaxvals < size)
+X    {   fprintf (stderr, "\nError in ct_split: ");
+X        fprintf (stderr, "topmaxvals(%d) + botmaxvals(%d) ",
+X                 topmaxvals, botmaxvals);
+X        fprintf (stderr, "< size(%d)", size);
+X        goto oops;
+X    }
+X
+X    /*
+X     * We now split the current partition into two halves of as close
+X     * to equal frequency as possible.  If the total of all frequencies
+X     * in the partition is zero, split into two halves of equal size.
+X     */
+X    if (freq == 0)
+X    {   topsize = size >> 1;
+X        ct = part + topsize;
+X        topfreq = 0;
+X    }
+X    else
+X    {   halffreq = freq >> 1;           /* half the total frequency */
+X        m = size >> 1;                  /* half the total elements, */
+X                                        /*    rounded down          */
+X        for (topsize = 0, topfreq = 0, ct = part;
+X             topsize < m && topfreq <= halffreq
+X                 && (onefreq = ct->ct_freq) > 0;
+X             topsize++, ct++)
+X            topfreq += onefreq;
+X        if (topsize >= 2)
+X        {   /*
+X             * If moving one element from the top to the bottom parti-
+X             * tion would make the two more closely equal in frequency,
+X             * do it.
+X             */
+X            onefreq = (ct-1)->ct_freq;
+X            if ((topfreq - halffreq) > (halffreq - (topfreq - onefreq)))
+X                ct--, topsize--, topfreq -= onefreq;
+X    }   }
+X    botsize = size - topsize;
+X    botfreq = freq - topfreq;
+X    /* "ct" points to first element in bottom half */
+X
+X    /*
+X     * The above first-cut attempt to split the partition may not work
+X     * for one of two reasons.  First, one or the other half may contain
+X     * too many values (more than "topmaxvals" or "botmaxvals").
+X     */
+X    while (topsize > topmaxvals)
+X    {   onefreq = (--ct)->ct_freq;
+X        topsize--; topfreq -= onefreq;
+X        botsize++; botfreq += onefreq;
+X    }
+X    while (botsize > botmaxvals)
+X    {   onefreq = (ct++)->ct_freq;
+X        topsize++; topfreq += onefreq;
+X        botsize--; botfreq -= onefreq;
+X    }
+X
+X    /*
+X     * Second, the number of bits required to represent the values in
+X     * each half may violate PKZIP's requirement (implicit in the way
+X     * trees are compressed in an imploded file) that no code string in
+X     * the top half may be longer than any code string in the bottom
+X     * half.
+X     */
+X    localminbits = preflen + 1;
+X    if (localminbits < minbits) localminbits = minbits;
+X    for (;;)
+X    {   for (maxshort = preflen + 1, n = 1;
+X             n < botsize;
+X             maxshort++, n <<= 1) ;
+X        if (n > botsize) maxshort--;
+X        if (maxshort < localminbits) maxshort = localminbits;
+X        if (maxshort > topmaxbits) maxshort = topmaxbits;
+X        for (minlong = preflen + 1, n = 1;
+X             n < topsize;
+X             minlong++, n <<= 1) ;
+X        if (minlong <= maxshort) break;
+X        onefreq = (--ct)->ct_freq;
+X        topsize--; topfreq -= onefreq;
+X        botsize++; botfreq += onefreq;
+X    }
+X
+X    /*
+X     * Third, the number of elements in the top half must be enough to
+X     * result in each string having at least "minbits" bits in all.
+X     */
+X    n = 1 << (minbits - preflen - 1);
+X    while (topsize < n)
+X    {   onefreq = (ct++)->ct_freq;
+X        topsize++; topfreq += onefreq;
+X        botsize--; botfreq -= onefreq;
+X    }
+X
+X    /*
+X     * Now that the sizes of the two halves of the partition have been
+X     * finalized, process the top and bottom halves via recursion.
+X     */
+X    retcode = ct_split (part, topsize, topfreq,
+X                        prefix | (1 << (15-preflen)),
+X                        preflen + 1, localminbits, maxshort);
+X    if (retcode != IM_OK) return retcode;
+X    ct = part + topsize;
+X    retcode = ct_split (ct, botsize, botfreq,
+X                        prefix, preflen + 1, (int)ct[-1].ct_len, maxbits);
+X    if (retcode != IM_OK) return retcode;
+X
+X    /* That's all. */
+X    return IM_OK;
+X
+X#ifdef VALIDATE
+badarg:
+X    fprintf (stderr, "\nError in ct_split: bad argument(s)");
+X    putchar ('\n'); fflush (stdout); fflush (stderr);
+X    /* abort (); */
+X    return IM_BADARG;
+X#endif /* VALIDATE */
+X
+oops:
+X#ifdef VALIDATE
+X    putchar ('\n'); fflush (stdout); fflush (stderr);
+X    /* abort (); */
+X#endif /* VALIDATE */
+X    return IM_LOGICERR;
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Sorting function -- descending order by source value frequency.
+X *
+X * This sorting function is used at the start of the code tree con-
+X * struction process, before the bit string values are assigned.
+X * To ensure consistent behaviour on all machines, we use the source
+X * values as secondary sort key, but this is not mandatory.
+X */
+X
+local
+int
+ct_fsort (tr1, tr2)
+X    TRDATA *tr1, *tr2;
+X{   long d;
+X    int v;
+X
+X    d = (long) tr1->ct_freq - (long) tr2->ct_freq;
+X    if (d < 0) return 1;
+X    if (d > 0) return -1;
+X    v = (int) tr1->ct_val - (int) tr2->ct_val;
+X    if (v < 0) return 1;
+X    if (v > 0) return -1;
+X    return 0;
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Sorting function -- ascending order by bit string length; if lengths
+X * are the same, ascending order by source value.
+X *
+X * This sorting function is used after the bit string values have been
+X * assigned.  
+X */
+X
+local
+int
+ct_rsort (cr1, cr2)
+X    RESORT *cr1, *cr2;
+X{   int d;
+X
+X    d = (int) cr1->ct_rlen - (int) cr2->ct_rlen;
+X    if (d > 0) return 1;
+X    if (d < 0) return -1;
+X    d = (int) cr1->ct_rval - (int) cr2->ct_rval;
+X    if (d > 0) return 1;
+X    if (d < 0) return -1;
+X    return 0;
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Allocate the code trees.
+X */
+X
+ImpErr
+ct_init ()
+X{   ImpErr retcode;
+X    int i;
+X
+X#ifdef DEBUG
+X    if (256*sizeof(TRDATA) > MA_BUFSIZE*sizeof(MATCH)) return IM_LOGICERR;
+X#endif /* DEBUG */
+X
+X    retcode = ct_windup ();
+X        if (retcode != IM_OK) return retcode;
+X
+X    ct_litc_num = 0;
+X    ct_lit2_num = 0;
+X    ct_strg_num = 0;
+X
+X    for (i = 255; i >= 0;  i--)
+X        ct_litc_freq[i] = 0;
+X    for (i = 63; i >= 0; i--)
+X        ct_len2_freq[i] = 0, ct_len3_freq[i] = 0,
+X        ct_dst2_freq[i] = 0, ct_dst3_freq[i] = 0;
+X
+X    retcode = ct_alloc (256, &ct_litc_tree);
+X    if (retcode != IM_OK) return retcode;
+X    retcode = ct_alloc  (64, &ct_len2_tree);
+X    if (retcode != IM_OK) return retcode;
+X    retcode = ct_alloc  (64, &ct_len3_tree);
+X    if (retcode != IM_OK) return retcode;
+X    retcode = ct_alloc  (64, &ct_dst2_tree);
+X    if (retcode != IM_OK) return retcode;
+X    retcode = ct_alloc  (64, &ct_dst3_tree);
+X    if (retcode != IM_OK) return retcode;
+X
+X    return IM_OK;
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Tally a "string match" data set.  The tally results will be used to
+X * determine how large the imploded result will be.
+X */
+X
+ImpErr
+ct_tally (ma)
+X         MATCH *ma;             /* match data to write out */
+X{   register int ch;
+X    int dist = ma->ma_dist;
+X
+X    /* Tally up the latest data. */
+X    if (dist == 0) {                 /* literal character */
+X            ct_litc_num++;
+X            ch = ma->l.ma_litc[0];
+X                ct_litc_freq[ch]++;
+X
+X    } else if (dist < 0) {           /* 2-character match */
+X            ct_lit2_num++;
+X            ch = ma->l.ma_litc[0];
+X                ct_litc_freq[ch]++;
+X            ch = ma->l.ma_litc[1];
+X                ct_litc_freq[ch]++;
+X            ch = ((-dist-1) >> fd.fd_nbits) & 0x3f;
+X                ct_dst2_freq[ch]++;
+X            ct_len2_freq[0]++;
+X
+X     } else {                        /* 3-char or longer match */
+X            ct_strg_num++;
+X            ch = ((dist-1) >> fd.fd_nbits) & 0x3f;
+X                ct_dst3_freq[ch]++;
+X         /* We defer the update of ct_dst2_freq and ct_len2_freq until
+X          * ct_mktrees:
+X          *     ct_dst2_freq[ch]++;
+X          * ch = ma->l.ma_length - 2;
+X          *     if (ch > 63) ch = 63;
+X          *     ct_len2_freq[ch]++;
+X          */
+X            ch = ma->l.ma_length - 3;
+X                if (ch > 63) ch = 63;
+X                ct_len3_freq[ch]++;
+X    }
+X
+X    /* That's all. */
+X    return IM_OK;
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Construct all code trees, and then determine how big the imploded
+X * file will be under both "literal tree" and "no literal tree" con-
+X * ditions.  Choose the best option.
+X */
+X
+ImpErr
+ct_mktrees ()
+X{   U_CHAR *c;
+X    ImpErr retcode;
+X    register long sum;
+X    long len2, len3;
+X    int n;
+X
+X    /* ct_tally did not update ct_dst2_freq and ct_len2_freq for matches of
+X     * length > 2, so correct this now.
+X     */
+X    for (n = 62; n >= 0; n--) {
+X        ct_dst2_freq[n] += ct_dst3_freq[n];
+X        ct_len2_freq[n+1] += ct_len3_freq[n];
+X    }
+X    ct_dst2_freq[63] += ct_dst3_freq[63];
+X    ct_len2_freq[63] += ct_len3_freq[63];
+X
+X    /*
+X     * Construct the code trees and see how much space each will save.
+X     *
+X     * It is conceivable that a tree could result in a negative savings
+X     * if its compressed form is sufficiently long.
+X     *
+X     * We need to construct the ZIP-file compressed representation of
+X     * each tree in order to figure out how much space it will take.
+X     * However, we don't save these tree representations now; rather,
+X     * we'll wait until later and reconstruct the representations for
+X     * whichever two (or three) trees we really need for the output.
+X     */
+X#ifdef IMPDEBUG
+X    treename = (char *)NULL;
+X#endif /* IMPDEBUG */
+X
+X    /* literal code tree */
+X    retcode = ct_loadf    (ct_litc_tree,  ct_litc_freq);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_gencodes (ct_litc_tree, 1, 16, &ct_litc_saved);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_ziprep   (ct_litc_tree, &c);
+X        if (retcode != IM_OK) return retcode;
+X    ct_litc_saved -= (int) (c[0]+2) * 8;
+X
+X    /* length code tree (2) */
+X    retcode = ct_loadf    (ct_len2_tree,  ct_len2_freq);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_gencodes (ct_len2_tree, 1, 16, &ct_len2_saved);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_ziprep   (ct_len2_tree, &c);
+X        if (retcode != IM_OK) return retcode;
+X    ct_len2_saved -= (int) (c[0]+2) * 8;
+X
+X    /* length code tree (3) */
+X    retcode = ct_loadf    (ct_len3_tree,  ct_len3_freq);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_gencodes (ct_len3_tree, 1, 16, &ct_len3_saved);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_ziprep   (ct_len3_tree, &c);
+X        if (retcode != IM_OK) return retcode;
+X    ct_len3_saved -= (int) (c[0]+2) * 8;
+X
+X    /* distance code tree (2) */
+X    retcode = ct_loadf    (ct_dst2_tree,  ct_dst2_freq);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_gencodes (ct_dst2_tree, 1,  8, &ct_dst2_saved);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_ziprep   (ct_dst2_tree, &c);
+X        if (retcode != IM_OK) return retcode;
+X    ct_dst2_saved -= (int) (c[0]+2) * 8;
+X
+X    /* distance code tree (3) */
+X    retcode = ct_loadf    (ct_dst3_tree,  ct_dst3_freq);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_gencodes (ct_dst3_tree, 1,  8, &ct_dst3_saved);
+X        if (retcode != IM_OK) return retcode;
+X    retcode = ct_ziprep   (ct_dst3_tree, &c);
+X        if (retcode != IM_OK) return retcode;
+X    ct_dst3_saved -= (int) (c[0]+2) * 8;
+X
+X    /*
+X     * Determine how big the compressed file will be
+X     * with, and without, a literal character tree.
+X     */
+X
+X    /* compressed length (no literal tree) */
+X    sum  = ct_litc_num + ct_lit2_num + ct_strg_num;    /* initial bit */
+X    sum += ct_litc_num * 8;                          /* literal bytes */
+X    sum += (ct_lit2_num+ct_strg_num) * 6 - ct_len2_saved;  /* lengths */
+X    sum += 8 * ct_len2_freq[63];                  /* oversize lengths */
+X    sum += (ct_lit2_num+ct_strg_num) * (fd.fd_nbits+6)
+X            - ct_dst2_saved;                             /* distances */
+X    len2 = (sum+7) / 8;                           /* convert to bytes */
+X
+X    /* compressed length (with literal tree) */
+X    sum  = ct_litc_num + 2*ct_lit2_num + ct_strg_num;  /* initial bit */
+X    sum += (ct_litc_num+2*ct_lit2_num)*8 - ct_litc_saved;/* lit bytes */
+X    sum += ct_strg_num * 6 - ct_len3_saved;                /* lengths */
+X    sum += 8 * ct_len3_freq[63];                  /* oversize lengths */
+X    sum += ct_strg_num * (fd.fd_nbits+6) - ct_dst3_saved;   /* dist's */
+X    len3 = (sum+7) / 8;                           /* convert to bytes */
+X
+X    /*
+X     * PKUNZIP 1.10 requires that the source value 255 in a "literal"
+X     * tree must be represented by a bit string of length >= 10.  The
+X     * literal tree was already adjusted to ensure that the value 255
+X     * was given a bit string of length 10 or greater if possible.  If
+X     * this did not succeed -- which would only happen if the longest
+X     * bit string in the literal tree were of length 8 or 9 -- then the
+X     * literal tree cannot be used.  In such a case, not much would be
+X     * gained by using it anyway, so there's little reason to be upset.
+X     */
+X    if (ct_table[ct_litc_tree].ct_array[255].ct_len < 10)
+X        len3 = len2;
+X
+X    /*
+X     * Choose the method of compression which will use the least space
+X     * for this particular file.  The possibilities are:  use a literal
+X     * character tree; or, don't use a literal character tree.
+X     */
+X    if (len2 <= len3)
+X    {   fd.fd_method = NO_LITERAL_TREE;
+X        fd.fd_clen   = len2;
+X        lit_tree     = -1;
+X        len_tree     = ct_len2_tree;
+X        dst_tree     = ct_dst2_tree;
+X        retcode = ct_free (ct_litc_tree);
+X            if (retcode != IM_OK) return retcode;
+X        retcode = ct_free (ct_dst3_tree);
+X            if (retcode != IM_OK) return retcode;
+X        retcode = ct_free (ct_len3_tree);
+X            if (retcode != IM_OK) return retcode;
+X    }
+X    else
+X    {   fd.fd_method = LITERAL_TREE;
+X        fd.fd_clen   = len3;
+X        lit_tree     = ct_litc_tree;
+X        len_tree     = ct_len3_tree;
+X        dst_tree     = ct_dst3_tree;
+X        retcode = ct_free (ct_dst2_tree);
+X            if (retcode != IM_OK) return retcode;
+X        retcode = ct_free (ct_len2_tree);
+X            if (retcode != IM_OK) return retcode;
+X    }
+X
+X    /* That's all. */
+X    return IM_OK;
+X}
+X
+X
+X/***********************************************************************
+X *
+X * Output the code trees.
+X */
+X
+ImpErr
+ct_wrtrees (outfp)
+X    FILE *outfp;                        /* output file */
+X{   ImpErr retcode;
+X    U_CHAR *c;
+X
+X    /* Output the literal tree, if any. */
+X#ifdef IMPDEBUG
+X    treename = "Literal";
+X#endif /* IMPDEBUG */
+X    if (lit_tree >= 0)
+X    {   retcode = ct_ziprep (lit_tree, &c);
+X            if (retcode != IM_OK) return retcode;
+X        if (zfwrite ((char *) c, (int) (c[0]+2), 1, outfp) != 1)
+X            return IM_IOERR;
+X    }
+X
+X    /* Output the length tree. */
+X#ifdef IMPDEBUG
+X    treename = "Length";
+X#endif /* IMPDEBUG */
+X    retcode = ct_ziprep (len_tree, &c);
+X        if (retcode != IM_OK) return retcode;
+X    if (zfwrite ((char *) c, (int) (c[0]+2), 1, outfp) != 1)
+X        return IM_IOERR;
+X
+X    /* Output the distance tree. */
+X#ifdef IMPDEBUG
+X    treename = "Distance";
+X#endif /* IMPDEBUG */
+X    retcode = ct_ziprep (dst_tree, &c);
+X        if (retcode != IM_OK) return retcode;
+X    if (zfwrite ((char *) c, (int) (c[0]+2), 1, outfp) != 1)
+X        return IM_IOERR;
+X
+X    return IM_OK;
+X}
+X
+X/* Macros for outputting bit string. */
+X
+X#define OUTBITS(value,length) \
+X        {   retcode = bi_rlout ((int) (value), (int) (length)); \
+X                if (retcode != IM_OK) return retcode; \
+X        }
+X#define OUTCODE(value,tree) \
+X        {   ct_lookup (tree, value, bitstring, bitlength); \
+X            retcode = bi_rlout (bitstring, bitlength); \
+X                if (retcode != IM_OK) return retcode; \
+X        }
+X
+X/***********************************************************************
+X *
+X * Output the body of the file in imploded form.
+X */
+ImpErr
+ct_wrdata (outfp)
+X         FILE *outfp;                   /* output (ZIP) file */
+X{   MATCH *ma;
+X    ImpErr retcode;
+X    register int minmatch;
+X    int bitstring, bitlength;
+X    int bitmask = (1 << (fd.fd_nbits+1))-1;
+X    /* Used to select the bottom 6 or 7 bits of a distance, which are
+X     * output literally, plus 1 bit marking a distance
+X     */
+X    int matches;
+X#ifdef  IMPDEBUG
+X    long srcpos;
+X#endif  /* IMPDEBUG */
+X
+X    /* Determine the minimum match length. */
+X    minmatch = (lit_tree >= 0) ? 3 : 2;
+X
+X    /* Prepare the I/O. */
+X    if (tflush (fd.fd_temp) != 0) return IM_IOERR;
+X    trewind (fd.fd_temp);
+X    retcode = bi_init (outfp);
+X        if (retcode != IM_OK) return retcode;
+X
+X#ifdef  IMPDEBUG
+X        srcpos = 0;
+X        fprintf (stderr, "\nImploded output:\n");
+X#endif  /* IMPDEBUG */
+X
+X    /* Read and process data from the temporary file. */
+X    while ((matches =
+X       tread ((char *) ma_buf, sizeof(MATCH), MA_BUFSIZE, fd.fd_temp)) > 0)
+X       for (ma = ma_buf; matches > 0; ma++, matches--)
+X    {
+X        int dist = ma->ma_dist;
+X        int len = 0;
+X
+X#ifdef  IMPDEBUG
+X        fprintf (stderr, "%8ld: ", srcpos);
+X#endif  /* IMPDEBUG */
+X
+X        if (dist < 0) {
+X            dist = -dist, len = 2;
+X        } else if (dist > 0) {
+X            len = ma->l.ma_length;
+X        }
+X
+X        /* Output distance and length if enough characters match. */
+X        if (len >= minmatch)
+X        {   /* "matched string" header bit (0) */
+X#ifdef  IMPDEBUG
+X            fprintf (stderr, "str (dst=%d,len=%d)  ",
+X                     dist, len);
+X            srcpos += len;
+X#endif  /* IMPDEBUG */
+X
+X            /* ouput one zero bit then the distance */
+X            dist--;
+X            OUTBITS ((dist << 1) & bitmask, fd.fd_nbits + 1);
+X            OUTCODE (dist >> fd.fd_nbits, dst_tree);
+X
+X            /* length -- depends on how it compares to maximum */
+X            len -= minmatch;
+X            if (len >= 63)
+X            {   /* big length -- output code for 63, then surplus */
+X                OUTCODE (63, len_tree);
+X                OUTBITS ((len - 63), 8);
+X            }
+X            else
+X            {   /* small length -- output code */
+X                OUTCODE (len, len_tree);
+X        }   }
+X        else if (lit_tree >= 0)
+X        {   /* first or single literal -- header bit (1) plus char */
+X#ifdef  IMPDEBUG
+X            fprintf (stderr, "lit (val=%02x)  ",
+X                     ma->l.ma_litc[0] & 0xff);
+X            srcpos++;
+X#endif  /* IMPDEBUG */
+X            OUTBITS (1, 1);
+X            OUTCODE (ma->l.ma_litc[0], lit_tree);
+X            if (len == 2)
+X            {   /* second literal -- header bit (1) plus char */
+X#ifdef  IMPDEBUG
+X                fprintf (stderr, "\n%8ld: lit (val=%02x)  ",
+X                         srcpos, ma->l.ma_litc[1] & 0xff);
+X                srcpos++;
+X#endif  /* IMPDEBUG */
+X                OUTBITS (1, 1);
+X                OUTCODE (ma->l.ma_litc[1], lit_tree);
+X        }   }
+X        else
+X        {   /* single literal -- header bit (1) plus char */
+X#ifdef  IMPDEBUG
+X            fprintf (stderr, "lit (val=%02x)  ",
+X                     ma->l.ma_litc[0] & 0xff);
+X            srcpos++;
+X#endif  /* IMPDEBUG */
+X            OUTBITS ((ma->l.ma_litc[0] << 1) + 1, 9);
+X        }
+X#ifdef  IMPDEBUG
+X        putc ('\n', stderr);
+X#endif  /* IMPDEBUG */
+X    }
+X
+X    /* Make sure we hit EOF on input without an error. */
+X    if (terror (fd.fd_temp)
+X#ifndef MINIX
+X#ifndef __TURBOC__      /* TurboC 2.0 does not set the EOF flag (?) */
+X        || !teof (fd.fd_temp)
+X#endif /* !__TURBOC__ */
+X#endif /* !MINIX */
+X       )
+X      return IM_IOERR;
+X    retcode = bi_windup ();
+X        if (retcode != IM_OK) return retcode;
+X
+X    /* That's all. */
+X    return IM_OK;
+X}
+X
+X#undef  OUTBITS
+X#undef  OUTCODE
+X
+X
+X/***********************************************************************
+X *
+X * Deallocate all code trees.
+X */
+X
+ImpErr
+ct_windup ()
+X{   int n;
+X    static windup_already_called = 0;
+X    ImpErr retcode;
+X
+X    if (windup_already_called)
+X    {   /* Discard any old code trees. */
+X        for (n = 0; n < MAXTREES; n++)
+X        {   if (ct_table[n].ct_array != NULL)
+X            {   retcode = ct_free (n);
+X                if (retcode != IM_OK) return retcode;
+X    }   }   }
+X    else
+X    {   /* Initialize the list of active code trees. */
+X        for (n = 0; n < MAXTREES; n++)
+X        {   ct_table[n].ct_array = NULL;
+X            ct_table[n].ct_size  = 0;
+X        }
+X        windup_already_called = 1;
+X    }
+X
+X    /* That's all. */
+X    return IM_OK;
+X}
+X
+X
+X/**********************************************************************/
+END_OF_FILE
+if test 45523 -ne `wc -c <'im_ctree.c'`; then
+    echo shar: \"'im_ctree.c'\" unpacked with wrong size!
+fi
+# end of 'im_ctree.c'
+fi
+echo shar: End of archive 7 \(of 7\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 7 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

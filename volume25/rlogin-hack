@@ -1,0 +1,1653 @@
+Newsgroups: comp.sources.unix
+From: gritton@ee.byu.edu (James Gritton)
+Subject: v25i105: Enhanced BSD Rlogin to support environment passing
+Sender: sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: gritton@ee.byu.edu (James Gritton)
+Posting-Number: Volume 25, Issue 105
+Archive-Name: rlogin-hack
+
+After reading the intro to comp.sources.unix, I hope this counts as one of
+those cases where a submittal can be accepted without a man page or makefile.
+
+As mentioned in the README, this is not so much source as a bit of code for
+hackers to apply. The meat of the submission is the diff files, which are (I
+hope) explained in the README adequately for any who would try this out.
+
+As I have only pure BSD sources, this has been test only on pure BSD (4.3 on
+a microvax), but the gist of the diff should be applicable anywhere.
+
+If you think this would fit better in another group, please tell me. I talked
+about this idea in comp.unix.wizards, and got a couple of suggestions to post
+it here. Just please don't relegate me to an alt group.
+
+	gritton@ee.byu.edu (James Gritton)
+
+#!/bin/sh
+#
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+#
+# Wrapped by Jamie Gritton <gritton@ee.byu.edu> on Tue Dec 24 00:00:23 1991
+#
+# This archive contains:
+#	rlogin	
+#
+
+LANG=""; export LANG
+PATH=/bin:/usr/bin:$PATH; export PATH
+
+echo mkdir - rlogin
+mkdir rlogin
+
+echo x - rlogin/login.c
+cat >rlogin/login.c <<'@EOF'
+/*
+ * Copyright (c) 1980 Regents of the University of California.
+ * All rights reserved.  The Berkeley software License Agreement
+ * specifies the terms and conditions for redistribution.
+ */
+
+#ifndef lint
+char copyright[] =
+"@(#) Copyright (c) 1980 Regents of the University of California.\n\
+ All rights reserved.\n";
+#endif not lint
+
+#ifndef lint
+static char sccsid[] = "@(#)login.c	5.15 (Berkeley) 4/12/86";
+#endif not lint
+
+/*
+ * login [ name ]
+ * login -r hostname (for rlogind)
+ * login -h hostname (for telnetd, etc.)
+ */
+
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <sys/file.h>
+
+#include <sgtty.h>
+#include <utmp.h>
+#include <signal.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <lastlog.h>
+#include <errno.h>
+#include <ttyent.h>
+#include <syslog.h>
+#include <grp.h>
+
+#define TTYGRPNAME	"tty"		/* name of group to own ttys */
+#define TTYGID(gid)	tty_gid(gid)	/* gid that owns all ttys */
+
+#define	SCMPN(a, b)	strncmp(a, b, sizeof(a))
+#define	SCPYN(a, b)	strncpy(a, b, sizeof(a))
+
+#define NMAX	sizeof(utmp.ut_name)
+#define HMAX	sizeof(utmp.ut_host)
+
+#define	FALSE	0
+#define	TRUE	-1
+
+#define QUOTAWARN       "/usr/ucb/quota -q"        /* warn user about quotas */
+
+char	nolog[] =	"/etc/nologin";
+char	qlog[]  =	".hushlogin";
+char	maildir[30] =	"/usr/spool/mail/";
+char	lastlog[] =	"/usr/adm/lastlog";
+struct	passwd nouser = {"", "nope", -1, -1, -1, "", "", "", "" };
+struct	sgttyb ttyb;
+struct	utmp utmp;
+char	minusnam[16] = "-";
+char	*envinitstr = 0;
+char	**envinit = &envinitstr;	/* now set by setenv calls */
+int	nextenv = 0;
+/*
+ * This bounds the time given to login.  We initialize it here
+ * so it can be patched on machines where it's too small.
+ */
+int	timeout = 60;
+
+char	term[64];
+
+struct	passwd *pwd;
+char	*strcat(), *rindex(), *index(), *malloc(), *realloc();
+int	timedout();
+char	*ttyname();
+char	*crypt();
+char	*getpass();
+char	*stypeof();
+extern	char **environ;
+extern	int errno;
+
+struct	tchars tc = {
+	CINTR, CQUIT, CSTART, CSTOP, CEOT, CBRK
+};
+struct	ltchars ltc = {
+	CSUSP, CDSUSP, CRPRNT, CFLUSH, CWERASE, CLNEXT
+};
+
+struct winsize win = { 0, 0, 0, 0 };
+
+int	rflag;
+int	usererr = -1;
+char	rusername[NMAX+1], lusername[NMAX+1];
+char	rpassword[NMAX+1];
+char	name[NMAX+1];
+char	*rhost;
+
+main(argc, argv)
+	char *argv[];
+{
+	register char *namep;
+	int pflag = 0, hflag = 0, t, f, c;
+	int invalid, quietlog;
+	FILE *nlfd;
+	char *ttyn, *tty;
+	int ldisc = 0, zero = 0, i;
+	char **envnew;
+
+	signal(SIGALRM, timedout);
+	alarm(timeout);
+	signal(SIGQUIT, SIG_IGN);
+	signal(SIGINT, SIG_IGN);
+	setpriority(PRIO_PROCESS, 0, 0);
+	/*
+	 * -p is used by getty to tell login not to destroy the environment
+	 * -r is used by rlogind to cause the autologin protocol;
+	 * -h is used by other servers to pass the name of the
+	 * remote host to login so that it may be placed in utmp and wtmp
+	 */
+	while (argc > 1) {
+		if (strcmp(argv[1], "-r") == 0) {
+			if (rflag || hflag) {
+				printf("Only one of -r and -h allowed\n");
+				exit(1);
+			}
+			rflag = 1;
+			usererr = doremotelogin(argv[2]);
+			SCPYN(utmp.ut_host, argv[2]);
+			argc -= 2;
+			argv += 2;
+			continue;
+		}
+		if (strcmp(argv[1], "-h") == 0 && getuid() == 0) {
+			if (rflag || hflag) {
+				printf("Only one of -r and -h allowed\n");
+				exit(1);
+			}
+			hflag = 1;
+			SCPYN(utmp.ut_host, argv[2]);
+			argc -= 2;
+			argv += 2;
+			continue;
+		}
+		if (strcmp(argv[1], "-p") == 0) {
+			argc--;
+			argv++;
+			pflag = 1;
+			continue;
+		}
+		break;
+	}
+	ioctl(0, TIOCLSET, &zero);
+	ioctl(0, TIOCNXCL, 0);
+	ioctl(0, FIONBIO, &zero);
+	ioctl(0, FIOASYNC, &zero);
+	ioctl(0, TIOCGETP, &ttyb);
+	/*
+	 * If talking to an rlogin process,
+	 * propagate the terminal type and
+	 * baud rate across the network.
+	 */
+	if (rflag)
+		doremoteterm(term, &ttyb);
+	ttyb.sg_erase = CERASE;
+	ttyb.sg_kill = CKILL;
+	ioctl(0, TIOCSLTC, &ltc);
+	ioctl(0, TIOCSETC, &tc);
+	ioctl(0, TIOCSETP, &ttyb);
+	for (t = getdtablesize(); t > 2; t--)
+		close(t);
+	ttyn = ttyname(0);
+	if (ttyn == (char *)0 || *ttyn == '\0')
+		ttyn = "/dev/tty??";
+	tty = rindex(ttyn, '/');
+	if (tty == NULL)
+		tty = ttyn;
+	else
+		tty++;
+	openlog("login", LOG_ODELAY, LOG_AUTH);
+	t = 0;
+	invalid = FALSE;
+	do {
+		ldisc = 0;
+		ioctl(0, TIOCSETD, &ldisc);
+		SCPYN(utmp.ut_name, "");
+		/*
+		 * Name specified, take it.
+		 */
+		if (argc > 1) {
+			SCPYN(utmp.ut_name, argv[1]);
+			argc = 0;
+		}
+		/*
+		 * If remote login take given name,
+		 * otherwise prompt user for something.
+		 */
+		if (rflag && !invalid)
+			SCPYN(utmp.ut_name, lusername);
+		else
+			getloginname(&utmp);
+		invalid = FALSE;
+		if (!strcmp(pwd->pw_shell, "/bin/csh")) {
+			ldisc = NTTYDISC;
+			ioctl(0, TIOCSETD, &ldisc);
+		}
+		/*
+		 * If no remote login authentication and
+		 * a password exists for this user, prompt
+		 * for one and verify it.
+		 */
+		if (usererr == -1 && *pwd->pw_passwd != '\0') {
+			char *pp;
+
+			setpriority(PRIO_PROCESS, 0, -4);
+			pp = getpass("Password:");
+			namep = crypt(pp, pwd->pw_passwd);
+			setpriority(PRIO_PROCESS, 0, 0);
+			if (strcmp(namep, pwd->pw_passwd))
+				invalid = TRUE;
+		}
+		/*
+		 * If user not super-user, check for logins disabled.
+		 */
+		if (pwd->pw_uid != 0 && (nlfd = fopen(nolog, "r")) > 0) {
+			while ((c = getc(nlfd)) != EOF)
+				putchar(c);
+			fflush(stdout);
+			sleep(5);
+			exit(0);
+		}
+		/*
+		 * If valid so far and root is logging in,
+		 * see if root logins on this terminal are permitted.
+		 */
+		if (!invalid && pwd->pw_uid == 0 && !rootterm(tty)) {
+			if (utmp.ut_host[0])
+				syslog(LOG_CRIT,
+				    "ROOT LOGIN REFUSED ON %s FROM %.*s",
+				    tty, HMAX, utmp.ut_host);
+			else
+				syslog(LOG_CRIT,
+				    "ROOT LOGIN REFUSED ON %s", tty);
+			invalid = TRUE;
+		}
+		if (invalid) {
+			printf("Login incorrect\n");
+			if (++t >= 5) {
+				if (utmp.ut_host[0])
+					syslog(LOG_CRIT,
+					    "REPEATED LOGIN FAILURES ON %s FROM %.*s, %.*s",
+					    tty, HMAX, utmp.ut_host,
+					    NMAX, utmp.ut_name);
+				else
+					syslog(LOG_CRIT,
+					    "REPEATED LOGIN FAILURES ON %s, %.*s",
+						tty, NMAX, utmp.ut_name);
+				ioctl(0, TIOCHPCL, (struct sgttyb *) 0);
+				close(0), close(1), close(2);
+				sleep(10);
+				exit(1);
+			}
+		}
+		if (*pwd->pw_shell == '\0')
+			pwd->pw_shell = "/bin/sh";
+		if (chdir(pwd->pw_dir) < 0 && !invalid ) {
+			if (chdir("/") < 0) {
+				printf("No directory!\n");
+				invalid = TRUE;
+			} else {
+				printf("No directory! %s\n",
+				   "Logging in with home=/");
+				pwd->pw_dir = "/";
+			}
+		}
+		/*
+		 * Remote login invalid must have been because
+		 * of a restriction of some sort, no extra chances.
+		 */
+		if (!usererr && invalid)
+			exit(1);
+	} while (invalid);
+/* committed to login turn off timeout */
+	alarm(0);
+
+	time(&utmp.ut_time);
+	t = ttyslot();
+	if (t > 0 && (f = open("/etc/utmp", O_WRONLY)) >= 0) {
+		lseek(f, (long)(t*sizeof(utmp)), 0);
+		SCPYN(utmp.ut_line, tty);
+		write(f, (char *)&utmp, sizeof(utmp));
+		close(f);
+	}
+	if ((f = open("/usr/adm/wtmp", O_WRONLY|O_APPEND)) >= 0) {
+		write(f, (char *)&utmp, sizeof(utmp));
+		close(f);
+	}
+	quietlog = access(qlog, F_OK) == 0;
+	if ((f = open(lastlog, O_RDWR)) >= 0) {
+		struct lastlog ll;
+
+		lseek(f, (long)pwd->pw_uid * sizeof (struct lastlog), 0);
+		if (read(f, (char *) &ll, sizeof ll) == sizeof ll &&
+		    ll.ll_time != 0 && !quietlog) {
+			printf("Last login: %.*s ",
+			    24-5, (char *)ctime(&ll.ll_time));
+			if (*ll.ll_host != '\0')
+				printf("from %.*s\n",
+				    sizeof (ll.ll_host), ll.ll_host);
+			else
+				printf("on %.*s\n",
+				    sizeof (ll.ll_line), ll.ll_line);
+		}
+		lseek(f, (long)pwd->pw_uid * sizeof (struct lastlog), 0);
+		time(&ll.ll_time);
+		SCPYN(ll.ll_line, tty);
+		SCPYN(ll.ll_host, utmp.ut_host);
+		write(f, (char *) &ll, sizeof ll);
+		close(f);
+	}
+	chown(ttyn, pwd->pw_uid, TTYGID(pwd->pw_gid));
+	if (!hflag && !rflag)					/* XXX */
+		ioctl(0, TIOCSWINSZ, &win);
+	chmod(ttyn, 0620);
+	setgid(pwd->pw_gid);
+	strncpy(name, utmp.ut_name, NMAX);
+	name[NMAX] = '\0';
+	initgroups(name, pwd->pw_gid);
+	setuid(pwd->pw_uid);
+	/* destroy environment unless user has asked to preserve it */
+	if (!pflag)
+		environ = envinit;
+
+	/* set up environment, this time without destruction */
+	/* copy the environment before setenving */
+	i = 0;
+	while (environ[i] != NULL)
+		i++;
+	envnew = (char **) malloc(sizeof (char *) * (i + 1));
+	for (; i >= 0; i--)
+		envnew[i] = environ[i];
+	environ = envnew;
+
+	setenv("HOME=", pwd->pw_dir, 1);
+	setenv("SHELL=", pwd->pw_shell, 1);
+	if (term[0] == '\0')
+		strncpy(term, stypeof(tty), sizeof(term));
+	setenv("TERM=", term, 0);
+	setenv("USER=", pwd->pw_name, 1);
+	setenv("PATH=", ":/usr/ucb:/bin:/usr/bin", 0);
+
+	if ((namep = rindex(pwd->pw_shell, '/')) == NULL)
+		namep = pwd->pw_shell;
+	else
+		namep++;
+	strcat(minusnam, namep);
+	if (tty[sizeof("tty")-1] == 'd')
+		syslog(LOG_INFO, "DIALUP %s, %s", tty, pwd->pw_name);
+	if (pwd->pw_uid == 0)
+		if (utmp.ut_host[0])
+			syslog(LOG_NOTICE, "ROOT LOGIN %s FROM %.*s",
+			    tty, HMAX, utmp.ut_host);
+		else
+			syslog(LOG_NOTICE, "ROOT LOGIN %s", tty);
+	if (!quietlog) {
+		struct stat st;
+
+		showmotd();
+		strcat(maildir, pwd->pw_name);
+		if (stat(maildir, &st) == 0 && st.st_size != 0)
+			printf("You have %smail.\n",
+				(st.st_mtime > st.st_atime) ? "new " : "");
+		system(QUOTAWARN);
+	}
+	signal(SIGALRM, SIG_DFL);
+	signal(SIGQUIT, SIG_DFL);
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTSTP, SIG_IGN);
+	execlp(pwd->pw_shell, minusnam, 0);
+	perror(pwd->pw_shell);
+	printf("No shell\n");
+	exit(0);
+}
+
+getloginname(up)
+	register struct utmp *up;
+{
+	register char *namep;
+	char c;
+
+	while (up->ut_name[0] == '\0') {
+		namep = up->ut_name;
+		printf("login: ");
+		while ((c = getchar()) != '\n') {
+			if (c == ' ')
+				c = '_';
+			if (c == EOF)
+				exit(0);
+			if (namep < up->ut_name+NMAX)
+				*namep++ = c;
+		}
+	}
+	strncpy(lusername, up->ut_name, NMAX);
+	lusername[NMAX] = 0;
+	if ((pwd = getpwnam(lusername)) == NULL)
+		pwd = &nouser;
+}
+
+timedout()
+{
+
+	printf("Login timed out after %d seconds\n", timeout);
+	exit(0);
+}
+
+int	stopmotd;
+catch()
+{
+
+	signal(SIGINT, SIG_IGN);
+	stopmotd++;
+}
+
+rootterm(tty)
+	char *tty;
+{
+	register struct ttyent *t;
+
+	if ((t = getttynam(tty)) != NULL) {
+		if (t->ty_status & TTY_SECURE)
+			return (1);
+	}
+	return (0);
+}
+
+showmotd()
+{
+	FILE *mf;
+	register c;
+
+	signal(SIGINT, catch);
+	if ((mf = fopen("/etc/motd", "r")) != NULL) {
+		while ((c = getc(mf)) != EOF && stopmotd == 0)
+			putchar(c);
+		fclose(mf);
+	}
+	signal(SIGINT, SIG_IGN);
+}
+
+#undef	UNKNOWN
+#define UNKNOWN "su"
+
+char *
+stypeof(ttyid)
+	char *ttyid;
+{
+	register struct ttyent *t;
+
+	if (ttyid == NULL || (t = getttynam(ttyid)) == NULL)
+		return (UNKNOWN);
+	return (t->ty_type);
+}
+
+doremotelogin(host)
+	char *host;
+{
+	char	*cp, *flags;
+	char	envbuf[256];
+
+	getstr(rusername, sizeof (rusername), "remuser");
+	getstr(lusername, sizeof (lusername), "locuser");
+	getstr(term, sizeof(term), "Terminal type");
+	if (getuid()) {
+		pwd = &nouser;
+		return(-1);
+	}
+	pwd = getpwnam(lusername);
+	if (pwd == NULL) {
+		pwd = &nouser;
+		return(-1);
+	}
+	if ((cp = index( term, '/')) && (cp = index( cp + 1, '/'))) {
+		*cp++ = 0;
+		flags = cp;
+		if (cp = index( cp, '/'))
+			*cp = 0;
+		if (index( flags, 'e')) {
+			write( 0, "", 1);
+			for (;;) {
+				getstr( envbuf, sizeof (envbuf), "environment");
+				if (envbuf[0]) {
+					if (nextenv)
+						envinit = (char **)realloc(
+							envinit, sizeof( char
+							**) * (nextenv + 2));
+					else
+						envinit = (char **)malloc(
+							sizeof( char **) * 2);
+					envinit[nextenv]
+						= malloc( strlen( envbuf) + 1);
+					strcpy( envinit[nextenv], envbuf);
+					envinit[++nextenv] = 0;
+				} else {
+					envinit[nextenv] = 0;
+					break;
+				}
+			}
+		}
+	}
+	return(ruserok(host, (pwd->pw_uid == 0), rusername, lusername));
+}
+
+getstr(buf, cnt, err)
+	char *buf;
+	int cnt;
+	char *err;
+{
+	char c;
+
+	do {
+		if (read(0, &c, 1) != 1)
+			exit(1);
+		if (--cnt < 0) {
+			printf("%s too long\r\n", err);
+			exit(1);
+		}
+		*buf++ = c;
+	} while (c != 0);
+}
+
+char	*speeds[] =
+    { "0", "50", "75", "110", "134", "150", "200", "300",
+      "600", "1200", "1800", "2400", "4800", "9600", "19200", "38400" };
+#define	NSPEEDS	(sizeof (speeds) / sizeof (speeds[0]))
+
+doremoteterm(term, tp)
+	char *term;
+	struct sgttyb *tp;
+{
+	register char *cp = index(term, '/'), **cpp;
+	char *speed;
+
+	if (cp) {
+		*cp++ = '\0';
+		speed = cp;
+		for (cpp = speeds; cpp < &speeds[NSPEEDS]; cpp++)
+			if (strcmp(*cpp, speed) == 0) {
+				tp->sg_ispeed = tp->sg_ospeed = cpp-speeds;
+				break;
+			}
+	}
+	tp->sg_flags = ECHO|CRMOD|ANYP|XTABS;
+}
+
+/*
+ * Set the value of var to be arg in the Unix 4.2 BSD environment env.
+ * Var should end with '='.
+ * (bindings are of the form "var=value")
+ * This procedure assumes the memory for the first level of environ
+ * was allocated using malloc.
+ */
+setenv(var, value, clobber)
+	char *var, *value;
+{
+	extern char **environ;
+	int index = 0;
+	int varlen = strlen(var);
+	int vallen = strlen(value);
+
+	for (index = 0; environ[index] != NULL; index++) {
+		if (strncmp(environ[index], var, varlen) == 0) {
+			/* found it */
+			if (!clobber)
+				return;
+			environ[index] = malloc(varlen + vallen + 1);
+			strcpy(environ[index], var);
+			strcat(environ[index], value);
+			return;
+		}
+	}
+	environ = (char **) realloc(environ, sizeof (char *) * (index + 2));
+	if (environ == NULL) {
+		fprintf(stderr, "login: malloc out of memory\n");
+		exit(1);
+	}
+	environ[index] = malloc(varlen + vallen + 1);
+	strcpy(environ[index], var);
+	strcat(environ[index], value);
+	environ[++index] = NULL;
+}
+
+tty_gid(default_gid)
+	int default_gid;
+{
+	struct group *getgrnam(), *gr;
+	int gid = default_gid;
+
+	gr = getgrnam(TTYGRPNAME);
+	if (gr != (struct group *) 0)
+		gid = gr->gr_gid;
+
+	endgrent();
+
+	return (gid);
+}
+@EOF
+
+chmod 644 rlogin/login.c
+
+echo x - rlogin/README
+cat >rlogin/README <<'@EOF'
+#
+#Enhanced BSD Rlogin to support environment passing: For Hackers Only
+#
+
+This isn't actually a program, but a patch to existing BSD code.
+When communicating between an enhanced client and an enhanced server,
+the remote session's environment can be set from the rlogin command line.
+Don't try to use this unless you know what you're doing.
+
+I based this patch on the (somewhat out of date) 1986 BSD code I have
+available. It has been tested using this code on a Microvax running
+4.3BSD. The whole source files are included here for convenience, but should
+not be expected to work on anything but pure 4.3BSD on a Vax.
+
+#
+#The Rlogin Protocol, and My Extension:
+#
+
+If you plan to try this hack, you should be (or become) familiar with
+RFC 1258, which describes the Rlogin protocol.
+
+In the unaldurated protocol, the client starts out by sending four null-
+terminated strings (the first a null string -- just a zero byte):
+
+\0
+local-username\0
+remote-username\0
+terminal-type/speed\0
+
+The server responds with a single zero byte, and then the protocol goes on to
+things that don't concern up here. My change is as follows: the client
+sends the four strings, with another field in the fourth.
+
+\0
+local-username\0
+remote-username\0
+terminal-type/speed/flags\0
+
+The only flag currently defined is 'e', which means the client can send
+environment variables. The server responds with not one but two zero bytes,
+and the client then sends any environment variables as null-terminated
+NAME=VALUE pairs, and then a null string (a zero byte). Then the protocol
+resumes as normal.
+
+The above was what happens with a modified client and a modified server.
+There are two compatablity cases to consider:
+
+New client, old server: The client sends the "term/speed/flags" string.
+The server ignores the third field, and doesn't send a second zero byte.
+When the client gets a nonzero second byte, it skips passing the environment.
+
+Old client, new server: The client doesn't pass the "flags" field in the
+fourth string, so the server sends only one zero byte, what the client expects.
+
+#
+#To Use This Hack:
+#
+
+The rlogin program must be changed on any machine you want this to work from.
+If you use 4.3BSD, you may be able to just compile the rlogin.c provided,
+but for most systems, you will need existing code for rlogin. The diff
+probably won't work automatically for any non-BSD rlogin, but it's short
+and you should be able to insert it by hand into the right place. Recompile
+rlogin and make sure it's setuid. Be good to yourself and save the old
+rlogin program somewhere.
+
+The login program must be changed on any machine you want this to work to.
+Like rlogin above, you will probably end up hand-splicing the diff file.
+This is hackers' work, after all. Note that the rlogind program need not
+be changed.
+
+#
+#Copyright:
+#
+
+The full source files rlogin.c and login.c are (c) 1983 Regents of the
+University of California. My changes are not copyrighted, and come with
+no guarantee at all. As I mentioned, I don't expect the actual source
+files to be used in most cases, only a deep look at the sources and diffs.
+Happy Hacking.
+
+James Gritton
+gritton@ee.byu.edu
+Brigham Young University
+Provo UT USA
+@EOF
+
+chmod 644 rlogin/README
+
+echo x - rlogin/rlogin.c
+cat >rlogin/rlogin.c <<'@EOF'
+/*
+ * Copyright (c) 1983 Regents of the University of California.
+ * All rights reserved.  The Berkeley software License Agreement
+ * specifies the terms and conditions for redistribution.
+ */
+
+#ifndef lint
+char copyright[] =
+"@(#) Copyright (c) 1983 Regents of the University of California.\n\
+ All rights reserved.\n";
+#endif not lint
+
+#ifndef lint
+static char sccsid[] = "@(#)rlogin.c	5.10 (Berkeley) 3/30/86";
+#endif not lint
+
+/*
+ * rlogin - remote login
+ */
+#include <sys/param.h>
+#include <sys/errno.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <sgtty.h>
+#include <errno.h>
+#include <pwd.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <netdb.h>
+
+# ifndef TIOCPKT_WINDOW
+# define TIOCPKT_WINDOW 0x80
+# endif TIOCPKT_WINDOW
+
+char	*index(), *rindex(), *malloc(), *realloc(), *getenv();
+struct	passwd *getpwuid();
+char	*name;
+int	rem;
+char	cmdchar = '~';
+int	eight;
+int	litout;
+char	*speeds[] =
+    { "0", "50", "75", "110", "134", "150", "200", "300",
+      "600", "1200", "1800", "2400", "4800", "9600", "19200", "38400" };
+char	term[256] = "network";
+extern	int errno;
+int	lostpeer();
+int	dosigwinch = 0;
+char	firstchar = 0;
+char	**newenvp;
+int	nextenv = 0;
+#ifndef sigmask
+#define sigmask(m)	(1 << ((m)-1))
+#endif
+#ifdef sun
+struct	ttysize winsize;
+struct winsize {
+	unsigned short ws_row, ws_col;
+	unsigned short ws_xpixel, ws_ypixel;
+};
+#else sun
+struct	winsize winsize;
+#endif sun
+int	sigwinch(), oob();
+
+main(argc, argv)
+	int argc;
+	char **argv;
+{
+	char *host, *cp;
+	struct sgttyb ttyb;
+	struct passwd *pwd;
+	struct servent *sp;
+	int uid, options = 0, oldmask;
+	int on = 1;
+
+	host = rindex(argv[0], '/');
+	if (host)
+		host++;
+	else
+		host = argv[0];
+	argv++, --argc;
+	if (!strcmp(host, "rlogin"))
+		host = *argv++, --argc;
+another:
+	if (argc > 0 && !strcmp(*argv, "-d")) {
+		argv++, argc--;
+		options |= SO_DEBUG;
+		goto another;
+	}
+	if (argc > 0 && !strcmp(*argv, "-l")) {
+		argv++, argc--;
+		if (argc == 0)
+			goto usage;
+		name = *argv++; argc--;
+		goto another;
+	}
+	if (argc > 0 && !strncmp(*argv, "-e", 2)) {
+		cmdchar = argv[0][2];
+		argv++, argc--;
+		goto another;
+	}
+	if (argc > 0 && !strcmp(*argv, "-8")) {
+		eight = 1;
+		argv++, argc--;
+		goto another;
+	}
+	if (argc > 0 && !strcmp(*argv, "-L")) {
+		litout = 1;
+		argv++, argc--;
+		goto another;
+	}
+	if (argc > 1 && !strcmp(*argv, "-D")) {
+		if (nextenv)
+			newenvp = (char **)realloc( newenvp, sizeof( char **)
+				* (nextenv + 2));
+		else
+			newenvp = (char **)malloc( sizeof( char **) * 2);
+		newenvp[nextenv] = malloc( strlen( argv[1]) + 1);
+		strcpy( newenvp[nextenv], argv[1]);
+		newenvp[++nextenv] = 0;
+		argv += 2; argc -= 2;
+		goto another;
+	}
+	if (host == 0)
+		goto usage;
+	if (argc > 0)
+		goto usage;
+	pwd = getpwuid(getuid());
+	if (pwd == 0) {
+		fprintf(stderr, "Who are you?\n");
+		exit(1);
+	}
+	sp = getservbyname("login", "tcp");
+	if (sp == 0) {
+		fprintf(stderr, "rlogin: login/tcp: unknown service\n");
+		exit(2);
+	}
+	cp = getenv("TERM");
+	if (cp)
+		strcpy(term, cp);
+	strcat(term, "/");
+	if (ioctl(0, TIOCGETP, &ttyb) == 0)
+		strcat(term, speeds[ttyb.sg_ospeed]);
+	if (nextenv)
+		strcat(term, "/e");
+#ifdef sun
+	(void) ioctl(0, TIOCGSIZE, &winsize);
+#else sun
+	(void) ioctl(0, TIOCGWINSZ, &winsize);
+#endif sun
+	signal(SIGPIPE, lostpeer);
+	signal(SIGURG, oob);
+	oldmask = sigblock(sigmask(SIGURG));
+        rem = rcmd(&host, sp->s_port, pwd->pw_name,
+	    name ? name : pwd->pw_name, term, 0);
+	if (nextenv && read( rem, &firstchar, 1) == 1 && !firstchar) {
+		while (nextenv--) {
+			write( rem, newenvp[nextenv],
+				strlen( newenvp[nextenv]) + 1);
+			free( newenvp[nextenv]);
+		}
+		write( rem, "", 1);
+	}
+        if (rem < 0)
+                exit(1);
+	if (options & SO_DEBUG &&
+	    setsockopt(rem, SOL_SOCKET, SO_DEBUG, &on, sizeof (on)) < 0)
+		perror("rlogin: setsockopt (SO_DEBUG)");
+	uid = getuid();
+	if (setuid(uid) < 0) {
+		perror("rlogin: setuid");
+		exit(1);
+	}
+	doit(oldmask);
+	/*NOTREACHED*/
+usage:
+	fprintf(stderr,
+	    "usage: rlogin host [ -ex ] [ -l username ] [ -8 ] [ -L ] [ -D NAME=VALUE ] ...\n");
+	exit(1);
+}
+
+#define CRLF "\r\n"
+
+int	child;
+int	catchild();
+int	writeroob();
+
+int	defflags, tabflag;
+int	deflflags;
+char	deferase, defkill;
+struct	tchars deftc;
+struct	ltchars defltc;
+struct	tchars notc =	{ -1, -1, -1, -1, -1, -1 };
+struct	ltchars noltc =	{ -1, -1, -1, -1, -1, -1 };
+
+doit(oldmask)
+{
+	int exit();
+	struct sgttyb sb;
+
+	ioctl(0, TIOCGETP, (char *)&sb);
+	defflags = sb.sg_flags;
+	tabflag = defflags & TBDELAY;
+	defflags &= ECHO | CRMOD;
+	deferase = sb.sg_erase;
+	defkill = sb.sg_kill;
+	ioctl(0, TIOCLGET, (char *)&deflflags);
+	ioctl(0, TIOCGETC, (char *)&deftc);
+	notc.t_startc = deftc.t_startc;
+	notc.t_stopc = deftc.t_stopc;
+	ioctl(0, TIOCGLTC, (char *)&defltc);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGHUP, exit);
+	signal(SIGQUIT, exit);
+	child = fork();
+	if (child == -1) {
+		perror("rlogin: fork");
+		done(1);
+	}
+	if (child == 0) {
+		mode(1);
+		sigsetmask(oldmask);
+		if (reader() == 0) {
+			prf("Connection closed.");
+			exit(0);
+		}
+		sleep(1);
+		prf("\007Connection closed.");
+		exit(3);
+	}
+	signal(SIGURG, writeroob);
+	sigsetmask(oldmask);
+	signal(SIGCHLD, catchild);
+	writer();
+	prf("Closed connection.");
+	done(0);
+}
+
+done(status)
+	int status;
+{
+
+	mode(0);
+	if (child > 0 && kill(child, SIGKILL) >= 0)
+		wait((int *)0);
+	exit(status);
+}
+
+/*
+ * This is called when the reader process gets the out-of-band (urgent)
+ * request to turn on the window-changing protocol.
+ */
+writeroob()
+{
+
+	if (dosigwinch == 0) {
+		sendwindow();
+		signal(SIGWINCH, sigwinch);
+	}
+	dosigwinch = 1;
+}
+
+catchild()
+{
+	union wait status;
+	int pid;
+
+again:
+	pid = wait3(&status, WNOHANG|WUNTRACED, 0);
+	if (pid == 0)
+		return;
+	/*
+	 * if the child (reader) dies, just quit
+	 */
+	if (pid < 0 || pid == child && !WIFSTOPPED(status))
+		done(status.w_termsig | status.w_retcode);
+	goto again;
+}
+
+/*
+ * writer: write to remote: 0 -> line.
+ * ~.	terminate
+ * ~^Z	suspend rlogin process.
+ * ~^Y  suspend rlogin process, but leave reader alone.
+ */
+writer()
+{
+	char c;
+	register n;
+	register bol = 1;               /* beginning of line */
+	register local = 0;
+
+	for (;;) {
+		n = read(0, &c, 1);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR)
+				continue;
+			break;
+		}
+		/*
+		 * If we're at the beginning of the line
+		 * and recognize a command character, then
+		 * we echo locally.  Otherwise, characters
+		 * are echo'd remotely.  If the command
+		 * character is doubled, this acts as a 
+		 * force and local echo is suppressed.
+		 */
+		if (bol) {
+			bol = 0;
+			if (c == cmdchar) {
+				bol = 0;
+				local = 1;
+				continue;
+			}
+		} else if (local) {
+			local = 0;
+			if (c == '.' || c == deftc.t_eofc) {
+				echo(c);
+				break;
+			}
+			if (c == defltc.t_suspc || c == defltc.t_dsuspc) {
+				bol = 1;
+				echo(c);
+				stop(c);
+				continue;
+			}
+			if (c != cmdchar)
+				write(rem, &cmdchar, 1);
+		}
+		if (write(rem, &c, 1) == 0) {
+			prf("line gone");
+			break;
+		}
+		bol = c == defkill || c == deftc.t_eofc ||
+		    c == deftc.t_intrc || c == defltc.t_suspc ||
+		    c == '\r' || c == '\n';
+	}
+}
+
+echo(c)
+register char c;
+{
+	char buf[8];
+	register char *p = buf;
+
+	c &= 0177;
+	*p++ = cmdchar;
+	if (c < ' ') {
+		*p++ = '^';
+		*p++ = c + '@';
+	} else if (c == 0177) {
+		*p++ = '^';
+		*p++ = '?';
+	} else
+		*p++ = c;
+	*p++ = '\r';
+	*p++ = '\n';
+	write(1, buf, p - buf);
+}
+
+stop(cmdc)
+	char cmdc;
+{
+	mode(0);
+	signal(SIGCHLD, SIG_IGN);
+	kill(cmdc == defltc.t_suspc ? 0 : getpid(), SIGTSTP);
+	signal(SIGCHLD, catchild);
+	mode(1);
+	sigwinch();			/* check for size changes */
+}
+
+#ifdef sun
+sigwinch()
+{
+	struct ttysize ws;
+
+	if (dosigwinch && ioctl(0, TIOCGSIZE, &ws) == 0 &&
+	    bcmp(&ws, &winsize, sizeof (ws))) {
+		winsize = ws;
+		sendwindow();
+	}
+}
+
+#else sun
+sigwinch()
+{
+	struct winsize ws;
+
+	if (dosigwinch && ioctl(0, TIOCGWINSZ, &ws) == 0 &&
+	    bcmp(&ws, &winsize, sizeof (ws))) {
+		winsize = ws;
+		sendwindow();
+	}
+}
+#endif
+
+/*
+ * Send the window size to the server via the magic escape
+ */
+sendwindow()
+{
+	char obuf[4 + sizeof (struct winsize)];
+	struct winsize *wp = (struct winsize *)(obuf+4);
+
+	obuf[0] = 0377;
+	obuf[1] = 0377;
+	obuf[2] = 's';
+	obuf[3] = 's';
+#ifdef sun
+	wp->ws_row = htons(winsize.ts_lines);
+	wp->ws_col = htons(winsize.ts_cols);
+	wp->ws_xpixel = 0;
+	wp->ws_ypixel = 0;
+#else sun
+	wp->ws_row = htons(winsize.ws_row);
+	wp->ws_col = htons(winsize.ws_col);
+	wp->ws_xpixel = htons(winsize.ws_xpixel);
+	wp->ws_ypixel = htons(winsize.ws_ypixel);
+#endif sun
+	(void) write(rem, obuf, sizeof(obuf));
+}
+
+/*
+ * reader: read from remote: line -> 1
+ */
+#define	READING	1
+#define	WRITING	2
+
+char	rcvbuf[8 * 1024];
+int	rcvcnt;
+int	rcvstate;
+int	ppid;
+jmp_buf	rcvtop;
+
+oob()
+{
+	int out = FWRITE, atmark, n;
+	int rcvd = 0;
+	char waste[BUFSIZ], mark;
+	struct sgttyb sb;
+
+	while (recv(rem, &mark, 1, MSG_OOB) < 0)
+		switch (errno) {
+		
+		case EWOULDBLOCK:
+			/*
+			 * Urgent data not here yet.
+			 * It may not be possible to send it yet
+			 * if we are blocked for output
+			 * and our input buffer is full.
+			 */
+			if (rcvcnt < sizeof(rcvbuf)) {
+				n = read(rem, rcvbuf + rcvcnt,
+					sizeof(rcvbuf) - rcvcnt);
+				if (n <= 0)
+					return;
+				rcvd += n;
+			} else {
+				n = read(rem, waste, sizeof(waste));
+				if (n <= 0)
+					return;
+			}
+			continue;
+				
+		default:
+			return;
+	}
+	if (mark & TIOCPKT_WINDOW) {
+		/*
+		 * Let server know about window size changes
+		 */
+		kill(ppid, SIGURG);
+	}
+	if (!eight && (mark & TIOCPKT_NOSTOP)) {
+		ioctl(0, TIOCGETP, (char *)&sb);
+		sb.sg_flags &= ~CBREAK;
+		sb.sg_flags |= RAW;
+		ioctl(0, TIOCSETN, (char *)&sb);
+		notc.t_stopc = -1;
+		notc.t_startc = -1;
+		ioctl(0, TIOCSETC, (char *)&notc);
+	}
+	if (!eight && (mark & TIOCPKT_DOSTOP)) {
+		ioctl(0, TIOCGETP, (char *)&sb);
+		sb.sg_flags &= ~RAW;
+		sb.sg_flags |= CBREAK;
+		ioctl(0, TIOCSETN, (char *)&sb);
+		notc.t_stopc = deftc.t_stopc;
+		notc.t_startc = deftc.t_startc;
+		ioctl(0, TIOCSETC, (char *)&notc);
+	}
+	if (mark & TIOCPKT_FLUSHWRITE) {
+		ioctl(1, TIOCFLUSH, (char *)&out);
+		for (;;) {
+			if (ioctl(rem, SIOCATMARK, &atmark) < 0) {
+				perror("ioctl");
+				break;
+			}
+			if (atmark)
+				break;
+			n = read(rem, waste, sizeof (waste));
+			if (n <= 0)
+				break;
+		}
+		/*
+		 * Don't want any pending data to be output,
+		 * so clear the recv buffer.
+		 * If we were hanging on a write when interrupted,
+		 * don't want it to restart.  If we were reading,
+		 * restart anyway.
+		 */
+		rcvcnt = 0;
+		longjmp(rcvtop, 1);
+	}
+	/*
+	 * If we filled the receive buffer while a read was pending,
+	 * longjmp to the top to restart appropriately.  Don't abort
+	 * a pending write, however, or we won't know how much was written.
+	 */
+	if (rcvd && rcvstate == READING)
+		longjmp(rcvtop, 1);
+}
+
+/*
+ * reader: read from remote: line -> 1
+ */
+reader()
+{
+#if !defined(BSD) || BSD < 43
+	int pid = -getpid();
+#else
+	int pid = getpid();
+#endif
+	int n, remaining;
+	char *bufp = rcvbuf;
+
+	signal(SIGTTOU, SIG_IGN);
+	fcntl(rem, F_SETOWN, pid);
+	ppid = getppid();
+	(void) setjmp(rcvtop);
+	for (;;) {
+		while ((remaining = rcvcnt - (bufp - rcvbuf)) > 0) {
+			rcvstate = WRITING;
+			n = write(1, bufp, remaining);
+			if (n < 0) {
+				if (errno != EINTR)
+					return (-1);
+				continue;
+			}
+			bufp += n;
+		}
+		bufp = rcvbuf;
+		rcvcnt = 0;
+		rcvstate = READING;
+		if (firstchar) {
+			rcvcnt = 1;
+			*rcvbuf = firstchar;
+			firstchar = 0;
+		} else {
+			rcvcnt = read(rem, rcvbuf, sizeof (rcvbuf));
+			if (rcvcnt == 0)
+				return (0);
+			if (rcvcnt < 0) {
+				if (errno == EINTR)
+					continue;
+				perror("read");
+				return (-1);
+			}
+		}
+	}
+}
+
+mode(f)
+{
+	struct tchars *tc;
+	struct ltchars *ltc;
+	struct sgttyb sb;
+	int	lflags;
+
+	ioctl(0, TIOCGETP, (char *)&sb);
+	ioctl(0, TIOCLGET, (char *)&lflags);
+	switch (f) {
+
+	case 0:
+		sb.sg_flags &= ~(CBREAK|RAW|TBDELAY);
+		sb.sg_flags |= defflags|tabflag;
+		tc = &deftc;
+		ltc = &defltc;
+		sb.sg_kill = defkill;
+		sb.sg_erase = deferase;
+		lflags = deflflags;
+		break;
+
+	case 1:
+		sb.sg_flags |= (eight ? RAW : CBREAK);
+		sb.sg_flags &= ~defflags;
+		/* preserve tab delays, but turn off XTABS */
+		if ((sb.sg_flags & TBDELAY) == XTABS)
+			sb.sg_flags &= ~TBDELAY;
+		tc = &notc;
+		ltc = &noltc;
+		sb.sg_kill = sb.sg_erase = -1;
+		if (litout)
+			lflags |= LLITOUT;
+		break;
+
+	default:
+		return;
+	}
+	ioctl(0, TIOCSLTC, (char *)ltc);
+	ioctl(0, TIOCSETC, (char *)tc);
+	ioctl(0, TIOCSETN, (char *)&sb);
+	ioctl(0, TIOCLSET, (char *)&lflags);
+}
+
+/*VARARGS*/
+prf(f, a1, a2, a3, a4, a5)
+	char *f;
+{
+	fprintf(stderr, f, a1, a2, a3, a4, a5);
+	fprintf(stderr, CRLF);
+}
+
+lostpeer()
+{
+	signal(SIGPIPE, SIG_IGN);
+	prf("\007Connection closed.");
+	done(1);
+}
+
+@EOF
+
+chmod 644 rlogin/rlogin.c
+
+echo x - rlogin/login.diff
+cat >rlogin/login.diff <<'@EOF'
+*** login.c.orig	Mon Dec 23 22:48:56 1991
+--- login.c	Mon Dec 23 22:53:17 1991
+***************
+*** 59,65 ****
+  struct	sgttyb ttyb;
+  struct	utmp utmp;
+  char	minusnam[16] = "-";
+! char	*envinit[] = { 0 };		/* now set by setenv calls */
+  /*
+   * This bounds the time given to login.  We initialize it here
+   * so it can be patched on machines where it's too small.
+--- 59,67 ----
+  struct	sgttyb ttyb;
+  struct	utmp utmp;
+  char	minusnam[16] = "-";
+! char	*envinitstr = 0;
+! char	**envinit = &envinitstr;	/* now set by setenv calls */
+! int	nextenv = 0;
+  /*
+   * This bounds the time given to login.  We initialize it here
+   * so it can be patched on machines where it's too small.
+***************
+*** 462,467 ****
+--- 464,472 ----
+  doremotelogin(host)
+  	char *host;
+  {
++ 	char	*cp, *flags;
++ 	char	envbuf[256];
++ 
+  	getstr(rusername, sizeof (rusername), "remuser");
+  	getstr(lusername, sizeof (lusername), "locuser");
+  	getstr(term, sizeof(term), "Terminal type");
+***************
+*** 474,479 ****
+--- 479,512 ----
+  		pwd = &nouser;
+  		return(-1);
+  	}
++ 	if ((cp = index( term, '/')) && (cp = index( cp + 1, '/'))) {
++ 		*cp++ = 0;
++ 		flags = cp;
++ 		if (cp = index( cp, '/'))
++ 			*cp = 0;
++ 		if (index( flags, 'e')) {
++ 			write( 0, "", 1);
++ 			for (;;) {
++ 				getstr( envbuf, sizeof (envbuf), "environment");
++ 				if (envbuf[0]) {
++ 					if (nextenv)
++ 						envinit = (char **)realloc(
++ 							envinit, sizeof( char
++ 							**) * (nextenv + 2));
++ 					else
++ 						envinit = (char **)malloc(
++ 							sizeof( char **) * 2);
++ 					envinit[nextenv]
++ 						= malloc( strlen( envbuf) + 1);
++ 					strcpy( envinit[nextenv], envbuf);
++ 					envinit[++nextenv] = 0;
++ 				} else {
++ 					envinit[nextenv] = 0;
++ 					break;
++ 				}
++ 			}
++ 		}
++ 	}
+  	return(ruserok(host, (pwd->pw_uid == 0), rusername, lusername));
+  }
+  
+***************
+*** 510,518 ****
+  	if (cp) {
+  		*cp++ = '\0';
+  		speed = cp;
+- 		cp = index(speed, '/');
+- 		if (cp)
+- 			*cp++ = '\0';
+  		for (cpp = speeds; cpp < &speeds[NSPEEDS]; cpp++)
+  			if (strcmp(*cpp, speed) == 0) {
+  				tp->sg_ispeed = tp->sg_ospeed = cpp-speeds;
+--- 543,548 ----
+@EOF
+
+chmod 644 rlogin/login.diff
+
+echo x - rlogin/rlogin.diff
+cat >rlogin/rlogin.diff <<'@EOF'
+*** rlogin.c.orig	Mon Dec 23 22:49:12 1991
+--- rlogin.c	Mon Dec 23 23:06:36 1991
+***************
+*** 37,43 ****
+  # define TIOCPKT_WINDOW 0x80
+  # endif TIOCPKT_WINDOW
+  
+! char	*index(), *rindex(), *malloc(), *getenv();
+  struct	passwd *getpwuid();
+  char	*name;
+  int	rem;
+--- 37,43 ----
+  # define TIOCPKT_WINDOW 0x80
+  # endif TIOCPKT_WINDOW
+  
+! char	*index(), *rindex(), *malloc(), *realloc(), *getenv();
+  struct	passwd *getpwuid();
+  char	*name;
+  int	rem;
+***************
+*** 51,56 ****
+--- 51,59 ----
+  extern	int errno;
+  int	lostpeer();
+  int	dosigwinch = 0;
++ char	firstchar = 0;
++ char	**newenvp;
++ int	nextenv = 0;
+  #ifndef sigmask
+  #define sigmask(m)	(1 << ((m)-1))
+  #endif
+***************
+*** 112,117 ****
+--- 115,132 ----
+  		argv++, argc--;
+  		goto another;
+  	}
++ 	if (argc > 1 && !strcmp(*argv, "-D")) {
++ 		if (nextenv)
++ 			newenvp = (char **)realloc( newenvp, sizeof( char **)
++ 				* (nextenv + 2));
++ 		else
++ 			newenvp = (char **)malloc( sizeof( char **) * 2);
++ 		newenvp[nextenv] = malloc( strlen( argv[1]) + 1);
++ 		strcpy( newenvp[nextenv], argv[1]);
++ 		newenvp[++nextenv] = 0;
++ 		argv += 2; argc -= 2;
++ 		goto another;
++ 	}
+  	if (host == 0)
+  		goto usage;
+  	if (argc > 0)
+***************
+*** 129,138 ****
+  	cp = getenv("TERM");
+  	if (cp)
+  		strcpy(term, cp);
+! 	if (ioctl(0, TIOCGETP, &ttyb) == 0) {
+! 		strcat(term, "/");
+  		strcat(term, speeds[ttyb.sg_ospeed]);
+! 	}
+  #ifdef sun
+  	(void) ioctl(0, TIOCGSIZE, &winsize);
+  #else sun
+--- 144,154 ----
+  	cp = getenv("TERM");
+  	if (cp)
+  		strcpy(term, cp);
+! 	strcat(term, "/");
+! 	if (ioctl(0, TIOCGETP, &ttyb) == 0)
+  		strcat(term, speeds[ttyb.sg_ospeed]);
+! 	if (nextenv)
+! 		strcat(term, "/e");
+  #ifdef sun
+  	(void) ioctl(0, TIOCGSIZE, &winsize);
+  #else sun
+***************
+*** 143,148 ****
+--- 159,172 ----
+  	oldmask = sigblock(sigmask(SIGURG));
+          rem = rcmd(&host, sp->s_port, pwd->pw_name,
+  	    name ? name : pwd->pw_name, term, 0);
++ 	if (nextenv && read( rem, &firstchar, 1) == 1 && !firstchar) {
++ 		while (nextenv--) {
++ 			write( rem, newenvp[nextenv],
++ 				strlen( newenvp[nextenv]) + 1);
++ 			free( newenvp[nextenv]);
++ 		}
++ 		write( rem, "", 1);
++ 	}
+          if (rem < 0)
+                  exit(1);
+  	if (options & SO_DEBUG &&
+***************
+*** 157,163 ****
+  	/*NOTREACHED*/
+  usage:
+  	fprintf(stderr,
+! 	    "usage: rlogin host [ -ex ] [ -l username ] [ -8 ] [ -L ]\n");
+  	exit(1);
+  }
+  
+--- 181,187 ----
+  	/*NOTREACHED*/
+  usage:
+  	fprintf(stderr,
+! 	    "usage: rlogin host [ -ex ] [ -l username ] [ -8 ] [ -L ] [ -D NAME=VALUE ] ...\n");
+  	exit(1);
+  }
+  
+***************
+*** 534,547 ****
+  		bufp = rcvbuf;
+  		rcvcnt = 0;
+  		rcvstate = READING;
+! 		rcvcnt = read(rem, rcvbuf, sizeof (rcvbuf));
+! 		if (rcvcnt == 0)
+! 			return (0);
+! 		if (rcvcnt < 0) {
+! 			if (errno == EINTR)
+! 				continue;
+! 			perror("read");
+! 			return (-1);
+  		}
+  	}
+  }
+--- 558,577 ----
+  		bufp = rcvbuf;
+  		rcvcnt = 0;
+  		rcvstate = READING;
+! 		if (firstchar) {
+! 			rcvcnt = 1;
+! 			*rcvbuf = firstchar;
+! 			firstchar = 0;
+! 		} else {
+! 			rcvcnt = read(rem, rcvbuf, sizeof (rcvbuf));
+! 			if (rcvcnt == 0)
+! 				return (0);
+! 			if (rcvcnt < 0) {
+! 				if (errno == EINTR)
+! 					continue;
+! 				perror("read");
+! 				return (-1);
+! 			}
+  		}
+  	}
+  }
+@EOF
+
+chmod 644 rlogin/rlogin.diff
+
+echo x - rlogin/README.submit
+cat >rlogin/README.submit <<'@EOF'
+After reading the intro to comp.sources.unix, I hope this counts as one of
+those cases where a submittal can be accepted without a man page or makefile.
+
+As mentioned in the README, this is not so much source as a bit of code for
+hackers to apply. The meat of the submission is the diff files, which are
+(I hope) explained in the README adequately for any who would try this out.
+
+As I have only pure BSD sources, this has been test only on pure BSD (4.3
+on a microvax), but the gist of the diff should be applicable anywhere.
+
+If you think this would fit better in another group, please tell me. I talked
+about this idea in comp.unix.wizards, and got a couple of suggestions to post
+it here. Just please don't relegate me to an alt group.
+
+James Gritton
+gritton@ee.byu.edu
+@EOF
+
+chmod 644 rlogin/README.submit
+
+chmod 755 rlogin
+
+exit 0

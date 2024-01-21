@@ -1,0 +1,499 @@
+Subject:  v11i050:  SystemV version of syslog
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rs@uunet.UU.NET
+
+Submitted-by: Johan Vromans <mcvax!mh.nl!jv>
+Posting-number: Volume 11, Issue 50
+Archive-name: syslog.sysv
+
+[  I understand my "younger brother" Brandon is working on a complete
+   4.3BSD-compatible version that uses named pipes.  Keep up the great
+   work, folks:  maybe we can get this as part of the Posvidix or
+   something.  --r$  ]
+
+This is a more realistic syslog development version. It is designed for
+System V with IPC (it uses message queues). I linked it to my sendmail for
+debugging purposes.
+It is not full-blown (it does not take a configuration file) but has proven
+to be very usefull.
+
+One special remark: because the logfile is default written on the /tmp
+filesystem, and our /tmp filesystems are cleaned up daily, an alarm timer is
+used to write a timestamp record 24 hours after the last activity to
+prevent the logfile from being removed due to lack of access.
+
+--
+Johan Vromans                              | jv@mh.nl via European backbone
+Multihouse N.V., Gouda, the Netherlands    | uucp: ..{?????!}mcvax!mh.nl!jv
+"It is better to light a candle than to curse the darkness"
+
+-------------------------------- cut here --------------------------------
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create:
+#	makefile
+#	syslog.c
+#	sendlog.c
+# This archive created: Thu Sep  3 09:35:37 1987
+export PATH; PATH=/bin:/usr/bin:$PATH
+echo shar: "extracting 'makefile'" '(419 characters)'
+if test -f 'makefile'
+then
+	echo shar: "will not over-write existing file 'makefile'"
+else
+cat << \SHAR_EOF > 'makefile'
+
+CFLAGS	= -O
+syslog:	syslog.c
+	$(CC) $(CFLAGS) -o syslog syslog.c
+
+libsyslog.a:	syslog.c
+	$(CC) $(CFLAGS) -DLIB_SYSLOG -c syslog.c
+	ar r libsyslog.a syslog.o
+
+sendlog:	sendlog.c libsyslog.a
+	$(CC) $(CFLAGS) -o sendlog sendlog.c libsyslog.a
+
+install:	syslog libsyslog.a
+	cp syslog /etc/syslog
+	chmod 0555 /etc/syslog
+	cp libsyslog.a /usr/lib/libsyslog.a
+	chmod 0444 /usr/lib/libsyslog.a
+
+all:	syslog sendlog libsyslog.a
+SHAR_EOF
+if test 419 -ne "`wc -c < 'makefile'`"
+then
+	echo shar: "error transmitting 'makefile'" '(should have been 419 characters)'
+fi
+fi
+echo shar: "extracting 'syslog.c'" '(7709 characters)'
+if test -f 'syslog.c'
+then
+	echo shar: "will not over-write existing file 'syslog.c'"
+else
+cat << \SHAR_EOF > 'syslog.c'
+#ifdef LIB_SYSLOG
+static char SCCS_ID[] = "@(#)@ syslog	1.8 system logger";
+#else
+static char SCCS_ID[] = "@(#)@ syslog	1.8 syslog.o";
+#endif
+static char CPYRGHT[] = "@(#)@ (c) Multihouse Group Support";
+/*
+ * usage: /etc/syslog [ logfilename ]
+ *
+ *	default logfilename: /tmp/syslog.log
+ *
+ * use	"kill -1  pid"	to release and re-open the logfile
+ *	"kill -15 pid"	to exit the program and remove the message queue
+ *
+ * Reasons to terminate:
+ *
+ *  0:	normal (catched a SIGTERM)
+ *  1:	could not reopen logfile after SIGHUP
+ *  2:	error during message recveive
+ *  3:	catched another signal
+ *
+ * define LIB_SYSLOG to obtain a library of access routines
+ */
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+
+#define TRUE	1
+#define FALSE	0
+#define EOS	'\0'
+#define SIG_ERR	((int (*)())-1)
+
+static int msgkey = -1;
+static int msgid = -1;
+static char *msgnam = "/etc/syslog";	/* used for ftok! */
+
+#define SYSLOG_MAGIC	0xfeff
+#define MSG_SIZE	512
+
+static struct {
+    long type;			/* must be SYSLOG_MAGIC */
+    long tm;			/* timestamp */
+    unsigned char class;	/* message class */
+    unsigned char length;	/* length of msg.text */
+    short pid;			/* pid of sending process */
+    short uid;			/* uid of sending process */
+    char text[MSG_SIZE];	/* text of the message */
+  } msg;
+
+#ifndef LIB_SYSLOG
+
+static struct {
+    long type;			/* must be not SYSLOG_MAGIC */
+    char text[MSG_SIZE];
+  } oldmsg;
+
+static char *lognam = "/tmp/syslog.log";
+static FILE *logfile = NULL;
+
+#define MAXERRCNT	10	/* max number of conseq. recv errors */
+
+static char *msgclass[] = {
+	"ALERT",
+	"SALERT",
+	"EMERG",
+	"ERROR",
+	"CRIT",
+	"WARNING",
+	"NOTICE",
+	"INFO",
+	"DEBUG"
+};
+
+/* signal catchers */
+
+static int hup = FALSE;
+static int term = FALSE;
+static int timedout = FALSE;
+static int delay = 24 * 60 * 60;
+
+int timeout ()
+{
+    timedout = TRUE;
+    (void) signal (SIGALRM, timeout);
+}
+
+int sighup ()
+{
+    hup = TRUE;
+    (void) signal (SIGHUP, sighup);
+}
+
+int sigterm ()
+{
+    term = TRUE;
+    (void) signal (SIGTERM, sigterm);
+}
+
+int sigcatch ()
+{
+    terminate (3);
+}
+
+terminate (why)
+int why;
+{
+    (void) msgctl (msgid, IPC_RMID, ((struct msqid_ds *) NULL));
+    if (logfile != NULL) {
+	if (why == 0 && term)
+	    sprintf (msg.text, "normal termination (caught SIGTERM)");
+	else
+	    sprintf (msg.text, "terminated reason=%d", why);
+	putlog (TRUE);
+    }
+    fclose (logfile);
+    exit (why);
+}
+
+catchit (sig)
+int sig;
+{
+    int (*sg)();
+    sg = signal (sig, sigcatch);
+    if (sg != SIG_DFL && sg != SIG_ERR)
+	signal (sig, sg);
+}
+
+main (argc, argv)
+int argc;
+char *argv[];
+{
+    char *cp;
+    int errcnt = 0;
+
+    msgkey = ftok (msgnam, 0);
+    if (msgkey < 0) {
+	perror ("ftok");
+	exit (2);
+    }
+
+    msgid = msgget (msgkey, IPC_CREAT | IPC_EXCL | 0722);
+    while (msgid < 0) {
+	if (errno = EEXIST) {
+	    fprintf (stderr, "syslog: warning - queue already exists\n");
+	    msgid = msgget (msgkey, IPC_CREAT | 0722);
+	}
+	else {
+	    perror ("msgget");
+	    exit (2);
+	}
+    }
+
+    if (argc > 1)
+	lognam = *++argv;
+
+    /* open logfile with correct protection */
+    umask (022);
+    logfile = fopen (lognam, "a");
+    if (logfile == NULL) {
+	perror ("open logfile");
+	exit (2);
+    }
+
+    /* make sure no other logger is active */
+    if (lockf (fileno (logfile), F_TEST, 0l) < 0) {
+	perror ("syslog: cannot lock logfile");
+	exit (2);
+    }
+
+#ifndef DEBUG
+    /* detach */
+    if (fork ())
+	exit (0);
+
+    setpgrp ();			/* forget where we came from */
+
+    /* re-claim the logfile (we lost the lock because we are a fork) */
+    if (lockf (fileno (logfile), F_TLOCK, 0l) < 0) {
+	perror ("syslog: logfile lock failed");
+	exit (2);
+    }
+#endif
+
+    /* catch SIGHUP and SIGTERM */
+    (void) signal (SIGTERM, sigterm);
+    (void) signal (SIGHUP, sighup);
+
+    /* ignore SIGINT and SIGQUIT */
+    (void) signal (SIGINT, SIG_IGN);
+    (void) signal (SIGQUIT, SIG_IGN);
+
+    /* set alarm */
+    (void) signal (SIGALRM, timeout);
+
+    strcpy (msg.text, "started");
+    putlog (TRUE);
+
+    for (;;) {
+	int res = msgrcv (msgid, &msg, MSG_SIZE, 0, 0 & MSG_NOERROR);
+	if (res >= 0) {
+	    if (msg.type != SYSLOG_MAGIC) {
+		memcpy (&oldmsg, &msg, sizeof (oldmsg));
+		(void) time (&msg.tm);
+		msg.class = oldmsg.type;
+		msg.length = strlen (oldmsg.text);
+		msg.type = SYSLOG_MAGIC;
+		msg.pid = msg.uid = -1;
+		strcpy (msg.text, oldmsg.text);
+	    }
+	    putlog (FALSE);
+	    errcnt = 0;
+	}
+	else {
+	    /* message receive error */
+	    if (errno == EINTR) {
+		/* receive was interrupted */
+		if (hup) {
+		    /* catched SIGHUP => release logfile */
+		    strcpy (msg.text, "logfile released (caught SIGHUP)");
+		    putlog (TRUE);
+		    fclose (logfile);
+		    logfile = fopen (lognam, "a");
+		    if (logfile == NULL) {
+			perror ("reopen logfile");
+			terminate (1);
+		    }
+		    strcpy (msg.text, "logfile reopened after SIGHUP");
+		    putlog (TRUE);
+		    hup = FALSE;
+		}
+		if (term) {
+		    /* catched SIGTERM => exit receive loop */
+		    break;
+		}
+		if (timedout) {
+		    strcpy (msg.text, "timestamp");
+		    putlog (TRUE);
+		    timedout = FALSE;
+		}
+		/* otherwise, retry */
+		errcnt = 0;
+		continue;
+	    }
+	    else {
+		/* other message receive error */
+		sprintf (msg.text, "msgrcv error %d", errno);
+		putlog (TRUE);
+		if (errcnt++ > MAXERRCNT)
+		    terminate (2);
+	    }
+	}
+    }
+
+    /* come here to exit the program */
+    terminate (0);
+}
+
+putlog (internal)
+int internal;
+{
+    long time();
+    char *ctime();
+    long now = (internal) ? time (&now) : msg.tm;
+    register char *date = ctime (&now);
+
+    if (internal) {
+	msg.pid = getpid ();
+	msg.uid = getuid ();
+	msg.length = strlen (msg.text);
+    }
+
+    fprintf (logfile, "%.2s-%.3s-%.2s %.8s", date+8, date+4, date+22, date+11);
+
+    if (msg.pid >= 0)
+	fprintf (logfile, "%6d ", msg.pid);
+    else
+	fprintf (logfile, "       ");
+
+    if (msg.uid >= 0)
+	fprintf (logfile, "%6d ", msg.uid);
+    else
+	fprintf (logfile, "       ");
+
+    if (internal)
+	fprintf (logfile, "SYSLOG  ");
+    else
+    if (msg.class > 0 && msg.class < 10)
+	fprintf (logfile, "%-7s ", msgclass[msg.class-1]);
+    else
+	fprintf (logfile, "?%-7d", msg.class);
+
+    fprintf (logfile, "%.*s", msg.length, msg.text);
+
+    /* append newline if needed */
+    if (msg.text[msg.length-1] != '\n')
+        fprintf (logfile, "\n");
+
+    fflush (logfile);
+
+    /* set new time out */
+    alarm (delay);
+}
+
+#endif !LIB_SYSLOG
+
+#ifdef LIB_SYSLOG
+
+#define MAX_LOGNAME	32
+#define MAX_BUF	256
+static char logname[MAX_LOGNAME] = "";
+
+/* chkque - checks message queue existence */
+
+static int
+chkque ()
+{
+    if (msgid == -1)
+	msgid = msgget (ftok (msgnam, 0), 0, 0);
+    return (msgid != -1);
+}
+
+/* openlog - sets up logname; checks message queue existence */
+
+int
+openlog (tag)
+char *tag;
+{
+    strncpy (logname, tag, MAX_LOGNAME);
+    logname[MAX_LOGNAME-1] = EOS;
+    return (chkque () ? 0 : -1);
+}
+
+/* syslog - writes message to system logger */
+
+int
+syslog (class, fmt, p1, p2, p3, p4, p5, p6, p7, p8, p9)
+int class;
+char *fmt;
+{
+    if (logname[0])
+	sprintf (msg.text, "%s: ", logname);
+    sprintf (msg.text+strlen(msg.text),
+		fmt, p1, p2, p3, p4, p5, p6, p7, p8, p9);
+    if (!chkque ())
+	return (-1);
+    msg.type = SYSLOG_MAGIC;
+    (void) time (&msg.tm);
+    msg.class = class;
+    msg.pid = getpid ();
+    msg.uid = getuid ();
+    msg.length = strlen (msg.text);
+    return (msgsnd (msgid, &msg, sizeof (msg) - MSG_SIZE + msg.length + 1, 0));
+}
+
+/* closelog - close message queue, resets logname */
+
+void
+closelog ()
+{
+    msgid = -1;
+    logname[0] = EOS;
+}
+
+#ifdef TEST
+
+main () {
+    openlog ("test");
+    syslog (55, "test message %d", 4);
+}
+
+#endif TEST
+
+#endif LIB_SYSLOG
+SHAR_EOF
+if test 7709 -ne "`wc -c < 'syslog.c'`"
+then
+	echo shar: "error transmitting 'syslog.c'" '(should have been 7709 characters)'
+fi
+fi
+echo shar: "extracting 'sendlog.c'" '(370 characters)'
+if test -f 'sendlog.c'
+then
+	echo shar: "will not over-write existing file 'sendlog.c'"
+else
+cat << \SHAR_EOF > 'sendlog.c'
+static char SCCS_id[] = "@(#)@ sendlog	1.2 - syslog interface";
+
+#include <stdio.h>
+#include <sys/syslog.h>
+
+main (argc, argv)
+int argc;
+char *argv[];
+{
+	char buf [512];
+	char *cp = buf;
+	while (argc-- > 1) {
+		char *cq = *++argv;
+		while (*cp++ = *cq++);
+		cp[-1] = ' ';
+	}
+	cp[-1] = '\n';
+	cp[0] = '\0';
+	openlog ("sendlog");
+	syslog (LOG_INFO, buf);
+	closelog ();
+}
+
+SHAR_EOF
+if test 370 -ne "`wc -c < 'sendlog.c'`"
+then
+	echo shar: "error transmitting 'sendlog.c'" '(should have been 370 characters)'
+fi
+fi
+exit 0
+#	End of shell archive

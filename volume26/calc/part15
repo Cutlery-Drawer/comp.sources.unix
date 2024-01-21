@@ -1,0 +1,1824 @@
+Newsgroups: comp.sources.unix
+From: dbell@pdact.pd.necisa.oz.au (David I. Bell)
+Subject: v26i041: CALC - An arbitrary precision C-like calculator, Part15/21
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: dbell@pdact.pd.necisa.oz.au (David I. Bell)
+Posting-Number: Volume 26, Issue 41
+Archive-Name: calc/part15
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 15 (of 21)."
+# Contents:  zmath.c
+# Wrapped by dbell@elm on Tue Feb 25 15:21:13 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'zmath.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'zmath.c'\"
+else
+echo shar: Extracting \"'zmath.c'\" \(32210 characters\)
+sed "s/^X//" >'zmath.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1992 David I. Bell
+X * Permission is granted to use, distribute, or modify this source,
+X * provided that this copyright notice remains intact.
+X *
+X * Extended precision integral arithmetic primitives
+X */
+X
+X#include <stdio.h>
+X#include "math.h"
+X
+X
+XHALF _twoval_[] = { 2 };
+XHALF _zeroval_[] = { 0 };
+XHALF _oneval_[] = { 1 };
+XHALF _tenval_[] = { 10 };
+X
+XZVALUE _zero_ = { _zeroval_, 1, 0};
+XZVALUE _one_ = { _oneval_, 1, 0 };
+XZVALUE _ten_ = { _tenval_, 1, 0 };
+X
+X/*
+X * mask of given bits, rotated thru all bit positions twice
+X *
+X * bitmask[i] 	 (1 << (i-1)),  for  -BASEB*4<=i<=BASEB*4
+X * rotmask[j][k] (1 << ((j+k-1)%BASEB)),  for  -BASEB*2<=j,k<=BASEB*2
+X */
+Xstatic HALF *bmask;		/* actual rotation thru 8 cycles */
+Xstatic HALF **rmask;		/* actual rotation pointers thru 2 cycles */
+XHALF *bitmask;			/* bit rotation, norm 0 */
+X#if 0
+Xstatic HALF **rotmask;		/* pointers to bit rotations, norm index */
+X#endif
+X
+XBOOL _math_abort_;		/* nonzero to abort calculations */
+X
+X
+Xstatic char *abortmsg = "Calculation aborted";
+Xstatic char *memmsg = "Not enough memory";
+X
+Xstatic void dadd proto((ZVALUE z1, ZVALUE z2, long y, long n));
+Xstatic BOOL dsub proto((ZVALUE z1, ZVALUE z2, long y, long n));
+Xstatic void dmul proto((ZVALUE z, FULL x, ZVALUE *dest));
+X
+X
+X#ifdef ALLOCTEST
+Xstatic long nalloc = 0;
+Xstatic long nfree = 0;
+X#endif
+X
+X
+XHALF *
+Xalloc(len)
+X	long len;
+X{
+X	HALF *hp;
+X
+X	if (_math_abort_)
+X		error(abortmsg);
+X	hp = (HALF *) malloc(len * sizeof(HALF) + 2);
+X	if (hp == 0)
+X		error(memmsg);
+X#ifdef ALLOCTEST
+X	++nalloc;
+X#endif
+X	return hp;
+X}
+X
+X#ifdef ALLOCTEST
+Xvoid
+Xfreeh(h)
+X	HALF *h;
+X{
+X	if ((h != _zeroval_) && (h != _oneval_)) {
+X		free(h);
+X		++nfree;
+X	}
+X}
+X
+X
+Xvoid
+XallocStat()
+X{
+X	fprintf(stderr, "nalloc: %ld nfree: %ld kept: %ld\n",
+X		nalloc, nfree, nalloc - nfree);
+X}
+X#endif
+X
+X
+X/*
+X * Convert a normal integer to a number.
+X */
+Xvoid
+Xitoz(i, res)
+X	long i;
+X	ZVALUE *res;
+X{
+X	long diddle, len;
+X
+X	res->len = 1;
+X	res->sign = 0;
+X	diddle = 0;
+X	if (i == 0) {
+X		res->v = _zeroval_;
+X		return;
+X	}
+X	if (i < 0) {
+X		res->sign = 1;
+X		i = -i;
+X		if (i < 0) {	/* fix most negative number */
+X			diddle = 1;
+X			i--;
+X		}
+X	}
+X	if (i == 1) {
+X		res->v = _oneval_;
+X		return;
+X	}
+X	len = 1 + (((FULL) i) >= BASE);
+X	res->len = len;
+X	res->v = alloc(len);
+X	res->v[0] = (HALF) (i + diddle);
+X	if (len == 2)
+X		res->v[1] = (HALF) (i / BASE);
+X}
+X
+X
+X/*
+X * Convert a number to a normal integer, as far as possible.
+X * If the number is out of range, the largest number is returned.
+X */
+Xlong
+Xztoi(z)
+X	ZVALUE z;
+X{
+X	long i;
+X
+X	if (isbig(z)) {
+X		i = MAXFULL;
+X		return (z.sign ? -i : i);
+X	}
+X	i = (istiny(z) ? z1tol(z) : z2tol(z));
+X	return (z.sign ? -i : i);
+X}
+X
+X
+X/*
+X * Make a copy of an integer value
+X */
+Xvoid
+Xzcopy(z, res)
+X	ZVALUE z, *res;
+X{
+X	res->sign = z.sign;
+X	res->len = z.len;
+X	if (isleone(z)) {	/* zero or plus or minus one are easy */
+X		res->v = (z.v[0] ? _oneval_ : _zeroval_);
+X		return;
+X	}
+X	res->v = alloc(z.len);
+X	copyval(z, *res);
+X}
+X
+X
+X/*
+X * Add together two integers.
+X */
+Xvoid
+Xzadd(z1, z2, res)
+X	ZVALUE z1, z2, *res;
+X{
+X	ZVALUE dest;
+X	HALF *p1, *p2, *pd;
+X	long len;
+X	FULL carry;
+X	SIUNION sival;
+X
+X	if (z1.sign && !z2.sign) {
+X		z1.sign = 0;
+X		zsub(z2, z1, res);
+X		return;
+X	}
+X	if (z2.sign && !z1.sign) {
+X		z2.sign = 0;
+X		zsub(z1, z2, res);
+X		return;
+X	}
+X	if (z2.len > z1.len) {
+X		pd = z1.v; z1.v = z2.v; z2.v = pd;
+X		len = z1.len; z1.len = z2.len; z2.len = len;
+X	}
+X	dest.len = z1.len + 1;
+X	dest.v = alloc(dest.len);
+X	dest.sign = z1.sign;
+X	carry = 0;
+X	pd = dest.v;
+X	p1 = z1.v;
+X	p2 = z2.v;
+X	len = z2.len;
+X	while (len--) {
+X		sival.ivalue = ((FULL) *p1++) + ((FULL) *p2++) + carry;
+X		*pd++ = sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	len = z1.len - z2.len;
+X	while (len--) {
+X		sival.ivalue = ((FULL) *p1++) + carry;
+X		*pd++ = sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	*pd = (HALF)carry;
+X	quicktrim(dest);
+X	*res = dest;
+X}
+X
+X
+X/*
+X * Subtract two integers.
+X */
+Xvoid
+Xzsub(z1, z2, res)
+X	ZVALUE z1, z2, *res;
+X{
+X	register HALF *h1, *h2, *hd;
+X	long len1, len2;
+X	FULL carry;
+X	SIUNION sival;
+X	ZVALUE dest;
+X
+X	if (z1.sign != z2.sign) {
+X		z2.sign = z1.sign;
+X		zadd(z1, z2, res);
+X		return;
+X	}
+X	len1 = z1.len;
+X	len2 = z2.len;
+X	if (len1 == len2) {
+X		h1 = z1.v + len1 - 1;
+X		h2 = z2.v + len2 - 1;
+X		while ((len1 > 0) && ((FULL)*h1 == (FULL)*h2)) {
+X			len1--;
+X			h1--;
+X			h2--;
+X		}
+X		if (len1 == 0) {
+X			*res = _zero_;
+X			return;
+X		}
+X		len2 = len1;
+X	}
+X	dest.sign = z1.sign;
+X	carry = ((len1 < len2) || ((len1 == len2) && ((FULL)*h1 < (FULL)*h2)));
+X	h1 = z1.v;
+X	h2 = z2.v;
+X	if (carry) {
+X		carry = len1;
+X		len1 = len2;
+X		len2 = carry;
+X		h1 = z2.v;
+X		h2 = z1.v;
+X		dest.sign = !dest.sign;
+X	}
+X	hd = alloc(len1);
+X	dest.v = hd;
+X	dest.len = len1;
+X	len1 -= len2;
+X	carry = 0;
+X	while (--len2 >= 0) {
+X		sival.ivalue = (BASE1 - ((FULL) *h1++)) + *h2++ + carry;
+X		*hd++ = BASE1 - sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	while (--len1 >= 0) {
+X		sival.ivalue = (BASE1 - ((FULL) *h1++)) + carry;
+X		*hd++ = BASE1 - sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	if (hd[-1] == 0)
+X		trim(&dest);
+X	*res = dest;
+X}
+X
+X
+X#if 0
+X/*
+X * Multiply two integers together.
+X */
+Xvoid
+Xzmul(z1, z2, res)
+X	ZVALUE z1, z2, *res;
+X{
+X	register HALF *s1, *s2, *sd, *h1;
+X	FULL mul, carry;
+X	long len1, len2;
+X	SIUNION sival;
+X	ZVALUE dest;
+X
+X	if (iszero(z1) || iszero(z2)) {
+X		*res = _zero_;
+X		return;
+X	}
+X	if (isone(z1)) {
+X		zcopy(z2, res);
+X		return;
+X	}
+X	if (isone(z2)) {
+X		zcopy(z1, res);
+X		return;
+X	}
+X	dest.len = z1.len + z2.len;
+X	dest.v = alloc(dest.len);
+X	dest.sign = (z1.sign != z2.sign);
+X	clearval(dest);
+X	/*
+X	 * Swap the numbers if necessary to make the second one smaller.
+X	 */
+X	if (z1.len < z2.len) {
+X		len1 = z1.len;
+X		z1.len = z2.len;
+X		z2.len = len1;
+X		s1 = z1.v;
+X		z1.v = z2.v;
+X		z2.v = s1;
+X	}
+X	/*
+X	 * Multiply the first number by each 'digit' of the second number
+X	 * and add the result to the total.
+X	 */
+X	sd = dest.v;
+X	s2 = z2.v;
+X	for (len2 = z2.len; len2--; sd++) {
+X		mul = (FULL) *s2++;
+X		if (mul == 0)
+X			continue;
+X		h1 = sd;
+X		s1 = z1.v;
+X		carry = 0;
+X		len1 = z1.len;
+X		while (len1 >= 4) {	/* expand the loop some */
+X			len1 -= 4;
+X			sival.ivalue = (mul * ((FULL) *s1++)) + ((FULL) *h1) + carry;
+X			*h1++ = sival.silow;
+X			sival.ivalue = (mul * ((FULL) *s1++)) + ((FULL) *h1) + ((FULL) sival.sihigh);
+X			*h1++ = sival.silow;
+X			sival.ivalue = (mul * ((FULL) *s1++)) + ((FULL) *h1) + ((FULL) sival.sihigh);
+X			*h1++ = sival.silow;
+X			sival.ivalue = (mul * ((FULL) *s1++)) + ((FULL) *h1) + ((FULL) sival.sihigh);
+X			*h1++ = sival.silow;
+X			carry = sival.sihigh;
+X		}
+X		while (--len1 >= 0) {
+X			sival.ivalue = (mul * ((FULL) *s1++)) + ((FULL) *h1) + carry;
+X			*h1++ = sival.silow;
+X			carry = sival.sihigh;
+X		}
+X		while (carry) {
+X			sival.ivalue = ((FULL) *h1) + carry;
+X			*h1++ = sival.silow;
+X			carry = sival.sihigh;
+X		}
+X	}
+X	trim(&dest);
+X	*res = dest;
+X}
+X#endif
+X
+X
+X/*
+X * Multiply an integer by a small number.
+X */
+Xvoid
+Xzmuli(z, n, res)
+X	ZVALUE z;
+X	long n;
+X	ZVALUE *res;
+X{
+X	register HALF *h1, *sd;
+X	FULL low;
+X	FULL high;
+X	FULL carry;
+X	long len;
+X	SIUNION sival;
+X	ZVALUE dest;
+X
+X	if ((n == 0) || iszero(z)) {
+X		*res = _zero_;
+X		return;
+X	}
+X	if (n < 0) {
+X		n = -n;
+X		z.sign = !z.sign;
+X	}
+X	if (n == 1) {
+X		zcopy(z, res);
+X		return;
+X	}
+X	low = ((FULL) n) & BASE1;
+X	high = ((FULL) n) >> BASEB;
+X	dest.len = z.len + 2;
+X	dest.v = alloc(dest.len);
+X	dest.sign = z.sign;
+X	/*
+X	 * Multiply by the low digit.
+X	 */
+X	h1 = z.v;
+X	sd = dest.v;
+X	len = z.len;
+X	carry = 0;
+X	while (len--) {
+X		sival.ivalue = ((FULL) *h1++) * low + carry;
+X		*sd++ = sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	*sd = (HALF)carry;
+X	/*
+X	 * If there was only one digit, then we are all done except
+X	 * for trimming the number if there was no last carry.
+X	 */
+X	if (high == 0) {
+X		dest.len--;
+X		if (carry == 0)
+X			dest.len--;
+X		*res = dest;
+X		return;
+X	}
+X	/*
+X	 * Need to multiply by the high digit and add it into the
+X	 * previous value.  Clear the final word of rubbish first.
+X	 */
+X	*(++sd) = 0;
+X	h1 = z.v;
+X	sd = dest.v + 1;
+X	len = z.len;
+X	carry = 0;
+X	while (len--) {
+X		sival.ivalue = ((FULL) *h1++) * high + ((FULL) *sd) + carry;
+X		*sd++ = sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	*sd = (HALF)carry;
+X	quicktrim(dest);
+X	*res = dest;
+X}
+X
+X
+X/*
+X * Divide two numbers by their greatest common divisor.
+X * This is useful for reducing the numerator and denominator of
+X * a fraction to its lowest terms.
+X */
+Xvoid
+Xzreduce(z1, z2, z1res, z2res)
+X	ZVALUE z1, z2, *z1res, *z2res;
+X{
+X	ZVALUE tmp;
+X
+X	if (isleone(z1) || isleone(z2))
+X		tmp = _one_;
+X	else
+X		zgcd(z1, z2, &tmp);
+X	if (isunit(tmp)) {
+X		zcopy(z1, z1res);
+X		zcopy(z2, z2res);
+X	} else {
+X		zquo(z1, tmp, z1res);
+X		zquo(z2, tmp, z2res);
+X	}
+X	freeh(tmp.v);
+X}
+X
+X
+X/*
+X * Divide two numbers to obtain a quotient and remainder.
+X * This algorithm is taken from
+X * Knuth, The Art of Computer Programming, vol 2: Seminumerical Algorithms.
+X * Slight modifications were made to speed this mess up.
+X */
+Xvoid
+Xzdiv(z1, z2, res, rem)
+X	ZVALUE z1, z2, *res, *rem;
+X{
+X	long i, j, k;
+X	register HALF *q, *pp;
+X	SIUNION pair;		/* pair of halfword values */
+X	HALF h2, v2;
+X	long y;
+X	FULL x;
+X	ZVALUE ztmp1, ztmp2, ztmp3, quo;
+X
+X	if (iszero(z2))
+X		error("Division by zero");
+X	if (iszero(z1)) {
+X		*res = _zero_;
+X		*rem = _zero_;
+X		return;
+X	}
+X	if (isone(z2)) {
+X		zcopy(z1, res);
+X		*rem = _zero_;
+X		return;
+X	}
+X	i = 32768;
+X	j = 0;
+X	k = (long) z2.v[z2.len - 1];
+X	while (! (k & i)) {
+X		j ++;
+X		i >>= 1;
+X	}
+X	ztmp1.v = alloc(z1.len + 1);
+X	ztmp1.len = z1.len + 1;
+X	copyval(z1, ztmp1);
+X	ztmp1.v[z1.len] = 0;
+X	ztmp1.sign = 0;
+X	ztmp2.v = alloc(z2.len);
+X	ztmp2.len = z2.len;
+X	ztmp2.sign = 0;
+X	copyval(z2, ztmp2);
+X	if (zrel(ztmp1, ztmp2) < 0) {
+X		rem->v = ztmp1.v;
+X		rem->sign = z1.sign;
+X		rem->len = z1.len;
+X		freeh(ztmp2.v);
+X		*res = _zero_;
+X		return;
+X	}
+X	quo.len = z1.len - z2.len + 1;
+X	quo.v = alloc(quo.len);
+X	quo.sign = z1.sign != z2.sign;
+X	clearval(quo);
+X
+X	ztmp3.v = zalloctemp(z2.len + 1);
+X
+X	/*
+X	 * Normalize z1 and z2
+X	 */
+X	shiftl(ztmp1, j);
+X	shiftl(ztmp2, j);
+X
+X	k = ztmp1.len - ztmp2.len;
+X	q = quo.v + quo.len;
+X	y = ztmp1.len - 1;
+X	h2 = ztmp2.v [ztmp2.len - 1];
+X	v2 = 0;
+X	if (ztmp2.len >= 2)
+X		v2 = ztmp2.v [ztmp2.len - 2];
+X	for (;k--; --y) {
+X		pp = ztmp1.v + y - 1;
+X		pair.silow = pp[0];
+X		pair.sihigh = pp[1];
+X		if (ztmp1.v[y] == h2)
+X			x = BASE1;
+X		else
+X			x = pair.ivalue / h2;
+X		if (x) {
+X			while (pair.ivalue - x * h2 < BASE &&
+X				v2 * x > (pair.ivalue - x * h2) * BASE + ztmp1.v [y-2]) {
+X					--x;
+X			}
+X			dmul(ztmp2, x, &ztmp3);
+X#ifdef divblab
+X			printf(" x: %ld\n", x);
+X			printf("ztmp1: ");
+X			printz(ztmp1);
+X			printf("ztmp2: ");
+X			printz(ztmp2);
+X			printf("ztmp3: ");
+X			printz(ztmp3);
+X#endif
+X			if (dsub(ztmp1, ztmp3, y, ztmp2.len)) {
+X				--x;
+X				/*
+X				printf("adding back\n");
+X				*/
+X				dadd(ztmp1, ztmp2, y, ztmp2.len);
+X			}
+X		}
+X		trim(&ztmp1);
+X		*--q = (HALF)x;
+X	}
+X	shiftr(ztmp1, j);
+X	*rem = ztmp1;
+X	trim(rem);
+X	freeh(ztmp2.v);
+X	trim(&quo);
+X	*res = quo;
+X}
+X
+X
+X/*
+X * Return the quotient and remainder of an integer divided by a small
+X * number.  A nonzero remainder is only meaningful when both numbers
+X * are positive.
+X */
+Xlong
+Xzdivi(z, n, res)
+X	ZVALUE z, *res;
+X	long n;
+X{
+X	register HALF *h1, *sd;
+X	FULL val;
+X	HALF divval[2];
+X	ZVALUE div;
+X	ZVALUE dest;
+X	long len;
+X
+X	if (n == 0)
+X		error("Division by zero");
+X	if (iszero(z)) {
+X		*res = _zero_;
+X		return 0;
+X	}
+X	if (n < 0) {
+X		n = -n;
+X		z.sign = !z.sign;
+X	}
+X	if (n == 1) {
+X		zcopy(z, res);
+X		return 0;
+X	}
+X	/*
+X	 * If the division is by a large number, then call the normal
+X	 * divide routine.
+X	 */
+X	if (n & ~BASE1) {
+X		div.sign = 0;
+X		div.len = 2;
+X		div.v = divval;
+X		divval[0] = (HALF) n;
+X		divval[1] = ((FULL) n) >> BASEB;
+X		zdiv(z, div, res, &dest);
+X		n = (istiny(dest) ? z1tol(dest) : z2tol(dest));
+X		freeh(dest.v);
+X		return n;
+X	}
+X	/*
+X	 * Division is by a small number, so we can be quick about it.
+X	 */
+X	len = z.len;
+X	dest.sign = z.sign;
+X	dest.len = len;
+X	dest.v = alloc(len);
+X	h1 = z.v + len - 1;
+X	sd = dest.v + len - 1;
+X	val = 0;
+X	while (len--) {
+X		val = ((val << BASEB) + ((FULL) *h1--));
+X		*sd-- = val / n;
+X		val %= n;
+X	}
+X	quicktrim(dest);
+X	*res = dest;
+X	return val;
+X}
+X
+X
+X/*
+X * Return the quotient of two numbers.
+X * This works the same as zdiv, except that the remainer is not returned.
+X */
+Xvoid
+Xzquo(z1, z2, res)
+X	ZVALUE z1, z2, *res;
+X{
+X	long i, j, k;
+X	register HALF *q, *pp;
+X	SIUNION pair;			/* pair of halfword values */
+X	HALF h2, v2;
+X	long y;
+X	FULL x;
+X	ZVALUE ztmp1, ztmp2, ztmp3, quo;
+X
+X	if (iszero(z2))
+X		error("Division by zero");
+X	if (iszero(z1)) {
+X		*res = _zero_;
+X		return;
+X	}
+X	if (isone(z2)) {
+X		zcopy(z1, res);
+X		return;
+X	}
+X	i = 32768;
+X	j = 0;
+X	k = (long) z2.v[z2.len - 1];
+X	while (! (k & i)) {
+X		j ++;
+X		i >>= 1;
+X	}
+X	ztmp1.v = alloc(z1.len + 1);
+X	ztmp1.len = z1.len + 1;
+X	copyval(z1, ztmp1);
+X	ztmp1.v[z1.len] = 0;
+X	ztmp1.sign = 0;
+X	ztmp2.v = alloc(z2.len);
+X	ztmp2.len = z2.len;
+X	ztmp2.sign = 0;
+X	copyval(z2, ztmp2);
+X	if (zrel(ztmp1, ztmp2) < 0) {
+X		freeh(ztmp1.v);
+X		freeh(ztmp2.v);
+X		*res = _zero_;
+X		return;
+X	}
+X	quo.len = z1.len - z2.len + 1;
+X	quo.v = alloc(quo.len);
+X	quo.sign = z1.sign != z2.sign;
+X	clearval(quo);
+X
+X	ztmp3.v = zalloctemp(z2.len + 1);
+X
+X	/*
+X	 * Normalize z1 and z2
+X	 */
+X	shiftl(ztmp1, j);
+X	shiftl(ztmp2, j);
+X
+X	k = ztmp1.len - ztmp2.len;
+X	q = quo.v + quo.len;
+X	y = ztmp1.len - 1;
+X	h2 = ztmp2.v [ztmp2.len - 1];
+X	v2 = 0;
+X	if (ztmp2.len >= 2)
+X		v2 = ztmp2.v [ztmp2.len - 2];
+X	for (;k--; --y) {
+X		pp = ztmp1.v + y - 1;
+X		pair.silow = pp[0];
+X		pair.sihigh = pp[1];
+X		if (ztmp1.v[y] == h2)
+X			x = BASE1;
+X		else
+X			x = pair.ivalue / h2;
+X		if (x) {
+X			while (pair.ivalue - x * h2 < BASE &&
+X				v2 * x > (pair.ivalue - x * h2) * BASE + ztmp1.v [y-2]) {
+X					--x;
+X			}
+X			dmul(ztmp2, x, &ztmp3);
+X			if (dsub(ztmp1, ztmp3, y, ztmp2.len)) {
+X				--x;
+X				dadd(ztmp1, ztmp2, y, ztmp2.len);
+X			}
+X		}
+X		trim(&ztmp1);
+X		*--q = (HALF)x;
+X	}
+X	freeh(ztmp1.v);
+X	freeh(ztmp2.v);
+X	trim(&quo);
+X	*res = quo;
+X}
+X
+X
+X/*
+X * Compute the remainder after dividing one number by another.
+X * This is only defined for positive z2 values.
+X * The result is normalized to lie in the range 0 to z2-1.
+X */
+Xvoid
+Xzmod(z1, z2, rem)
+X	ZVALUE z1, z2, *rem;
+X{
+X	long i, j, k, neg;
+X	register HALF *pp;
+X	SIUNION pair;			/* pair of halfword values */
+X	HALF h2, v2;
+X	long y;
+X	FULL x;
+X	ZVALUE ztmp1, ztmp2, ztmp3;
+X
+X	if (iszero(z2))
+X		error("Division by zero");
+X	if (isneg(z2))
+X		error("Non-positive modulus");
+X	if (iszero(z1) || isunit(z2)) {
+X		*rem = _zero_;
+X		return;
+X	}
+X	if (istwo(z2)) {
+X		if (isodd(z1))
+X			*rem = _one_;
+X		else
+X			*rem = _zero_;
+X		return;
+X	}
+X	neg = z1.sign;
+X	z1.sign = 0;
+X
+X	/*
+X	 * Do a quick check to see if the absolute value of the number
+X	 * is less than the modulus.  If so, then the result is just a
+X	 * subtract or a copy.
+X	 */
+X	h2 = z1.v[z1.len - 1];
+X	v2 = z2.v[z2.len - 1];
+X	if ((z1.len < z2.len) || ((z1.len == z2.len) && (h2 < v2))) {
+X		if (neg)
+X			zsub(z2, z1, rem);
+X		else
+X			zcopy(z1, rem);
+X		return;
+X	}
+X
+X	/*
+X	 * Do another quick check to see if the number is positive and
+X	 * between the size of the modulus and twice the modulus.
+X	 * If so, then the answer is just another subtract.
+X	 */
+X	if (!neg && (z1.len == z2.len) && (h2 > v2) &&
+X		(((FULL) h2) < 2 * ((FULL) v2)))
+X	{
+X		zsub(z1, z2, rem);
+X		return;
+X	}
+X
+X	/*
+X	 * If the modulus is an exact power of two, then the result
+X	 * can be obtained by ignoring the high bits of the number.
+X	 * This truncation assumes that the number of words for the
+X	 * number is at least as large as the number of words in the
+X	 * modulus, which is true at this point.
+X	 */
+X	if (((v2 & -v2) == v2) && zisonebit(z2)) {	/* ASSUMES 2'S COMP */
+X		i = zhighbit(z2);
+X		z1.len = (i + BASEB - 1) / BASEB;
+X		zcopy(z1, &ztmp1);
+X		i %= BASEB;
+X		if (i)
+X			ztmp1.v[ztmp1.len - 1] &= ((((HALF) 1) << i) - 1);
+X		ztmp2.len = 0;
+X		goto gotanswer;
+X	}
+X
+X	/*
+X	 * If the modulus is one less than an exact power of two, then
+X	 * the result can be simplified similarly to "casting out 9's".
+X	 * Only do this simplification for large enough modulos.
+X	 */
+X	if ((z2.len > 1) && (z2.v[0] == BASE1) && zisallbits(z2)) {
+X		i = -(zhighbit(z2) + 1);
+X		zcopy(z1, &ztmp1);
+X		z1 = ztmp1;
+X		while ((k = zrel(z1, z2)) > 0) {
+X			ztmp1 = _zero_;
+X			while (!iszero(z1)) {
+X				zand(z1, z2, &ztmp2);
+X				zadd(ztmp2, ztmp1, &ztmp3);
+X				freeh(ztmp1.v);
+X				freeh(ztmp2.v);
+X				ztmp1 = ztmp3;
+X				zshift(z1, i, &ztmp2);
+X				freeh(z1.v);
+X				z1 = ztmp2;
+X			}
+X			freeh(z1.v);
+X			z1 = ztmp1;
+X		}
+X		if (k == 0) {
+X			freeh(ztmp1.v);
+X			*rem = _zero_;
+X			return;
+X		}
+X		ztmp2.len = 0;
+X		goto gotanswer;
+X	}
+X
+X	/*
+X	 * Must actually do the divide.
+X	 */
+X	i = 32768;
+X	j = 0;
+X	k = (long) z2.v[z2.len - 1];
+X	while (! (k & i)) {
+X		j ++;
+X		i >>= 1;
+X	}
+X	ztmp1.v = alloc(z1.len + 1);
+X	ztmp1.len = z1.len + 1;
+X	copyval(z1, ztmp1);
+X	ztmp1.v[z1.len] = 0;
+X	ztmp1.sign = 0;
+X	ztmp2.v = alloc(z2.len);
+X	ztmp2.len = z2.len;
+X	ztmp2.sign = 0;
+X	copyval(z2, ztmp2);
+X	if (zrel(ztmp1, ztmp2) < 0)
+X		goto gotanswer;
+X
+X	ztmp3.v = zalloctemp(z2.len + 1);
+X
+X	/*
+X	 * Normalize z1 and z2
+X	 */
+X	shiftl(ztmp1, j);
+X	shiftl(ztmp2, j);
+X
+X	k = ztmp1.len - ztmp2.len;
+X	y = ztmp1.len - 1;
+X	h2 = ztmp2.v [ztmp2.len - 1];
+X	v2 = 0;
+X	if (ztmp2.len >= 2)
+X		v2 = ztmp2.v [ztmp2.len - 2];
+X	for (;k--; --y) {
+X		pp = ztmp1.v + y - 1;
+X		pair.silow = pp[0];
+X		pair.sihigh = pp[1];
+X		if (ztmp1.v[y] == h2)
+X			x = BASE1;
+X		else
+X			x = pair.ivalue / h2;
+X		if (x) {
+X			while (pair.ivalue - x * h2 < BASE &&
+X				v2 * x > (pair.ivalue - x * h2) * BASE + ztmp1.v [y-2]) {
+X					--x;
+X			}
+X			dmul(ztmp2, x, &ztmp3);
+X			if (dsub(ztmp1, ztmp3, y, ztmp2.len))
+X				dadd(ztmp1, ztmp2, y, ztmp2.len);
+X		}
+X		trim(&ztmp1);
+X	}
+X	shiftr(ztmp1, j);
+X
+Xgotanswer:
+X	trim(&ztmp1);
+X	if (ztmp2.len)
+X		freeh(ztmp2.v);
+X	if (neg && !iszero(ztmp1)) {
+X		zsub(z2, ztmp1, rem);
+X		freeh(ztmp1.v);
+X	} else
+X		*rem = ztmp1;
+X}
+X
+X
+X/*
+X * Calculate the mod of an integer by a small number.
+X * This is only defined for positive moduli.
+X */
+Xlong
+Xzmodi(z, n)
+X	ZVALUE z;
+X	long n;
+X{
+X	register HALF *h1;
+X	FULL val;
+X	HALF divval[2];
+X	ZVALUE div;
+X	ZVALUE temp;
+X	long len;
+X
+X	if (n == 0)
+X		error("Division by zero");
+X	if (n < 0)
+X		error("Non-positive modulus");
+X	if (iszero(z) || (n == 1))
+X		return 0;
+X	if (isone(z))
+X		return 1;
+X	/*
+X	 * If the modulus is by a large number, then call the normal
+X	 * modulo routine.
+X	 */
+X	if (n & ~BASE1) {
+X		div.sign = 0;
+X		div.len = 2;
+X		div.v = divval;
+X		divval[0] = (HALF) n;
+X		divval[1] = ((FULL) n) >> BASEB;
+X		zmod(z, div, &temp);
+X		n = (istiny(temp) ? z1tol(temp) : z2tol(temp));
+X		freeh(temp.v);
+X		return n;
+X	}
+X	/*
+X	 * The modulus is by a small number, so we can do this quickly.
+X	 */
+X	len = z.len;
+X	h1 = z.v + len - 1;
+X	val = 0;
+X	while (len--)
+X		val = ((val << BASEB) + ((FULL) *h1--)) % n;
+X	if (z.sign)
+X		val = n - val;
+X	return val;
+X}
+X
+X
+X/*
+X * Return whether or not one number exactly divides another one.
+X * Returns TRUE if division occurs with no remainder.
+X * z1 is the number to be divided by z2.
+X */
+XBOOL
+Xzdivides(z1, z2)
+X	ZVALUE z1, z2;		/* numbers to test division into and by */
+X{
+X	ZVALUE temp;
+X	long cv;
+X
+X	z1.sign = 0;
+X	z2.sign = 0;
+X	/*
+X	 * Take care of obvious cases first
+X	 */
+X	if (isleone(z2)) {	/* division by zero or one */
+X		if (*z2.v == 0)
+X			error("Division by zero");
+X		return TRUE;
+X	}
+X	if (iszero(z1))	/* everything divides zero */
+X		return TRUE;
+X	if (z1.len < z2.len)	/* quick size comparison */
+X		return FALSE;
+X	if ((z1.len == z2.len) && (z1.v[z1.len-1] < z2.v[z2.len-1]))	/* more */
+X		return FALSE;
+X	if (isodd(z1) && iseven(z2))	/* can't divide odd by even */
+X		return FALSE;
+X	if (zlowbit(z1) < zlowbit(z2))	/* can't have smaller power of two */
+X		return FALSE;
+X	cv = zrel(z1, z2);	/* can't divide smaller number */
+X	if (cv <= 0)
+X		return (cv == 0);
+X	/*
+X	 * Now do the real work.  Divisor divides dividend if the gcd of the
+X	 * two numbers equals the divisor.
+X	 */
+X	zgcd(z1, z2, &temp);
+X	cv = zcmp(z2, temp);
+X	freeh(temp.v);
+X	return (cv == 0);
+X}
+X
+X
+X/*
+X * Compute the logical OR of two numbers
+X */
+Xvoid
+Xzor(z1, z2, res)
+X	ZVALUE z1, z2, *res;
+X{
+X	register HALF *sp, *dp;
+X	long len;
+X	ZVALUE bz, lz, dest;
+X
+X	if (z1.len >= z2.len) {
+X		bz = z1;
+X		lz = z2;
+X	} else {
+X		bz = z2;
+X		lz = z1;
+X	}
+X	dest.len = bz.len;
+X	dest.v = alloc(dest.len);
+X	dest.sign = 0;
+X	copyval(bz, dest);
+X	len = lz.len;
+X	sp = lz.v;
+X	dp = dest.v;
+X	while (len--)
+X		*dp++ |= *sp++;
+X	*res = dest;
+X}
+X
+X
+X/*
+X * Compute the logical AND of two numbers.
+X */
+Xvoid
+Xzand(z1, z2, res)
+X	ZVALUE z1, z2, *res;
+X{
+X	register HALF *h1, *h2, *hd;
+X	register long len;
+X	ZVALUE dest;
+X
+X	len = ((z1.len <= z2.len) ? z1.len : z2.len);
+X	h1 = &z1.v[len-1];
+X	h2 = &z2.v[len-1];
+X	while ((len > 1) && ((*h1 & *h2) == 0)) {
+X		h1--;
+X		h2--;
+X		len--;
+X	}
+X	dest.len = len;
+X	dest.v = alloc(len);
+X	dest.sign = 0;
+X	h1 = z1.v;
+X	h2 = z2.v;
+X	hd = dest.v;
+X	while (len--)
+X		*hd++ = (*h1++ & *h2++);
+X	*res = dest;
+X}
+X
+X
+X/*
+X * Compute the logical XOR of two numbers.
+X */
+Xvoid
+Xzxor(z1, z2, res)
+X	ZVALUE z1, z2, *res;
+X{
+X	register HALF *sp, *dp;
+X	long len;
+X	ZVALUE bz, lz, dest;
+X
+X	if (z1.len == z2.len) {
+X		for (len = z1.len; ((len > 1) && (z1.v[len-1] == z2.v[len-1])); len--) ;
+X		z1.len = len;
+X		z2.len = len;
+X	}
+X	if (z1.len >= z2.len) {
+X		bz = z1;
+X		lz = z2;
+X	} else {
+X		bz = z2;
+X		lz = z1;
+X	}
+X	dest.len = bz.len;
+X	dest.v = alloc(dest.len);
+X	dest.sign = 0;
+X	copyval(bz, dest);
+X	len = lz.len;
+X	sp = lz.v;
+X	dp = dest.v;
+X	while (len--)
+X		*dp++ ^= *sp++;
+X	*res = dest;
+X}
+X
+X
+X/*
+X * Shift a number left (or right) by the specified number of bits.
+X * Positive shift means to the left.  When shifting right, rightmost
+X * bits are lost.  The sign of the number is preserved.
+X */
+Xvoid
+Xzshift(z, n, res)
+X	ZVALUE z, *res;
+X	long n;
+X{
+X	ZVALUE ans;
+X	long hc;		/* number of halfwords shift is by */
+X
+X	if (iszero(z)) {
+X		*res = _zero_;
+X		return;
+X	}
+X	if (n == 0) {
+X		zcopy(z, res);
+X		return;
+X	}
+X	/*
+X	 * If shift value is negative, then shift right.
+X	 * Check for large shifts, and handle word-sized shifts quickly.
+X	 */
+X	if (n < 0) {
+X		n = -n;
+X		if ((n < 0) || (n >= (z.len * BASEB))) {
+X			*res = _zero_;
+X			return;
+X		}
+X		hc = n / BASEB;
+X		n %= BASEB;
+X		z.v += hc;
+X		z.len -= hc;
+X		ans.len = z.len;
+X		ans.v = alloc(ans.len);
+X		ans.sign = z.sign;
+X		copyval(z, ans);
+X		if (n > 0) {
+X			shiftr(ans, n);
+X			trim(&ans);
+X		}
+X		if (iszero(ans)) {
+X			freeh(ans.v);
+X			ans = _zero_;
+X		}
+X		*res = ans;
+X		return;
+X	}
+X	/*
+X	 * Shift value is positive, so shift leftwards.
+X	 * Check specially for a shift of the value 1, since this is common.
+X	 * Also handle word-sized shifts quickly.
+X	 */
+X	if (isunit(z)) {
+X		zbitvalue(n, res);
+X		res->sign = z.sign;
+X		return;
+X	}
+X	hc = n / BASEB;
+X	n %= BASEB;
+X	ans.len = z.len + hc + 1;
+X	ans.v = alloc(ans.len);
+X	ans.sign = z.sign;
+X	if (hc > 0)
+X		memset((char *) ans.v, 0, hc * sizeof(HALF));
+X	memcpy((char *) (ans.v + hc), 
+X	    (char *) z.v, z.len * sizeof(HALF));
+X	ans.v[ans.len - 1] = 0;
+X	if (n > 0) {
+X		ans.v += hc;
+X		ans.len -= hc;
+X		shiftl(ans, n);
+X		ans.v -= hc;
+X		ans.len += hc;
+X	}
+X	trim(&ans);
+X	*res = ans;
+X}
+X
+X
+X/*
+X * Return the position of the lowest bit which is set in the binary
+X * representation of a number (counting from zero).  This is the highest
+X * power of two which evenly divides the number.
+X */
+Xlong
+Xzlowbit(z)
+X	ZVALUE z;
+X{
+X	register HALF *zp;
+X	long n;
+X	HALF dataval;
+X	HALF *bitval;
+X
+X	n = 0;
+X	for (zp = z.v; *zp == 0; zp++)
+X		if (++n >= z.len)
+X			return 0;
+X	dataval = *zp;
+X	bitval = bitmask;
+X	while ((*(bitval++) & dataval) == 0) {
+X	}
+X	return (n*BASEB)+(bitval-bitmask-1);
+X}
+X
+X
+X/*
+X * Return the position of the highest bit which is set in the binary
+X * representation of a number (counting from zero).  This is the highest power
+X * of two which is less than or equal to the number (which is assumed nonzero).
+X */
+Xlong
+Xzhighbit(z)
+X	ZVALUE z;
+X{
+X	HALF dataval;
+X	HALF *bitval;
+X
+X	dataval = z.v[z.len-1];
+X	if (dataval) {
+X		bitval = bitmask+BASEB;
+X		while ((*(--bitval) & dataval) == 0) {
+X		}
+X	}
+X	return (z.len*BASEB)+(bitval-bitmask-BASEB);
+X}
+X
+X
+X#if 0
+X/*
+X * Reverse the bits of a particular range of bits of a number.
+X *
+X * This function returns an integer with bits a thru b swapped.
+X * That is, bit a is swapped with bit b, bit a+1 is swapped with b-1,
+X * and so on.
+X *
+X * As a special case, if the ending bit position is < 0, is it taken to 
+X * mean the highest bit set.  Thus zbitrev(0, -1, z, &res) will 
+X * perform a complete bit reverse of the number 'z'.
+X *
+X * As a special case, if the starting bit position is < 0, is it taken to 
+X * mean the lowest bit set.  Thus zbitrev(-1, -1, z, &res) is the
+X * same as zbitrev(lowbit(z), highbit(z), z, &res).
+X *
+X * Note that the low order bit number is taken to be 0.  Also, bitrev
+X * ignores the sign of the number.
+X *
+X * Bits beyond the highest bit are taken to be zero.  Thus the calling
+X * bitrev(0, 100, _one_, &res) will result in a value of 2^100.
+X */
+Xvoid
+Xzbitrev(low, high, z, res)
+X	long low;	/* lowest bit to reverse, <0 => lowbit(z) */
+X	long high;	/* highest bit to reverse, <0 => highbit(z) */
+X	ZVALUE z;	/* value to bit reverse */
+X	ZVALUE *res;	/* resulting bit reverse number */
+X{
+X}
+X#endif
+X
+X
+X/*
+X * Return whether or not the specifed bit number is set in a number.
+X * Rightmost bit of a number is bit 0.
+X */
+XBOOL
+Xzisset(z, n)
+X	ZVALUE z;
+X	long n;
+X{
+X	if ((n < 0) || ((n / BASEB) >= z.len))
+X		return FALSE;
+X	return ((z.v[n / BASEB] & (((HALF) 1) << (n % BASEB))) != 0);
+X}
+X
+X
+X/*
+X * Check whether or not a number has exactly one bit set, and
+X * thus is an exact power of two.  Returns TRUE if so.
+X */
+XBOOL
+Xzisonebit(z)
+X	ZVALUE z;
+X{
+X	register HALF *hp;
+X	register LEN len;
+X
+X	if (iszero(z) || isneg(z))
+X		return FALSE;
+X	hp = z.v;
+X	len = z.len;
+X	while (len > 4) {
+X		len -= 4;
+X		if (*hp++ || *hp++ || *hp++ || *hp++)
+X			return FALSE;
+X	}
+X	while (--len > 0) {
+X		if (*hp++)
+X			return FALSE;
+X	}
+X	return ((*hp & -*hp) == *hp);		/* NEEDS 2'S COMPLEMENT */
+X}
+X
+X
+X/*
+X * Check whether or not a number has all of its bits set below some
+X * bit position, and thus is one less than an exact power of two.
+X * Returns TRUE if so.
+X */
+XBOOL
+Xzisallbits(z)
+X	ZVALUE z;
+X{
+X	register HALF *hp;
+X	register LEN len;
+X	HALF digit;
+X
+X	if (iszero(z) || isneg(z))
+X		return FALSE;
+X	hp = z.v;
+X	len = z.len;
+X	while (len > 4) {
+X		len -= 4;
+X		if ((*hp++ != BASE1) || (*hp++ != BASE1) ||
+X			(*hp++ != BASE1) || (*hp++ != BASE1))
+X				return FALSE;
+X	}
+X	while (--len > 0) {
+X		if (*hp++ != BASE1)
+X			return FALSE;
+X	}
+X	digit = *hp + 1;
+X	return ((digit & -digit) == digit);	/* NEEDS 2'S COMPLEMENT */
+X}
+X
+X
+X/*
+X * Return the number whose binary representation contains only one bit which
+X * is in the specified position (counting from zero).  This is equivilant
+X * to raising two to the given power.
+X */
+Xvoid
+Xzbitvalue(n, res)
+X	long n;
+X	ZVALUE *res;
+X{
+X	ZVALUE z;
+X
+X	if (n < 0) n = 0;
+X	z.sign = 0;
+X	z.len = (n / BASEB) + 1;
+X	z.v = alloc(z.len);
+X	clearval(z);
+X	z.v[z.len-1] = (((HALF) 1) << (n % BASEB));
+X	*res = z;
+X}
+X
+X
+X/*
+X * Compare a number against zero.
+X * Returns the sgn function of the number (-1, 0, or 1).
+X */
+XFLAG
+Xztest(z)
+X	ZVALUE z;
+X{
+X	register int sign;
+X	register HALF *h;
+X	register long len;
+X
+X	sign = 1;
+X	if (z.sign)
+X		sign = -sign;
+X	h = z.v;
+X	len = z.len;
+X	while (len--)
+X		if (*h++)
+X			return sign;
+X	return 0;
+X}
+X
+X
+X/*
+X * Compare two numbers to see which is larger.
+X * Returns -1 if first number is smaller, 0 if they are equal, and 1 if
+X * first number is larger.  This is the same result as ztest(z2-z1).
+X */
+XFLAG
+Xzrel(z1, z2)
+X	ZVALUE z1, z2;
+X{
+X	register HALF *h1, *h2;
+X	register long len1, len2;
+X	int sign;
+X
+X	sign = 1;
+X	if (z1.sign < z2.sign)
+X		return 1;
+X	if (z2.sign < z1.sign)
+X		return -1;
+X	if (z2.sign)
+X		sign = -1;
+X	len1 = z1.len;
+X	len2 = z2.len;
+X	h1 = z1.v + z1.len - 1;
+X	h2 = z2.v + z2.len - 1;
+X	while (len1 > len2) {
+X		if (*h1--)
+X			return sign;
+X		len1--;
+X	}
+X	while (len2 > len1) {
+X		if (*h2--)
+X			return -sign;
+X		len2--;
+X	}
+X	while (len1--) {
+X		if (*h1-- != *h2--)
+X			break;
+X	}
+X	if ((len1 = *++h1) > (len2 = *++h2))
+X		return sign;
+X	if (len1 < len2)
+X		return -sign;
+X	return 0;
+X}
+X
+X
+X/*
+X * Compare two numbers to see if they are equal or not.
+X * Returns TRUE if they differ.
+X */
+XBOOL
+Xzcmp(z1, z2)
+X	ZVALUE z1, z2;
+X{
+X	register HALF *h1, *h2;
+X	register long len;
+X
+X	if ((z1.sign != z2.sign) || (z1.len != z2.len) || (*z1.v != *z2.v))
+X		return TRUE;
+X	len = z1.len;
+X	h1 = z1.v;
+X	h2 = z2.v;
+X	while (len-- > 0) {
+X		if (*h1++ != *h2++)
+X			return TRUE;
+X	}
+X	return FALSE;
+X}
+X
+X
+X/*
+X * Internal utility subroutines
+X */
+Xstatic void
+Xdadd(z1, z2, y, n)
+X	ZVALUE z1, z2;
+X	long y, n;
+X{
+X	HALF *s1, *s2;
+X	short carry;
+X	long sum;
+X
+X	s1 = z1.v + y - n;
+X	s2 = z2.v;
+X	carry = 0;
+X	while (n--) {
+X		sum = (long)*s1 + (long)*s2 + carry;
+X		carry = 0;
+X		if (sum >= BASE) {
+X			sum -= BASE;
+X			carry = 1;
+X		}
+X		*s1 = (HALF)sum;
+X		++s1;
+X		++s2;
+X	}
+X	sum = (long)*s1 + carry;
+X	*s1 = (HALF)sum;
+X}
+X
+X
+X/*
+X * Do subtract for divide, returning TRUE if subtraction went negative.
+X */
+Xstatic BOOL
+Xdsub(z1, z2, y, n)
+X	ZVALUE z1, z2;
+X	long y, n;
+X{
+X	HALF *s1, *s2, *s3;
+X	FULL i1;
+X	BOOL neg;
+X
+X	neg = FALSE;
+X	s1 = z1.v + y - n;
+X	s2 = z2.v;
+X	if (++n > z2.len)
+X		n = z2.len;
+X	while (n--) {
+X		i1 = (FULL) *s1;
+X		if (i1 < (FULL) *s2) {
+X			s3 = s1 + 1;
+X			while (s3 < z1.v + z1.len && !(*s3)) {
+X				*s3 = BASE1;
+X				++s3;
+X			}
+X			if (s3 >= z1.v + z1.len)
+X				neg = TRUE;
+X			else
+X				--(*s3);
+X			i1 += BASE;
+X		}
+X		*s1 = i1 - (FULL) *s2;
+X		++s1;
+X		++s2;
+X	}
+X	return neg;
+X}
+X
+X
+X/*
+X * Multiply a number by a single 'digit'.
+X * This is meant to be used only by the divide routine, and so the
+X * destination area must already be allocated and be large enough.
+X */
+Xstatic void
+Xdmul(z, mul, dest)
+X	ZVALUE z;
+X	FULL mul;
+X	ZVALUE *dest;
+X{
+X	register HALF *zp, *dp;
+X	SIUNION sival;
+X	FULL carry;
+X	long len;
+X
+X	dp = dest->v;
+X	dest->sign = 0;
+X	if (mul == 0) {
+X		dest->len = 1;
+X		*dp = 0;
+X		return;
+X	}
+X	len = z.len;
+X	zp = z.v + len - 1;
+X	while ((*zp == 0) && (len > 1)) {
+X		len--;
+X		zp--;
+X	}
+X	dest->len = len;
+X	zp = z.v;
+X	carry = 0;
+X	while (len >= 4) {
+X		len -= 4;
+X		sival.ivalue = (mul * ((FULL) *zp++)) + carry;
+X		*dp++ = sival.silow;
+X		sival.ivalue = (mul * ((FULL) *zp++)) + ((FULL) sival.sihigh);
+X		*dp++ = sival.silow;
+X		sival.ivalue = (mul * ((FULL) *zp++)) + ((FULL) sival.sihigh);
+X		*dp++ = sival.silow;
+X		sival.ivalue = (mul * ((FULL) *zp++)) + ((FULL) sival.sihigh);
+X		*dp++ = sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	while (--len >= 0) {
+X		sival.ivalue = (mul * ((FULL) *zp++)) + carry;
+X		*dp++ = sival.silow;
+X		carry = sival.sihigh;
+X	}
+X	if (carry) {
+X		*dp = (HALF)carry;
+X		dest->len++;
+X	}
+X}
+X
+X
+X/*
+X * Utility to calculate the gcd of two small integers.
+X */
+Xlong
+Xiigcd(i1, i2)
+X	long i1, i2;
+X{
+X	FULL f1, f2, temp;
+X
+X	f1 = (FULL) ((i1 >= 0) ? i1 : -i1);
+X	f2 = (FULL) ((i2 >= 0) ? i2 : -i2);
+X	while (f1) {
+X		temp = f2 % f1;
+X		f2 = f1;
+X		f1 = temp;
+X	}
+X	return (long) f2;
+X}
+X
+X
+Xvoid
+Xtrim(z)
+X	ZVALUE *z;
+X{
+X	register HALF *h;
+X	register long len;
+X
+X	h = z->v + z->len - 1;
+X	len = z->len;
+X	while (*h == 0 && len > 1) {
+X		--h;
+X		--len;
+X	}
+X	z->len = len;
+X}
+X
+X
+X/*
+X * Utility routine to shift right.
+X */
+Xvoid
+Xshiftr(z, n)
+X	ZVALUE z;
+X	long n;
+X{
+X	register HALF *h, *lim;
+X	FULL mask, maskt;
+X	long len;
+X
+X	if (n >= BASEB) {
+X		len = n / BASEB;
+X		h = z.v;
+X		lim = z.v + z.len - len;
+X		while (h < lim) {
+X			h[0] = h[len];
+X			++h;
+X		}
+X		n -= BASEB * len;
+X		lim = z.v + z.len;
+X		while (h < lim)
+X			*h++ = 0;
+X	}
+X	if (n) {
+X		len = z.len;
+X		h = z.v + len - 1;
+X		mask = 0;
+X		while (len--) {
+X			maskt = (((FULL) *h) << (BASEB - n)) & BASE1;
+X			*h = (*h >> n) | mask;
+X			mask = maskt;
+X			--h;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Utility routine to shift left.
+X */
+Xvoid
+Xshiftl(z, n)
+X	ZVALUE z;
+X	long n;
+X{
+X	register HALF *h;
+X	FULL mask, i;
+X	long len;
+X
+X	if (n >= BASEB) {
+X		len = n / BASEB;
+X		h = z.v + z.len - 1;
+X		while (!*h)
+X			--h;
+X		while (h >= z.v) {
+X			h[len] = h[0];
+X			--h;
+X		}
+X		n -= BASEB * len;
+X		while (len)
+X			h[len--] = 0;
+X	}
+X	if (n > 0) {
+X		len = z.len;
+X		h = z.v;
+X		mask = 0;
+X		while (len--) {
+X			i = (((FULL) *h) << n) | mask;
+X			if (i > BASE1) {
+X				mask = i >> BASEB;
+X				i &= BASE1;
+X			} else
+X				mask = 0;
+X			*h = (HALF) i;
+X			++h;
+X		}
+X	}
+X}
+X
+X/*
+X * initmasks - init the bitmask rotation arrays
+X *
+X * bitmask[i] 	 (1 << (i-1)),  for  -BASEB*4<=i<=BASEB*4
+X * rotmask[j][k] (1 << ((j+k-1)%BASEB)),  for  -BASEB*2<=j,k<=BASEB*2
+X *
+X * The bmask array contains 8 cycles of rotations of a bit mask.
+X * We point bitmask and the rotmask pointers into the middle to
+X * ensure that we can have a complete two cycle swing forward
+X * and backward.
+X */
+Xvoid
+Xinitmasks()
+X{
+X	int i;
+X
+X	/*
+X	 * setup the bmask array
+X	 */
+X	bmask = alloc((8*BASEB)+1);
+X	for (i=0; i < (8*BASEB)+1; ++i) {
+X		bmask[i] = 1 << (i%BASEB);
+X	}
+X
+X	/*
+X	 * setup the rmask pointers
+X	 */
+X	rmask = (HALF **)malloc(sizeof(HALF *)*((BASEB*4)+2));
+X	for (i = 0; i <= (4*BASEB)+1; ++i) {
+X		rmask[i] = &bmask[(2*BASEB)+i];
+X	}
+X
+X#if 0
+X	/* 
+X	 * setup the rotmask array, allow for -2*BASEB thru 2*BASEB indexing
+X	 */
+X	rotmask = &rmask[2*BASEB];
+X#endif
+X
+X	/*
+X	 * setup the bitmask array to allow -4*BASEB thru 4*BASEB indexing
+X	 */
+X	bitmask = &bmask[4*BASEB];
+X	return;
+X}
+X
+X/* END CODE */
+END_OF_FILE
+if test 32210 -ne `wc -c <'zmath.c'`; then
+    echo shar: \"'zmath.c'\" unpacked with wrong size!
+fi
+# end of 'zmath.c'
+fi
+echo shar: End of archive 15 \(of 21\).
+cp /dev/null ark15isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 21 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

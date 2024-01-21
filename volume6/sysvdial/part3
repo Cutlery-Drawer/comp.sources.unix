@@ -1,0 +1,2114 @@
+Subject: v06i088:  System V generic dial routines (sysVdial), Part3/3
+Newsgroups: mod.sources
+Approved: rs@mirror.UUCP
+
+Submitted by: ihnp4!quest!gene
+Mod.sources: Volume 6, Issue 88
+Archive-name: sysVdial/Part3
+
+[  I did not try to compile this, as we run BSD exlusively.  It appears
+   that the hardest part of doing the port will be emulating the timed-
+   out reads (c_cc[VTIME]) in dial.c  --r$  ]
+
+#	Generic Modem Dialer subroutine and support programs for system V.
+#	
+#	Modem configuration is done in the user configured file
+#	dialinfo.  Should be able to dial any modem (eg Vadic, Hayes)
+#	with a built-in auto dialer.   Replaces ATT dial(3C).
+#	Works with CU, uucico, lp, etc.
+#	
+#	This is part 3 of 3.
+#	
+#	The parts are:
+#	
+#	1)	README file and all documentation.
+#	2)	Makefile, dialinfo, *.h, some *.c files
+#	3)	dial.c
+#	
+#--------CUT---------CUT---------CUT---------CUT--------#
+#########################################################
+#                                                       #
+# This is a shell archive file.  To extract files:      #
+#                                                       #
+#    1)	Create an empty directory for the files.        #
+#    2) Write a file, such as "file.shar", containing   #
+#       this archive file into the directory.           #
+#    3) Type "sh file.shar".  Do not use csh.           #
+#                                                       #
+#########################################################
+echo Creating: dial.c
+sed -e 's/^#//' >dial.c <<'end_dial.c'
+#/****************************************************************
+# *	Copyright 1986, Gene H. Olson, Quest Research, Burnsville   *
+# *	Minnesota.   Permission to copy and distribute this         *
+# *	program, all associated code in source and binary form,     *
+# *	for any purpose, so long as this notice is preserved.       *
+# ****************************************************************/
+#
+#
+#/********************************************************************
+# *          System V dial(3) generic modem dialer.                  *
+# ********************************************************************/
+#
+##include <stdio.h>
+##include <time.h>
+##include <setjmp.h>
+##include <signal.h>
+##include <fcntl.h>
+##include <ctype.h>
+##include <errno.h>
+##include <termio.h>
+#
+##include "dial.h"
+##include "dialinfo.h"
+#
+##define loop for(;;)
+#
+##define YIPE(x) { if ((x) < 0) yipe(__LINE__); }
+##define NS(x) ( (x) ? (x) : nullstring )
+#
+#extern int errno ;
+#extern int sys_nerr ;
+#extern char *sys_errlist[] ;
+#
+#extern void perror() ;
+#extern int (*signal())() ;
+#extern struct tm *localtime() ;
+#extern char *getenv() ;
+#extern unsigned alarm() ;
+#extern long time() ;
+#extern char *ttyname() ;
+#extern char *strcat() ;
+#extern char *strcpy() ;
+#extern char *strncpy() ;
+#extern char *strncat() ;
+#extern void exit() ;
+#extern unsigned sleep() ;
+#
+#extern char *parseshort() ;
+#extern void dialfree() ;
+#
+#
+#/*
+# *	Externally visible stuff.
+# */
+#
+#int nolock ;						/* Disable lockfile usage */
+#
+#char *ldevice[9] ;					/* L-devices pointer array */
+#
+#char dialdev[50];					/* Device pathname */
+#char diallock[50];					/* Lockfile pathname */
+#char dialnum[50] ;					/* Telephone number */
+#
+#int dialfd ;						/* Dialer file descriptor */
+#
+#/*
+# *	Local storage.
+# */
+#
+#static jmp_buf jmpstate ;			/* Interrupt recovery */
+#
+#static char ldbuf[100] ;			/* L-devices buffer */
+#
+#static int iflags[4] ;				/* Initial termio c_cflag */
+#static int cflags[4] ;				/* Current termio c_cflag */
+#
+#static int carrier ;				/* Carrier detect option */
+#static int debug ;					/* Selected debug options */
+#static int gotalarm ;				/* Dialer alarms */
+#static int inline ;					/* In middle of output line */
+#
+#static char nullstring[] = "(null)" ;
+#
+#/*
+# *	Match list definition.
+# */
+#
+##define NMATCH 20					/* Max # of match strings */
+#
+#typedef struct {
+#	short	m_index ;				/* Number of chars */
+#	short	m_state ;				/* Associated state value */
+#	char*	m_string ;				/* Match string */
+#	} MATCH ;
+#
+#/*
+# *	Dialer state stuff.
+# */
+#
+##define NBUF 1000					/* Size of temporary buffer */
+#
+##define DS_NONE		1001			/* No state defined */
+##define DS_FAIL		1003			/* Fail state */
+##define DS_SUCCEED	1004			/* Succeed state */
+##define DS_TIMEOUT	1005			/* Timeout state */
+##define DS_HANGUP	1006			/* Hangup state */
+#
+#typedef struct {
+#	short	ds_retry ;				/* Retry counter */
+#	short	ds_sec ;				/* Timeout in seconds */
+#	short	ds_hangup ;				/* Hangup state */
+#	short	ds_timeout ;			/* Timeout state */
+#	short	ds_nmatch ;				/* Number of match items */
+#	MATCH	ds_match[NMATCH] ;		/* Match item array */
+#	char 	*ds_buf ;				/* Current buffer pointer */
+#	char	ds_failmsg[80] ;		/* Failure message */
+#	char	ds_buffer[NBUF] ;		/* Scratch buffer */
+#	} DSTATE ;
+#
+#/*
+# *	Dialer debug options.
+# *
+# *	The user may specify a DIALDEBUG variable in
+# *	the environment, using one or more of the characters
+# *	listed in the table below.   When this is done,
+# *	debugging output is produced.
+# */
+#
+##define D_ALL		0xff			/* Show everything */
+##define D_DEVICE	0x01			/* Show L-device decisions */
+##define D_STATE		0x02			/* Show state transitions */
+##define D_LINE		0x04			/* Show line control actions */
+##define D_MATCH		0x08			/* Show matched strings */
+##define D_COMM		0x10			/* Show transmitted/received comm */
+#
+#static char dtable[] = {
+#	'd',	D_DEVICE,
+#	's',	D_STATE,
+#	'l',	D_LINE,
+#	'm',	D_MATCH,
+#	'c',	(D_COMM|D_LINE|D_MATCH),
+#	'a',	(D_DEVICE|D_STATE|D_LINE|D_MATCH|D_COMM),
+#	0 } ;
+#
+#
+#/*
+# *	Dialer baud rate table.
+# */
+#
+#static short btable[] = {
+#	50,		CSTOPB|B50,
+#	75,		CSTOPB|B75,
+#	110,	CSTOPB|B110,
+#	134,	CSTOPB|B134,
+#	150,	B150,
+#	200,	B200,
+#	300,	B300,
+#	600,	B600,
+#	1200,	B1200,
+#	1800,	B1800,
+#	2400,	B2400,
+#	4800,	B4800,
+#	9600,	B9600,
+#	0 } ;
+#
+#
+#
+#/******
+# *	getbaud - Get baud rate entry.
+# */
+#
+#static int
+#getbaud(rate)
+#int rate ;
+#{
+#	register short *sp ;
+#
+#	for (sp = btable ;; sp += 2) {
+#		if (sp[0] == 0) return(-1) ;
+#		if (sp[0] == rate) return(sp[1]) ;
+#		}
+#	}
+#
+#
+#
+#/*****
+# *	errstring - Get system error string.
+# */
+#
+#static
+#char *
+#errstring()
+#{
+#	static char buf[20] ;
+#
+#	if ((unsigned) errno <= sys_nerr) return(sys_errlist[errno]) ;
+#
+#	(void) sprintf(buf, "errno=%d", errno) ;
+#	return(buf) ;
+#	}
+#
+#
+#
+#/*****
+# *	dialmsg - Dialer debug output routine.
+# */
+#
+#/*VARARGS1*/
+#void
+#dialmsg(s, args)
+#char *s ;							/* Printf-style string */
+#struct { char _arg[16] ; } args ;	/* Printf-style arguments */
+#{
+#	struct tm tm ;
+#	long clock ;
+#
+#	/*
+#	 *	Finish up any line in progress.
+#	 */
+#
+#	if (inline) {
+#		(void) putc('\n', stderr) ;
+#		inline = 0 ;
+#		}
+#
+#	/*
+#	 *	Note the time.
+#	 */
+#
+#	if (debug) {
+#		(void) time(&clock) ;
+#		tm = *localtime(&clock) ;
+#
+#		(void) fprintf(stderr,"%02d:%02d:%02d  ",
+#			tm.tm_hour, tm.tm_min, tm.tm_sec
+#			) ;
+#		}
+#
+#	/*
+#	 *	Output the user's message.
+#	 */
+#
+#	(void) fprintf(stderr, s, args) ;
+#	(void) fflush(stderr) ;
+#	}
+#
+#
+#
+#/*****
+# *	yipe - Print error messages for unexpected errors.
+# */
+#
+#static void
+#yipe(lineno)
+#int lineno ;
+#{
+#	dialmsg("dial.c line %d: %s\n", lineno, errstring()) ;
+#	}
+#
+#
+#
+#/*****
+# *	wakeup - Wakeup on alarm interrupts.
+# */
+#
+#static int
+#wakeup()
+#{
+#	/*
+#	 *	Note that we got the interrupt, re-arm for
+#	 *	the next interrupt, and schedule another one
+#	 *	so we can't get caught in a window where the
+#	 *	interrupt is lost.
+#	 */
+#
+#	gotalarm = 1 ;
+#	(void) signal(SIGALRM, wakeup) ;
+#	return alarm(1) ;
+#	}
+#
+#
+#
+#/*****
+# *	catch - Catch SIGHUP, SIGINT, SIGQUIT, SIGTERM.
+# */
+#
+#static int
+#catch(num)
+#{
+#	/*
+#	 *	Do a longjump back to "dial" which will then
+#	 *	return failure.
+#	 */
+#
+#	if (debug) dialmsg("Got signal: %d\n", num) ;
+#	longjmp(jmpstate,num) ;
+#	}
+#
+#
+#
+#/*****
+# *	showchar - Display a character in unambiguous format.
+# */
+#
+#static void
+#showchar(ch)
+#register int ch ;
+#{
+#	if (ch < 0x20) {
+#		(void) putc('^', stderr) ;
+#		ch |= 0x40 ;
+#		}
+#
+#	(void) putc(ch, stderr) ;
+#	}
+#
+#
+#
+#/*****
+# *	showstring - Show a string in an unambigous format.
+# */
+#
+#static void
+#showstring(str)
+#register char *str ;
+#{
+#	while (*str) showchar(*str++) ;
+#	}
+#
+#
+#
+#/*****
+# *	dialerror - Handle communication error.
+# */
+#
+#static void
+#dialerror()
+#{
+#	/*
+#	 *	Flush the tty and make sure we aren't blocked
+#	 *	by XOFF.
+#	 */
+#
+#	YIPE(ioctl(dialfd,TCFLSH,2)) ;
+#	YIPE(ioctl(dialfd,TCXONC,1)) ;
+#
+#	if (debug & D_LINE) {
+#		dialmsg("Flushed device.\n") ;
+#		}
+#	}
+#
+#
+#
+#/******
+# *	setflags - Set termio flags on communication line.
+# */
+#
+#static void
+#setflags()
+#{
+#	static struct termio tio ;
+#
+#	tio.c_iflag = IGNPAR|IGNBRK|ISTRIP ;
+#	tio.c_oflag = 0 ;
+#	tio.c_cflag = cflags[carrier] ;
+#	tio.c_lflag = NOFLSH ;
+#
+#	tio.c_cc[VMIN] = 10 ;
+#	tio.c_cc[VTIME] = 1 ;
+#
+#	YIPE(ioctl(dialfd,TCSETA,&tio)) ;
+#
+#	if (debug & D_LINE) dialmsg("Control flags now: %06o\n", tio.c_cflag) ;
+#	}
+#
+#
+#
+#/*****
+# *	dropdtr - Drop DTR for a "n" seconds.
+# */
+#
+#void
+#dropdtr(n)
+#short n ;					/* Number of seconds to hang up */
+#{
+#	/*
+#	 *	Hang up the line.
+#	 */
+#
+#	carrier = 0 ;
+#	cflags[0] = 0 ;
+#	setflags() ;
+#
+#	/*
+#	 *	Sleep for the specified interval.
+#	 */
+#
+#	if (debug & D_LINE) dialmsg("Dropping DTR for %d seconds\n", n) ;
+#
+#	(void) sleep((unsigned) n) ;
+#
+#	/*
+#	 *	Raise DTR, and restore the baud rate.
+#	 */
+#
+#	cflags[0] = iflags[0] ;
+#	cflags[1] = iflags[1] ;
+#	cflags[2] = iflags[2] ;
+#	cflags[3] = iflags[3] ;
+#
+#	setflags() ;
+#
+#	/*
+#	 *	For some reason, this open appears to be necessary,
+#	 *	at least on Plexus.
+#	 */
+#
+#	YIPE(close(open(dialdev, O_RDWR))) ;
+#	}
+#
+#
+#
+#/****
+# *	setcarrier - Set carrier detect option.
+# *
+# *	state 	0 = set default c_cflags and CLOCAL.
+# *			1 = set user c_cflags and CLOCAL.
+# *			2 = set user c_cflags and call.modem CLOCAL option.
+# *			3 = use user c_cflags and ~CLOCAL.
+# */
+#
+#static void
+#setcarrier(state)
+#int state ;				/* Set carrier detect */
+#{
+#	/*
+#	 *	Enable or disable carrier sense.
+#	 */
+#
+#	if (state != carrier) {
+#		carrier = state ;
+#
+#		setflags() ;
+#
+#		if (debug & D_LINE) dialmsg("Set connect option %d\n", state) ;
+#		}
+#	}
+#
+#
+#
+#/*****
+# *	newbaud - Change baud rate.
+# */
+#
+#static int
+#newbaud(baud)
+#int baud ;						/* New baud rate */
+#{
+#	register int i ;
+#
+#	i = getbaud(baud) ;
+#	if (i == -1) return(A_PROB) ;
+#
+#	cflags[0] = (cflags[0] & ~(CSTOPB|CBAUD)) | i ;
+#	cflags[1] = (cflags[1] & ~(CSTOPB|CBAUD)) | i ;
+#	cflags[2] = (cflags[2] & ~(CSTOPB|CBAUD)) | i ;
+#	cflags[3] = (cflags[3] & ~(CSTOPB|CBAUD)) | i ;
+#
+#	setflags() ;
+#
+#	if (debug & D_LINE) dialmsg("New baud rate: %d\n", baud) ;
+#	return(0) ;
+#	}
+#
+#
+#
+#/*****
+# *	waitcarrier - Wait for carrier.
+# */
+#
+#static int
+#waitcarrier(timeout)
+#short timeout ;				/* Max time to wait */
+#{
+#	register int fd ;
+#
+#	if (debug & D_LINE) dialmsg("Waiting for carrier detect.\n") ;
+#
+#	(void) alarm((unsigned)timeout) ;
+#
+#	fd = open(dialdev, O_RDWR) ;
+#	if (fd < 0) {
+#		if (debug & D_LINE) dialmsg("%s: %s\n", errstring(), dialdev) ;
+#		}
+#	else {
+#		(void) close(fd) ;
+#		if (debug & D_LINE) dialmsg("Carrier detected.\n") ;
+#		}
+#
+#	(void) alarm(0) ;
+#
+#	return(fd) ;
+#	}
+#
+#
+#
+#/*****
+# *	dialopen - Open communication line device.
+# */
+#
+#static int
+#dialopen()
+#{
+#	/*
+#	 *	Open the tty communication line device with O_NDELAY.
+#	 *	Once the device is open, turn off O_NDELAY.
+#	 */
+#
+#	dialfd = open(dialdev, O_RDWR|O_NDELAY) ;
+#	if (dialfd < 0) {
+#		if (debug) dialmsg("%s: %s\n", errstring(), dialdev) ;
+#		return(-1) ;
+#		}
+#
+#	if (debug & D_LINE) dialmsg("Opened comm line.\n") ;
+#
+#	/*
+#	 *	Turn off carrier sense.
+#	 */
+#
+#	carrier = -1 ;
+#	setcarrier(0) ;
+#
+#	/*
+#	 *	For some reason, this open appears to be necessary,
+#	 *	at least on Plexus.
+#	 */
+#
+#	YIPE(close(open(dialdev, O_RDWR))) ;
+#
+#	/*
+#	 *	Turn off NDELAY, flush I/O and unblock output.
+#	 */
+#
+#	YIPE(fcntl(dialfd, F_SETFL, O_RDWR)) ;
+#	YIPE(ioctl(dialfd, TCFLSH, 2)) ;
+#	YIPE(ioctl(dialfd, TCXONC, 1)) ;
+#
+#	return(0) ;
+#	}
+#
+#
+#
+#/*****
+# *	dialbreak - Send break.
+# */
+#
+#static void
+#dialbreak()
+#{
+#	YIPE(ioctl(dialfd,TCSBRK,0)) ;
+#
+#	if (debug & (D_LINE|D_COMM)) dialmsg("Sent break signal.\n") ;
+#	}
+#
+#
+#
+#/****
+# *	dialclose - Close communication line.
+# */
+#
+#static void
+#dialclose()
+#{
+#	YIPE(ioctl(dialfd,TCFLSH,2)) ;
+#	YIPE(close(dialfd)) ;
+#	dialfd = -1 ;
+#
+#	if (debug & D_LINE) {
+#		dialmsg("Closed comm device.\n") ;
+#		}
+#	}
+#
+#
+#
+#/*****
+# *	send - Send characters to the comm line.
+# */
+#
+#static int
+#send(buf)
+#char *buf ;						/* Buffer to send */
+#{
+#	register short nsend ;
+#	register short nbyte ;
+#
+#	/*
+#	 *	Flush I/O queues and make sure we are not blocked
+#	 *	by an XOFF.
+#	 */
+#
+#	YIPE(ioctl(dialfd,TCFLSH,2)) ;
+#	YIPE(ioctl(dialfd,TCXONC,1)) ;
+#
+#	/*
+#	 *	Setup an alarm to detect transmit failure and
+#	 *	write the data.
+#	 */
+#
+#	gotalarm = 0 ;
+#	(void) alarm(10) ;
+#
+#	nsend = strlen(buf) ;
+#	nbyte = write(dialfd, buf, (unsigned) nsend) ;
+#
+#	(void) alarm(0) ;
+#
+#	/*
+#	 *	Debug print.
+#	 */
+#
+#	if (debug & D_COMM) {
+#		dialmsg("Sent: ") ;
+#		showstring(buf) ;
+#		(void) putc('\n', stderr) ;
+#		}
+#
+#	/*
+#	 *	Return status.
+#	 */
+#
+#	return (nbyte != nsend || gotalarm) ? -1 : 0 ;
+#	}
+#
+#
+#
+#/****
+# *	receive - Receive data from the comm line until a
+# *	          recognized state, a hangup, or a timeout
+# *	          is detected.
+# */
+#
+#static int
+#receive(nmatch, match, sec)
+#short nmatch ;						/* Number of match items */
+#MATCH *match ;						/* Match string array */
+#short sec ;							/* Timeout */
+#{
+#	register MATCH *mp ;
+#	register char *s ;
+#	register short ch ;
+#	register short index ;
+#	register short i ;
+#	register short last ;
+#	register short l ;
+#	register short n ;
+#	short state ;
+#	char buf[4] ;
+#
+#	state = DS_NONE ;
+#	match += nmatch ;
+#
+#	gotalarm = 0 ;
+#	(void) alarm((unsigned)sec) ;
+#
+#	/*
+#	 *	Major loop - read data and scan for a state.
+#	 */
+#
+#	loop {
+#		/*
+#		 *	Read the next input character.  This is done
+#		 *	unbuffered deliberately,  so we don't read
+#		 *	ahead any data we want to leave in the buffer
+#		 *	for the caller.
+#		 */
+#
+#		if (gotalarm == 0) {
+#			n = read(dialfd, buf, 1) ;
+#			if (n < 0 && (debug & D_LINE)) {
+#				dialmsg("Read: %d, %s\n", n, errstring()) ;
+#				}
+#			}
+#
+#		/*
+#		 *	Handle timeout condition.
+#		 */
+#
+#		if (gotalarm) {
+#			if (debug & (D_LINE|D_MATCH)) dialmsg("Receive timeout.\n") ;
+#			dialerror() ;
+#			state = DS_TIMEOUT ;
+#			break ;
+#			}
+#
+#		/*
+#		 *	Handle hangup condition.
+#		 */
+#
+#		if (n == 0) {
+#			if (debug & (D_LINE|D_MATCH)) dialmsg("Lost carrier.\n") ;
+#			dialerror() ;
+#			state = DS_HANGUP ;
+#			break ;
+#			}
+#
+#		/*
+#		 *	Handle unexpected error and fail.
+#		 */
+#
+#		if (n != 1) {
+#			dialmsg("Read returned %d, %s\n", n, errstring) ;
+#			dialerror() ;
+#			state = DS_FAIL ;
+#			break ;
+#			}
+#
+#		/*
+#		 *	Utterly ignore nulls and rubouts.
+#		 */
+#
+#		ch = buf[0] ;
+#		if (ch == 0 || ch == 0x7f) continue ;
+#
+#		/*
+#		 *	Debug print.
+#		 */
+#
+#		if (debug & D_COMM) {
+#			if (inline == 0) {
+#				dialmsg("Got: ") ;
+#				inline = 1 ;
+#				}
+#			showchar(ch) ;
+#			if (ch == '\n') {
+#				(void) putc('\n', stderr) ;
+#				(void) fflush(stderr) ;
+#				inline = 0 ;
+#				}
+#			}
+#
+#		/*
+#		 *	Match the received character against all
+#		 *	the expected receive match strings.
+#		 *
+#		 *	Each match item contains an "index" which
+#		 *	keeps track of the number of characters matched
+#		 *	so far.
+#		 *
+#		 *	When all characters in a string are matched,
+#		 *	we return the associated "state".
+#		 *
+#		 *	When a character match fails, "index" is
+#		 *	backed down accordingly.
+#		 */
+#
+#		n = nmatch ;
+#		mp = match ;
+#
+#		while (--n >= 0) {
+#			--mp ;
+#			index = mp->m_index ;
+#			s = mp->m_string ;
+#
+#			if (ch == s[index]) {
+#				index++ ;
+#				if (s[index] == 0) {
+#					state = mp->m_state ;
+#					break ;
+#					}
+#				}
+#
+#			else if (index != 0) {
+#				last = index ;
+#				index-- ;
+#				loop {
+#					if (ch == s[index]) {
+#						i = index ;
+#						l = last ;
+#						while (--i >= 0 && s[i] == s[--l]) ;
+#						if (i < 0) break ;
+#						}
+#					if (--index < 0) break ;
+#					}
+#				index++ ;
+#				}
+#
+#			mp->m_index = index ;
+#			}
+#
+#		if (state != DS_NONE) {
+#			if (debug & D_MATCH) {
+#				dialmsg("Matched: ") ;
+#				showstring(s) ;
+#				(void) putc('\n', stderr) ;
+#				(void) fflush(stderr) ;
+#				}
+#			break ;
+#			}
+#		}
+#
+#	(void) alarm(0) ;
+#
+#	if (inline) {
+#		(void) putc('\n', stderr) ;
+#		(void) fflush(stderr) ;
+#		}
+#
+#	return(state) ;
+#	}
+#
+#
+#
+#/******
+# *	statestr - Generate state string representation.
+# */
+#
+#static void
+#statestr(str, state)
+#char *str ;						/* Destination string */
+#int state ;						/* State to display */
+#{
+#	if (state == DS_FAIL) (void) strcpy(str, "-") ;
+#	else if (state == DS_SUCCEED) (void) strcpy(str, "+") ;
+#	else (void) sprintf(str, "%d", state) ;
+#	}
+#
+#
+#
+#/******
+# *	expand - Expand string.
+# */
+#
+#static void
+#expand(dest, source, di)
+#register char *dest ;				/* Destination string */
+#register char *source ;				/* Source string */
+#DINFO *di ;							/* Dial info structure */
+#{
+#	register char *cp ;
+#	register char *rp ;
+#	register short ch ;
+#	register short c ;
+#	register int i ;
+#
+#	rp = 0 ;
+#
+#	while (ch = *source++) {
+#
+#		/*
+#		 *	Get control character escapes.
+#		 */
+#
+#		if (ch == '^') ch = *source++ & 0x1f ;
+#
+#		/*
+#		 *	Handle escape characters.
+#		 */
+#
+#		else if (ch == '\\') {
+#
+#			switch (ch = *source++) {
+#
+#				/*
+#				 *	Standard "C" escapes.
+#				 */
+#
+#				case 'f':
+#					ch = '\f' ;
+#					break ;
+#
+#				case 'b':
+#					ch = '\b' ;
+#					break ;
+#
+#				case 'n':
+#					ch = '\n' ;
+#					break ;
+#
+#				case 'r':
+#					ch = '\r' ;
+#					break ;
+#
+#				case 't':
+#					ch = '\t' ;
+#					break ;
+#
+##ifndef lint
+#				/*
+#				 *	Hex character constant.
+#				 */
+#
+#				case '$':
+#					ch = 0 ;
+#					i = 2 ;
+#					loop {
+#						c = *source ;
+#						if ('0' <= c && c <= '9') c -= '0' ;
+#						else if ('A' <= c && c <= 'F') c -= 'A' - 10 ;
+#						else if ('a' <= c && c <= 'f') c -= 'a' - 10 ;
+#						else break ;
+#						ch = 16 * ch + c ;
+#						source++ ;
+#						if (--i == 0) break ;
+#						}
+#					break ;
+##endif
+#
+#				/*
+#				 *	Octal character constant.
+#				 */
+#
+#				case '0':
+#				case '1':
+#				case '2':
+#				case '3':
+#				case '4':
+#				case '5':
+#				case '6':
+#				case '7':
+#					ch = 0 ;
+#					i = 3 ;
+#					loop {
+#						c = *source ;
+#						if ('0' <= c && c <= '7') c -= '0' ;
+#						else break ;
+#						ch = 8 * ch + c ;
+#						source++ ;
+#						if (--i == 0) break ;
+#						}
+#					break ;
+#
+#				default:
+#					ch = *source++ ;
+#				}
+#			}
+#
+#		/*
+#		 *	Handle %x escapes.
+#		 */
+#
+#		else if (ch == '%') {
+#
+#			switch(ch = *source++) {
+#
+#				/*
+#				 *	Columns 1-9 of L-devices.
+#				 */
+#
+#				case '1':
+#				case '2':
+#				case '3':
+#				case '4':
+#				case '5':
+#				case '6':
+#				case '7':
+#				case '8':
+#				case '9':
+#					rp = ldevice[ch - '0'] ;
+#					break ;
+#
+#				/*
+#				 *	Environment variable.
+#				 */
+#
+#				case '{':
+#					ch = 0 ;
+#					cp = source ;
+#					rp = dest ;
+#					loop {
+#						if (*cp == 0) {
+#							rp = "%{";
+#							break;
+#							}
+#						if (*cp == '}') {
+#							*rp = 0;
+#							rp = getenv(dest);
+#							source = cp + 1;
+#							break;
+#							}
+#						*rp++ = *cp++;
+#						}
+#					break;
+#
+#				/*
+#				 *	Untranslated phone number.
+#				 */
+#
+#				case 'n':
+#					rp = dialnum ;
+#					break;
+#
+#				/*
+#				 *	Translated telephone number.
+#				 */
+#
+#				case 'N':
+#					cp = dialnum;
+#					while (ch = *cp++) {
+#						switch (ch) {
+#							case '*':
+#							case ':':
+#							case 's':
+#								rp = di->di_star ;
+#								break ;
+#
+#							case '#':
+#							case ';':
+#							case 'p':
+#								rp = di->di_pound ;
+#								break ;
+#
+#							case '-':
+#							case 'd':
+#								rp = di->di_delay ;
+#								break ;
+#
+#							case '=':
+#							case 'w':
+#								rp = di->di_wait ;
+#								break ;
+#
+#							case 'f':
+#								rp = di->di_flash ;
+#								break ;
+#							}
+#
+#						if (rp != 0) {
+#							while (*rp) *dest++ = *rp++ ;
+#							rp = 0 ;
+#							}
+#						else *dest++ = ch ;
+#						}
+#					break;
+#
+#				/*
+#				 *	%% becomes %.
+#				 */
+#
+#				case '%':
+#					break;
+#
+#				/*
+#				 *	Other %x escapes pass through untouched.
+#				 */
+#
+#				default:
+#					*dest++ = '%';
+#					break;
+#				}
+#			}
+#
+#		/*
+#		 *	Output translate string, translated character,
+#		 *	or original character untouched.
+#		 */
+#
+#		if (rp != 0) {
+#			while (*rp) *dest++ = *rp++ ;
+#			rp = 0;
+#			}
+#
+#		else if (ch != 0) *dest++ = ch ;
+#		}
+#
+#	*dest = 0 ;
+#	}
+#
+#
+#
+##if 0
+#/******
+# *	sysname - Read L.sys file and look up phone number as
+# *	          system name.
+# */
+#
+#static void
+#sysname(telno)
+#register char *telno ;
+#{
+#	register FILE *file ;
+#	register short ch ;
+#	register short i ;
+#	char *word[5] ;
+#	register char *bp ;
+#	char buf[80] ;
+#	static char fname[] = "/usr/lib/uucp/L.sys" ;
+#
+#	file = fopen(fname, "r") ;
+#	if (file == 0) {
+#		if (errno != EACCES) dialmsg("%s: %s\n", errstring(), fname) ;
+#		return ;
+#		}
+#
+#	/*
+#	 *	Read all lines from the file.
+#	 */
+#
+#	for (;;) {
+#
+#		/*
+#		 *	Read a line from the file and break it out
+#		 *	into 5 fields separated by white space.
+#		 */
+#
+#		ch = getc(file) ;
+#		bp = buf ;
+#
+#		for (i = 0 ; i < 5 ; i++) {
+#			word[i] = bp ;
+#			while (ch != ' ' && ch != '\t' && ch != '\n') {
+#				if (ch == EOF) goto done ;
+#				if (bp < buf+75) *bp++ = ch ;
+#				ch = getc(file) ;
+#				}
+#			*bp++ = 0 ;
+#			while (ch == ' ' || ch == '\t') ch = getc(file) ;
+#			}
+#
+#		while (ch != '\n') {
+#			ch = getc(file) ;
+#			if (ch == EOF) goto done ;
+#			}
+#
+##if 0
+#		(void) printf("L.sys: %s %s %s %s %s\n",
+#			word[0], word[1], word[2], word[3], word[4]
+#			) ;
+##endif
+#
+#		/*
+#		 *	If the system name matches, and not a direct
+#		 *	entry, replace the phone number with the phone
+#		 *	number for the system.
+#		 */
+#
+#		if	(	strcmp(word[0], telno) == 0
+#			&&	strcmp(word[2], "DIR") != 0
+#			)
+#		{
+#			(void) strcpy(telno, word[4]) ;
+#			break ;
+#			}
+#		}
+#
+#done:
+#	(void) fclose(file) ;
+#	}
+##endif
+#
+#
+#
+#/******
+# *	dialcodes - Read dialcodes file and fool with phone number.
+# */
+#
+#static void
+#dialcodes(telno)
+#register char *telno ;
+#{
+#	register FILE *file ;
+#	register char *cp ;
+#	register int ch ;
+#	register int n ;
+#	char buf[100] ;
+#	static char fname[] = "/usr/lib/uucp/L-dialcodes" ;
+#
+#	/*
+#	 *	Open the dialcodes file.
+#	 */
+#
+#	file = fopen(fname, "r") ;
+#	if (file == 0) {
+#		dialmsg("%s: %s\n", errstring(), fname) ;
+#		return ;
+#		}
+#
+#	/*
+#	 *	Read all lines of the file until a match
+#	 *	or end-of-file is reached.
+#	 */
+#
+#	loop {
+#
+#		/*
+#		 *	Search for a space-terminated code in the file
+#		 *	which matches the phone number prefix.
+#		 *
+#		 *	When a match is found, replace the match prefix
+#		 *	with the remainder of the line.
+#		 */
+#
+#		cp = telno ;
+#		loop {
+#			ch = getc(file) ;
+#			if (ch == ' ') {
+#				(void) strncpy(buf, cp, sizeof(buf)) ;
+#				n = sizeof(buf) - 1 ;
+#				loop {
+#					ch = getc(file) ;
+#					if (ch == EOF || ch == '\n' || --n < 0) break ;
+#					*telno++ = ch ;
+#					}
+#				cp = buf ;
+#				while (*cp && --n >= 0) *telno++ = *cp++ ;
+#				*telno = 0 ;
+#				goto done ;
+#				}
+#			if (ch != *cp++) break ;
+#			}
+#
+#		/*
+#		 *	Skip to end-of-line.
+#		 */
+#
+#		while (ch != '\n') {
+#			if (ch == EOF) goto done ;
+#			ch = getc(file) ;
+#			}
+#		}
+#
+#done:
+#	(void) fclose(file) ;
+#	}
+#
+#
+#
+#static int
+#dostate(state, di, ds, depth)
+#int state ;						/* State number */
+#register DINFO *di ;			/* Dialer information */
+#register DSTATE *ds ;			/* State variables */
+#int depth ;						/* Use state depth */
+#{
+#	register char *cp ;
+#	register char *bp ;
+#	register MATCH *mp ;
+#	char *errp ;
+#	register short ch ;
+#	short i ;
+#
+#	cp = di->di_state[state] ;
+#
+#	if (cp == 0) {
+#		dialmsg("Transferred to undefined state: %d\n", state) ;
+#		return (A_PROB) ;
+#		}
+#
+#	if (depth > 10) {
+#		dialmsg("Use command depth overflow, state: %d\n", state) ;
+#		return(A_PROB) ;
+#		}
+#
+#	if (debug & D_STATE) {
+#		dialmsg("using: s%d=%s\n", state, cp) ;
+#		}
+#
+#	/*
+#	 *	Loop over all commands in string.
+#	 */
+#
+#	loop {
+#
+#		/*
+#		 *	Skip over white space.
+#		 */
+#
+#		ch = *cp++ ;
+#		while (isspace(ch)) ch = *cp++ ;
+#
+#		if (ch == 0) return(DS_NONE) ;
+#
+#		errp = cp - 1 ;
+#
+#		/*
+#		 *	Parse next command in state string.
+#		 */
+#
+#		if (islower(ch)) ch = toupper(ch) ;
+#
+#		switch (ch) {
+#
+#			/*
+#			 *	Parse Break.
+#			 */
+#
+#			case 'B':
+#				break ;
+#
+#			/*
+#			 *	Error messages and modem string.
+#			 */
+#
+#			case 'E':
+#			case 'M':
+#			case 'F':
+#				if (*cp++ != '"') goto error ;
+#				bp = ds->ds_buf ;
+#				loop {
+#					if (*cp == '"') break ;
+#					if (*cp == 0) goto error ;
+#					if (cp[0] == '\\' && cp[1] == ']') cp++ ;
+#					*bp++ = *cp++ ;
+#					}
+#				*bp++ = 0 ;
+#				cp++ ;
+#				break ;
+#
+#			/*
+#			 *	Carrier sense.
+#			 */
+#
+#			case 'C':
+#				cp = parseshort(cp, &i, 0, 4) ;
+#				break ;
+#
+#			/*
+#			 *	Retry decrement.
+#			 */
+#
+#			case 'R':
+#				cp = parseshort(cp, &i, 1, 1000) ;
+#				break ;
+#
+#			/*
+#			 *	Baud rate.
+#			 */
+#
+#			case 'N':
+#				cp = parseshort(cp, &i, 50, 30000) ;
+#				break ;
+#
+#			/*
+#			 *	Delay time, Pause time, and Seconds of timeout.
+#			 */
+#
+#			case 'D':
+#			case 'P':
+#			case 'S':
+#				cp = parseshort(cp, &i, 1, 120) ;
+#				break ;
+#
+#			/*
+#			 *	Pattern match.
+#			 */
+#
+#			case '[':
+#				bp = ds->ds_buf + 50 ;
+#				loop {
+#					if (*cp == ']') break ;
+#					if (*cp == 0) goto error ;
+#					if (cp[0] == '\\' && cp[1] == ']') cp++ ;
+#					*bp++ = *cp++ ;
+#					}
+#				*bp = 0 ;
+#				cp++ ;
+#
+#			/*
+#			 *	Goto, Hangup, and Timeout states.
+#			 */
+#
+#			case 'G':
+#			case 'H':
+#			case 'T':
+#				if (*cp == '+') {
+#					cp++ ;
+#					i = DS_SUCCEED ;
+#					break ;
+#					}
+#				if (*cp == '-') {
+#					cp++ ;
+#					i = DS_FAIL ;
+#					break ;
+#					}
+#
+#			/*
+#			 *	Use other state.
+#			 */
+#
+#			case 'U':
+#				cp = parseshort(cp, &i, 0, NSTATE-1) ;
+#				break ;
+#
+#			default:
+#				cp = 0 ;
+#			}
+#
+#		/*
+#		 *	Handle parsing error.
+#		 */
+#
+#		if (cp == 0) goto error ;
+#
+#		/*
+#		 *	Action parsed okay, now execute it.
+#		 */
+#
+#		switch (ch) {
+#
+#			/*
+#			 *	Send a break signal to the remote.
+#			 */
+#
+#			case 'B':
+#				dialbreak() ;
+#				break ;
+#
+#			/*
+#			 *	Change carrier sense.
+#			 */
+#
+#			case 'C':
+#				if (i <= 3) setcarrier(i) ;
+#				else {
+#					setcarrier(3) ;
+#					i = waitcarrier(ds->ds_sec) ;
+#					if (i < 0) return(DS_TIMEOUT) ;
+#					}
+#				break ;
+#
+#			/*
+#			 *	Drop DTR time.
+#			 */
+#
+#			case 'D':
+#				dropdtr(i) ;
+#				break ;
+#
+#			/*
+#			 *	String to standard error.
+#			 */
+#
+#			case 'E':
+#				expand(bp, ds->ds_buf, di) ;
+#				dialmsg("%s\n", bp) ;
+#				break ;
+#
+#			/*
+#			 *	Fail message string.
+#			 */
+#
+#			case 'F':
+#				expand(ds->ds_failmsg, ds->ds_buf, di) ;
+#				break ;
+#
+#			/*
+#			 *	Unconditional goto.
+#			 */
+#
+#			case 'G':
+#				return(i) ;
+#
+#			/*
+#			 *	Hangup state.
+#			 */
+#
+#			case 'H':
+#				ds->ds_hangup = i ;
+#				break ;
+#
+#			/*
+#			 *	Send control string to modem.
+#			 */
+#
+#			case 'M':
+#				expand(bp, ds->ds_buf, di) ;
+#				if (send(bp) < 0) return(DS_TIMEOUT) ;
+#				break ;
+#
+#			/*
+#			 *	Adopt new baud rate.
+#			 */
+#
+#			case 'N':
+#				if (newbaud(i) < 0) goto error ;
+#				break ;
+#
+#			/*
+#			 *	Pause for specified interval.
+#			 */
+#
+#			case 'P':
+#				if (debug & D_LINE)
+#					dialmsg("Pause for %d seconds\n", i) ;
+#				(void) sleep((unsigned) i) ;
+#				break ;
+#
+#			/*
+#			 *	Decrement retry count.  If it goes negative,
+#			 *	return failure.
+#			 */
+#
+#			case 'R':
+#				ds->ds_retry -= i ;
+#				if (debug & D_STATE)
+#					dialmsg("Decrement retry by %d to %d\n", i, ds->ds_retry) ;
+#				if (ds->ds_retry < 0) return(DS_FAIL) ;
+#				break ;
+#
+#			/*
+#			 *	Seconds of timeout.
+#			 */
+#
+#			case 'S':
+#				ds->ds_sec = i ;
+#				break ;
+#
+#			/*
+#			 *	Timeout state.
+#			 */
+#
+#			case 'T':
+#				ds->ds_timeout = i ;
+#				break ;
+#
+#			/*
+#			 *	Use another state definition string.
+#			 */
+#
+#			case 'U':
+#				i = dostate(i, di, ds, depth+1) ;
+#				if (i != DS_NONE) return(i) ;
+#				break ;
+#
+#			/*
+#			 *	Setup match strings.
+#			 */
+#
+#			case '[':
+#				expand(ds->ds_buf, ds->ds_buf+50, di) ;
+#				if (ds->ds_nmatch >= NMATCH) goto error ;
+#				mp = &ds->ds_match[ds->ds_nmatch++] ;
+#				mp->m_string = ds->ds_buf ;
+#				mp->m_index = 0 ;
+#				mp->m_state = i ;
+#				ds->ds_buf += strlen(ds->ds_buf) + 1 ;
+#				if (ds->ds_buf >= &ds->ds_buffer[NBUF-100]) goto error ;
+#				break ;
+#
+#			default:
+#				goto error ;
+#			}
+#		}
+#
+#	/*
+#	 *	Print diagnostic error.
+#	 */
+#
+#error:
+#	dialmsg("Problem in dialer %s, state %d, field %s\n",
+#		ldevice[2], state, errp) ;
+#	return(A_PROB) ;
+#	}
+#
+#
+#
+#/******
+# *	dialstate - Dialer state machine.
+# *
+# *	Returns:	open file descriptor >= 0 for success.
+# *				error code < 0 for failure.
+# */
+#
+#static int
+#dialstate(di)
+#DINFO *di ;						/* Dialer info structure */
+#{
+#	register short state ;
+#	DSTATE ds ;
+#	register int i ;
+#	register MATCH *mp ;
+#	char str1[10], str2[10] ;
+#
+#	/*
+#	 *	Initialize state machine.
+#	 */
+#
+#	ds.ds_retry = (di->di_retry > 0) ? di->di_retry : 1 ;
+#	ds.ds_sec = 30 ;
+#	ds.ds_timeout = DS_FAIL ;
+#	ds.ds_hangup = DS_FAIL ;
+#	ds.ds_failmsg[0] = 0 ;
+#
+#	cflags[0] = iflags[0] ;
+#	cflags[1] = iflags[1] ;
+#	cflags[2] = iflags[2] ;
+#	cflags[3] = iflags[3] ;
+#
+#	/*
+#	 *	Begin in state 0 with the communication line open.
+#	 */
+#
+#	state = 0 ;
+#	if (dialopen() < 0) return(L_PROB) ;
+#
+#	/*
+#	 *	Process dial states until success or failure.
+#	 */
+#
+#	loop {
+#
+#		if (debug & D_STATE) {
+#			dialmsg("Entering state: %d\n", state) ;
+#			}
+#
+#		/*
+#		 *	Initialize the match list.
+#		 */
+#
+#		ds.ds_nmatch = 0 ;
+#		ds.ds_buf = &ds.ds_buffer[0] ;
+#
+#		/*
+#		 *	Execute the specified state.
+#		 */
+#
+#		state = dostate(state, di, &ds, 1) ;
+#
+#		/*
+#		 *	Do the receive with the user-specified
+#		 *	timeout value.
+#		 */
+#
+#		if (state == DS_NONE) {
+#			if (debug & D_MATCH) {
+#				statestr(str1, ds.ds_hangup) ;
+#				statestr(str2, ds.ds_timeout) ;
+#				dialmsg("Receive parameters: C%d H%s S%d T%s\n",
+#					carrier, str1, ds.ds_sec, str2
+#					) ;
+#				dialmsg("Patterns:") ;
+#				i = ds.ds_nmatch ;
+#				mp = ds.ds_match ;
+#				while (--i >= 0) {
+#					statestr(str1, mp->m_state) ;
+#					(void) fprintf(stderr, " [%s]%s", mp->m_string, str1) ;
+#					mp++ ;
+#					}
+#				(void) fprintf(stderr, "\n") ;
+#				}
+#			state = receive(ds.ds_nmatch, ds.ds_match, ds.ds_sec) ;
+#			}
+#
+#		/*
+#		 *	Determine next state.
+#		 */
+#
+#		if (state == DS_TIMEOUT) {
+#			state = ds.ds_timeout ;
+#			}
+#		else if (state == DS_HANGUP) {
+#			state = ds.ds_hangup ;
+#			}
+#
+#		if (state == DS_NONE) state = 0 ;
+#
+#		if (state == DS_SUCCEED) return(dialfd) ;
+#
+#		if ((unsigned) state >= NSTATE) {
+#			if (*ds.ds_failmsg) dialmsg("%s\n", ds.ds_failmsg) ;
+#			dialclose() ;
+#			return(state >= 0 ? NO_ANS : state) ;
+#			}
+#		}
+#	}
+#
+#
+#
+#/******
+# *	dial - System V dial(3).
+# */
+#
+#int
+#dial(call)
+#CALL call ;						/* See dial(3) */
+#{
+#	register char *cp ;
+#	register char *dp ;
+#	register int i ;
+#	register int n ;
+#	register int ch ;
+#	register FILE *file ;
+#	int lockfd ;
+#	int gotint ;
+#	int gotdinfo ;
+#	int rtn ;
+#	int num ;
+#	int speed ;
+#	unsigned alarmval ;
+#	int (*alarmproc)() ;
+#	int found ;
+#	int (*save)() ;
+#	int (*sigsave[4])() ;
+#	struct termio attr ;
+#	DINFO dinfo ;
+#
+#	static short signum[4] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM } ;
+#
+#	/*
+#	 *	Setup debug print options.
+#	 */
+#
+#	cp = getenv("DIALDEBUG") ;
+#	if (cp) {
+#		while (ch = *cp++) {
+#			for (dp = dtable ; *dp ; dp += 2) {
+#				if (dp[0] == ch) debug |= dp[1] ;
+#				}
+#			}
+#		}
+#
+#	/*
+#	 *	Debug print call parameters.
+#	 */
+#
+#	if (debug) {
+#		dialmsg("Dial called with:\n") ;
+#		dialmsg("\tbaud=%d, speed=%d, line=%s, telno=%s\n",
+#			call.baud, call.speed, NS(call.line), NS(call.telno)) ;
+#		dialmsg("\tmodem=%d, device=%s, devlen=%d\n",
+#			call.modem, NS(call.device), call.dev_len) ;
+#		}
+#
+#	/*
+#	 *	Remove any pathname stuff from the beginning of
+#	 *	the line device name.
+#	 */
+#
+#	if (call.line != 0) {
+#		cp = call.line ;
+#		while (*cp) if (*cp++ == '/') call.line = cp ;
+#		}
+#
+#	/*
+#	 *	Setup to catch interrupts.
+#	 */
+#
+#	lockfd = -1 ;
+#	dialfd = -1 ;
+#	file = 0 ;
+#	gotdinfo = 0 ;
+#
+#	alarmval = alarm(0) ;
+#	if ((alarmproc = signal(SIGALRM, SIG_IGN)) != SIG_IGN)
+#		(void) signal(SIGALRM, wakeup) ;
+#
+#	if (gotint = setjmp(jmpstate)) {
+#		rtn = INTRPT ;
+#		goto done ;
+#		}
+#
+#	for (i = 0 ; i < 4 ; i++)
+#		if ((sigsave[i] = signal(signum[i], SIG_IGN)) != SIG_IGN)
+#			(void) signal(signum[i], catch) ;
+#
+#	/*
+#	 *	Validate baud rates.
+#	 */
+#
+#	if (call.speed <= 0) call.speed = call.baud ;
+#	if (call.baud <= 0) call.baud = call.speed ;
+#
+#	if	(	(call.speed > 0 && getbaud(call.speed) == -1)
+#		||	(call.baud > 0 && getbaud(call.baud) == -1)
+#		)
+#	{
+#		rtn = ILL_BD ;
+#		goto done ;
+#		}
+#
+#	/*
+#	 *	Open and read L-devices file.
+#	 */
+#
+#	file = fopen("/usr/lib/uucp/L-devices", "r") ;
+#	if (file == 0) {
+#		rtn = NO_Ldv ;
+#		goto done ;
+#		}
+#
+#	/*
+#	 *	Traverse the L-devices file.
+#	 */
+#
+#	found = 0 ;
+#
+#	loop {
+#
+#		/*
+#		 *	Get the first 9 fields in each line.
+#		 */
+#
+#		ch = getc(file) ;
+#		n = sizeof(ldbuf) - 9 ;
+#		cp = ldbuf ;
+#
+#		for (i = 0 ; i < 9 ; i++) {
+#			ldevice[i] = cp ;
+#
+#			while (ch == ' ' || ch == '\t') ch = getc(file) ;
+#
+#			while (ch != EOF && ch != ' ' && ch != '\t' && ch != '\n') {
+#				if (--n > 0) *cp++ = ch ;
+#				ch = getc(file) ;
+#				}
+#
+#			*cp++ = 0 ;
+#			n++ ;
+#			}
+#
+#		while (ch != EOF && ch != '\n') ch = getc(file) ;
+#
+#		/*
+#		 *	If we have read to EOF, and still haven't found
+#		 *	a compatible device,  exit with an error.
+#		 */
+#
+#		if (ch == EOF) {
+#			if (debug) dialmsg("No entry found in L-devices.\n") ;
+#			rtn =
+#				(	(call.line == 0 || *call.line == 0)
+#				?	(found ? NO_BD_A : NO_BD_K)
+#				:	(found ? DV_NT_A : DV_NT_K)
+#				) ;
+#			goto done ;
+#			}
+#
+#		/*
+#		 *	Check for compatibility between the user's
+#		 *	request, and the current entry.
+#		 */
+#
+#		speed = atoi(ldevice[3]) ;
+#
+#		if	(	(	(call.telno == 0 || *call.telno == 0)
+#				?	strcmp(ldevice[0], "DIR") == 0
+#				:	strcmp(ldevice[0], "ACU") == 0
+#				)
+#			&&	(	call.line == 0
+#				||	*call.line == 0
+#				||	strcmp(ldevice[1], call.line) == 0
+#				)
+#			&&	(call.speed <= 0 || speed == call.speed)
+#			)
+#		{
+#			/*
+#			 *	This looks like a compatible entry.
+#			 */
+#
+#			found++ ;
+#
+#			if (debug & D_DEVICE) {
+#				dialmsg("Using L-device: %s %s %s %s\n",
+#					ldevice[0], ldevice[1], ldevice[2], ldevice[3]) ;
+#				}
+#
+#			/*
+#			 *	Attempt to create the lock file.  If we
+#			 *	can't,  advance to the next entry.
+#			 */
+#
+#			(void) strcpy(diallock, "/usr/spool/uucp/LCK..") ;
+#			(void) strncat(diallock, ldevice[1], 20) ;
+#
+#			if (nolock == 0) {
+#				lockfd = open(diallock, O_WRONLY|O_CREAT|O_EXCL, 0444) ;
+#				if (lockfd < 0) {
+#					if (debug & D_DEVICE) {
+#						dialmsg("%s: %s\n", errstring(), diallock) ;
+#						}
+#					continue ;
+#					}
+#
+#				(void) close(lockfd) ;
+#
+#				if (debug & (D_LINE|D_DEVICE))
+#					dialmsg("Created lock file: %s\n", diallock) ;
+#				}
+#
+#			/*
+#			 *	Get dialer characteristics from dialinfo file.
+#			 */
+#
+#			gotdinfo = 1 ;
+#			if (dialinfo(&dinfo, ldevice[2]) < 0) {
+#				rtn = A_PROB ;
+#				goto done ;
+#				}
+#
+#			/*
+#			 *	Figure out what the termio(7) c_cflags
+#			 *	byte should contain based on the user's
+#			 *	requests.
+#			 */
+#
+#			iflags[0] = getbaud(speed) ;
+#			if (iflags[0] == -1) {
+#				rtn = ILL_BD ;
+#				goto done ;
+#				}
+#
+#			iflags[0] |= CS8 | CREAD | CLOCAL | HUPCL ;
+#
+#			if (call.attr != 0) {
+#				iflags[1] = call.attr->c_cflag | CREAD | CLOCAL | HUPCL ;
+#				if ((iflags[1] & CBAUD) == 0) {
+#					iflags[1] |= iflags[0] & (CBAUD|CSTOPB) ;
+#					}
+#				if (call.baud > 0) {
+#					iflags[1] &= ~CBAUD ;
+#					iflags[1] |= getbaud(call.baud) ;
+#					}
+#				if ((iflags[1] & CSIZE) == 0) {
+#					iflags[1] |= iflags[0] & CSIZE ;
+#					}
+#				}
+#			else {
+#				iflags[1] = iflags[0] ;
+#				}
+#
+#			iflags[3] = iflags[1] & ~CLOCAL ;
+#
+#			iflags[2] = ((call.telno && *call.telno) || call.modem)
+#				? iflags[3] : iflags[1] ;
+#
+#			/*
+#			 *	Attempt dial out on all specified phone
+#			 *	numbers.
+#			 *
+#			 *	The "telno" string is a list of phone numbers
+#			 *	separated by commas.  Run through the list
+#			 *	until we get a connect or we get an error
+#			 *	more serious than "no answer".
+#			 */
+#
+#			(void) strcpy(dialdev, "/dev/") ;
+#			(void) strcat(dialdev, ldevice[1]) ;
+#
+#			if (call.telno == 0) {
+#				dialnum[0] = 0 ;
+#				rtn = dialstate(&dinfo) ;
+#				}
+#			else {
+#				cp = call.telno ;
+#				loop {
+#					dp = dialnum ;
+#					i = sizeof(dialnum) ;
+#					while (*cp != 0 && *cp != ',' && --i > 0)
+#						*dp++ = *cp++ ;
+#					*dp = 0 ;
+##if 0
+#					sysname(dialnum) ;
+##endif
+#					dialcodes(dialnum) ;
+#
+#					if (debug & D_DEVICE) dialmsg("Telno: %s\n", dialnum) ;
+#
+#					rtn = dialstate(&dinfo) ;
+#					if (rtn != NO_ANS || *cp == 0) break ;
+#					cp++ ;
+#					}
+#				}
+#
+#			if (rtn < 0) goto done ;
+#
+#			/*
+#			 *	Set the user's termio options.
+#			 */
+#
+#			if (call.attr != 0) {
+#				attr = *call.attr ;
+#				attr.c_cflag = cflags[carrier] ;
+#				YIPE(ioctl(dialfd, TCSETA, &attr)) ;
+#				}
+#			goto done ;
+#			}
+#		}
+#
+#	/*
+#	 *	Universal return point.  Remove the lock file,
+#	 *	and restore all the caller's signals.  If we
+#	 *	got an interrupt apparently for the user, either
+#	 *	ignore it, call his processing routine, or exit
+#	 *	depending on his original options.
+#	 */
+#
+#done:
+#	if (gotdinfo) dialfree(&dinfo) ;
+#
+#	if (file != 0) (void) fclose(file) ;
+#
+#	if (rtn < 0) {
+#		if (lockfd >= 0 && nolock == 0) {
+#			if (unlink(diallock) < 0)
+#				dialmsg("Could not unlink %s: %s\n", diallock, errstring()) ;
+#			else if (debug & (D_LINE|D_DEVICE))
+#				dialmsg("Removed lock file: %s\n", diallock) ;
+#			}
+#		if (dialfd >= 0) dialclose() ;
+#		}
+#	else if (call.device != 0 && call.dev_len > 0)
+#		(void) strncpy(call.device, dialdev, call.dev_len) ;
+#
+#	for (i = 0 ; i < 4 ; i++) {
+#		num = signum[i] ;
+#		save = sigsave[i] ;
+#		if (save != SIG_IGN) {
+#			(void) signal(num, save) ;
+#			if (num == gotint) {
+#				if (save == SIG_DFL) exit(1) ;
+#				else (*save)(gotint) ;
+#				}
+#			}
+#		}
+#
+#	(void) signal(SIGALRM, alarmproc) ;
+#	(void) alarm((unsigned)alarmval) ;
+#
+#	if (debug) dialmsg("Dial returned: %d\n", rtn) ;
+#
+#	return(rtn) ;
+#	}
+#
+#
+#
+#/*****
+# *	undial - Clean up after successful dial.
+# */
+#
+#void
+#undial(fd)
+#register int fd ;				/* File descriptor to close */
+#{
+#	register char *tty ;
+#	register char *cp ;
+#	char buf[50] ;
+#
+#	/*
+#	 *	Get the file descriptor tty name and
+#	 *	convert it to its uucp lockfile name.
+#	 */
+#
+#	tty = ttyname(fd) ;
+#
+#	if (tty == 0) {
+#		dialmsg("Undial fd=%d: not a tty\n", fd) ;
+#		return ;
+#		}
+#
+#	cp = tty ;
+#	while (*cp) {
+#		if (*cp++ == '/') tty = cp ;
+#		}
+#
+#	(void) strcpy(buf, "/usr/spool/uucp/LCK..") ;
+#	(void) strcat(buf, tty) ;
+#
+#	if (!nolock && unlink(buf) < 0)
+#		dialmsg("%s: %s", buf, errstring()) ;
+#
+#	/*
+#	 *	Close the file.
+#	 */
+#
+#	if (close(fd) < 0)
+#		dialmsg("Undial fd=%d: %s\n", fd, errstring()) ;
+#
+#	if (debug & D_LINE)
+#		dialmsg("Undial complete: fd=%d, %s\n", fd, tty) ;
+#	}
+end_dial.c
+
+
+

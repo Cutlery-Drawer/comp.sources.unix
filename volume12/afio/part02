@@ -1,0 +1,1314 @@
+Subject:  v12i047:  Manipulate CPIO-format archive and files, Part02/02
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rs@uunet.UU.NET
+
+Submitted-by: Mark Brukhartz <ihnp4!laidbak!mdb>
+Posting-number: Volume 12, Issue 47
+Archive-name: afio/part02
+
+[  This is a replacement for cpio, a (tape-) archive program.  I wrote the
+   Makefile.  I had to split the source file into two halves, which will
+   need to be joined together.  --r$ ]
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 2)."
+# Contents:  afio.c.P1
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'afio.c.P1' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'afio.c.P1'\"
+else
+echo shar: Extracting \"'afio.c.P1'\" \(29675 characters\)
+sed "s/^X//" >'afio.c.P1' <<'END_OF_FILE'
+X/*
+X * afio.c
+X *
+X * Manipulate archives and files.
+X *
+X * Copyright (c) 1985 Lachman Associates, Inc..
+X *
+X * This software was written by Mark Brukhartz at Lachman Associates,
+X * Inc.. It may be distributed within the following restrictions:
+X *	(1) It may not be sold at a profit.
+X *	(2) This credit and notice must remain intact.
+X * This software may be distributed with other software by a commercial
+X * vendor, provided that it is included at no additional charge.
+X *
+X * Please report bugs to "..!ihnp4!laidbak!mdb".
+X *
+X * Options:
+X *  o Define INDEX to use index() in place of strchr() (v7, BSD).
+X *  o Define MEMCPY when an efficient memcpy() exists (SysV).
+X *  o Define MKDIR when a mkdir() system call is present (4.2BSD, SysVr3).
+X *  o Define NOVOID if your compiler doesn't like void casts.
+X *  o Define SYSTIME to use <sys/time.h> rather than <time.h> (4.2BSD).
+X *  o Define VOIDFIX to allow pointers to functions returning void (non-PCC).
+X *  o Define CTC3B2 to support AT&T 3B2 streaming cartridge tape.
+X */
+X
+Xstatic char *ident = "$Header: afio.c,v 1.68 86/12/15 13:07:11 mdb Exp $";
+X
+X#include <stdio.h>
+X#include <errno.h>
+X#include <sys/signal.h>
+X#include <sys/types.h>
+X#include <sys/ioctl.h>
+X#include <sys/stat.h>
+X#include <pwd.h>
+X#include <grp.h>
+X
+X#ifndef	major
+X#	include <sys/sysmacros.h>
+X#endif	/* major */
+X
+X#ifdef	SYSTIME
+X#	include <sys/time.h>
+X#else	/* SYSTIME */
+X#	include <time.h>
+X#endif	/* SYSTIME */
+X
+X#ifdef	CTC3B2
+X#	include <sys/vtoc.h>
+X#	include <sys/ct.h>
+X#endif	/* CTC3B2 */
+X
+X/*
+X * Address link information base.
+X */
+X#define	linkhash(ino)	\
+X	(linkbase + (ino) % nel(linkbase))
+X
+X/*
+X * Mininum value.
+X */
+X#define	min(one, two)	\
+X	(one < two ? one : two)
+X
+X/*
+X * Number of array elements.
+X */
+X#define	nel(a)		\
+X	(sizeof(a) / sizeof(*(a)))
+X
+X/*
+X * Remove a file or directory.
+X */
+X#define	remove(name, asb) \
+X	(((asb)->sb_mode & S_IFMT) == S_IFDIR ? rmdir(name) : unlink(name))
+X
+X/*
+X * Swap bytes.
+X */
+X#define	swab(n)		\
+X	((((ushort)(n) >> 8) & 0xff) | (((ushort)(n) << 8) & 0xff00))
+X
+X/*
+X * Cast and reduce to unsigned short.
+X */
+X#define	ush(n)		\
+X	(((ushort) (n)) & 0177777)
+X
+X/*
+X * Definitions.
+X */
+X#define	reg	register	/* Convenience */
+X#define	uint	unsigned int	/* Not always in types.h */
+X#define	ushort	unsigned short	/* Not always in types.h */
+X#define	BLOCK	5120		/* Default archive block size */
+X#define	FSBUF	(8*1024)	/* Filesystem buffer size */
+X#define	H_COUNT	10		/* Number of items in ASCII header */
+X#define	H_PRINT	"%06o%06o%06o%06o%06o%06o%06o%011lo%06o%011lo"
+X#define	H_SCAN	"%6ho%6ho%6ho%6ho%6ho%6ho%6ho%11lo%6o%11lo"
+X#define	H_STRLEN 70		/* ASCII header string length */
+X#define	M_ASCII "070707"	/* ASCII magic number */
+X#define	M_BINARY 070707		/* Binary magic number */
+X#define	M_STRLEN 6		/* ASCII magic number length */
+X#define	NULLDEV	-1		/* Null device code */
+X#define	NULLINO	0		/* Null inode number */
+X#define	PATHELEM 256		/* Pathname element count limit */
+X#define	PATHSIZE 1024		/* Pathname length limit */
+X#define	S_IFSHF	12		/* File type shift (shb in stat.h) */
+X#define	S_IPERM	07777		/* File permission bits (shb in stat.h) */
+X#define	S_IPEXE	07000		/* Special execution bits (shb in stat.h) */
+X#define	S_IPOPN	0777		/* Open access bits (shb in stat.h) */
+X#define	STDIN	0		/* Standard input file descriptor */
+X#define	STDOUT	1		/* Standard output file descriptor */
+X#define	TTY	"/dev/tty"	/* For volume-change queries */
+X
+X/*
+X * Some versions of the portable "C" compiler (PCC) can't handle
+X * pointers to functions returning void.
+X */
+X#ifdef	VOIDFIX
+X#	define	VOIDFN	void	/* Expect "void (*fnptr)()" to work */
+X#else	/* VOIDFIX */
+X#	define	VOIDFN	int	/* Avoid PCC "void (*fnptr)()" bug */
+X#endif	/* VOIDFIX */
+X
+X/*
+X * Trailer pathnames. All must be of the same length.
+X */
+X#define	TRAILER	"TRAILER!!!"	/* Archive trailer (cpio compatible) */
+X#define	TRAILZ	11		/* Trailer pathname length (including null) */
+X
+X/*
+X * Open modes; there is no <fcntl.h> with v7 UNIX.
+X */
+X#define	O_RDONLY 0		/* Read-only */
+X#define	O_WRONLY 1		/* Write-only */
+X#define	O_RDWR	2		/* Read/write */
+X
+X/*
+X * V7 and BSD UNIX use old-fashioned names for a couple of
+X * string functions.
+X */
+X#ifdef	INDEX
+X#	define	strchr	index	/* Forward character search */
+X#	define	strrchr	rindex	/* Reverse character search */
+X#endif	/* INDEX */
+X
+X/*
+X * Some compilers can't handle void casts.
+X */
+X#ifdef	NOVOID
+X#	define	VOID		/* Omit void casts */
+X#else	/* NOVOID */
+X#	define	VOID	(void)	/* Quiet lint about ignored return values */
+X#endif	/* NOVOID */
+X
+X/*
+X * Adb is more palatable when static functions and variables are
+X * declared as globals. Lint gives more useful information when
+X * statics are truly static.
+X */
+X#ifdef	lint
+X#	define	STATIC	static	/* Declare static variables for lint */
+X#else	/* lint */
+X#	define	STATIC		/* Make static variables global for adb */
+X#endif	/* lint */
+X
+X/*
+X * Simple types.
+X */
+Xtypedef struct group	Group;	/* Structure for getgrgid(3) */
+Xtypedef struct passwd	Passwd;	/* Structure for getpwuid(3) */
+Xtypedef struct tm	Time;	/* Structure for localtime(3) */
+X
+X#ifdef	S_IFLNK
+X	/*
+X	 * File status with symbolic links. Kludged to hold symbolic
+X	 * link pathname within structure.
+X	 */
+X	typedef struct {
+X		struct stat	sb_stat;
+X		char		sb_link[PATHSIZE];
+X	} Stat;
+X#	define	STAT(name, asb)		stat(name, &(asb)->sb_stat)
+X#	define	FSTAT(fd, asb)		fstat(fd, &(asb)->sb_stat)
+X#	define	LSTAT(name, asb)	lstat(name, &(asb)->sb_stat)
+X#	define	sb_dev		sb_stat.st_dev
+X#	define	sb_ino		sb_stat.st_ino
+X#	define	sb_mode		sb_stat.st_mode
+X#	define	sb_nlink	sb_stat.st_nlink
+X#	define	sb_uid		sb_stat.st_uid
+X#	define	sb_gid		sb_stat.st_gid
+X#	define	sb_rdev		sb_stat.st_rdev
+X#	define	sb_size		sb_stat.st_size
+X#	define	sb_atime	sb_stat.st_atime
+X#	define	sb_mtime	sb_stat.st_mtime
+X#	define	sb_ctime	sb_stat.st_ctime
+X#	define	sb_blksize	sb_stat.st_blksize
+X#	define	sb_blocks	sb_stat.st_blocks
+X#else	/* S_IFLNK */
+X	/*
+X	 * File status without symbolic links.
+X	 */
+X	typedef	struct stat	Stat;
+X#	define	STAT(name, asb)		stat(name, asb)
+X#	define	FSTAT(fd, asb)		fstat(fd, asb)
+X#	define	LSTAT(name, asb)	stat(name, asb)
+X#	define	sb_dev		st_dev
+X#	define	sb_ino		st_ino
+X#	define	sb_mode		st_mode
+X#	define	sb_nlink	st_nlink
+X#	define	sb_uid		st_uid
+X#	define	sb_gid		st_gid
+X#	define	sb_rdev		st_rdev
+X#	define	sb_size		st_size
+X#	define	sb_atime	st_atime
+X#	define	sb_mtime	st_mtime
+X#	define	sb_ctime	st_ctime
+X#endif	/* S_IFLNK */
+X
+X/*
+X * Binary archive header (obsolete).
+X */
+Xtypedef struct {
+X	short	b_dev;			/* Device code */
+X	ushort	b_ino;			/* Inode number */
+X	ushort	b_mode;			/* Type and permissions */
+X	ushort	b_uid;			/* Owner */
+X	ushort	b_gid;			/* Group */
+X	short	b_nlink;		/* Number of links */
+X	short	b_rdev;			/* Real device */
+X	ushort	b_mtime[2];		/* Modification time (hi/lo) */
+X	ushort	b_name;			/* Length of pathname (with null) */
+X	ushort	b_size[2];		/* Length of data */
+X} Binary;
+X
+X/*
+X * Child process structure.
+X */
+Xtypedef struct child {
+X	struct child	*c_forw;	/* Forward link */
+X	int		c_pid;		/* Process ID */
+X	int		c_flags;	/* Flags (CF_) */
+X	int		c_status;	/* Exit status */
+X} Child;
+X
+X/*
+X * Child process flags (c_flags).
+X */
+X#define	CF_EXIT	(1<<0)			/* Exited */
+X
+X/*
+X * Hard link sources. One or more are chained from each link
+X * structure.
+X */
+Xtypedef struct name {
+X	struct name	*p_forw;	/* Forward chain (terminated) */
+X	struct name	*p_back;	/* Backward chain (circular) */
+X	char		*p_name;	/* Pathname to link from */
+X} Path;
+X
+X/*
+X * File linking information. One entry exists for each unique
+X * file with with outstanding hard links.
+X */
+Xtypedef struct link {
+X	struct link	*l_forw;	/* Forward chain (terminated) */
+X	struct link	*l_back;	/* Backward chain (terminated) */
+X	dev_t		l_dev;		/* Device */
+X	ino_t		l_ino;		/* Inode */
+X	ushort		l_nlink;	/* Unresolved link count */
+X	off_t		l_size;		/* Length */
+X	Path		*l_path;	/* Pathname(s) to link from */
+X} Link;
+X
+X/*
+X * Pathnames to (or to not) be processed.
+X */
+Xtypedef struct pattern {
+X	struct pattern	*p_forw;	/* Forward chain */
+X	char		*p_str;		/* String */
+X	int		p_len;		/* Length of string */
+X	int		p_not;		/* Reverse logic */
+X} Pattern;
+X
+X/*
+X * External functions.
+X */
+Xvoid	_exit();
+Xvoid	exit();
+Xvoid	free();
+Xchar	*getenv();
+Xushort	getgid();
+XGroup	*getgrgid();
+XPasswd	*getpwuid();
+Xushort	getuid();
+XTime	*localtime();
+Xoff_t	lseek();
+Xchar	*malloc();
+XVOIDFN	(*signal())();
+Xuint	sleep();
+Xchar	*strcat();
+Xchar	*strchr();
+Xchar	*strcpy();
+Xchar	*strncpy();
+Xchar	*strrchr();
+Xtime_t	time();
+Xushort	umask();
+X
+X/*
+X * Internal functions.
+X */
+XVOIDFN	copyin();
+XVOIDFN	copyout();
+Xint	dirchg();
+Xint	dirmake();
+Xint	dirneed();
+Xvoid	fatal();
+XVOIDFN	in();
+Xvoid	inalloc();
+Xint	inascii();
+Xint	inavail();
+Xint	inbinary();
+Xint	indata();
+Xint	inentry();
+Xint	infill();
+Xint	inhead();
+Xint	inread();
+Xint	inskip();
+Xint	inswab();
+Xint	lineget();
+Xvoid	linkalso();
+XLink	*linkfrom();
+Xvoid	linkleft();
+XLink	*linkto();
+Xvoid	memcpy();
+Xchar	*memget();
+Xchar	*memstr();
+Xint	mkdir();
+Xvoid	nameadd();
+Xint	namecmp();
+Xint	nameopt();
+Xvoid	next();
+Xvoid	nextask();
+Xvoid	nextclos();
+Xint	nextopen();
+Xint	openi();
+Xint	openo();
+Xint	openq();
+Xint	options();
+Xoff_t	optsize();
+XVOIDFN	out();
+Xvoid	outalloc();
+Xuint	outavail();
+Xint	outdata();
+Xvoid	outeof();
+Xvoid	outflush();
+Xvoid	outhead();
+Xvoid	outpad();
+Xvoid	outwait();
+Xvoid	outwrite();
+XVOIDFN	pass();
+Xvoid	passdata();
+Xint	passitem();
+Xint	pipechld();
+Xint	pipeopen();
+Xvoid	pipewait();
+Xvoid	prsize();
+Xint	rmdir();
+Xint	swrite();
+Xchar	*syserr();
+XVOIDFN	toc();
+Xvoid	tocentry();
+Xvoid	tocmode();
+Xvoid	usage();
+Xint	warn();
+Xint	warnarch();
+Xint	xfork();
+Xvoid	xpause();
+Xint	xwait();
+X
+X/*
+X * External variables.
+X */
+Xextern int	errno;		/* System error code */
+Xextern char	*sys_errlist[];	/* System error messages */
+Xextern int	sys_nerr;	/* Number of sys_errlist entries */
+X
+X/*
+X * Static variables.
+X */
+X#ifdef	CTC3B2
+XSTATIC short	Cflag;		/* Enable 3B2 CTC streaming (kludge) */
+X#endif	/* CTC3B2 */
+XSTATIC short	dflag;		/* Don't create missing directories */
+XSTATIC short	fflag;		/* Fork before writing to archive */
+XSTATIC short	gflag;		/* Change to input file directories */
+XSTATIC short	hflag;		/* Follow symbolic links */
+XSTATIC short	jflag;		/* Don't generate sparse filesystem blocks */
+XSTATIC short	kflag;		/* Skip initial junk to find a header */
+XSTATIC short	lflag;		/* Link rather than copying (when possible) */
+XSTATIC short	mflag;		/* Ignore archived timestamps */
+XSTATIC short	nflag;		/* Keep newer existing files */
+XSTATIC short	uflag;		/* Report files with unseen links */
+XSTATIC short	vflag;		/* Verbose */
+XSTATIC short	xflag;		/* Retain file ownership */
+XSTATIC short	zflag;		/* Print final statistics */
+XSTATIC uint	arbsize = BLOCK;/* Archive block size */
+XSTATIC short	areof;		/* End of input volume reached */
+XSTATIC int	arfd;		/* Archive file descriptor */
+XSTATIC off_t	arleft;		/* Space remaining within current volume */
+XSTATIC char	*arname;	/* Expanded archive name */
+XSTATIC uint	arpad;		/* Final archive block padding boundary */
+XSTATIC char	arspec[PATHSIZE];/* Specified archive name */
+XSTATIC off_t	aruntil;	/* Volume size limit */
+XSTATIC uint	arvolume;	/* Volume number */
+XSTATIC uint	buflen;		/* Archive buffer length */
+XSTATIC char	*buffer;	/* Archive buffer */
+XSTATIC char	*bufidx;	/* Archive buffer index */
+XSTATIC char	*bufend;	/* End of data within archive buffer */
+XSTATIC Child	*children;	/* Child processes */
+XSTATIC ushort	gid;		/* Group ID */
+XSTATIC Link	*linkbase[256];	/* Unresolved link information */
+XSTATIC ushort	mask;		/* File creation mask */
+XSTATIC char	*myname;	/* Arg0 */
+XSTATIC char	*optarg;	/* Option argument */
+XSTATIC int	optind;		/* Command line index */
+XSTATIC int	outpid;		/* Process ID of outstanding outflush() */
+XSTATIC Pattern	*pattern;	/* Pathname matching patterns */
+XSTATIC char	pwd[PATHSIZE];	/* Working directory (with "-g") */
+XSTATIC int	pipepid;	/* Pipeline process ID */
+XSTATIC time_t	timenow;	/* Current time */
+XSTATIC time_t	timewait;	/* Time spent awaiting new media */
+XSTATIC off_t	total;		/* Total number of bytes transferred */
+XSTATIC int	ttyf;		/* For interactive queries (yuk) */
+XSTATIC ushort	uid;		/* User ID */
+X
+Xmain(ac, av)
+Xint		ac;
+Xreg char	**av;
+X{
+X	reg int		c;
+X	reg uint	group = 1;
+X	reg VOIDFN	(*fn)() = NULL;
+X	reg time_t	timedone;
+X	auto char	remote[PATHSIZE];
+X
+X	if (myname = strrchr(*av, '/'))
+X		++myname;
+X	else
+X		myname = *av;
+X	mask = umask(0);
+X	ttyf = openq();
+X	uid = getuid();
+X	gid = getgid();
+X	if (uid == 0)
+X		++xflag;
+X	VOID signal(SIGPIPE, SIG_IGN);
+X	while (c = options(ac, av, "ioptIOVCb:c:de:fghjklmns:uvxXy:Y:z")) {
+X		switch (c) {
+X		case 'i':
+X			if (fn)
+X				usage();
+X			fn = in;
+X			break;
+X		case 'o':
+X			if (fn)
+X				usage();
+X			fn = out;
+X			break;
+X		case 'p':
+X			if (fn)
+X				usage();
+X			fn = pass;
+X			break;
+X		case 't':
+X			if (fn)
+X				usage();
+X			fn = toc;
+X			break;
+X		case 'I':
+X			if (fn)
+X				usage();
+X			fn = copyin;
+X			break;
+X		case 'O':
+X			if (fn)
+X				usage();
+X			fn = copyout;
+X			break;
+X		case 'V':
+X			VOID printf("%s\n", ident);
+X			exit(0);
+X#ifdef	CTC3B2
+X		case 'C':
+X			++Cflag;
+X			arbsize = 31 * 512;
+X			group = 10;
+X			aruntil = 1469 * 31 * 512;
+X			break;
+X#endif	/* CTC3B2 */
+X		case 'b':
+X			if ((arbsize = (uint) optsize(optarg)) == 0)
+X				fatal(optarg, "Bad block size");
+X			break;
+X		case 'c':
+X			if ((group = (uint) optsize(optarg)) == 0)
+X				fatal(optarg, "Bad buffer count");
+X			break;
+X		case 'd':
+X			++dflag;
+X			break;
+X		case 'e':
+X			arpad = (uint) optsize(optarg);
+X			break;
+X		case 'f':
+X			++fflag;
+X			break;
+X		case 'g':
+X			++gflag;
+X			break;
+X		case 'h':
+X			++hflag;
+X			break;
+X		case 'j':
+X			++jflag;
+X			break;
+X		case 'k':
+X			++kflag;
+X			break;
+X		case 'l':
+X			++lflag;
+X			break;
+X		case 'm':
+X			++mflag;
+X			break;
+X		case 'n':
+X			++nflag;
+X			break;
+X		case 's':
+X			aruntil = optsize(optarg);
+X			break;
+X		case 'u':
+X			++uflag;
+X			break;
+X		case 'v':
+X			++vflag;
+X			break;
+X		case 'x':
+X			++xflag;
+X			break;
+X		case 'X':
+X			xflag = 0;
+X			break;
+X		case 'y':
+X			nameadd(optarg, 0);
+X			break;
+X		case 'Y':
+X			nameadd(optarg, 1);
+X			break;
+X		case 'z':
+X			++zflag;
+X			break;
+X		default:
+X			usage();
+X		}
+X	}
+X	if (fn == NULL || av[optind] == NULL)
+X		usage();
+X	buflen = arbsize * group;
+X	if (arpad == 0)
+X		arpad = arbsize;
+X	if (fn != pass) {
+X		reg char	*colon;
+X		reg char	*equal;
+X		reg int		isoutput = (fn == out || fn == copyout);
+X
+X		arname = strcpy(arspec, av[optind++]);
+X		if (colon = strchr(arspec, ':')) {
+X			*colon++ = '\0';
+X			if (equal = strchr(arspec, '='))
+X				*equal++ = '\0';
+X			VOID sprintf(arname = remote,
+X			    "!rsh %s %s -%c -b %u -c %u %s",
+X			    arspec, equal ? equal : myname,
+X			    isoutput ? 'O' : 'I', arbsize,
+X			    group, colon);
+X			if (equal)
+X				*--equal = '=';
+X			*--colon = ':';
+X		}
+X		if (gflag && *arname != '/' && *arname != '!')
+X			fatal(arspec, "Relative pathname");
+X		if ((buffer = bufidx = bufend = malloc(buflen)) == NULL)
+X			fatal(arspec, "Cannot allocate I/O buffer");
+X		if (nextopen(isoutput ? O_WRONLY : O_RDONLY) < 0)
+X			exit(1);
+X	}
+X	timenow = time((time_t *) NULL);
+X	(*fn)(av + optind);
+X	timedone = time((time_t *) NULL);
+X	if (uflag)
+X		linkleft();
+X	if (zflag) {
+X		reg FILE	*stream;
+X
+X		stream = fn == toc || arfd == STDOUT ? stderr : stdout;
+X		VOID fprintf(stream, "%s: ", myname);
+X		prsize(stream, total);
+X		VOID fprintf(stream, " bytes %s in %lu seconds\n",
+X		  fn == pass
+X		    ? "transferred"
+X		    : fn == out || fn == copyout
+X		      ? "written"
+X		      : "read",
+X		  timedone - timenow - timewait);
+X	}
+X	nextclos();
+X	exit(0);
+X	/* NOTREACHED */
+X}
+X
+X/*
+X * copyin()
+X *
+X * Copy directly from the archive to the standard output.
+X */
+XSTATIC VOIDFN
+Xcopyin(av)
+Xreg char	**av;
+X{
+X	reg int		got;
+X	reg uint	have;
+X
+X	if (*av)
+X		fatal(*av, "Extraneous argument");
+X	while (!areof) {
+X		VOID infill();
+X		while (have = bufend - bufidx)
+X			if ((got = write(STDOUT, bufidx, have)) < 0)
+X				fatal("<stdout>", syserr());
+X			else if (got > 0)
+X				bufidx += got;
+X			else
+X				return;
+X	}
+X}
+X
+X/*
+X * copyout()
+X *
+X * Copy directly from the standard input to the archive.
+X */
+XSTATIC VOIDFN
+Xcopyout(av)
+Xreg char	**av;
+X{
+X	reg int		got;
+X	reg uint	want;
+X
+X	if (*av)
+X		fatal(*av, "Extraneous argument");
+X	for (;;) {
+X		while ((want = bufend - bufidx) == 0)
+X			outflush();
+X		if ((got = read(STDIN, bufidx, want)) < 0)
+X			fatal("<stdin>", syserr());
+X		else if (got == 0)
+X			break;
+X		else
+X			bufidx += got;
+X	}
+X	outflush();
+X	if (fflag)
+X		outwait();
+X}
+X
+X/*
+X * dirchg()
+X *
+X * Change to the directory containing a given file.
+X */
+XSTATIC int
+Xdirchg(name, local)
+Xreg char	*name;
+Xreg char	*local;
+X{
+X	reg char	*last;
+X	reg int		len;
+X	auto char	dir[PATHSIZE];
+X
+X	if (*name != '/')
+X		return (warn(name, "Relative pathname"));
+X	for (last = name + strlen(name); last[-1] != '/'; --last)
+X		;
+X	len = last - name;
+X	strncpy(dir, name, len)[len] = '\0';
+X	VOID strcpy(local, *last ? last : ".");
+X	if (strcmp(dir, pwd) == 0)
+X		return (0);
+X	if (chdir(dir) < 0)
+X		return (warn(name, syserr()));
+X	VOID strcpy(pwd, dir);
+X	return (0);
+X}
+X
+X/*
+X * dirmake()
+X *
+X * Make a directory. Returns zero if successful, -1 otherwise.
+X */
+XSTATIC int
+Xdirmake(name, asb)
+Xreg char	*name;
+Xreg Stat	*asb;
+X{
+X	if (mkdir(name, asb->sb_mode & S_IPOPN) < 0)
+X		return (-1);
+X	if (asb->sb_mode & S_IPEXE)
+X		VOID chmod(name, asb->sb_mode & S_IPERM);
+X	if (xflag)
+X		VOID chown(name,
+X		    uid == 0 ? ush(asb->sb_uid) : uid,
+X		    ush(asb->sb_gid));
+X	return (0);
+X}
+X
+X/*
+X * dirneed()
+X *
+X * Recursively create missing directories (with the same permissions
+X * as their first existing parent). Temporarily modifies the 'name'
+X * argument string. Returns zero if successful, -1 otherwise.
+X */
+XSTATIC int
+Xdirneed(name)
+Xchar		*name;
+X{
+X	reg char	*cp;
+X	reg char	*last;
+X	reg int		ok;
+X	static Stat	sb;
+X
+X	last = NULL;
+X	for (cp = name; *cp; )
+X		if (*cp++ == '/')
+X			last = cp;
+X	if (last == NULL)
+X		return (STAT(".", &sb));
+X	*--last = '\0';
+X	ok = STAT(*name ? name : "/", &sb) == 0
+X	    ? ((sb.sb_mode & S_IFMT) == S_IFDIR)
+X	    : (!dflag && dirneed(name) == 0 && dirmake(name, &sb) == 0);
+X	*last = '/';
+X	return (ok ? 0 : -1);
+X}
+X
+X/*
+X * fatal()
+X *
+X * Print fatal message and exit.
+X */
+XSTATIC void
+Xfatal(what, why)
+Xchar		*what;
+Xchar		*why;
+X{
+X	VOID fprintf(stderr,
+X	    "%s: \"%s\": %s\n",
+X	    myname, what, why);
+X	exit(1);
+X}
+X
+X/*
+X * in()
+X *
+X * Read an archive.
+X */
+XSTATIC VOIDFN
+Xin(av)
+Xreg char	**av;
+X{
+X	auto Stat	sb;
+X	auto char	name[PATHSIZE];
+X
+X	if (*av)
+X		fatal(*av, "Extraneous argument");
+X	name[0] = '\0';
+X	while (inhead(name, &sb) == 0) {
+X		if (namecmp(name) < 0 || inentry(name, &sb) < 0)
+X			if (inskip(sb.sb_size) < 0)
+X				VOID warn(name, "Skipped file data is corrupt");
+X		if (vflag)
+X			VOID fprintf(stderr, "%s\n", name);
+X	}
+X}
+X
+X/*
+X * inalloc()
+X *
+X * Allocate input buffer space (which was previously indexed
+X * by inavail()).
+X */
+XSTATIC void
+Xinalloc(len)
+Xreg uint	len;
+X{
+X	bufidx += len;
+X	total += len;
+X}
+X
+X/*
+X * inascii()
+X *
+X * Read an ASCII header. Returns zero if successful;
+X * -1 otherwise. Assumes that the entire magic number
+X * has been read.
+X */
+XSTATIC int
+Xinascii(magic, name, asb)
+Xreg char	*magic;
+Xreg char	*name;
+Xreg Stat	*asb;
+X{
+X	auto uint	namelen;
+X	auto char	header[H_STRLEN + 1];
+X
+X	if (strncmp(magic, M_ASCII, M_STRLEN) != 0)
+X		return (-1);
+X	if (inread(header, H_STRLEN) < 0)
+X		return (warnarch("Corrupt ASCII header", (off_t) H_STRLEN));
+X	header[H_STRLEN] = '\0';
+X	if (sscanf(header, H_SCAN, &asb->sb_dev,
+X	    &asb->sb_ino, &asb->sb_mode, &asb->sb_uid,
+X	    &asb->sb_gid, &asb->sb_nlink, &asb->sb_rdev,
+X	    &asb->sb_mtime, &namelen, &asb->sb_size) != H_COUNT)
+X		return (warnarch("Bad ASCII header", (off_t) H_STRLEN));
+X	if (namelen == 0 || namelen >= PATHSIZE)
+X		return (warnarch("Bad ASCII pathname length", (off_t) H_STRLEN));
+X	if (inread(name, namelen) < 0)
+X		return (warnarch("Corrupt ASCII pathname", (off_t) namelen));
+X	if (name[namelen - 1] != '\0')
+X		return (warnarch("Bad ASCII pathname", (off_t) namelen));
+X	return (0);
+X}
+X
+X/*
+X * inavail()
+X *
+X * Index availible input data within the buffer. Stores a pointer
+X * to the data and its length in given locations. Returns zero with
+X * valid data, -1 if unreadable portions were replaced with nulls.
+X */
+XSTATIC int
+Xinavail(bufp, lenp)
+Xreg char	**bufp;
+Xuint		*lenp;
+X{
+X	reg uint	have;
+X	reg int		corrupt = 0;
+X
+X	while ((have = bufend - bufidx) == 0)
+X		corrupt |= infill();
+X	*bufp = bufidx;
+X	*lenp = have;
+X	return (corrupt);
+X}
+X
+X/*
+X * inbinary()
+X *
+X * Read a binary header. Returns the number of trailing alignment
+X * bytes to skip; -1 if unsuccessful.
+X */
+XSTATIC int
+Xinbinary(magic, name, asb)
+Xreg char	*magic;
+Xreg char	*name;
+Xreg Stat	*asb;
+X{
+X	reg uint	namefull;
+X	auto Binary	binary;
+X
+X	if (*((ushort *) magic) != M_BINARY)
+X		return (-1);
+X	memcpy((char *) &binary,
+X	    magic + sizeof(ushort),
+X	    M_STRLEN - sizeof(ushort));
+X	if (inread((char *) &binary + M_STRLEN - sizeof(ushort),
+X	    sizeof(binary) - (M_STRLEN - sizeof(ushort))) < 0)
+X		return (warnarch("Corrupt binary header",
+X		    (off_t) sizeof(binary) - (M_STRLEN - sizeof(ushort))));
+X	asb->sb_dev = binary.b_dev;
+X	asb->sb_ino = binary.b_ino;
+X	asb->sb_mode = binary.b_mode;
+X	asb->sb_uid = binary.b_uid;
+X	asb->sb_gid = binary.b_gid;
+X	asb->sb_nlink = binary.b_nlink;
+X	asb->sb_rdev = binary.b_rdev;
+X	asb->sb_mtime = binary.b_mtime[0] << 16 | binary.b_mtime[1];
+X	asb->sb_size = binary.b_size[0] << 16 | binary.b_size[1];
+X	if (binary.b_name == 0 || binary.b_name >= PATHSIZE)
+X		return (warnarch("Bad binary pathname length",
+X		    (off_t) sizeof(binary) - (M_STRLEN - sizeof(ushort))));
+X	if (inread(name, namefull = binary.b_name + binary.b_name % 2) < 0)
+X		return (warnarch("Corrupt binary pathname", (off_t) namefull));
+X	if (name[binary.b_name - 1] != '\0')
+X		return (warnarch("Bad binary pathname", (off_t) namefull));
+X	return (asb->sb_size % 2);
+X}
+X
+X/*
+X * indata()
+X *
+X * Install data from an archive. Returns given file descriptor.
+X */
+XSTATIC int
+Xindata(fd, size, name)
+Xint		fd;
+Xreg off_t	size;
+Xchar		*name;
+X{
+X	reg uint	chunk;
+X	reg char	*oops;
+X	reg int		sparse;
+X	reg int		corrupt;
+X	auto char	*buf;
+X	auto uint	avail;
+X
+X	corrupt = sparse = 0;
+X	oops = NULL;
+X	while (size) {
+X		corrupt |= inavail(&buf, &avail);
+X		size -= (chunk = size < avail ? (uint) size : avail);
+X		if (oops == NULL && (sparse = swrite(fd, buf, chunk)) < 0)
+X			oops = syserr();
+X		inalloc(chunk);
+X	}
+X	if (corrupt)
+X		VOID warn(name, "Corrupt archive data");
+X	if (oops)
+X		VOID warn(name, oops);
+X	else if (sparse > 0
+X	  && (lseek(fd, (off_t) -1, 1) < 0
+X	    || write(fd, "", 1) != 1))
+X		VOID warn(name, syserr());
+X	return (fd);
+X}
+X
+X/*
+X * inentry()
+X *
+X * Install a single archive entry. Returns zero if successful, -1 otherwise.
+X */
+XSTATIC int
+Xinentry(name, asb)
+Xchar		*name;
+Xreg Stat	*asb;
+X{
+X	reg Link	*linkp;
+X	reg int		ifd;
+X	reg int		ofd;
+X	auto time_t	tstamp[2];
+X
+X	if ((ofd = openo(name, asb, linkp = linkfrom(asb), 0)) > 0)
+X		if (asb->sb_size || linkp == NULL || linkp->l_size == 0)
+X			VOID close(indata(ofd, asb->sb_size, name));
+X		else if ((ifd = open(linkp->l_path->p_name, O_RDONLY)) < 0)
+X			VOID warn(linkp->l_path->p_name, syserr());
+X		else {
+X			passdata(linkp->l_path->p_name, ifd, name, ofd);
+X			VOID close(ifd);
+X			VOID close(ofd);
+X		}
+X	else if (ofd < 0)
+X		return (-1);
+X	else if (inskip(asb->sb_size) < 0)
+X		VOID warn(name, "Redundant file data is corrupt");
+X	tstamp[0] = tstamp[1] = mflag ? timenow : asb->sb_mtime;
+X	VOID utime(name, tstamp);
+X	return (0);
+X}
+X
+X/*
+X * infill()
+X *
+X * Fill the archive buffer. Remembers mid-buffer read failures and
+X * reports them the next time through. Replaces unreadable data with
+X * null characters. Returns zero with valid data, -1 otherwise.
+X */
+XSTATIC int
+Xinfill()
+X{
+X	reg int		got;
+X	static int	failed;
+X
+X	bufend = bufidx = buffer;
+X	if (!failed) {
+X		if (areof)
+X			if (total == 0)
+X				fatal(arspec, "No input");
+X			else
+X				next(O_RDONLY, "Input EOF");
+X		if (aruntil && arleft < arbsize)
+X			next(O_RDONLY, "Input limit reached");
+X		while (!failed
+X		    && !areof
+X		    && (aruntil == 0 || arleft >= arbsize)
+X		    && buffer + buflen - bufend >= arbsize) {
+X			if ((got = read(arfd, bufend, arbsize)) > 0) {
+X				bufend += got;
+X				arleft -= got;
+X			} else if (got < 0)
+X				failed = warnarch(syserr(),
+X				    (off_t) 0 - (bufend - bufidx));
+X			else
+X				++areof;
+X		}
+X	}
+X	if (failed && bufend == buffer) {
+X		failed = 0;
+X		for (got = 0; got < arbsize; ++got)
+X			*bufend++ = '\0';
+X		return (-1);
+X	}
+X	return (0);
+X}
+X
+X/*
+X * inhead()
+X *
+X * Read a header. Quietly translates old-fashioned binary cpio headers
+X * (and arranges to skip the possible alignment byte). Returns zero if
+X * successful, -1 upon archive trailer.
+X */
+XSTATIC int
+Xinhead(name, asb)
+Xreg char	*name;
+Xreg Stat	*asb;
+X{
+X	reg off_t	skipped;
+X	auto char	magic[M_STRLEN];
+X	static int	align;
+X
+X	if (align > 0)
+X		VOID inskip((off_t) align);
+X	align = 0;
+X	for (;;) {
+X		VOID inread(magic, M_STRLEN);
+X		skipped = 0;
+X		while ((align = inascii(magic, name, asb)) < 0
+X		    && (align = inbinary(magic, name, asb)) < 0
+X		    && (align = inswab(magic, name, asb)) < 0) {
+X			if (++skipped == 1) {
+X				if (!kflag && total - sizeof(magic) == 0)
+X					fatal(arspec, "Unrecognizable archive");
+X				VOID warnarch("Bad magic number",
+X				    (off_t) sizeof(magic));
+X				if (name[0])
+X					VOID warn(name, "May be corrupt");
+X			}
+X			memcpy(magic, magic + 1, sizeof(magic) - 1);
+X			VOID inread(magic + sizeof(magic) - 1, 1);
+X		}
+X		if (skipped) {
+X			VOID warnarch("Apparently resynchronized",
+X			    (off_t) sizeof(magic));
+X			VOID warn(name, "Continuing");
+X		}
+X		if (strcmp(name, TRAILER) == 0)
+X			return (-1);
+X		if (nameopt(name) >= 0)
+X			break;
+X		VOID inskip(asb->sb_size + align);
+X	}
+X#ifdef	S_IFLNK
+X	if ((asb->sb_mode & S_IFMT) == S_IFLNK) {
+X		if (inread(asb->sb_link, (uint) asb->sb_size) < 0) {
+X			VOID warn(name, "Corrupt symbolic link");
+X			return (inhead(name, asb));
+X		}
+X		asb->sb_link[asb->sb_size] = '\0';
+X		asb->sb_size = 0;
+X	}
+X#endif	/* S_IFLNK */
+X	if (name[0] == '/')
+X		if (name[1])
+X			while (name[0] = name[1])
+X				++name;
+X		else
+X			name[0] = '.';
+X	asb->sb_atime = asb->sb_ctime = asb->sb_mtime;
+X	return (0);
+X}
+X
+X/*
+X * inread()
+X *
+X * Read a given number of characters from the input archive. Returns
+X * zero with valid data, -1 if unreadable portions were replaced by
+X * null characters.
+X */
+XSTATIC int
+Xinread(dst, len)
+Xreg char	*dst;
+Xuint		len;
+X{
+X	reg uint	have;
+X	reg uint	want;
+X	reg int		corrupt = 0;
+X	char		*endx = dst + len;
+X
+X	while (want = endx - dst) {
+X		while ((have = bufend - bufidx) == 0)
+X			corrupt |= infill();
+X		if (have > want)
+X			have = want;
+X		memcpy(dst, bufidx, have);
+X		bufidx += have;
+X		dst += have;
+X		total += have;
+X	}
+X	return (corrupt);
+X}
+X
+X/*
+X * inskip()
+X *
+X * Skip input archive data. Returns zero under normal circumstances,
+X * -1 if unreadable data is encountered.
+X */
+XSTATIC int
+Xinskip(len)
+Xreg off_t	len;
+X{
+X	reg uint	chunk;
+X	reg int		corrupt = 0;
+X
+X	while (len) {
+X		while ((chunk = bufend - bufidx) == 0)
+X			corrupt |= infill();
+X		if (chunk > len)
+X			chunk = len;
+X		bufidx += chunk;
+X		len -= chunk;
+X		total += chunk;
+X	}
+X	return (corrupt);
+X}
+X
+X/*
+X * inswab()
+X *
+X * Read a reversed byte order binary header. Returns the number
+X * of trailing alignment bytes to skip; -1 if unsuccessful.
+X */
+XSTATIC int
+Xinswab(magic, name, asb)
+Xreg char	*magic;
+Xreg char	*name;
+Xreg Stat	*asb;
+X{
+X	reg ushort	namesize;
+X	reg uint	namefull;
+X	auto Binary	binary;
+X
+X	if (*((ushort *) magic) != swab(M_BINARY))
+X		return (-1);
+X	memcpy((char *) &binary,
+X	    magic + sizeof(ushort),
+X	    M_STRLEN - sizeof(ushort));
+X	if (inread((char *) &binary + M_STRLEN - sizeof(ushort),
+X	    sizeof(binary) - (M_STRLEN - sizeof(ushort))) < 0)
+X		return (warnarch("Corrupt swapped header",
+X		    (off_t) sizeof(binary) - (M_STRLEN - sizeof(ushort))));
+X	asb->sb_dev = (dev_t) swab(binary.b_dev);
+X	asb->sb_ino = (ino_t) swab(binary.b_ino);
+X	asb->sb_mode = swab(binary.b_mode);
+X	asb->sb_uid = swab(binary.b_uid);
+X	asb->sb_gid = swab(binary.b_gid);
+X	asb->sb_nlink = swab(binary.b_nlink);
+X	asb->sb_rdev = (dev_t) swab(binary.b_rdev);
+X	asb->sb_mtime = swab(binary.b_mtime[0]) << 16 | swab(binary.b_mtime[1]);
+X	asb->sb_size = swab(binary.b_size[0]) << 16 | swab(binary.b_size[1]);
+X	if ((namesize = swab(binary.b_name)) == 0 || namesize >= PATHSIZE)
+X		return (warnarch("Bad swapped pathname length",
+X		    (off_t) sizeof(binary) - (M_STRLEN - sizeof(ushort))));
+X	if (inread(name, namefull = namesize + namesize % 2) < 0)
+X		return (warnarch("Corrupt swapped pathname", (off_t) namefull));
+X	if (name[namesize - 1] != '\0')
+X		return (warnarch("Bad swapped pathname", (off_t) namefull));
+X	return (asb->sb_size % 2);
+X}
+X
+X/*
+X * lineget()
+X *
+X * Get a line from a given stream. Returns 0 if successful, -1 at EOF.
+X */
+XSTATIC int
+Xlineget(stream, buf)
+Xreg FILE	*stream;
+Xreg char	*buf;
+X{
+X	reg int		c;
+X
+X	for (;;) {
+X		if ((c = getc(stream)) == EOF)
+X			return (-1);
+X		if (c == '\n')
+X			break;
+X		*buf++ = c;
+X	}
+X	*buf = '\0';
+X	return (0);
+X}
+X
+X/*
+X * linkalso()
+X *
+X * Add a destination pathname to an existing chain. Assumes that
+X * at least one element is present.
+X */
+XSTATIC void
+Xlinkalso(linkp, name)
+Xreg Link	*linkp;
+Xchar		*name;
+X{
+X	reg Path	*path;
+X
+X	if ((path = (Path *) memget(sizeof(Path))) == NULL
+X	    || (path->p_name = memstr(name)) == NULL)
+X		return;
+X	path->p_forw = NULL;
+X	path->p_back = linkp->l_path->p_back;
+X	path->p_back->p_forw = path;
+X	linkp->l_path->p_back = path;
+X}
+X
+X/*
+X * linkfrom()
+X *
+X * Find a file to link from. Returns a pointer to a link
+X * structure, or NULL if unsuccessful.
+X */
+XSTATIC Link *
+Xlinkfrom(asb)
+Xreg Stat	*asb;
+X{
+X	reg Link	*linkp;
+X	reg Link	*linknext;
+X	reg Path	*path;
+X	reg Path	*pathnext;
+X	reg Link	**abase;
+X
+X	for (linkp = *(abase = linkhash(asb->sb_ino)); linkp; linkp = linknext)
+X		if (linkp->l_nlink == 0) {
+X			for (path = linkp->l_path; path; path = pathnext) {
+X				pathnext = path->p_forw;
+X				free(path->p_name);
+X			}
+X			free((char *) linkp->l_path);
+X			if (linknext = linkp->l_forw)
+X				linknext->l_back = linkp->l_back;
+X			if (linkp->l_back)
+X				linkp->l_back->l_forw = linkp->l_forw;
+X			else
+X				*abase = linkp->l_forw;
+X			free((char *) linkp);
+X		} else if (linkp->l_ino == asb->sb_ino
+X		    && linkp->l_dev == asb->sb_dev) {
+X			--linkp->l_nlink;
+X			return (linkp);
+X		} else
+X			linknext = linkp->l_forw;
+X	return (NULL);
+X}
+X
+END_OF_FILE
+if test 29675 -ne `wc -c <'afio.c.P1'`; then
+    echo shar: \"'afio.c.P1'\" unpacked with wrong size!
+fi
+# end of 'afio.c.P1'
+fi
+echo shar: End of archive 2 \(of 2\).
+##  End of shell archive.
+exit 0

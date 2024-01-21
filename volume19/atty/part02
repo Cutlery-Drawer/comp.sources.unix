@@ -1,0 +1,2184 @@
+Subject:  v19i011:  A command-line editor (for BSD), Part02/04
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: ka@june.cs.washington.edu (Kenneth Almquist)
+Posting-number: Volume 19, Issue 11
+Archive-name: atty/part02
+
+# This is part 2 of atty.  To unpack, feed it into the shell (not csh).
+# The atty distribution consists of four pieces.  After you unpack everyting,
+# read the file README.
+
+echo extracting ed.c
+cat > ed.c <<\EOF
+/*
+ * Input line editing for atty.
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of atty, which is distributed under the terms specified
+ * by the Atty General Public License.  See the file named LICENSE.
+ */
+
+#include <stdio.h>
+#include "attyed.h"
+#include "ed.h"
+#include "bind.h"
+#include "regex.h"
+#include <ctype.h>
+#include <signal.h>
+
+
+#define HISTFILLER -1		/* indicates blank record in history file */
+#define HISTSIZE 8192		/* size of history; MUST be a power of 2 */
+#define LOCMASK (HISTSIZE - 1)	/* mask to get offset in history area */
+
+/* flags to histadvance */
+#define SKIPEMPTY 01		/* skip empty history lines */
+#define SAMEPRGM 02		/* skip history lines read by other programs */
+#define HSEARCH 04		/* skip history lines not matching pattern */
+
+
+struct histhdr {
+      short len;		/* length of history line */
+      short prevlen;		/* length of preceding line */
+      long prgmid;		/* identifies program */
+      /* text of line goes here */
+};
+
+
+struct histline {
+      short len;		/* length of history line */
+      short prevlen;		/* length of preceding line */
+      long prgmid;		/* identifies program */
+      char *text;		/* text of line */
+};
+
+
+char curline[MAXLLEN+1];	/* line being edited */
+char *point;			/* location of point */
+char *mark;			/* location of mark */
+char *endcurline;		/* end of line */
+char histarea[HISTSIZE];	/* history file */
+long endhist;			/* end of history file */
+long curhist;			/* location in history file */
+char lasthist[MAXLLEN];		/* line after end of history file */
+int lasthistlen;		/* length of lasthist */
+int histprevlen;		/* length of last entry in history file */
+char killbuffer[MAXLLEN];	/* killed text goes here */
+int killsize;			/* length of killed text */
+int prefixarg;			/* if set, evaluating prefix arg */
+int prefixval;			/* value of prefix argument */
+int prefixsign;			/* sign of prefix argument */
+char cmdcharacter;		/* character that invoked this command */
+unsigned char *curmode;		/* base key table for current mode */
+unsigned char *curtable;	/* current command parsing table */
+unsigned char *keytabs;		/* key tables */
+int keyhash;			/* DEBUG */
+char syntaxtbl[NSYNTAX][16];	/* syntax tables */
+char *edstrings;		/* string table */
+char *abbrevtbl;		/* abbreviation table */
+extern int version;		/* version of .bindc format */
+extern int (*edfunc[])();	/* table of editor functions */
+int (*edrecurse)();		/* function to call when recursive edit done */
+int (*ednextc)();		/* function to call on next character */
+struct re_pattern_buffer pbuf;	/* buffer containing last search pattern */
+int savedpattern;		/* true if current pattern set */
+char savecurline[MAXLLEN];	/* saved copy of current line */
+int savecurlinelen;		/* length of savecurline */
+char *savepoint;		/* point saved for recursive edit */
+char *savemark;			/* point saved for recursive edit */
+int saveprefixval;		/* prefixval saved here during recursive edit */
+char editprompt;		/* printed during recursive edit */
+
+
+#ifdef __STDC__
+int getsh(FILE *);
+int runfmatch(int);
+void zapline(void);
+void delregion(char *, int);
+int dosearch(int);
+int extractword(char *, int, int);
+int histadvance(int, int);
+void addhist(void);
+void loadhistline(long);
+void gethist(long, struct histline *);
+char *getenv(char *);
+char *malloc(unsigned);
+#else
+int getsh();
+int runfmatch();
+void zapline();
+void delregion();
+int dosearch();
+int extractword();
+int histadvance();
+void addhist();
+void loadhistline();
+void gethist();
+char *getenv();
+char *malloc();
+#endif
+
+
+
+void
+edinit(file)
+      char *file;
+      {
+      FILE *fp;
+      int ktsize;
+      int stringsize;
+      int abbrevsize;
+      char fname[256];
+      char *home;
+      extern char dftbind[];
+
+      if (file == NULL) {
+	    if ((home = getenv("HOME")) != NULL) {
+		  strcpy(fname, home);
+		  strcat(fname, "/.bindc");
+		  if ((fp = fopen(fname, "r")) == NULL)
+			file = dftbind;
+	    } else {
+		  file = dftbind;
+	    }
+      }
+      if (file != NULL) {
+	    if ((fp = fopen(file, "r")) == NULL) {
+		  perror(file);
+		  badinit("Can't read bindings file");
+	    }
+      }
+      if (getsh(fp) != BINDMAGIC) {
+	    badinit("Bad magic number on key binding file");
+      }
+      if (getc(fp) != version) {
+	    badinit(".bindc file needs to be recompiled");
+      }
+      ktsize = getc(fp) << 8;
+      stringsize = getsh(fp);
+      abbrevsize = getsh(fp);
+      if (feof(fp) || ferror(fp))
+	    badinit("Key binding file truncated");
+      if ((keytabs = (unsigned char *)malloc(ktsize)) == NULL)
+	    badinit("Out of space");
+      fread((char *)keytabs, ktsize, 1, fp);
+      keyhash = genkeyhash();	/*DEBUG*/
+      fread((char *)syntaxtbl, sizeof syntaxtbl, 1, fp);
+      if (stringsize != 0) {
+	    if ((edstrings = malloc(stringsize)) == NULL)
+		  badinit("Out of space");
+	    fread(edstrings, stringsize, 1, fp);
+      }
+      if (abbrevsize != 0) {
+	    if ((abbrevtbl = malloc(abbrevsize + 1)) == NULL)
+		  badinit("Out of space");
+	    fread(abbrevtbl, abbrevsize, 1, fp);
+	    abbrevtbl[abbrevsize] = '\0';	/* mark end of abbrevs */
+      }
+      if (feof(fp) || ferror(fp))
+	    badinit("Key binding file truncated");
+      fclose(fp);
+      endcurline = curline;
+      point = curline;
+      curtable = curmode = keytabs;
+      gettermcap();
+}
+
+
+
+/*
+ * Read a short integer from a file.
+ */
+
+int
+getsh(fp)
+      FILE *fp;
+      {
+      int c;
+
+      c = getc(fp);
+      return c | getc(fp) << 8;
+}
+
+
+void
+newttychars() {
+      /* nothing to do */
+}
+
+
+void
+edflush() {
+      zapline();
+      /* also reset state to start of command */
+      curtable = keytabs;
+      prefixarg = 0;
+}
+
+
+void
+inchar(c)
+      char c;
+      {
+      int cmd;
+      int index;
+      int status;
+      int pfx;
+      int (*func)();
+
+      c &= 0177;		/* just in case */
+      if (ednextc) {
+	    func = ednextc;
+	    ednextc = NULL;
+	    if ((*func)(c) == 1)
+		  needbeep++;
+	    goto out;
+      }
+      if (prefixarg && c >= '0' && c <= '9') {
+	    if (prefixarg >= 2)
+		  prefixval = 0;
+	    prefixarg = 1;
+	    prefixval = prefixval * 10 + c - '0';
+	    goto out;
+      }
+      cmd = curtable[c];
+      index = curtable[c + 128];
+      if (cmd == C_FUNC || cmd == C_INSERT) {
+	    if (prefixarg == 0)
+		  pfx = 1;
+	    else if (prefixarg == 3)
+		  pfx = -1;
+	    else if (prefixsign)
+		  pfx = - prefixval;
+	    else
+		  pfx = prefixval;
+	    cmdcharacter = c;
+	    if (cmd == C_FUNC)
+		  status = (*edfunc[index])(pfx);
+	    else
+		  status = insert_string(index, pfx);
+	    if (status == 1)
+		  needbeep++;
+	    if (status != 2)
+		  prefixarg = 0;
+	    curtable = curmode;
+      } else if (cmd == C_PFXTBL) {
+	    curtable = keytabs + index * 256;
+      } else {
+	    needbeep++;
+	    curtable = curmode;
+      }
+out:;
+}
+
+
+void
+zapline() {
+      point = curline;
+      endcurline = curline;
+      mark = NULL;
+}
+
+
+
+universal_argument(n) {
+      if (prefixarg == 0) {
+	    prefixval = 1;
+	    prefixsign = 0;
+      }
+      prefixarg = 2;
+      prefixval *= 4;
+      return 2;
+}
+
+
+digit_argument(n) {
+      prefixarg = 1;
+      prefixval = cmdcharacter - '0';
+      if (prefixval > 9 || prefixval < 0)
+	    prefixval = 0;
+      prefixsign = 0;
+      return 2;
+}
+
+
+negative_argument(n) {
+      prefixarg = 3;
+      prefixval = 0;
+      prefixsign = 1;
+      return 2;
+}
+
+
+mode_0(n) {
+      curmode = keytabs;
+      return 0;
+}
+
+
+mode_1(n) {
+      curmode = keytabs + 256;
+      return 0;
+}
+
+
+newline(n) {
+      if (edrecurse)
+	    return (*edrecurse)(0);
+      if (point == endcurline && expandabbrev() < 0)
+	    return 1;
+      addhist();
+      refresh();
+      *endcurline++ = '\n';
+      senddata(curline, endcurline - curline);
+      movetoend();
+      curhist = endhist;
+      zapline();
+      curmode = keytabs;
+      return 0;
+}
+
+
+end_of_file(n) {
+      if (edrecurse)
+	    return (*edrecurse)(1);
+      if (point == endcurline && expandabbrev() < 0)
+	    return 1;
+      addhist();
+      senddata(curline, endcurline - curline);
+      freezedisp(1);
+      curhist = endhist;
+      zapline();
+      curmode = keytabs;
+      return 0;
+}
+
+
+eof_or_delete_char(n) {
+      if (endcurline == curline)
+	    return end_of_file(n);
+      else
+	    return delete_char(n);
+}
+
+
+newline_and_insert(n) {
+      if (edrecurse)
+	    return 1;
+      if (point == endcurline && expandabbrev() < 0)
+	    return 1;
+      if (curhist == endhist) {
+	    lasthistlen = endcurline - curline;
+	    bcopy(curline, lasthist, lasthistlen);
+      }
+      addhist();
+      refresh();
+      *endcurline++ = '\n';
+      senddata(curline, endcurline - curline);
+      movetoend();
+      zapline();
+      curmode = keytabs;
+      if (curhist < endhist - HISTSIZE) {
+	    curhist = endhist;
+	    return 1;
+      }
+      return histadvance(1, 0);
+}
+
+
+file_complete(n) {
+      return runfmatch('c');
+}
+
+
+list_file_completions(n) {
+      return runfmatch('l');
+}
+
+
+runfmatch(type) {
+      char saveline[MAXLLEN];
+      register char *p;
+      char *savemark;
+      char *savepoint;
+      int savelen;
+      int status;
+
+      p = point;
+      while (p < endcurline && infname(*p))
+	    p++;
+      if (p == curline || ! infname(p[-1]))
+	    return 1;
+      savelen = endcurline - curline;
+      bcopy(curline, saveline, savelen);
+      savemark = mark;
+      savepoint = p;
+      if (promptset && type == 'l') {
+	    refresh();
+	    movetoend();
+	    promptset = 1;		/* retain prompt */
+      }
+      point = p;
+      delregion(endcurline, 0);
+      while (p > curline && infname(p[-1]))
+	    p--;
+      point = curline;
+      delregion(p, 0);
+      if (makespace(10)) {
+	    status = 1;
+	    goto out;
+      }
+      bcopy("fmatch -x ", curline, 10);
+      curline[8] = type;
+      if (promptset) {
+	    if (makespace(1)) {
+		  status = 1;
+		  goto out;
+	    }
+	    curline[0] = '\034';
+      } else {
+	    refresh();
+	    movetoend();
+      }
+#ifdef notdef /* no longer add to history file */
+      atend = (curhist == endhist);
+      addhist();
+      if (atend)
+	    curhist = endhist;
+#endif
+      *endcurline++ = '\n';
+      senddata(curline, endcurline - curline);
+      status = 0;
+out:
+      endcurline = curline + savelen;
+      bcopy(saveline, curline, savelen);
+      mark = savemark;
+      point = savepoint;
+      return status;
+}
+
+      
+tty_intr(n) {
+      if (edrecurse)
+	    return (*edrecurse)(1);
+      sendsig(SIGINT);
+      return 0;
+}
+
+
+tty_quit(n) {
+      sendsig(SIGQUIT);
+      return 0;
+}
+
+
+tty_susp(n) {
+      sendsig(SIGTSTP);
+      return 0;
+}
+
+
+do_quoted_insert(c) {
+      cmdcharacter = c;
+      return self_insert(prefixval);
+}
+
+
+quoted_insert(n) {
+      ednextc = do_quoted_insert;
+      prefixval = n;
+}
+
+
+/*
+ * Delete the characters between the point and "end".  If "kill" is true,
+ * copy to kill buffer.  Exception:  we don't copy to kill if the region
+ * is empty.
+ */
+
+void
+delregion(end, kill)
+      char *end;
+      {
+      register char *p, *q;
+      register char *k;
+
+      if (end > endcurline)
+	    end = endcurline;
+      if (end < curline)
+	    end = curline;
+      if (end > point) {
+	    p = point;
+	    q = end;
+      } else {
+	    p = end;
+	    q = point;
+      }
+      if (kill && p != q) {
+	    end = p;
+	    k = killbuffer;
+	    while (p < q)
+		  *k++ = *p++;
+	    killsize = k - killbuffer;
+	    p = end;
+      }
+      point = p;
+      if (mark && mark > p) {
+	    if (mark > q)
+		  mark -= q - p;
+	    else
+		  mark = p;
+      }
+      while (q < endcurline)
+	    *p++ = *q++;
+      endcurline = p;
+}
+
+
+delete_backward_char(n) {
+      delregion(point - n, prefixarg);
+}
+
+
+delete_char(n) {
+      delregion(point + n, prefixarg);
+}
+
+
+kill_word(n) {
+      char *save = point;
+
+      forward_word(n);
+      delregion(save, 1);
+      return 0;
+}
+
+
+backward_kill_word(n) {
+      char *save = point;
+
+      backward_word(n);
+      delregion(save, 1);
+      return 0;
+}
+
+
+kill_region(n) {
+      if (mark == NULL)
+	    return 1;
+      delregion(mark, 1);
+      return 0;
+}
+
+
+kill_line(n) {
+      delregion(n <= 0? curline : endcurline, 1);
+      return 0;
+}
+
+
+kill_input(n) {
+      point = curline;
+      delregion(endcurline, 1);
+      return 0;
+}
+
+
+copy_region_as_kill(n) {
+      char *savepoint = point;
+      char *savemark = mark;
+      delregion(mark, 1);
+      yank(1);
+      point = savepoint;
+      mark = savemark;
+}
+
+
+forward_char(n) {
+      int left;
+      left = endcurline - point;
+      if (n > left)
+	    n = left;
+      left = curline - point;
+      if (n < left)
+	    n = left;
+      point += n;
+      return 0;
+}
+
+
+backward_char(n) {
+      return forward_char(-n);
+}
+
+
+int
+inword(c)
+      char c;
+      {
+      c &= 0177;
+      return syntaxtbl[0][c >> 3] & 1 << (c & 07);
+}
+
+
+int
+infname(c)
+      char c;
+      {
+      c &= 0177;
+      return syntaxtbl[1][c >> 3] & 1 << (c & 07);
+}
+
+
+int
+inabbrev(c)
+      char c;
+      {
+      c &= 0177;
+      return syntaxtbl[2][c >> 3] & 1 << (c & 07);
+}
+
+
+forward_word(n) {
+      if (n < 0)
+	    return backward_word(-n);
+      while (--n >= 0) {
+	    while (point < endcurline && ! inword(*point))
+		  point++;
+	    while (point < endcurline && inword(*point))
+		  point++;
+      }
+      return 0;
+}
+
+
+backward_word(n) {
+      if (n < 0)
+	    return forward_word(-n);
+      while (--n >= 0) {
+	    while (--point >= curline && ! inword(*point));
+	    point++;
+	    while (--point >= curline && inword(*point));
+	    point++;
+      }
+      return 0;
+}
+
+
+end_of_line(n) {
+      point = endcurline;
+      return 0;
+}
+
+
+beginning_of_line(n) {
+      point = curline;
+      return 0;
+}
+
+
+
+/*
+ * Make space for n characters after the point.  Return 1 on failure.
+ */
+
+int
+makespace(n) {
+      char *p;
+
+      if (endcurline - curline + n > MAXLLEN)
+	    return 1;
+      for (p = endcurline ; --p >= point ; )
+	    *(p + n) = *p;
+      endcurline += n;
+      if (mark != NULL && mark > point)
+	    mark += n;
+      return 0;
+}
+
+
+void
+insertchars(p, n)
+      char *p;
+      {
+      if (makespace(n) != 0) {
+	    needbeep++;
+	    return;
+      }
+      bcopy(p, point, n);
+      point += n;
+}
+
+
+self_insert(n) {
+      if (abbrevtbl && ! inabbrev(cmdcharacter)) {
+	    if (expandabbrev() < 0)
+		  return 1;
+      }
+      while (--n >= 0) {
+	    if (point == endcurline) {
+		  if (endcurline == &curline[MAXLLEN])
+			return 1;
+		  endcurline++;
+	    } else {
+		  if (makespace(1) != 0)
+			return 1;
+	    }
+	    *point++ = cmdcharacter;
+      }
+      return 0;
+}
+
+
+yank(n) {
+      if (makespace(killsize) != 0)
+	    return 1;
+      bcopy(killbuffer, point, killsize);
+      mark = point +  killsize;
+      if (! prefixarg)
+	    exchange_point_and_mark(0);
+      return 0;
+}
+
+
+insert_string(stringnum, n) {
+      char *p;
+      int len;
+
+      p = edstrings;
+      while (--stringnum >= 0)
+	    p = p + *p + 1;
+      if (abbrevtbl && *p != 0 &&! inabbrev(p[1])) {
+	    if (expandabbrev() < 0)
+		  return 1;
+      }
+      while (--n >= 0) {
+	    if (makespace(len = *p) != 0) {
+		  return 1;
+	    }
+	    bcopy(p + 1, point, len);
+	    point += len;
+      }
+      return 0;
+}
+
+
+set_mark(n) {
+      mark = point;
+      return 0;
+}
+
+
+exchange_point_and_mark(n) {
+      char *p;
+
+      if (mark == NULL)
+	    return 1;
+      p = mark;
+      mark = point;
+      point = p;
+      return 0;
+}
+
+
+/*
+ * Convert characters between the point and the specified location to
+ * upper case.
+ */
+
+void
+upcase(end)
+      char *end;
+      {
+      char *p;
+      int len;
+
+      if (end > point) {
+	    p = point;
+	    len = end - point;
+      } else {
+	    p = end;
+	    len = point - end;
+      }
+      while (--len >= 0) {
+	    if (islower(*p))
+		  *p = toupper(*p);
+	    p++;
+      }
+}
+
+
+upcase_char(n) {
+      char *save = point;
+
+      forward_char(n);
+      upcase(save);
+      return 0;
+}
+
+
+upcase_word(n) {
+      char *save = point;
+
+      forward_word(n);
+      upcase(save);
+      return 0;
+}
+
+
+upcase_region(n) {
+      upcase(mark);
+      return 0;
+}
+
+
+gosling_transpose_chars(n) {
+      char c;
+
+      if (prefixarg)
+	    return transpose_chars(n);
+      if (point < curline + 2)
+	    return 1;
+      c = point[-1];
+      point[-1] = point[-2];
+      point[-2] = c;
+      return 0;
+}
+
+
+transpose_chars(n) {
+      char c;
+
+      if (point == endcurline && point >= curline + 2 && ! prefixarg)
+	    point--;
+      if (point <= curline || n > 0 && point >= endcurline)
+	    return 1;
+      c = *(point - 1);
+      delregion(point - 1, 0);
+      forward_char(n);
+      makespace(1);
+      *point++ = c;
+      return 0;
+}
+
+
+transpose_words(n) {
+      char *save = point;
+      char *start;
+      char *loc;
+      int end1, start2, end2;
+      char buf[MAXLLEN];
+
+      if (point == endcurline)
+	    backward_word(1);
+      loc = point;
+      backward_word(1);
+      start = point;
+      if (start >= loc || ! inword(*start))
+	    goto fail;
+      forward_word(1);
+      if (point > loc)
+	    point = loc;
+      end1 = point - start;
+      forward_word(1);
+      end2 = point - start;
+      backward_word(1);
+      if (point < loc) {
+	    point = loc;
+	    if (! inword(*loc))
+		  goto fail;
+      }
+      start2 = point - start;
+      bcopy(start, buf, end2);
+      point = start + start2;
+      delregion(start + end2, 0);
+      point = start;
+      delregion(start + end1, 0);
+      makespace(end2 - start2);
+      bcopy(buf + start2, start, end2 - start2);
+      point = start + end2 - end1;
+      makespace(end1);
+      bcopy(buf, point, end1);
+      point += end1;
+      if (save == endcurline)
+	    point = save;
+      return 0;
+
+fail:
+      point = save;
+      return 1;
+}
+
+
+re_search_backward(n) {
+      return re_search_forward(-n);
+}
+
+
+re_search_forward(n) {
+      if (edrecurse)
+	    return 1;
+      edrecurse = dosearch;
+      savecurlinelen = endcurline - curline;
+      bcopy(curline, savecurline, savecurlinelen);
+      savepoint = point;
+      savemark = mark;
+      saveprefixval = n;
+      zapline();
+      editprompt = cmdcharacter? cmdcharacter : '/';
+      curmode = keytabs;
+      return 0;
+}
+
+
+dosearch(flag) {
+      edrecurse = NULL;
+      editprompt = '\0';
+      if (flag)
+	    goto fail;
+      if (endcurline == curline) {
+	    if (! savedpattern)
+		  goto fail;
+      } else if (re_compile_pattern(curline, endcurline - curline, &pbuf)) {
+	    savedpattern = 0;
+	    goto fail;
+      }
+      savedpattern = 1;
+      bcopy(savecurline, curline, savecurlinelen);
+      endcurline = curline + savecurlinelen;
+      point = savepoint;
+      mark = savemark;
+      return histadvance(saveprefixval, HSEARCH);
+
+fail:
+      bcopy(savecurline, curline, savecurlinelen);
+      endcurline = curline + savecurlinelen;
+      point = savepoint;
+      mark = savemark;
+      return 1;
+}
+
+
+get_history_word(n) {
+      struct histline hline;
+
+      if (endhist == 0)
+	    return 1;
+      gethist(endhist - histprevlen - sizeof (struct histhdr), &hline);
+      if (! prefixarg)
+	    n = -1;
+      return extractword(hline.text, hline.len, n);
+}
+
+
+last_output_line(n) {
+      if (! prefixarg)
+	    n = 0;
+      return extractword(lastoutline, lastoutlinelen, n);
+}
+
+
+/*
+ * Insert the contents of word n of the line.  If n is zero, insert the
+ * entire line; if it is negative, count words from the end.  In this
+ * routine, words are always delimited by spaces and tabs.
+ */
+
+int
+extractword(line, len, n)
+      char *line;
+      {
+      char *p;
+      char *q;
+      char *endline = line + len;
+      int wordlen;
+
+      if (n > 0) {
+	    p = line;
+	    for (;;) {
+		  while (p < endline && ! infname(*p))
+			p++;
+		  q = p;
+		  while (q < endline && infname(*q))
+			q++;
+		  if (--n == 0)
+			break;
+		  p = q;
+	    }
+      } else if (n < 0) {
+	    q = endline;
+	    for (;;) {
+		  while (q > line && ! infname(q[-1]))
+			q--;
+		  p = q;
+		  while (p > line && infname(p[-1]))
+			p--;
+		  if (++n == 0)
+			break;
+		  q = p;
+	    }
+      } else { /* n == 0 */
+	    p = line;
+	    q = endline;
+      }
+      wordlen = q - p;
+      if (makespace(wordlen) != 0)
+	    return 1;
+      bcopy(p, point, wordlen);
+      mark = point;
+      point += wordlen;
+      return 0;
+}
+
+
+next_history(n) {
+      return histadvance(n, SKIPEMPTY);
+}
+
+
+previous_history(n) {
+      return histadvance(-n, SKIPEMPTY);
+}
+
+
+end_of_history(n) {
+      loadhistline(endhist);
+      return 0;
+}
+
+
+beginning_of_history(n) {
+      histadvance(-32767, 0);
+      return 0;
+}
+
+
+/*
+ * Move through the history file, and load the result into curline.
+ * N is the number of items to move:  a negative value of n moves
+ * backward in the history file and a postive value of n moves forward.
+ * The flags control which history lines are counted.  The search starts
+ * from the location specified by the curhist variable.
+ *
+ * The structure of the history file is as follows.  Each line in the
+ * history file consists of a header, defined as (struct histhdr), followed
+ * by the text of the line.  Locations in the history file are identified
+ * by the number of bytes written since the file was first created.  To
+ * keep the file from growing without bound, the file wraps around at
+ * HISTSIZE bytes.  Thus any location less than (endhist - HISTSIZE) has
+ * been overwritten.  (Endhist points to the end of the history file.)
+ */
+
+int
+histadvance(n, flags) {
+      struct histline hline;
+      long loc;
+      long found;
+      int back;
+      int oldloc;
+      int prgmid = 1;
+
+      if (edrecurse)
+	    return 1;
+      loc = curhist;
+      if (loc == endhist) {
+	    lasthistlen = endcurline - curline;
+	    bcopy(curline, lasthist, lasthistlen);
+      }
+      back = 0;
+      if (n < 0) {
+	    n = -n;
+	    back = 1;
+      }
+      found = loc;
+      while (n >= 0) {
+	    oldloc = loc;
+	    if (back) {
+		  if (loc == endhist) {
+			loc -= sizeof (struct histhdr) + histprevlen;
+		  } else if (loc < 0 || loc < endhist - HISTSIZE) {
+			break;
+		  } else {
+			gethist(loc, &hline);
+			loc -= sizeof (struct histhdr) + hline.prevlen;
+		  }
+	    } else {
+		  if (loc == endhist) {
+			loc++;
+		  } else if (loc > endhist) {
+			break;
+		  } else {
+			gethist(loc, &hline);
+			loc += sizeof (struct histhdr) + hline.len;
+		  }
+	    }
+	    if (oldloc == endhist) {
+		  hline.prgmid = prgmid;
+		  hline.text = lasthist;
+		  hline.len = lasthistlen;
+	    }
+	    if (hline.prgmid != HISTFILLER
+	     && ((flags & SKIPEMPTY) == 0 || oldloc == endhist || hline.len > 0)
+	     && ((flags & SAMEPRGM) == 0 || hline.prgmid == prgmid)
+	     && ((flags & HSEARCH) == 0 || oldloc == curhist ||
+			re_search(&pbuf, hline.text, hline.len, 0, hline.len,
+				  (struct re_registers *)0) >= 0)) {
+		  n--;
+		  found = oldloc;
+	    }
+      }
+      if (found != curhist || n < 0)
+	    loadhistline(found);
+      return n >= 0? 1 : 0;
+}
+
+
+/*
+ * Add the current line to the history file.  If echoing is turned off,
+ * we store a blank line rather than the actual line so that we don't
+ * have passwords in the history file.
+ */
+
+void
+addhist() {
+      struct histhdr hdr;
+      int space;
+      int len = ttymode.echo? endcurline - curline : 0;
+      char *lp;
+
+      hdr.prevlen = histprevlen;
+      space = HISTSIZE - (endhist & LOCMASK);
+      if (space < len + 2 * sizeof (struct histhdr)) {
+	    hdr.len = space - sizeof (struct histhdr);
+	    hdr.prgmid = HISTFILLER;
+	    bcopy((char *)&hdr, histarea + (endhist & LOCMASK), sizeof hdr);
+	    hdr.prevlen = hdr.len;
+	    endhist += space;
+      }
+      lp = histarea + (endhist & LOCMASK);
+      hdr.len = len;
+      hdr.prgmid = 0;		/* for now */
+      bcopy((char *)&hdr, lp, sizeof hdr);
+      bcopy(curline, lp + sizeof hdr, len);
+      histprevlen = len;
+      endhist += sizeof hdr + len;
+}
+
+
+/*
+ * Load the contents of a history line into curline.
+ */
+
+void
+loadhistline(loc)
+      long loc;
+      {
+      struct histline hline;
+
+      if (loc == endhist) {
+	    if (curhist == endhist) {
+		  return;
+	    }
+	    hline.text = lasthist;
+	    hline.len = lasthistlen;
+      } else {
+	    gethist(loc, &hline);
+      }
+      bcopy(hline.text, curline, hline.len);
+      endcurline = curline + hline.len;
+      point = endcurline;
+      mark = NULL;
+      curhist = loc;
+}
+
+
+/*
+ * Read a history entry into hline.  To make the history file be a real
+ * file rather than a block of memory, change this routine and the addhist
+ * routine.
+ */
+
+void
+gethist(loc, hline)
+      long loc;
+      struct histline *hline;
+      {
+      char *lp = histarea + (loc & LOCMASK);
+
+      bcopy(lp, (char *)hline, sizeof (struct histhdr));
+      hline->text = lp + sizeof (struct histhdr);
+}
+
+
+/*
+ * Expand the abbreviation before point, if any.  Returns 1 if expansion
+ * occurred, 0 if no expansion occurred, and -1 if the expansion could
+ * not be performed because there was not sufficient space.
+ */
+
+int
+expandabbrev() {
+      char *start;
+      int len;
+      char *p;
+
+      if (abbrevtbl == NULL)
+	    return 0;
+      start = point;
+      while (--start >= curline && inabbrev(*start));
+      start++;
+      if (start == point)
+	    return 0;
+      len = point - start;
+      p = abbrevtbl;
+      for (;;) {
+	    if (*p == 0)
+		  return 0;		/* end of table */
+	    if (*p == len && bcmp(p + 1, start, len) == 0)
+		  break;
+	    p += *p + 1;
+	    p += *p + 1;
+      }
+      p += *p + 1;
+      if (endcurline - curline + *p - len > MAXLLEN)
+	    return -1;
+      delregion(start, 0);
+      if (makespace(*p))
+	    return -1;			/* can't happen */
+      bcopy(p + 1, point, *p);
+      point += *p;
+      return 1;
+}
+
+
+/* DEBUG */
+
+int
+genkeyhash() {
+      int hash;
+      unsigned char *p;
+
+      hash = 123456; p = keytabs + 256;
+      do { hash = ((hash << 8) + *--p) % 8380087; } while (p >= keytabs);
+      return hash;
+}
+
+
+chkkeytab() {
+      int hash;
+      unsigned char *p;
+
+      hash = 123456; p = keytabs + 256;
+      do { hash = ((hash << 8) + *--p) % 8380087; } while (p >= keytabs);
+      if (hash != keyhash)
+	    abort();
+}
+
+/* END DEBUG */
+EOF
+if test `wc -c < ed.c` -ne 25745
+then	echo 'ed.c is the wrong size'
+fi
+echo extracting fmatch.1
+cat > fmatch.1 <<\EOF
+.TH FMATCH 1
+.SH NAME
+fmatch \- file name matching
+.SH SYNOPSYS
+.B fmatch
+[
+-lc
+]
+.I file-prefix
+.SH COPYRIGHT
+.if n Copyright (C) 1989 by Kenneth Almquist.
+.if t Copyright \(co 1989 by Kenneth Almquist.  
+.SH DESCRIPTION
+The
+.I fmatch
+command finds the files which are matched by the
+.IR file-prefix .
+If the
+.B -l
+option is given (the default),
+.I fmatch
+lists the matching files.
+The default bindings for
+.IR atty (1)
+run
+.B fmatch
+.B -l
+on the current word when
+.B ESC\ =
+is typed.
+.PP
+If the
+.B -c
+option is given,
+.I fmatch
+attemtps to perform file name completion.
+If the prefix matches exactly one file,
+.I fmatch
+generates the rest of the file name matched by the prefix and
+inserts it in the input line buffer used by
+.IR atty (1).
+If the file is a directory, a ``/'' is appended.
+If the prefix matches no files or matches more than one file,
+.I fmatch
+inserts as many characters as it can (if the prefix matches multiple
+files), and rings the terminal bell.
+The default bindings for
+.IR atty (1)
+run
+.B fmatch
+.B -c
+on the current word when
+.B ESC\ ESC
+is typed.
+.SH BUGS
+.I Fmatch
+is kind of a kludge.
+.I Atty
+can't do file completion itself because it doesn't know the current working
+directory of the process reading the input.  This lack of knowledge could be
+corrected with some help from the kernel.
+EOF
+if test `wc -c < fmatch.1` -ne 1317
+then	echo 'fmatch.1 is the wrong size'
+fi
+echo extracting fmatch.c
+cat > fmatch.c <<\EOF
+/*
+ * File matching program run by the list-file-completions and file-complete
+ * commands of atty(1).
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of atty, which is distributed under the terms specified
+ * by the Atty General Public License.  See the file named LICENSE.
+ */
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/dir.h>
+
+
+#ifndef __STDC__
+#define const /* empty */
+#endif
+#define ARB 4
+
+
+int list;			/* true if -l option given */
+int completion;			/* true if -c option given */
+char *dirname;			/* directory being searched */
+int basenamelen;		/* number of characters of name specified */
+
+
+#ifdef __STDC__
+char **listfiles(char *);
+int compar(char **, char **);
+void printlist(char **);
+void complete(char **);
+int prefix(const char *, const char *);
+#else
+char **listfiles();
+int compar();
+void printlist();
+void complete();
+int prefix();
+#endif
+
+#ifdef __STDC__
+void *malloc(unsigned);
+void *realloc(void *, unsigned);
+#else
+char *malloc();
+char *realloc();
+#endif
+
+
+#define equal(s1, s2)	(strcmp(s1, s2) == 0)
+
+
+
+main(argc, argv)
+      char **argv;
+      {
+      char **ap;
+      char *p;
+      char **flist;
+
+      if (argc <= 1) {
+usage:	    fputs("Usage: fmatch -cl file_prefix\n", stdout);
+	    exit(2);
+      }
+      ap = argv + 1;
+      p = *ap;
+      if (*p == '-') {
+	    ap++;
+	    p++;
+	    while (*p) {
+		  switch (*p++) {
+		  case 'c':
+			completion++;
+			break;
+		  case 'l':
+			list++;
+			break;
+		  default:
+			goto usage;
+		  }
+	    }
+      }
+      if (*ap == NULL)
+	    goto usage;
+      if (! completion)
+	    list++;
+      flist = listfiles(*ap);
+      if (list)
+	    printlist(flist);
+      if (completion)
+	    complete(flist);
+      return 0;
+}
+
+
+char **
+listfiles(name)
+      char *name;
+      {
+      char *p;
+      char *basename;
+      char *dir;
+      DIR *dp;
+      struct direct *dirp;
+      struct stat statb;
+      char **flist;
+      int listsize;
+      int nfiles;
+
+      basename = NULL;
+      for (p = name ; *p ; p++) {
+	    if (*p == '/')
+		  basename = p;
+      }
+      if (basename == NULL) {
+	    basename = name;
+	    dir = ".";
+      } else if (basename == name) {
+	    basename++;
+	    dir = "/";
+      } else {
+	    *basename++ = '\0';
+	    dir = name;
+      }
+      if (! equal(dir, ".")
+       && (stat(dir, &statb) < 0 || (statb.st_mode & S_IFMT) != S_IFDIR)) {
+	    fputs(dir, stdout);
+	    fputs(": no such directory\n", stdout);
+	    if (completion)
+		  putc('\7', stdout);
+	    exit(2);
+      }
+      if ((dp = opendir(dir)) == NULL) {
+	    fputs(dir, stdout);
+	    fputs(": cannot open\n", stdout);
+	    if (completion)
+		  putc('\7', stdout);
+	    exit(2);
+      }
+      listsize = 20;
+      if ((flist = (char **)malloc(listsize * sizeof (char *))) == NULL) {
+nospace:    fputs("fmatch: out of space\n", stdout);
+	    exit(2);
+      }
+      nfiles = 0;
+      while ((dirp = readdir(dp)) != NULL) {
+	    if (*basename) {
+		  if (*dirp->d_name != *basename
+		   || ! prefix(basename, dirp->d_name))
+			continue;
+	    } else {
+		  if (*dirp->d_name == '.')
+			continue;
+	    }
+	    if (nfiles >= listsize - 1) {
+		  listsize += listsize >= 100? 40 : 20;
+		  if ((flist = (char **)realloc(flist,
+					listsize * sizeof (char *))) == NULL) {
+			goto nospace;
+		  }
+	    }
+	    if ((p = malloc(strlen(dirp->d_name) + 1)) == NULL)
+		  goto nospace;
+	    strcpy(p, dirp->d_name);
+	    flist[nfiles++] = p;
+      }
+      flist[nfiles] = NULL;
+      dirname = dir;
+      basenamelen = strlen(basename);
+      return flist;
+}
+
+
+int
+compar(a, b)
+      char **a, **b;
+      {
+      return strcmp(*a, *b);
+}
+
+
+void
+printlist(flist)
+      char **flist;
+      {
+      char **pp;
+      int maxlen;
+      int nfiles;
+      int len;
+      int ncolumns;
+      int sep;
+      int line;
+      int col;
+      int fnum;
+      int colwidth;
+      int i;
+
+      if (flist[0] == NULL)
+	    fputs("No match", stdout);
+      nfiles = 0;
+      maxlen = 0;
+      for (pp = flist ; *pp ; pp++) {
+	    len = strlen(*pp);
+	    if (maxlen < len)
+		  maxlen = len;
+	    nfiles++;
+      }
+      if (nfiles == 0)
+	    return;
+      qsort((char *)flist, nfiles, sizeof (char *), compar);
+      ncolumns = 80 / (maxlen + 2);
+      if (ncolumns == 0)
+	    ncolumns = 1;
+      colwidth = 80 / ncolumns;
+      sep = (nfiles + ncolumns - 1) / ncolumns;
+      for (line = 0 ; line < sep ; line++) {
+	    for (col = 0 ; ; ) {
+		  fnum = col * sep + line;
+		  if (fnum >= nfiles)
+			break;
+		  fputs(flist[fnum], stdout);
+		  if (++col >= ncolumns)
+			break;
+		  for (i = colwidth - strlen(flist[fnum]) ; --i >= 0 ; )
+			putc(' ', stdout);
+	    }
+	    putc('\n', stdout);
+      }
+}
+
+
+void
+complete(flist)
+      char **flist;
+      {
+      char *first;
+      int nmatch;
+      char **pp;
+      char *p, *q;
+      struct stat statb;
+
+      if ((first = *flist) == NULL) {
+	    putc('\7', stdout);
+	    return;
+      }
+      nmatch = strlen(first);
+      statb.st_mode = 0;
+      if (flist[1] == NULL) {
+	    if ((p = malloc(strlen(dirname) + nmatch + 3)) == NULL) {
+		  fputs("Out of space\n", stdout);
+		  exit(2);
+	    }
+	    strcpy(p, dirname);
+	    strcat(p, "/");
+	    strcat(p, first);
+	    stat(p, &statb);
+      } else {
+	    for (pp = flist ; *++pp != NULL ; ) {
+		  for (p = first, q = *pp ; *p == *q && p - first < nmatch ; p++, q++);
+		  nmatch = p - first;
+	    }
+	    if (nmatch <= basenamelen) {
+		  putc('\7', stdout);
+		  return;
+	    }
+      }
+      fputs("\033]I", stdout);
+      fwrite(first + basenamelen, nmatch - basenamelen, 1, stdout);
+      if ((statb.st_mode & S_IFMT) == S_IFDIR)
+	    putc('/', stdout);
+      putc('\n', stdout);
+      if (flist[1] != NULL)
+	    putc('\7', stdout);
+}
+
+
+int
+prefix(pfx, string)
+      register char const *pfx;
+      register char const *string;
+      {
+      while (*pfx) {
+	    if (*pfx++ != *string++)
+		  return 0;
+      }
+      return 1;
+}
+EOF
+if test `wc -c < fmatch.c` -ne 5900
+then	echo 'fmatch.c is the wrong size'
+fi
+echo extracting INTERNALS
+cat > INTERNALS <<\EOF
+I was going to write something about the internals, but decided you
+don't want to know!  This program is hack and should be rewritten
+properly, with appropriate kernel support.  Here are some hints on
+adding editing commands, if you want to do that.
+
+First, select a name for your routine, and add it to the "command"
+array at the top of kbind.c.  Then write a routine to implement the
+command and put it in ed.c.  The name of the routine should be the
+same as the name of the command, except that dashes should be replaced
+with underscores.
+
+The routine will be called with an integer argument specifying the
+prefix arg passed to the command, or 1 if there is no prefix arg.
+The global variable prefixarg will be nonzero if a prefix argument
+was given.  The global variable cmdcharacter will contain the last
+character of the key sequence used to invoke the command.  Your
+routine should return zero on success and one on failure; the latter
+will cause the editor to ring the terminal bell.
+
+The current line being edited is stored in the global variable curline.
+Endcurline points to the location after the last character of the
+line, "point" points to the character after the cursor, and "mark"
+points to the character following the mark.
+
+To modify the line, you probably want to use the routine makespace and
+delregion.  Makespace(n) creates space for n characters after the
+point, moving the characters following the point to the right.  You
+then have to copy characters into the space created.  The yank routine
+illustrates its usage.  Be sure to check the return code from
+makespace; a nonzero return means that the space could not be created.
+
+Delregion(p, kill) deletes all the characters between the point and
+the location pointed to by p.  For example, delregion(endcurline, 0)
+deletes all characters between the point and the end of the line.  If
+the integer flag "kill" is nonzero, delregion stores the deleted
+characters in the kill buffer.
+
+Beyond this, you're on your own!
+EOF
+if test `wc -c < INTERNALS` -ne 1990
+then	echo 'INTERNALS is the wrong size'
+fi
+echo extracting kbind.1
+cat > kbind.1 <<\EOF
+.TH KBIND 1
+.SH NAME
+kbind \- construct key bindings file for
+.IR atty (1)
+.SH SYNOPSYS
+.B kbind
+.I file
+\&...
+.br
+.B kbind -makefuncs
+.SH COPYRIGHT
+.if n Copyright (C) 1989 by Kenneth Almquist.
+.if t Copyright \(co 1989 by Kenneth Almquist.  
+.SH DESCRIPTION
+.I Kbind
+translates the key binding files given as arguments into a form that can
+be read by
+.IR atty (1).
+For each file, the name of the output file is constructed by removing
+the suffix ``.bind'' from the input file name if it is present, and
+then appending the suffix ``.bindc''.
+The
+.B -makefuncs
+option is intended to be used only by the makefile that compiles
+.IR atty (1).
+.sp 2
+.I "Syntax"
+.PP
+An input file consists of a series of commands, one per line.  Blank
+lines and lines beginning with a ``#'' are treated as comments are are
+ignored.  The commands accepted are:
+.sp
+.nr i 6
+.in +\ni
+.ti -\ni
+.B mode
+.I mode-number
+.br
+Specify the mode that subsequent
+.I bind
+commands apply to.  Multiple modes are intended for emulating editors
+like
+.IR vi (1)
+which have separate input and command modes.  Atty starts out in mode
+zero.
+.sp
+.ti -\ni
+.B b
+.I key-sequence
+.I command
+.br
+Bind the specified key sequence to
+.IR command .
+A list of commands will be given later on.
+The key sequence may contain a ``^'' followed by a character to specify
+a control character.  Control characters can also be specifed by a backslash
+followed by up to three octal digits.  Finally, there are several sequences
+consisting of a backslash followed by a letter:
+.ta 1i, 1.6i
+.nf
+      \\b	backspace
+      \\e	escape
+      \\f	form feed
+      \\n	newline
+      \\r	carriage return
+      \\s	space
+      \\t	tab
+.fi
+The
+.I key-sequence
+is terminated by white space, so you must use ``\es'' and ``\et'' to include
+spaces at tabs in the key sequence.  To include a ``^'' or backslash,
+precede it with a backslash.
+.sp
+.ti -\ni
+.B default
+.I command
+.br
+If a key sequence is not explicitly bound to anything, it will normally
+be bound to
+.IR undefined .
+The
+.B default
+command specifies a different default binding for single character key
+sequences.  Multiple character sequences are always bound to
+.IR undefined ,
+independent of the default command.
+(For example, if you bind
+.B ^X^X
+to
+.IR exchange-point-and-mark ,
+then ^X will become a prefix character.
+All the other possible
+character sequences beginning with ^X will then be bound to
+.IR undefined ,
+regardless of any
+.B default
+command,
+unless they are explicitly bound to something else using the
+.B b
+command.)
+.sp
+.tr ~"
+.ti -\ni
+.B syntax
+.I name
+.RI ~ characters ~
+.br
+Defines the characters in the syntax class specified by
+.IR name .
+A minus sign may be used to specify a range of characters, and
+a leading ``^'' may be used to invert the character class.
+Three syntax classes currently exist.
+The syntax class ``word''
+specifies the characters which make up a word for the commands
+that deal with words.
+The syntax class ``filename''
+specifies the characters which make up a filename.
+The syntax class ``abbrev''
+specifies the characters which make up an abbreviation.
+.sp
+.ti -\ni
+.B syntax
+.RI ~ abbreviation ~
+.RI ~ replacement ~
+.br
+Defines an abbreviation.  When you type a character not in the abbreviation
+syntax class, \fIatty\fR looks at the preceding characters which are in the
+abbreviation syntax class (if any).  If these match one of the abbreviations
+defined with the \fIabbrev\fR command, atty replaces the abbreviation with
+the replacement text.
+.in -\ni
+.sp 2
+.I "Editing Commands"
+.de b
+.in +0.6i
+..
+.de c
+.sp 0.5
+.ti -0.6i
+\\$1 \\$2
+.br
+..
+.de e
+.sp
+.in -0.6i
+..
+.PP
+This section lists the commands that can be bound to key sequences,
+along with the key sequences that they are traditionally bound to.
+Commands can be given prefix arguments using the
+.IR universal-argument ,
+.IR digit-argument ,
+and
+.I negative-argument
+commands.
+In the following, the value of the prefix argument is referred to as
+.IR n .
+The value of
+.I n
+is one if no prefix argument is given.
+.sp
+.B "Prefix arguments and modes:"
+.b
+.c digit-argument "(ESC 0, ESC 1, ...)"
+Introduces a sequence of digits specifying the prefix argument to the
+following command.  If this command is bound to a key sequence that ends
+in a digit, that digit forms the first character of the digit sequence.
+.c negative-argument "(ESC -)"
+Introduces a sequence of digits.  The value of the prefix argument to
+the following command will be the negation of the value specified by
+the digits, or -1 if no digits are given.
+.c universal-argument "(^U)"
+Introduces a sequence of digits specifying the prefix argument to the
+following command.  If no digits are given, the prefix argument to the
+following command will be four times the value of the prefix argument
+to the
+.I universal-argument
+command.  (Thus one ^U in front of a command sets the prefix argument to
+4, two ^U's set the prefix argument to 16, and so on.)
+.c "mode-0"
+Switch to mode zero, so that the bindings defined for mode zero apply.
+Mode zero is the default mode.
+.c "mode-1"
+Switch to mode one, so that the bindings defined for that mode apply.
+.e
+.B "Fundamental commands:"
+.b
+.c self-insert "(all printing characters)"
+.I N
+copies of the last character in the key sequence that this command is
+bound to are inserted.
+.c quoted-insert "(^V, ^Q)"
+.I N
+copies of the following character are inserted in the buffer.
+.c newline "(carriage return)"
+Send the current line to the program, followed by a newline character.
+The history location is set to the end of the history file and the line
+after the history file is cleared.  (See information on history commands
+below.)  The mode is reset to zero.
+.c newline-and-insert "(^J)"
+Send the current line to the program, followed by a newline character.
+Advance to the next line in the history file.  Set the mode to zero.
+.c end-of-file "(^_)"
+Send the characters in the input buffer, without a trailing newline.
+If the input buffer is empty, this has the effect of sending an end of
+file.  Sets the mode to zero.
+.c eof-or-delete-char
+This is equivalent to
+.I end-of-file
+if the input line is empty, and to
+.I delete-char
+otherwise.
+This is commonly bound to ^D.
+.c undefined
+Rings the bell on the terminal.
+Key sequences which are not bound to anything else are bound to
+.IR undefined .
+.e
+.B "Signals:"
+.b
+.c tty-intr "(^?)"
+Send an interrupt signal, like typing the interrupt character under
+.IR tty (4).
+.c tty-quit "(^\e)"
+Send a quit signal, like typing the quit character under
+.IR tty (4).
+.c tty-susp "(^Z)"
+Send a suspend (SIGTSTP) signal, like typing the suspc character under
+.IR tty (4).
+.e
+.B "Motion:"
+These commands move the
+.I point
+(the location of the cursor).
+.b
+.c forward-char "(^F)"
+Move point forward
+.I n
+characters.
+.c backward-char "(^B)"
+Move point backward
+.I n
+characters.
+.c forward-word "(ESC f)"
+Move point forward
+.I n
+words.
+.c backward-word "(ESC b)"
+Move point backward
+.I n
+words.
+.c beginning-of-line "(^A)"
+Move point to the beginning of the line.
+.c end-of-line "(^E)"
+Move point to the end of the line.
+.c set-mark "(^@, ESC SPACE)"
+Set the mark to the value of point.  The mark identifies a location in the
+input line.
+.c exchange-point-and-mark "(ESC x)"
+Goto the location specified by mark, and set the mark to the old value of
+point.
+.e
+.B "Deletions:"
+These commands delete text.  Except as noted, the deleted text is stored
+in the
+.IR "kill buffer" ,
+overwriting anything that was previously in the kill buffer.  (For
+convenience, a command that kills zero characters will not modify the
+kill buffer.)
+.b
+.c delete-char "(^D)"
+Delete the next
+.I n
+characters.  (If
+.I n
+is negative, delete preceding characters.)  The deleted text is saved in
+the kill buffer if a prefix argument is given.
+.c delete-backward-char "(^H)"
+Delete
+.I n
+characters before point (after point if
+.I n
+is negative).  The deleted text is saved in
+the kill buffer if a prefix argument is given.
+.c kill-word "(ESC d)"
+Delete the next
+.I n
+words (preceding words if
+.I n
+is negative).
+.c backward-kill-word "(ESC ^H, ESC h)"
+Delete
+.I n
+words preceding point (following point if
+.I n
+is negative).
+.c kill-line "(^K)"
+Delete from point to the end of the line if
+.I n
+is positive, and from the beginning of the line to point if
+.I n
+is less than or equal to zero.
+.c kill-input "(^X)"
+Delete the entire input line.
+.c kill-region "(^W)"
+Delete the region between the mark and the point.  See the
+.I set-mark
+command above.
+.c copy-region-as-kill "(ESC w)"
+Set the contents of the kill buffer to the text between the point and the
+mark, without deleting the text.
+.e
+.B Insertions:
+See also the
+.I self-insert
+and
+.I quoted-insert
+commands described above,
+and the
+.I get-history-word
+command described below.
+.b
+.c yank "(^Y)"
+Insert the contents of the kill buffer.  The mark is normally set to the
+start of the inserted text and the point to the end of the inserted text.
+If a prefix argument is given, the point and mark are interchanged.
+.c "insert \"text\""
+The specified text is inserted.  The text to be inserted appears inside
+double quotes following the word ``insert'' in the key bindings file.
+The backslash escape sequences which apply to key sequences can be used
+in
+.IR text .
+(The use of ``^'' to specify control characters is not supported,
+though.)  The maximum length of the text is 127 characters.
+.c last-output-line "(ESC ,)"
+Inserts the contents of the last output line when run without a prefix
+argument or with a prefix argument of zero.
+With an argument, it inserts the
+.IR n 'th
+word of the output line.  This command uses the filename syntax rather
+than the word syntax to identify words.  If
+.I n
+is negative, words are counted from the end of the line rather than the
+beginning.
+.e
+.B "Case Conversion:"
+.b
+.c upcase-char "(^C)"
+Convert the next
+.I n
+characters to upper case (if they are lower case letters).
+Convert characters preceding point rather than following point if
+.I n
+is negative.
+.c upcase-word "(ESC u)"
+Convert the next
+.I n
+words (preceding words if
+.I n
+is negative) to upper case.
+.c upcase-region
+Convert all the characters in the region to upper case.
+.e
+.B Transpositions:
+.b
+.c gosling-transpose-chars "(^T)"
+If no argument is given, transpose the two characters preceding the point.
+If an argument is given, delete the character preceding point, and reinsert it
+.I n
+characters to the right.
+.c transpose-chars
+Like
+.IR gosling-transpose-chars ,
+except that it does the delete and reinsert even if a prefix argument is
+not given, unless point is at the right end of the line.
+.c transpose-words "(ESC t)"
+If point is at the right end of the line, transpose the two words before
+point and leave point unchanged.  Otherwise, transpose the word before point
+and the word after point, and leave point after the second word.
+The current implementation of this command ignores any prefix argument.
+.e
+.B History:
+The history mechanism remembers lines which have been previously typed in
+and allows you to access them.  Moving around the history file loads
+lines from the history file into the current line buffer.  You can then
+edit the line (which only modifies the copy of the line, and leaves
+the contents of the history file unchanged).  There is also a line
+beyond the end of the history file, which is where you normally are.
+You can enter some text on this line, move back in the history file,
+and then return to the line after the history file.  The
+.I newline
+command goes to the line after the history file.  It clears this line
+if you were already on it.  The
+.I newline-and-insert
+command goes to the following line in the history file.  If you were
+on the line after the history file, the
+.I newline-and-insert
+command leaves you there, without clearing it.  The commands for
+accessing the history file are:
+.b
+.c previous-history "(^P)"
+Go back
+.I n
+nonblank lines in the history file, skipping blank lines.
+.c next-history "(^N)"
+Go forward
+.I n
+nonblank lines in the history file.
+.c re-search-backward "(^R)"
+You are prompted for a regular expression, which you can enter using
+normal editing commands.  The
+.IR newline ,
+.IR end-of-file ,
+and
+.I tty-intr
+commands are redefined while you are entering the regular expression;
+the first terminates the regular expression, and the latter two
+get out of the
+.I re-search-backward
+command without doing a search.
+After the regular expression is entered, the command goes to the
+.IR n 'th
+preceding line of the history file which the regular expression matches.
+Regular expressions are as in GNU emacs.
+With a negative argument, the command searches forward rather than backward.
+.c re-search-forward "(^S)"
+Like
+.IR re-search-backward ,
+but searches in the other direction.
+(Although this command is bound to ^S by default, setting the stop character
+to ^S overrides this binding.)
+.c get-history-word "(ESC .)"
+Insert the
+IR n 'th
+word of the last line of the history file.  This command uses filename
+syntax rather than the word syntax to identify words.
+If
+.I n
+is negative, count words from the end of the line rather than the beginning.
+If
+.I n
+is zero, insert the entire line.  If
+.I n
+is omitted, insert the last word.
+.e
+.B "Output Lines:"
+.b
+.c last-output-line "(ESC ,)"
+Insert the last line of output.  With a positive argument, insert the
+.IR n 'th
+word of the line.
+If
+.I n
+is negative, count words from the end of the line rather than the beginning.
+.e
+.B "File Name Matching:"
+.b
+.c list-file-completions "(ESC =)"
+Generate a
+.B "fmatch -l"
+command, with the current word (as determined by the filename syntax)
+as the argument.  Assuming that the user is at a shell
+prompt, this will produce a list of files which have the current word as
+a prefix.
+.c file-complete "(ESC ESC)"
+Like
+.IR list-file-completions ,
+but generates a
+.B "fmatch -c"
+command rather than a
+.B "fmatch -l"
+command.
+This will cause the remainder of the current file name to be inserted in
+the input buffer if the file name is unique.  (There should be a cleaner
+way to do file name completion.  Unfortunately,
+.I atty
+cannot easily do file name completion itself because it doesn't know the
+current directory of the process reading the commands.)
+.e
+.SH AUTHOR
+Kenneth Almquist
+.SH BUGS
+When new editor commands are added to
+.IR atty (1),
+the ``.bind'' files may have to be recompiled.
+EOF
+if test `wc -c < kbind.1` -ne 14303
+then	echo 'kbind.1 is the wrong size'
+fi
+echo Archive 2 unpacked
+exit
+

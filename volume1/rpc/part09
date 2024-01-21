@@ -1,0 +1,2137 @@
+Date: Wed, 3 Apr 85 00:16:07 pst
+From: decvax!sun!pumpkinseed!blyon (Bob Lyon)
+Subject: Sun RPC part 9 of 10
+
+echo x - svc.c
+sed 's/^X//' >svc.c <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#ifndef lint
+static char sccsid[] = "@(#)svc.c 1.7 85/03/20 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * svc.c, Server-side remote procedure call interface.
+ *
+ * There are two sets of procedures here.  The xprt routines are
+ * for handling transport handles.  The svc routines handle the
+ * list of service routines.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include "types.h"
+#include <sys/errno.h>
+#include <netinet/in.h>
+#include "xdr.h"
+#include "auth.h"
+#include "clnt.h"
+#include "rpc_msg.h"
+#include "svc.h"
+#include "svc_auth.h"
+#include "pmap_clnt.h"	/* <make kernel depend happy> */
+
+#define NOFILE 32
+
+static SVCXPRT *xports[NOFILE];
+int svc_fds = 0;
+extern errno;
+char *malloc();
+
+#define NULL_SVC ((struct svc_callout *)0)
+
+void rpctest_service();
+
+/*
+ * The services list
+ * Each entry represents a set of procedures (an rpc program).
+ * The dispatch routine takes request structs and runs the
+ * apropriate procedure.
+ */
+static struct svc_callout {
+	struct svc_callout *sc_next;
+	u_long		    sc_prog;
+	u_long		    sc_vers;
+	void		    (*sc_dispatch)();
+} *svc_head = NULL_SVC;
+
+static struct svc_callout *svc_find();
+
+/* ***************  SVCXPRT related stuff **************** */
+
+/*
+ * Activate a transport handle.
+ */
+void
+xprt_register(xprt)
+	SVCXPRT *xprt;
+{
+	register int sock = xprt->xp_sock;
+
+	if (sock < NOFILE) {
+		xports[sock] = xprt;
+		svc_fds |= (1 << sock);
+	}
+}
+
+/*
+ * De-activate a transport handle. 
+ */
+void
+xprt_unregister(xprt) 
+	SVCXPRT *xprt;
+{ 
+	register int sock = xprt->xp_sock;
+
+	if ((sock < NOFILE) && (xports[sock] == xprt)) {
+		xports[sock] = (SVCXPRT *)NULL;
+		svc_fds &= ~(1 << sock);
+	}
+} 
+
+
+/* ********************** CALLOUT list related stuff ************* */
+
+/*
+ * Add a service program to the callout list.
+ * The dispatch routine will be called when a rpc request for this
+ * program number comes in.
+ */
+bool_t
+svc_register(xprt, prog, vers, dispatch, protocol)
+	SVCXPRT *xprt;
+	u_long prog;
+	u_long vers;
+	void (*dispatch)();
+	int protocol;
+{
+	struct svc_callout *prev;
+	register struct svc_callout *s;
+
+	if ((s = svc_find(prog, vers, &prev)) != NULL_SVC) {
+		if (s->sc_dispatch == dispatch)
+			goto pmap_it;  /* he is registering another xptr */
+		return (FALSE);
+	}
+	s = (struct svc_callout *)mem_alloc(sizeof(struct svc_callout));
+	if (s == NULL) {
+		fprintf(stderr, "svc_register: out of memory\n");
+		return (FALSE);
+	}
+	s->sc_prog = prog;
+	s->sc_vers = vers;
+	s->sc_dispatch = dispatch;
+	s->sc_next = svc_head;
+	svc_head = s;
+pmap_it:
+	/* now register the information with the local binder service */
+	if (protocol) {
+		return (pmap_set(prog, vers, protocol, xprt->xp_port));
+	}
+	return (TRUE);
+}
+
+/*
+ * Remove a service program from the callout list.
+ */
+void
+svc_unregister(prog, vers)
+	u_long prog;
+	u_long vers;
+{
+	struct svc_callout *prev;
+	register struct svc_callout *s;
+
+	if ((s = svc_find(prog, vers, &prev)) == NULL_SVC)
+		return;
+	if (prev == NULL_SVC) {
+		svc_head = s->sc_next;
+	} else {
+		prev->sc_next = s->sc_next;
+	}
+	s->sc_next = NULL_SVC;
+	mem_free(s, sizeof(struct svc_callout));
+	/* now unregister the information with the local binder service */
+	(void)pmap_unset(prog, vers);
+}
+
+/*
+ * Search the callout list for a program number, return the callout
+ * struct.
+ */
+static struct svc_callout *
+svc_find(prog, vers, prev)
+	u_long prog;
+	u_long vers;
+	struct svc_callout **prev;
+{
+	register struct svc_callout *s, *p;
+
+	p = NULL_SVC;
+	for (s = svc_head; s != NULL_SVC; s = s->sc_next) {
+		if ((s->sc_prog == prog) && (s->sc_vers == vers))
+			goto done;
+		p = s;
+	}
+done:
+	*prev = p;
+	return (s);
+}
+
+/* ******************* REPLY GENERATION ROUTINES  ************ */
+
+/*
+ * Send a reply to an rpc request
+ */
+bool_t
+svc_sendreply(xprt, xdr_results, xdr_location)
+	register SVCXPRT *xprt;
+	xdrproc_t xdr_results;
+	caddr_t xdr_location;
+{
+	struct rpc_msg rply; 
+
+	rply.rm_direction = REPLY;  
+	rply.rm_reply.rp_stat = MSG_ACCEPTED; 
+	rply.acpted_rply.ar_verf = xprt->xp_verf; 
+	rply.acpted_rply.ar_stat = SUCCESS;
+	rply.acpted_rply.ar_results.where = xdr_location;
+	rply.acpted_rply.ar_results.proc = xdr_results;
+	return (SVC_REPLY(xprt, &rply)); 
+}
+
+/*
+ * No procedure error reply
+ */
+void
+svcerr_noproc(xprt)
+	register SVCXPRT *xprt;
+{
+	struct rpc_msg rply;
+
+	rply.rm_direction = REPLY;
+	rply.rm_reply.rp_stat = MSG_ACCEPTED;
+	rply.acpted_rply.ar_verf = xprt->xp_verf;
+	rply.acpted_rply.ar_stat = PROC_UNAVAIL;
+	SVC_REPLY(xprt, &rply);
+}
+
+/*
+ * Can't decode args error reply
+ */
+void
+svcerr_decode(xprt)
+	register SVCXPRT *xprt;
+{
+	struct rpc_msg rply; 
+
+	rply.rm_direction = REPLY; 
+	rply.rm_reply.rp_stat = MSG_ACCEPTED; 
+	rply.acpted_rply.ar_verf = xprt->xp_verf;
+	rply.acpted_rply.ar_stat = GARBAGE_ARGS;
+	SVC_REPLY(xprt, &rply); 
+}
+
+/*
+ * Some system error
+ */
+void
+svcerr_systemerr(xprt)
+	register SVCXPRT *xprt;
+{
+	struct rpc_msg rply; 
+
+	rply.rm_direction = REPLY; 
+	rply.rm_reply.rp_stat = MSG_ACCEPTED; 
+	rply.acpted_rply.ar_verf = xprt->xp_verf;
+	rply.acpted_rply.ar_stat = SYSTEM_ERR;
+	SVC_REPLY(xprt, &rply); 
+}
+
+/*
+ * Authentication error reply
+ */
+void
+svcerr_auth(xprt, why)
+	SVCXPRT *xprt;
+	enum auth_stat why;
+{
+	struct rpc_msg rply;
+
+	rply.rm_direction = REPLY;
+	rply.rm_reply.rp_stat = MSG_DENIED;
+	rply.rjcted_rply.rj_stat = AUTH_ERROR;
+	rply.rjcted_rply.rj_why = why;
+	SVC_REPLY(xprt, &rply);
+}
+
+/*
+ * Auth too weak error reply
+ */
+void
+svcerr_weakauth(xprt)
+	SVCXPRT *xprt;
+{
+
+	svcerr_auth(xprt, AUTH_TOOWEAK);
+}
+
+/*
+ * Program unavailable error reply
+ */
+void 
+svcerr_noprog(xprt)
+	register SVCXPRT *xprt;
+{
+	struct rpc_msg rply;  
+
+	rply.rm_direction = REPLY;   
+	rply.rm_reply.rp_stat = MSG_ACCEPTED;  
+	rply.acpted_rply.ar_verf = xprt->xp_verf;  
+	rply.acpted_rply.ar_stat = PROG_UNAVAIL;
+	SVC_REPLY(xprt, &rply);
+}
+
+/*
+ * Program version mismatch error reply
+ */
+void  
+svcerr_progvers(xprt, low_vers, high_vers)
+	register SVCXPRT *xprt; 
+	u_long low_vers;
+	u_long high_vers;
+{
+	struct rpc_msg rply;
+
+	rply.rm_direction = REPLY;
+	rply.rm_reply.rp_stat = MSG_ACCEPTED;
+	rply.acpted_rply.ar_verf = xprt->xp_verf;
+	rply.acpted_rply.ar_stat = PROG_MISMATCH;
+	rply.acpted_rply.ar_vers.low = low_vers;
+	rply.acpted_rply.ar_vers.high = high_vers;
+	SVC_REPLY(xprt, &rply);
+}
+
+/* ******************* SERVER INPUT STUFF ******************* */
+
+/*
+ * Get server side input from some transport
+ */
+void
+svc_getreq(rdfds)
+	int rdfds;
+{
+	register int sock;
+	register int readfds = rdfds & svc_fds;
+	register SVCXPRT *xprt;
+	register enum xprt_stat stat;
+	struct rpc_msg msg;
+	/*char cred_body[MAX_AUTH_BYTES], verf_body[MAX_AUTH_BYTES];*/
+	char *cred_body;
+	int prog_found;
+	u_long low_vers;
+	u_long high_vers;
+
+	cred_body = (char *)mem_alloc(2 * MAX_AUTH_BYTES);
+	if (cred_body == NULL) {
+		fprintf(stderr, "svc_getreq: out of memory\n");
+		svcerr_systemerr(xprt);
+		goto call_done;
+	}
+	msg.rm_call.cb_cred.oa_base = cred_body;
+	msg.rm_call.cb_verf.oa_base = &(cred_body[MAX_AUTH_BYTES]);
+	for (sock = 0; readfds != 0; sock++, readfds >>= 1) {
+	    if ((readfds & 1) != 0) {
+		/* sock has input waiting */
+		xprt = xports[sock];
+		/* now receive msgs from xprtprt (support batch calls) */
+		do {
+			if (SVC_RECV(xprt, &msg)) {
+
+				/* now find the exported program and call it */
+				register struct svc_callout *s;
+				enum auth_stat why;
+				struct svc_req r;
+
+				r.rq_xprt = xprt;
+				r.rq_prog = msg.rm_call.cb_prog;
+				r.rq_vers = msg.rm_call.cb_vers;
+				r.rq_proc = msg.rm_call.cb_proc;
+				r.rq_cred = msg.rm_call.cb_cred;
+				/* first authenticate the message */
+				if ((why= _authenticate(&r, &msg)) != AUTH_OK) {
+					svcerr_auth(xprt, why);
+					goto call_done;
+				}
+				/* now match message with a registered service*/
+				prog_found = FALSE;
+				low_vers = 0 - 1;
+				high_vers = 0;
+				for (s = svc_head; s != NULL_SVC; s = s->sc_next) {
+					if (s->sc_prog == r.rq_prog) {
+						if (s->sc_vers == r.rq_vers) {
+							(*s->sc_dispatch)(&r, xprt);
+							goto call_done;
+						}  /* found correct version */
+						prog_found = TRUE;
+						if (s->sc_vers < low_vers)
+							low_vers = s->sc_vers;
+						if (s->sc_vers > high_vers)
+							high_vers = s->sc_vers;
+					}   /* found correct program */
+				}
+				/*
+				 * if we got here, the program or version
+				 * is not served ...
+				 */
+				if (prog_found)
+					svcerr_progvers(xprt,
+					low_vers, high_vers);
+				else
+					 svcerr_noprog(xprt);
+				/* Fall through to ... */
+			}
+		call_done:
+			if ((stat = SVC_STAT(xprt)) == XPRT_DIED){
+				SVC_DESTROY(xprt);
+				break;
+			}
+		} while (stat == XPRT_MOREREQS);
+	    }
+	}
+	mem_free(cred_body, 2 * MAX_AUTH_BYTES);
+}
+
+/*
+ * This is the rpc server side idle loop
+ * Wait for input, call server program.
+ */
+void
+svc_run()
+{
+	int readfds;
+
+	while (TRUE) {
+		readfds = svc_fds;
+		switch (select(32, &readfds, (int *)NULL, (int *)NULL,
+		    (struct timeval *)NULL)) {
+
+		case -1:
+                        if (errno == EINTR)
+                                continue;
+	                else {
+                                perror("svc.c: - Select failed");
+                                return;
+			}
+		case 0:
+			continue;
+		default:
+			svc_getreq(readfds);
+		}
+	}
+}
+
+/* *************************** BUILTIN TEST SERVICE **************** */
+void
+rpctest_service(reqst, xprt)
+	struct svc_req *reqst;
+	register SVCXPRT *xprt;
+{
+
+	switch (reqst->rq_proc) {
+
+	case RPCTEST_NULL_PROC:
+		/* get nullp parameters, return null results */
+		if (SVC_GETARGS(xprt, xdr_void, NULL)) {
+			svc_sendreply(xprt, (xdrproc_t)xdr_void, (caddr_t)NULL);
+		} else {
+			svcerr_decode(xprt);
+		}
+		return;
+
+	case  RPCTEST_NULL_BATCH_PROC:  /* nothing !! */
+		return;
+
+	default:
+		svcerr_noproc(xprt);
+		return;
+	}
+}
+!Funky!Stuff!
+echo x - svc.h
+sed 's/^X//' >svc.h <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+/*      @(#)svc.h 1.2 85/02/08 SMI      */
+
+/*
+ * svc.h, Server-side remote procedure call interface.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+/*
+ * This interface must manage two items concerning remote procedure calling:
+ *
+ * 1) An arbitrary number of transport connections upon which rpc requests
+ * are received.  The two most notable transports are TCP and UDP;  they are
+ * created and registered by routines in svc_tcp.c and svc_udp.c, respectively;
+ * they in turn call xprt_register and xprt_unregister.
+ *
+ * 2) An arbitrary number of locally registered services.  Services are
+ * described by the following four data: program number, version number,
+ * "service dispatch" function, a transport handle, and a boolean that
+ * indicates whether or not the exported program should be registered with a
+ * local binder service;  if true the program's number and version and the
+ * port number from the transport handle are registered with the binder.
+ * These data are registered with the rpc svc system via svc_register.
+ *
+ * A service's dispatch function is called whenever an rpc request comes in
+ * on a transport.  The request's program and version numbers must match
+ * those of the registered service.  The dispatch function is passed two
+ * parameters, struct svc_req * and SVCXPRT *, defined below.
+ */
+
+enum xprt_stat {
+	XPRT_DIED,
+	XPRT_MOREREQS,
+	XPRT_IDLE
+};
+
+/*
+ * Server side transport handle
+ */
+typedef struct {
+	int		xp_sock;
+	u_short		xp_port;	 /* associated port number */
+	struct xp_ops {
+	    bool_t	(*xp_recv)();	 /* receive incomming requests */
+	    enum xprt_stat (*xp_stat)(); /* get transport status */
+	    bool_t	(*xp_getargs)(); /* get arguments */
+	    bool_t	(*xp_reply)();	 /* send reply */
+	    bool_t	(*xp_freeargs)();/* free mem allocated for args */
+	    void	(*xp_destroy)(); /* destroy this struct */
+	} *xp_ops;
+	int		xp_addrlen;	 /* length of remote address */
+	struct sockaddr_in xp_raddr;	 /* remote address */
+	struct opaque_auth xp_verf;	 /* raw response verifier */
+	caddr_t		xp_p1;		 /* private */
+	caddr_t		xp_p2;		 /* private */
+} SVCXPRT;
+
+/*
+ *  Approved way of getting address of caller
+ */
+#define svc_getcaller(x) (&(x)->xp_raddr)
+
+/*
+ * Operations defined on an SVCXPRT handle
+ *
+ * SVCXPRT		*xprt;
+ * struct rpc_msg	*msg;
+ * xdrproc_t		 xargs;
+ * caddr_t		 argsp;
+ */
+#define SVC_RECV(xprt, msg)				\
+	(*(xprt)->xp_ops->xp_recv)((xprt), (msg))
+#define svc_recv(xprt, msg)				\
+	(*(xprt)->xp_ops->xp_recv)((xprt), (msg))
+
+#define SVC_STAT(xprt)					\
+	(*(xprt)->xp_ops->xp_stat)(xprt)
+#define svc_stat(xprt)					\
+	(*(xprt)->xp_ops->xp_stat)(xprt)
+
+#define SVC_GETARGS(xprt, xargs, argsp)			\
+	(*(xprt)->xp_ops->xp_getargs)((xprt), (xargs), (argsp))
+#define svc_getargs(xprt, xargs, argsp)			\
+	(*(xprt)->xp_ops->xp_getargs)((xprt), (xargs), (argsp))
+
+#define SVC_REPLY(xprt, msg)				\
+	(*(xprt)->xp_ops->xp_reply) ((xprt), (msg))
+#define svc_reply(xprt, msg)				\
+	(*(xprt)->xp_ops->xp_reply) ((xprt), (msg))
+
+#define SVC_FREEARGS(xprt, xargs, argsp)		\
+	(*(xprt)->xp_ops->xp_freeargs)((xprt), (xargs), (argsp))
+#define svc_freeargs(xprt, xargs, argsp)		\
+	(*(xprt)->xp_ops->xp_freeargs)((xprt), (xargs), (argsp))
+
+#define SVC_DESTROY(xprt)				\
+	(*(xprt)->xp_ops->xp_destroy)(xprt)
+#define svc_destroy(xprt)				\
+	(*(xprt)->xp_ops->xp_destroy)(xprt)
+
+
+/*
+ * Service request
+ */
+struct svc_req {
+	u_long		rq_prog;	/* service program number */
+	u_long		rq_vers;	/* service protocol version */
+	u_long		rq_proc;	/* the desired procedure */
+	struct opaque_auth rq_cred;	/* raw creds from the wire */
+	caddr_t		rq_clntcred;	/* read only cooked cred */
+	SVCXPRT	*rq_xprt;		/* associated transport */
+};
+
+
+/*
+ * Service registration
+ *
+ * svc_register(xprt, prog, vers, dispatch, protocol)
+ *	SVCXPRT *xprt;
+ *	u_long prog;
+ *	u_long vers;
+ *	void (*dispatch)();
+ *	int protocol;  /* like TCP or UDP, zero means do not register 
+ */
+extern bool_t	svc_register();
+
+/*
+ * Service un-registration
+ *
+ * svc_unregister(prog, vers)
+ *	u_long prog;
+ *	u_long vers;
+ */
+extern void	svc_unregister();
+
+/*
+ * Transport registration.
+ *
+ * xprt_register(xprt)
+ *	SVCXPRT *xprt;
+ */
+extern void	xprt_register();
+
+/*
+ * Transport un-register
+ *
+ * xprt_unregister(xprt)
+ *	SVCXPRT *xprt;
+ */
+extern void	xprt_unregister();
+
+
+/*
+ * When the service routine is called, it must first check to see if it
+ * knows about the procedure;  if not, it should call svcerr_noproc
+ * and return.  If so, it should deserialize its arguments via 
+ * SVC_GETARGS (defined above).  If the deserialization does not work,
+ * svcerr_decode should be called followed by a return.  Successful
+ * decoding of the arguments should be followed the execution of the
+ * procedure's code and a call to svc_sendreply.
+ *
+ * Also, if the service refuses to execute the procedure due to too-
+ * weak authentication parameters, svcerr_weakauth should be called.
+ * Note: do not confuse access-control failure with weak authentication!
+ *
+ * NB: In pure implementations of rpc, the caller always waits for a reply
+ * msg.  This message is sent when svc_sendreply is called.  
+ * Therefore pure service implementations should always call
+ * svc_sendreply even if the function logically returns void;  use
+ * xdr.h - xdr_void for the xdr routine.  HOWEVER, tcp based rpc allows
+ * for the abuse of pure rpc via batched calling or pipelining.  In the
+ * case of a batched call, svc_sendreply should NOT be called since
+ * this would send a return message, which is what batching tries to avoid.
+ * It is the service/protocol writer's responsibility to know which calls are
+ * batched and which are not.  Warning: responding to batch calls may
+ * deadlock the caller and server processes!
+ */
+
+extern bool_t  svc_sendreply();
+extern void	svcerr_noproc();
+extern void	svcerr_decode();
+extern void	svcerr_weakauth();
+
+/*
+ * Lowest level dispatching -OR- who owns this process anyway.
+ * Somebody has to wait for incoming requests and then call the correct
+ * service routine.  The routine svc_run does infinite waiting; i.e.,
+ * svc_run never returns.
+ * Since another (co-existant) package may wish to selectively wait for
+ * incoming calls or other events outside of the rpc architecture, the
+ * routine svc_getreq is provided.  It must be passed readfds, the
+ * "in-place" results of a select system call (see select, section 2).
+ */
+
+/* dynamic; must be inspected before each call to select */
+extern int svc_fds;
+
+extern void	svc_getreq();
+extern void	svc_run();  /* never returns */
+
+/*
+ * a small program implemented by the svc_rpc implementation itself;
+ * also see clnt.h for protocol numbers.
+ */
+extern void rpctest_service();
+
+/*
+ * Socket to use on svcxxx_create call to get default socket
+ */
+#define	RPC_ANYSOCK	-1
+
+/*
+ * These are the existing service side transport implementations
+ */
+
+/*
+ * Memory based rpc for testing and timing.
+ */
+extern SVCXPRT *svcraw_create();
+
+/*
+ * Udp based rpc.
+ */
+extern SVCXPRT *svcudp_create();
+
+/*
+ * Tcp based rpc.
+ */
+extern SVCXPRT *svctcp_create();
+
+!Funky!Stuff!
+echo x - svc_auth.c
+sed 's/^X//' >svc_auth.c <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#ifndef lint
+static char sccsid[] = "@(#)svc_auth.c 1.4 85/03/17 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * svc_auth.c, Server-side rpc authenticator interface.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include "types.h"
+#include <netinet/in.h>
+#include "xdr.h"
+#include "auth.h"
+#include "clnt.h"
+#include "rpc_msg.h"
+#include "svc.h"
+#include "svc_auth.h"
+
+/*
+ * svcauthsw is the bdevsw of server side authentication. 
+ * 
+ * Server side authenticators are called from authenticate by
+ * using the client auth struct flavor field to index into svcauthsw.
+ * The server auth flavors must implement a routine that looks  
+ * like: 
+ * 
+ *	enum auth_stat 
+ *	flavorx_auth(rqst, msg)
+ *		register struct svc_req *rqst; 
+ *		register struct rpc_msg *msg;
+ *  
+ */
+
+enum auth_stat _svcauth_null();		/* no authentication */
+enum auth_stat _svcauth_unix();		/* unix style (uid, gids) */
+enum auth_stat _svcauth_short();		/* short hand unix style */
+
+static struct {
+	enum auth_stat (*authenticator)();
+} svcauthsw[] = {
+	_svcauth_null,			/* AUTH_NULL */
+	_svcauth_unix,			/* AUTH_UNIX */
+	_svcauth_short			/* AUTH_SHORT */
+};
+#define	AUTH_MAX	2		/* HIGHEST AUTH NUMBER */
+
+
+/*
+ * The call rpc message, msg has been obtained from the wire.  The msg contains
+ * the raw form of credentials and verifiers.  authenticate returns AUTH_OK
+ * if the msg is successfully authenticated.  If AUTH_OK then the routine also
+ * does the following things:
+ * set rqst->rq_xprt->verf to the appropriate response verifier;
+ * sets rqst->rq_client_cred to the "cooked" form of the credentials.
+ *
+ * NB: rqst->rq_cxprt->verf must be pre-alloctaed;
+ * its length is set appropriately.
+ *
+ * The caller still owns and is responsible for msg->u.cmb.cred and
+ * msg->u.cmb.verf.  The authentication system retains ownership of
+ * rqst->rq_client_cred, the cooked credentials.
+ */
+enum auth_stat
+_authenticate(rqst, msg)
+	register struct svc_req *rqst;
+	struct rpc_msg *msg;
+{
+	register int cred_flavor;
+
+	rqst->rq_cred = msg->rm_call.cb_cred;
+	rqst->rq_xprt->xp_verf.oa_flavor = _null_auth.oa_flavor;
+	rqst->rq_xprt->xp_verf.oa_length = 0;
+	rqst->rq_clntcred = (caddr_t)AUTH_NULL;
+	cred_flavor = rqst->rq_cred.oa_flavor;
+	if (cred_flavor <= AUTH_MAX) {
+		return ((*(svcauthsw[cred_flavor].authenticator))(rqst, msg));
+	}
+
+	return (AUTH_REJECTEDCRED);
+}
+
+enum auth_stat
+_svcauth_null(/*rqst, msg*/)
+	/*struct svc_req *rqst;
+	struct rpc_msg *msg;*/
+{
+
+	return (AUTH_OK);
+}
+!Funky!Stuff!
+echo x - svc_auth.h
+sed 's/^X//' >svc_auth.h <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+/*      @(#)svc_auth.h 1.2 85/03/14 SMI      */
+
+/*
+ * svc_auth.h, Service side of rpc authentication.
+ * 
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+
+/*
+ * Server side authenticator
+ */
+extern enum auth_stat _authenticate();
+!Funky!Stuff!
+echo x - svc_auth_unix.c
+sed 's/^X//' >svc_auth_unix.c <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#ifndef lint
+static char sccsid[] = "@(#)svc_auth_unix.c 1.4 85/03/14 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * svc_auth_unix.c
+ * Handles UNIX flavor authentication parameters on the service side of rpc.
+ * There are two svc auth implementations here: AUTH_UNIX and AUTH_SHORT.
+ * _svcauth_unix does full blown unix style uid,gid+gids auth,
+ * _svcauth_short uses a shorthand auth to index into a cache of longhand auths.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include "types.h"
+#include <sys/time.h>
+#include <netinet/in.h>
+#include "xdr.h"
+#include "auth.h"
+#include "clnt.h"
+#include "rpc_msg.h"
+#include "svc.h"
+#include "auth_unix.h"
+#include "svc_auth.h"
+char *mem_alloc();
+
+#define SHORT_VERF_SIZE (3 * BYTES_PER_XDR_UNIT)
+#define CACHE_SIZE 16
+
+static struct cache_entry {
+	u_long		sh;		/* short hand value */
+#define SHORT_CRED_SIZE (sizeof (u_long))
+	short		cred_len;	/* byte length of opaque credential */
+	caddr_t		cred_base;	/* the opaque credential body */
+	struct authunix_parms aup;	/* cooked, deserialized credentials */
+} cache[CACHE_SIZE];
+
+static short cacheindex[CACHE_SIZE];
+
+/*
+ * Cache handling macros
+ */
+#define valid_aup(aup) (TRUE)
+#define nexti(i)  ((i == CACHE_SIZE-1) ? 0 : i+1)
+#define previ(i)  ((i == 0) ? CACHE_SIZE-1 : i-1)
+#define cache_hit(c, d) \
+   ( hits++, d=cnt-c, depth += d, maxdepth = (d > maxdepth) ? d: maxdepth )
+
+/*
+ * Cache handling routines
+ */
+static short	find_short_hand();
+static short	find_long_hand();
+
+/*
+ * Cache variables
+ */
+static short head, maxdepth;	/* values from 0 to CACHE_SIZE-1, inclusive */
+static short cnt;		/*  values from 0 to CACHE_SIZE, inclusive */
+static u_long additions, deletions, queries, hits, depth;
+static struct timeval last_time;
+static inited = 0;		/* stupid kludge to be sure init gets called */
+
+
+/*
+ * Unix longhand authenticator
+ */
+enum auth_stat
+_svcauth_unix(rqst, msg)
+	register struct svc_req *rqst;
+	register struct rpc_msg *msg;
+{
+	register short i = -1;
+	register int len = msg->rm_call.cb_cred.oa_length;
+	register caddr_t base = msg->rm_call.cb_cred.oa_base;
+	register enum auth_stat stat = AUTH_OK;
+	XDR xdrs;
+	struct authunix_parms aup;
+	struct opaque_auth short_cred;
+
+	if (!inited) {
+		svcauth_unix_init();
+	}
+	while ((i = find_long_hand(base, len)) < 0) {
+		/* deserialize credentials */
+		aup.aup_machname = NULL;
+		aup.aup_gids = (int *)NULL;
+		xdrmem_create(&xdrs, base, (u_int)len, XDR_DECODE); 
+		if (! (xdr_authunix_parms(&xdrs, &aup) && valid_aup(&aup))) {
+			xdrs.x_op = XDR_FREE;
+			(void)xdr_authunix_parms(&xdrs, &aup);
+			stat = AUTH_BADCRED;
+			goto done;
+		}
+		/* now make a new cache entry for this credential */
+		cache_new_user(base, len, &aup);
+	}
+	rqst->rq_clntcred = (caddr_t)&(cache[i].aup);
+	/* now build a verifier that suggests using the short hand credential */
+	short_cred.oa_flavor = AUTH_SHORT;
+	short_cred.oa_length = SHORT_CRED_SIZE;
+	short_cred.oa_base = (caddr_t)&(cache[i].sh);
+	/* the short hand cred get serialized into a verifier */
+	xdrmem_create(&xdrs, rqst->rq_xprt->xp_verf.oa_base,
+	    SHORT_VERF_SIZE, XDR_ENCODE);
+	if (! xdr_opaque_auth(&xdrs, &short_cred)) {
+		stat = AUTH_BADCRED;
+		goto done;
+	}
+	rqst->rq_xprt->xp_verf.oa_length = XDR_GETPOS(&xdrs);
+	rqst->rq_xprt->xp_verf.oa_flavor = AUTH_SHORT;
+done:
+	XDR_DESTROY(&xdrs);
+	return (stat);
+}
+
+
+/*
+ * Shorthand unix authenticator
+ * Looks up longhand in a cache.
+ */
+enum auth_stat 
+_svcauth_short(rqst, msg)
+	struct svc_req *rqst;
+	struct rpc_msg *msg;
+{
+	short i;
+
+	if (!inited) {
+		svcauth_unix_init();
+	}
+	if (msg->rm_call.cb_cred.oa_length != SHORT_CRED_SIZE)
+		return (AUTH_BADCRED);
+	if ((i = find_short_hand(*(u_long *)msg->rm_call.cb_cred.oa_base)) < 0)
+		return (AUTH_REJECTEDCRED);
+	rqst->rq_clntcred = (caddr_t)&(cache[i].aup);
+	return (AUTH_OK);
+}
+
+
+/*
+ * returns cache index or -1 if sh not in the cache
+ */
+static short
+find_short_hand(sh)
+	register u_long sh;  /* short hand value */
+{
+	/* declared in order of importance */
+	register short entry, i, c, p;
+
+	queries++;
+	for (c = cnt, i = head; c > 0; --c, i = nexti(i)) {
+
+		entry = cacheindex[i];
+		if (sh == cache[entry].sh) {
+			/* cache hit! Now buble swap i up one notch */
+			cache_hit(c, p);  /* used for accounting only */
+			if (i != head) {
+				/* c acts as the temporary variable */
+				p = previ(i);
+				c = cacheindex[p];
+				cacheindex[p] = entry; /* gets cacheindex[i] */
+				cacheindex[i] = c;
+			}
+			return (entry);
+		}  /* end of successful cache hit */
+	}
+	return (-1);
+}
+
+/*
+ * returns cache index or -1 if cred not in the cache
+ */
+static short
+find_long_hand(cred_base, len)
+	register caddr_t cred_base;
+	register int len;
+{
+	/* declared in order of importance */
+	register short entry, i, c, p;
+
+	queries++;
+	for (c = cnt, i = head; c > 0; --c, i = nexti(i)) {
+
+		entry = cacheindex[i];
+		if ((cache[entry].cred_len == len) &&
+		    (bcmp(cache[entry].cred_base, cred_base, len) == 0)) {
+			/* cache hit! Now buble swap i up one notch */
+			cache_hit(c, p);  /* used for accounting only */
+			if (i != head) {
+				/* c acts as the temporary variable */
+				p = previ(i);
+				c = cacheindex[p];
+				cacheindex[p] = entry; /* gets cacheindex[i] */
+				cacheindex[i] = c;
+			}
+		return (entry);
+		}  /* end of successful cache hit */
+	}
+	return (-1);
+}
+
+/*
+ * Place a new entry at the HEAD of the cache.  This means moving the
+ * heap index back one and possibly flushing the oldest entry from the cache.
+ */
+static
+cache_new_user(base, len, aup)
+	caddr_t base;
+	int len;
+	struct authunix_parms *aup;
+{
+	register short entry;
+	struct timeval now;
+
+	head = previ(head);
+	entry = cacheindex[head];
+	if (cnt == CACHE_SIZE) { /* full cache, delete lru entry */
+		XDR xdrs;
+
+		xdrs.x_op = XDR_FREE;
+		deletions++;
+		if (cache[entry].cred_base != NULL) {
+			mem_free(cache[entry].cred_base,
+			    cache[entry].cred_len);
+			cache[entry].cred_base = NULL;
+		}
+		(void)xdr_authunix_parms(&xdrs, &cache[entry].aup);
+	} else {
+		cnt++;
+	}
+	/* now add current entry, raw cred must be copied */
+	additions++;
+	cache[entry].aup = *aup;
+	cache[entry].cred_len = len;
+	if ((cache[entry].cred_base = (char *)mem_alloc(len)) == NULL) {
+		fprintf(stderr, "cache_new_user: out of memory\n");
+		additions--;
+		return;
+	}
+	bcopy(base, cache[entry].cred_base, (u_int)len);
+	/* finally compute a new, unique short hand value */
+	cache[entry].sh = ++ last_time.tv_sec;
+	/* don't let real time get ahead of last_time */
+	while (TRUE) {
+		(void)gettimeofday(&now, (struct timezone *)0);
+		if (((long int)now.tv_sec - (long int)last_time.tv_sec) > 0)
+			break;
+		sleep(1);
+	}
+}
+
+/*
+ * Initialize the shorthand cache.
+ * Must be called before unix auth can be used!
+ */
+static svcauth_unix_init()
+{
+	register short i;
+
+	inited++;
+	(void)gettimeofday(&last_time, (struct timezone *)0);
+	for (i = 0; i < CACHE_SIZE; ++i) {
+		cacheindex[i] = i;
+	}
+}
+!Funky!Stuff!
+echo x - svc_raw.c
+sed 's/^X//' >svc_raw.c <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#ifndef lint
+static char sccsid[] = "@(#)svc_raw.c 1.3 85/03/14 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * svc_raw.c,   This a toy for simple testing and timing.
+ * Interface to create an rpc client and server in the same UNIX process.
+ * This lets us similate rpc and get rpc (round trip) overhead, without
+ * any interference from the kernal.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include "types.h"
+#include <netinet/in.h>
+#include "xdr.h"
+#include "auth.h"
+#include "clnt.h"
+#include "rpc_msg.h"
+#include "svc.h"
+
+#define NULL ((caddr_t)0)
+
+/*
+ * This is the "network" that we will be moving data over
+ */
+extern char _raw_buf[UDPMSGSIZE];
+
+static bool_t		svcraw_recv();
+static enum xprt_stat 	svcraw_stat();
+static bool_t		svcraw_getargs();
+static bool_t		svcraw_reply();
+static bool_t		svcraw_freeargs();
+static void		svcraw_destroy();
+
+static struct xp_ops server_ops = {
+	svcraw_recv,
+	svcraw_stat,
+	svcraw_getargs,
+	svcraw_reply,
+	svcraw_freeargs,
+	svcraw_destroy
+};
+
+static SVCXPRT server;
+static XDR xdr_stream;
+static char verf_body[MAX_AUTH_BYTES];
+
+SVCXPRT *
+svcraw_create()
+{
+
+	server.xp_sock = 0;
+	server.xp_port = 0;
+	server.xp_ops = &server_ops;
+	server.xp_verf.oa_base = verf_body;
+	xdrmem_create(&xdr_stream, _raw_buf, UDPMSGSIZE, XDR_FREE);
+	return (&server);
+}
+
+static enum xprt_stat
+svcraw_stat()
+{
+
+	return (XPRT_IDLE);
+}
+
+static bool_t
+svcraw_recv(xprt, msg)
+	SVCXPRT *xprt;
+	struct rpc_msg *msg;
+{
+	register XDR *xdrs = &xdr_stream;
+
+	xdrs->x_op = XDR_DECODE;
+	XDR_SETPOS(xdrs, 0);
+	if (! xdr_callmsg(xdrs, msg))
+	       return (FALSE);
+	return (TRUE);
+}
+
+static bool_t
+svcraw_reply(xprt, msg)
+	SVCXPRT *xprt;
+	struct rpc_msg *msg;
+{
+	register XDR *xdrs = &xdr_stream;
+
+	xdrs->x_op = XDR_ENCODE;
+	XDR_SETPOS(xdrs, 0);
+	if (! xdr_replymsg(xdrs, msg))
+	       return (FALSE);
+	(void)XDR_GETPOS(xdrs);  /* called just for overhead */
+	return (TRUE);
+}
+
+static bool_t
+svcraw_getargs(xprt, xdr_args, args_ptr)
+	SVCXPRT *xprt;
+	xdrproc_t xdr_args;
+	caddr_t args_ptr;
+{
+
+	return ((*xdr_args)(&xdr_stream, args_ptr));
+}
+
+static bool_t
+svcraw_freeargs(xprt, xdr_args, args_ptr)
+	SVCXPRT *xprt;
+	xdrproc_t xdr_args;
+	caddr_t args_ptr;
+{ 
+	register XDR *xdrs = &xdr_stream;
+
+	xdrs->x_op = XDR_FREE;
+	return ((*xdr_args)(xdrs, args_ptr));
+} 
+
+static void
+svcraw_destroy()
+{
+}
+!Funky!Stuff!
+echo x - svc_simple.c
+sed 's/^X//' >svc_simple.c <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#ifndef lint
+static char sccsid[] = "@(#)svc_simple.c 1.3 85/03/14 Copyr 1984 Sun Micro";
+#endif
+
+/* 
+ * svc_simple.c
+ * Simplified front end to rpc.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include <rpc/rpc.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netdb.h>
+
+static struct proglst {
+	char *(*p_progname)();
+	int  p_prognum;
+	int  p_procnum;
+	xdrproc_t p_inproc, p_outproc;
+	struct proglst *p_nxt;
+} *proglst;
+int universal();
+
+registerrpc(prognum, versnum, procnum, progname, inproc, outproc)
+	char *(*progname)();
+	xdrproc_t inproc, outproc;
+{
+	static SVCXPRT *transp;
+	static madetransp = 0;
+	struct proglst *pl;
+	
+	if (procnum == NULLPROC) {
+		fprintf(stderr,
+		    "can't reassign procedure number %d\n", NULLPROC);
+		return (-1);
+	}
+	if (!madetransp) {
+		madetransp = 1;
+		transp = svcudp_create(RPC_ANYSOCK);
+		if (transp == NULL) {
+			fprintf(stderr, "couldn't create an rpc server\n");
+			return (-1);
+		}
+	}
+	pmap_unset(prognum, versnum);
+	if (!svc_register(transp, prognum, versnum, universal, IPPROTO_UDP)) {
+	    	fprintf(stderr, "couldn't register prog %d vers %d\n",
+		    prognum, versnum);
+		return (-1);
+	}
+	pl = (struct proglst *)malloc(sizeof(struct proglst));
+	if (pl == NULL) {
+		fprintf(stderr, "registerrpc: out of memory\n");
+		return (-1);
+	}
+	pl->p_progname = progname;
+	pl->p_prognum = prognum;
+	pl->p_procnum = procnum;
+	pl->p_inproc = inproc;
+	pl->p_outproc = outproc;
+	pl->p_nxt = proglst;
+	proglst = pl;
+	return (0);
+}
+
+static
+universal(rqstp, transp)
+	struct svc_req *rqstp;
+	SVCXPRT *transp;
+{
+	int prog, proc, i;
+	char *outdata;
+	char xdrbuf[UDPMSGSIZE];
+	struct proglst *pl;
+
+	/* 
+	 * enforce "procnum 0 is echo" convention
+	 */
+	if (rqstp->rq_proc == NULLPROC) {
+		if (svc_sendreply(transp, xdr_void, 0) == FALSE) {
+			fprintf(stderr, "xxx\n");
+			exit(1);
+		}
+		return;
+	}
+	prog = rqstp->rq_prog;
+	proc = rqstp->rq_proc;
+	for (pl = proglst; pl != NULL; pl = pl->p_nxt)
+		if (pl->p_prognum == prog && pl->p_procnum == proc) {
+			/* decode arguments into a CLEAN buffer */
+			bzero(xdrbuf, sizeof(xdrbuf)); /* required ! */
+			if (!svc_getargs(transp, pl->p_inproc, xdrbuf)) {
+				svcerr_decode(transp);
+				return;
+			}
+			outdata = (*(pl->p_progname))(xdrbuf);
+			if (outdata == NULL && pl->p_outproc != xdr_void)
+				/* there was an error */
+				return;
+			if (!svc_sendreply(transp, pl->p_outproc, outdata)) {
+				fprintf(stderr,
+				    "trouble replying to prog %d\n",
+				    pl->p_prognum);
+				exit(1);
+			/* free the decoded arguments */
+			(void)svc_freeargs(transp, pl->p_inproc, xdrbuf);
+			}
+			return;
+		}
+	fprintf(stderr, "never registered prog %d\n", prog);
+	exit(1);
+}
+
+!Funky!Stuff!
+echo x - svc_tcp.c
+sed 's/^X//' >svc_tcp.c <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#ifndef lint
+static char sccsid[] = "@(#)svc_tcp.c 1.5 85/03/17 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * svc_tcp.c, Server side for TCP/IP based RPC. 
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ *
+ * Actually implements two flavors of transporter -
+ * a tcp rendezvouser (a listner and connection establisher)
+ * and a record/tcp stream.
+ */
+
+#include <stdio.h>
+#include "types.h"
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <errno.h>
+#include "xdr.h"
+#include "auth.h"
+#include "clnt.h"
+#include "rpc_msg.h"
+#include "svc.h"
+char *mem_alloc();
+extern bool_t abort();
+extern errno;
+
+/*
+ * Ops vector for TCP/IP based rpc service handle
+ */
+static bool_t		svctcp_recv();
+static enum xprt_stat	svctcp_stat();
+static bool_t		svctcp_getargs();
+static bool_t		svctcp_reply();
+static bool_t		svctcp_freeargs();
+static void		svctcp_destroy();
+
+static struct xp_ops svctcp_op = {
+	svctcp_recv,
+	svctcp_stat,
+	svctcp_getargs,
+	svctcp_reply,
+	svctcp_freeargs,
+	svctcp_destroy
+};
+
+/*
+ * Ops vector for TCP/IP rendezvous handler
+ */
+static bool_t		rendezvous_request();
+static enum xprt_stat	rendezvous_stat();
+
+static struct xp_ops svctcp_rendezvous_op = {
+	rendezvous_request,
+	rendezvous_stat,
+	abort,
+	abort,
+	abort,
+	svctcp_destroy
+};
+
+static int readtcp(), writetcp();
+
+struct tcp_rendezvous { /* kept in xprt->xp_p1 */
+	u_int sendsize;
+	u_int recvsize;
+};
+
+struct tcp_conn {  /* kept in xprt->xp_p1 */
+	enum xprt_stat strm_stat;
+	u_long x_id;
+	XDR xdrs;
+	char verf_body[MAX_AUTH_BYTES];
+};
+
+/*
+ * Usage:
+ *	xprt = svctcp_create(sock, send_buf_size, recv_buf_size);
+ *
+ * Creates, registers, and returns a (rpc) tcp based transporter.
+ * Once *xprt is initialized, it is registered as a transporter
+ * see (svc.h, xprt_register).  This routine returns
+ * a NULL if a problem occurred.
+ *
+ * If sock<0 then a socket is created, else sock is used.
+ * If the socket, sock is not bound to a port then svctcp_create
+ * binds it to an arbitrary port.  The routine then starts a tcp
+ * listener on the socket's associated port.  In any (successful) case,
+ * xprt->xp_sock is the registered socket number and xprt->xp_port is the
+ * associated port number.
+ *
+ * Since tcp streams do buffered io similar to stdio, the caller can specify
+ * how big the send and receive buffers are via the second and third parms;
+ * 0 => use the system default.
+ */
+SVCXPRT *
+svctcp_create(sock, sendsize, recvsize)
+	register int sock;
+	u_int sendsize;
+	u_int recvsize;
+{
+	bool_t madesock = FALSE;
+	register SVCXPRT *xprt;
+	register struct tcp_rendezvous *r;
+	struct sockaddr_in addr;
+	int len = sizeof(struct sockaddr_in);
+
+	if (sock == RPC_ANYSOCK) {
+		if ((sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+			perror("svctcp_.c - udp socket creation problem");
+			return ((SVCXPRT *)NULL);
+		}
+		madesock = TRUE;
+	}
+	addr.sin_addr.s_addr = 0;
+	addr.sin_family = AF_INET;
+	addr.sin_port = 0;
+	(void)bind(sock, (struct sockaddr *)&addr, len);
+	if ((getsockname(sock, (caddr_t)&addr, &len) != 0)  ||
+	    (listen(sock, 2) != 0)) {
+		perror("svctcp_.c - cannot getsockname or listen");
+		if (madesock)
+		       (void)close(sock);
+		return ((SVCXPRT *)NULL);
+	}
+	r = (struct tcp_rendezvous *)mem_alloc(sizeof(*r));
+	if (r == NULL) {
+		fprintf(stderr, "svctcp_create: out of memory\n");
+		return (NULL);
+	}
+	r->sendsize = sendsize;
+	r->recvsize = recvsize;
+	xprt = (SVCXPRT *)mem_alloc(sizeof(SVCXPRT));
+	if (xprt == NULL) {
+		fprintf(stderr, "svctcp_create: out of memory\n");
+		return (NULL);
+	}
+	xprt->xp_p2 = NULL;
+	xprt->xp_p1 = (caddr_t)r;
+	xprt->xp_verf = _null_auth;
+	xprt->xp_ops = &svctcp_rendezvous_op;
+	xprt->xp_port = ntohs(addr.sin_port);
+	xprt->xp_sock = sock;
+	xprt_register(xprt);
+	return (xprt);
+}
+
+static bool_t
+rendezvous_request(xprt)
+	register SVCXPRT *xprt;
+{
+	register int sock;
+	register struct tcp_rendezvous *r;
+	register struct tcp_conn *cd;
+	struct sockaddr_in addr;
+	int len;
+
+	r = (struct tcp_rendezvous *)xprt->xp_p1;
+    again:
+	len = sizeof(struct sockaddr_in);
+	if ((sock = accept(xprt->xp_sock, (struct sockaddr *)&addr,
+	    &len)) < 0) {
+		if (errno == EINTR)
+			goto again;
+	       return (FALSE);
+	}
+	/*
+	 * make a new transporter (re-uses xprt)
+	 */
+	xprt = (SVCXPRT *)mem_alloc(sizeof(SVCXPRT));
+	if (xprt == NULL) {
+		fprintf(stderr, "rendezvous_request: out of memory\n");
+		return (FALSE);
+	}
+	cd = (struct tcp_conn *)mem_alloc(sizeof(struct tcp_conn));
+	if (cd == NULL) {
+		fprintf(stderr, "rendezvous_request: out of memory\n");
+		return (FALSE);
+	}
+	cd->strm_stat = XPRT_IDLE;
+	xdrrec_create(&(cd->xdrs), r->sendsize, r->recvsize,
+	    (caddr_t)xprt, readtcp, writetcp);
+	xprt->xp_p2 = NULL;
+	xprt->xp_p1 = (caddr_t)cd;
+	xprt->xp_verf.oa_base = cd->verf_body;
+	xprt->xp_raddr = addr;
+	xprt->xp_addrlen = len;
+	xprt->xp_ops = &svctcp_op;  /* truely deals with calls */
+	xprt->xp_port = 0;  /* this is a connection, not a rendezvouser */
+	xprt->xp_sock = sock;
+	xprt_register(xprt);
+	return (FALSE); /* there is never an rpc msg to be processed */
+}
+
+static enum xprt_stat
+rendezvous_stat()
+{
+
+	return (XPRT_IDLE);
+}
+
+static void
+svctcp_destroy(xprt)
+	register SVCXPRT *xprt;
+{
+	register struct tcp_conn *cd = (struct tcp_conn *)xprt->xp_p1;
+
+	xprt_unregister(xprt);
+	(void)close(xprt->xp_sock);
+	if (xprt->xp_port != 0) {
+		/* a rendezvouser socket */
+		xprt->xp_port = 0;
+	} else {
+		/* an actual connection socket */
+		XDR_DESTROY(&(cd->xdrs));
+	}
+	mem_free((caddr_t)cd, sizeof(struct tcp_conn));
+	mem_free((caddr_t)xprt, sizeof(SVCXPRT));
+}
+
+/*
+ * All read operations timeout after 35 seconds.
+ * A timeout is fatal for the connection.
+ */
+static struct timeval wait_per_try = { 35, 0 };
+
+/*
+ * reads data from the tcp conection.
+ * any error is fatal and the connection is closed.
+ * (And a read of zero bytes is a half closed stream => error.)
+ */
+static int
+readtcp(xprt, buf, len)
+	register SVCXPRT *xprt;
+	caddr_t buf;
+	register int len;
+{
+	register int sock = xprt->xp_sock;
+	register int mask = 1 << sock;
+	int readfds;
+
+	do {
+		readfds = mask;
+		if (select(32, &readfds, NULL, NULL, &wait_per_try) <= 0) {
+			if (errno == EINTR)
+				continue;
+			goto fatal_err;
+		}
+	} while (readfds != mask);
+	if ((len = read(sock, buf, len)) > 0)
+		return (len);
+fatal_err:
+	((struct tcp_conn *)(xprt->xp_p1))->strm_stat = XPRT_DIED;
+	return (-1);
+}
+
+/*
+ * writes data to the tcp connection.
+ * Any error is fatal and the connection is closed.
+ */
+static int
+writetcp(xprt, buf, len)
+	register SVCXPRT *xprt;
+	caddr_t buf;
+	int len;
+{
+	register int i, cnt;
+
+	for (cnt = len; cnt > 0; cnt -= i, buf += i) {
+		if ((i = write(xprt->xp_sock, buf, cnt)) < 0) {
+			((struct tcp_conn *)(xprt->xp_p1))->strm_stat =
+			    XPRT_DIED;
+			return (-1);
+		}
+	}
+	return (len);
+}
+
+static enum xprt_stat
+svctcp_stat(xprt)
+	SVCXPRT *xprt;
+{
+	register struct tcp_conn *cd =
+	    (struct tcp_conn *)(xprt->xp_p1);
+
+	if (cd->strm_stat == XPRT_DIED)
+		return (XPRT_DIED);
+	if (! xdrrec_eof(&(cd->xdrs)))
+		return (XPRT_MOREREQS);
+	return (XPRT_IDLE);
+}
+
+static bool_t
+svctcp_recv(xprt, msg)
+	SVCXPRT *xprt;
+	register struct rpc_msg *msg;
+{
+	register struct tcp_conn *cd =
+	    (struct tcp_conn *)(xprt->xp_p1);
+	register XDR *xdrs = &(cd->xdrs);
+
+	xdrs->x_op = XDR_DECODE;
+	(void)xdrrec_skiprecord(xdrs);
+	if (xdr_callmsg(xdrs, msg)) {
+		cd->x_id = msg->rm_xid;
+		return (TRUE);
+	}
+	return (FALSE);
+}
+
+static bool_t
+svctcp_getargs(xprt, xdr_args, args_ptr)
+	SVCXPRT *xprt;
+	xdrproc_t xdr_args;
+	caddr_t args_ptr;
+{
+
+	return ((*xdr_args)(&(((struct tcp_conn *)(xprt->xp_p1))->xdrs), args_ptr));
+}
+
+static bool_t
+svctcp_freeargs(xprt, xdr_args, args_ptr)
+	SVCXPRT *xprt;
+	xdrproc_t xdr_args;
+	caddr_t args_ptr;
+{
+	register XDR *xdrs =
+	    &(((struct tcp_conn *)(xprt->xp_p1))->xdrs);
+
+	xdrs->x_op = XDR_FREE;
+	return ((*xdr_args)(xdrs, args_ptr));
+}
+
+static bool_t
+svctcp_reply(xprt, msg)
+	SVCXPRT *xprt;
+	register struct rpc_msg *msg;
+{
+	register struct tcp_conn *cd =
+	    (struct tcp_conn *)(xprt->xp_p1);
+	register XDR *xdrs = &(cd->xdrs);
+	register bool_t stat;
+
+	xdrs->x_op = XDR_ENCODE;
+	msg->rm_xid = cd->x_id;
+	stat = xdr_replymsg(xdrs, msg);
+	(void)xdrrec_endofrecord(xdrs, TRUE);
+	return (stat);
+}
+!Funky!Stuff!
+echo x - svc_udp.c
+sed 's/^X//' >svc_udp.c <<'!Funky!Stuff!'
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#ifndef lint
+static char sccsid[] = "@(#)svc_udp.c 1.4 85/03/14 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * svc_udp.c,
+ * Server side for UDP/IP based RPC.  (Does some caching in the hopes of
+ * achieving execute-at-most-once semantics.)
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include "types.h"
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <errno.h>
+#include "xdr.h"
+#include "auth.h"
+#include "clnt.h"
+#include "rpc_msg.h"
+#include "svc.h"
+
+char *mem_alloc();
+
+#define rpc_buffer(xprt) ((xprt)->xp_p1)
+
+static bool_t		svcudp_recv();
+static bool_t		svcudp_reply();
+static enum xprt_stat	svcudp_stat();
+static bool_t		svcudp_getargs();
+static bool_t		svcudp_freeargs();
+static void		svcudp_destroy();
+
+static struct xp_ops svcudp_op = {
+	svcudp_recv,
+	svcudp_stat,
+	svcudp_getargs,
+	svcudp_reply,
+	svcudp_freeargs,
+	svcudp_destroy
+};
+
+extern int errno;
+
+/*
+ * kept in xprt->xp_p2
+ */
+struct svcudp_data {
+	u_long	su_xid;		/* transaction id */
+	XDR	su_xdrs;	/* XDR handle */
+	char	su_verfbody[MAX_AUTH_BYTES];	/* verifier body */
+};
+#define	su_data(xprt)	((struct svcudp_data *)(xprt->xp_p2))
+
+/*
+ * Usage:
+ *	xprt = svcudp_create(sock);
+ *
+ * If sock<0 then a socket is created, else sock is used.
+ * If the socket, sock is not bound to a port then svcudp_create
+ * binds it to an arbitrary port.  In any (successful) case,
+ * xprt->xp_sock is the registered socket number and xprt->xp_port is the
+ * associated port number.
+ * Once *xprt is initialized, it is registered as a transporter;
+ * see (svc.h, xprt_register).
+ * The routines returns NULL if a problem occurred.
+ */
+SVCXPRT *
+svcudp_create(sock)
+	register int sock;
+{
+	bool_t madesock = FALSE;
+	register SVCXPRT *xprt;
+	register struct svcudp_data *su;
+	struct sockaddr_in addr;
+	int len = sizeof(struct sockaddr_in);
+
+	if (sock == RPC_ANYSOCK) {
+		if ((sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
+			perror("svcudp_create: socket creation problem");
+			return ((SVCXPRT *)NULL);
+		}
+		madesock = TRUE;
+	}
+	addr.sin_addr.s_addr = 0;
+	addr.sin_family = AF_INET;
+	addr.sin_port = 0;
+	(void)bind(sock, (struct sockaddr *)&addr, len);
+	if (getsockname(sock, (caddr_t)&addr, &len) != 0) {
+		perror("svcudp_create - cannot getsockname");
+		if (madesock)
+			(void)close(sock);
+		return ((SVCXPRT *)NULL);
+	}
+	xprt = (SVCXPRT *)mem_alloc(sizeof(SVCXPRT));
+	if (xprt == NULL) {
+		fprintf(stderr, "svcudp_create: out of memory\n");
+		return (NULL);
+	}
+	if ((rpc_buffer(xprt) = mem_alloc(UDPMSGSIZE)) == NULL) {
+		fprintf(stderr, "svcudp_create: out of memory\n");
+		return (NULL);
+	}
+	su = (struct svcudp_data *)mem_alloc(sizeof(*su));
+	if (su == NULL) {
+		fprintf(stderr, "svcudp_create: out of memory\n");
+		return (NULL);
+	}
+	xdrmem_create(
+	    &(su->su_xdrs), rpc_buffer(xprt), UDPMSGSIZE, XDR_DECODE);
+	xprt->xp_p2 = (caddr_t)su;
+	xprt->xp_verf.oa_base = su->su_verfbody;
+	xprt->xp_ops = &svcudp_op;
+	xprt->xp_port = ntohs(addr.sin_port);
+	xprt->xp_sock = sock;
+	xprt_register(xprt);
+	return (xprt);
+}
+ 
+static enum xprt_stat
+svcudp_stat(xprt)
+	SVCXPRT *xprt;
+{
+
+	return (XPRT_IDLE); 
+}
+
+static bool_t
+svcudp_recv(xprt, msg)
+	register SVCXPRT *xprt;
+	struct rpc_msg *msg;
+{
+	register struct svcudp_data *su = su_data(xprt);
+	register XDR *xdrs = &(su->su_xdrs);
+	register int rlen;
+
+    again:
+	xprt->xp_addrlen = sizeof(struct sockaddr_in);
+	rlen = recvfrom(xprt->xp_sock, rpc_buffer(xprt), UDPMSGSIZE,
+	    0, (struct sockaddr *)&(xprt->xp_raddr), &(xprt->xp_addrlen));
+	if (rlen == -1 && errno == EINTR)
+		goto again;
+	if (rlen < 4*sizeof(u_long))
+		return (FALSE);
+	xdrs->x_op = XDR_DECODE;
+	XDR_SETPOS(xdrs, 0);
+	if (! xdr_callmsg(xdrs, msg))
+		return (FALSE);
+	su->su_xid = msg->rm_xid;
+	return (TRUE);
+}
+
+static bool_t
+svcudp_reply(xprt, msg)
+	register SVCXPRT *xprt; 
+	struct rpc_msg *msg; 
+{
+	register struct svcudp_data *su = su_data(xprt);
+	register XDR *xdrs = &(su->su_xdrs);
+	register int slen;
+	register bool_t stat = FALSE;
+
+	xdrs->x_op = XDR_ENCODE;
+	XDR_SETPOS(xdrs, 0);
+	msg->rm_xid = su->su_xid;
+	if (xdr_replymsg(xdrs, msg)) {
+		slen = (int)XDR_GETPOS(xdrs);
+		if (sendto(xprt->xp_sock, rpc_buffer(xprt), slen, 0,
+		    (struct sockaddr *)&(xprt->xp_raddr), xprt->xp_addrlen)
+		    == slen)
+			stat = TRUE;
+	}
+	return (stat);
+}
+
+static bool_t
+svcudp_getargs(xprt, xdr_args, args_ptr)
+	SVCXPRT *xprt;
+	xdrproc_t xdr_args;
+	caddr_t args_ptr;
+{
+
+	return ((*xdr_args)(&(su_data(xprt)->su_xdrs), args_ptr));
+}
+
+static bool_t
+svcudp_freeargs(xprt, xdr_args, args_ptr)
+	SVCXPRT *xprt;
+	xdrproc_t xdr_args;
+	caddr_t args_ptr;
+{
+	register XDR *xdrs = &(su_data(xprt)->su_xdrs);
+
+	xdrs->x_op = XDR_FREE;
+	return ((*xdr_args)(xdrs, args_ptr));
+}
+
+static void
+svcudp_destroy(xprt)
+	register SVCXPRT *xprt;
+{
+	register struct svcudp_data *su = su_data(xprt);
+
+	xprt_unregister(xprt);
+	(void)close(xprt->xp_sock);
+	XDR_DESTROY(&(su->su_xdrs));
+	mem_free((caddr_t)su, sizeof(struct svcudp_data));
+	mem_free(rpc_buffer(xprt), UDPMSGSIZE);
+	mem_free((caddr_t)xprt, sizeof(SVCXPRT));
+}
+!Funky!Stuff!
+
+exit

@@ -1,0 +1,2218 @@
+Newsgroups: comp.sources.unix
+From: jnweiger@immd4.informatik.uni-erlangen.de (Juergen Weigert)
+Subject: v25i044: Screen3 - multiple windows on an ASCII terminal, Part04/08
+Sender: sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: jnweiger@immd4.informatik.uni-erlangen.de (Juergen Weigert)
+Posting-Number: Volume 25, Issue 44
+Archive-Name: screen3/part04
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 4 (of 8)."
+# Contents:  mark.c socket.c
+# Wrapped by vixie@cognition.pa.dec.com on Thu Dec 19 17:36:05 1991
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'mark.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mark.c'\"
+else
+echo shar: Extracting \"'mark.c'\" \(25040 characters\)
+sed "s/^X//" >'mark.c' <<'END_OF_FILE'
+X/* Copyright (c) 1991
+X *      Juergen Weigert (jnweiger@immd4.informatik.uni-erlangen.de)
+X *      Michael Schroeder (mlschroe@immd4.informatik.uni-erlangen.de)
+X * Copyright (c) 1987 Oliver Laumann
+X *
+X * This program is free software; you can redistribute it and/or modify
+X * it under the terms of the GNU General Public License as published by
+X * the Free Software Foundation; either version 1, or (at your option)
+X * any later version.
+X *
+X * This program is distributed in the hope that it will be useful,
+X * but WITHOUT ANY WARRANTY; without even the implied warranty of
+X * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X * GNU General Public License for more details.
+X *
+X * You should have received a copy of the GNU General Public License
+X * along with this program (see the file COPYING); if not, write to the
+X * Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X * Noteworthy contributors to screen's design and implementation:
+X *	Wayne Davison (davison@borland.com)
+X *	Patrick Wolfe (pat@kai.com, kailand!pat)
+X *	Bart Schaefer (schaefer@cse.ogi.edu)
+X *	Nathan Glasser (nathan@brokaw.lcs.mit.edu)
+X *	Larry W. Virden (lwv27%cas.BITNET@CUNYVM.CUNY.Edu)
+X *	Howard Chu (hyc@hanauma.jpl.nasa.gov)
+X *	Tim MacKenzie (tym@dibbler.cs.monash.edu.au)
+X *	Markku Jarvinen (mta@{cc,cs,ee}.tut.fi)
+X *	Marc Boucher (marc@CAM.ORG)
+X *
+X ****************************************************************
+X */
+X
+X#ifndef lint
+X  static char rcs_id[] = "$Id: mark.c,v 1.38 91/10/11 11:46:04 jnweiger Exp $ FAU";
+X#endif
+X
+X#include <sys/types.h>
+X#if defined(BSD) || defined(sequent)
+X# include <strings.h>
+X#else
+X# include <string.h>
+X#endif
+X
+X#include "config.h"
+X#include "screen.h"
+X#include "ansi.h"	/* here we find A_SO, ASCII, EXPENSIVE */
+X#include "extern.h"
+X
+static int is_letter __P((int));
+static void nextword __P((int *, int *, int, int));
+static int linestart __P((int));
+static int lineend __P((int));
+static int rem __P((int, int , int , int , int , char *, int));
+static int eq __P((int, int ));
+static void revto __P((int, int));
+static void revto_line __P((int, int, int));
+static void MarkRedisplayLine __P((int, int, int, int));
+static int MarkRewrite __P((int, int, int, int));
+static void process_mark_input __P((char **, int *));
+static void AbortMarkRoutine __P((void));
+static int MarkScrollDownDisplay __P((int));
+static int MarkScrollUpDisplay __P((int));
+X
+int join_with_cr =  0;
+extern struct win *fore, *wtab[];
+extern int screenwidth, screenheight;
+extern int screentop, screenbot;
+extern char GlobalAttr, GlobalCharset;
+extern int in_ovl;
+extern int HS;
+extern int LP;
+extern char *null, *blank;
+X
+X#ifdef NETHACK
+extern nethackflag;
+X#endif
+X
+char *copybuffer = NULL;
+int copylen = 0;
+char mark_key_tab[256]; /* this array must be initialised first! */
+X
+static int in_mark;	/* mark routine active */
+static int left_mar, right_mar, nonl;
+static int x1, y1, second; /* y1 is in terms of WIN coordinates, not DISPLAY */
+static int cx, cy;	/* Cursor Position in WIN coords*/
+static rep_cnt;		/* no. of repeats are rep_cnt+1. jw. */
+static int append_mode;	/* shall we overwrite or append to copybuffer */
+static write_buffer;	/* shall we do a KEY_WRITE_EXCHANGE right away? */
+static hist_offset;
+X
+static int is_letter(c)
+char c;
+X{
+X  if (c >= 'a' && c <= 'z' ||
+X      c >= 'A' && c <= 'Z' ||
+X      c >= '0' && c <= '9' ||
+X      c == '_' || c == '.' ||
+X      c == '@' || c == ':' ||
+X      c == '%' || c == '!' ||
+X      c == '-' || c == '+')
+X    /* thus we can catch email-addresses as a word :-) */
+X    return 1;
+X  else if (c != ' ')
+X    return 2;
+X  return 0;
+X}
+X
+X/*
+X * iWIN gives us a reference to line y of the *whole* image 
+X * where line 0 is the oldest line in our history.
+X * y must be in WIN coordinate system, not in display.
+X */
+X#define iWIN(y) ((y < fore->histheight) ? fore->ihist[(fore->histidx + y)\
+X		% fore->histheight] : fore->image[y - fore->histheight])
+X#define aWIN(y) ((y < fore->histheight) ? fore->ahist[(fore->histidx + y)\
+X		% fore->histheight] : fore->attr[y - fore->histheight])
+X#define fWIN(y) ((y < fore->histheight) ? fore->fhist[(fore->histidx + y)\
+X		% fore->histheight] : fore->font[y - fore->histheight])
+X/*
+X * hist_offset tells us, how many lines there are on top of the
+X * visible screen.
+X */
+X
+X#define W2D(y) ((y)-hist_offset)
+X#define D2W(y) ((y)+hist_offset)
+X
+static int
+linestart(y)
+int y;
+X{
+X  register int x;
+X  register char *i;
+X
+X  for (x = left_mar, i = iWIN(y) + x; x < screenwidth-1; x++)
+X    if (*i++ != ' ')
+X      break;
+X  if (x == screenwidth-1)
+X    x = left_mar;
+X  return(x);
+X}
+X
+static int
+lineend(y)
+int y;
+X{
+X  register int x;
+X  register char *i;
+X
+X  for (x = right_mar, i = iWIN(y) + x; x >= 0; x--)
+X    if (*i-- != ' ')
+X      break;
+X  if (x < 0)
+X    x = left_mar;
+X  return(x);
+X}
+X
+X/*
+X * nextword returnes 1 if x,y altered. dir== -1 means backwards search
+X * beginning of a word, +1 means forward search beginning of a word, +2
+X * means search forward end of word.
+X */
+X
+X#define NW_BACK		1
+X#define NW_ENDOFWORD	2
+X#define NW_MUSTMOVE	4
+X
+static void nextword(xp, yp, dir, num)
+int *xp, *yp, dir, num;
+X{
+X  int xx = screenwidth, yy = fore->histheight + screenheight;
+X  register int sx, oq, q, x, y;
+X
+X  x = *xp;
+X  y = *yp;
+X  sx = (dir & NW_BACK) ? -1 : 1;
+X  if ((dir & NW_ENDOFWORD) && (dir & NW_MUSTMOVE))
+X    x += sx;
+X  for (oq = -1; ; x += sx, oq = q)
+X    {
+X      if (x >= xx || x < 0)
+X	q = 0;
+X      else
+X        q = is_letter(iWIN(y)[x]);
+X      if (oq >= 0 && oq != q)
+X	{
+X	  if (oq == 0 || !(dir & NW_ENDOFWORD))
+X	    *xp = x;
+X	  else
+X	    *xp = x-sx;
+X	  *yp = y;
+X	  if ((!(dir & NW_ENDOFWORD) && q) ||
+X	      ((dir & NW_ENDOFWORD) && oq))
+X	    {
+X	      if (--num <= 0)
+X	        return;
+X	    }
+X	}
+X      if (x == xx)
+X	{
+X	  x = -1;
+X	  if (++y >= yy)
+X	    return;
+X	}
+X      else if (x < 0)
+X	{
+X	  x = xx;
+X	  if (--y < 0)
+X	    return;
+X	}
+X    }
+X}
+X
+X
+X/*
+X * y1, y2 are WIN coordinates
+X *
+X * redisplay:	0  -  just copy
+X * 		1  -  redisplay + copy
+X *		2  -  count + copy, don't redisplay
+X */
+X
+static int rem(x1, y1, x2, y2, redisplay, pt, yend)
+int x1, y1, x2, y2, redisplay, yend;
+char *pt;
+X{
+X  int i, j, from, to, ry;
+X  int l = 0;
+X  char *im;
+X
+X  second = 0;
+X  if (y2 < y1 || y2 == y1 && x2 < x1)
+X    {
+X      i = y2;
+X      y2 = y1;
+X      y1 = i;
+X      i = x2;
+X      x2 = x1;
+X      x1 = i;
+X    }
+X  ry = y1 - hist_offset;
+X  
+X  i = y1;
+X  if (redisplay != 2 && pt == 0 && ry <0)
+X    {
+X      i -= ry;
+X      ry = 0;
+X    }
+X  for (; i <= y2; i++, ry++)
+X    {
+X      if (redisplay != 2 && pt == 0 && ry > yend)
+X	break;
+X      from = (i == y1) ? x1 : 0;
+X      if (from < left_mar)
+X	from = left_mar;
+X      for (to = screenwidth-1, im = iWIN(i)+to; to>=0; to--)
+X        if (*im-- != ' ')
+X	  break;
+X      if (i == y2 && x2 < to)
+X	to = x2;
+X      if (to > right_mar)
+X	to = right_mar;
+X      if (redisplay == 1 && from <= to && ry >=0 && ry <= yend)
+X	MarkRedisplayLine(ry, from, to, 0);
+X      if (redisplay != 2 && pt == 0)	/* don't count/copy */
+X	continue;
+X      for (j = from, im = iWIN(i)+from; j <= to; j++)
+X	{
+X	  if (pt)
+X	    *pt++ = *im++;
+X	  l++;
+X	}
+X      if (i != y2)
+X	{
+X	  /* 
+X	   * this code defines, what glues lines together
+X	   */
+X	  switch (nonl)
+X	    {
+X	    case 0:		/* lines separated by newlines */
+X	      if (join_with_cr)
+X		{
+X		  if (pt)
+X		    *pt++ = '\r';
+X		  l++;
+X		}
+X	      if (pt)
+X		*pt++ = '\n';
+X	      l++;
+X	      break;
+X	    case 1:		/* nothing to separate lines */
+X	      break;
+X	    case 2:		/* lines separated by blanks */
+X	      if (pt)
+X		*pt++ = ' ';
+X	      l++;
+X	      break;
+X	    }
+X	}
+X    }
+X  return(l);
+X}
+X
+static int eq(a, b)
+int a, b;
+X{
+X  if (a == b)
+X    return 1;
+X  if (a == 0 || b == 0)
+X    return 1;
+X  if (a <= '9' && a >= '0' && b <= '9' && b >= '0')
+X    return 1;
+X  return 0;
+X}
+X
+int MarkRoutine(flag)	/* return value 1 when copybuffer changed; */
+int flag;
+X{
+X  int x, y, i;
+X 
+X  hist_offset = fore->histheight;
+X 
+X  if (!fore->active)
+X    {
+X      Msg(0, "Fore window is not active !!!");
+X      return 0;
+X    }
+X
+X  second = 0;
+X  rep_cnt = 0;
+X  append_mode = 0;
+X  write_buffer = 0;
+X  nonl = left_mar = 0;
+X  right_mar = screenwidth-1;
+X  x = fore->x;
+X  y = D2W(fore->y);
+X  if (x >= screenwidth)
+X    x = screenwidth-1;
+X
+X  if (flag == TRICKY)
+X    {
+X      int f, q = 0, xx, yy;
+X      char *linep;
+X
+X      debug2("cursor is at x=%d, y=%d\n", fore->x, D2W(fore->y));
+X      for (xx = fore->x - 1, linep = iWIN(y)+xx; xx >= 0; xx--)
+X	if ((q = *linep--) != ' ' )
+X	  break;
+X      debug3("%c at (%d,%d)\n", q, xx, y);
+X      for (yy = D2W(fore->y) - 1; yy >= 0; yy--)
+X	if (xx < 0 || eq(iWIN(yy)[xx], q))
+X	  {		/* line is matching... */
+X	    f = 0;
+X	    for (i = fore->x; i < screenwidth-1; i++)
+X	      {
+X		if (iWIN(yy)[i] != ' ')
+X		  {
+X		    f = 1;
+X		    break;
+X		  }
+X	      }
+X	    if (f)
+X	      break;
+X	  }
+X      if (yy < 0)
+X	return 0;
+X      xx = 0;
+X      for (i = screenwidth-1, linep = iWIN(yy)+i; i>0; i--)
+X	if (*linep-- != ' ')
+X	  break;
+X      if (i < x)
+X	i = x;
+X      if (copybuffer != NULL)
+X	Free(copybuffer);
+X      if ((copybuffer = malloc((unsigned) (i - x + 2))) == NULL)
+X	{
+X	  Msg(0, "Not enough memoooh!... Sorry.");
+X	  return 0;
+X	}
+X      rem(x, yy, i, yy, 0, copybuffer, 0);
+X      copylen = i - x + 1;
+X      return 1;
+X    }
+X  InitOverlayPage(process_mark_input, MarkRedisplayLine, MarkRewrite, 1);
+X  GotoPos(x, W2D(y));
+X#ifdef NETHACK
+X  if (nethackflag)
+X    Msg(0, "Welcome to hacker's treasure zoo - Column %d Line %d(+%d) (%d,%d)",
+X	x+1, W2D(y+1), fore->histheight, fore->width, fore->height);
+X  else
+X#endif
+X  Msg(0, "Copy mode - Column %d Line %d(+%d) (%d,%d)",
+X      x+1, W2D(y+1), fore->histheight, fore->width, fore->height);
+X  fflush(stdout);
+X  cx = x1 = x;
+X  cy = y1 = y;
+X  in_mark = 1;
+X  return 0;
+X}
+X
+static void process_mark_input(inbufp,inlenp)
+char **inbufp;
+int *inlenp;
+X{
+X  char *inbuf, *pt;
+X  int inlen;
+X  int x2, y2, i, j, yend;
+X  int newcopylen = 0, od;
+X/*
+X  char *extrap = 0, extrabuf[100];
+X*/
+X      
+X  if (inbufp == 0)
+X    {
+X      AbortMarkRoutine();
+X      return;
+X    }
+X 
+X  inbuf= *inbufp;
+X  inlen= *inlenp;
+X  pt = inbuf;
+X  while (in_mark && (inlen /* || extrap */))
+X    {
+X      if (!HS)
+X	RemoveStatus();
+X/*
+X      if (extrap)
+X	{
+X	  od = *extrap++;
+X	  if (*extrap == 0)
+X	    extrap = 0;
+X	}
+X      else
+X*/
+X	{
+X          od = mark_key_tab[*pt++];
+X          inlen--;
+X	}
+X      if (od >= '0' && od <= '9')
+X        {
+X	  if (rep_cnt < 1001 && (od != '0' || rep_cnt != 0))
+X	    {
+X	      rep_cnt = 10 * rep_cnt + od - '0';
+X	      continue;
+X 	      /*
+X	       * Now what is that 1001 here? Well, we have a screen with
+X	       * 25 * 80 = 2000 characters. Movement is at most across the full
+X	       * screen. This we do with word by word movement, as character by
+X	       * character movement never steps over line boundaries. The most words
+X	       * we can place on the screen are 1000 single letter words. Thus 1001
+X	       * is sufficient. Users with bigger screens never write in single letter
+X	       * words, as they should be more advanced. jw.
+X	       * Oh, wrong. We still give even the experienced user a factor of ten.
+X	       */
+X	    }
+X	}
+X      switch (od)
+X	{
+X	case '\014':	/* CTRL-L Redisplay */
+X	  Redisplay();
+X	  GotoPos(cx, W2D(cy));
+X	  break;
+X	case '\010':	/* CTRL-H Backspace */
+X	case 'h':
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  revto(cx - rep_cnt, cy);
+X	  break;
+X	case '\016':	/* CTRL-N */
+X	case 'j':
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  revto(cx, cy + rep_cnt);
+X	  break;
+X	case '+':
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  j = cy + rep_cnt;
+X	  if (j > fore->histheight + screenheight - 1)
+X	    j = fore->histheight + screenheight - 1;
+X	  revto(linestart(j), j);
+X	  break;
+X	case '-':
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  j = cy - rep_cnt;
+X	  if (j < 0)
+X	    j = 0;
+X	  revto(linestart(j), j);
+X	  break;
+X	case '^':
+X	  revto(linestart(cy), cy);
+X	  break;
+X	case '\n':
+X	  revto(left_mar, cy + 1);
+X	  break;
+X	case 'k':
+X	case '\020':	/* CTRL-P */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  revto(cx, cy - rep_cnt);
+X	  break;
+X	case 'l':
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  revto(cx + rep_cnt, cy);
+X	  break;
+X	case '\001':	/* CTRL-A from tcsh/emacs */
+X	case '0':
+X	  revto(left_mar, cy);
+X	  break;
+X	case '\004':    /* CTRL-D down half screen */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = (screenheight+1) >> 1;
+X	  revto_line(cx, cy + rep_cnt, W2D(cy));
+X	  break;
+X	case '$':
+X	  revto(lineend(cy), cy);
+X	  break;
+X	case '\025':	/* CTRL-U up half screen */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = (screenheight+1) >> 1;
+X	  revto_line(cx, cy - rep_cnt, W2D(cy));
+X	  break;
+X	case '?':
+X	  if (left_mar == 0 && right_mar == screenwidth - 1)
+X	    Msg(0, "Column %d Line %d(+%d)", cx+1, W2D(cy)+1,
+X		hist_offset);
+X	  else
+X	    Msg(0, "Column %d(%d..%d) Line %d(+%d)", cx+1,
+X		left_mar+1, right_mar+1, W2D(cy)+1, hist_offset);
+X	  break;
+X	case '\002':	/* CTRL-B  back one page */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  rep_cnt *= (screenheight-1);
+X	  revto(cx, cy - rep_cnt);
+X	  break;
+X	case '\006':	/* CTRL-F  forward one page */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  rep_cnt *= (screenheight-1);
+X	  revto(cx, cy + rep_cnt);
+X	  break;
+X	case '\005':	/* CTRL-E  scroll up */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  rep_cnt = MarkScrollUpDisplay(rep_cnt);
+X	  if (cy < D2W(0))
+X            revto(cx, D2W(0));
+X	  else
+X            GotoPos(cx, W2D(cy));
+X	  break;
+X	case '\031': /* CTRL-Y  scroll down */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  rep_cnt = MarkScrollDownDisplay(rep_cnt);
+X	  if (cy > D2W(screenheight-1))
+X            revto(cx, D2W(screenheight-1));
+X	  else
+X            GotoPos(cx, W2D(cy));
+X	  break;
+X	case '@':
+X	  /* it may be usefull to have a key that does nothing */
+X	  break;
+X	case '%':
+X	  rep_cnt--;
+X	  /* rep_cnt is a percentage for the history buffer */
+X	  if (rep_cnt < 0)
+X	    rep_cnt = 0;
+X	  if (rep_cnt > 100)
+X	    rep_cnt = 100;
+X	  revto_line(left_mar, (rep_cnt * (fore->histheight + screenheight)) / 100, (screenheight-1)/2);
+X	  break;
+X	case 'g':
+X	  rep_cnt = 1;
+X	  /* FALLTHROUGH */
+X	case 'G':
+X	  /* rep_cnt is here the WIN line number */
+X	  if (rep_cnt == 0)
+X	    rep_cnt = fore->histheight + screenheight;
+X	  revto_line(left_mar, --rep_cnt, (screenheight-1)/2);
+X	  break;
+X	case 'H':
+X	  revto(left_mar, D2W(0));
+X	  break;
+X	case 'M':
+X	  revto(left_mar, D2W((screenheight-1) / 2));
+X	  break;
+X	case 'L':
+X	  revto(left_mar, D2W(screenheight-1));
+X	  break;
+X	case '|':
+X	  revto(--rep_cnt, cy);
+X	  break;
+X	case 'w':
+X	  i = cx;
+X	  j = cy;
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  nextword(&i, &j, NW_MUSTMOVE, rep_cnt);
+X	  revto(i, j);
+X	  break;
+X	case 'e':
+X	  i = cx;
+X	  j = cy;
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  nextword(&i, &j, NW_ENDOFWORD|NW_MUSTMOVE, rep_cnt);
+X	  revto(i, j);
+X	  break;
+X	case 'b':
+X	  i = cx;
+X	  j = cy;
+X	  if (rep_cnt == 0)
+X	    rep_cnt = 1;
+X	  nextword(&i, &j, NW_BACK|NW_ENDOFWORD|NW_MUSTMOVE, rep_cnt);
+X	  revto(i, j);
+X	  break;
+X	case 'a':
+X	  append_mode = 1 - append_mode;
+X	  debug1("append mode %d--\n", append_mode);
+X	  Msg(0, (append_mode) ? ":set append" : ":set noappend");
+X	  break;
+X	case 'v':
+X	case 'V':
+X	  /* this sets start column to column 9 for VI :set nu users */
+X	  if (left_mar == 8)
+X	    rep_cnt = 1;
+X	  else
+X	    rep_cnt = 9;
+X	  /* FALLTHROUGH */
+X	case 'c':
+X	case 'C':
+X	  /* set start column (c) and end column (C) */
+X	  if (second)
+X	    {
+X	      rem(x1, y1, cx, cy, 1, 0, screenheight-1); /* Hack */
+X	      second = 1;	/* rem turns off second */
+X	    }
+X	  rep_cnt--;
+X	  if (rep_cnt < 0)
+X	    rep_cnt = cx;
+X	  if (od != 'C')
+X	    {
+X	      left_mar = rep_cnt;
+X	      if (left_mar > right_mar)
+X		left_mar = right_mar;
+X	    }
+X	  else
+X	    {
+X	      right_mar = rep_cnt;
+X	      if (left_mar > right_mar)
+X		right_mar = left_mar;
+X	    }
+X	  if (second)
+X	    {
+X	      int x = cx, y = cy;
+X	      cx = x1; cy = y1;
+X	      revto(x, y);
+X	    }
+X	  if (od == 'v' || od == 'V')
+X	    Msg(0, (left_mar != 8) ? ":set nonu" : ":set nu");
+X	  break;
+X	case 'J':
+X	  /* how do you join lines in VI ? */
+X	  nonl = (nonl + 1) % 3;
+X	  switch (nonl)
+X	    {
+X	    case 0:
+X	      if (join_with_cr)
+X		Msg(0, "Multiple lines (CR/LF)");
+X	      else
+X		Msg(0, "Multiple lines (LF)");
+X	      break;
+X	    case 1:
+X	      Msg(0, "Lines joined");
+X	      break;
+X	    case 2:
+X	      Msg(0, "Lines joined with blanks");
+X	      break;
+X	    }
+X	  break;
+X	case 'y':
+X	case 'Y':
+X	  if (!second)
+X	    {
+X	      revto(linestart(cy), cy);
+X	      second++;
+X	      x1 = cx;
+X	      y1 = cy;
+X	    }
+X	  if (--rep_cnt > 0)
+X	    revto(cx, cy + rep_cnt);
+X	  revto(lineend(cy), cy);
+X	  if (od == 'y')
+X	    break;
+X	  /* FALLTHROUGH */
+X	case 'W':
+X	  if (od == 'W')
+X	    {
+X	      if (rep_cnt == 0)
+X		rep_cnt = 1;
+X	      if (!second)
+X		{
+X		  i = cx;
+X		  j = cy;
+X		  nextword(&i, &j, NW_BACK|NW_ENDOFWORD, 1);
+X		  revto(i, j);
+X		  second++;
+X		  x1 = cx;
+X		  y1 = cy;
+X		}
+X	      i = cx;
+X	      j = cy;
+X	      nextword(&i, &j, NW_ENDOFWORD, rep_cnt);
+X	      revto(i, j);
+X	    }
+X	  /* FALLTHROUGH */
+X	case 'A':
+X	  if (od == 'A')
+X	    append_mode = 1;
+X	  /* FALLTHROUGH */
+X	case '>':
+X	  if (od == '>')
+X	    write_buffer = 1;
+X	  /* FALLTHROUGH */
+X	case ' ':
+X	case '\r':
+X	  if (!second)
+X	    {
+X	      second++;
+X	      x1 = cx;
+X	      y1 = cy;
+X	      revto(x1, y1);
+X#ifdef NETHACK
+X	      if (nethackflag)
+X		Msg(0, "You drop a magic marker - Column %d Line %d",
+X	    	    cx+1, W2D(cy)+1, hist_offset);
+X	      else
+X#endif
+X	      Msg(0, "First mark set - Column %d Line %d", cx+1, cy+1);
+X	      break;
+X	    }
+X	  else
+X	    {
+X	      x2 = cx;
+X	      y2 = cy;
+X	      newcopylen = rem(x1, y1, x2, y2, 2, 0, 0); /* count */
+X	      if (copybuffer != NULL && !append_mode)
+X		{
+X		  copylen = 0;
+X		  Free(copybuffer);
+X		}
+X	      if (newcopylen > 0)
+X		{
+X		  /* the +3 below is for : cr + lf + \0 */
+X		  if (copybuffer != NULL)
+X		    copybuffer = realloc(copybuffer,
+X			(unsigned) (copylen + newcopylen + 3));
+X		  else
+X		    {
+X		    copylen = 0;
+X		    copybuffer = malloc((unsigned) (newcopylen + 3));
+X		    }
+X		  if (copybuffer == NULL)
+X		    {
+X		      AbortMarkRoutine();
+X		      Msg(0, "Not enough memoooh!... Sorry.");
+X		      copylen = 0;
+X		      copybuffer = NULL;
+X		      break;
+X		    }
+X		  if (append_mode)
+X		    {
+X		      switch (nonl)
+X			/* 
+X			 * this code defines, what glues lines together
+X			 */
+X			{
+X			case 0:
+X			  if (join_with_cr)
+X			    {
+X			      copybuffer[copylen] = '\r';
+X			      copylen++;
+X			    }
+X			  copybuffer[copylen] = '\n';
+X			  copylen++;
+X			  break;
+X			case 1:
+X			  break;
+X			case 2:
+X			  copybuffer[copylen] = ' ';
+X			  copylen++;
+X			  break;
+X			}
+X		    }
+X		  yend = screenheight - 1;
+X		  if (fore->histheight - hist_offset < screenheight)
+X		    {
+X		      second = 0;
+X		      yend -= MarkScrollUpDisplay(fore->histheight - hist_offset);
+X		    }
+X		  copylen += rem(x1, y1, x2, y2, hist_offset == fore->histheight, copybuffer + copylen, yend);
+X		}
+X	      if (hist_offset != fore->histheight)
+X		{
+X		  in_ovl = 0;	/* So we can use Activate() */
+X		  Activate();
+X		}
+X	      ExitOverlayPage();
+X	      if (append_mode)
+X		Msg(0, "Appended %d characters to buffer",
+X		    newcopylen);
+X	      else
+X		Msg(0, "Copied %d characters into buffer", copylen);
+X	      if (write_buffer)
+X		WriteFile(DUMP_EXCHANGE);
+X	      in_mark = 0;
+X	      break;
+X	    }
+X	default:
+X	  AbortMarkRoutine();
+X#ifdef NETHACK
+X	  if (nethackflag)
+X	    Msg(0, "You escaped the dungeon.");
+X	  else
+X#endif
+X	  Msg(0, "Copy mode aborted");
+X	  break;
+X	}
+X      rep_cnt = 0;
+X    }
+X  fflush(stdout);
+X  *inbufp = pt;
+X  *inlenp = inlen;
+X}
+X
+static void revto(tx, ty)
+int tx, ty;
+X{
+X  revto_line(tx, ty, -1);
+X}
+X
+X/* tx, ty: WINDOW,  line: DISPLAY */
+static void revto_line(tx, ty, line)
+int tx, ty, line;
+X{
+X  int fx, fy;
+X  int x, y, t, revst, reven, qq, ff, tt, st, en, ce = 0;
+X  int ystart = 0, yend = screenheight-1;
+X  int i, ry;
+X 
+X  if (tx < 0)
+X    tx = 0;
+X  else if (tx > screenwidth - 1)
+X    tx = screenwidth -1;
+X  if (ty < 0)
+X    ty = 0;
+X  else if (ty > fore->histheight + screenheight - 1)
+X    ty = fore->histheight + screenheight - 1;
+X  
+X  fx = cx; fy = cy;
+X  cx = tx; cy = ty;
+X/*debug2("revto(%d, %d, ", x1, y1);
+X  debug2("%d, %d, ", fx, fy);
+X  debug2("%d, %d)\n", tx, ty);*/
+X 
+X  /*
+X   * if we go to a position that is currently offscreen 
+X   * then scroll the screen
+X   */
+X  i = 0;
+X  if (line >= 0 && line < screenheight)
+X    i = W2D(ty) - line;
+X  else if (ty < hist_offset)
+X    i = ty - hist_offset;
+X  else if (ty > hist_offset + (screenheight-1))
+X    i = ty-hist_offset-(screenheight-1);
+X  if (i > 0)
+X    yend -= MarkScrollUpDisplay(i);
+X  else if (i < 0)
+X    ystart += MarkScrollDownDisplay(-i);
+X
+X  if (second == 0)
+X    {
+X      GotoPos(tx, W2D(cy));
+X      return;
+X    }
+X  
+X  qq = x1 + y1 * screenwidth;
+X  ff = fx + fy * screenwidth; /* "from" offset in WIN coords */
+X  tt = tx + ty * screenwidth; /* "to" offset  in WIN coords*/
+X 
+X  if (ff > tt)
+X    {
+X      st = tt; en = ff;
+X      x = tx; y = ty;
+X    }
+X  else
+X    {
+X      st = ff; en = tt;
+X      x = fx; y = fy;
+X    }
+X  if (st > qq)
+X    {
+X      st++;
+X      x++;
+X    }
+X  if (en < qq)
+X    en--;
+X  if (tt > qq)
+X    {
+X      revst = qq; reven = tt;
+X    }
+X  else
+X    {
+X      revst = tt; reven = qq;
+X    }
+X  ry = y - hist_offset;
+X  if (ry < ystart)
+X    {
+X      y += (ystart - ry);
+X      x = 0;
+X      st = y * screenwidth;
+X      ry = ystart;
+X    }
+X  for (t = st; t <= en; t++, x++)
+X    {
+X      if (x >= screenwidth)
+X	{
+X	  x = 0;
+X	  y++, ry++;
+X	}
+X      if (ry > yend)
+X	break;
+X      if (t == st || x == 0)
+X	{
+X	  for (ce = screenwidth-1; ce >= 0; ce--)
+X	    if (iWIN(y)[ce] != ' ')
+X	      break;
+X	}
+X      if (x <= ce && x >= left_mar && x <= right_mar
+X          && (LP || x < screenwidth-1 || ry < screenbot))
+X	{
+X	  GotoPos(x, W2D(y));
+X	  if (t >= revst && t <= reven)
+X	    SaveSetAttr(A_SO, ASCII);
+X	  else
+X	    SaveSetAttr(aWIN(y)[x], fWIN(y)[x]);
+X	  PUTCHAR(iWIN(y)[x]);
+X	}
+X    }
+X  GotoPos(tx, W2D(cy));
+X}
+X
+static void AbortMarkRoutine()
+X{
+X  int yend, redisp;
+X
+X  yend = screenheight - 1;
+X  redisp = second;
+X  if (fore->histheight - hist_offset < screenheight)
+X    {
+X      second = 0;
+X      yend -= MarkScrollUpDisplay(fore->histheight - hist_offset);
+X    }
+X  if (hist_offset != fore->histheight)
+X    {
+X      in_ovl = 0;	/* So we can use Activate() */
+X      Activate();	/* to do a complete redisplay */
+X    }
+X  else
+X    {
+X      rem(x1, y1, cx, cy, redisp, 0, yend);
+X    }
+X  ExitOverlayPage();
+X  in_mark = 0;
+X}
+X
+X
+static void MarkRedisplayLine(y, xs, xe, isblank)
+int y; /* NOTE: y is in DISPLAY coords system! */
+int xs, xe;
+int isblank;
+X{
+X  int x, i, rm;
+X  int sta, sto, cp; /* NOTE: these 3 are in WINDOW coords system */
+X  char *wi, *wa, *wf, *oldi;
+X 
+X  InsertMode(0); /* Not done in DisplayLine() */
+X
+X  wi = iWIN(D2W(y));
+X  wa = aWIN(D2W(y));
+X  wf = fWIN(D2W(y));
+X  oldi = isblank ? blank : null;
+X 
+X  if (second == 0)
+X    {
+X      DisplayLine(oldi, null, null, wi, wa, wf, y, xs, xe);
+X      return;
+X    }
+X 
+X  sta = y1 * screenwidth + x1;
+X  sto = cy * screenwidth + cx;
+X  if (sta > sto)
+X    {
+X      i=sta; sta=sto; sto=i;
+X    }
+X  cp = D2W(y) * screenwidth + xs;
+X 
+X  rm = right_mar;
+X  for (x=screenwidth-1; x>=0; x--)
+X    if (wi[x] != ' ')
+X      break;
+X  if (x < rm)
+X    rm = x;
+X 
+X  for (x=xs; x<=xe; x++, cp++)
+X    if (cp>=sta && x>= left_mar)
+X      break;
+X  if (x>xs)
+X    DisplayLine(oldi, null, null, wi, wa, wf, y, xs, x-1);
+X  for (; x<=xe; x++, cp++)
+X    {
+X      if (cp > sto || x > rm || (!LP && x >= screenwidth-1 && y == screenbot))
+X	break;
+X      GotoPos(x, y);
+X      SaveSetAttr(A_SO, ASCII);
+X      PUTCHAR(wi[x]);
+X    }
+X  if (x<=xe)
+X    DisplayLine(oldi, null, null, wi, wa, wf, y, x, xe);
+X}
+X
+X
+static int
+MarkRewrite(ry, xs, xe, doit)
+int ry, xs, xe, doit;
+X{
+X  int dx, x, y, st, en, t, rm;
+X  char *a, *f, *i;
+X
+X  y = D2W(ry);
+X  dx = xe - xs;
+X  if (doit)
+X    {
+X      i = iWIN(y) + xs;
+X      while (dx--)
+X        PUTCHAR(*i++);
+X      return(0);
+X    }
+X  
+X  a = aWIN(y) + xs,
+X  f = fWIN(y) + xs;
+X  if (second == 0)
+X    st = en = -1;
+X  else
+X    {
+X      st = y1 * screenwidth + x1;
+X      en = cy * screenwidth + cx;
+X      if (st > en)
+X        {
+X          t = st; st = en; en = t;
+X        }
+X    }
+X  t = y * screenwidth + xs;
+X  for (rm=screenwidth-1, i=iWIN(y) + screenwidth-1; rm>=0; rm--)
+X    if (*i-- != ' ')
+X      break;
+X  if (rm > right_mar)
+X    rm = right_mar;
+X  x = xs;
+X  while (dx--)
+X    {
+X      if (t >= st && t <= en && x >= left_mar && x <= rm)
+X        {
+X	  if (GlobalAttr != A_SO || GlobalCharset != ASCII)
+X	    return(EXPENSIVE);
+X        }
+X      else
+X        {
+X	  if (GlobalAttr != *a || GlobalCharset != *f)
+X	    return(EXPENSIVE);
+X        }
+X      a++, f++, t++, x++;
+X    }
+X  return(xe - xs);
+X}
+X
+X
+X/*
+X * scroll the screen contents up/down.
+X */
+static int MarkScrollUpDisplay(n)
+int n;
+X{
+X  int i;
+X 
+X  debug1("MarkScrollUpDisplay(%d)\n", n);
+X  if (n <= 0)
+X    return 0;
+X  if (n > fore->histheight - hist_offset)
+X    n = fore->histheight - hist_offset;
+X  i = (n < screenheight) ? n : (screenheight);
+X  ScrollRegion(0, screenheight - 1, i);
+X  hist_offset += n;
+X  while (i-- > 0)
+X    MarkRedisplayLine(screenheight-i-1, 0, screenwidth-1, 1);
+X  return n;
+X}
+X
+static int MarkScrollDownDisplay(n)
+int n;
+X{
+X  int i;
+X 
+X  debug1("MarkScrollDownDisplay(%d)\n", n);
+X  if (n <= 0)
+X    return 0;
+X  if (n > hist_offset)
+X    n = hist_offset;
+X  i = (n < screenheight) ? n : (screenheight);
+X  ScrollRegion(0, screenheight - 1, -i);
+X  hist_offset -= n;
+X  while (i-- > 0)
+X    MarkRedisplayLine(i, 0, screenwidth-1, 1);
+X  return n;
+X}
+X
+END_OF_FILE
+if test 25040 -ne `wc -c <'mark.c'`; then
+    echo shar: \"'mark.c'\" unpacked with wrong size!
+fi
+# end of 'mark.c'
+fi
+if test -f 'socket.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'socket.c'\"
+else
+echo shar: Extracting \"'socket.c'\" \(25596 characters\)
+sed "s/^X//" >'socket.c' <<'END_OF_FILE'
+X/* Copyright (c) 1991
+X *      Juergen Weigert (jnweiger@immd4.informatik.uni-erlangen.de)
+X *      Michael Schroeder (mlschroe@immd4.informatik.uni-erlangen.de)
+X * Copyright (c) 1987 Oliver Laumann
+X *
+X * This program is free software; you can redistribute it and/or modify
+X * it under the terms of the GNU General Public License as published by
+X * the Free Software Foundation; either version 1, or (at your option)
+X * any later version.
+X *
+X * This program is distributed in the hope that it will be useful,
+X * but WITHOUT ANY WARRANTY; without even the implied warranty of
+X * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X * GNU General Public License for more details.
+X *
+X * You should have received a copy of the GNU General Public License
+X * along with this program (see the file COPYING); if not, write to the
+X * Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X * Noteworthy contributors to screen's design and implementation:
+X *	Wayne Davison (davison@borland.com)
+X *	Patrick Wolfe (pat@kai.com, kailand!pat)
+X *	Bart Schaefer (schaefer@cse.ogi.edu)
+X *	Nathan Glasser (nathan@brokaw.lcs.mit.edu)
+X *	Larry W. Virden (lwv27%cas.BITNET@CUNYVM.CUNY.Edu)
+X *	Howard Chu (hyc@hanauma.jpl.nasa.gov)
+X *	Tim MacKenzie (tym@dibbler.cs.monash.edu.au)
+X *	Markku Jarvinen (mta@{cc,cs,ee}.tut.fi)
+X *	Marc Boucher (marc@CAM.ORG)
+X *
+X ****************************************************************
+X */
+X
+X#ifndef lint
+X  static char rcs_id[] = "$Id: socket.c,v 1.55 91/10/11 11:24:38 jnweiger Exp $ FAU";
+X#endif
+X
+X#include "config.h"
+X#if defined(MIPS) || defined(GOULD_NP1) || defined(B43)
+extern int errno;
+X#endif
+X#if defined(BSD) || defined(sequent) || defined(pyr)
+X# include <strings.h>
+X#else
+X# include <string.h>
+X#endif
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <sys/file.h>
+X#ifndef NAMEDPIPE
+X#include <sys/socket.h>
+X#endif
+X#include <fcntl.h>
+X#ifndef NAMEDPIPE
+X#include <sys/un.h>
+X#endif
+X#include <signal.h>
+X#include <sys/time.h>
+X#ifdef DIRENT
+X# include <sys/param.h>
+X# include <dirent.h>
+X#else
+X# include <sys/dir.h>
+X# define dirent direct
+X#endif
+X#ifdef USEVARARGS
+X# if defined(__STDC__)
+X#  include <stdarg.h>
+X# else
+X#  include <varargs.h>
+X# endif
+X#endif
+X#include "screen.h"
+X#include "extern.h"
+X
+X#if defined(_SEQUENT_) && !defined(NAMEDPIPE)
+X# define connect sconnect	/* _SEQUENT_ has braindamaged connect */
+X#endif
+X
+extern char *RcFileName, *extra_incap, *extra_outcap;
+extern WinList, Detached, ServerSocket, real_uid, real_gid, eff_uid, eff_gid;
+X#ifdef BSDJOBS
+extern int Suspended;
+X#endif
+extern AttacherPid, dflag, mflag, rflag, lsflag, quietflag, wipeflag;
+extern char HostName[];
+extern struct mode OldMode, NewMode;
+extern struct win *wtab[], *fore;
+X#ifdef NETHACK
+extern nethackflag;
+X#endif
+X
+X#ifdef PASSWORD
+extern int CheckPassword;
+extern char Password[];
+X#endif
+X#if !defined(POSIX) && defined(BSDJOBS)
+extern DevTty;
+X#endif
+extern char *getenv(), *GetTtyName();
+X
+char SockPath[MAXPATH];
+char *SockNamePtr, *SockName;
+X
+char *strdup(str)
+const char *str;
+X{
+X  char *ret;
+X
+X  if ((ret = (char *) malloc((unsigned) (strlen(str) + 1))) == 0)
+X    {
+X      Msg_nomem;
+X      return (0);
+X    }
+X  (void) strcpy(ret, str);
+X  return (ret);
+X}
+X
+int RecoverSocket()
+X{
+X  int s = 0, d;
+X
+X  (void) unlink(SockPath);
+X  s = MakeServerSocket();
+X  if (s != ServerSocket)
+X    {
+X      debug2("Oh, Serversocket was %d, now %d, let's dup!\n", ServerSocket, s);
+X      d = dup2(s, ServerSocket);
+X      close(s);
+X      if (d != ServerSocket)
+X	{
+X	  debug2("Hmm, dup2() failed, Serversocket was %d, now %d, bye\n",
+X		 ServerSocket, d);
+X	  return 0;
+X	}
+X    }
+X  if (Detached)
+X    (void) chmod(SockPath, /* S_IFSOCK | */ 0600); /* Flag detached-ness */
+X  return 1;
+X}
+X
+X
+X/* socket mode 700 means we are Attached. 600 is detached.
+X * we return how many sockets we found. if it was exactly one, we come
+X * back with a SockPath set to it and open it in a fd pointed to by fdp.
+X * if fdp == 0 we simply produce a list if all sockets.
+X */
+int FindSocket(how, fdp)
+int how;
+int *fdp;
+X{
+X  register int s, lasts = 0, found = 0, deadcount = 0, wipecount = 0;
+X  register DIR *dirp;
+X  register struct dirent *dp;
+X  struct stat st;
+X  struct foundsock
+X    {
+X      char *name;
+X      int mode;
+X    }         foundsock[100];	/* 100 is hopefully enough. */
+X  int foundsockcount = 0;
+X
+X  if (SockName && fdp)
+X    {
+X      if ((lasts = MakeClientSocket(0, SockName)) == -1)
+X	{
+X	  if (quietflag)
+X	    eexit(10);
+X	  else
+X	    {
+X	      if (how == MSG_CONT)
+X	        Msg(0, "Attach failed.");
+X	      else
+X	        Msg(0, "There is no screen to be %sed from %s.",
+X	            dflag ? "detach" : "resum", SockName);
+X	    }
+X	}
+X      debug1("FindSocket likes what You specified('%s');\n", SockPath);
+X      *fdp = lasts;
+X      return 1;
+X    }
+X
+X  /* user gave no SockName, so we really have to search */
+X#ifdef NFS_HACK
+X  setreuid(eff_uid, real_uid);
+X#endif
+X  debug1("FindSock searching... '%s'\n", SockPath);
+X  if ((dirp = opendir(SockPath)) == NULL)
+X    Msg(0, "Cannot opendir %s", SockPath);
+X  while ((dp = readdir(dirp)) != NULL)
+X    {
+X      SockName = dp->d_name;
+X      if (SockName[0] == '.')
+X	continue;
+X      debug1("Attach found: '%s'\n", SockName);
+X      /*
+X       * ATTENTION! MakeClientSocket adds SockName to SockPath! anyway, we
+X       * need it earlier.
+X       */
+X      strcpy(SockNamePtr, SockName);
+X      if (stat(SockPath, &st) == -1)
+X	Msg(errno, "stat");
+X      if (st.st_uid != real_uid)
+X	continue;
+X      foundsock[foundsockcount].name = strdup(SockName);
+X      foundsock[foundsockcount].mode = s = st.st_mode & 0777;
+X      debug2("FindSocket: %s has mode %04o...\n", SockName, s);
+X      if (s == 0700 || s == 0600)
+X	{
+X	  /* we try to connect through the socket. if successfull, 
+X	   * thats o.k. otherwise we record that mode as -1.
+X	   */
+X	  if ((s = MakeClientSocket(0, SockName)) == -1)
+X	    { 
+X	      foundsock[foundsockcount].mode = -1;
+X	      deadcount++;
+X	    }
+X	  else
+X	    close(s);
+X	}
+X      if (++foundsockcount >= 100)
+X	break;
+X    }
+X  closedir(dirp);
+X#ifdef NFS_HACK
+X  setreuid(real_uid, eff_uid);
+X#endif
+X
+X  if (wipeflag)
+X    {
+X      for (s = 0; s < foundsockcount; s++)
+X	{
+X	  if (foundsock[s].mode == -1)
+X	    {
+X              strcpy(SockNamePtr, foundsock[s].name);
+X	      debug1("wiping '%d'\n", SockPath);
+X	      if (unlink(SockPath) == 0)
+X	        {
+X		  foundsock[s].mode = -2;
+X	          wipecount++;
+X		}
+X	    }
+X	}
+X    }
+X  for (s = 0; s < foundsockcount; s++)
+X    if ((foundsock[s].mode) == (dflag ? 0700 : 0600))
+X      {
+X	found++;
+X	lasts = s;
+X      }
+X  if (quietflag && (lsflag || (found != 1 && rflag !=2)))
+X    eexit(10+found);
+X  debug2("attach: found=%d, foundsockcount=%d\n", found, foundsockcount);
+X  if (found == 1 && lsflag == 0)
+X    {
+X      if ((lasts = MakeClientSocket(0, foundsock[lasts].name)) == -1)
+X        found = 0;
+X    }
+X  else if (!quietflag && foundsockcount > 0)
+X    {
+X      switch (found)
+X        {
+X        case 0:
+X          if (lsflag)
+X	    {
+X#ifdef NETHACK
+X              if (nethackflag)
+X	        printf("Your inventory:\n");
+X	      else
+X#endif
+X	      printf((foundsockcount>1) ? "There are screens on:\n" : "There is a screen on:\n");
+X	    }
+X          else
+X	    {
+X#ifdef NETHACK
+X              if (nethackflag)
+X	        printf("Nothing fitting exists in the game:\n");
+X	      else
+X#endif
+X	      printf((foundsockcount>1) ? "There are screens on:\n" : "There is a screen on:\n");
+X	    }
+X          break;
+X        case 1:
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf((foundsockcount>1) ? "Prove thyself worthy or perish:\n" : "You see here a good looking screen:\n");
+X          else
+X#endif
+X          printf((foundsockcount>1) ? "There are several screens on:\n" : "There is a possible screen on:\n");
+X          break;
+X        default:
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf((foundsockcount>1) ? "You may whish for a screen, what do you want?\n" : "You see here a screen:\n");
+X          else
+X#endif
+X          printf((foundsockcount>1) ? "There are several screens on:\n" : "There is a screen on:\n");
+X          break;
+X        }
+X      for (s = 0; s < foundsockcount; s++)
+X	{
+X	  switch (foundsock[s].mode)
+X	    {
+X	    case 0700:
+X	      printf("\t%s\t(Attached)\n", foundsock[s].name);
+X	      break;
+X	    case 0600:
+X	      printf("\t%s\t(Detached)\n", foundsock[s].name);
+X	      break;
+X	    case -1:
+X#if defined(__STDC__)
+X	      printf("\t%s\t(Dead \?\?\?)\n", foundsock[s].name);
+X#else
+X	      printf("\t%s\t(Dead ???)\n", foundsock[s].name);
+X#endif
+X	      break;
+X	    case -2:
+X	      printf("\t%s\t(Removed)\n", foundsock[s].name);
+X	      break;
+X	    default:
+X	      printf("\t%s\t(Wrong mode)\n", foundsock[s].name);
+X	      break;
+X	    }
+X	}
+X    }
+X  if (deadcount && !quietflag)
+X    {
+X      if (wipeflag)
+X        {
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf("You hear%s distant explosion%s.\n",
+X	       (deadcount > 1)?"":" a", (deadcount > 1)?"s":"");
+X          else
+X#endif
+X          printf("%d Socket%s wiped out.\n", deadcount, (deadcount > 1)?"s":"");
+X	}
+X      else
+X	{
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf("The dead screen%s touch%s you. Try 'screen -wipe'.\n",
+X	       (deadcount > 1)?"s":"", (deadcount >1)?"":"es");
+X          else
+X#endif
+X          printf("Remove dead Sockets with 'screen -wipe'.\n");
+X	}
+X    }
+X
+X  for (s = 0; s < foundsockcount; s++)
+X    Free(foundsock[s].name);
+X  if (found == 1 && fdp)
+X    *fdp = lasts;
+X  if (fdp)
+X    return found;
+X  SockName = NULL;
+X  return foundsockcount - wipecount;
+X}
+X
+int
+GetSockName()
+X{
+X  register int client;
+X  static char buf[2 * MAXSTR];
+X
+X  if (!mflag && (SockName = getenv("STY")) != 0 && *SockName != '\0')
+X    {
+X      client = 1;
+X      setuid(real_uid);
+X      setgid(real_gid);
+X    }
+X  else
+X    {
+X      sprintf(buf, "%s.%s", HostName, Filename(GetTtyName()));
+X      SockName = buf;
+X      client = 0;
+X    }
+X  return client;
+X}
+X
+X#ifdef NAMEDPIPE
+X
+int
+MakeServerSocket()
+X{
+X  register int s;
+X  struct stat st;
+X
+X  strcpy(SockNamePtr, SockName);
+X
+X  if ((s = open(SockPath, O_WRONLY | O_NDELAY)) >= 0)
+X    {
+X      debug("huii, my fifo already exists??\n");
+X      if (quietflag)
+X	{
+X	  Kill(AttacherPid, SIG_BYE);
+X	  eexit(11);
+X	}
+X      printf("There is already a screen running on %s.\n",
+X	     Filename(SockPath));
+X      if (stat(SockPath, &st) == -1)
+X	Msg(errno, "stat");
+X      if (st.st_uid != real_uid)
+X	Msg(0, "Unfortunatelly you are not its owner.");
+X      if ((st.st_mode & 0700) == 0600)
+X	Msg(0, "To resume it, use \"screen -r\"");
+X      else
+X	Msg(0, "It is not detached.");
+X      /* NOTREACHED */
+X    }
+X  (void) unlink(SockPath);
+X  if (UserContext() > 0)
+X    {
+X      if (mknod(SockPath, S_IFIFO | S_IEXEC | S_IWRITE | S_IREAD, 0))
+X	UserReturn(0);
+X      UserReturn(1);
+X    }
+X  if (UserStatus() <= 0)
+X    Msg(0, "mknod fifo %s failed", SockPath);
+X  /*
+X   * MUST be RDWR because otherwise we will get EOF's if
+X   * nobody has opened the pipe for writing
+X   */
+X  if ((s = secopen(SockPath, O_RDWR | O_NDELAY, 0)) < 0)
+X    Msg(errno, "open fifo %s", SockPath);
+X  return s;
+X}
+X
+X
+int
+MakeClientSocket(err, name)
+int err;
+char *name;
+X{
+X  register int s = 0;
+X
+X  strcpy(SockNamePtr, name);
+X
+X  
+X  if ((s = secopen(SockPath, O_WRONLY | O_NDELAY, 0)) >= 0)
+X    {
+X      (void) fcntl(s, F_SETFL, 0);
+X      return s;
+X    }
+X  if (err)
+X    {
+X      Msg(errno, "open: %s (but continuing...)", SockPath);
+X      debug1("MakeClientSocket() open %s failed\n", SockPath);
+X    }
+X  else
+X    {
+X      debug1("MakeClientSocket() open %s failed\n", SockPath);
+X    }
+X  return -1;
+X}
+X
+X#else	/* NAMEDPIPE */
+X
+int
+MakeServerSocket()
+X{
+X  register int s;
+X  struct sockaddr_un a;
+X  struct stat st;
+X
+X  if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+X    Msg(errno, "socket");
+X  a.sun_family = AF_UNIX;
+X  strcpy(SockNamePtr, SockName);
+X  strcpy(a.sun_path, SockPath);
+X  if (connect(s, (struct sockaddr *) & a, strlen(SockPath) + 2) != -1)
+X    {
+X      debug("oooooh! socket already is alive!\n");
+X      if (quietflag)
+X	{ 
+X	  Kill(AttacherPid, SIG_BYE);
+X	  /* 
+X	   * oh, well. nobody receives that return code. papa 
+X	   * dies by signal.
+X	   */
+X	  eexit(11);
+X	}
+X      printf("There is already a screen running on %s.\n",
+X	     Filename(SockPath));
+X      if (stat(SockPath, &st) == -1)
+X	Msg(errno, "stat");
+X      if (st.st_uid != real_uid)
+X	Msg(0, "Unfortunatelly you are not its owner.");
+X      if ((st.st_mode & 0700) == 0600)
+X	Msg(0, "To resume it, use \"screen -r\"");
+X      else
+X	Msg(0, "It is not detached.");
+X      /* NOTREACHED */
+X    }
+X  (void) unlink(SockPath);
+X#ifndef NOREUID
+X  setreuid(eff_uid, real_uid);
+X  setregid(eff_gid, real_gid);
+X#endif
+X  if (bind(s, (struct sockaddr *) & a, strlen(SockPath) + 2) == -1)
+X    Msg(errno, "bind");
+X  (void) chmod(SockPath, /* S_IFSOCK | */ 0700);
+X#ifdef NOREUID
+X  chown(SockPath, real_uid, real_gid);
+X#else
+X  setreuid(real_uid, eff_uid);
+X  setregid(real_gid, eff_gid);
+X#endif
+X  if (listen(s, 5) == -1)
+X    Msg(errno, "listen");
+X#ifdef F_SETOWN
+X  fcntl(s, F_SETOWN, getpid());
+X  debug1("Serversocket owned by %d\n",fcntl(s, F_GETOWN, 0));
+X#endif /* F_SETOWN */
+X  return s;
+X}
+X
+int
+MakeClientSocket(err, name)
+int err;
+char *name;
+X{
+X  register int s;
+X  struct sockaddr_un a;
+X
+X  if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+X    Msg(errno, "socket");
+X  a.sun_family = AF_UNIX;
+X  strcpy(SockNamePtr, name);
+X  strcpy(a.sun_path, SockPath);
+X#ifndef NOREUID
+X  setreuid(eff_uid, real_uid);
+X  setregid(eff_gid, real_gid);
+X#else
+X  if (access(SockPath, W_OK))
+X    {
+X      if (err)
+X	Msg(errno, "%s", SockPath);
+X      else
+X	debug2("MakeClientSocket: access(%s): %d.\n", SockPath, errno);
+X      close(s);
+X      return -1;
+X    }
+X#endif
+X  if (connect(s, (struct sockaddr *) & a, strlen(SockPath) + 2) == -1)
+X    {
+X      if (err)
+X	Msg(errno, "%s: connect", SockPath);
+X      else
+X	debug("MakeClientSocket: connect failed.\n");
+X      close(s);
+X      s = -1;
+X    }
+X#ifndef NOREUID
+X  setreuid(real_uid, eff_uid);
+X  setregid(real_gid, eff_gid);
+X#endif
+X  return s;
+X}
+X#endif
+X
+X
+void
+SendCreateMsg(s, ac, av, aflag, flowflag, lflag, histheight, sterm)
+int s, ac, aflag, flowflag, lflag, histheight;
+char **av;
+char *sterm;
+X{
+X  struct msg m;
+X  register char *p;
+X  register int len, n;
+X
+X  debug1("SendCreateMsg() to '%s'\n", SockPath);
+X  m.type = MSG_CREATE;
+X  p = m.m.create.line;
+X  for (n = 0; ac > 0 && n < MAXARGS - 1; ++av, --ac, ++n)
+X    {
+X      len = strlen(*av) + 1;
+X      if (p + len >= m.m.create.line + MAXPATH - 1)
+X	break;
+X      strcpy(p, *av);
+X      p += len;
+X    }
+X  if (!ac && *av && p + strlen(*av) + 1 < m.m.create.line + MAXPATH)
+X    strcpy(p, *av);
+X  else
+X    *p = '\0';
+X  m.m.create.nargs = n;
+X  m.m.create.aflag = aflag;
+X  m.m.create.flowflag = flowflag;
+X  m.m.create.lflag = lflag;
+X  m.m.create.hheight = histheight;
+X#ifdef SYSV
+X  if (getcwd(m.m.create.dir, sizeof(m.m.create.dir)) == 0)
+X#else
+X    if (getwd(m.m.create.dir) == 0)
+X#endif
+X      Msg(0, "%s", m.m.create.dir);
+X  strncpy(m.m.create.screenterm, sterm, 19);
+X  m.m.create.screenterm[19] = '\0';
+X  debug1("SendCreateMsg writing '%s'\n", m.m.create.line);
+X  if (write(s, (char *) &m, sizeof m) != sizeof m)
+X    Msg(errno, "write");
+X}
+X
+void
+X#ifdef USEVARARGS
+X/*VARARGS1*/
+X# if defined(__STDC__)
+SendErrorMsg(char *fmt, ...)
+X# else
+SendErrorMsg(fmt, va_alist)
+char *fmt;
+va_dcl
+X#endif
+X{ /* } */
+X  static va_list ap = 0;
+X#else
+X/*VARARGS1*/
+SendErrorMsg(fmt, p1, p2, p3, p4, p5, p6)
+char *fmt;
+unsigned long p1, p2, p3, p4, p5, p6;
+X{
+X#endif
+X  register int s;
+X  struct msg m;
+X
+X  s = MakeClientSocket(1, SockName);
+X  debug1("SendErrorMsg() to '%s'\n", SockPath);
+X  m.type = MSG_ERROR;
+X#ifdef USEVARARGS
+X# if defined(__STDC__)
+X  va_start(ap, fmt);
+X# else
+X  va_start(ap);
+X# endif
+X  (void) vsprintf(m.m.message, fmt, ap);
+X  va_end(ap);
+X#else
+X  sprintf(m.m.message, fmt, p1, p2, p3, p4, p5, p6);
+X#endif
+X  debug1("SendErrorMsg writing '%s'\n", m.m.message);
+X  (void) write(s, (char *) &m, sizeof m);
+X  close(s);
+X  sleep(2);
+X}
+X
+X#ifdef PASSWORD
+static int CheckPasswd(pwd, pid, tty)
+int pid;
+char *pwd, *tty;
+X{
+X  if (CheckPassword && 
+X      strcmp(crypt(pwd, ((unsigned)strlen(Password) > 1) ? Password : "JW"),
+X	     Password))
+X    {
+X      if (*pwd)
+X	{
+X#ifdef NETHACK
+X          if (nethackflag)
+X	    Msg(0, "'%s' tries to explode in the sky, but fails. (%s)", tty, pwd);
+X          else
+X#endif
+X	  Msg(0, "Illegal reattach attempt from terminal %s, \"%s\"", tty, pwd);
+X	}
+X      debug1("CheckPass() wrong password kill(%d, SIG_PW_FAIL)\n", pid);
+X      Kill(pid, SIG_PW_FAIL);
+X      return 0;
+X    }
+X  debug1("CheckPass() from %d happy\n", pid);
+X  Kill(pid, SIG_PW_OK);
+X  return 1;
+X}
+X#endif	/* PASSWORD */
+X
+static void ExecCreate(mp)
+struct msg *mp;
+X{
+X  char *args[MAXARGS];
+X  register int n;
+X  register char **pp = args, *p = mp->m.create.line;
+X
+X  for (n = mp->m.create.nargs; n > 0; --n)
+X    {
+X      *pp++ = p;
+X      p += strlen(p) + 1;
+X    }
+X  *pp = 0;
+X  if (!*p)
+X    p = 0;
+X  MakeWindow(p, args, mp->m.create.aflag, mp->m.create.flowflag,
+X		      0, mp->m.create.dir, mp->m.create.lflag,
+X		      mp->m.create.hheight, mp->m.create.screenterm);
+X}
+X
+void
+ReceiveMsg(s)
+int s;
+X{
+X  int left, len, i;
+X  struct msg m;
+X  char *p;
+X  char buf[20];
+X#ifdef NAMEDPIPE
+X  /*
+X   * we may be called if there are no pending messages, so we will have to
+X   * block on first read.
+X   */
+X  debug("Ha, there was someone knocking on my fifo??\n");
+X  if (fcntl(s, F_SETFL, 0) == -1)
+X    {
+X      Msg(errno, "fcntl no O_NDELAY");
+X      exit(1);
+X    }
+X  p = (char *) &m;
+X  left = sizeof(m);
+X  while (left > 0 && (len = read(s, p, left)) > 0)
+X    {
+X      /*		if (p == (char *)&m)
+X       *		{	if (fcntl(s,F_SETFL,O_NDELAY) == -1)
+X       *			{	Msg(errno, "fcntl O_NDELAY !");
+X       *				return;
+X       *			}
+X       *		}
+X       */
+X      p += len;
+X      left -= len;
+X    }
+X# ifdef DEBUG
+X  if (len == 0)
+X    debug("ReceiveMsg: Yucc! Got an EOF !!\n");
+X# endif
+X#else
+X  register int ns;
+X  struct sockaddr_un a;
+X
+X  len = sizeof(struct sockaddr_un);
+X  debug("Ha, there was someone knocking on my socket??\n");
+X  if ((ns = accept(s, (struct sockaddr *) & a, &len)) == -1)
+X    {
+X      Msg(errno, "accept");
+X      return;
+X    }
+X  p = (char *) &m;
+X  left = sizeof m;
+X  while (left > 0 && (len = read(ns, p, left)) > 0)
+X    {
+X      p += len;
+X      left -= len;
+X    }
+X  close(ns);
+X#endif				/* NAMEDPIPE */
+X
+X  if (len == -1)
+X    Msg(errno, "read");
+X  if (left > 0)
+X    return;
+X  debug1("RecMsg: type %d !, ", m.type);
+X  switch (m.type)
+X    {
+X    case MSG_WINCH:
+X      /* Already processed in screen.c */
+X#ifdef notdef
+X      CheckScreenSize(1); /* Change fore */
+X#endif
+X      break;
+X    case MSG_CREATE:
+X      if (!Detached)
+X	ExecCreate(&m);
+X      break;
+X    case MSG_CONT:
+X      debug3("RecMsg: apid=%d,was %d, Detached=%d\n", m.m.attach.apid, AttacherPid, Detached);
+X
+X#ifdef SECURE_MSG_CONT
+X      if (m.m.attach.apid != AttacherPid || !Detached)
+X	/*
+X	 * now we realize, that there is something strange happening.
+X	 * First, there was some idiot who said "CONT" and thought
+X	 * "ATTACH". This is, when we have (AttacherPid == 0). Harmless.
+X	 * Let him in. Second, we are waiting for a certain AttacherPid,
+X	 * and not for "any" attacher. This is when (AttacherPid != 0).
+X	 * But Darwin's rule says "survival of the fittest", thus: Look
+X	 * weather "our" AttacherPid is still alive and well, and let the
+X	 * new one only in, if the old Attacher has been killed. jw.
+X	 */
+X	if (AttacherPid != 0 && kill(AttacherPid, 0) == 0)
+X	  break;		/* Intruder Alert */
+X	else
+X#endif				/* SECURE_MSG_CONT */
+X	  AttacherPid = 0;	/* we dont want to kill ourselves
+X				 * later. jw. */
+X      /* FALLTHROUGH */
+X    case MSG_ATTACH:
+X      if (CheckPid(m.m.attach.apid))
+X	{
+X	  debug1("Attach attempt with bad pid(%d)\n", m.m.attach.apid);
+X	  Msg(0, "Attach attempt with bad pid(%d) !", m.m.attach.apid);
+X          break;
+X	}
+X#ifdef PASSWORD
+X      if (!CheckPasswd(m.m.attach.password, m.m.attach.apid, m.m.attach.tty))
+X	{
+X	  debug3("RcvMsg:Checkpass(%s,%d,%s) failed\n",
+X		 m.m.attach.password, m.m.attach.apid, m.m.attach.tty);
+X	  break;
+X	}
+X#endif				/* PASSWORD */
+X      if (!Detached)
+X	{
+X	  debug("RecMsg: hey, why you disturb, we are not detached. hangup!\n");
+X	  Kill(m.m.attach.apid, SIG_BYE);
+X	  Msg(0, "Attach msg ignored: We are not detached.");
+X	  break;
+X	}
+X      if ((i = secopen(m.m.attach.tty, O_RDWR | O_NDELAY, 0)) < 0)
+X	{
+X	  debug1("ALERT: Cannot open %s!\n", m.m.attach.tty);
+X#ifdef NETHACK
+X          if (nethackflag)
+X	    Msg(errno, "You can't open (%s). Perhaps there's a Monster behind it."
+X	      ,m.m.attach.tty);
+X          else
+X#endif
+X	  Msg(errno, "Attach: Could not open %s", m.m.attach.tty);
+X	  Kill(m.m.attach.apid, SIG_BYE);
+X	  break;
+X	}
+X      errno = 0;
+X      if (i)
+X	{
+X	  debug("PANIC: open did not return fd 0!\n");
+X	  close(0);
+X	  dup(i);
+X	  close(i);
+X	  close(1);
+X	  close(2);
+X	}
+X      debug2("RecMsg: apid %d is o.k. and we just opened '%s'\n", m.m.attach.apid, m.m.attach.tty);
+X
+X#ifdef hpux_and_it_still_does_not_work
+X      {
+X	int pgrp, zero = 0;
+X
+X	if (ioctl(0, TIOCGPGRP, &pgrp) == -1)
+X	  debug1("tcgetpgrp: %d\n", errno);	/* save old pgrp from
+X						   tty */
+X
+X	if (ioctl(0, TIOCSPGRP, &zero) == -1)
+X	  debug1("tcsetpgrp: %d\n", errno);	/* detach tty from proc
+X						   grp */
+X#ifdef hpux
+X	setpgrp();
+X#else
+X	if (setpgrp(0, getpid()) == -1)
+X	  debug1("setpgrp: %d\n", errno);	/* make me process group
+X					      	   leader */
+X#endif
+X
+X	close(0);	/* reopen tty, now we should get it as our
+X			 * tty */
+X	(void) secopen(m.m.attach.tty, O_RDWR | O_NDELAY, 0);	/* */
+X
+X#ifdef hpux
+X	setpgrp2(0, pgrp);
+X#else
+X	setpgrp(0, pgrp);
+X#endif
+X	ioctl(0, TIOCSPGRP, &pgrp);
+X      }
+X#endif  /* hpux_and_it_still_does_not_work */
+X
+X      (void) dup(0);
+X      (void) dup(0);
+X      GetTTY(0, &OldMode);
+X      SetMode(&OldMode, &NewMode);
+X      SetTTY(0, &NewMode);
+X#if !defined(POSIX) && defined(BSDJOBS)
+X      if ((DevTty = open("/dev/tty", O_RDWR | O_NDELAY)) == -1)
+X	{
+X	  debug1("DevTty not opened: %d.\n", errno);
+X	  Msg(errno, "/dev/tty");
+X	}
+X#endif
+X      signal(SIGHUP, SigHup);
+X#ifdef BSDJOBS
+X      if (Suspended && m.type == MSG_ATTACH)
+X	if (kill(AttacherPid, SIG_BYE) == 0)
+X	  kill(AttacherPid, SIGCONT);
+X#endif
+X
+X      AttacherPid = m.m.attach.apid;
+X#ifdef UTMPOK
+X      /*
+X       * we set the Utmp slots again, if we were detached normally
+X       * and if we were detached by ^Z.
+X       */
+X      ReInitUtmp();
+X      for (i = WinList; i != -1; i = wtab[i]->WinLink)
+X	if (wtab[i]->slot != (slot_t) -1)
+X	  SetUtmp(wtab[i], i);
+X#endif
+X      (void) chmod(SockPath, /* S_IFSOCK | */ 0700);
+X      Detached = 0;
+X#ifdef BSDJOBS
+X      Suspended = 0;
+X#endif
+X      /*
+X       * we like to have always the valid termcap, even if we are
+X       * reattached from a different tty type. thus attacher had to
+X       * tell us, what TERM we have. The attacher has correct env
+X       * setting. we (the backend may be wrong).
+X       */
+X      if (*m.m.attach.envterm)
+X	{
+X#if defined(pyr) || defined(xelos) || defined(sequent)
+X	  /*
+X	   * Kludge for systems with braindamaged termcap routines,
+X	   * which evaluate $TERMCAP, regardless weather it describes
+X	   * the correct terminal type or not.
+X	   */
+X	  if (strcmp(getenv("TERM"), m.m.attach.envterm + 5))
+X	    {
+X	      debug("a different terminal, so unsetenv(TERMCAP)");
+X	      unsetenv("TERMCAP");
+X	    }
+X#endif
+X	
+X#if !defined(sequent) && !defined(MIPS)
+X	  putenv(m.m.attach.envterm);
+X#else
+X	  setenv("TERM", m.m.attach.envterm + 5, 1);
+X#endif
+X	}
+X#if !defined(sequent) && !defined(MIPS)
+X      sprintf(buf, "LINES=%d", m.m.attach.lines);
+X      if (m.m.attach.lines > 0 || getenv("LINES"))
+X        putenv(buf);
+X      sprintf(buf, "COLUMNS=%d", m.m.attach.columns);
+X      if (m.m.attach.columns > 0 || getenv("COLUMNS"))
+X        putenv(buf);
+X#else
+X      sprintf(buf, "%d", m.m.attach.lines);
+X      if (m.m.attach.lines > 0 || getenv("LINES"))
+X        setenv("LINES", buf);
+X      sprintf(buf, "%d", m.m.attach.columns);
+X      if (m.m.attach.columns > 0 || getenv("COLUMNS"))
+X        setenv("COLUMNS", buf);
+X#endif
+X      
+X      /*
+X       * We reboot our Terminal Emulator. Forget all we knew about
+X       * the old terminal, reread the termcap entries in .screenrc
+X       * (and nothing more from .screenrc is read. Mainly because
+X       * I did not check, weather a full reinit is save. jw) 
+X       * and /etc/screenrc, and initialise anew.
+X       */
+X      if (extra_outcap)
+X	Free(extra_outcap);
+X      if (extra_incap)
+X	Free(extra_incap);
+X#ifdef ETCSCREENRC
+X      if ((p = getenv("SYSSCREENRC")) == NULL)
+X	StartRc(ETCSCREENRC);
+X      else
+X	StartRc(p);
+X#endif
+X      StartRc(RcFileName);
+X      InitTermcap();
+X      InitTerm(m.m.attach.adaptflag);
+X      fore->active = 1;
+X      Activate();
+X      debug("activated...\n");
+X      break;
+X    case MSG_ERROR:
+X      Msg(0, "%s", m.m.message);
+X      break;
+X    case MSG_HANGUP:
+X#ifdef REMOTE_DETACH
+X    case MSG_DETACH:
+X# ifdef POW_DETACH
+X    case MSG_POW_DETACH:
+X# endif				/* POW_DETACH */
+X#endif
+X      if (CheckPid(m.m.detach.dpid))
+X	{
+X	  Msg(0, "Detach/Hup attempt with bad pid !!");
+X          break;
+X	}
+X#ifdef PASSWORD
+X      if (!CheckPasswd(m.m.detach.password, m.m.detach.dpid, m.m.detach.tty))
+X	return;
+X#endif				/* PASSWORD */
+X#ifdef REMOTE_DETACH
+X# ifdef POW_DETACH
+X      if (m.type == MSG_POW_DETACH)
+X	Detach(D_REMOTE_POWER);
+X      else
+X# endif				/* POW_DETACH */
+X      if (m.type == MSG_DETACH)
+X	Detach(D_REMOTE);
+X      else
+X#endif
+X      SigHup(SIGARG);
+X      break;
+X    default:
+X      Msg(0, "Invalid message (type %d).", m.type);
+X    }
+X}
+X
+X#if defined(_SEQUENT_) && !defined(NAMEDPIPE)
+X#undef connect
+X
+sconnect(s,sapp,len)
+int s,len;
+struct sockaddr *sapp;
+X{
+X  register struct sockaddr_un *sap;
+X  struct stat st;
+X  int x;
+X
+X  sap=(struct sockaddr_un *)sapp;
+X  if (stat(sap->sun_path,&st))
+X    return(-1);
+X  chmod(sap->sun_path,0);
+X  x=connect(s, (struct sockaddr *) sap, len);
+X  chmod(sap->sun_path,st.st_mode);
+X  return(x);
+X}
+X#endif
+END_OF_FILE
+if test 25596 -ne `wc -c <'socket.c'`; then
+    echo shar: \"'socket.c'\" unpacked with wrong size!
+fi
+# end of 'socket.c'
+fi
+echo shar: End of archive 4 \(of 8\).
+cp /dev/null ark4isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 8 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

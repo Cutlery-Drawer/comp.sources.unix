@@ -1,0 +1,1457 @@
+Newsgroups: comp.sources.unix
+From: kstailey@leidecker.gsfc.nasa.gov (Kenneth Stailey)
+Subject: v28i143: pint - PINT is not TWAIN (scanner interface toolset), Part05/07
+References: <1.783771355.23520@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: kstailey@leidecker.gsfc.nasa.gov (Kenneth Stailey)
+Posting-Number: Volume 28, Issue 143
+Archive-Name: pint/part05
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 5 (of 7)."
+# Contents:  pint/ibm/scandd.b.c
+# Wrapped by kstailey@leidecker on Tue Nov  1 12:27:55 1994
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'pint/ibm/scandd.b.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'pint/ibm/scandd.b.c'\"
+else
+echo shar: Extracting \"'pint/ibm/scandd.b.c'\" \(44888 characters\)
+sed "s/^X//" >'pint/ibm/scandd.b.c' <<'END_OF_FILE'
+X/*
+X *  PINT Pint Is Not TWAIN - common scanner driver interface for UN*X
+X *  Copyright (C) 1994 Kenneth Stailey ken@spacenet.com
+X *
+X *  This program is free software; you can redistribute it and/or modify
+X *  it under the terms of the GNU General Public License as published by
+X *  the Free Software Foundation; either version 2 of the License, or
+X *  (at your option) any later version.
+X *
+X *  This program is distributed in the hope that it will be useful,
+X *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+X *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X *  GNU General Public License for more details.
+X *
+X *  You should have received a copy of the GNU General Public License
+X *  along with this program; if not, write to the Free Software
+X *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X */
+X
+X/*
+X * scandd.b.c: bottom half of PINT
+X *
+X * This file contains the bottom half of the device driver.
+X * All functions and variables are pinned into memory when the scanner is 
+X * opened.
+X * There is no stratagy() since this would have made the pinned code larger
+X * than the pageable code.
+X *
+X * routines in this file:
+X *
+X *  scan_scsi_cmd
+X *  scaniodone
+X *  adapter_error
+X *  scanwait
+X *
+X * ken@spacenet.com
+X *
+X * first release, version 0.1
+X *
+X */
+X
+X#define _KERNEL		   /* let includes know that we are in the kernel */
+X
+X#include <sys/types.h>
+X#include <sys/device.h>
+X#include <sys/uio.h>
+X#include <sys/errno.h>
+X#include <sys/malloc.h>
+X#include <sys/scsi.h>
+X#include <sys/iostat.h>
+X#include <sys/watchdog.h>
+X#include <sys/sleep.h>
+X#include "scandd.h"
+X
+X/*
+X *  global data
+X */
+Xstruct scan_hash_table_df scanner_list[SCANNER_HASHSIZE] = { NULL };
+Xint scanner_chain_lock = LOCK_AVAIL; /* for exclusive access to scanner_list */
+Xint scanner_config_count = 0;	     /* # of devices configured		 */
+X
+Xuchar wd[4][256 + 8];		/* space for the SET_WINDOW data	  */
+X				/* (the FS1 needs the biggest wd so far)  */
+X
+X/*
+X * scan_scsi_cmd:  send a given command to the scanner
+X *
+X * calling sequence:
+X * scan{open|read} -> scan_scsi_cmd -> sc_strategy -> iodone -> scaniodone
+X *
+X * 1) fill in the sc_buf struct
+X *   a) forge a buf struct
+X * 2) call devstrat()
+X */
+Xvoid
+Xscan_scsi_cmd(uchar cmd, struct scan_df *scan_ptr)
+X{
+X  char   escape_codes[256];	/* string of control codes for jx600, etc */
+X
+X  /* for SCSI_MODE_SELECT command... */
+X  struct ricoh_mode_params rmp;
+X
+X  int cs;			/* Current Scanner (array index into wd) */
+X  int i;
+X
+X  /* for the SCSI_TRIGGER_SCAN command */
+X  static char window_zero[1] = { '\0' };
+X
+X#ifdef DEBUG_SCSI_CMD
+X    printf("scan_scsi_cmd: cmd = 0x%x\n", cmd);
+X#endif
+X
+X  /* forge a buf struct (inside sc_buf struct) with default values */
+X
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_flags = B_READ;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_forw  = NULL;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_back  = NULL;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.av_forw = NULL;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.av_back = NULL;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_iodone = scaniodone;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_vp = NULL;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_dev = scan_ptr->s_dds.parent_devno;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_blkno = (daddr_t)0;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)0;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = (uint)0;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_error = (char)0;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_resid = (uint)0;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_options = 0;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_xmemd.aspace_id = XMEM_GLOBAL;
+X
+X  scan_ptr->cmd_buf.scsi_buf.bp = NULL;
+X
+X  /* fill in the length of the command with default of 6 (override if wrong) */
+X  scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_length = (uchar)6;
+X
+X  scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_id =
+X    (uchar)scan_ptr->s_dds.scsi_id;
+X  scan_ptr->cmd_buf.scsi_buf.scsi_command.resvd = (uchar)0;
+X
+X  /* fill in the flags field */
+X
+X  if (scan_ptr->retry) {	/* is this command a retry? */
+X#ifdef DEBUG_SCSI_CMD
+X    printf("scan_scsi_cmd: setting SC_RESUME flag\n");
+X#endif
+X    scan_ptr->cmd_buf.scsi_buf.flags |= (uchar)SC_RESUME;
+X  } else {
+X#ifdef DEBUG_SCSI_CMD
+X    printf("scan_scsi_cmd: NOT setting SC_RESUME flag\n");
+X#endif
+X    scan_ptr->cmd_buf.scsi_buf.flags &= ~(uchar)SC_RESUME;
+X  }
+X
+X  /* the Ricoh FS1 & IS50 don't support sync i/o at all */
+X  if (scan_ptr->s_dds.scanner_type == RICOH_FS1  ||
+X      scan_ptr->s_dds.scanner_type == RICOH_IS50 ||
+X      scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X      scan_ptr->s_dds.scanner_type == UMAX_UG630 ||
+X      scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC) {
+X#ifdef DEBUG_SCSI_CMD
+X    printf("scan_scsi_cmd: setting SC_ASYNC flag\n");
+X#endif
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.flags |= (uchar)SC_ASYNC;
+X  }
+X
+X  scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_op_code = cmd;
+X
+X  scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.lun =
+X    scan_ptr->s_dds.lun << 5;
+X
+X  /* command-specific portion of command block */
+X  switch (cmd) {
+X  case SCSI_RESERVE_UNIT:
+X  case SCSI_RELEASE_UNIT:
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    /* SCB4 is the transfer length */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    break;
+X
+X  case SCSI_REQUEST_SENSE:
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)&scan_ptr->rs;
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case RICOH_FS1:
+X    case RICOH_IS50:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 12;
+X      break;
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case FUJITSU:
+X    case SHARP_JX600:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount =
+X	(uint)sizeof(struct scan_req_sense_data);
+X      break;
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 18;
+X      break;
+X
+X    case HP_SCANJET_IIC:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 8;
+X      break;
+X
+X#ifdef DEBUG_SCSI_CMD
+X    default:
+X      printf("scan_scsi_cmd: unsupported scanner type %d\n",
+X	     scan_ptr->s_dds.scanner_type);
+X#endif
+X    }
+X
+X    /* bytes 2-3 are reserved */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X
+X    /* byte 4 is the allocation length */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] =
+X      (uchar)sizeof(struct scan_req_sense_data);
+X
+X    /* byte 5 is the "control byte" whatever that means */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    break;
+X
+X  case SCSI_SET_WINDOW:
+X
+X    cs = minor(scan_ptr->devno);
+X
+X    /****   fill in the window descriptor arrays  ***/
+X
+X    /* first eight bytes are the header */
+X    wd[cs][WDH_RESERVED0] = (uchar)0;
+X    wd[cs][WDH_RESERVED1] = (uchar)0;
+X    wd[cs][WDH_RESERVED2] = (uchar)0;
+X    wd[cs][WDH_RESERVED3] = (uchar)0;
+X    wd[cs][WDH_RESERVED4] = (uchar)0;
+X    wd[cs][WDH_RESERVED5] = (uchar)0;
+X
+X    switch  (scan_ptr->s_dds.scanner_type) {
+X    case FUJITSU:
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_MSB] = (uchar)0;
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_LSB] = (uchar)64;
+X      break;
+X
+X    case RICOH_IS410:		/* 320 bytes = 0x0140 */
+X    case IBM_2456:
+X    case RICOH_IS50:
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_MSB] = (uchar)0x01;
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_LSB] = (uchar)0x40;
+X      break;
+X
+X    case RICOH_FS1:		/* 256 (0x0100) */
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_MSB] = (uchar)0x01;
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_LSB] = (uchar)0x00;
+X      break;
+X
+X    case UMAX_UC630:		/* 46 (0x002e) */
+X    case UMAX_UG630:		/* 46 (0x002e) */
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_MSB] = (uchar)0x00;
+X      wd[cs][WDH_WINDOW_DESCRIPTOR_BLOCK_LENGTH_LSB] = (uchar)0x2e;
+X      break;
+X   }
+X
+X    wd[cs][WD_WINDOW_ID]	  = (uchar)0;
+X    wd[cs][WD_RESERVED00]	  = (uchar)0; /* auto bit is unsupported */
+X
+X    wd[cs][WD_X_RES_MSB] = (uchar)(scan_ptr->s_dds.x_resolution >> 8 & 0xff);
+X    wd[cs][WD_X_RES_LSB] = (uchar)(scan_ptr->s_dds.x_resolution & 0xff);
+X
+X    wd[cs][WD_Y_RES_MSB] = (uchar)(scan_ptr->s_dds.y_resolution>>8 & 0xff);
+X    wd[cs][WD_Y_RES_LSB] = (uchar)(scan_ptr->s_dds.y_resolution & 0xff);
+X
+X    wd[cs][WD_UPPER_LEFT_X_MSB] =
+X      (uchar)(scan_ptr->s_dds.x_origin>>24 & 0xff);
+X    wd[cs][WD_UPPER_LEFT_X_MHB] =
+X      (uchar)(scan_ptr->s_dds.x_origin>>16 & 0xff);
+X    wd[cs][WD_UPPER_LEFT_X_MLB] =
+X      (uchar)(scan_ptr->s_dds.x_origin>> 8 & 0xff);
+X    wd[cs][WD_UPPER_LEFT_X_LSB] =
+X      (uchar)(scan_ptr->s_dds.x_origin & 0xff);
+X
+X    wd[cs][WD_UPPER_LEFT_Y_MSB] =
+X      (uchar)(scan_ptr->s_dds.y_origin>>24 & 0xff);
+X    wd[cs][WD_UPPER_LEFT_Y_MHB] =
+X      (uchar)(scan_ptr->s_dds.y_origin>>16 & 0xff);
+X    wd[cs][WD_UPPER_LEFT_Y_MLB] =
+X      (uchar)(scan_ptr->s_dds.y_origin>> 8 & 0xff);
+X    wd[cs][WD_UPPER_LEFT_Y_LSB] =
+X      (uchar)(scan_ptr->s_dds.y_origin & 0xff);
+X
+X    wd[cs][WD_WIDTH_MSB] = (uchar)(scan_ptr->s_dds.window_width>>24 & 0xff);
+X    wd[cs][WD_WIDTH_MHB] = (uchar)(scan_ptr->s_dds.window_width>>16 & 0xff);
+X    wd[cs][WD_WIDTH_MLB] = (uchar)(scan_ptr->s_dds.window_width>> 8 & 0xff);
+X    wd[cs][WD_WIDTH_LSB] = (uchar)(scan_ptr->s_dds.window_width & 0xff);
+X
+X    wd[cs][WD_LENGTH_MSB] = (uchar)(scan_ptr->s_dds.window_length>>24 & 0xff);
+X    wd[cs][WD_LENGTH_MHB] = (uchar)(scan_ptr->s_dds.window_length>>16 & 0xff);
+X    wd[cs][WD_LENGTH_MLB] = (uchar)(scan_ptr->s_dds.window_length>> 8 & 0xff);
+X    wd[cs][WD_LENGTH_LSB] = (uchar)(scan_ptr->s_dds.window_length & 0xff);
+X
+X    switch  (scan_ptr->s_dds.scanner_type) {
+X    case FUJITSU:
+X    case RICOH_FS1:
+X      wd[cs][WD_BRIGHTNESS] = (uchar)0x00; /* unsupported */
+X      break;
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      wd[cs][WD_BRIGHTNESS] = (uchar)(scan_ptr->s_dds.brightness);
+X      break;
+X
+X    case RICOH_IS50:
+X
+X      /* if you throw the MRIF bit the brighness control reverses too */
+X      /* so I reverse the reversal in software for symmetry's sake */
+X
+X      switch (scan_ptr->s_dds.image_mode) {
+X      case GRAYSCALE:
+X      case DITHERED_MONOCHROME:
+X	wd[cs][WD_BRIGHTNESS] = 256 - (uchar)(scan_ptr->s_dds.brightness);
+X	break;
+X
+X      default:
+X	wd[cs][WD_BRIGHTNESS] = (uchar)(scan_ptr->s_dds.brightness);
+X	break;
+X      }
+X    }
+X
+X    switch  (scan_ptr->s_dds.scanner_type) {
+X    case FUJITSU:
+X      if (scan_ptr->s_dds.image_mode == BINARY_MONOCHROME)
+X	wd[cs][WD_THRESHOLD]  = (uchar)(scan_ptr->s_dds.brightness);
+X      else
+X	wd[cs][WD_THRESHOLD]  = (uchar)0x00; /* dynamic threshold */
+X      break;
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_IS50:
+X      wd[cs][WD_THRESHOLD]  = (uchar)0x00; /* dynamic threshold */
+X      break;
+X
+X    case RICOH_FS1:
+X      wd[cs][WD_THRESHOLD]  = (uchar)0x01; /* "normal" threshold */
+X
+X    case UMAX_UC630:		/* follow brightness control */
+X    case UMAX_UG630:
+X      wd[cs][WD_THRESHOLD]  =  (uchar)(scan_ptr->s_dds.brightness);
+X    }
+X
+X    switch  (scan_ptr->s_dds.scanner_type) {
+X    case FUJITSU:
+X      wd[cs][WD_CONTRAST]	= (uchar)0;
+X      break;
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_FS1:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      wd[cs][WD_CONTRAST]	= (uchar)(scan_ptr->s_dds.contrast);
+X      break;
+X
+X    case RICOH_IS50:
+X
+X      /* if you throw the MRIF bit the contrast control reverses too */
+X      /* so I reverse the reversal in software for symmetry's sake */
+X
+X      switch (scan_ptr->s_dds.image_mode) {
+X      case GRAYSCALE:
+X      case DITHERED_MONOCHROME:
+X	wd[cs][WD_CONTRAST] = 256 - (uchar)(scan_ptr->s_dds.contrast);
+X	break;
+X
+X      default:
+X	wd[cs][WD_CONTRAST] = (uchar)(scan_ptr->s_dds.contrast);
+X	break;
+X      }
+X    }
+X
+X    switch (scan_ptr->s_dds.image_mode) {
+X    case RED:
+X    case GREEN:
+X    case BLUE:
+X      wd[cs][WD_IMAGE_COMPOSTION] = GRAYSCALE;
+X      break;
+X
+X    default:
+X      wd[cs][WD_IMAGE_COMPOSTION] = scan_ptr->s_dds.image_mode;
+X    }
+X
+X    switch (scan_ptr->s_dds.image_mode) {
+X    case GRAYSCALE:
+X    case RED:
+X    case GREEN:
+X    case BLUE:
+X      wd[cs][WD_BITS_PER_PIXEL]	  = (uchar)8;
+X      break;
+X
+X    case DITHERED_MONOCHROME:
+X    case BINARY_MONOCHROME:
+X      wd[cs][WD_BITS_PER_PIXEL]	  = (uchar)1;
+X      break;
+X
+X    case COLOR:
+X      wd[cs][WD_BITS_PER_PIXEL]	  = (uchar)24;
+X      break;
+X    }
+X
+X    switch  (scan_ptr->s_dds.scanner_type) {
+X    case FUJITSU:
+X      wd[cs][WDF_HALFTONE_PATTERN_MSB] = (uchar)0;
+X      wd[cs][WDF_HALFTONE_PATTERN_LSB] = (uchar)BUILTIN_HALFTONE_PATTERN;
+X
+X      wd[cs][WD_RIF_AND_PADDING]  = (uchar)0;
+X
+X      wd[cs][WD_BIT_ORDERING_MSB] = (uchar)0;
+X      wd[cs][WD_BIT_ORDERING_LSB] = (uchar)0;
+X
+X      break;
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_IS50:
+X      wd[cs][WDR_HALFTONE_CODE] = (uchar)2; /* dithering */
+X      wd[cs][WDR_HALFTONE_ID]   = (uchar)0x0A; /* 8x8 Bayer pattern */
+X
+X      wd[cs][WD_RIF_AND_PADDING] = (uchar)0x03;
+X
+X      wd[cs][WD_BIT_ORDERING_MSB] = (uchar)0;
+X      wd[cs][WD_BIT_ORDERING_LSB] = (uchar)0x07;
+X      break;
+X
+X    case RICOH_FS1:
+X      wd[cs][WDR_HALFTONE_CODE] = (uchar)0;	/* reserved */
+X      wd[cs][WDR_HALFTONE_ID]   = (uchar)0;	/* reserved */
+X
+X      wd[cs][WD_RIF_AND_PADDING] = (uchar)0x03;
+X
+X      wd[cs][WD_BIT_ORDERING_MSB] = (uchar)0;
+X      wd[cs][WD_BIT_ORDERING_LSB] = (uchar)0;
+X      break;
+X
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      wd[cs][WDR_HALFTONE_CODE] = (uchar)0x00;
+X      wd[cs][WDR_HALFTONE_ID]   = (uchar)0x0c; /* 4x4 pattern */
+X
+X      wd[cs][WD_RIF_AND_PADDING] = (uchar)0x03;
+X
+X      wd[cs][WD_BIT_ORDERING_MSB] = (uchar)0;
+X      wd[cs][WD_BIT_ORDERING_LSB] = (uchar)0;
+X      break;
+X    }
+X
+X    wd[cs][WD_COMPRESSION_TYPE] = (uchar)0;
+X    wd[cs][WD_COMPRESSION_ARG]  = (uchar)0;
+X    wd[cs][WD_RESERVED01]	= (uchar)0;
+X    wd[cs][WD_RESERVED02]	= (uchar)0;
+X    wd[cs][WD_RESERVED03]	= (uchar)0;
+X    wd[cs][WD_RESERVED04]	= (uchar)0;
+X    wd[cs][WD_RESERVED05]	= (uchar)0;
+X    wd[cs][WD_RESERVED06]	= (uchar)0;
+X
+X    switch  (scan_ptr->s_dds.scanner_type) {
+X
+X    case FUJITSU:
+X      wd[cs][WDF_IDENTIFICATION_CODE]	= (uchar)0;
+X      wd[cs][WDF_RESERVED07]		= (uchar)0;
+X      wd[cs][WDF_OUTLINE]		= (uchar)0;
+X      wd[cs][WDF_EMPHASIS]		= (uchar)0;
+X      wd[cs][WDF_MIXED]			= (uchar)0;
+X      wd[cs][WDF_MIRRORING]		= (uchar)0;
+X      wd[cs][WDF_RESERVED08]		= (uchar)0;
+X      wd[cs][WDF_RESERVED09]		= (uchar)0;
+X      wd[cs][WDF_RESERVED10]		= (uchar)0;
+X      wd[cs][WDF_RESERVED11]		= (uchar)0;
+X      wd[cs][WDF_RESERVED12]		= (uchar)0;
+X      wd[cs][WDF_SUBWINDOW_LIST_MSB]	= (uchar)0;
+X      wd[cs][WDF_SUBWINDOW_LIST_LSB]	= (uchar)0;
+X      wd[cs][WDF_PAPER_SIZE]		= (uchar)0;
+X
+X      wd[cs][WDF_X_MSB]		  = (uchar)0;
+X      wd[cs][WDF_X_MHB]		  = (uchar)0;
+X      wd[cs][WDF_X_MLB]		  = (uchar)0;
+X      wd[cs][WDF_X_LSB]		  = (uchar)0;
+X
+X      wd[cs][WDF_Y_MSB]		  = (uchar)0;
+X      wd[cs][WDF_Y_MHB]		  = (uchar)0;
+X      wd[cs][WDF_Y_MLB]		  = (uchar)0;
+X      wd[cs][WDF_Y_LSB]		  = (uchar)0;
+X
+X      wd[cs][WDF_RESERVED13]	  = (uchar)0;
+X      wd[cs][WDF_RESERVED14]	  = (uchar)0;
+X      break;
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X      wd[cs][WDR_RESERVED01]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED02]	    = (uchar)0;
+X      wd[cs][WDR_MRIF_FILTERING_GAMMA_ID] = (uchar)0x80;
+X      wd[cs][WDR_RESERVED03]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED04]	    = (uchar)0;
+X      wd[cs][WDR_BINARY_FILTER]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED05]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED06]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED07]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED08]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED09]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED10]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED11]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED12]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED13]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED14]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED15]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED16]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED17]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED18]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED19]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED20]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED21]	    = (uchar)0;
+X      wd[cs][WDR_RESERVED22]	    = (uchar)0;
+X      break;
+X
+X    case RICOH_IS50:
+X      bzero(&wd[cs][WDR_RESERVED01], 24);
+X
+X      switch (scan_ptr->s_dds.image_mode) {
+X      case GRAYSCALE:
+X	wd[cs][WDR_MRIF_FILTERING_GAMMA_ID] = (uchar)0x90;
+X	break;
+X      case DITHERED_MONOCHROME:
+X	wd[cs][WDR_MRIF_FILTERING_GAMMA_ID] = (uchar)0x10;
+X	break;
+X      }
+X
+X    case RICOH_FS1:
+X      bzero(&wd[cs][WDR_RESERVED01], 223);
+X      break;
+X
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X
+X      wd[cs][WDU_SPEED] = (uchar)0x01; /* fastest speed that doesn't smear */
+X
+X      switch (scan_ptr->s_dds.image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X	wd[cs][WDU_SELECT_COLOR] = (uchar)0;
+X	break;
+X
+X      default:			/* color modes */
+X	switch (scan_ptr->s_dds.image_mode) {
+X	case RED:
+X	  wd[cs][WDU_SELECT_COLOR] = 0x80;
+X	  break;
+X	case GREEN:
+X	  wd[cs][WDU_SELECT_COLOR] = 0x40;
+X	  break;
+X	case BLUE:
+X	  wd[cs][WDU_SELECT_COLOR] = 0x20;
+X	  break;
+X#ifdef DEBUG_SCSI_CMD
+X	default:
+X	  printf("scan_scsi_cmd: problem setting colors\n");
+X#endif
+X	}
+X      }
+X
+X      wd[cs][WDU_HIGHLIGHT] = (uchar)50;
+X      wd[cs][WDU_SHADOW] = (uchar)0;
+X
+X      wd[cs][WDU_PAPER_LENGTH_MSB] = (uchar)0;
+X      wd[cs][WDU_PAPER_LENGTH_LSB] = (uchar)0;
+X      break;
+X    }
+X
+X    /* customize the buf struct */
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_flags = B_WRITE;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)wd[cs];
+X    switch (scan_ptr->s_dds.scanner_type) {
+X
+X    case RICOH_FS1:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 0x0108; /* 256+8 */
+X    break;
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_IS50:
+X    case FUJITSU:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 72;
+X      break;
+X
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 46 + 8;
+X      break;
+X    }
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_length = (uchar)10;
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 15;
+X
+X    /* bytes 2-5 are reserved */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X
+X    /*
+X     * bytes 6-8 are for transfer length:
+X     *	  Ricoh IS410 wants 328 (0x148) bytes, but ignores extra data
+X     *	     and accepts less data as valid too
+X     *	  Fujitsu wants 72 (0x48) bytes
+X     *    Ricoh FS1 wants 264 (0x0108) bytes
+X     */
+X
+X    /* shorthand #define for the sake of space (scb = scsi command byte) */
+X#define scb scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_IS50:
+X      scb[SCB6] = (uchar)0x00; /* MSB */
+X      scb[SCB7] = (uchar)0x00;
+X      scb[SCB8] = (uchar)0x48; /* LSB  (72 bytes) */
+X      break;
+X
+X    case RICOH_FS1:
+X      scb[SCB6] = (uchar)0x00; /* MSB */
+X      scb[SCB7] = (uchar)0x01;
+X      scb[SCB8] = (uchar)0x08; /* LSB */
+X      break;
+X
+X    case FUJITSU:
+X      scb[SCB6] = (uchar)0x00; /* MSB */
+X      scb[SCB7] = (uchar)0x00;
+X      scb[SCB8] = (uchar)0x48; /* LSB  (72 bytes) */
+X      break;
+X
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      scb[SCB6] = (uchar)0x00; /* MSB */
+X      scb[SCB7] = (uchar)0x00;
+X      scb[SCB8] = (uchar)0x36; /* LSB  (54 bytes) */
+X      break;
+X    }
+X
+X    /* byte number 10 is called "vendor unique" or "control byte" */
+X    scb[SCB9] = (uchar)0;
+X
+X    break;
+X
+X  case SCSI_TRIGGER_SCAN:
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_flags = B_WRITE;
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 90;
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_IS50:
+X    case RICOH_FS1:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)window_zero;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = (uint)sizeof(window_zero);
+X      break;
+X
+X    default:
+X      break;			/* no data out during start/stop */
+X    }
+X
+X    /* bytes 2-3 & 5 are reserved */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_IS50:
+X    case RICOH_FS1:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      /* transfer length */
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x01;
+X      break;
+X    }
+X
+X    break;
+X
+X  case SCSI_MODE_SELECT:
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_flags = B_WRITE;
+X
+X    /* lun is really SCB1 (sigh) */
+X    if (scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X	scan_ptr->s_dds.scanner_type == IBM_2456    ||
+X	scan_ptr->s_dds.scanner_type == RICOH_IS50  ||
+X	scan_ptr->s_dds.scanner_type == RICOH_FS1)
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.lun |= (uchar)PF_BIT;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case RICOH_FS1:
+X      /* parameter list length */
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 12;
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0;
+X
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)&rmp;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = (uint)(12);
+X
+X      /* mode select parameters... */
+X      /* header: */
+X      rmp.mode_data_length = 0;
+X      rmp.medium_type = 0;
+X      rmp.device_specific_parameter = 0;
+X      rmp.block_descriptor_length = 0;
+X
+X      /* page descriptor: */
+X      rmp.page_code = SCANNING_MEASUREMENT_PARAMETERS;
+X      rmp.paramter_length = (uchar)6;
+X      rmp.base_measurement_unit = INCHES;
+X      rmp.reserved1 = 0;
+X      rmp.measurement_unit_devisor_msb = (1200 >> 8) & 0xff;
+X      rmp.measurement_unit_devisor_lsb = (1200 & 0xff);
+X      rmp.reserved2 = 0;
+X      rmp.reserved3 = 0;
+X      break;
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_IS50:
+X      /* parameter list length */
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 20;
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)&rmp;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = (uint)(sizeof(rmp));
+X
+X      /* mode select parameters... */
+X      /* header: */
+X      rmp.mode_data_length = 0;
+X      rmp.medium_type = 0;
+X      rmp.device_specific_parameter = 0;
+X      rmp.block_descriptor_length = 0;
+X
+X      /* page descriptor: */
+X      rmp.page_code = SCANNING_MEASUREMENT_PARAMETERS;
+X      rmp.paramter_length = (uchar)6;
+X      rmp.base_measurement_unit = INCHES;
+X      rmp.reserved1 = 0;
+X      rmp.measurement_unit_devisor_msb = (1200 >> 8) & 0xff;
+X      rmp.measurement_unit_devisor_lsb = (1200 & 0xff);
+X      rmp.reserved2 = 0;
+X      rmp.reserved3 = 0;
+X
+X      /* ADF support */
+X      rmp.adf_page_code = 0x26;
+X      rmp.adf_parameter_length = 6;
+X      if (scan_ptr->adf_state == ADF_ARMED) {
+X#ifdef DEBUG_SCSI_CMD
+X	printf("scan_scsi_cmd: ADF is on\n");
+X#endif
+X	rmp.adf_control = '\01';
+X      } else {
+X#ifdef DEBUG_SCSI_CMD
+X	printf("scan_scsi_cmd: ADF is off\n");
+X#endif
+X	rmp.adf_control = '\0';
+X      }
+X      rmp.reserved4 = 0;
+X      rmp.reserved5 = 0;
+X      rmp.reserved6 = 0;
+X      rmp.reserved7 = 0;
+X      rmp.reserved8 = 0;
+X      break;
+X    }
+X    break;			/* end of mode select */
+X
+X  case SCSI_GET_BUFFER_STATUS:
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_length = (uchar)10;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr =
+X      (caddr_t)scan_ptr->buf_status;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount =
+X      (uint)sizeof(scan_ptr->buf_status);
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 15;
+X
+X    /* reserved goo */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB6] = 0x00;
+X
+X    /* allocation length */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB7] =
+X      (uchar)((sizeof(scan_ptr->buf_status) >> 8) & 0xff); /* MSB */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB8] =
+X      (uchar)(sizeof(scan_ptr->buf_status) & 0xff);        /* LSB */
+X
+X    /* vendor unique goo */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB9] = 0x00;
+X
+X    break;			/* esac GET_BUFFER_STATUS */
+X
+X  case SCSI_OBJECT_POSITION:
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_length = (uchar)10;
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 30;
+X
+X    if (scan_ptr->do_unload) {
+X      /* the load bit has been cleared by the common code */
+X      scan_ptr->do_unload = FALSE;
+X    } else {
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.lun |= LOAD_BIT;
+X      scan_ptr->do_unload = TRUE;
+X    }
+X
+X    /* count of pages to move */
+X
+X    switch  (scan_ptr->s_dds.scanner_type) {
+X
+X    case FUJITSU:		/* unsupported: must be set to zero */
+X    case RICOH_IS50:
+X    case UMAX_UG630:
+X    case UMAX_UC630:
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x00;
+X      break;
+X
+X    case RICOH_IS410:			/* one page */
+X    case IBM_2456:
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x01;
+X      break;
+X    }
+X
+X    /* reserved goo */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB6] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB7] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB8] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB9] = 0x00;
+X
+X    break;			/* esac SCSI_OBJECT_POSITION */
+X
+X  case SCSI_GET_IMAGE_STATUS:
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr =
+X      (caddr_t)scan_ptr->buf_status;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 6;
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 15;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.flags |= SC_NODISC;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    /* SCB4 is the transfer length */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = '\06';
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    break;
+X
+X  case SCSI_WRITE_EXTENDED:	/* so far only Sharp JX-600S */
+X    escape_codes[0] = '\0';
+X
+X    strcpy(escape_codes, "T2");
+X
+X    switch (scan_ptr->s_dds.x_resolution) {
+X    case 300:
+X      strcat(escape_codes, "D1");
+X      break;
+X    case 200:
+X      strcat(escape_codes, "D2");
+X      break;
+X    case 150:
+X      strcat(escape_codes, "D3");
+X      break;
+X    case 100:
+X      strcat(escape_codes, "D4");
+X      break;
+X    case 75:
+X      strcat(escape_codes, "D5");
+X      break;
+X    case 400:
+X      strcat(escape_codes, "D6");
+X      break;
+X    case 600:
+X      strcat(escape_codes, "D7");
+X      break;
+X    }
+X
+X    switch (scan_ptr->s_dds.image_mode) {
+X    case COLOR:
+X      strcat(escape_codes, "C1");
+X      break;
+X    case RED:
+X      strcat(escape_codes, "C3L2");
+X      break;
+X    case GREEN:
+X      strcat(escape_codes, "C3L1");
+X      break;
+X    case BLUE:
+X      strcat(escape_codes, "C3L3");
+X      break;
+X    case GRAYSCALE:
+X      strcat(escape_codes, "C3L1"); /* man. says deflt drop out color green*/
+X      break;
+X    case BINARY_MONOCHROME:
+X      strcat(escape_codes, "C4L1");
+X      break;
+X    }
+X
+X#if 0				/* warning: this code panics AIX 3.1 */
+X    if (scan_ptr->s_dds.image_mode != BINARY_MONOCHROME) {
+X      int i, j;
+X
+X      strcat(escape_codes, "G0;");
+X
+X      for (j = 0; j < 4; j++) {
+X	sprintf(escape_codes, "%s%d",
+X		escape_codes, scan_ptr->s_dds.brightness);
+X	for (i = 0; i < 255; i++)
+X	  sprintf(escape_codes, "%s,%d",
+X		  escape_codes, scan_ptr->s_dds.brightness);
+X	strcat(escape_codes, "/");
+X      }
+X
+X      strcat(escape_codes, ";");
+X    } else
+X      strcat(escape_codes, "B1"); /* MONO threshold: normal */
+X#else
+X    strcat(escape_codes, "G2");
+X#endif /* 0 */
+X
+X    strcat(escape_codes, "F5"); /* image format will be like PPM(5) */
+X
+X    /* size & placement of window */
+X
+X    sprintf(escape_codes, "%sA0;%d,%d,%d,%d;",
+X	    escape_codes,
+X	    scan_ptr->s_dds.x_origin / 48 + 3,
+X	    scan_ptr->s_dds.window_width / 48,
+X	    scan_ptr->s_dds.y_origin / 48 + 10,
+X	    scan_ptr->s_dds.window_length / 48);
+X
+X    /* overhead time... */
+X
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_flags = B_WRITE;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_length = (uchar)10;
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 15;
+X
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)escape_codes;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = (uint)strlen(escape_codes);
+X
+X#ifdef DEBUG_READ
+X    printf("scanread: escape_codes is %s\n", escape_codes);
+X#endif
+X
+X    /* transfer data type 0x80 is for setting mode parameters */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x80;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB6] = 0x00;
+X
+X    /* transfer length */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB7] =
+X      (uchar)(strlen(escape_codes)) >> 8;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB8] =
+X      (uchar)(strlen(escape_codes)) & 0xff;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB9] = 0x00;
+X    break;
+X
+X  case SCSI_WRITE:		/* so far only HP ScanJet */
+X    switch (scan_ptr->hp_command) {
+X    case HP_CONFIG:
+X      sprintf(escape_codes, "%c*f%dP", '\033',
+X	      scan_ptr->s_dds.window_width / 4);
+X      sprintf(escape_codes, "%s%c*f%dQ", escape_codes, '\033',
+X	      scan_ptr->s_dds.window_length / 4);
+X      sprintf(escape_codes, "%s%c*f%dX", escape_codes, '\033',
+X	      scan_ptr->s_dds.x_origin / 4);
+X      sprintf(escape_codes, "%s%c*f%dY", escape_codes, '\033',
+X	      scan_ptr->s_dds.y_origin / 4);
+X
+X      sprintf(escape_codes, "%s%c*a%dR", escape_codes, '\033',
+X	      scan_ptr->s_dds.x_resolution);
+X      sprintf(escape_codes, "%s%c*a%dS", escape_codes, '\033',
+X	      scan_ptr->s_dds.y_resolution);
+X
+X      switch (scan_ptr->s_dds.image_mode) {
+X      case BINARY_MONOCHROME:
+X	sprintf(escape_codes, "%s%c*a%dT", escape_codes, '\033', 0);
+X	sprintf(escape_codes, "%s%c*a%dG", escape_codes, '\033', 1);
+X	/* make image data be "min-is-white ala PBM */
+X	sprintf(escape_codes, "%s%c*a%dI", escape_codes, '\033', 0);
+X	break;
+X      case DITHERED_MONOCHROME:
+X	sprintf(escape_codes, "%s%c*a%dT", escape_codes, '\033', 3);
+X	sprintf(escape_codes, "%s%c*a%dG", escape_codes, '\033', 1);
+X	/* make image data be "min-is-white ala PBM */
+X	sprintf(escape_codes, "%s%c*a%dI", escape_codes, '\033', 0);
+X	break;
+X      case GRAYSCALE:
+X	sprintf(escape_codes, "%s%c*a%dT", escape_codes, '\033', 4);
+X	sprintf(escape_codes, "%s%c*a%dG", escape_codes, '\033', 8);
+X	/* make image data be "min-is-black ala PGM */
+X	sprintf(escape_codes, "%s%c*a%dI", escape_codes, '\033', 1);
+X	break;
+X      case COLOR:
+X	sprintf(escape_codes, "%s%c*a%dT", escape_codes, '\033', 5);
+X	/* use 24-bit data */
+X	sprintf(escape_codes, "%s%c*a%dG", escape_codes, '\033', 24);
+X	/* make image data be "min-is-black ala PPM */
+X	sprintf(escape_codes, "%s%c*a%dI", escape_codes, '\033', 1);
+X	/* use pass-through matrix (disable NTSC) */
+X	sprintf(escape_codes, "%s%c*u%dT", escape_codes, '\033', 2);
+X      }
+X
+X      sprintf(escape_codes, "%s%c*a%dL", escape_codes, '\033',
+X	      (int)(scan_ptr->s_dds.brightness) - 128);
+X      
+X      sprintf(escape_codes, "%s%c*a%dK", escape_codes, '\033',
+X	      (int)(scan_ptr->s_dds.contrast) - 128);
+X
+X      break;
+X
+X    case HP_TRIGGER:
+X      sprintf(escape_codes, "%c*f0S", '\033');
+X      break;
+X
+X    case HP_PAPER_SENSE:
+X      sprintf(escape_codes, "%c*s1027E", '\033');
+X      break;
+X
+X    case HP_UNLOAD_ADF:
+X      sprintf(escape_codes, "%c*u0U", '\033');
+X      break;
+X    }
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_flags = B_WRITE;
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 15;
+X
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)escape_codes;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = (uint)strlen(escape_codes);
+X
+X#ifdef DEBUG_READ
+X    printf("scanread: escape_codes are:\n");
+X    {
+X      int i = 0;
+X      while (escape_codes[i]) {
+X	if (escape_codes[i] == 033)
+X	  printf("[esc]");
+X	else
+X	  printf("%c", escape_codes[i]);
+X	++i;
+X      }
+X      printf("\n");
+X    }
+X#endif
+X
+X    /* transfer length */
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x0;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] =
+X      (uchar)(strlen(escape_codes)) >> 8;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] =
+X      (uchar)(strlen(escape_codes)) & 0xff;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X
+X    break;
+X
+X  case SCSI_INQUIRY:
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)&scan_ptr->inq;
+X
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount =
+X      (uint)sizeof(struct scan_inq_data);
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x02;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] =
+X      (uchar)sizeof(struct scan_inq_data);
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    break;
+X
+X  case SCSI_SHARP_READ_ABORT:
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_length = (uchar)10;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x8F;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB6] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB7] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB8] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB9] = 0x00;
+X    break;
+X
+X  case SCSI_READ:
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = scan_ptr->hp_response;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 16;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x10;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X    break;
+X
+X#ifdef DEBUG_SET_WINDOW
+X  case SCSI_GET_WINDOW:
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.lun |= (uchar)0x01;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_length = (uchar)10;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_un.b_addr = (caddr_t)wd;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_bcount = 256+8;
+X    scan_ptr->cmd_buf.scsi_buf.timeout_value = 5;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0x00;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0x00;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB6] = 0x00;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB7] = 0x01;
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB8] = 0x08;
+X
+X    scan_ptr->cmd_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB9] = 0x00;
+X
+X    break;
+X#endif /* DEBUG_SET_WINDOW */
+X  }
+X
+X  scan_ptr->cmd_buf.scan_ptr = scan_ptr;
+X
+X  scan_ptr->cmd_state = cmd;
+X
+X  /* more reserved crap courtesy of IBM */
+X  scan_ptr->cmd_buf.scsi_buf.resvd1 = (uint)0;
+X  scan_ptr->cmd_buf.scsi_buf.resvd2 = (uint)0;
+X  scan_ptr->cmd_buf.scsi_buf.resvd3 = (uint)0;
+X  scan_ptr->cmd_buf.scsi_buf.resvd4 = (uint)0;
+X
+X  scan_ptr->cmd_buf.scsi_buf.resvd5 = (uchar)0;
+X  scan_ptr->cmd_buf.scsi_buf.resvd6 = (uchar)0;
+X  scan_ptr->cmd_buf.scsi_buf.resvd7 = (uchar)0;
+X  scan_ptr->cmd_buf.scsi_buf.resvd8 = (uchar)0;
+X
+X  /****	 call the adapter driver's strategy routine via devstrat()  ***/
+X
+X  (void) devstrat(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X  return;
+X}
+X
+X/*
+X *  scaniodone: the routine with the error recovery, restart, & cleanup code
+X *
+X * sc_strategy -> iodone -> scaniodone
+X */
+X
+Xvoid
+Xscaniodone(struct buf *bp)
+X{
+X  struct scan_buf *buf_ptr;
+X  struct buf	  *cur_bp, *next_bp;
+X  struct sc_buf	  *scsi_buf_ptr;
+X  struct scan_df  *scan_ptr;
+X
+X#ifdef DEBUG_IODONE
+X  printf("scaniodone called\n");
+X#endif
+X
+X  /*
+X   * The B_DONE flag must be cleared to force iowait to wait
+X   * on this buf struct.  The flag will be set when processing
+X   * is complete. (other invocations of scaniodone() may happen
+X   * concurrently)
+X   */
+X  bp->b_flags &= ~B_DONE;
+X
+X  scsi_buf_ptr = (struct sc_buf *)bp; /* these 2 typecasts are made possible */
+X  buf_ptr = (struct scan_buf *)bp;    /* by the fact that the three structs */
+X  scan_ptr = buf_ptr->scan_ptr;	      /* are overlapping supersets */
+X
+X#ifdef DEBUG_IODONE
+X  printf("scaniodone: bp->b_error/bp->b_resid is 0x%x/0x%x\n",
+X	 bp->b_error, bp->b_resid);
+X  printf("scaniodone: scan_ptr->cmd_state is 0x%x\n", scan_ptr->cmd_state);
+X#endif
+X
+X  if (scan_ptr->cmd_state == SCAN_PASS_THRU) {
+X    /*
+X     * In the case of a pass-through command, the waiting process
+X     * is simply woken up.  No error handling is done.
+X     */
+X    bp->b_flags |= B_DONE;
+X    e_wakeup(&bp->b_event);
+X
+X    goto iodone_exit;
+X  }
+X
+X
+X  if (!(bp->b_flags & B_ERROR)) {		/* if no error flag... */
+X    switch (scan_ptr->cmd_state) {
+X
+X      /* handle trivial commands: */
+X
+X    case SCSI_SET_WINDOW:
+X    case SCSI_GET_WINDOW:
+X    case SCSI_RESERVE_UNIT:
+X    case SCSI_RELEASE_UNIT:
+X    case SCSI_REQUEST_SENSE:
+X    case SCSI_TRIGGER_SCAN:
+X    case SCSI_MODE_SELECT:
+X    case SCSI_GET_BUFFER_STATUS:
+X    case SCSI_OBJECT_POSITION:
+X    case SCSI_WRITE_EXTENDED:
+X    case SCSI_WRITE:
+X    case SCSI_INQUIRY:
+X#ifdef DEBUG_IODONE
+X      printf("scaniodone: cmd 0x%x finished ok\n", scan_ptr->cmd_state);
+X#endif
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X      break;
+X
+X    case SCSI_GET_IMAGE_STATUS:
+X#ifdef DEBUG_IODONE
+X      printf("scaniodone: SCSI_GET_IMAGE_STATUS finished\n");
+X#endif
+X      scsi_buf_ptr->flags &= ~SC_NODISC;
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X      break;
+X
+X    case SCSI_READ_EXTENDED:
+X#ifdef DEBUG_IODONE
+X      printf("scaniodone: SCSI_READ_EXTENDED complete\n");
+X#endif
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X      break;
+X
+X    case SCSI_READ:
+X#ifdef DEBUG_IODONE
+X      printf("scaniodone: SCSI_READ complete\n");
+X#endif
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X      break;
+X
+X#ifdef DEBUG_IODONE
+X    default:
+X      printf("%cscaniodone: unmapped command state: %d\n",
+X	     '\07', scan_ptr->cmd_state);
+X#endif
+X    }
+X  } else {   /* b_flags has the error bit set */
+X
+X    bp->b_flags &= ~B_ERROR;	/* clear the error bit */
+X
+X    if (scsi_buf_ptr->status_validity & SC_ADAPTER_ERROR) {
+X      scan_ptr->adapter_error = adapter_error(bp);
+X#if defined(DEBUG_IODONE) || defined(DEBUG_ADAPTER_ERROR)
+X      printf("scaniodone: adapter error; code = %d\n", scan_ptr->adapter_error);
+X#endif
+X
+X      /* clear the adapter error bit */
+X      scsi_buf_ptr->status_validity &= ~SC_ADAPTER_ERROR;
+X
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X    }
+X
+X    switch (scan_ptr->cmd_state) {
+X
+X    case SCSI_REQUEST_SENSE:
+X#ifdef DEBUG_IODONE
+X      printf("scaniodone: REQUEST_SENSE failed!\n");
+X#endif
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X      break;
+X
+X    case SCSI_SET_WINDOW:
+X    case SCSI_GET_WINDOW:
+X    case SCSI_RESERVE_UNIT:
+X    case SCSI_RELEASE_UNIT:
+X    case SCSI_TRIGGER_SCAN:
+X    case SCSI_MODE_SELECT:
+X    case SCSI_GET_BUFFER_STATUS:
+X    case SCSI_OBJECT_POSITION:
+X    case SCSI_GET_IMAGE_STATUS:
+X    case SCSI_WRITE_EXTENDED:
+X    case SCSI_WRITE:
+X    case SCSI_INQUIRY:
+X      if (scsi_buf_ptr->scsi_status == SC_CHECK_CONDITION) {
+X
+X	/* tell the top half to to a request sense */
+X	scan_ptr->check_condition = TRUE;
+X      }
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X      break;
+X
+X    case SCSI_READ_EXTENDED:
+X    case SCSI_READ:
+X      if (scsi_buf_ptr->scsi_status == SC_CHECK_CONDITION) {
+X
+X#ifdef DEBUG_IODONE
+X	printf("scaniodone: SC_CHECK_CONDITION detected\n");
+X#endif
+X	/* tell the top half to to a request sense */
+X	scan_ptr->check_condition = TRUE;
+X      }
+X      bp->b_flags |= B_DONE;
+X      e_wakeup(&bp->b_event);
+X      break;
+X
+X    default:
+X#ifdef DEBUG_IODONE
+X      printf("scaniodone: unrecognized command state: 0x%x\n",
+X	     scan_ptr->cmd_state);
+X#endif
+X      break;
+X    }
+X  }
+X
+X
+X iodone_exit:
+X
+X#ifdef IOSTAT
+X  scan_ptr->scan_dkstat.dk_status &= ~IOST_DK_BUSY;
+X#endif
+X
+X#ifdef DEBUG_IODONE
+X  printf("scaniodone exiting\n");
+X#endif
+X
+X#ifndef IOSTAT			/* xlc can't handle a label at the end of */
+X  return;			/* a function */
+X#endif
+X}
+X
+X/*
+X *   adapter_error: process errors sent by the host adapter
+X *
+X *   return ADAPTER_FATAL if the card is totally hosed
+X *   or	    ADAPTER_RETRY if device might come around again
+X */
+Xuchar adapter_error(struct scan_buf *sbp)
+X{
+X#ifdef DEBUG_ADAPTER_ERROR
+X    printf("adapter_error:  general_card_status: %d\n",
+X	   sbp->scsi_buf.general_card_status);
+X#endif
+X  switch (sbp->scsi_buf.general_card_status) {
+X  case SC_HOST_IO_BUS_ERR:	/* indicates a Host I/O Bus error condition */
+X  case SC_SCSI_BUS_FAULT:	/* indicates a failure of the SCSI Bus */
+X  case SC_ADAPTER_HDW_FAILURE:	/* hardware failure */
+X  case SC_ADAPTER_SFW_FAILURE:	/* microcode failure */
+X  case SC_FUSE_OR_TERMINAL_PWR: /* blown fuse or bad termination */
+X    return (ADAPTER_FATAL);
+X
+X  case SC_SCSI_BUS_RESET:	/* external SCSI bus reset */
+X  case SC_CMD_TIMEOUT:		/* timeout_value units expired */
+X  case SC_NO_DEVICE_RESPONSE:	/* target device did not respond to select */
+X    return (ADAPTER_RETRY);
+X
+X#ifdef DEBUG_ADAPTER_ERROR
+X  default:
+X    printf("adapter_error: unmapped general_card_status: %d\n",
+X	   sbp->scsi_buf.general_card_status);
+X#endif
+X  }
+X
+X  return (0);
+X}
+X
+X/*
+X * scanwait:  sleep on the b_event flag of a buf struct until the
+X *	      B_DONE bit in the b_flags gets set.
+X *
+X * precautions:
+X * 1. code executed during the disable operation must be pinned
+X * 2. the event_word parameter must be initialized to EVENT_NULL
+X *    before its first use
+X */
+X
+Xvoid
+Xscanwait(struct buf *bp)
+X{
+X  int old_ilevel;
+X
+X  old_ilevel = i_disable(INTIODONE);
+X
+X  while ((bp->b_flags & B_DONE) == 0) {
+X    e_sleep(&bp->b_event, EVENT_SHORT); /* sleep with signals disabled */
+X  }
+X
+X  i_enable(old_ilevel);
+X}
+X
+X#ifdef DEBUG_UIO
+Xprint_buf_struct(struct buf *bp)
+X{
+X  printf("bp->b_flags	  0x%x\t", bp->b_flags);
+X  printf("bp->b_forw	  0x%x\n", bp->b_forw);
+X  printf("bp->b_back	  0x%x\t", bp->b_back);
+X  printf("bp->av_forw	  0x%x\n", bp->av_forw);
+X  printf("bp->av_back	  0x%x\t", bp->av_back);
+X  printf("bp->b_iodone	  0x%x\n", bp->b_iodone);
+X  printf("bp->b_vp	  0x%x\t", bp->b_vp);
+X  printf("bp->b_dev	  0x%x\n", bp->b_dev);
+X  printf("bp->b_blkno	  0x%x\t", bp->b_blkno);
+X  printf("bp->b_baddr	  0x%x\n", bp->b_baddr);
+X  printf("bp->b_bcount	  0x%x\t", bp->b_bcount);
+X  printf("bp->b_error	  0x%x\n", bp->b_error);
+X  printf("bp->b_resid	  0x%x\t", bp->b_resid);
+X  printf("bp->b_work	  0x%x\n", bp->b_work);
+X  printf("bp->b_options	  0x%x\t", bp->b_options);
+X  printf("bp->b_event	  0x%x\n", bp->b_event);
+X}
+X#endif /* DEBUG */
+END_OF_FILE
+if test 44888 -ne `wc -c <'pint/ibm/scandd.b.c'`; then
+    echo shar: \"'pint/ibm/scandd.b.c'\" unpacked with wrong size!
+fi
+# end of 'pint/ibm/scandd.b.c'
+fi
+echo shar: End of archive 5 \(of 7\).
+cp /dev/null ark5isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 7 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

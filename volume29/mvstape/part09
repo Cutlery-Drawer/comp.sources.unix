@@ -1,0 +1,783 @@
+Newsgroups: comp.sources.unix
+From: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Subject: v29i028: mvstape - suite of utilities for handling IBM MVS tapes, Part09/09
+References: <1.807573809.16947@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Posting-Number: Volume 29, Issue 28
+Archive-Name: mvstape/part09
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 9 (of 9)."
+# Contents:  control.c
+# Wrapped by nmm1@ursa.cus.cam.ac.uk on Fri Aug  4 15:44:00 1995
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'control.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'control.c'\"
+else
+echo shar: Extracting \"'control.c'\" \(26690 characters\)
+sed "s/^X//" >'control.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xcontrol.c  -  this controls the scanning of the tape, file matching and so
+Xon, in conjunction with scanning.c.  All really foul stuff is put into
+Xlabels.c, iebcopy.c, tlspds.c or tapeio.c, but this interacts horribly with
+Xthose in some places. */
+X
+X
+X
+X#include <ctype.h>
+X
+X#include "mvstape.h"
+X#include "command.h"
+X#include "control.h"
+X
+X
+X
+X/* The real global variables relating to dataset control. */
+X
+Xint following_EOF = 1, block_length = 0;
+X
+Xchar dataset_name[MVSnamesize] = "",
+X    dataset_date[date_charsize] = "";
+Xint dataset_int_date[3] = {0,0,0},
+X    dataset_seqno = 0,
+X    dataset_recfm = 0, dataset_lrecl = 0, dataset_blksize = 0;
+Xchar dataset_comments[comment_size] = "";
+Xint dataset_dsorg = 0, dataset_keylen = 0,
+X    dataset_KB = 0, dataset_dir_blks = 0,
+X    dataset_deleted = 0;
+X
+Xint PDS_member_max = 0, PDS_member_count = -1;
+XPDS_STRUCT *PDS_member_list = NULL;
+XPDS_WORK_STRUCT *PDS_work_list = NULL;
+X
+Xchar UNIX_filename[UNIXnamesize] = "";
+X
+X
+X
+XSTATIC int check_match (const command *cmdptr, int check, int length,
+X    int *wildstart, int *wildend) {
+X
+X/* This checks if the MVS filename matches the MVS filename.  Note that there
+Xis a kludge for PDS members, in that they are included in the match only if
+Xthere is a colon in the pattern; hence the command decoding changes brackets to
+Xcolons. */
+X
+X    char *pattern = cmdptr->MVSname;
+X    int wild = -1, wildptr[10], MVS_colon = 0, pattern_colon = 0,
+X        uptr = 0, pptr = 0, i, k;
+X
+X    for (i = 0; i < 10; ++i) wildstart[i] = wildend[i] = -1;
+X
+X/* Check that the various PDS kludges interact properly; note that the
+Xpreliminary check must ignore skipped members, and that MVS_colon is not
+Xpossible if check is true. */
+X
+X    for (i = 0; i < strlen(dataset_name); ++i) if (dataset_name[i] == ':')
+X        MVS_colon = i+1;
+X    for (i = 0; i < strlen(pattern); ++i) if (pattern[i] == ':')
+X        pattern_colon = 1;
+X    if (MVS_colon && pattern_colon) MVS_colon = pattern_colon = 0;
+X    if (pattern_colon && (check ? cmdptr->command_type == command_skip : 1))
+X        return 0;
+X    if (MVS_colon) length = MVS_colon-1;
+X
+X/* Deal with sequence number testing and impossible cases . */
+X
+X    if (cmdptr->seq_from > 0)
+X        return (dataset_seqno >= cmdptr->seq_from &&
+X                dataset_seqno <= cmdptr->seq_to);
+X    else if (tape_type == type_NL || dataset_deleted)
+X        return 0;
+X
+X/* Perform a simple pattern match on the file name.  Note that wild cards
+Xcannot match colons, unless there is more than one colon in dataset_name! */
+X
+X    while (1) {
+X        if (pattern[pptr] == '*') {
+X            wildptr[++wild] = ++pptr;
+X            wildstart[wild] = uptr;
+X            wildend[wild] = uptr = length;
+X        } else if ((k = tolower(dataset_name[uptr])) == pattern[pptr]) {
+X            if (k == '\0') break;
+X            ++uptr;
+X            ++pptr;
+X
+X/* Perform some horrible kludging for PDSs and their members, and iterate round
+Xthe wild card possibilities.  Note that, by this stage, check and pattern_colon
+Xhave the same value. */
+X
+X        } else if (MVS_colon && dataset_name[uptr] == ':' &&
+X                pattern[pptr] == '\0')
+X            break;
+X        else if (check && dataset_name[uptr] == '\0' && pattern[pptr] == ':')
+X            break;
+X        else if (wild >= 0 && wildend[wild] > wildstart[wild]) {
+X            uptr = --wildend[wild];
+X            pptr = wildptr[wild];
+X        } else if (--wild < 0)
+X            return 0;
+X    }
+X    return 1;
+X}
+X
+X
+X
+XSTATIC void name_overflow (void) {
+X
+X/* Produce a diagnostic that probably will never be seen by users! */
+X
+X    if (tape_type == type_NL)
+X        fatal("UNIX name too long when matching file %d'\n",ERR_private,
+X            dataset_seqno);
+X    else
+X        fatal("UNIX name too long when matching '%s'\n",ERR_private,
+X            dataset_name);
+X}
+X
+X
+X
+XSTATIC int match_command (const command *cmdptr, int check) {
+X
+X/* This matches the MVS filename against the command, and converts it to a
+XUNIX name if it matches.  Note that there is a kludge for PDS members, in
+Xthat they are included in the match only if there is a colon in the pattern;
+Xhence the command decoding changes brackets to colons. */
+X
+X    char member[MVSnamesize], seqno[5];
+X    const char *pattern = cmdptr->MVSname, *ptr;
+X    int wild, wildstart[10], wildend[10], length = strlen(dataset_name),
+X        range, lastdot, colon, mptr, uptr, pptr, i, k;
+X
+X    k = check_match(cmdptr,check,length,wildstart,wildend);
+X    if (check || k == 0 || cmdptr->command_type == command_skip) return k;
+X    sprintf(seqno,"%.4d",dataset_seqno);
+X    if (dataset_recfm == 0) dataset_recfm = cmdptr->recfm;
+X    if (dataset_lrecl == 0) dataset_lrecl = cmdptr->lrecl;
+X
+X/* If there is no second name, use the default name mapping algorithm. */
+X
+X    if (cmdptr->UNIXname[cmdptr->dir_len] == '\0') {
+X        strcpy(UNIX_filename,cmdptr->UNIXname);
+X        uptr = cmdptr->dir_len;
+X        lastdot = -1;
+X        pptr = cmdptr->prefix_len;
+X        colon = -1;
+X
+X/* Change various of the separator characters, preserving pointers for
+Xmanipulating the last two components. */
+X
+X        while ((UNIX_filename[uptr] = tolower(k = dataset_name[pptr++])) !=
+X                    '\0') {
+X            if (k == '.')
+X                UNIX_filename[lastdot = uptr] = '/';
+X            else if (k == ':')
+X                UNIX_filename[colon = uptr] = '.';
+X            if (++uptr >= UNIXnamesize) name_overflow();
+X        }
+X
+X/* Sort out cases where the last component is 'A:B', and convert these to b.a
+Xor a/b UNIX form, depending on the renaming option.  Then see about changing
+Xthe last slash to a dot.  Note that the location of FUDGE_FILE_NAME is
+Xcritical.  This is all rather kludgy - tough! */
+X
+X        if (colon > lastdot) {
+X            if (renaming_option&1)
+X                UNIX_filename[lastdot = colon] = '/';
+X            else {
+X                length = uptr;
+X                uptr = 0;
+X                for (pptr = mptr = lastdot+1; ; ++pptr) {
+X                    if (pptr >= colon) break;
+X                    member[uptr++] = UNIX_filename[pptr];
+X                }
+X                for (++pptr; pptr < length; ++pptr)
+X                    UNIX_filename[mptr++] = UNIX_filename[pptr];
+X                UNIX_filename[mptr++] = '.';
+X                for (i = 0; i < uptr; ++i) UNIX_filename[mptr++] = member[i];
+X                UNIX_filename[mptr] = '\0';
+X                lastdot = -1;
+X            }
+X        }
+X        if ((renaming_option&2) && lastdot > 0) UNIX_filename[lastdot] = '.';
+X        FUDGE_FILE_NAME(UNIX_filename);
+X
+X/* Otherwise map the matched name into the new form.  There are some horrible
+Xkludges for the two sequence number forms here. */
+X
+X    } else {
+X        range = wild = 0;
+X        if (cmdptr->seq_from > 0) {
+X            if (cmdptr->command_flags&command_flags_range)
+X                range = 1;
+X            else
+X                ++wild;
+X        }
+X        pattern = cmdptr->UNIXname;
+X        uptr = pptr = 0;
+X
+X/* Insert the wild cards as appropriate to complete the name. */
+X
+X        do {
+X            if ((k = pattern[pptr++]) == '*') {
+X                if (wild == 0 && range)
+X                    for (i = 0; i < strlen(seqno); ++i) {
+X                        UNIX_filename[uptr++] = seqno[i];
+X                        if (uptr >= UNIXnamesize) name_overflow();
+X                    }
+X                else {
+X                    for (i = wildstart[wild]; i < wildend[wild]; ++i) {
+X                        UNIX_filename[uptr++] = tolower(dataset_name[i]);
+X                        if (uptr >= UNIXnamesize) name_overflow();
+X                    }
+X                }
+X                ++wild;
+X            } else
+X                UNIX_filename[uptr++] = k;
+X            if (uptr >= UNIXnamesize) name_overflow();
+X        } while (k != '\0');
+X    }
+X
+X/* Check the name for MS-DOS, change colons to asterisks (why not?) for MacOS,
+Xflag the file name is matched and return.  This is parameterised, but a 
+Xradically new system will still probably cause trouble. */
+X
+X    CHECK_FILE_NAME(UNIX_filename);
+X    for (i = 0; UNIX_filename[i] != '\0'; ++i)
+X        if ((ptr = strchr(NAME_CHAR_VETO,UNIX_filename[i])) != NULL)
+X            UNIX_filename[i] = NAME_CHAR_SUB[ptr-NAME_CHAR_VETO];
+X    return 1;
+X}
+X
+X
+X
+XSTATIC const command *match_name (int check) {
+X
+X/* This matches the MVS filename against the commands in order, and converts it
+Xto a UNIX name if it matches.  Note that PDS members do not necessarily match
+Xthe same command that the whole file name matched.  If check is set, the
+Xoutput filename is not updated. */
+X
+X    command *cmdptr = command_chain;
+X
+X    while (cmdptr != NULL) {
+X        if (match_command(cmdptr,check) != 0) {
+X            if (debug) {
+X                if (check)
+X                    comment("Dataset %s matches command block %p (PDS check)\n",
+X                        dataset_name,cmdptr);
+X                else
+X                    comment("Dataset %s matches command block %p giving %s\n",
+X                        dataset_name,cmdptr,UNIX_filename);
+X            }
+X            return cmdptr;
+X        }
+X        cmdptr = cmdptr->command_next;
+X    }
+X    if (debug) comment("Dataset %s not matched\n",dataset_name);
+X    return NULL;
+X}
+X
+X
+X
+XSTATIC int create_file (const char *filename, int operation,
+X    const char *linkname) {
+X
+X/* This opens an output file or a link, creating directories as necessary.  It
+Xis a pity that there does not seem to be a standard function to do this.
+Xoperation is 1, 2, 3 or 4 for writing, appending, linking or linking as an
+Xappend operation. */
+X
+X    char dirname[UNIXnamesize], *ptr;
+X    int n = 0;    /* Silencing 'gcc -Wall' */
+X
+X/* If the file is in a separate directory, create subdirectories recursively.
+XThe contortions are for efficiency.  It would be even faster to try this code
+Xonly when the file creation fails, but that would be very messy. */
+X
+X    ptr = strcpy(dirname,filename);
+X    while ((ptr = strrchr(dirname,'/')) != NULL) {
+X        *ptr = '\0';
+X        errno = 0;
+X        if (Mkdir(dirname,O_DIRMODE) == 0 || errno == E_EXISTS)
+X            break;
+X        else if (errno == E_NODIR)
+X            continue;
+X        else {
+X            warn("unable to create directory '%s'",ERR_system,dirname);
+X            return -1;
+X        }
+X    }
+X    for ( ; ; ) {
+X        strcpy(dirname,filename);
+X        ptr = (ptr == NULL ? dirname : ++ptr);
+X        if ((ptr = strchr(ptr,'/')) == NULL) break;
+X        *ptr = '\0';
+X        errno = 0;
+X        if (Mkdir(dirname,O_DIRMODE) != 0) {
+X            warn("unable to create directory '%s'",ERR_system,dirname);
+X            return -1;
+X        }
+X    }
+X
+X/* Having created the directories, create the file or link as appropriate. */
+X
+X    errno = 0;
+X    switch (operation) {
+Xcase 1: if ((n = Open(filename,O_WRITE,O_WRMODE)) < 0)
+X            warn("unable to open output file '%s'",ERR_system,filename);
+X        break;
+Xcase 2: if ((n = Open(filename,O_EXTEND,O_WRMODE)) < 0)
+X            warn("unable to open output file '%s'",ERR_system,filename);
+X        break;
+Xcase 3: case 4:
+X        if ((n = Link(linkname,filename)) < 0) {
+X            if (errno == E_EXISTS && operation == 3) {
+X                errno = 0;
+X                if ((n = Unlink(filename)) >= 0) n = Link(linkname,filename);
+X            }
+X        }
+X        if (n < 0)
+X            warn("unable to link file %s as %s",
+X                ERR_system,linkname,UNIX_filename);
+X        break;
+Xdefault:
+X        fatal("internal error - unknown operation in create_file",ERR_private);
+X    }
+X    if (n < 0 && ++disk_IO_errors >= disk_IO_error_limit) stop(EXIT_FAILURE);
+X    return n;
+X}
+X
+X
+X
+XSTATIC void copy_PDS (const command *cmdptr) {
+X
+X/* This handles TLS and IEBCOPY PDSs.  It is rather like another level of the
+Xfunction process_commands.  Ignore the warnings about variables changed by
+Xlongjmp() from 'gcc -Wall'. */
+X
+X    int skip = 0, last_skipped, index, current, warn_ttrs = 0, fileno, size,
+X        operation,  i;
+X    char *member_ptr = strchr(dataset_name,'\0'), linkname[UNIXnamesize],
+X        temp[100],
+X         *ptr = NULL;    /* Silencing 'gcc -Wall' */
+X    const char *cptr;
+X
+X    IO_jump_set = 1;
+X    if (setjmp(IO_error_jump)) {
+X        read_basic_block = read_simple_block;
+X        if (! following_EOF) skip_file(0);
+X        return;
+X    } else if (tape_type == type_TLS)
+X        read_TLS_directory();
+X    else
+X        read_IEB_directory();
+X    IO_jump_set = 0;
+X
+X/* Dump the directory structure, if debugging is at a high enough level. */
+X
+X    if (debug >= 2) {
+X        if (PDS_member_count ==0)
+X            comment("PDS %s has no members",dataset_name);
+X        else
+X            comment("PDS %s has members:\n",dataset_name);
+X        for (i = 0; i < PDS_member_count; ++i) {
+X            if (i%4 == 0) {
+X                if (i != 0) comment(temp);
+X                sprintf(temp,"%3d:",i);
+X                ptr = strchr(temp,'\0');
+X            }
+X            sprintf(ptr,"  %s %d %.2x",PDS_member_list[i].name,
+X                PDS_member_list[i].next_entry,PDS_member_list[i].flags);
+X            ptr = strchr(ptr,'\0');
+X        }
+X        comment("%s",temp);
+X        comment("");
+X    }
+X
+X/* Find the next member, and see if it is plausible.  Give only one diagnostic
+Xper file for load modules, but allow mixed PDSs (if any loony has them). */
+X
+X    while (1) {
+X        last_skipped = skip;
+X        skip = 0;
+X        IO_jump_set = 1;
+X        if (setjmp(IO_error_jump)) {
+X            read_basic_block = read_simple_block;
+X            if (! following_EOF) skip_file(0);
+X            return;
+X        } else {
+X            index = (tape_type == type_TLS ? next_TLS_member(last_skipped) :
+X                    next_IEB_member(last_skipped));
+X            if (index < 0) break;
+X            if (PDS_member_list[index].flags&PDS_flags_ttrs) {
+X                if (! warn_ttrs)
+X                    warn("file %s contains load modules, which will be ignored",
+X                        ERR_private,dataset_name);
+X                skip = warn_ttrs = 1;
+X                goto next_member;
+X            }
+X        }
+X        IO_jump_set = 0;
+X        skip = 1;
+X
+X/* See this member or any alias of it matches, and open the UNIX name if so. */
+X
+X        *member_ptr = ':';
+X        current = index;
+X        while (1) {
+X            strcpy(member_ptr+1,PDS_member_list[current].name);
+X            if ((cmdptr = match_name(0)) == NULL ||
+X                   cmdptr->command_type == command_skip)
+X                goto next_alias;
+X            if (tar_fileno >= 0)
+X                fileno = temp_tar_fileno;
+X            else {
+X                operation = (cmdptr->command_type == command_append ? 2 : 1);
+X                fileno = create_file(UNIX_filename,operation,NULL);
+X                if (fileno < 0) goto next_alias;
+X            }
+X
+X/* If successful, copy it and print any messages. */
+X
+X            IO_jump_set = 1;
+X            if (setjmp(IO_error_jump))
+X                read_basic_block = read_simple_block;
+X            else {
+X               if (tape_type == type_TLS) {
+X                    read_basic_block = read_TLS_block;
+X                    TLS_next_segment = NULL;
+X               } else
+X                    read_basic_block = read_IEB_block;
+X                size = copy_file(fileno,cmdptr,0);
+X                read_basic_block = read_simple_block;
+X                if ((tar_fileno >= 0 ? ! write_tar_file(size) : 1) &&
+X                        verification != 0) {
+X                    cptr = (cmdptr->command_type == command_append ?
+X                        "appended" : "copied");
+X                    fprintf(listing_file,"Member %s %s to %s (%d bytes)\n",
+X                        PDS_member_list[current].name,cptr,UNIX_filename,size);
+X                }
+X                skip = 0;
+X            }
+X            IO_jump_set = 0;
+X
+X/* Clean up after the transfer, failure or skipping. */
+X
+X            errno = 0;
+X            if (fileno != temp_tar_fileno && Close(fileno))
+X                fatal("unable to close output file '%s'",
+X                    ERR_system,UNIX_filename);
+X            break;
+Xnext_alias:
+X            if ((current = PDS_member_list[current].next_entry) == index)
+X                goto next_member;
+X        }
+X
+X/* Now turn any remaining aliases into hard links. */
+X
+X        if (! skip) {
+X            strcpy(linkname,UNIX_filename);
+X            while ((current = PDS_member_list[current].next_entry) != index) {
+X                strcpy(member_ptr+1,PDS_member_list[current].name);
+X                if ((cmdptr = match_name(0)) != NULL &&
+X                       cmdptr->command_type != command_skip) {
+X                    if (tar_fileno < 0) {
+X                        operation =
+X                            (cmdptr->command_type == command_append ? 4 : 3);
+X                        if (create_file(UNIX_filename,operation,linkname) < 0)
+X                            continue;
+X                    } else
+X                        if (! write_tar_alias(linkname)) continue;
+X                    if (verification != 0)
+X                        fprintf(listing_file,"Alias %s linked to %s as %s\n",
+X                            PDS_member_list[current].name,linkname,
+X                            UNIX_filename);
+X                }
+X            }
+X        }
+Xnext_member:
+X        *member_ptr = '\0';
+X    }
+X}
+X
+X
+X
+Xvoid process_commands (void) {
+X
+X/* This handles dataset processing, including some rudimentary error recovery.
+XFor unlabelled tapes, it can do very little about I/O errors except hope that
+Xit has not missed a tape mark.  Ignore the warnings about variables changed by
+Xlongjmp() from 'gcc -Wall'. */
+X
+X    const command *cmdptr = NULL;    /* Silencing 'gcc -Wall' */
+X    int block_count, label_in_hand, block_in_hand, copy, seqno, fileno = -1,
+X        size, n;
+X    const char *ptr;
+X
+X/* Start by skipping the TLS dictionary when necessary, and allowing for
+Xrecovery. */
+X
+X    if (tape_type == type_TLS) {
+X        skip_file(1);
+X        skip_file(0);
+X        skip_file(1);
+X        if (verification&verify_all)
+X            fprintf(listing_file,"1:  [TLS dictionary]\n");
+X        dataset_seqno = 2;
+X    } else
+X        dataset_seqno = 1;
+X    for ( ; dataset_seqno <= max_seqno_matched; ++dataset_seqno) {
+X        if (tape_type == type_NL && tape_mark_count >= tape_marks) break;
+X        if (debug >= 2) display_tape_globals();
+X        block_number = 0;
+X        label_in_hand = 0;
+Xretry:  sprintf(dataset_name,"tapefile_%.4d",dataset_seqno);
+X        PDS_member_count = -1;
+X        dataset_dsorg = dataset_recfm = dataset_lrecl = dataset_blksize = 0;
+X
+X/* If the tape is TLS, we can take the decisions from the dictionary alone. */
+X
+X        if (tape_type == type_TLS) {
+X            if (! read_header_labels(1)) break;
+X            tape_file_count = dataset_seqno;
+X            if (debug) display_label_globals();
+X            cmdptr = match_name(dataset_dsorg == dsorg_PO);
+X            copy = (cmdptr != NULL && cmdptr->command_type != command_skip);
+X            if (verification&(copy ? verify_all|verify_matched : verify_all))
+X                print_headers();
+X
+X/* Now see if the dataset is both matched and fit to copy.  I think that some
+Xof these cases cannot occur, but check them anyway. */
+X
+X            if (! copy)
+X                ;
+X            else if (dataset_dsorg != dsorg_PS && dataset_dsorg != dsorg_PO &&
+X                    (dataset_dsorg != dsorg_DA || dataset_recfm != recfm_F)) {
+X                warn("dataset '%s' has an unsupported organisation",
+X                    ERR_private,dataset_name);
+X                copy = 0;
+X            } else if ((dataset_recfm&(recfm_F|recfm_V|recfm_U)) == 0 ||
+X                    dataset_lrecl == 0 || dataset_blksize == 0) {
+X                warn("dataset '%s' has unset DCB characteristics",
+X                    ERR_private,dataset_name);
+X                copy = 0;
+X            } else if (dataset_keylen != 0) {
+X                warn("dataset '%s' has a non-zero key length",
+X                    ERR_private,dataset_name);
+X                copy = 0;
+X            }
+X            if (! copy) {
+X                skip_file(1);
+X                skip_file(0);
+X                skip_file(1);
+X                continue;
+X            }
+X        } else
+X            dataset_recfm = dataset_lrecl = 0;
+X
+X/* TLS and labelled tape processing takes a sledge-hammer approach to any
+Xproblems during header label processing, and skips to the next identifiable
+XHDR1 label. This can recurse in extreme cases, but not indefinitely.  It
+Xinteracts horribly with the code in labels.c. */
+X
+X        if (tape_type != type_NL) {
+X            IO_jump_set = 1;
+X            if (setjmp(IO_error_jump)) {
+X                if ((seqno = find_good_header()) == 0) {
+X                    comment("end-of-tape reached while looking for a file");
+X                    break;
+X                }
+X                n = seqno-dataset_seqno-1;
+X                if (n != 0)
+X                    warn("%d other datasets missed because of I/O errors",
+X                        ERR_private,n);
+X                dataset_seqno = seqno;
+X                block_number = 1;
+X                label_in_hand = 1;
+X                goto retry;
+X
+X/* The main code reads the labels and checks the sequence number is what is
+Xexpected; if not, it assumes that the tape is right. */
+X
+X            } else {
+X                if ((seqno = read_header_labels(label_in_hand ? -1 : 0)) == 0)
+X                    break;
+X                if (debug && tape_type != type_TLS) display_label_globals();
+X                if (seqno != dataset_seqno) {
+X                    warn("expected sequence number %d, but found %d in label",
+X                        ERR_private,dataset_seqno,seqno);
+X                    if (++IO_error_count >= IO_error_limit) stop(EXIT_FAILURE);
+X                    dataset_seqno = seqno;
+X                    label_in_hand = 1;
+X                    goto retry;
+X                }
+X            }
+X            IO_jump_set = 0;
+X        }
+X        if (debug >= 2) display_tape_globals();
+X        tape_file_count = dataset_seqno;
+X        block_number = 0;
+X
+X/* See if this is an IEBCOPY unloaded PDS.  This involves the duplication of
+Xcode, but still helps. */
+X
+X        IO_jump_set = 1;
+X        if (setjmp(IO_error_jump)) {
+X            skip_file(0);
+X            if (tape_type != type_NL) skip_file(1);
+X            continue;
+X        } else
+X            block_in_hand = (tape_type != type_TLS && check_IEB_unloaded());
+X        if (debug >= 2) display_tape_globals();
+X        IO_jump_set = 0;
+X        if (tape_type != type_TLS && dataset_dsorg == dsorg_PO) {
+X            cmdptr = match_name(1);
+X            copy = (cmdptr != NULL && cmdptr->command_type != command_skip);
+X            if (verification&(copy ? verify_all|verify_matched : verify_all)) {
+X                if (tape_type != type_NL)
+X                    print_headers();
+X                else
+X                   fprintf(listing_file,"File %d\n",dataset_seqno);
+X            }
+X            if (! copy) {
+X                skip_file(0);
+X                if (tape_type != type_NL) skip_file(1);
+X                continue;
+X            }
+X        }
+X
+X/* Deal with PDSs as soon as possible, to simplify later code. */
+X
+X        if (dataset_dsorg == dsorg_PO) {
+X            copy_PDS(cmdptr);
+X            if (debug >= 2) display_tape_globals();
+X            if (tape_type == type_TLS)
+X                skip_file(1);
+X            else if (tape_type != type_NL) {
+X                block_count = block_number;
+X                block_number = 0;
+X                read_trailer_labels(block_count);
+X            }
+X            continue;
+X        }
+X
+X/* Find whether the name or sequence number matches and skip the appropriate
+Xamount. */
+X
+X        if (tape_type != type_TLS) {
+X            cmdptr = match_name(0);
+X            copy = (cmdptr != NULL && cmdptr->command_type != command_skip);
+X            if (verification&(copy ? verify_all|verify_matched : verify_all)) {
+X                if (tape_type != type_NL)
+X                    print_headers();
+X                else
+X                   fprintf(listing_file,"File %d\n",dataset_seqno);
+X            }
+X            if (tape_type != type_NL &&
+X                    ((dataset_recfm&(recfm_F|recfm_V|recfm_U)) == 0 ||
+X                        (! (dataset_recfm&recfm_U) && dataset_lrecl == 0))) {
+X                warn("dataset '%s' has unset DCB characteristics",
+X                    ERR_private,dataset_name);
+X                copy = 0;
+X            }
+X            if (! copy) {
+X                if (! block_in_hand || ! following_EOF) skip_file(0);
+X                if (tape_type != type_NL) skip_file(1);
+X                continue;
+X            }
+X        }
+X
+X/* Open the output file if necessary.  Note that this will create an empty file
+Xif the terminating tape mark on an an unlabelled tape is matched.  Tough. */
+X
+X        if (tar_fileno >= 0)
+X            fileno = temp_tar_fileno;
+X        else {
+X            fileno = create_file(UNIX_filename,
+X                    (cmdptr->command_type == command_append ? 2 : 1),NULL);
+X            if (fileno < 0) {
+X                if (! block_in_hand || ! following_EOF) skip_file(0);
+X                if (tape_type != type_NL) skip_file(1);
+X                continue;
+X            }
+X        }
+X
+X/* Handle the copying, including error recovery, and clean up.  Remember that
+XPDSs have gone by now. */
+X
+X        IO_jump_set = 1;
+X        if (setjmp(IO_error_jump)) {
+X            read_basic_block = read_simple_block;
+X            if (! following_EOF) skip_file(0);
+X        } else {
+X            if (dataset_dsorg == dsorg_DA) {    /* Necessarily TLS */
+X                read_basic_block = read_TLS_block;
+X                TLS_next_segment = NULL;
+X            }
+X            size = copy_file(fileno,cmdptr,block_in_hand);
+X            read_basic_block = read_simple_block;
+X            if (! following_EOF) skip_file(0);
+X            if ((tar_fileno >= 0 ? ! write_tar_file(size) : 1) &&
+X                    verification != 0) {
+X                ptr = (cmdptr->command_type == command_append ? "appended" :
+X                    "copied");
+X                fprintf(listing_file,"File %s to %s (%d bytes)\n",
+X                    ptr,UNIX_filename,size);
+X            }
+X        }
+X        IO_jump_set = 0;
+X
+X/* Close the output file, if any, and check or skip the trailer labels if we
+Xmanaged to get this far. */
+X
+X        errno = 0;
+X        if (fileno != temp_tar_fileno && Close(fileno))
+X            fatal("unable to close output file '%s'",ERR_system,UNIX_filename);
+X        if (debug >= 2) display_tape_globals();
+X        block_count = block_number;
+X        block_number = 0;
+X        if (tape_type != type_NL) read_trailer_labels(block_count);
+X    }
+X
+X/* The only cleaning up we do here is to write the two null blocks at the end
+Xof a tar file.  The rest is in mvstape.c. */
+X
+X    if (tar_fileno >= 0) {
+X        write_tar_file(-1);
+X        write_tar_file(-1);
+X    }
+X}
+END_OF_FILE
+if test 26690 -ne `wc -c <'control.c'`; then
+    echo shar: \"'control.c'\" unpacked with wrong size!
+fi
+# end of 'control.c'
+fi
+echo shar: End of archive 9 \(of 9\).
+cp /dev/null ark9isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 9 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

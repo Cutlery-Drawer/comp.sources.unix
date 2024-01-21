@@ -1,0 +1,1541 @@
+Subject:  v25i014:  trn 2.0 - threaded newsreader based on rn 4.4, Part11/13
+Newsgroups: comp.sources.unix
+Approved: vixie@pa.dec.com
+
+Submitted-by: davison@borland.com (Wayne Davison)
+Posting-number: Volume 25, Issue 14
+Archive-name: trn/part11
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 11 (of 13)."
+# Contents:  mt-process.c
+# Wrapped by vixie@cognition.pa.dec.com on Tue Dec  3 16:34:57 1991
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'mt-process.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mt-process.c'\"
+else
+echo shar: Extracting \"'mt-process.c'\" \(36510 characters\)
+sed "s/^X//" >'mt-process.c' <<'END_OF_FILE'
+X/* $Id: mt-process.c,v 4.4.3.1 1991/11/22 04:12:15 davison Trn $
+X**
+X** $Log: mt-process.c,v $
+X** Revision 4.4.3.1  1991/11/22  04:12:15  davison
+X** Trn Release 2.0
+X** 
+X*/
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "threads.h"
+X#include "mthreads.h"
+X#include "ndir.h"
+X#ifdef SERVER
+X#include "server.h"
+X#endif
+X#include "INTERN.h"
+X#include "bits.h"
+X
+X#include <time.h>
+X#ifndef TZSET
+X# include <sys/timeb.h>
+X#endif
+X
+X#if defined(SERVER) && !defined(USLEEP)
+X# include <sys/time.h>
+X#endif
+X
+X#define buff buf
+X
+char references[1024];
+X
+char subject_str[80];
+bool found_Re;
+X
+char author_str[20];
+X
+extern int log_verbosity, slow_down;
+X
+long num;
+X
+DOMAIN *next_domain;
+X
+void insert_article(), expire(), trim_roots(), order_roots(), trim_authors();
+void make_root(), use_root(), merge_roots(), set_root(), unlink_root();
+void link_child(), unlink_child();
+void free_article(), free_domain(), free_subject(), free_root(), free_author();
+void get_subject_str(), get_author_str();
+ARTICLE *get_article();
+SUBJECT *new_subject();
+AUTHOR *new_author();
+X
+X#ifdef TZSET
+extern time_t tnow;
+extern long timezone;
+X#else
+extern struct timeb ftnow;
+X#endif
+X
+X#ifndef SERVER
+static FILE *fp_article;
+X#endif
+X
+X/* Given the upper/lower bounds of the articles in the current group, add all
+X** the ones that we don't know about and remove all the ones that have expired.
+X** The current directory must be the newsgroup's spool directory.
+X*/
+void
+process_articles(first_article, last_article)
+ART_NUM first_article, last_article;
+X{
+X    register char *cp, *str;
+X    register ARTICLE *article;
+X    register ART_NUM i;
+X    time_t date;
+X    bool has_xrefs;
+X    int len;
+X#ifdef SERVER
+X    bool orig_extra = extra_expire;
+X#endif
+X#ifdef TMPTHREAD
+X    extern int start;
+X#else
+X    int start = total.last + 1;
+X#endif
+X    extern int errno;
+X    extern int sys_nerr;
+X    extern char *sys_errlist[];
+X
+X    if (first_article > start) {
+X	start = first_article;
+X    }
+X    added_count = last_article - start + 1;
+X    if (added_count < 0) {
+X	added_count = 0;
+X    } else if (added_count > 1000) {
+X	/* Don't overwork ourselves the first time */
+X	added_count = 1000;
+X	start = last_article - 1000 + 1;
+X    }
+X    expired_count = 0;
+X
+X#ifdef TMPTHREAD
+X    if (added_count) {
+X	printf("\nThreading %d article%s...", added_count,
+X		added_count == 1 ? nullstr : "s"), fflush(stdout);
+X    }
+X#endif
+X
+X    for (i = start; i <= last_article; i++) {
+X#ifdef TMPTHREAD
+X	if ((i - start) % 20 == 0) {
+X	    if (i - start) {
+X		printf("%d...", i - start), fflush(stdout);
+X	    }
+X	}
+X#endif
+X#ifdef SERVER
+X	if (slow_down) {
+X	    usleep(slow_down);
+X	}
+X	sprintf(buff, "HEAD %ld", (long)i);
+X	put_server(buff);
+X	if (get_server(buff, sizeof buff) < 0 || *buff == CHAR_FATAL) {
+X	    last_article = i - 1;
+X	    extra_expire = FALSE;
+X	    break;
+X	}
+X	if (*buff != CHAR_OK) {
+X	    added_count--;
+X	    continue;
+X	}
+X#else
+X	/* Open article in current directory. */
+X	sprintf(buff, "%ld", (long)i);
+X	/* Set errno for purely paranoid reasons */
+X	errno = 0;
+X	if ((fp_article = fopen(buff, "r")) == Nullfp) {
+X	    /* Missing files are ok -- they've just been expired or canceled */
+X	    if (errno != 0 && errno != ENOENT) {
+X		if (errno < 0 || errno > sys_nerr) {
+X		    log_error("Can't open `%s': Error %d.\n", buff, errno);
+X		} else {
+X		    log_error("Can't open `%s': %s.\n", buff,
+X		      sys_errlist[errno]);
+X		}
+X	    }
+X	    added_count--;
+X	    continue;
+X	}
+X#endif
+X
+X	article = Nullart;
+X	*references = '\0';
+X	*author_str = '\0';
+X	*subject_str = '\0';
+X	found_Re = 0;
+X	date = 0;
+X	has_xrefs = FALSE;
+X
+X#ifdef SERVER
+X	while (get_server(cp = buff, sizeof buff) == 0) {
+X	  process_line:
+X	    if (*cp == '.') {
+X		if (cp[1]) {
+X		    log_error("Header line starts with '.'! [%ld].\n",
+X				(long)i);
+X		    continue;
+X		}
+X		break;
+X	    }
+X#else
+X	while ((cp = fgets(buff, sizeof buff, fp_article)) != Nullch) {
+X	  process_line:
+X	    if (*cp == '\n') {		/* check for end of header */
+X		break;			/* break out when found */
+X	    }
+X#endif
+X	    if ((unsigned char)*cp <= ' ') {	 /* skip continuation lines */
+X		continue;		/* (except references -- see below) */
+X	    }
+X	    if ((str = index(cp, ':')) == Nullch) {
+X#ifdef SERVER
+X		if (log_verbosity) {
+X		    log_error("Header line missing colon! [%ld].\n", (long)i);
+X		}
+X		continue;		/* skip bogus header line */
+X#else
+X		break;			/* end of header if no colon found */
+X#endif
+X	    }
+X	    if ((len = str - cp) > 10) {
+X		continue;		/* skip keywords > 10 chars */
+X	    }
+X#ifndef SERVER
+X	    cp[strlen(cp)-1] = '\0';	/* remove newline */
+X#endif
+X	    while (cp < str) {		/* lower-case the keyword */
+X		if ((unsigned char)*cp <= ' ') { /* stop at any whitespace */
+X		    break;
+X		}
+X		if (isupper(*cp)) {
+X		    *cp = tolower(*cp);
+X		}
+X		cp++;
+X	    }
+X	    *cp = '\0';
+X	    cp = buff;
+X	    if (len == 4 && strEQ(cp, "date")) {
+X#ifdef TZSET
+X	        date = get_date(str + 1, tnow, timezone);
+X#else
+X		date = get_date(str + 1, ftnow.time, (long) ftnow.timezone);
+X#endif
+X	    } else
+X	    if (len == 4 && strEQ(cp, "from")) {
+X		get_author_str(str + 1);
+X	    } else
+X	    if (len == 4 && strEQ(cp, "xref")) {
+X		has_xrefs = TRUE;
+X	    } else
+X	    if (len == 7 && strEQ(cp, "subject")) {
+X		get_subject_str(str + 1);
+X	    } else
+X	    if (len == 10 && strEQ(cp, "message-id")) {
+X		if (!article) {
+X		    article = get_article(str + 1);
+X		} else {
+X		    if (log_verbosity) {
+X			log_error("Found multiple Message-IDs! [%ld].\n",
+X				(long)i);
+X		    }
+X		}
+X	    } else
+X	    if (len == 10 && strEQ(cp, "references")) {
+X		/* include preceding space in saved reference */
+X		len = strlen(str + 1);
+X		bcopy(str + 1, references, len + 1);
+X		str = references + len;
+X		/* check for continuation lines */
+X#ifdef SERVER
+X		while (get_server(cp = buff, sizeof buff) == 0) {
+X#else
+X		while ((cp = fgets(buff, sizeof buff, fp_article)) != Nullch) {
+X#endif
+X		    if (*cp != ' ' && *cp != '\t') {
+X			goto process_line;
+X		    }
+X		    while (*++cp == ' ' || *cp == '\t') {
+X			;
+X		    }
+X		    *--cp = ' ';
+X		    /* If the references are too long, shift them over to
+X		    ** always save the most recent ones.
+X		    */
+X		    if ((len += strlen(cp)) > 1023) {
+X			strcpy(buff, buff + len - 1023);
+X			str -= len - 1023;
+X			len = 1023;
+X		    }
+X		    strcpy(str, cp);
+X		}/* while */
+X		break;
+X	    }/* if */
+X	}/* while */
+X	if (article) {
+X	    num = i;
+X	    insert_article(article, date);
+X	    if (has_xrefs) {
+X		article->flags |= HAS_XREFS;
+X	    }
+X	} else {
+X	    if (log_verbosity) {
+X		log_error("Message-ID line missing! [%ld].\n", (long)i);
+X	    }
+X	}
+X#ifndef SERVER
+X	fclose(fp_article);
+X#endif
+X    }
+X
+X    if (extra_expire || first_article > total.first) {
+X	absfirst = first_article;
+X	lastart = last_article;
+X	expire(first_article <= last_article ? extra_expire : FALSE);
+X    }
+X    trim_roots();
+X    order_roots();
+X    trim_authors();
+X
+X    total.first = first_article;
+X    total.last = last_article;
+X#ifdef SERVER
+X    extra_expire = orig_extra;
+X#endif
+X}
+X
+X/* Search all articles for numbers less than new_first.  Traverse the list
+X** using the domain links so we don't have to deal with the tree structure.
+X** If extra is true, list all articles in the directory to setup a bitmap
+X** with the existing articles marked as 'read', and drop everything that
+X** isn't there.
+X*/
+void
+expire(extra)
+bool_int extra;
+X{
+X    register DOMAIN *domain;
+X    register ARTICLE *article, *next_art, *hold;
+X#ifndef TMPTHREAD
+X    register ART_NUM art;
+X#ifndef SERVER
+X    register DIR *dirp;
+X#endif
+X#endif
+X
+X#ifdef TMPTHREAD
+X    extra = FALSE;
+X#else
+X    if (extra) {
+X      MEM_SIZE ctlsize;
+X
+X	/* Allocate a bitmap large enough for absfirst thru lastart. */
+X#ifndef lint
+X	ctlsize = (MEM_SIZE)(OFFSET(lastart)/BITSPERBYTE+20);
+X#endif
+X	ctlarea = safemalloc(ctlsize);
+X	bzero(ctlarea, ctlsize);
+X
+X	/* List all articles and use ctl_set() to keep track of what's there. */
+X#ifdef SERVER
+X	sprintf(buff, "XHDR message-id %ld-%ld", (long)absfirst, (long)lastart);
+X	put_server(buff);
+X	if (get_server(buff, sizeof buff) == 0 && *buff == CHAR_OK) {
+X	    while (1) {
+X		if (get_server(buff, sizeof buff) < 0) {
+X		    extra = 0;
+X		    break;
+X		}
+X		if (*buff == '.') {
+X		    break;
+X		}
+X		art = atol(buff);
+X		if (art >= absfirst && art <= lastart) {
+X		    ctl_set(art);
+X		}
+X	    }
+X	} else {
+X	    extra = 0;
+X	}
+X#else
+X	if ((dirp = opendir(".")) != 0) {
+X	  register struct DIRTYPE *dp;
+X
+X	    while ((dp = readdir(dirp)) != Null(struct DIRTYPE *)) {
+X	      register char *p;
+X
+X		for (p = dp->d_name; *p; p++) {
+X		    if (!isdigit(*p)) {
+X			goto nope;
+X		    }
+X		}
+X		art = atol(dp->d_name);
+X		if (art >= absfirst && art <= lastart) {
+X		    ctl_set(art);
+X		}
+X	  nope: ;
+X	    }
+X	    closedir(dirp);
+X	} else {
+X	    extra = 0;
+X	}
+X#endif
+X    } else {
+X	ctlarea = Nullch;
+X    }
+X#endif /* TMPTHREAD */
+X
+X    for (domain = &unk_domain; domain; domain = next_domain) {
+X	next_domain = domain->link;
+X	for (article = domain->ids; article; article = next_art) {
+X	    next_art = article->id_link;
+X	    if (!article->subject) {
+X		continue;
+X	    }
+X	    if (article->num < absfirst
+X#ifndef TMPTHREAD
+X	     || (extra && !ctl_read(article->num))
+X#endif
+X	   ) {
+X		article->subject->count--;
+X		article->subject = 0;
+X		article->flags &= ~HAS_XREFS;
+X		article->author->count--;
+X		article->author = 0;
+X		/* Free expired article if it has no children.  Then check
+X		** if the parent(s) are also fake and can be freed.  We'll
+X		** free any empty roots later.
+X		*/
+X		while (!article->children) {
+X		    hold = article->parent;
+X		    unlink_child(article);
+X		    free_article(article);
+X		    if (hold && !hold->subject) {
+X			if ((article = hold) == next_art) {
+X			    next_art = next_art->id_link;
+X			}
+X		    } else {
+X			break;
+X		    }
+X		}
+X		expired_count++;
+X	    }/* if */
+X	}/* for */
+X    }/* for */
+X    next_domain = Null(DOMAIN*);
+X
+X#ifndef TMPTHREAD
+X    safefree(&ctlarea);
+X#endif
+X}
+X
+X/* Trim the article chains down so that we don't have more than one faked
+X** article between the root and any real ones.
+X*/
+void
+trim_roots()
+X{
+X    register ROOT *root, *last_root;
+X    register ARTICLE *article, *next;
+X    register SUBJECT *subject, *last_subj;
+X    register int found;
+X
+X#ifndef lint
+X    last_root = (ROOT *)&root_root;
+X#else
+X    last_root = Null(ROOT*);
+X#endif
+X    for (root = root_root; root; root = last_root->link) {
+X	for (article = root->articles; article; article = article->siblings) {
+X	    /* If an article has no subject, it is a "fake" reference node.
+X	    ** If all of its immediate children are also fakes, delete it
+X	    ** and graduate the children to the root.  If everyone is fake,
+X	    ** the chain dies.
+X	    */
+X	    while (!article->subject) {
+X		found = 0;
+X		for (next = article->children; next; next = next->siblings) {
+X		    if (next->subject) {
+X			found = 1;
+X			break;
+X		    }
+X		}
+X		if (!found) {
+X		    /* Remove this faked article and move all its children
+X		    ** up to the root.
+X		    */
+X		    next = article->children;
+X		    unlink_child(article);
+X		    free_article(article);
+X		    for (article = next; article; article = next) {
+X			next = article->siblings;
+X			article->parent = Nullart;
+X			link_child(article);
+X		    }
+X		    article = root->articles;	/* start this root over */
+X		} else {
+X		    break;			/* else, on to next article */
+X		}
+X	    }
+X	}
+X	/* Free all unused subject strings.  Begin by trying to find a
+X	** subject for the root's pointer.
+X	*/
+X	for (subject = root->subjects; subject && !subject->count; subject = root->subjects) {
+X	    root->subjects = subject->link;
+X	    free_subject(subject);
+X	    root->subject_cnt--;
+X	}
+X	/* Then free up any unused intermediate subjects.
+X	*/
+X	if ((last_subj = subject) != Null(SUBJECT*)) {
+X	    while ((subject = subject->link) != Null(SUBJECT*)) {
+X		if (!subject->count) {
+X		    last_subj->link = subject->link;
+X		    free_subject(subject);
+X		    root->subject_cnt--;
+X		    subject = last_subj;
+X		} else {
+X		    last_subj = subject;
+X		}
+X	    }
+X	}
+X	/* Now, free all roots without articles.  Flag unexpeced errors.
+X	*/
+X	if (!root->articles) {
+X	    if (root->subjects) {
+X		log_error("** Empty root still had subjects remaining! **\n");
+X	    }
+X	    last_root->link = root->link;
+X	    free_root(root);
+X	} else {
+X	    last_root = root;
+X	}
+X    }
+X}
+X
+X/* Descend the author list, find any author names that aren't used
+X** anymore and free them.
+X*/
+void
+trim_authors()
+X{
+X    register AUTHOR *author, *last_author;
+X
+X#ifndef lint
+X    last_author = (AUTHOR *)&author_root;
+X#else
+X    last_author = Null(AUTHOR*);
+X#endif
+X    for (author = author_root; author; author = last_author->link) {
+X	if (!author->count) {
+X	    last_author->link = author->link;
+X	    free_author(author);
+X	} else {
+X	    last_author = author;
+X	}
+X    }
+X}
+X
+X/* Reorder the roots to place the oldest ones first (age determined by
+X** date of oldest article).
+X*/
+void
+order_roots()
+X{
+X    register ROOT *root, *next, *search;
+X
+X    /* If we don't have at least two roots, we're done! */
+X    if (!(root = root_root) || !(next = root->link)) {
+X	return;						/* RETURN */
+X    }
+X    /* Break the old list off after the first root, and then start
+X    ** inserting the roots into the list by date.
+X    */
+X    root->link = Null(ROOT*);
+X    while ((root = next) != Null(ROOT*)) {
+X	next = next->link;
+X	if ((search = root_root)->articles->date >= root->articles->date) {
+X	    root->link = root_root;
+X	    root_root = root;
+X	} else {
+X	    while (search->link
+X	     && search->link->articles->date < root->articles->date) {
+X		search = search->link;
+X	    }
+X	    root->link = search->link;
+X	    search->link = root;
+X	}
+X    }
+X}
+X
+X#define EQ(x,y) ((isupper(x) ? tolower(x) : (x)) == (y))
+X
+X/* Parse the subject into 72 characters or less.  Remove any "Re[:^]"s from
+X** the front (noting that it's there), and any "(was: old)" stuff from
+X** the end.  Then, compact multiple whitespace characters into one space,
+X** trimming leading/trailing whitespace.  If it's still too long, unmercifully
+X** cut it off.  We don't bother with subject continuation lines either.
+X*/
+void
+get_subject_str(str)
+register char *str;
+X{
+X    register char *cp;
+X    register int len;
+X
+X    while (*str && (unsigned char)*str <= ' ') {
+X	str++;
+X    }
+X    if (!*str) {
+X	bcopy("<None>", subject_str, 7);
+X	return;						/* RETURN */
+X    }
+X    cp = str;
+X    while (EQ(cp[0], 'r') && EQ(cp[1], 'e')) {	/* check for Re: */
+X	cp += 2;
+X	if (*cp == '^') {				/* allow Re^2: */
+X	    while (*++cp <= '9' && *cp >= '0') {
+X		;
+X	    }
+X	}
+X	if (*cp != ':') {
+X	    break;
+X	}
+X	while (*++cp == ' ') {
+X	    ;
+X	}
+X	found_Re = 1;
+X	str = cp;
+X    }
+X    /* Remove "(was: oldsubject)", because we already know the old subjects.
+X    ** Also match "(Re: oldsubject)".  Allow possible spaces after the ('s.
+X    */
+X    for (cp = str; (cp = index(cp+1, '(')) != Nullch;) {
+X	while (*++cp == ' ') {
+X	    ;
+X	}
+X	if (EQ(cp[0], 'w') && EQ(cp[1], 'a') && EQ(cp[2], 's')
+X	 && (cp[3] == ':' || cp[3] == ' '))
+X	{
+X	    *--cp = '\0';
+X	    break;
+X	}
+X	if (EQ(cp[0], 'r') && EQ(cp[1], 'e')
+X	 && ((cp[2]==':' && cp[3]==' ') || (cp[2]=='^' && cp[4]==':'))) {
+X	    *--cp = '\0';
+X	    break;
+X	}
+X    }
+X    /* Copy subject to a temporary string, compacting multiple spaces/tabs */
+X    for (len = 0, cp = subject_str; len < 72 && *str; len++) {
+X	if ((unsigned char)*str <= ' ') {
+X	    while (*++str && (unsigned char)*str <= ' ') {
+X		;
+X	    }
+X	    *cp++ = ' ';
+X	} else {
+X	    *cp++ = *str++;
+X	}
+X    }
+X    if (cp[-1] == ' ') {
+X	cp--;
+X    }
+X    *cp = '\0';
+X}
+X
+X/* Try to fit the author name in 16 bytes.  Use the comment portion in
+X** parenthesis if present.  Cut off non-commented names at the '@' or '%'.
+X** Then, put as many characters as we can into the 16 bytes, packing multiple
+X** whitespace characters into a single space.
+X** We might want to implement a nice name shortening algorithm sometime.
+X*/
+void
+get_author_str(str)
+char *str;
+X{
+X    register char *cp, *cp2;
+X
+X    if ((cp = index(str, '(')) != Nullch) {
+X	str = cp+1;
+X	if ((cp = rindex(str, ')')) != Nullch) {
+X	    *cp = '\0';
+X	}
+X    } else {
+X	if ((cp = index(str, '@')) != Nullch) {
+X	    *cp = '\0';
+X	}
+X	if ((cp = index(str, '%')) != Nullch) {
+X	    *cp = '\0';
+X	}
+X    }
+X    for (cp = str, cp2 = author_str; *cp && cp2-author_str < 16;) {
+X	/* Pack white space and turn ctrl-chars into spaces. */
+X	if (*cp <= ' ') {
+X	    while (*++cp && *cp <= ' ') {
+X		;
+X	    }
+X	    if (cp2 != author_str) {
+X		*cp2++ = ' ';
+X	    }
+X	} else {
+X	    *cp2++ = *cp++;
+X	}
+X    }
+X    *cp2 = '\0';
+X}
+X
+X/* Take a message-id and see if we already know about it.  If so, return it.
+X** If not, create it.  We separate the id into its id@domain parts, and
+X** link all the unique ids to one copy of the domain portion.  This saves
+X** a bit of space.
+X*/
+ARTICLE *
+get_article(msg_id)
+char *msg_id;
+X{
+X    register DOMAIN *domain;
+X    register ARTICLE *article;
+X    register char *cp, *after_at;
+X
+X    /* Take message id, break it up into <id@domain>, and try to match it.
+X    */
+X    while (*msg_id == ' ') {
+X	msg_id++;
+X    }
+X    cp = msg_id + strlen(msg_id) - 1;
+X    if (msg_id >= cp) {
+X	if (log_verbosity) {
+X	    log_error("Message-ID is empty! [%ld]\n", num);
+X	}
+X	return Nullart;
+X    }
+X    if (*msg_id++ != '<') {
+X	if (log_verbosity) {
+X	    log_error("Message-ID doesn't start with '<' [%ld]\n", num);
+X	}
+X	msg_id--;
+X    }
+X    if (*cp != '>') {
+X	if (log_verbosity) {
+X	    log_error("Message-ID doesn't end with '>' [%ld]\n", num);
+X	}
+X	cp++;
+X    }
+X    *cp = '\0';
+X    if (msg_id == cp) {
+X	if (log_verbosity) {
+X	    log_error("Message-ID is null! [%ld]\n", num);
+X	}
+X	return Nullart;
+X    }
+X
+X    if ((after_at = index(msg_id, '@')) == Nullch) {
+X	domain = &unk_domain;
+X    } else {
+X	*after_at++ = '\0';
+X	for (cp = after_at; *cp; cp++) {
+X	    if (isupper(*cp)) {
+X		*cp = tolower(*cp);		/* lower-case domain portion */
+X	    }
+X	}
+X	*cp = '\0';
+X	/* Try to find domain name in database. */
+X	for (domain = unk_domain.link; domain; domain = domain->link) {
+X	    if (strEQ(domain->name, after_at)) {
+X		break;
+X	    }
+X	}
+X	if (!domain) {		/* if domain doesn't exist, create it */
+X	  register int len = cp - after_at + 1;
+X	    domain = (DOMAIN *)safemalloc(sizeof (DOMAIN));
+X	    total.domain++;
+X	    domain->name = safemalloc(len);
+X	    total.string2 += len;
+X	    bcopy(after_at, domain->name, len);
+X	    domain->ids = Nullart;
+X	    domain->link = unk_domain.link;
+X	    unk_domain.link = domain;
+X	}
+X    }
+X    /* Try to find id in this domain. */
+X    for (article = domain->ids; article; article = article->id_link) {
+X	if (strEQ(article->id, msg_id)) {
+X	    break;
+X	}
+X    }
+X    if (!article) {		/* If it doesn't exist, create an article */
+X      register int len = strlen(msg_id) + 1;
+X	article = (ARTICLE *)safemalloc(sizeof (ARTICLE));
+X	bzero(article, sizeof (ARTICLE));
+X	total.article++;
+X	article->num = 0;
+X	article->id = safemalloc(len);
+X	total.string2 += len;
+X	bcopy(msg_id, article->id, len);
+X	article->domain = domain;
+X	article->id_link = domain->ids;
+X	domain->ids = article;
+X    }
+X    return article;
+X}
+X
+X/* Take all the data we've accumulated about the article and shove it into
+X** the article tree at the best place we can possibly imagine.
+X*/
+void
+insert_article(article, date)
+ARTICLE *article;
+time_t date;
+X{
+X    register ARTICLE *node, *last;
+X    register char *cp, *end;
+X    int len;
+X
+X    if (article->subject) {
+X	if (log_verbosity) {
+X	    log_error("We've already seen article #%ld (%s@%s)\n",
+X		num, article->id, article->domain->name);
+X	}
+X	return;						/* RETURN */
+X    }
+X    article->date = date;
+X    article->num = num;
+X    article->flags = 0;
+X
+X    if (!*references && found_Re) {
+X	if (log_verbosity > 1) {
+X	    log_error("Missing reference line!  [%ld]\n", num);
+X	}
+X    }
+X    /* If the article has a non-zero root, it is already in a thread somewhere.
+X    ** Unlink it to try to put it in the best possible spot.
+X    */
+X    if (article->root) {
+X	/* Check for a real or shared-fake parent.  Articles that have never
+X	** existed have a num of 0.  Expired articles that remain as references
+X	** have a valid num.  (Valid date too, but no subject.)
+X	*/
+X	for (node = article->parent;
+X	     node && !node->num && node->child_cnt == 1;
+X	     node = node->parent)
+X	{
+X	    ;
+X	}
+X	unlink_child(article);
+X	if (node) {			/* do we have decent parents? */
+X	    /* Yes: assume that our references are ok, and just reorder us
+X	    ** with our siblings by date.
+X	    */
+X	    link_child(article);
+X	    use_root(article, article->root);
+X	    /* Freshen the date in any faked parent articles. */
+X	    for (node = article->parent;
+X		 node && !node->num && date < node->date;
+X		 node = node->parent)
+X	    {
+X		node->date = date;
+X		unlink_child(node);
+X		link_child(node);
+X	    }
+X	    return;					/* RETURN */
+X	}
+X	/* We'll assume that this article has as good or better references
+X	** than the child that faked us initially.  Free the fake reference-
+X	** chain and process our references as usual.
+X	*/
+X	for (node = article->parent; node; node = node->parent) {
+X	    unlink_child(node);
+X	    free_article(node);
+X	}
+X	article->parent = Nullart;		/* neaten up */
+X	article->siblings = Nullart;
+X    }
+X  check_references:
+X    if (!*references) {	/* If no references but "Re:" in subject, */
+X	if (found_Re) {	/* search for a reference in any cited text */
+X#ifndef SERVER
+X	    for (len = 4; len && fgets(buff, sizeof buff, fp_article); len--) {
+X		if ((cp = index(buff, '<')) && (end = index(cp, ' '))) {
+X		    if (end[-1] == ',') {
+X			end--;
+X		    }
+X		    *end = '\0';
+X		    if ((end = index(cp, '>')) == Nullch) {
+X			end = cp + strlen(cp) - 1;
+X		    }
+X		    if (valid_message_id(cp, end)) {
+X			strcpy(references+1, cp);
+X			*references = ' ';
+X			if (log_verbosity > 2) {
+X			    log_error("Found cited-text reference: '%s' [%ld]\n",
+X				references+1, num);
+X			}
+X			break;
+X		    }
+X		}
+X	    }
+X#endif
+X	} else {
+X	    article->flags |= ROOT_ARTICLE;
+X	}
+X    }
+X    /* If we have references, process them from the right end one at a time
+X    ** until we either run into somebody, or we run out of references.
+X    */
+X    if (*references) {
+X	last = article;
+X	node = Nullart;
+X	end = references + strlen(references) - 1;
+X	while ((cp = rindex(references, '<')) != Nullch) {
+X	    while (end >= cp && ((unsigned char)*end <= ' ' || *end == ',')) {
+X		end--;
+X	    }
+X	    end[1] = '\0';
+X	    /* Quit parsing references if this one is garbage. */
+X	    if (!valid_message_id(cp, end)) {
+X		if (log_verbosity) {
+X		    log_error("Bad ref '%s' [%ld]\n", cp, num);
+X		}
+X		break;
+X	    }
+X	    /* Dump all domains that end in '.', such as "..." & "1@DEL." */
+X	    if (end[-1] == '.') {
+X		break;
+X	    }
+X	    node = get_article(cp);
+X	    *cp = '\0';
+X
+X	    /* Check for duplicates on the reference line.  Brand-new data has
+X	    ** no date.  Data we just allocated earlier on this line has a
+X	    ** date but no root.  Special-case the article itself, since it
+X	    ** MIGHT have a root.
+X	    */
+X	    if ((node->date && !node->root) || node == article) {
+X		if (log_verbosity) {
+X		    log_error("Reference line contains duplicates [%ld]\n",
+X			num);
+X		}
+X		if ((node = last) == article) {
+X		    node = Nullart;
+X		}
+X		continue;
+X	    }
+X	    last->parent = node;
+X	    link_child(last);
+X	    if (node->root) {
+X		break;
+X	    }
+X	    node->date = date;
+X	    last = node;
+X	    end = cp-1;
+X	}
+X	if (!node) {
+X	    *references = '\0';
+X	    goto check_references;
+X	}
+X	/* Check if we ran into anybody that was already linked.  If so, we
+X	** just use their root.
+X	*/
+X	if (node->root) {
+X	    /* See if this article spans the gap between what we thought
+X	    ** were two different roots.
+X	    */
+X	    if (article->root && article->root != node->root) {
+X		merge_roots(node->root, article->root);
+X		/* Set the roots of any children we brought with us. */
+X		set_root(article, node->root);
+X	    }
+X	    use_root(article, node->root);
+X	} else {
+X	    /* We didn't find anybody we knew, so either create a new root or
+X	    ** use the article's root if it was previously faked.
+X	    */
+X	    if (!article->root) {
+X		make_root(node);
+X		use_root(article, node->root);
+X	    } else {
+X		node->root = article->root;
+X		link_child(node);
+X		use_root(article, article->root);
+X	    }
+X	}
+X	/* Set the roots of the faked articles we created as references. */
+X	for (node = article->parent; node && !node->root; node = node->parent) {
+X	    node->root = article->root;
+X	}
+X	/* Make sure we didn't circularly link to a child article(!), by
+X	** ensuring that we run into the root before we run into ourself.
+X	*/
+X	while (node && node->parent != article) {
+X	    node = node->parent;
+X	}
+X	if (node) {
+X	    /* Ugh.  Someone's tweaked reference line with an incorrect
+X	    ** article-order arrived first, and one of our children is
+X	    ** really one of our ancestors. Cut off the bogus child branch
+X	    ** right where we are and link it to the root.
+X	    */
+X	    if (log_verbosity) {
+X		log_error("Found ancestral child -- fixing.\n");
+X	    }
+X	    unlink_child(node);
+X	    node->parent = Nullart;
+X	    link_child(node);
+X	}
+X    } else {
+X	/* The article has no references.  Either turn it into a new root, or
+X	** re-attach fleshed-out (previously faked) article to its old root.
+X	*/
+X	if (!article->root) {
+X	    make_root(article);
+X	} else {
+X	    link_child(article);
+X	    use_root(article, article->root);
+X	}
+X    }
+X}
+X
+X/* Check if the string we've found looks like a valid message-id reference.
+X*/
+int
+valid_message_id(start, end)
+register char *start, *end;
+X{
+X    char *mid;
+X
+X    if (start == end) {
+X	return 0;
+X    }
+X
+X    if (*end != '>') {
+X	/* Compensate for space cadets who include the header in their
+X	** subsitution of all '>'s into another citation character.
+X	*/
+X	if (*end == '<' || *end == '-' || *end == '!' || *end == '%'
+X	 || *end == ')' || *end == '|' || *end == ':' || *end == '}'
+X	 || *end == '*' || *end == '+' || *end == '#' || *end == ']'
+X	 || *end == '@' || *end == '$') {
+X	    if (log_verbosity) {
+X		log_error("Reference ended in '%c' [%ld]\n", *end, num);
+X	    }
+X	    *end = '>';
+X	}
+X    } else if (end[-1] == '>') {
+X	if (log_verbosity) {
+X	    log_error("Reference ended in '>>' [%ld]\n", num);
+X	}
+X	*(end--) = '\0';
+X    }
+X    /* Id must be "<...@...>" */
+X    if (*start != '<' || *end != '>' || (mid = index(start, '@')) == Nullch
+X     || mid == start+1 || mid+1 == end) {
+X	return 0;					/* RETURN */
+X    }
+X    return 1;
+X}
+X
+X/* Remove an article from its parent/siblings.  Leave parent pointer intact.
+X*/
+void
+unlink_child(child)
+register ARTICLE *child;
+X{
+X    register ARTICLE *last;
+X
+X    if (!(last = child->parent)) {
+X	child->root->thread_cnt--;
+X	if ((last = child->root->articles) == child) {
+X	    child->root->articles = child->siblings;
+X	} else {
+X	    goto sibling_search;
+X	}
+X    } else {
+X	last->child_cnt--;
+X	if (last->children == child) {
+X	    last->children = child->siblings;
+X	} else {
+X	    last = last->children;
+X	  sibling_search:
+X	    while (last->siblings != child) {
+X		last = last->siblings;
+X	    }
+X	    last->siblings = child->siblings;
+X	}
+X    }
+X}
+X
+X/* Link an article to its parent article.  If its parent pointer is zero,
+X** link it to its root.  Sorts siblings by date.
+X*/
+void
+link_child(child)
+register ARTICLE *child;
+X{
+X    register ARTICLE *node;
+X    register ROOT *root;
+X
+X    if (!(node = child->parent)) {
+X	root = child->root;
+X	root->thread_cnt++;
+X	node = root->articles;
+X	if (!node || child->date < node->date) {
+X	    child->siblings = node;
+X	    root->articles = child;
+X	} else {
+X	    goto sibling_search;
+X	}
+X    } else {
+X	node->child_cnt++;
+X	node = node->children;
+X	if (!node || child->date < node->date) {
+X	    child->siblings = node;
+X	    child->parent->children = child;
+X	} else {
+X	  sibling_search:
+X	    for (; node->siblings; node = node->siblings) {
+X		if (node->siblings->date > child->date) {
+X		    break;
+X		}
+X	    }
+X	    child->siblings = node->siblings;
+X	    node->siblings = child;
+X	}
+X    }
+X}
+X
+X/* Create a new root for the specified article.  If the current subject_str
+X** matches any pre-existing root's subjects, we'll instead add it on as a
+X** parallel thread.
+X*/
+void
+make_root(article)
+ARTICLE *article;
+X{
+X    register ROOT *new, *node;
+X    register SUBJECT *subject;
+X
+X#ifndef NO_SUBJECT_MATCHING
+X    /* First, check the other root's subjects for a match. */
+X    for (node = root_root; node; node = node->link) {
+X	for (subject = node->subjects; subject; subject = subject->link) {
+X	    if (subject_equal(subject->str, subject_str)) {
+X		use_root(article, node);		/* use it instead */
+X		link_child(article);
+X		return;					/* RETURN */
+X	    }
+X	}
+X    }
+X#endif
+X
+X    /* Create a new root. */
+X    new = (ROOT *)safemalloc(sizeof (ROOT));
+X    total.root++;
+X    new->articles = article;
+X    new->root_num = article->num;
+X    new->thread_cnt = 1;
+X    if (article->num) {
+X	article->author = new_author();
+X	new->subject_cnt = 1;
+X	new->subjects = article->subject = new_subject();
+X    } else {
+X	new->subject_cnt = 0;
+X	new->subjects = Null(SUBJECT*);
+X    }
+X    article->root = new;
+X    new->link = root_root;
+X    root_root = new;
+X}
+X
+X/* Add this article's subject onto the indicated root's list.  Point the
+X** article at the root.
+X*/
+void
+use_root(article, root)
+ARTICLE *article;
+ROOT *root;
+X{
+X    register SUBJECT *subject;
+X    register ROOT *root2;
+X    SUBJECT *hold, *child_subj = Null(SUBJECT*), *sib_subj = Null(SUBJECT*);
+X    ARTICLE *node;
+X
+X    article->root = root;
+X
+X    /* If it's a fake, there's no subject to add. */
+X    if (!article->num) {
+X	return;						/* RETURN */
+X    }
+X
+X    /* If we haven't picked a unique message number to represent this root,
+X    ** use the first non-zero number we encounter.  Which one doesn't matter.
+X    */
+X    if (!root->root_num) {
+X	root->root_num = article->num;
+X    }
+X    article->author = new_author();
+X
+X    /* Check if the new subject matches any of the other subjects in this root.
+X    ** If so, we just update the count.  If not, check all the other roots for
+X    ** a match.  If found, the new subject is common between the two roots, so
+X    ** we merge the two roots together.
+X    */
+X    root2 = root;
+X#ifndef NO_SUBJECT_MATCHING
+X    do {
+X#endif
+X	for (subject = root2->subjects; subject; subject = subject->link) {
+X	    if (subject_equal(subject->str, subject_str)) {
+X		article->subject = subject;
+X		subject->count++;
+X#ifndef NO_SUBJECT_MATCHING
+X		if (root2 != root) {
+X		    merge_roots(root, root2);
+X		}
+X#endif
+X		return;					/* RETURN */
+X	    }
+X	}
+X#ifndef NO_SUBJECT_MATCHING
+X	if ((root2 = root2->link) == Null(ROOT*)) {
+X	    root2 = root_root;
+X	}
+X    } while (root2 != root);
+X#endif
+X
+X    article->subject = hold = new_subject();
+X    root->subject_cnt++;
+X
+X    /* Find the subject of any pre-existing children or siblings.  We want
+X    ** to insert the new subject before one of these to keep the numbering
+X    ** intuitive in the newsreader.
+X    */
+X    for (node = article->children; node; node = node->children) {
+X	if (node->subject) {
+X	    child_subj = node->subject;
+X	    break;
+X	}
+X    }
+X    for (node = article->siblings; node; node = node->siblings) {
+X	if (node->subject) {
+X	    sib_subj = node->subject;
+X	    break;
+X	}
+X    }
+X    if (!(subject = root->subjects)
+X     || subject == child_subj || subject == sib_subj) {
+X	hold->link = root->subjects;
+X	root->subjects = hold;
+X    } else {
+X	while (subject->link
+X	 && subject->link != child_subj && subject->link != sib_subj) {
+X	    subject = subject->link;
+X	}
+X	hold->link = subject->link;
+X	subject->link = hold;
+X    }
+X}
+X
+X/* Check subjects in a case-insignificant, punctuation-ignoring manner.
+X*/
+int
+subject_equal(str1, str2)
+register char *str1, *str2;
+X{
+X    register char ch1, ch2;
+X
+X    while ((ch1 = *str1++)) {
+X	if (ch1 == ' ' || ispunct(ch1)) {
+X	    while (*str1 && (*str1 == ' ' || ispunct(*str1))) {
+X		str1++;
+X	    }
+X	    ch1 = ' ';
+X	} else if (isupper(ch1)) {
+X	    ch1 = tolower(ch1);
+X	}
+X	if (!(ch2 = *str2++)) {
+X	    return 0;
+X	}
+X	if (ch2 == ' ' || ispunct(ch2)) {
+X	    while (*str2 && (*str2 == ' ' || ispunct(*str2))) {
+X		str2++;
+X	    }
+X	    ch2 = ' ';
+X	} else if (isupper(ch2)) {
+X	    ch2 = tolower(ch2);
+X	}
+X	if (ch1 != ch2) {
+X	    return 0;
+X	}
+X    }
+X    if (*str2) {
+X	return 0;
+X    }
+X    return 1;
+X}
+X
+X/* Create a new subject structure. */
+SUBJECT *
+new_subject()
+X{
+X    register int len = strlen(subject_str) + 1;
+X    register SUBJECT *subject;
+X
+X    subject = (SUBJECT *)safemalloc(sizeof (SUBJECT));
+X    total.subject++;
+X    subject->count = 1;
+X    subject->link = Null(SUBJECT*);
+X    subject->str = safemalloc(len);
+X    total.string1 += len;
+X    bcopy(subject_str, subject->str, len);
+X
+X    return subject;
+X}
+X
+X/* Create a new author structure. */
+AUTHOR *
+new_author()
+X{
+X    register len = strlen(author_str) + 1;
+X    register AUTHOR *author, *last_author;
+X
+X    last_author = Null(AUTHOR*);
+X    for (author = author_root; author; author = author->link) {
+X#ifndef DONT_COMPARE_AUTHORS	/* might like to define this to save time */
+X	if (strEQ(author->name, author_str)) {
+X	    author->count++;
+X	    return author;				/* RETURN */
+X	}
+X#endif
+X	last_author = author;
+X    }
+X
+X    author = (AUTHOR *)safemalloc(sizeof (AUTHOR));
+X    total.author++;
+X    author->count = 1;
+X    author->link = Null(AUTHOR*);
+X    author->name = safemalloc(len);
+X    total.string1 += len;
+X    bcopy(author_str, author->name, len);
+X
+X    if (last_author) {
+X	last_author->link = author;
+X    } else {
+X	author_root = author;
+X    }
+X    return author;
+X}
+X
+X/* Insert all of root2 into root1, setting the proper root values and
+X** updating subject counts.
+X*/
+void
+merge_roots(root1, root2)
+ROOT *root1, *root2;
+X{
+X    register ARTICLE *node, *next;
+X    register SUBJECT *subject;
+X
+X    /* Remember whoever's root num is lower.  This could screw up a
+X    ** newsreader's kill-thread code if someone already saw the roots as
+X    ** being separate, but it must be done.  The newsreader code will have
+X    ** to handle this as best as it can.
+X    */
+X    if (root1->root_num > root2->root_num) {
+X	root1->root_num = root2->root_num;
+X    }
+X
+X    for (node = root2->articles; node; node = next) {
+X	/* For each article attached to root2: detach it, set the branch's
+X	** root pointer to root1, and then attach it to root1.
+X	*/
+X	next = node->siblings;
+X	unlink_child(node);
+X	node->siblings = Nullart;
+X	set_root(node, root1);		/* sets children too */
+X	/* Link_child() depends on node->parent being null and node->root
+X	** being set.
+X	*/
+X	link_child(node);
+X    }
+X    root1->subject_cnt += root2->subject_cnt;
+X    if (!(subject = root1->subjects)) {
+X	root1->subjects = root2->subjects;
+X    } else {
+X	while (subject->link) {
+X	    subject = subject->link;
+X	}
+X	subject->link = root2->subjects;
+X    }
+X    unlink_root(root2);
+X    free_root(root2);
+X}
+X
+X/* When merging roots, we need to reset all the root pointers.
+X*/
+void
+set_root(node, root)
+ARTICLE *node;
+ROOT *root;
+X{
+X    do {
+X	node->root = root;
+X	if (node->children) {
+X	    set_root(node->children, root);
+X	}
+X    } while (node = node->siblings);
+X}
+X
+X/* Unlink a root from its neighbors. */
+void
+unlink_root(root)
+register ROOT *root;
+X{
+X    register ROOT *node;
+X
+X    if ((node = root_root) == root) {
+X	root_root = root->link;
+X    } else {
+X	while (node->link != root) {
+X	    node = node->link;
+X	}
+X	node->link = root->link;
+X    }
+X}
+X
+X/* Free an article and its message-id string.  All other resources must
+X** already be free, and it must not be attached to any threads.
+X*/
+void
+free_article(this)
+ARTICLE *this;
+X{
+X    register ARTICLE *art;
+X
+X    if ((art = this->domain->ids) == this) {
+X	if (!(this->domain->ids = this->id_link)) {
+X	    free_domain(this->domain);
+X	}
+X    } else {
+X	while (this != art->id_link) {
+X	    art = art->id_link;
+X	}
+X	art->id_link = this->id_link;
+X    }
+X    total.string2 -= strlen(this->id) + 1;
+X    free(this->id);
+X    free(this);
+X    total.article--;
+X}
+X
+X/* Free the domain only when its last unique id has been freed. */
+void
+free_domain(this)
+DOMAIN *this;
+X{
+X    register DOMAIN *domain;
+X
+X    if (this == (domain = &unk_domain)) {
+X	return;
+X    }
+X    if (this == next_domain) {	/* help expire routine skip freed domains */
+X	next_domain = next_domain->link;
+X    }
+X    while (this != domain->link) {
+X	domain = domain->link;
+X    }
+X    domain->link = this->link;
+X    total.string2 -= strlen(this->name) + 1;
+X    free(this->name);
+X    free(this);
+X    total.domain--;
+X}
+X
+X/* Free the subject structure and its string. */
+void
+free_subject(this)
+SUBJECT *this;
+X{
+X    total.string1 -= strlen(this->str) + 1;
+X    free(this->str);
+X    free(this);
+X    total.subject--;
+X}
+X
+X/* Free a root.  It must already be unlinked. */
+void
+free_root(this)
+ROOT *this;
+X{
+X    free(this);
+X    total.root--;
+X}
+X
+X/* Free the author structure when it's not needed any more. */
+void
+free_author(this)
+AUTHOR *this;
+X{
+X    total.string1 -= strlen(this->name) + 1;
+X    free(this->name);
+X    free(this);
+X    total.author--;
+X}
+X
+X#if defined(SERVER) && !defined(USLEEP)
+usleep(usec)
+long usec;
+X{
+X# ifndef USELECT
+X    if (usec /= 1000000) {
+X	sleep((int)usec);
+X    }
+X# else
+X    struct timeval t;
+X
+X    if (usec <= 0) {
+X	return;
+X    }
+X    t.tv_usec = usec % 1000000;
+X    t.tv_sec  = usec / 1000000;
+X    (void) select(1, 0, 0, 0, &t);
+X# endif
+X}
+X#endif
+END_OF_FILE
+if test 36510 -ne `wc -c <'mt-process.c'`; then
+    echo shar: \"'mt-process.c'\" unpacked with wrong size!
+fi
+# end of 'mt-process.c'
+fi
+echo shar: End of archive 11 \(of 13\).
+cp /dev/null ark11isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 13 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

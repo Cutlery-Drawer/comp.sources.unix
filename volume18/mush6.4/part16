@@ -1,0 +1,1616 @@
+Subject:  v18i038:  Mail user's shell version 6.4, Part16/19
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Dan Heller <island!argv@sun.com>
+Posting-number: Volume 18, Issue 38
+Archive-name: mush6.4/part16
+
+
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 16 (of 19)."
+# Contents:  mail.c
+# Wrapped by rsalz@papaya.bbn.com on Mon Mar 13 19:25:22 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'mail.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mail.c'\"
+else
+echo shar: Extracting \"'mail.c'\" \(46580 characters\)
+sed "s/^X//" >'mail.c' <<'END_OF_FILE'
+X/* @(#)mail.c 	(c) copyright 1986 (Dan Heller) */
+X
+X#include "mush.h"
+X
+X/*
+X * mail.c --
+X *    do_mail() 	invoked from within mail.  see function for description.
+X *    abort_mail()	suntools specific: resets panel items and so forth.
+X *    start_file()      creates the editing file and reset signal catching.
+X *    mail_someone()    called from do_mail() or from the shell.
+X *    add_to_letter()	adds the next line to letter --determine ~ escapes.
+X *    finish_up_letter()  prompts for Cc:, verifies user really wants to send
+X *    send_it()		invokes mailer, sends to record file, expands aliases,
+X *			adds own_hdrs.
+X *    rm_edfile()	signals are directed here. remove letter, longjmp
+X *
+X * The flow of control in this file is NOT obvious to allow for both text
+X * and suntools _event driven_ attributes.  In text, the flow is far more
+X * obvious because it is sequential. In suntools, each function is called
+X * from outside this module.  Keystrokes are interpreted individually and
+X * queued up in "rite.c".  select.c calls add_to_letter when a \n is entered
+X * passing the string stored in rite.c.  If you're trying to follow the flow
+X * of control for suntools, keep the event drivers in mind and follow select.c
+X * and rite.c
+X */
+X#define TO_FIELD	1
+X#define SUBJECT		2
+X#define CC_FIELD	3
+X#define BC_FIELD	4
+X
+Xstatic char Subject[BUFSIZ],To[HDRSIZ],Cc[HDRSIZ],Bcc[HDRSIZ],in_reply_to[256];
+Xstatic int killme;
+Xstatic u_long flags;
+Xstatic SIGRET (*oldterm)(), (*oldint)(), (*oldquit)();
+Xstatic void send_it();
+Xstatic jmp_buf cntrl_c_buf;
+XFILE *ed_fp;
+Xchar *edfile;
+X
+X/* argc, and argv could be null if coming from compose */
+Xdo_mail(n, argv, list)
+Xregister int n;   /* no need for "argc", so use the space for a variable */
+Xregister char **argv, *list;
+X{
+X    char firstchar = (argv)? **argv: 'm';
+X    char *to = NULL, *cc = NULL, *addcc = NULL, *bcc = NULL, *subj = NULL;
+X    char *route = NULL;
+X    char inc_list[MAXMSGS_BITS], buf[HDRSIZ];
+X    u_long flgs = 0;
+X
+X    if (ison(glob_flags, IS_GETTING)) {
+X	print("You must finish the letter you are editing first.\n");
+X	return -1;
+X    }
+X    if (ison(glob_flags, DO_PIPE)) {
+X	print("You can't pipe through the mail command.\n");
+X	return -1;
+X    }
+X    turnon(flgs, NO_IGNORE); /* if we include a message, include all hdrs */
+X    clear_msg_list(inc_list);
+X
+X    if (do_set(set_options, "autoedit"))
+X	turnon(flgs, EDIT);
+X#ifdef VERBOSE_ARG
+X    if (do_set(set_options, "verbose"))
+X	turnon(flgs, VERBOSE);
+X#endif /* VERBOSE_ARG */
+X    if (do_set(set_options, "autosign"))
+X	turnon(flgs, SIGN);
+X    /* If piped to mail, include the messages piped */
+X    if (ison(glob_flags, IS_PIPE) ||
+X	(lower(firstchar) == 'r' && do_set(set_options, "autoinclude"))) {
+X	turnon(flgs, INCLUDE);
+X	bitput(list, inc_list, msg_cnt, =);
+X    }
+X    while (argv && *argv && *++argv && **argv == '-') {
+X	n = 1;
+X	while (n && argv[0][n])
+X	    switch (argv[0][n]) {
+X#ifdef VERBOSE_ARG
+X		case 'v': turnon(flgs, VERBOSE); n++; break;
+X#endif /* VERBOSE_ARG */
+X		case 'e': turnon(flgs, EDIT); n++;
+X		when 'F': turnon(flgs, DO_FORTUNE); n++;
+X		when 'b':
+X		    if (argv[1]) {
+X			n = 0, bcc = *++argv;
+X			fix_up_addr(bcc);
+X		    } else {
+X			print("Must specify blind-carbon list\n");
+X			return -1;
+X		    }
+X		when 'c':
+X		    if (argv[1]) {
+X			n = 0, addcc = *++argv;
+X			fix_up_addr(addcc);
+X		    } else {
+X			print("Must specify carbon-copy list\n");
+X			return -1;
+X		    }
+X		when 's':
+X		    if (argv[1])
+X			n = 0, subj = *++argv;
+X		    else
+X			n++, turnon(flgs, NEW_SUBJECT);
+X		when 'i': case 'h': case 'f': {
+X		    int m;
+X		    if (!msg_cnt) {
+X			print("No message to include!\n");
+X			return -1;
+X		    }
+X		    if (argv[0][n] == 'i') {
+X			turnon(flgs, INCLUDE);
+X			turnoff(flgs, INCLUDE_H);
+X			turnoff(flgs, FORWARD);
+X		    } else if (argv[0][n] == 'h') {
+X			turnon(flgs, INCLUDE_H);
+X			turnoff(flgs, INCLUDE);
+X			turnoff(flgs, FORWARD);
+X		    } else if (argv[0][n] == 'f') {
+X			turnon(flgs, FORWARD);
+X			turnoff(flgs, INCLUDE_H);
+X			turnoff(flgs, INCLUDE);
+X		    }
+X		    /* "-i 3-5" or "-i3-5"  Consider the latter case first */
+X		    if (!argv[0][++n])
+X			argv++, n = 0;
+X		    (*argv) += n;
+X		    m = get_msg_list(argv, inc_list);
+X		    (*argv) -= n;
+X		    if (m == -1)
+X			return -1;
+X		    /* if there were args, then go back to the first char
+X		     * in the next argv
+X		     */
+X		    if (m)
+X			n = 0;
+X		    if (!n) /* n may be 0 from above! */
+X			argv += (m-1);
+X		}
+X		when 'r':
+X		    if (lower(firstchar) == 'r') {
+X			route = *++argv;
+X			n = 0;
+X			break;
+X		    }
+X		    /* fall thru */
+X		default:
+X		    if (argv[0][n] != '?')
+X			wprint("%c: unknown option\n", argv[0][n]);
+X		    wprint("available options\n");
+X#ifdef VERBOSE_ARG
+X		    wprint("v      verbose (passed to mail delivery system)\n");
+X#endif /* VERBOSE_ARG */
+X		    wprint("e      immediately enter editor (autoedit)\n");
+X		    wprint("F      add fortune to the end of message.\n");
+X		    wprint("s [subject]  prompt for or set subject.\n");
+X		    wprint("c cc-addrs   set carbon-copy recipients.\n");
+X		    wprint("b bcc-addrs  set blind-carbon-copy recipients.\n");
+X		    wprint("i [msg#'s]   include msg_list into letter.\n");
+X		    wprint("h [msg#'s]   include msg_list with headers.\n");
+X		    wprint("f [msg#'s]   forward msg_list (not indented).\n");
+X		    return -1;
+X	    }
+X    }
+X    *in_reply_to = *To = *Subject = *Cc = *Bcc = 0;
+X    if (lower(firstchar) == 'r') {
+X	char *old_fmt = hdr_format, *pcc = NULL;
+X	to = To, cc = Cc;
+X	/*
+X	 * Generate a reply to all the messages passed to respond().  This
+X	 * list is different than the include-msg list above.  Get info about
+X	 * whom the messages were sent to for reply-all.
+X	 * BUG: currently, redundant addresses aren't pruned from Bcc list!
+X	 */
+X	for (n = 0; n < msg_cnt; n++)
+X	    if (msg_bit(list, n)) {
+X		if (to != To)
+X		    *to++ = ',', *to++ = ' ';
+X		(void) reply_to(n, (firstchar == 'R'), buf);
+X		if (strlen(buf) + (to - To) > sizeof(To) - 1) {
+X		    print("# recipients exceeded at msg %d\n", n);
+X		    break;
+X		}
+X		to += Strcpy(to, buf);
+X		if (firstchar == 'R') {
+X		    if (pcc) /* if there was a previous cc, append ", " */
+X			*cc++ = ',', *cc++ = ' ';
+X		    if (pcc = cc_to(n, buf))
+X			if (strlen(pcc) + (cc - Cc) > sizeof(Cc) - 1)
+X			    print("# Cc's exceeded at msg %d\n", n);
+X			else
+X			    cc += Strcpy(cc, pcc);
+X		}
+X		/* remove redundant addresses now, or headers could get too
+X		 * long before the list runs out (it still might)
+X		 */
+X		rm_redundant_addrs(To, Cc);
+X		to = To + strlen(To);
+X		cc = Cc + strlen(Cc);
+X	    }
+X	/* clean up end of Cc line for replyall's */
+X	while (*cc == ' ' || *cc == ',')
+X	    *cc-- = '\0';
+X	to = To, cc = Cc;
+X	if (route || (route = do_set(set_options, "auto_route")))
+X	    /* careful! This routine could add lots-o-bytes and lose addresses
+X	     * to avoid writing out of segment.
+X	     */
+X	    route_addresses(To, Cc, route);
+X	if (hdr_format = do_set(set_options, "in_reply_to"))
+X	    /* "9" here is a magic # --see compose_hdr() */
+X	    (void) strcpy(in_reply_to, compose_hdr(current_msg)+9);
+X	hdr_format = old_fmt;
+X    }
+X    if (ison(flgs, FORWARD) && ison(flgs, EDIT) ||
+X	    lower(firstchar) == 'r' && isoff(flgs, NEW_SUBJECT)) {
+X	turnoff(flgs, NEW_SUBJECT);
+X	if (subj = subject_to(current_msg, buf))
+X	    subj = strcpy(Subject, buf + 4*(lower(firstchar) != 'r'));
+X    } else if (isoff(flgs, NEW_SUBJECT) && isoff(flgs, FORWARD) &&
+X	(do_set(set_options, "ask") || do_set(set_options, "asksub")))
+X	turnon(flgs, NEW_SUBJECT);
+X    if (argv && *argv) {
+X	char buf[HDRSIZ];
+X	(void) argv_to_string(buf, argv);
+X	fix_up_addr(buf);
+X	to = &To[strlen(To)];
+X	if (*To)
+X	    *to++ = ',', *to++ = ' ';
+X	(void) strcpy(to, buf);
+X	to = To;
+X    }
+X    if (addcc && *addcc) {
+X	cc = &Cc[strlen(Cc)];
+X	if (*Cc)
+X	    *cc++ = ',', *cc++ = ' ';
+X	(void) strcpy(cc, addcc); /* addcc has already been fixed up */
+X	cc = Cc;
+X    }
+X    /* remove any redundant addresses that just got added */
+X    rm_redundant_addrs(To, Cc);
+X    if (bcc && *bcc)
+X	(void) strncpy(Bcc, bcc, sizeof(Bcc)); /* bcc already fixed up */
+X    bcc = Bcc;
+X    if (do_set(set_options, "fortune"))
+X	turnon(flgs, DO_FORTUNE);
+X#ifdef SUNTOOL
+X    if (istool) {
+X	do_clear();
+X	panel_set(abort_item,   PANEL_SHOW_ITEM, TRUE,  0);
+X	panel_set(comp_item,    PANEL_SHOW_ITEM, FALSE, 0);
+X	panel_set(read_item,    PANEL_SHOW_ITEM, FALSE, 0);
+X	panel_set(respond_item, PANEL_SHOW_ITEM, FALSE, 0);
+X    }
+X#endif /* SUNTOOL */
+X    return mail_someone(to, subj, cc, bcc, flgs, inc_list);
+X}
+X
+X#ifdef SUNTOOL
+X/* panel item selection -- it's here because of local (static) variables */
+Xabort_mail(item, value)
+XPanel_item item;
+X{
+X    get_hdr_field = 0;
+X    if (item == abort_item && value != 2) {
+X	print("Aborted letter.");
+X	killme = 1, rm_edfile(SIGINT);
+X	flags = 0;
+X    }
+X    panel_set(comp_item,    PANEL_SHOW_ITEM, TRUE,  0);
+X    panel_set(send_item,    PANEL_SHOW_ITEM, FALSE, 0);
+X    panel_set(edit_item,    PANEL_SHOW_ITEM, FALSE, 0);
+X    panel_set(abort_item,   PANEL_SHOW_ITEM, FALSE, 0);
+X    panel_set(read_item,    PANEL_SHOW_ITEM, TRUE,  0);
+X    panel_set(respond_item, PANEL_SHOW_ITEM, TRUE,  0);
+X    turnoff(glob_flags, IS_GETTING);
+X    unlock_cursors();
+X}
+X#endif /* SUNTOOL */
+X
+Xmail_someone(to, subject, cc, bcc, flgs, list)
+Xregister char *to, *subject, *cc, *bcc, *list;
+Xu_long flgs;
+X{
+X    register char *p;
+X
+X    flags = flgs;
+X#ifdef SUNTOOL
+X    if (istool)
+X	rite(_tty.sg_kill), do_clear();
+X#endif /* SUNTOOL */
+X    if (to && *to) {
+X	if (!*To)
+X	    (void) strncpy(To, to, sizeof(To));
+X	if (istool)
+X	    wprint("To: %s\n", To);
+X    } else
+X#ifdef SUNTOOL
+X	if (istool)
+X	    turnon(get_hdr_field, TO_FIELD);
+X	else
+X#endif /* SUNTOOL */
+X	    to = NO_STRING;
+X    if (subject && *subject) {
+X	if (!*Subject)
+X	    (void) strncpy(Subject, subject, sizeof(Subject));
+X	if (istool)
+X	    wprint("Subject: %s\n", Subject);
+X    } else
+X#ifdef SUNTOOL
+X	if (istool && !*Subject && ison(flags, NEW_SUBJECT))
+X	    turnon(get_hdr_field, SUBJECT);
+X	else
+X#endif /* SUNTOOL */
+X	    subject = NO_STRING;
+X    if (cc && *cc) {
+X	if (!*Cc)
+X	    (void) strncpy(Cc, cc, sizeof(Cc));
+X	if (istool)
+X	    wprint("Cc: %s\n", Cc);
+X    } else
+X#ifdef SUNTOOL  /* get_hdr_field -- prevents prompting on reply and forward */
+X	if (istool && get_hdr_field && do_set(set_options, "askcc"))
+X	    turnon(get_hdr_field, CC_FIELD);
+X	else
+X#endif /* SUNTOOL */
+X	    Cc[0] = '\0';
+X    if (bcc && *bcc) {
+X	if (!*Bcc)
+X	    (void) strncpy(Bcc, bcc, sizeof(Bcc));
+X	if (istool)
+X	    wprint("Bcc: %s\n", Bcc);
+X    } else
+X#ifdef SUNTOOL  /* get_hdr_field -- prevents prompting on reply and forward */
+X	if (istool && get_hdr_field)
+X	    turnon(get_hdr_field, BC_FIELD);
+X	else
+X#endif /* SUNTOOL */
+X	    Bcc[0] = '\0';
+X
+X    if (ison(glob_flags, REDIRECT)) {
+X	send_it(); /* doesn't return */
+X	return 0;
+X    }
+X    /* if (!*to) then prompting will be done */
+X    if (!istool) {
+X	if (!(p = set_header("To: ", to, !*to)) || !*p) {
+X	    puts("No recipients, can't mail.");
+X	    return -1;
+X	}
+X	if (!*to) /* if user typed To-line here, fix up the address line */
+X	    fix_up_addr(p);
+X	(void) strcpy(To, p);
+X	/* don't prompt for subject if forwarding mail */
+X	if (isoff(flags, FORWARD) && 
+X		(p = set_header("Subject: ", subject,
+X			!*subject && ison(flags, NEW_SUBJECT))))
+X	    (void) strcpy(Subject, p);
+X	if (*Cc)
+X	    printf("Cc: %s\n", Cc);
+X	if (*Bcc)
+X	    printf("Bcc: %s\n", Bcc);
+X	putchar('\n');
+X    }
+X#ifdef SUNTOOL
+X    else if (!get_hdr_field) {
+X	panel_set(send_item, PANEL_SHOW_ITEM, TRUE, 0);
+X	panel_set(edit_item, PANEL_SHOW_ITEM, TRUE, 0);
+X    } else if (ison(flags, FORWARD) && ison(flags, EDIT) &&
+X	    ison(get_hdr_field, TO_FIELD)) {
+X	print("Specify recipient(s) to forward in tool mode.\n");
+X	return -1;
+X    }
+X#endif /* SUNTOOL */
+X    /* If forwarding w/o editing, start a new file for each */
+X    if (ison(flags, FORWARD) && isoff(flags, EDIT)) {
+X	char fwd[MAXMSGS_BITS];
+X	register int i;
+X	clear_msg_list(fwd);
+X	for (i = 0; i < msg_cnt; i++)
+X	    if (msg_bit(list, i)) {
+X		set_msg_bit(fwd, i);
+X		if (start_file(fwd) < 0)
+X		    return -1;
+X		clear_msg_list(fwd);
+X	    }
+X    } else
+X	return start_file(list);
+X}
+X
+Xstart_file(list)
+Xchar *list;
+X{
+X    register char  *dir;
+X    register int   i;
+X    char  	   line[MAXPATHLEN];
+X
+X    if (!(dir = do_set(set_options, "tmpdir")) &&
+X	!(dir = do_set(set_options, "home")))
+Xalted:
+X	dir = ALTERNATE_HOME;
+X    (void) mktemp(sprintf(line, "%s/%s", dir, EDFILE));
+X    strdup(edfile, line);
+X    if (!(ed_fp = mask_fopen(edfile, "w+"))) {
+X	if (strcmp(dir, ALTERNATE_HOME))
+X	    goto alted;
+X#ifdef SUNTOOL
+X	if (istool)
+X	    abort_mail(NO_ITEM, 0);
+X#endif /* SUNTOOL */
+X	error("can't create %s", edfile);
+X	return -1;
+X    }
+X    if (!istool) {
+X	oldint = signal(SIGINT, rm_edfile);
+X	oldquit = signal(SIGQUIT, rm_edfile);
+X	oldterm = signal(SIGTERM, rm_edfile);
+X    }
+X
+X    /* if flags call for it, include current message (with header?) */
+X    if (ison(flags, INCLUDE) || ison(flags,FORWARD) || ison(flags,INCLUDE_H)) {
+X	long copy_flgs = 0, is_forw = ison(flags, FORWARD);
+X	char buf[sizeof(To)];
+X	if (is_forw)
+X	    turnon(copy_flgs, FORWARD);
+X	else
+X	    turnon(copy_flgs, INDENT);
+X	if (ison(flags, INCLUDE))
+X	    turnon(copy_flgs, NO_HEADER);
+X	if (ison(flags, INCLUDE) || is_forw)
+X	    turnon(copy_flgs, NO_IGNORE);
+X#ifdef MMDF
+X	turnon(copy_flgs, NO_SEPARATOR);
+X#endif /* MMDF */
+X#ifdef SUNTOOL
+X	if (istool)
+X	    lock_cursors();
+X#endif /* SUNTOOL */
+X	for (i = 0; i < msg_cnt; i++)
+X	    if (msg_bit(list, i)) {
+X		if (is_forw && ison(flags, EDIT)) {
+X		    (void) reply_to(i, FALSE, buf);
+X		    fprintf(ed_fp, "--- Forwarded mail from %s\n\n", buf);
+X		}
+X		wprint("%sing message %d ...",
+X		    is_forw? "forward" : "includ", i+1);
+X		wprint("(%d lines)\n", copy_msg(i, ed_fp, copy_flgs));
+X		set_isread(i); /* if we included it, we read it, right? */
+X		if (is_forw && ison(flags, EDIT))
+X		    fprintf(ed_fp,
+X			"\n--- End of forwarded message from %s\n", buf);
+X	    }
+X	fflush(ed_fp);
+X#ifdef SUNTOOL
+X	if (istool)
+X	    unlock_cursors();
+X#endif /* SUNTOOL */
+X    }
+X    if (ison(glob_flags, WARNING)) {
+X	if (escape && !strncmp(escape, DEF_ESCAPE, 1))
+X	    wprint("(escape character is set to `%c')\n", *escape);
+X	if (wrapcolumn && wrapcolumn < 20)
+X	    wprint("(warning: wrapping only %d columns from the left!)\n",
+X		    wrapcolumn);
+X    }
+X    turnon(glob_flags, IS_GETTING);
+X    /* enter editor if autoedit and not toolmode */
+X    if (
+X#ifdef SUNTOOL
+X        (!istool || !get_hdr_field) &&
+X#endif /* SUNTOOL */
+X    /* do an "if" again in case editor not found and EDIT turned off */
+X					ison(flags, EDIT)) {
+X	char *argv[3];
+X	if (!(argv[0] = do_set(set_options, "visual")) || !*argv[0])
+X	    argv[0] = DEF_EDITOR;
+X	argv[1] = edfile;
+X	argv[2] = NULL;
+X	print("Starting \"%s\"...\n", argv[0]);
+X	fclose(ed_fp);
+X	ed_fp = NULL_FILE;
+X	execute(argv);
+X	turnoff(flags, EDIT);
+X	turnoff(flags, FORWARD); /* forwarded messages must be unedited */
+X	/* upon exit of editor, user must now type ^D or "." to send */
+X	if (istool)
+X	    return 0;
+X	if (!(ed_fp = fopen(edfile, "r+"))) {
+X	    error("can't reopen %s", edfile);
+X	    return -1;
+X	}
+X	(void) fseek(ed_fp, 0L, 2);
+X	puts("continue editing letter or ^D to send");
+X    } else if (ison(flags, FORWARD) &&
+X#ifdef SUNTOOL
+X	       (!istool || !get_hdr_field) &&
+X#endif /* SUNTOOL */
+X	       finish_up_letter())
+X	return 0; /* if forwarding mail, check to see if tool requires To: */
+X#ifdef SUNTOOL
+X    if (istool) {
+X	/* If toolmode, we're ready for IO. Give first prompt if not given */
+X	if (ison(get_hdr_field, TO_FIELD))
+X	    wprint("To: ");
+X	else if (ison(get_hdr_field, SUBJECT))
+X	    wprint("Subject: ");
+X	else if (ison(get_hdr_field, CC_FIELD))
+X	    wprint("Cc: ");
+X	type_cursor(PIX_SRC);
+X	win_setcursor(msg_sw->ts_windowfd, &write_cursor);
+X	return 0;
+X    }
+X#endif /* SUNTOOL */
+X    i = 0;
+X    do  {
+X	/* If the user hits ^C in cbreak mode, mush will return to
+X	 * Getstr and not clear the buffer. whatever is typed next will
+X	 * be appended to the line.  jumping here will force the line to
+X	 * be cleared cuz it's a new call.
+X	 */
+X	(void) setjmp(cntrl_c_buf);
+X	while (Getstr(line, sizeof(line), 0) > -1) {
+X	    if (!istool) /* toolmode checks on a timer -- don't do it here */
+X		(void) check_new_mail(); /* if new mail comes in, get it */
+X	    if ((i = add_to_letter(line)) <= 0)
+X		break;
+X	}
+X    } while (i >= 0 && !finish_up_letter());
+X    return i; /* return -1 if ~x or ~q to terminate letter */
+X}
+X
+Xchar *tilde_commands[] = {
+X    "commands: [OPTIONAL argument]",
+X    "e [editor]\tEnter editor. Editor used: \"set editor\", env EDITOR, vi",
+X    "v [editor]\tEnter visual editor. \"set visual\", env VISUAL, vi",
+X    "p [pager]\tPage message; pager used: \"set pager\", env. PAGER, more",
+X    "i [msg#'s]\tInclude current msg body [msg#'s] indented by \"indent_str\"",
+X    "H [msg#'s]\tSame, but include the message headers from included messages",
+X    "f [msg#'s]\tForward mail. Not indented, but marked as \"forwarded mail\"",
+X    "t [list]\tChange list of recipients",
+X    "s [subject]\tModify [set] subject header",
+X    "c [cc list]\tModify [set] carbon copy recipients",
+X    "b [bcc list]\tModify [set] blind carbon recipients",
+X    "h\t\tModify all message headers",
+X    "S[!]\t\tInclude Signature file [suppress file]",
+X    "F[!]\t\tAdd a fortune at end of letter [don't add]",
+X    "w file\t\tWrite msg buffer to file name",
+X    "a file\t\tAppend msg buffer to file name",
+X    "r file\t\tRead filename into message buffer",
+X    "q \t\tQuit message; save in dead.letter (unless \"nosave\" is set).",
+X    "x \t\tQuit message; don't save in dead.letter.",
+X    "$variable\tInsert the string value for \"variable\" into message.",
+X    ":cmd\t\tRun the mail command \"cmd\".",
+X    "u\t\tedit previous line in file.",
+X    "E[!]\t\tClear contents of letter after saving to dead.letter [unless !].",
+X    0
+X};
+X
+X/*
+X * Add the line (char *) parameter to the letter.  Determine tilde
+X * escapes and determine what to do.  This function returns 0 to
+X * indicate user wants to end the letter, -1 if the letter cannot
+X * be sent (~q, ~x no buffer after editor, etc...) or 1 to indicate
+X * successful addition of the line to the letter.
+X */
+Xadd_to_letter(line)
+Xchar line[];
+X{
+X    register char *p;
+X    char buf[BUFSIZ];
+X
+X    killme = 0;
+X    (void) fseek(ed_fp, 0L, 2);
+X#ifdef SUNTOOL
+X    if (get_hdr_field) {
+X	/* These are received in order by design! */
+X	if (ison(get_hdr_field, TO_FIELD)) {
+X	    if (!line[0]) {
+X	        wprint("There must be a recipient!\nTo: ");
+X		return 1;
+X	    }
+X	    fix_up_addr(line);
+X	    (void) strcpy(To, line), turnoff(get_hdr_field, TO_FIELD);
+X	} else if (ison(get_hdr_field, SUBJECT)) {
+X	    (void) strcpy(Subject, line);
+X	    turnoff(get_hdr_field, SUBJECT);
+X	} else if (ison(get_hdr_field, CC_FIELD)) {
+X	    fix_up_addr(line);
+X	    (void) strcpy(Cc, line);
+X	    turnoff(get_hdr_field, CC_FIELD);
+X	} else if (ison(get_hdr_field, BC_FIELD)) {
+X	    fix_up_addr(line);
+X	    (void) strcpy(Bcc, line);
+X	    turnoff(get_hdr_field, BC_FIELD);
+X	}
+X
+X        if (ison(get_hdr_field, SUBJECT))
+X	    (void) set_header("Subject: ", Subject, 1);
+X        else if (ison(get_hdr_field, CC_FIELD))
+X	    (void) set_header("Cc: ", Cc, 1);
+X        else if (ison(get_hdr_field, BC_FIELD))
+X	    (void) set_header("Bcc: ", Bcc, 1);
+X	panel_set(send_item, PANEL_SHOW_ITEM, (get_hdr_field==0), 0);
+X	panel_set(edit_item, PANEL_SHOW_ITEM, (get_hdr_field==0), 0);
+X	if (!get_hdr_field) {
+X	    wprint("\n");
+X	    if (ison(flags, EDIT)) {
+X		(void) add_to_letter(sprintf(line, "%cv", *escape));
+X		turnoff(flags, EDIT);
+X	    }
+X	}
+X	return 1;
+X    }
+X#endif /* SUNTOOL */
+X    if (!strcmp(line, ".") && (istool || do_set(set_options, "dot")))
+X	return 0;
+X    if (line[0] != *escape) {
+X	fputs(line, ed_fp), fputc('\n', ed_fp), fflush(ed_fp);
+X	return 1;
+X    }
+X    /* all commands are "~c" (where 'c' is the command). set p = first
+X     * character after 'c' and skip whitespace
+X     */
+X    p = &line[2];
+X    skipspaces(0);
+X    switch (line[1]) {
+X	case 'v' : case 'p': case 'e': {
+X	    if (!*p || *p == 'i' && !p[1])
+X		switch (line[1]) {
+X		    case 'p' :
+X			if (!*p && !(p = do_set(set_options, "pager")))
+X			    p = DEF_PAGER;
+X			if (!*p || !strcmp(p, "internal"))
+X			    p = NULL;
+X		    when 'v' :
+X			if (p = do_set(set_options, "visual"))
+X			    break;
+X		    default :
+X			if (!(p = do_set(set_options, "editor")) || !*p)
+X			    p = DEF_EDITOR;
+X		}
+X	    if (line[1] == 'p') {
+X		rewind(ed_fp);
+X		(void) do_pager(p, TRUE); /* start the pager "p" */
+X		do_pager(sprintf(buf, "To: %s\n", To), FALSE);
+X		if (Subject[0])
+X		    do_pager(sprintf(buf, "Subject: %s\n", Subject), FALSE);
+X		if (Cc[0])
+X		    do_pager(sprintf(buf, "Cc: %s\n", Cc), FALSE);
+X		if (Bcc[0])
+X		    do_pager(sprintf(buf, "Bcc: %s\n", Bcc), FALSE);
+X		do_pager(strcpy(buf, "--------\nMessage contains:\n"), FALSE);
+X		while (fgets(buf, sizeof(buf), ed_fp))
+X		    if (do_pager(buf, FALSE) == EOF)
+X			break;
+X		(void) do_pager(NULL, FALSE); /* end pager */
+X	    } else {
+X		char *argv[3];
+X		argv[0] = p;
+X		argv[1] = edfile;
+X		argv[2] = NULL;
+X		fclose(ed_fp);
+X		ed_fp = NULL_FILE;
+X		execute(argv); /* tool will return even tho editor isn't done */
+X		if (istool)
+X		    return 1;
+X		if (!(ed_fp = fopen(edfile, "r+"))) {
+X		    error("can't reopen %s", edfile);
+X		    return -1;
+X		}
+X	    }
+X	}
+X	when '$': {
+X	    register char *p2;
+X	    if (!(p2 = do_set(set_options, p)))
+X		wprint("(%s isn't set)\n", p);
+X	    else
+X		putstring(p2, ed_fp);
+X	}
+X	when ':': {
+X	    char new[MAXMSGS_BITS];
+X	    u_long save_flags = glob_flags;
+X
+X	    turnon(glob_flags, IGN_SIGS);
+X	    turnon(glob_flags, IGN_BANG);
+X	    turnoff(glob_flags, DO_PIPE);
+X	    turnoff(glob_flags, IS_PIPE);
+X	    (void) cmd_line(p, new);
+X	    glob_flags = save_flags;
+X#ifdef SUNTOOL
+X	    if (istool && msg_pix) /* the command was to read a message */
+X		return 1;
+X#endif /* SUNTOOL */
+X	}
+X	when 'i': case 'f': case 'H': case 'm': {
+X	    int  n;
+X	    long copy_flgs = 0;
+X	    char list[MAXMSGS_BITS];
+X
+X	    if (!msg_cnt) {
+X		print("No messages.\n");
+X		break;
+X	    }
+X	    clear_msg_list(list);
+X	    if (line[1] != 'f')
+X		turnon(copy_flgs, INDENT);
+X	    if (line[1] == 'i')
+X		turnon(copy_flgs, NO_HEADER);
+X#ifdef MMDF
+X	    turnon(copy_flgs, NO_SEPARATOR);
+X#endif /* MMDF */
+X	    if (!*p)
+X		set_msg_bit(list, current_msg);
+X	    else if (!do_range(p, list))
+X		return 1;
+X#ifdef SUNTOOL
+X	    if (istool)
+X		lock_cursors();
+X#endif /* SUNTOOL */
+X	    for (n = 0; n < msg_cnt; n++)
+X		if (msg_bit(list, n)) {
+X		    if (line[1] == 'f') {
+X			(void) reply_to(n, FALSE, buf);
+X			fprintf(ed_fp, "--- Forwarded mail from %s\n\n", buf);
+X		    }
+X		    wprint("Including message %d ... ", n+1);
+X		    wprint("(%d lines)\n", copy_msg(n, ed_fp, copy_flgs));
+X		    set_isread(n);
+X		    if (line[1] == 'f')
+X		fprintf(ed_fp,"\n--- End of forwarded message from %s\n\n",buf);
+X		}
+X#ifdef SUNTOOL
+X	    if (istool)
+X		unlock_cursors();
+X#endif /* SUNTOOL */
+X	}
+X	/* To: Cc: and Bcc: headers */
+X	when 'b':
+X	case 't':
+X	case 'c': {
+X	    char *h = (line[1] == 't')? To : (line[1] == 'c')? Cc : Bcc;
+X	    char *Prompt = line[1] == 't'? "To: " :
+X			   line[1] == 'c'? "Cc: " : "Bcc: ";
+X#ifdef SUNTOOL
+X	    if (!*p && istool) {
+X		turnon(get_hdr_field, CC_FIELD);
+X		(void) set_header(Prompt, h, 1);
+X		panel_set(send_item, PANEL_SHOW_ITEM, FALSE, 0);
+X		panel_set(edit_item, PANEL_SHOW_ITEM, FALSE, 0);
+X		return 1;
+X	    }
+X#endif /* SUNTOOL */
+X	    if (*p) {
+X		fix_up_addr(p);
+X		if (*h)
+X		    (void) sprintf(h+strlen(h), ", %s", p);
+X		else
+X		    (void) strcpy(h, p);
+X	    } else if (!(p = set_header(Prompt, h, TRUE)) || !*p)
+X		if (line[1] == 't') {
+X		    wprint("There must be a recipient!\n");
+X#ifdef SUNTOOL
+X		    turnoff(get_hdr_field, TO_FIELD);
+X		    panel_set(send_item, PANEL_SHOW_ITEM, TRUE, 0);
+X		    panel_set(edit_item, PANEL_SHOW_ITEM, TRUE, 0);
+X#endif /* SUNTOOL */
+X		} else
+X		    *h = 0;
+X	    else {
+X		fix_up_addr(p);
+X		(void) strcpy(h, p);
+X	    }
+X	}
+X	when 's':
+X#ifdef SUNTOOL
+X	    if (!*p && istool) {
+X		turnon(get_hdr_field, SUBJECT);
+X		panel_set(send_item, PANEL_SHOW_ITEM, FALSE, 0);
+X		panel_set(edit_item, PANEL_SHOW_ITEM, FALSE, 0);
+X		(void) set_header("Subject: ", Subject, 1);
+X		return 1;
+X	    }
+X#endif /* SUNTOOL */
+X	    if (*p || (p = set_header("Subject: ", Subject, 1)))
+X		if (!*p)
+X		    Subject[0] = 0;
+X		else
+X		    (void) strcpy(Subject, p);
+X	when 'h':
+X#ifdef SUNTOOL
+X	    if (istool) {
+X		turnon(get_hdr_field, TO_FIELD);
+X		turnon(get_hdr_field, SUBJECT);
+X		turnon(get_hdr_field, CC_FIELD);
+X		turnon(get_hdr_field, BC_FIELD);
+X		(void) set_header("To: ", To, 1);
+X		panel_set(send_item, PANEL_SHOW_ITEM, FALSE, 0);
+X		panel_set(edit_item, PANEL_SHOW_ITEM, FALSE, 0);
+X		return 1;
+X	    }
+X#endif /* SUNTOOL */
+X	    while ((p = set_header("To: ", To, 1)) && !*p)
+X		wprint("(There must be a recipient.)\n");
+X	    (void) strcpy(To, p);
+X	    if (p = set_header("Subject: ", Subject, 1))
+X		if (!*p)
+X		    Subject[0] = 0;
+X		else
+X		    (void) strcpy(Subject, p);
+X	    if (p = set_header("Cc: ", Cc, 1))
+X		if (!*p)
+X		    Cc[0] = 0;
+X		else {
+X		    fix_up_addr(p);
+X		    (void) strcpy(Cc, p);
+X		}
+X	    if (p = set_header("Bcc: ", Bcc, 1))
+X		if (!*p)
+X		    Bcc[0] = 0;
+X		else {
+X		    fix_up_addr(p);
+X		    (void) strcpy(Bcc, p);
+X		}
+X	when 'S':
+X	    if (*p == '!')
+X		turnoff(flags, SIGN), wprint("not ");
+X	    else
+X		turnon(flags, SIGN);
+X	    wprint("adding signature file at end of message.\n");
+X	when 'F':
+X	    if (*p == '!')
+X		turnoff(flags, DO_FORTUNE), wprint("not ");
+X	    else
+X		turnon(flags, DO_FORTUNE);
+X	    wprint("adding fortune at end of message.\n");
+X	when 'w': case 'a': case 'r':
+X	    if (!*p) {
+X		wprint("(you must specify a filename)\n");
+X		return 1;
+X	    }
+X	    (void) fseek(ed_fp, 0L, 2); /* append */
+X	    file_to_fp(p, ed_fp, (line[1] == 'r')? "r":
+X			      (line[1] == 'w')? "w": "a");
+X	/* go up one line in the message file and allow the user to edit it */
+X	when 'u': {
+X	    long newpos, pos = ftell(ed_fp);
+X	    char oldline[256];
+X	    if (istool) {
+X		wprint("(Not available in tool mode.)\n");
+X		return 1;
+X	    }
+X	    if (pos <= 0L) { /* pos could be -1 if ftell() failed */
+X		wprint("(No previous line in file.)\n");
+X		return 1;
+X	    }
+X	    /* get the last 256 bytes written and read backwards from the
+X	     * current place until '\n' is found. Start by moving past the
+X	     * first \n which is at the end of the line we want to edit
+X	     */
+X	    newpos = max(0, pos - 256L);
+X	    (void) fseek(ed_fp, newpos, L_SET);
+X	    /* don't fgets -- it'll stop at a \n */
+X	    (void) fread(line, sizeof(char), (int)(pos-newpos), ed_fp);
+X	    pos--;
+X	    /* the last char in line should be a \n cuz it was last input */
+X	    if (line[(int)(pos-newpos)] != '\n')
+X		wprint("I don't know how, but your last line ended with %c.\n",
+X		    line[(int)(pos-newpos)]);
+X	    else
+X		line[(int)(pos-newpos)] = 0; /* null terminate \n for ^H-ing */
+X	    for (pos--; pos > newpos && line[(int)(pos-newpos)] != '\n'; pos--)
+X		;
+X	    /* we've gone back to the end of the second previous line. Check
+X	     * to see if the char we're pointing to is a \n.  It should be, but
+X	     * if it's not, we moved back to the first line of the file.
+X	     */
+X	    if (line[(int)(pos-newpos)] == '\n')
+X		++pos;
+X	    /* save the old line that's there in case the user boo-boos */
+X	    (void) strcpy(oldline, &line[(int)(pos-newpos)]);
+X	    /* let set header print out the line and get the input */
+X	    if (!(p = set_header("", &line[(int)(pos-newpos)], TRUE))) {
+X		wprint("Something bad happened and I don't know what it is.\n");
+X		p = oldline;
+X	    } else if (*p == *escape)
+X		wprint("(Warning: %c escapes ignored on %cu lines.)\n",
+X				*escape, *escape);
+X	    /* seek to to the position where the new line will go */
+X	    (void) fseek(ed_fp, pos, L_SET);
+X	    /* put the newly typed line */
+X	    (void) fputs(p, ed_fp); /* don't add \n. padding may be necessary */
+X	    /* if the new line is less than the old line, we're going to do
+X	     * one of two things.  The best thing to do is to truncate the
+X	     * file to the end of the new line.  Sys-v can't do that, so we
+X	     * pad the line with blanks.  May be messy in some cases, but...
+X	     */
+X	    if ((pos = strlen(p) - strlen(oldline)) < 0) {
+X#ifndef SYSV
+X		/* add the \n, flush the file, truncate to the current pos */
+X		fputc('\n', ed_fp), fflush(ed_fp);
+X		(void) ftruncate(fileno(ed_fp), (int)ftell(ed_fp));
+X#else
+X		/* pad with blanks to the length of the old line. add \n */
+X		while (pos++ < 0)
+X		    fputc(' ', ed_fp);
+X		fputc('\n', ed_fp), fflush(ed_fp);
+X#endif /* SYSV */
+X	    } else
+X		/* the new line is >= the old line, add \n -- no trunc req. */
+X	        fputc('\n', ed_fp);
+X	    return 1;
+X	 }
+X	/* break;  not here cuz of "return" (lint). */
+X	case 'E':
+X	    if (*p != '!' && !do_set(set_options, "nosave"))
+X		dead_letter();
+X	    if (emptyfile(&ed_fp, edfile) == -1)
+X		error(edfile);
+X	    else
+X		wprint("Message buffer empty\n");
+X	when 'q':
+X	    /* save in dead.letter if nosave not set -- rm_edfile(-2). */
+X	    rm_edfile(-2); /* doesn't return out of tool mode */
+X	    return -1;
+X	    /* break; not stated cuz of "return" (lint) */
+X	case 'x':
+X	    /* don't save dead.letter -- simulate normal rm_edfile() call */
+X	    rm_edfile(0);
+X#ifdef SUNTOOL
+X	    if (istool) {
+X		wprint("*Letter aborted*");
+X		type_cursor(PIX_CLR);
+X	    }
+X#endif /* SUNTOOL */
+X	    return -1;
+X	    /* break; (not specified for lint) */
+X	default:
+X	    if (line[1] == *escape) {
+X		fputs(&line[1], ed_fp), fputc('\n', ed_fp), fflush(ed_fp);
+X		return 1;
+X	    } else if (line[1] == '?') {
+X		register int x;
+X		if (!istool)
+X		    (void) do_pager(NULL, TRUE); /* start pager */
+X		for (x = 0; tilde_commands[x]; x++) {
+X		    (void) sprintf(buf, "%s%s\n", escape, tilde_commands[x]);
+X		    if (!istool) {
+X			if (do_pager(buf, FALSE))
+X			    break;
+X		    } else
+X			wprint(buf);
+X		}
+X		(void) sprintf(buf, "%s%s\t\tbegin a line with a single %s\n",
+X		    escape, escape, escape);
+X		if (istool)
+X		    wprint(buf);
+X		else {
+X		    if (tilde_commands[x] == NULL)
+X			(void) do_pager(buf, FALSE);
+X		    (void) do_pager(NULL, FALSE); /* end pager */
+X		}
+X#ifdef SUNTOOL
+X		if (istool)
+X		    (void) help(0, "compose", tool_help);
+X#endif /* SUNTOOL */
+X	    } else
+X		wprint("`%c': unknown %c escape. Use %c? for help.\n",
+X		    line[1], *escape, *escape);
+X    }
+X    (void) fseek(ed_fp, 0L, 2); /* seek to end of file in case there's more */
+X    wprint("(continue editing letter)\n");
+X    return 1;
+X}
+X
+X/*
+X * finish up the letter. ask for the cc line, if verify is set, ask to
+X * verify sending, continue editing, or to dump the whole idea.
+X * Then check for signature and fortune.  Finally, pass it to send_it()
+X * to actually send it off.
+X */
+Xfinish_up_letter()
+X{
+X    register char *p;
+X    int c;
+X    char buf[MAXPATHLEN];
+X
+X    /* forwarded mail has no additional personalized text */
+X    if (ison(flags, FORWARD)) {
+X	send_it();
+X	turnoff(glob_flags, IS_GETTING);
+X	return 1;
+X    }
+X
+X    if (isoff(glob_flags, REDIRECT)) {
+X	if (!istool) {
+X	    if (do_set(set_options, "askcc")) {
+X		if (p = set_header("Cc: ", Cc, 1))
+X		    (void) strcpy(Cc, p);
+X	    }
+X#ifdef MMDF
+X	    /* Give some sort of indication that the end was seen */
+X	    else
+X		wprint("EOT\n");
+X#endif /* MMDF */
+X	}
+X	/* ~v on the Cc line asks for verification, first initialize p! */
+X	p = NULL;
+X	if (!strncmp(Cc, "~v", 2) || (p = do_set(set_options, "verify"))) {
+X	    if (!p) /* so we don't Cc to ~v! */
+X		*Cc = 0;
+X	    for (;;) {
+X#ifdef SUNTOOL
+X		if (istool) {
+X		    type_cursor(PIX_CLR);
+X		    print("Send, Continue, Discard [Left, Middle, Right]?");
+X		    c = confirm(msg_sw->ts_windowfd);
+X		    clr_bot_line(); /* really: clears print window */
+X		    if (isascii(c))
+X			Lower(c);
+X		    else switch(c) {
+X			when MS_LEFT : c = 's';
+X			when MS_MIDDLE : c = 'c';
+X			when MS_RIGHT : c = 'd';
+X			otherwise: c = 0;
+X		    }
+X		} else
+X#endif /* SUNTOOL */
+X		{
+X		    print("send, continue editing, discard [s,c,d]? ");
+X		    c = Getstr(buf, sizeof(buf), 0);
+X		}
+X		if (c < 0)
+X		    putchar('\n');
+X		else if (!istool)
+X		    c = lower(*buf);
+X		if (c == 'd') {
+X		    rm_edfile(-2);
+X		    return 1;
+X		} else if (c == 'c') {
+X		    wprint("(continue editing letter)\n");
+X#ifdef SUNTOOL
+X		    if (istool)
+X			type_cursor(PIX_SRC);
+X#endif /* SUNTOOL */
+X		    return 0;
+X		} else if (c == 's')
+X		    break;
+X	    }
+X	}
+X    }
+X
+X#ifdef SUNTOOL
+X    if (istool)
+X	lock_cursors();
+X#endif /* SUNTOOL */
+X    send_it();
+X    turnoff(glob_flags, IS_GETTING);
+X    return 1;
+X}
+X
+X/*
+X * actually send the letter.
+X * 1. reset all the signals because of fork.
+X * 2. determine recipients (users, address, files, programs)
+X * 3. determine mailer, fork and return (if not verbose).
+X * 4. popen mailer, $record, and other files specified in step 1.
+X * 5. make the headers; this includes To: line, and user set headers, etc...
+X * 6. copy the letter right into the array of file pointers (step 1).
+X * 7. close the mailer and other files (step 1) and remove the edit-file.
+X */
+Xstatic void
+Xsend_it()
+X{
+X    register char *p, *b, *addr_list;
+X#ifdef MAXFILES
+X    register int size = MAXFILES - 1;
+X    FILE *files[MAXFILES];
+X#else
+X    register int size = getdtablesize() - 1;
+X    FILE *files[30];  /* 30 should be sufficiently large enough */
+X#endif /* MAXFILES */
+X    int next_file = 1; /* reserve files[0] for the mail delivery program */
+X    int log_file = -1; /* the index into the files array for mail logging */
+X    char buf[3*HDRSIZ];
+X    char expand = !do_set(set_options, "no_expand");
+X    int fork_err = 0;
+X
+X    if (!istool) {
+X	(void) signal(SIGINT, oldint);
+X	(void) signal(SIGQUIT, oldquit);
+X	(void) signal(SIGTERM, oldterm);
+X    }
+X
+X    if (!(p = do_set(set_options, "sendmail")))
+X	p = MAIL_DELIVERY;
+X
+X#ifdef VERBOSE_ARG
+X    if (ison(flags, VERBOSE) || do_set(set_options, "verbose"))
+X#ifdef MMDF
+X	b = &buf[strlen(sprintf(buf, "%s%s", p, VERBOSE_ARG))];
+X#else /* MMDF */
+X	b = &buf[strlen(sprintf(buf, "%s %s", p, VERBOSE_ARG))];
+X#endif /* MMDF */
+X    else
+X#endif /* VERBOSE_ARG */
+X	b = buf + Strcpy(buf, p);
+X#ifdef METOO_ARG
+X    if (!strcmp(p, MAIL_DELIVERY) && do_set(set_options, "metoo"))
+X	b += strlen(sprintf(b, " %s", METOO_ARG));
+X#endif /* METOO_ARG */
+X    *b++ = ' ', *b = 0; /* strcat(b, " "); */
+X    addr_list = b; /* save this position to check for addresses later */
+X
+X    /*
+X     * Build the address lines to give to the mail transfer system.  This
+X     * address line cannot contain comment fields!  First, expand aliases
+X     * since they may contain comment fields within addresses. Copy this
+X     * result back into the Buffer since this will go into the header ...
+X     * Next, remove all comments so the buffer contains ONLY valid addresses.
+X     * Next, strip off any filenames/programs which might occur in the list.
+X     * Finally, add this information to the command line buffer (buf).
+X     * Remove commas if necessary (see ifdefs).  In the event of errors,
+X     * force a dead letter by rm_edfile(-1).
+X     */
+X    if (!(p = alias_to_address(To))) {
+X	print("address expansion failed for To: line.\n");
+X	rm_edfile(-1);
+X    } else {
+X	next_file += find_files(p, files+next_file, size - next_file);
+X	if (expand)
+X	    (void) strcpy(To, p);
+X	rm_cmts_in_addr(p);
+X	skipspaces(0);
+X	if (!*p) {
+X	    print("There must be at least 1 legal recipient on the To line\n");
+X	    while (--next_file > 0)
+X		fclose(files[next_file]);
+X	    rm_edfile(-2);
+X	    return;
+X	}
+X	b += Strcpy(b, p);
+X    }
+X    if (*Cc) {
+X	if (!(p = alias_to_address(Cc))) {
+X	    print("address expansion failed for Cc: line.\n");
+X	    while (--next_file > 0)
+X		fclose(files[next_file]);
+X	    rm_edfile(-1);
+X	} else {
+X	    next_file += find_files(p, files+next_file, size - next_file);
+X	    if (expand)
+X		(void) strcpy(Cc, p);
+X	    rm_cmts_in_addr(p);
+X	    skipspaces(0);
+X	    if (*p) {
+X		*b++ = ',', *b++ = ' ';
+X		b += Strcpy(b, p);
+X	    }
+X	}
+X    }
+X
+X    /* Sign the letter before adding the Bcc list since they aren't
+X     * considered when adding a signature.
+X     */
+X    if ((ison(flags, SIGN) || ison(flags, DO_FORTUNE)) &&
+X	isoff(glob_flags, REDIRECT) && isoff(flags, FORWARD))
+X	sign_letter(addr_list, flags, ed_fp);
+X
+X    if (*Bcc) {
+X	if (!(p = alias_to_address(Bcc))) {
+X	    print("address expansion failed for Bcc: line.\n");
+X	    while (--next_file > 0)
+X		fclose(files[next_file]);
+X	    rm_edfile(-1);
+X	} else {
+X	    next_file += find_files(p, files+next_file, size - next_file);
+X	    (void) strcpy(Bcc, p);
+X	    rm_cmts_in_addr(p);
+X	    skipspaces(0);
+X	    if (*p) {
+X		*b++ = ',', *b++ = ' ';
+X		b += Strcpy(b, p);
+X	    }
+X	}
+X    }
+X
+X#ifdef NO_COMMAS
+X    for (p = buf; p = index(p, ','); p++)
+X	*p = ' ';
+X#endif /* NO_COMMAS */
+X
+X    Debug("mail command: %s\n", buf);
+X
+X#ifdef SUNTOOL
+X    if (istool)
+X	abort_mail(NO_ITEM, 0);
+X#endif /* SUNTOOL */
+X
+X    if (isoff(flags, VERBOSE) && debug < 3)
+X	switch (fork()) {
+X	    case  0:  /* the child will send the letter. ignore signals */
+X#ifdef SYSV
+X		if (setpgrp() == -1)
+X		    error("setpgrp");
+X#endif /* SYSV */
+X#ifdef MMDF
+X		(void) signal(SIGCHLD, SIG_DFL);
+X#endif /* MMDF */
+X		(void) signal(SIGINT, SIG_IGN);
+X		(void) signal(SIGHUP, SIG_IGN);
+X		(void) signal(SIGQUIT, SIG_IGN);
+X		(void) signal(SIGTERM, SIG_IGN);
+X#ifdef SIGTTIN
+X		(void) signal(SIGTTOU, SIG_IGN);
+X		(void) signal(SIGTTIN, SIG_IGN);
+X#endif /* SIGTTIN */
+X#ifdef SIGCONT
+X		(void) signal(SIGCONT, SIG_IGN);
+X		(void) signal(SIGTSTP, SIG_IGN);
+X#endif /* SIGCONT */
+X		turnon(glob_flags, IGN_SIGS);
+X	    when -1:
+X		error("fork failed trying to send mail");
+X		fork_err++;
+X		rm_edfile(-1);
+X		/* fall thru */
+X	    default:
+X		if (!fork_err && isoff(glob_flags, REDIRECT))
+X		    fclose(ed_fp);
+X#ifdef SUNTOOL
+X                if (istool) {
+X		    if (!fork_err) {
+X			wprint("Letter sent.");
+X			print("Letter sent.");
+X		    }
+X		    type_cursor(PIX_CLR);
+X		}
+X#endif /* SUNTOOL */
+X		while (--next_file > 0)
+X		    fclose(files[next_file]);
+X#ifdef MMDF
+X		if (!fork_err)
+X		    (void) wait((int *) 0);
+X#endif /* MMDF */
+X		return;
+X	}
+X
+X#ifdef MMDF
+X    *(addr_list-1) = '\0';
+X#endif /* MMDF */
+X    if (debug > 2)
+X	files[0] = stdout;
+X    else if (!(files[0] = open_file(buf, TRUE))) {
+X	rm_edfile(-1); /* force saving of undeliverable mail */
+X	if (isoff(flags, VERBOSE) && debug < 3)
+X	    exit(-1);
+X	else
+X	    return;
+X    }
+X
+X    if (ison(flags, VERBOSE))
+X	wprint("Sending letter ... "), fflush(stdout);
+X#ifdef MMDF
+X    /* give address list to submit */
+X    for (p = addr_list; p && (p = any(p, ",<")); p++)
+X	if (*p == ',')
+X	    *p = '\n';
+X	else
+X	    p = index(p, '>');
+X    fprintf(files[0], "%s\n\n", addr_list);
+X#endif /* MMDF */
+X
+X    /* see if log is set.  This is just to add message headers. No msg body. */
+X    if (p = do_set(set_options, "logfile")) {
+X	if (!*p)
+X	    p = "~/mail.log";
+X	(void) strcpy(buf, p);
+X	log_file = next_file;
+X	next_file += find_files(buf, files+next_file, size - next_file);
+X	if (log_file == next_file)
+X	    log_file = -1;
+X    }
+X
+X    /* see if record is set.  If so, open that file for appending and add
+X     * the letter in a format such that mail can be read from it
+X     */
+X    if (p = do_set(set_options, "record")) {
+X	if (!*p)
+X	    p = "~/record";
+X	(void) strcpy(buf, p);
+X	next_file += find_files(buf, files+next_file, size - next_file);
+X    }
+X
+X    /* Make folders conform to RFC-822 by adding From: and Date: headers.
+X     * Some older mailers (binmail, execmail, delivermail), don't add
+X     * these headers, so add them for #define OLD_MAILER.  Also add them
+X     * with the "Resent-" prefix when forwarding.
+X     */
+X    {
+X	time_t t;
+X	char From_buf[256], *pF = From_buf, date_str[64];
+X	char *host = NULL;
+X	
+X	if (ourname)
+X	    host = ourname[0];
+X
+X	if (ison(flags, FORWARD))
+X	    pF += Strcpy(From_buf, "Resent-");
+X	pF += Strcpy(pF, "From: ");
+X#ifdef UUCP
+X	if (host && *host)
+X	    pF += strlen(sprintf(pF, "%s!", host));
+X#endif /* UUCP */
+X	pF += Strcpy(pF, login);
+X#ifndef UUCP
+X	if (host && *host)
+X	    pF += strlen(sprintf(pF, "@%s", host));
+X#endif /* UUCP */
+X	if (p = do_set(set_options, "realname"))
+X	    pF += strlen(sprintf(pF, " (%s)", p));
+X	*pF++ = '\n', *pF++ = 0;
+X	(void) time(&t);
+X	for (size = 0; size < next_file; size++) {
+X#ifndef OLD_MAILER
+X	    if (size == 0 && isoff(flags, FORWARD))
+X		continue;
+X#endif /* OLD_MAILER */
+X	    if (size > 0) {
+X#ifndef MSG_SEPARATOR
+X		fprintf(files[size], "From %s %s", login, ctime(&t));
+X#else /* MSG_SEPARATOR */
+X#ifdef MMDF
+X		fputs(MSG_SEPARATOR, files[size]);
+X#else /* MMDF */
+X		fprintf(files[size], "%s\n", MSG_SEPARATOR);
+X#endif /* MMDF */
+X#endif /* MSG_SEPARATOR */
+X	    }
+X	    fputs(From_buf, files[size]);
+X	    fprintf(files[size], "%sDate: %s\n",
+X		ison(flags, FORWARD) ? "Resent-" : "", rfc_date(date_str));
+X	}
+X    }
+X
+X    /* first print users own message headers */
+X    if (own_hdrs && !do_set(set_options, "no_hdrs")) {
+X	struct options *opts;
+X	for (opts = own_hdrs; opts; opts = opts->next)
+X	    for (size = 0; size < next_file; size++)
+X		fprintf(files[size], "%s %s\n", opts->option, opts->value);
+X    }
+X
+X    wrap_addrs(To, 80);
+X    wrap_addrs(Cc, 80);
+X    wrap_addrs(Bcc, 80);
+X    /* send the header stuff to sendmail and end header with a blank line */
+X    for (size = 0; size < next_file; size++) {
+X	if (*in_reply_to)
+X	    fprintf(files[size], "In-Reply-To: %s\n", in_reply_to);
+X	fprintf(files[size], "X-Mailer: %s\n", VERSION);
+X	fprintf(files[size], "%sTo: %s\n",
+X	    ison(flags, FORWARD) ? "Resent-" : "", To);
+X	if (*Subject && isoff(flags, FORWARD))
+X	    fprintf(files[size], "Subject: %s\n", Subject);
+X	if (*Cc)
+X	    fprintf(files[size], "%sCc: %s\n",
+X		ison(flags, FORWARD) ? "Resent-" : "", Cc);
+X	if (size > 0) {
+X	    /* Do not send these to mail transfer agent */
+X	    if (*Bcc)
+X		fprintf(files[size], "%sBcc: %s\n",
+X		ison(flags, FORWARD) ? "Resent-" : "", Bcc);
+X	    fprintf(files[size], "Status: OR\n");
+X	}
+X	if (isoff(flags, FORWARD))
+X	    fputc('\n', files[size]);
+X    }
+X
+X    /* if redirection, ed_fp = stdin, else rewind the file just made */
+X    if (isoff(glob_flags, REDIRECT))
+X	rewind(ed_fp);
+X    else
+X	ed_fp = stdin;
+X
+X    /* Read from stdin or the edfile till EOF and send it all to the mailer
+X     * and other open files/folders/programs. Check for "From " at the
+X     * beginnings of these lines to prevent creating new messages in folders.
+X     * If forwarding, skip the leading From_ line of the forwarded message.
+X     */
+X#ifndef MSG_SEPARATOR
+X    if (ison(flags, FORWARD) && fgets(buf, sizeof buf, ed_fp)) {
+X	if (strncmp(buf, "From ", 5) != 0)
+X	    rewind(ed_fp); /* No From_ line (should never happen) */
+X    }
+X#endif /* !MSG_SEPARATOR */
+X    while (fgets(buf, sizeof buf, ed_fp))
+X	for (size = 0; size < next_file; size++) {
+X	    if (size == log_file)
+X		continue;
+X#ifndef MSG_SEPARATOR
+X	    if (!strncmp(buf, "From ", 5))
+X		fputc('>', files[size]);
+X#endif /* MSG_SEPARATOR */
+X	    fputs(buf, files[size]);
+X	}
+X
+X    /* loop thru the open files (except for the first: the mail delivery agent)
+X     * and append a blank line so that ucb-mail can read these folders.
+X     * Then close the files.  If the file was a popened program, the sigchld
+X     * that the program generates will close the file.
+X     */
+X#ifdef END_MSG_SEP
+X    for (size = 1; size < next_file; size++) {
+X	fputs(END_MSG_SEP, files[size]);
+X	if (files[size])
+X	    fclose(files[size]);
+X    }
+X#else /* !END_MSG_SEP */
+X    for (size = 1; size < next_file; size++)
+X	if (files[size]) {
+X	    fputc('\n', files[size]);
+X	    fclose(files[size]);
+X	}
+X#endif /* END_MSG_SEP */
+X
+X#ifdef MMDF
+X    if (debug < 3) {
+X	int reply_code = pclose(files[0]);
+X	Debug("pclose reply_code = %d\n", reply_code);
+X	rm_edfile((reply_code >> 8) == 9 ? 0 : -1);
+X    } else
+X	rm_edfile(0);
+X#else /* MMDF */
+X    rm_edfile(0);
+X    if (debug < 3)
+X	(void) pclose(files[0]);
+X#endif /* MMDF */
+X
+X    if ((ison(flags, VERBOSE) || debug > 2) && isoff(glob_flags, REDIRECT))
+X	wprint("sent.\n");
+X    else
+X	exit(0); /* not a user exit -- a child exit */
+X}
+X
+X/* ARGSUSED */
+XSIGRET
+Xrm_edfile(sig)
+X{
+X    if (sig > 0) {
+X	/* wrapcolumn may have been trashed -- restore it */
+X	char *fix = do_set(set_options, "wrapcolumn");
+X	if (fix && *fix)
+X	    wrapcolumn = atoi(fix);
+X	mac_flush(); /* abort pending macros */
+X    }
+X    /* now check whether we should abort the letter */
+X    if (sig > 0 && !killme) {
+X	if (!istool)
+X	    (void) signal(sig, rm_edfile);
+X	killme = 1;
+X	wprint("\n** interrupt -- one more to kill letter **\n");
+X#ifdef SUNTOOL
+X	if (istool) {
+X	    type_cursor(PIX_SRC);
+X	    return;
+X	}
+X#endif /* SUNTOOL */
+X	longjmp(cntrl_c_buf, 1);
+X    }
+X    killme = 0;
+X    /* if sig == -1, force a save into dead.letter.
+X     * else, check for nosave not being set and save anyway if it's not set
+X     * sig == 0 indicates normal exit (or ~x), so don't save a dead letter.
+X     */
+X    if (sig == -1 || sig != 0 && !do_set(set_options, "nosave"))
+X	dead_letter();
+X    if (isoff(glob_flags, REDIRECT))
+X	fclose(ed_fp);
+X    (void) unlink(edfile);
+X
+X    turnoff(glob_flags, IS_GETTING);
+X    if (sig == -1)
+X	return;
+X#ifdef SUNTOOL
+X    if (sig && istool > 1) {
+X	wprint("*Letter aborted*");
+X	abort_mail(abort_item, 2);
+X    }
+X#endif /* SUNTOOL */
+X
+X    if (sig == SIGHUP)
+X	cleanup(0);
+X    if (!istool) {
+X	(void) signal(SIGINT, oldint);
+X	(void) signal(SIGQUIT, oldquit);
+X	(void) signal(SIGTERM, oldterm);
+X    }
+X
+X    if (sig == 0)
+X	return;
+X    if (istool || sig == -2) /* make sure sigchld is reset first */
+X	return;
+X
+X    if (isoff(glob_flags, DO_SHELL)) {  /* If we're not in a shell, exit */
+X	puts("exiting");
+X	echo_on();
+X	exit(1);
+X    }
+X    longjmp(jmpbuf, 1);
+X}
+X
+X/* save letter into dead letter */
+Xdead_letter()
+X{
+X    char 	*p, buf[BUFSIZ];
+X    long 	t;
+X    FILE 	*dead;
+X
+X    if (ison(glob_flags, REDIRECT)) {
+X	print("input redirected -- can't save dead letter.\n");
+X	return;
+X    }
+X    /* If the file doesn't exist, get outta here. File may not exist if
+X     * user generated a ^C from a promptable header and catch sent us here.
+X     */
+X    if (Access(edfile, R_OK))
+X	return;
+X    /* User may have killed mush via a signal while he was in an editor.
+X     * ed_fp will be NULL in this case.  Since the file does exist (above),
+X     * open it so we can copy it to dead letter.
+X     */
+X    if (!ed_fp && !(ed_fp = fopen(edfile, "r"))) {
+X	error("can't save dead letter from %s", edfile);
+X	return;
+X    }
+X    /* don't save a dead letter if there's nothing to save. */
+X    if (fseek(ed_fp, 0L, 2) || ftell(ed_fp) <= 1L)
+X	return;
+X    if (!(p = do_set(set_options, "dead")))
+X	p = "~/dead.letter";
+X    if (!(dead = open_file(p, FALSE)))
+X	return;
+X    (void) time (&t);
+X    fflush(ed_fp);
+X    rewind(ed_fp);
+X#ifdef MSG_SEPARATOR
+X	fputs(MSG_SEPARATOR, dead);
+X#else /* MSG_SEPARATOR */
+X    fprintf(dead, "From %s %s", login, ctime(&t));
+X#endif /* MSG_SEPARATOR */
+X    fprintf(dead, "To: %s\nSubject: %s\n", To, Subject);
+X    fprintf(dead, "Date: %s\n", rfc_date(buf));
+X    if (*Cc)
+X	fprintf(dead, "Cc: %s\n", Cc);
+X    if (*Bcc)
+X	fprintf(dead, "Bcc: %s\n", Bcc);
+X    (void) fputc('\n', dead);
+X    while (fgets(buf, sizeof(buf), ed_fp))
+X	(void) fputs(buf, dead);
+X    (void) fputc('\n', dead);
+X#ifdef END_MSG_SEP
+X    fputs(END_MSG_SEP, dead);
+X#endif /* END_MSG_SEP */
+X    (void) fclose(dead);
+X    print("Saved unfinished letter in %s.\n", p);
+X}
+END_OF_FILE
+if test 46580 -ne `wc -c <'mail.c'`; then
+    echo shar: \"'mail.c'\" unpacked with wrong size!
+fi
+# end of 'mail.c'
+fi
+echo shar: End of archive 16 \(of 19\).
+cp /dev/null ark16isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 19 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

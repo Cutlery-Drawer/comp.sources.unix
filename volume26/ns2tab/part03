@@ -1,0 +1,1599 @@
+Newsgroups: comp.sources.unix
+From: i3558@newsie.dc.dk (Soeren Michael Roug)
+Subject: v26i094: ns2tab - Increasing the usefullnes of the nameserver, Part03/03
+Sender: unix-sources-moderator@vix.com
+Approved: paul@vix.com
+
+Submitted-By: i3558@newsie.dc.dk (Soeren Michael Roug)
+Posting-Number: Volume 26, Issue 94
+Archive-Name: ns2tab/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 3)."
+# Contents:  list.c
+# Wrapped by i3558@ulrik.dc.dk on Fri Mar 26 15:05:36 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'list.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'list.c'\"
+else
+echo shar: Extracting \"'list.c'\" \(32658 characters\)
+sed "s/^X//" >'list.c' <<'END_OF_FILE'
+X/*
+X *******************************************************************************
+X *
+X *  list.c --
+X *
+X *	Routines to obtain info from name and finger servers.
+X *
+X *	Adapted from 4.3BSD BIND ns_init.c and from finger.c.
+X *
+X *******************************************************************************
+X */
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <netdb.h>
+X#include <stdio.h>
+X#include <string.h>
+X#include <ctype.h>
+X#include <errno.h>
+X#include <arpa/nameser.h>
+X#ifndef T_TXT
+X#define T_TXT 16
+X#endif
+X#include <arpa/inet.h>
+X#include <resolv.h>
+X#include "res.h"
+X#include "vtable.h"
+X
+X#ifndef __STDC__
+Xextern char *malloc();
+X#else
+X#include <stdlib.h>
+X#endif
+X
+Xextern void *htab_find();
+X
+X#define NOID -8472874   /* Something very unlikely */
+X/*
+X *  Imported from res_debug.c
+X */
+Xextern char *_res_resultcodes[];
+X
+Xextern int errno;
+Xstatic int lelmstyle;
+Xstatic int recursegroup;
+X
+Xtypedef union {
+X    HEADER qb1;
+X    char qb2[PACKETSZ];
+X} querybuf;
+X
+Xextern HostInfo	*defaultPtr;
+Xextern HostInfo	curHostInfo;
+Xextern char *vdomain;
+Xextern int	queryType;
+Xextern int	queryClass;
+X
+Xstatic int sockFD = -1;
+Xstatic int ListSubr();
+X
+Xstatic void AddAlias();
+Xstatic void ChangeMailList();
+Xstatic void ChangeAddr();
+Xstatic void ChangeMailBox();
+Xstatic void AddMailListMember();
+Xstatic void ChangeUGID();
+Xstatic void ChangeHInfo();
+X#ifdef EMULATE_HESIOD
+Xstatic void ChangeText();
+X#endif /* EMULATE_HESIOD */
+X/*
+X *  During a listing to a file, hash marks are printed
+X *  every HASH_SIZE records.
+X */
+X
+X#define HASH_SIZE 50
+X
+X
+X/*
+X *******************************************************************************
+X *
+X *  LoadHosts --
+X *
+X *	Requests the name server to do a zone transfer so we
+X *	find out what hosts it knows about.
+X *
+X *	For LoadHosts, there are five types of output:
+X *
+X *	To see all types of information sorted by name, do the following:
+X *	  ls -d domain.edu > file
+X *	  view file
+X *
+X *  Results:
+X *	SUCCESS		the listing was successful.
+X *	ERROR		the server could not be contacted because
+X *			a socket could not be obtained or an error
+X *			occured while receiving, or the output file
+X *			could not be opened.
+X *
+X *******************************************************************************
+X */
+X
+Xvoid
+XLoadHosts(domain)
+X	char *domain;
+X{
+X	int result;
+X
+X	if (domain && *domain)
+X	{
+X	    result = ListSubr(domain);
+X	    if (result != SUCCESS)
+X		fprintf(stderr, "*** Can't list domain %s: %s\n", 
+X			domain, DecodeError(result));
+X	}
+X	else
+X	{
+X	    fprintf(stderr, "*** ns2tab: empty domain\n");
+X	}
+X	    return;
+X}
+X
+Xstruct minfo_ent {
+X    char name[32];
+X    char request[32];
+X    char errors[32];
+X    vtable table; /* Table for the members */
+X};
+Xstruct mg_ent {
+X    char member[32];
+X};
+X
+Xstruct mb_ent {
+X    char name[32];
+X    char mailbox[32];
+X    int qtype;
+X    char *gecos;
+X    int gid;
+X    int uid;
+X};
+X
+Xstruct host_ent {
+X    char name[32];
+X    char *machtype;
+X    char *ostype;
+X    vtable aliases;
+X    vtable ipaddr;
+X};
+Xstruct host_ali {
+X    char name[32];
+X};
+Xstruct host_ip {
+X    int addr;
+X    int used;
+X};
+X
+Xstruct txt_ent {
+X    char name[32];
+X    char *txt;
+X};
+X
+Xstruct ns_ent {
+X    char name[32];
+X    int is_explicit;
+X};
+Xvtable subdomains; /* Table to hold subdomain list */
+X
+Xvoid *mailtab; /* The global hash table for maillists */
+Xvoid *mb_tab; /* The hash table for mailboxes */
+Xvoid *host_tab;
+X#ifdef EMULATE_HESIOD
+Xvoid *txt_tab;
+X#endif /* EMULATE_HESIOD */
+X
+Xint
+Xns_cmp(n1,n2)
+X    struct ns_ent *n1,*n2;
+X{
+X    return strncmp(n1->name,n2->name,sizeof(n1->name));
+X}
+X
+Xns_add(name,is_explicit)
+X    char *name;
+X    int is_explicit;
+X{
+X    struct ns_ent nb;
+X
+X    memcpy(nb.name,name,sizeof(nb.name));
+X    nb.is_explicit = is_explicit;
+X    if(!VTableLookup(&subdomains,&nb))
+X	VTableAppend(&subdomains,(char*)&nb);
+X}
+X
+Xint
+XInitTables()
+X{
+X    mailtab = htab_init(17,NULL,NULL,NULL);
+X    mb_tab = htab_init(231,NULL,NULL,NULL);
+X    host_tab = htab_init(231,NULL,NULL,NULL);
+X    VTableSet(&subdomains,sizeof(struct ns_ent));
+X    VTableSetCmp(&subdomains,ns_cmp);
+X#ifdef EMULATE_HESIOD
+X    txt_tab = htab_init(17,NULL,NULL,NULL);
+X#endif /* EMULATE_HESIOD */
+X}
+X
+Xstatic int
+XListSubr(domain)
+X	char *domain;
+X{
+X	querybuf		buf;
+X	struct sockaddr_in	sin;
+X	HEADER			*headerPtr;
+X	int			msglen;
+X	int			amtToRead;
+X	int			numRead;
+X	int			numAnswers = 0;
+X	int			result;
+X	int			soacnt = 0;
+X	u_short			len;
+X	char			*cp, *nmp;
+X	char			dname[2][NAME_LEN];
+X	char			file[NAME_LEN];
+X	static char		*answer = NULL;
+X	static int		answerLen = 0;
+X	enum {
+X	    NO_ERRORS,
+X	    ERR_READING_LEN,
+X	    ERR_READING_MSG,
+X	    ERR_PRINTING,
+X	} error = NO_ERRORS;
+X
+X	/*
+X	 *  Create a query packet for the requested domain name.
+X	 */
+X	msglen = res_mkquery(QUERY, domain, queryClass, T_AXFR,
+X				(char *)0, 0, (char *)0,
+X				(char *) &buf, sizeof(buf));
+X	if (msglen < 0) {
+X	    if (_res.options & RES_DEBUG) {
+X		fprintf(stderr, "*** ls: res_mkquery failed\n");
+X	    }
+X	    return (ERROR);
+X	}
+X
+X	bzero((char *)&sin, sizeof(sin));
+X	sin.sin_family	= AF_INET;
+X	sin.sin_port	= htons(nsport);
+X
+X	/*
+X	 *  Check to see if we have the address of the server or the
+X	 *  address of a server who knows about this domain.
+X	 *
+X	 *  For now, just use the first address in the list.
+X	 */
+X
+X	if (defaultPtr->addrList != NULL) {
+X	  sin.sin_addr = *(struct in_addr *) defaultPtr->addrList[0];
+X	} else {
+X	  sin.sin_addr = *(struct in_addr *)defaultPtr->servers[0]->addrList[0];
+X	}
+X
+X	/*
+X	 *  Set up a virtual circuit to the server.
+X	 */
+X	if ((sockFD = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+X	    perror("ls: socket");
+X	    return(ERROR);
+X	}
+X	if (connect(sockFD, &sin, sizeof(sin)) < 0) {
+X	    int e;
+X	    if (errno == ECONNREFUSED) {
+X		e = NO_RESPONSE;
+X	    } else {
+X		perror("ls: connect");
+X		e = ERROR;
+X	    }
+X	    (void) close(sockFD);
+X	    sockFD = -1;
+X	    return e;
+X	}
+X
+X	/*
+X	 * Send length & message for zone transfer
+X	 */
+X
+X        len = htons(msglen);
+X
+X        if (write(sockFD, (char *)&len, sizeof(len)) != sizeof(len) ||
+X            write(sockFD, (char *) &buf, msglen) != msglen) {
+X		perror("ls: write");
+X		(void) close(sockFD);
+X		sockFD = -1;
+X		return(ERROR);
+X	}
+X
+X	dname[0][0] = '\0';
+X	while (1) {
+X	    unsigned short tmp;
+X
+X	    /*
+X	     * Read the length of the response.
+X	     */
+X
+X	    cp = (char *) &tmp;
+X	    amtToRead = sizeof(u_short);
+X	    while (amtToRead > 0 && (numRead=read(sockFD, cp, amtToRead)) > 0) {
+X		cp	  += numRead;
+X		amtToRead -= numRead;
+X	    }
+X	    if (numRead <= 0) {
+X		error = ERR_READING_LEN;
+X		break;
+X	    }
+X
+X	    if ((len = htons(tmp)) == 0) {
+X		break;	/* nothing left to read */
+X	    }
+X
+X	    /*
+X	     * The server sent too much data to fit the existing buffer --
+X	     * allocate a new one.
+X	     */
+X	    if (len > answerLen) {
+X		if (answerLen != 0) {
+X		    free(answer);
+X		}
+X		answerLen = len;
+X		answer = malloc(answerLen);
+X	    }
+X
+X	    /*
+X	     * Read the response.
+X	     */
+X
+X	    amtToRead = len;
+X	    cp = answer;
+X	    while (amtToRead > 0 && (numRead=read(sockFD, cp, amtToRead)) > 0) {
+X		cp += numRead;
+X		amtToRead -= numRead;
+X	    }
+X	    if (numRead <= 0) {
+X		error = ERR_READING_MSG;
+X		break;
+X	    }
+X
+X	    result = PrintListInfo(filePtr, answer, cp, dname[0]);
+X	    if (result != SUCCESS) {
+X		error = ERR_PRINTING;
+X		break;
+X	    }
+X
+X	    numAnswers++;
+X	    cp = answer + sizeof(HEADER);
+X	    if (ntohs(((HEADER* )answer)->qdcount) > 0)
+X		cp += dn_skipname(cp, answer + len) + QFIXEDSZ;
+X	    nmp = cp;
+X	    cp += dn_skipname(cp, (u_char *)answer + len);
+X	    if ((_getshort(cp) == T_SOA)) {
+X		dn_expand(answer, answer + len, nmp, dname[soacnt],
+X			sizeof(dname[0]));
+X	        if (soacnt) {
+X		    if (strcmp(dname[0], dname[1]) == 0)
+X			break;
+X		} else
+X		    soacnt++;
+X	    }
+X	} /* while */
+X
+X	(void) close(sockFD);
+X	sockFD = -1;
+X	switch (error) {
+X	    case NO_ERRORS:
+X		return (SUCCESS);
+X
+X	    case ERR_READING_LEN:
+X		return(ERROR);
+X
+X	    case ERR_PRINTING:
+X		return(result);
+X
+X	    case ERR_READING_MSG:
+X		headerPtr = (HEADER *) answer;
+X		fprintf(stderr,"*** ls: error receiving zone transfer:\n");
+X		fprintf(stderr,
+X	       "  result: %s, answers = %d, authority = %d, additional = %d\n",
+X			_res_resultcodes[headerPtr->rcode],
+X			ntohs(headerPtr->ancount), ntohs(headerPtr->nscount),
+X			ntohs(headerPtr->arcount));
+X		return(ERROR);
+X	    default:
+X		return(ERROR);
+X	}
+X}
+X
+X
+X/*
+X *******************************************************************************
+X *
+X *  PrintListInfo --
+X *
+X *	Used by the ListInfo routine to print the answer
+X *	received from the name server. Only the desired
+X *	information is printed.
+X *
+X *  Results:
+X *	SUCCESS		the answer was printed without a problem.
+X *	NO_INFO		the answer packet did not contain an answer.
+X *	ERROR		the answer was malformed.
+X *      Misc. errors	returned in the packet header.
+X *
+X *******************************************************************************
+X */
+X
+X#define NAME_FORMAT "%s"
+X
+Xstatic Boolean
+Xstrip_domain(string, domain)
+X    char *string, *domain;
+X{
+X    register char *dot;
+X
+X    if (*domain != '\0') {
+X	dot = string;
+X	while ((dot = strchr(dot, '.')) != NULL && strcasecmp(domain, ++dot))
+X		;
+X	if (dot != NULL) {
+X	    dot[-1] = '\0';
+X	    return TRUE;
+X	}
+X    }
+X    return FALSE;
+X}
+X
+Xstatic char *
+Xdomain_start(string, domain)
+X    char *string, *domain;
+X{
+X    register char *dot;
+X
+X    if (*domain != '\0') {
+X	dot = string;
+X	while ((dot = strchr(dot, '.')) != NULL && strcasecmp(domain, ++dot))
+X		;
+X	return dot;
+X    }
+X    return NULL;
+X}
+X
+Xstatic char *
+Xdomain_child(string, domain)
+X    char *string, *domain;
+X{
+X    register char *dot;
+X
+X    if (*domain != '\0') {
+X	dot = string;
+X	if((dot = strchr(dot, '.')) != NULL && !strcasecmp(domain, ++dot))
+X	    return dot;
+X    }
+X    return NULL;
+X}
+X
+XPrintListInfo(file, msg, eom, domain)
+X    FILE	*file;
+X    char	*msg, *eom;
+X    char	*domain;
+X{
+X    register char	*cp;
+X    HEADER		*headerPtr;
+X    int			type, qclass, dlen, nameLen;
+X    u_long		ttl;
+X    int			n, pref;
+X    struct in_addr	inaddr;
+X    char		name[NAME_LEN];
+X    char		name2[NAME_LEN];
+X    Boolean		stripped;
+X
+X    /*
+X     * Read the header fields.
+X     */
+X    headerPtr = (HEADER *)msg;
+X    cp = msg + sizeof(HEADER);
+X    if (headerPtr->rcode != NOERROR) {
+X	return(headerPtr->rcode);
+X    }
+X
+X    /*
+X     *  We are looking for info from answer resource records.
+X     *  If there aren't any, return with an error. We assume
+X     *  there aren't any question records.
+X     */
+X
+X    if (ntohs(headerPtr->ancount) == 0) {
+X	return(NO_INFO);
+X    } else {
+X	if (ntohs(headerPtr->qdcount) > 0) {
+X	    nameLen = dn_skipname(cp, eom);
+X	    if (nameLen < 0)
+X		return (ERROR);
+X	    cp += nameLen + QFIXEDSZ;
+X	}
+X	if ((nameLen = dn_expand(msg, eom, cp, name, sizeof(name))) < 0)
+X	    return (ERROR);
+X	cp += nameLen;
+X
+X	type = _getshort(cp);
+X	cp += sizeof(u_short);
+X
+X	qclass = _getshort(cp);
+X	cp += sizeof(u_short);
+X	ttl = _getlong(cp);
+X	cp += sizeof(u_long);
+X	dlen = _getshort(cp);
+X	cp += sizeof(u_short);
+X
+X	if (name[0] == 0)
+X		strcpy(name, ".");
+X
+X	/* Strip the domain name from the data, if desired. */
+X	stripped = FALSE;
+X	if (type != T_A && type != T_HINFO && type != T_CNAME)
+X	{
+X	    char *y;
+X
+X	    stripped = strip_domain(name, vdomain);
+X	    if ((y = strrchr(name,'.')) != 0)
+X	    {
+X		if(stripped)
+X		{
+X		    *y++ = '\0';
+X		    ns_add(y,0); /* Adding implicit domain */
+X		}
+X		return(SUCCESS);
+X	    }
+X	}
+X	else
+X	{
+X	    char *y,*ds;
+X
+X	    ds = domain_start(name,vdomain);
+X	    if(!ds)  return(SUCCESS);
+X	    ds[-1] = '\0';
+X	    if(( y = strrchr(name,'.')) != 0)
+X	    {
+X		*y++ = '\0';
+X		ns_add(y,0); /* Adding implicit domain */
+X		return (SUCCESS);
+X	    }
+X	    ds[-1] = '.';
+X	}
+X	if(strlen(name) == 0)
+X	    return(SUCCESS); /* Ignore this record */
+X
+X/*
+X * The wildcard is a special case.
+X */
+X	if(!strcmp(name,"*")) return(SUCCESS);
+X
+X	switch (type)
+X	{
+X	    case T_NS:
+X		if ((nameLen =
+X			dn_expand(msg, eom, cp, name2, sizeof(name2))) < 0) {
+X		    return (ERROR);
+X		}
+X		strip_domain(name2, vdomain);
+X		ns_add(name,1); /* Add explicit domain */
+X		break;
+X	    case T_MR:
+X	    {
+X		char mailbox[64];
+X
+X		if ((nameLen =
+X			dn_expand(msg, eom, cp, name2, sizeof(name2))) < 0) {
+X		    return (ERROR);
+X		}
+X		strip_domain(name2, domain);
+X		if(use_quotes(name2))
+X		{
+X		    sprintf(mailbox,"\"%s\"",name2);
+X		    ChangeMailBox(name,mailbox,NULL,type);
+X		    /* fprintf(file, "%s:\"%s\"\n",name,name2); */
+X		}
+X		else
+X		{
+X		    ChangeMailBox(name,name2,NULL,type);
+X		    /* fprintf(file, "%s:%s\n",name,name2); */
+X		}
+X		break;
+X	    }
+X	    case T_MB:
+X	    {
+X		char mailbox[64];
+X
+X		if ((nameLen =
+X			dn_expand(msg, eom, cp, name2, sizeof(name2))) < 0) {
+X		    return (ERROR);
+X		}
+X/*		strip_domain(name2, vdomain); */
+X		if(use_quotes(name2))
+X		{
+X		    fprintf(stderr,"Error in hostname: %s\n",name2);
+X		    break;
+X		}
+X		sprintf(mailbox,"%s@%s",name,name2);
+X		ChangeMailBox(name,mailbox,NULL,type);
+X		/* fprintf(file, "%s:%s@%s\n",name,name, name2); */
+X		break;
+X	    }
+X	    case T_MG:
+X		if ((nameLen =
+X			dn_expand(msg, eom, cp, name2, sizeof(name2))) < 0)
+X		    return (ERROR);
+X		strip_domain(name2, domain);
+X		AddMailListMember(name,name2);
+X		break;
+X	    case T_CNAME:
+X		if ((nameLen = dn_expand(msg, eom, cp, name2,
+X		sizeof(name2))) < 0)
+X		    return (ERROR);
+X		strip_domain(name2, vdomain);
+X		AddAlias(name2,name);
+X		break;
+X
+X	    case T_MINFO:
+X	    {
+X		char req_name[32],err_name[32];
+X		int n;
+X
+X		if((n = dn_expand(msg,eom,cp,req_name,sizeof(req_name))) < 0)
+X			return(ERROR);
+X		cp += n;
+X		strip_domain(req_name, domain);
+X		if((n = dn_expand(msg,eom,cp,err_name,sizeof(err_name))) < 0)
+X			return(ERROR);
+X		cp += n;
+X		strip_domain(err_name, domain);
+X		ChangeMailList(name,req_name,err_name);
+X	    }
+X		break;
+X	    case T_UINFO:
+X		ChangeMailBox(name,NULL,cp,0);
+X		/* fprintf(file, "# %s -- %s\n",name, cp); */
+X		break;
+X	    case T_HINFO:
+X	    {
+X		char mach_name[128],os_name[128];
+X		int n;
+X
+X		*mach_name = '\0'; /* Reset machine_name */
+X		if(n = *cp++) {
+X		    (void)sprintf(mach_name,"%.*s",n, cp);
+X		    cp += n;
+X		} 
+X		*os_name = '\0'; /* Reset os_name */
+X		if(n = *cp++) {
+X		    (void)sprintf(os_name,"%.*s",n, cp);
+X		    cp += n;
+X		} 
+X		ChangeHInfo(name,mach_name,os_name);
+X	    }
+X		break;
+X	    case T_GID:
+X		ChangeUGID(name,NOID,_getlong(cp));
+X		break;
+X	    case T_UID:
+X		ChangeUGID(name,_getlong(cp),NOID);
+X		break;
+X	    case T_A:
+X		ChangeAddr(name,_getlong(cp));
+X		break;
+X#ifdef EMULATE_HESIOD
+X	    case T_TXT:
+X		{
+X		    int n;
+X		    n = *cp++;
+X		    ChangeText(name,cp,n);
+X		    /* fprintf(file, "%s|%s\n",name,name2); */
+X		}
+X		break;
+X#endif /* EMULATE_HESIOD */
+X	    default:
+X		break;
+X	} /* switch */
+X    }
+X    return(SUCCESS);
+X}
+X
+Xstatic int
+Xuse_quotes(name)
+X    char *name;
+X{
+X    char *wildp;
+X    int noquotes = 1;
+X
+X    while(*name && noquotes)
+X    {
+X	for(wildp = " \t\n|/"; *wildp && noquotes; )
+X	    if(*wildp++ == *name)
+X		noquotes=0;
+X	name++;
+X    }
+X    return !noquotes;
+X}
+X
+XListHost_close()
+X{
+X    if (sockFD != -1) {
+X	(void) close(sockFD);
+X	sockFD = -1;
+X    }
+X}
+X
+Xstruct mb_ent *
+XCreateMailBox(name)
+X   char *name;
+X{
+X    struct mb_ent *me;
+X
+X    me = (struct mb_ent*)malloc(sizeof(struct mb_ent));
+X    bzero(me,sizeof(struct mb_ent));
+X    me->gid = NOID;
+X    me->uid = NOID;
+X    strncpy(me->name,name,32);
+X    htab_enter(mb_tab,me,me);
+X    return me;
+X}
+X
+Xstatic void
+XChangeMailBox(name,box,gecos,qtype)
+X   char *name,*box,*gecos;
+X   int qtype;
+X{
+X    struct mb_ent *me;
+X    
+X    me = (struct mb_ent*)htab_find(mb_tab,name);
+X    if(!me) 
+X	me = CreateMailBox(name);
+X    if(qtype)
+X	me->qtype = qtype;
+X    if(box)
+X    {
+X	strncpy(me->mailbox,box,32);
+X        if(!strncmp(name,box,32))
+X	    *me->mailbox = '\0'; /* Zeroing it. */
+X    }
+X/*
+X * This can have some size, and is probaly infrequent, so I malloc the space
+X */
+X    if(gecos)
+X    {
+X	if(me->gecos) free(me->gecos); /* Previos stuff */
+X	me->gecos = malloc(strlen(gecos) +1 );
+X	strcpy(me->gecos,gecos);
+X    }
+X}
+X
+X#ifdef EMULATE_HESIOD
+Xstatic void
+XChangeText(name,text,n)
+X    char *name,*text;
+X    int n;
+X{
+X    struct txt_ent *te;
+X
+X    te = (struct txt_ent*)htab_find(txt_tab,name);
+X    if(!te) 
+X    {
+X	te = (struct txt_ent*)malloc(sizeof(struct txt_ent));
+X	strncpy(te->name,name,32);
+X	htab_enter(txt_tab,te,te);
+X    }
+X    else
+X	free(te->txt);
+X    te->txt = malloc(n+1);
+X    strncpy(te->txt,text,n);
+X    te->txt[n] = '\0';
+X}
+X#endif /* EMULATE_HESIOD */
+X
+Xstatic void
+XChangeUGID(name,uid,gid)
+X    char *name;
+X    int uid,gid;
+X{
+X    struct mb_ent *me;
+X    
+X    me = (struct mb_ent*)htab_find(mb_tab,name);
+X    if(!me) 
+X	me = CreateMailBox(name);
+X    if(gid != NOID) me->gid = gid;
+X    if(uid != NOID) me->uid = uid;
+X}
+X
+Xstruct host_ent *
+XCreateAddr(name)
+X    char *name;
+X{
+X    struct host_ent *me;
+X
+X    me = (struct host_ent *)malloc(sizeof(struct host_ent));
+X    bzero(me,sizeof(struct host_ent));
+X    strncpy(me->name,name,32);
+X    VTableSet(&me->ipaddr,sizeof(struct host_ip));
+X    VTableSet(&me->aliases,sizeof(struct host_ali));
+X    htab_enter(host_tab,me,me);
+X    return me;
+X}
+X
+Xstatic void
+XChangeAddr(name,addr)
+X    char *name;
+X    int addr;
+X{
+X    struct host_ent *me;
+X    struct host_ip ip,*hi;
+X    int ix=0;
+X
+X#if 0
+Xfprintf(stderr,"In ChangeAddr with %s\n",name);
+X#endif
+X    me = (struct host_ent*)htab_find(host_tab,name);
+X    if(!me)
+X       me = CreateAddr(name);
+X    while(hi = (struct host_ip*)VTableNext(&me->ipaddr,&ix,1))
+X    {
+X       if(hi->addr == addr) return; /* Do not add same IP address twice */
+X    }
+X    ip.used = 0;
+X    ip.addr = addr;
+X    VTableAppend(&me->ipaddr,(char*)&ip);
+X}
+X
+Xstatic void
+XAddAlias(name,alias)
+X    char *name;
+X    char *alias;
+X{
+X    struct host_ent *me;
+X    struct host_ali ali;
+X
+X#if 0
+Xfprintf(stderr,"In AddAlias with %s\n",name);
+X#endif
+X    me = (struct host_ent*)htab_find(host_tab,name);
+X    if(!me)
+X       me = CreateAddr(name);
+X    strncpy(ali.name,alias,32);
+X    VTableAppend(&me->aliases,(char*)&ali);
+X}
+X
+Xstatic void
+XChangeHInfo(name,mach,os)
+X    char *name;
+X    char *mach;
+X    char *os;
+X{
+X    struct host_ent *me;
+X    char *mmach;
+X    char *mos;
+X
+X    me = (struct host_ent*)htab_find(host_tab,name);
+X    if(!me)
+X	me = CreateAddr(name);
+X    mmach = malloc(strlen(mach)+1);
+X    mos = malloc(strlen(os)+1);
+X    strcpy(mmach,mach);
+X    strcpy(mos,os);
+X
+X    me->ostype = mos;
+X    me->machtype = mmach;
+X}
+X
+Xstruct minfo_ent *
+XCreateMailList(name)
+X   char *name;
+X{
+X    struct minfo_ent *me;
+X
+X    me = (struct minfo_ent*)malloc(sizeof(struct minfo_ent));
+X    bzero(me,sizeof(struct minfo_ent));
+X    strncpy(me->name,name,32);
+X    VTableSet(&me->table,sizeof(struct mg_ent));
+X    htab_enter(mailtab,me,me);
+X    return me;
+X}
+X
+Xstatic void
+XChangeMailList(name,request,errors)
+X   char *name,*request,*errors;
+X{
+X    struct minfo_ent *me;
+X    
+X    me = (struct minfo_ent*)htab_find(mailtab,name);
+X    if(!me) 
+X	me = CreateMailList(name);
+X    if(request)
+X	strncpy(me->request,request,32);
+X    if(errors)
+X	strncpy(me->errors,errors,32);
+X}
+X
+Xstatic void
+XAddMailListMember(name,member)
+X    char *name,*member;
+X{
+X    struct minfo_ent *me;
+X    struct mg_ent mg;
+X    
+X    me = (struct minfo_ent*)htab_find(mailtab,name);
+X    if(!me) 
+X	me = CreateMailList(name);
+X    strncpy(mg.member,member,32);
+X    VTableAppend(&me->table,(char*)&mg);
+X}
+X
+XPrintMailLists(file)
+X    FILE	*file;
+X{
+X    int starting= TRUE;
+X    int pos,first,mlen;
+X    struct minfo_ent *me,*key;
+X    struct mg_ent *mg;
+X
+X    fprintf(file,"#\n# Maillists created by ns2tab\n#\n");
+X    while(htab_list(mailtab,starting,&me,&key))
+X    {
+X	int ix=0;
+X	int l,dnr;
+X	struct mb_ent *mb;
+X
+X	starting = FALSE;
+X	if(VTableSize(&me->table) == 0)
+X	    continue;
+X	fprintf(file,"\n"); /* Start each list with a newline */
+X	if((mb = htab_find(mb_tab,me->name)) && mb->gecos)
+X	   fprintf(file,"# %s\n",mb->gecos); /* Get comment */
+X	dnr =0;
+X	if(*me->request)
+X	    fprintf(file,"%s-request: %s\n",me->name,me->request);
+X	if(*me->errors)
+X	    fprintf(file,"owner-%s: %s\n",me->name,me->errors);
+X	fprintf(file,"%s: ",me->name);
+X	pos = strlen(me->name) +1;
+X	mlen = pos;
+X	first = TRUE;
+X        while(mg = (struct mg_ent*)VTableNext(&me->table,&ix,1))
+X	{
+X/*
+X * Do not include a listmember with the same name as the list it self
+X */
+X	    if(!strcmp(me->name,mg->member)) continue;
+X
+X	    l = strlen(mg->member) + 2;
+X/* I am told that because of restrictions in dbm an alias cannot contain
+X   more than approximately 1000 bytes of information. So I create
+X   dummy aliases.
+X*/
+X	    mlen += l;
+X	    if(mlen > 970)
+X	    {
+X		if(!first) putc(',',file);
+X		dnr++;
+X		fprintf(file,"%s_%d,\n",me->name,dnr);
+X		fprintf(file,
+X	"# Dummy alias necesary because of restrictions in dbm(3x).\n");
+X		fprintf(file,"%s_%d: %s",me->name,dnr,mg->member);
+X		pos = strlen(me->name) + 4;
+X		mlen = pos + l;
+X		first = FALSE;
+X	    }
+X	    if((pos + l) > 76)
+X	    {
+X		pos = l;
+X		fprintf(file,",\n\t%s",mg->member);
+X	    }
+X	    else
+X	    {
+X		pos += l;
+X		if(!first) fprintf(file,", ");
+X		first = FALSE;
+X		fprintf(file,"%s",mg->member);
+X	    }
+X	}
+X	fprintf(file,"\n");
+X    }
+X}
+X
+XPrintMailBoxes(file)
+X    FILE	*file;
+X{
+X    int starting= TRUE;
+X    struct mb_ent *me,*key;
+X
+X    fprintf(file,"#\n# Mailboxes created by ns2tab\n#\n");
+X    while(htab_list(mb_tab,starting,&me,&key))
+X    {
+X	starting = FALSE;
+X	if(*me->mailbox)
+X	{
+X	    if(me->gecos)
+X		fprintf(file,"# %s +- %s\n",me->name,me->gecos);
+X	    fprintf(file,"%s: %s\n",me->name,me->mailbox);
+X	}
+X    }
+X}
+X
+XPrintMail(file)
+X    FILE	*file;
+X{
+X    fprintf(file,"# Aliases created from [%s] nameserver.\n",
+X	    (defaultPtr->addrList != NULL) ? defaultPtr->name :
+X	     defaultPtr->servers[0]->name);
+X    PrintMailBoxes(file);
+X    PrintMailLists(file);
+X    return 0;
+X}
+X
+X
+XPrintElmLists(file)
+X    FILE	*file;
+X{
+X    int starting= TRUE;
+X    int pos,first,mlen;
+X    struct minfo_ent *me,*key;
+X    struct mg_ent *mg;
+X
+X    fprintf(file,"#\n# Maillists created by ns2tab (ELM) Style\n#\n");
+X    while(htab_list(mailtab,starting,&me,&key))
+X    {
+X	int ix=0;
+X	int l,dnr;
+X	struct mb_ent *mb;
+X
+X	starting = FALSE;
+X	if(VTableSize(&me->table) == 0)
+X	    continue;
+X	fprintf(file,"\n"); /* Start each list with a newline */
+X	mb = htab_find(mb_tab,me->name); /* Get Comment */
+X	dnr =0;
+X	if(*me->request)
+X	    if(lelmstyle)
+X		fprintf(file,"%s-request = %s Request = %s-request\n",
+X		     me->name,me->name,me->name);
+X	    else
+X		fprintf(file,"%s-request = %s Request = %s\n",
+X		     me->name,me->name,me->request);
+X	if(*me->errors)
+X	    if(lelmstyle)
+X		fprintf(file,"owner-%s = %s Errors = owner-%s\n",
+X		     me->name,me->name,me->name);
+X	    else
+X		fprintf(file,"owner-%s = %s Errors = %s\n",
+X		     me->name,me->name,me->errors);
+X	if(mb && mb->gecos)
+X	    fprintf(file,"%s = %s = ",me->name,mb->gecos);
+X	else
+X	    fprintf(file,"%s = = ",me->name);
+X/*
+X * Local elm doesn't define the members in a maillist, but lets
+X * /usr/lib/aliases handle that part.
+X */
+X	if(lelmstyle)
+X	{
+X	    fprintf(file,"%s\n",me->name);
+X	    continue;
+X	}
+X	pos = strlen(me->name) +1;
+X	mlen = pos;
+X	first = TRUE;
+X        while(mg = (struct mg_ent*)VTableNext(&me->table,&ix,1))
+X	{
+X/*
+X * Do not include a listmember with the same name as the list itself
+X */
+X	    if(!strcmp(me->name,mg->member)) continue;
+X
+X	    l = strlen(mg->member) + 2;
+X#if 0
+X/* I am told that because of restrictions in dbm an alias cannot contain
+X   more than approximately 1000 bytes of information. So I create
+X   dummy aliases.
+X*/
+X	    mlen += l;
+X	    if(mlen > 970)
+X	    {
+X		if(!first) putc(',',file);
+X		dnr++;
+X		fprintf(file,"%s_%d\n",me->name,dnr);
+X		fprintf(file,
+X	"# Dummy alias necesary because of restrictions in dbm(3x).\n");
+X		fprintf(file,"%s_%d = = %s",me->name,dnr,mg->member);
+X		pos = strlen(me->name) + 4;
+X		mlen = pos + l;
+X		first = FALSE;
+X	    }
+X#endif
+X	    if((pos + l) > 76)
+X	    {
+X		pos = l;
+X		fprintf(file,",\n   %s",mg->member);
+X	    }
+X	    else
+X	    {
+X		pos += l;
+X		if(!first) fprintf(file,", ");
+X		first = FALSE;
+X		fprintf(file,"%s",mg->member);
+X	    }
+X	} /* while */
+X	fprintf(file,"\n");
+X    } /* while */
+X}
+X
+XPrintElmBoxes(file)
+X    FILE	*file;
+X{
+X    int starting= TRUE;
+X    struct mb_ent *me,*key;
+X
+X    fprintf(file,"#\n# Mailboxes created by ns2tab (ELM style)\n#\n");
+X    while(htab_list(mb_tab,starting,&me,&key))
+X    {
+X	starting = FALSE;
+X	if(*me->mailbox)
+X	{
+X	    if(lelmstyle)
+X	    {
+X		if(me->qtype == T_MR)
+X		    fprintf(file,"%s = = %s\n",me->name,me->mailbox);
+X		else
+X		    if(me->gecos)
+X			fprintf(file,"%s = %s = %s\n"
+X			,me->name,me->gecos,me->name);
+X	    }
+X	    else /* Elm style with no /usr/lib/aliases */
+X	    {
+X		fprintf(file,"%s = %s = %s\n",me->name,
+X		    (me->gecos)?me->gecos:"",me->mailbox);
+X	    }
+X	}
+X    } /* while */
+X}
+X
+XPrintElmish(file)
+X    FILE	*file;
+X{
+X    fprintf(file,"# Aliases created from [%s] nameserver.\n",
+X	    (defaultPtr->addrList != NULL) ? defaultPtr->name :
+X	     defaultPtr->servers[0]->name);
+X    PrintElmBoxes(file);
+X    PrintElmLists(file);
+X    return 0;
+X}
+X
+Xstatic void ExpandMember();
+X
+XPrintGroupish(file)
+X    FILE	*file;
+X{
+X    int starting= TRUE;
+X    int first;
+X    struct minfo_ent *me,*key;
+X    struct mg_ent *mg;
+X
+X    while(htab_list(mailtab,starting,&me,&key))
+X    {
+X	int ix=0;
+X	struct mb_ent *mb;
+X
+X	starting = FALSE;
+X	if(!(mb = htab_find(mb_tab,me->name)))
+X	   continue;  /* Ignore everything that doesn't have a MB */
+X	if(mb->gid == NOID)
+X	   continue;  /* Ignore everything that doesn't have a GID */
+X	fprintf(file,"%s:*:%d:",me->name,mb->gid);
+X	first = TRUE;
+X	ExpandMember(file,me);
+X	fprintf(file,"\n");
+X    } /* while */
+X}
+X
+Xstatic void
+XExpandMember(file,me)
+X    FILE *file;
+X    struct minfo_ent *me;
+X{
+X    struct mg_ent *mg;
+X
+X    int first=TRUE;
+X    int ix=0;
+X    while(mg = (struct mg_ent*)VTableNext(&me->table,&ix,1))
+X    {
+X	int doprint = 1;
+X
+X	if(!first) fprintf(file,",");
+X	first = FALSE;
+X/*
+X * If we expand members, we must check them out. If a member has a UID
+X * It should not be expanded.
+X * Also, as an added security, if a member of a group has same
+X * name the group it is not expanded.
+X */
+X	if(recursegroup && strcmp(me->name,mg->member))
+X	{
+X	    struct minfo_ent *mm;
+X	    struct mb_ent *member;
+X
+X/* Check too see if this is a MINFO */
+X	    if(mm = htab_find(mailtab,mg->member))
+X	    {
+X		member = htab_find(mb_tab,mg->member);
+X		if ((member && member->uid == NOID) || !member)
+X		    if(VTableSize(&mm->table) != 0)
+X		    {
+X			ExpandMember(file,mm);
+X			doprint = 0;
+X		    }
+X	    }
+X	}
+X	if(doprint)
+X	    fprintf(file,"%s",mg->member);
+X    }
+X}
+X
+XPrintHosts(file,domain)
+X    FILE	*file;
+X    char *domain;
+X{
+X    int starting= TRUE;
+X    int first;
+X    struct host_ent *host,*key;
+X
+X    fprintf(file,"#\n# Hosttable - derived from ns2tab. Do not change\n#\n");
+X/*
+X * Run through all the canonical names.
+X */
+X    while(htab_list(host_tab,starting,&host,&key))
+X    {
+X	int aix,ix=0;
+X	struct host_ali *ha;
+X	struct host_ip *hi;
+X	char *punkt;
+X
+X	starting = FALSE;
+X        while(hi = (struct host_ip*)VTableNext(&host->ipaddr,&ix,1))
+X	{
+X	    aix=0;
+X#if 0
+X	    fprintf(file,"%-15s %s.%s %s",inet_ntoa(ntohl(hi->addr)),
+X	      host->name,vdomain,host->name);
+X#else
+X	    fprintf(file,"%-15s %s",inet_ntoa(ntohl(hi->addr)),
+X	      host->name);
+X	    if(punkt = strchr(host->name,'.'))
+X	    {
+X		*punkt = '\0';
+X		fprintf(file," %s",host->name);
+X		*punkt = '.';
+X	    }
+X#endif
+X	    while(ha = (struct host_ali*)VTableNext(&host->aliases,&aix,1))
+X		fprintf(file," %s",ha->name);
+X	    if(host->machtype || host->ostype)
+X		fprintf(file,"\t#");
+X	    if(host->machtype)
+X		fprintf(file," %s",host->machtype);
+X	    if(host->ostype)
+X		fprintf(file," %s",host->ostype);
+X	    fprintf(file,"\n");
+X	}
+X    }
+X}
+X
+X#include <pwd.h>
+XPWUpd(file)
+X    FILE	*file;
+X{
+X    struct passwd *pw;
+X    struct mb_ent *mb;
+X    char *gecostmp;
+X
+X    while(pw = getpwent())
+X    {
+X	gecostmp = pw->pw_gecos;
+X	if((mb = htab_find(mb_tab,pw->pw_name)) && mb->gecos)
+X	    pw->pw_gecos = mb->gecos;
+X	putpwent(pw,file);
+X	pw->pw_gecos = gecostmp;
+X    }
+X    endpwent();
+X}
+X
+Xstatic
+XPrintElm(file)
+X    FILE	*file;
+X{
+X    lelmstyle=0;
+X    PrintElmish(file);
+X}
+X
+Xstatic
+XPrintLElm(file)
+X    FILE	*file;
+X{
+X    lelmstyle=1;
+X    PrintElmish(file);
+X}
+X
+Xstatic
+XPrintGroup(file)
+X    FILE	*file;
+X{
+X    recursegroup=1;
+X    PrintGroupish(file);
+X}
+X
+Xstatic
+XPrintNrGroup(file)
+X    FILE	*file;
+X{
+X    recursegroup=0;
+X    PrintGroupish(file);
+X}
+X
+Xstatic
+XPrintSubdomains(file)
+X    FILE	*file;
+X{
+X    struct ns_ent *ns;
+X    int ix = 0;
+X
+X    while(ns = (struct ns_ent*)VTableNext(&subdomains,&ix,1))
+X    {
+X	printf("%-32s %s\n",ns->name,(ns->is_explicit)?"explicit":"implicit");
+X    }
+X}
+X
+X#ifdef EMULATE_HESIOD
+XPrintPrintcap(file)
+X    FILE *file;
+X{
+X    int starting= TRUE;
+X    int first;
+X    struct txt_ent *name,*key;
+X
+X    fprintf(file,"#\n# Printcap - derived from ns2tab. Do not change\n#\n");
+X/*
+X * Run through all the canonical names.
+X */
+X    while(htab_list(txt_tab,starting,&name,&key))
+X    {
+X	register char *p;
+X
+X	starting = FALSE;
+X/*	fprintf(file,"%s",name->txt); */
+X	p = name->txt;
+X	while(*p)
+X	{
+X	   putc(*p,file);
+X	   if(*p == ':' && p[1] ) fprintf(file,"\\\n\t:");
+X	   p++;
+X	}
+X    }
+X    return 0;
+X}
+X
+Xvoid (*printfunc)();
+X
+XFilesysEngine(file)
+X    FILE *file;
+X{
+X    int starting= TRUE;
+X    int first;
+X    struct txt_ent *name,*key;
+X/*
+X * Run through all the canonical names.
+X */
+X    while(htab_list(txt_tab,starting,&name,&key))
+X    {
+X	int x;
+X	char fs_type[8];
+X	char name_on_server[128], server_hostname[128];
+X	char mount_mode[2],mount_point[128];
+X
+X	starting = FALSE;
+X	x = sscanf(name->txt,"%s %s %s %s %s",
+X	    fs_type,name_on_server,
+X	    server_hostname,mount_mode,mount_point);
+X	if(x != 5) continue;
+X	(*printfunc)(file,fs_type,name_on_server,server_hostname,
+X	      mount_mode,mount_point);
+X    }
+X    return 0;
+X}
+X
+Xvoid
+XFstabEntry(file,fs_type,name_on_server,server_hostname,mount_mode,mount_point)
+X    FILE *file;
+X    char *fs_type,*name_on_server,*server_hostname,*mount_mode,*mount_point;
+X{
+X    char *p;
+X    for(p = fs_type; *p; p++) *p = tolower(*p);
+X    fprintf(file,"%s@%s:%s:r%s:0:0:%s:hard,intr:\n",
+X	name_on_server,server_hostname,mount_point,
+X	mount_mode,fs_type);
+X}
+X
+XPrintFstab(file)
+X    FILE *file;
+X{
+X    printfunc = FstabEntry;
+X    FilesysEngine(file);
+X}
+X
+X/*
+X * /etc/default/filesys format as seen on SCO unix.
+X */
+Xvoid
+XFilesysEntry(file,fs_type,name_on_server,server_hostname,mount_mode,mount_point)
+X    FILE *file;
+X    char *fs_type,*name_on_server,*server_hostname,*mount_mode,*mount_point;
+X{
+X    fprintf(file,"bdev=%s:%s mountdir=%s fsck=no rcfsck=no \\\n",
+X       server_hostname,name_on_server,mount_point);
+X    fprintf(file,"rcmount=yes mount=yes fstyp=%s nfsopts=\"hard,intr\"\n\n",
+X       fs_type);
+X}
+X
+XPrintFilesys(file)
+X    FILE *file;
+X{
+X    printfunc = FilesysEntry;
+X    FilesysEngine(file);
+X}
+X
+Xvoid
+XChecklistEntry(file,fs_type,
+X  name_on_server,server_hostname,mount_mode,mount_point)
+X    FILE *file;
+X    char *fs_type,*name_on_server,*server_hostname,*mount_mode,*mount_point;
+X{
+X    char *p;
+X    for(p = fs_type; *p; p++) *p = tolower(*p);
+X    fprintf(file,"%s:%s %s %s r%s,hard,intr 0 0 # loaded from ns2tab\n",
+X	server_hostname,name_on_server,mount_point,fs_type,mount_mode);
+X}
+X
+XPrintChecklist(file)
+X{
+X    printfunc = ChecklistEntry;
+X    FilesysEngine(file);
+X}
+X
+Xvoid
+XVfstabEntry(file,fs_type,
+X  name_on_server,server_hostname,mount_mode,mount_point)
+X    FILE *file;
+X    char *fs_type,*name_on_server,*server_hostname,*mount_mode,*mount_point;
+X{
+X    char *p;
+X    for(p = fs_type; *p; p++) *p = tolower(*p);
+X    fprintf(file,"%s:%s - %s %s - yes r%s,hard,intr\n",
+X	server_hostname,name_on_server,mount_point,fs_type,mount_mode);
+X}
+X
+XPrintVfstab(file)
+X{
+X    printfunc = VfstabEntry;
+X    FilesysEngine(file);
+X}
+X
+Xvoid
+XPrintPasswd(file)
+X    FILE *file;
+X{
+X    int starting= TRUE;
+X    int first;
+X    struct txt_ent *name,*key;
+X
+X    while(htab_list(txt_tab,starting,&name,&key))
+X    {
+X	starting = FALSE;
+X	fprintf(file,"%s\n",name->txt);
+X    }
+X}
+X#endif /* EMULATE_HESIOD */
+X
+Xtypedef int (*intfunc)();
+X
+Xstruct stylerec {
+X     char *name;
+X     int  parselen;
+X     intfunc func;
+X     char *infix;
+X} Styles[] = {
+X    { "lelm",4,PrintLElm ,""},
+X    { "elm",3, PrintElm ,""},
+X    { "aliases",3, PrintMail ,""},
+X    { "group",3, PrintGroup ,""},
+X    { "nrgroup",3, PrintNrGroup ,""},
+X    { "pwupd",5, PWUpd ,""},
+X    { "hosts",5, PrintHosts ,""},
+X    { "subdomain",4,PrintSubdomains,""},
+X#ifdef EMULATE_HESIOD
+X    { "printcap",8,PrintPrintcap,"pcap"},
+X    { "fstab",5,PrintFstab,"filsys"},
+X    { "vfstab",5,PrintVfstab,"filsys"},
+X    { "filesys",7,PrintFilesys,"filsys"},
+X    { "checklist",6,PrintChecklist,"filsys"},
+X    { "passwd",7,PrintPasswd,"passwd"},
+X#endif /* EMULATE_HESIOD */
+X};
+X
+Xstatic intfunc stylefunc = PrintMail;
+X
+Xint
+XSetStyle(style)
+X    char *style;
+X{
+X    int x;
+X
+X    for(x = 0; x < (sizeof(Styles)/sizeof(Styles[0])); x++)
+X	if(!strncmp(Styles[x].name,style,Styles[x].parselen))
+X	{
+X	    stylefunc = Styles[x].func;
+X#ifdef EMULATE_HESIOD
+X	    if(*Styles[x].infix)
+X	    {
+X		char *v;
+X		v = malloc(strlen(vdomain) + strlen(Styles[x].infix) + 4);
+X		sprintf(v,"%s.%s",Styles[x].infix,vdomain);
+X		vdomain = v;
+X	    }
+X#endif /* EMULATE_HESIOD */
+X	    return 0;
+X	}
+X    fprintf(stderr,"Unimplemented style: %s\n",style);
+X    return -1;
+X}
+X
+Xextern int hasprinted;
+X
+XPrintStyle(file)
+X    FILE *file;
+X{
+X    hasprinted = 1;
+X    (*stylefunc)(file);
+X}
+END_OF_FILE
+if test 32658 -ne `wc -c <'list.c'`; then
+    echo shar: \"'list.c'\" unpacked with wrong size!
+fi
+# end of 'list.c'
+fi
+echo shar: End of archive 3 \(of 3\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

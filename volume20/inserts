@@ -1,0 +1,436 @@
+Subject:  v20i079:  Do insertions into a document
+Newsgroups: comp.sources.unix,comp.text
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Henry Spencer <attcan!utzoo!henry>
+Posting-number: Volume 20, Issue 79
+Archive-name: inserts
+
+I alluded to this in comp.text a while ago, and got a number of requests
+for it.  It's a program for things like form letters, where one wants to
+insert chunks of text into repetitions of a master document.  It does much
+the same things as troff's .rd request, but it is much faster, does better
+error checking, and cuts the troff input down to a single stream (which is
+much easier to use in an environment where troff jobs get batched up and
+fed to a server).
+
+
+echo 'README':
+sed 's/^X//' >'README' <<'!'
+XI alluded to this in comp.text a while ago, and got a number of requests
+Xfor it.  It's a program for things like form letters, where one wants to
+Xinsert chunks of text into repetitions of a master document.  It does much
+Xthe same things as troff's .rd request, but it is much faster, does better
+Xerror checking, and cuts the troff input down to a single stream (which is
+Xmuch easier to use in an environment where troff jobs get batched up and
+Xfed to a server).
+X
+X                                     Henry Spencer at U of Toronto Zoology
+X                                 uunet!attcan!utzoo!henry henry@zoo.toronto.edu
+!
+echo 'inserts.1':
+sed 's/^X//' >'inserts.1' <<'!'
+X.TH INSERTS 1 local
+X.DA 14 April 1988
+X.SH NAME
+Xinserts \- do insertions into document
+X.SH SYNOPSIS
+X.B inserts
+X[
+X.B \-p
+Xinspt
+X] [
+X.B \-e
+Xend
+X] [
+X.B \-s
+Xoutsep
+X] [
+X.B \-w
+X] [
+X.B \-i
+Xinsfile
+X] [ file ] ...
+X.SH DESCRIPTION
+X.I Inserts
+Xaccepts input from the named \fIfile\fR(s) (standard input default;
+X`\-' as a name means standard input also)
+Xconsisting of a document containing \fIinsertion points\fR,
+Xfollowed by a sequence of \fIinserts\fR, and produces
+X(on standard output) copies of the document with each insertion point
+Xreplaced by an insert.
+XInserts are used in succession until there are no more;
+Xthe number of copies of the document produced
+Xis the number needed to use up all the inserts.
+XIf the inserts end midway through a copy of the document,
+Xempty insertions are supplied until that copy is complete.
+X.PP
+XAn insertion point in the input
+Xis a line consisting entirely of the \fIinspt\fR string,
+X(default \fB.RD\fR).
+XIn the input, the document is separated from the inserts by
+Xa line
+Xconsisting entirely
+Xof the \fIend\fR string (default \fB.INSERTS\fR).
+XSuccessive inserts are separated from each other in the input by a
+Xsingle empty line.
+X.I Inserts
+Xseparates
+Xsuccessive copies of the document in the output by a line
+Xconsisting entirely of the \fIoutsep\fR string (default \fB.END\fR).
+X.PP
+XIf the \fB\-i\fR option is given, the effect is as if
+Xthe contents of \fIinsfile\fR were appended to the input, with an
+X\fIend\fR line in between.
+X.SH SEE ALSO
+Xtroff(1)
+X.SH DIAGNOSTICS
+XIt is an error for there to be no insertion points in the document.
+XIn the absence of the \fB\-w\fR option, warnings are produced if there
+Xare no inserts or if the supply of inserts is exhausted midway through
+Xa copy of the document.
+X.SH HISTORY
+XWritten at U of Toronto by Henry Spencer.
+X.SH BUGS
+XA finite in-core buffer is used to hold the document, so a very large
+Xdocument will fail.
+!
+echo 'inserts.c':
+sed 's/^X//' >'inserts.c' <<'!'
+X/*
+X * inserts - process form-letter-ish insertions
+X *
+X * $Log$
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <string.h>
+X
+X#define	MAXSTR	500		/* For sizing strings -- DON'T use BUFSIZ! */
+X#define	STREQ(a, b)	(*(a) == *(b) && strcmp((a), (b)) == 0)
+X
+X#ifndef lint
+Xstatic char RCSid[] = "$Header$";
+X#endif
+X
+X/* storage for document body */
+X#define	MAXBODY	30000
+X#define	MAXSEGS	100
+Xchar body[MAXBODY];		/* relies on initialization to 0 */
+Xint nbody = 0;			/* chars in body */
+Xchar *segs[MAXSEGS] = { body };	/* ptrs to NUL-terminated body segments */
+Xint nsegs = 1;
+X
+X/* markers in text */
+Xchar *inspoint = ".RD";		/* insertion point in body */
+Xchar *endbody = ".INSERTS";	/* end of body */
+Xchar *separator = ".END";	/* separator between copies in output */
+Xint dowarn = 1;			/* supply warnings? */
+X
+Xint debug = 0;
+Xchar *progname;
+X
+Xchar **argvp;				/* scan pointer for nextfile() */
+Xchar *nullargv[] = { "-", NULL };	/* dummy argv for case of no args */
+Xchar *inname;				/* filename for messages etc. */
+Xchar *filename = NULL;			/* -f overrides inname for messages */
+Xlong lineno;				/* line number for messages etc. */
+XFILE *in = NULL;			/* current input file */
+X
+Xchar *ifile = NULL;			/* -i file, if any */
+Xint istart = 0;				/* just starting ifile? */
+X
+Xextern void error(), exit();
+X#ifdef UTZOOERR
+Xextern char *mkprogname();
+X#else
+X#define	mkprogname(a)	(a)
+X#endif
+X
+Xchar *nextfile();
+Xvoid fail();
+Xvoid getfirst();
+Xvoid getins();
+X
+X/*
+X - main - parse arguments and handle options
+X */
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	int c;
+X	int errflg = 0;
+X	extern int optind;
+X	extern char *optarg;
+X	void process();
+X
+X	progname = mkprogname(argv[0]);
+X
+X	while ((c = getopt(argc, argv, "p:e:s:wi:d")) != EOF)
+X		switch (c) {
+X		case 'p':	/* insertion-point marker */
+X			inspoint = optarg;
+X			break;
+X		case 'e':	/* end-of-body marker */
+X			endbody = optarg;
+X			break;
+X		case 's':	/* output separator */
+X			separator = optarg;
+X			break;
+X		case 'w':	/* suppress warnings */
+X			dowarn = 0;
+X			break;
+X		case 'i':	/* this is file of inserts */
+X			ifile = optarg;
+X			break;
+X		case 'd':	/* Debugging. */
+X			debug++;
+X			break;
+X		case '?':
+X		default:
+X			errflg++;
+X			break;
+X		}
+X	if (errflg) {
+X		fprintf(stderr, "usage: %s ", progname);
+X		fprintf(stderr, "[-i inspt] [-e end] [-s outsep] [file] ...\n");
+X		exit(2);
+X	}
+X
+X	if (optind >= argc)
+X		argvp = nullargv;
+X	else
+X		argvp = &argv[optind];
+X	inname = nextfile();
+X	if (inname != NULL)
+X		process();
+X	exit(0);
+X}
+X
+X/*
+X - getline - get next line (internal version of fgets)
+X */
+Xchar *
+Xgetline(ptr, size)
+Xchar *ptr;
+Xint size;
+X{
+X	register char *namep;
+X
+X	while (fgets(ptr, size, in) == NULL) {	/* while no more */
+X		namep = nextfile();		/* try next source */
+X		if (namep == NULL)
+X			return(NULL);		/* really no more */
+X		inname = namep;
+X		if (istart) {			/* transition to ifile */
+X			sprintf(ptr, "%s\n", endbody);
+X			return(ptr);
+X		}
+X	}
+X	lineno++;
+X	return(ptr);
+X}
+X
+X/*
+X - nextfile - switch files
+X */
+Xchar *				/* filename */
+Xnextfile()
+X{
+X	register char *namep;
+X	struct stat statbuf;
+X	extern FILE *efopen();
+X
+X	namep = *argvp;
+X	if (namep == NULL) {	/* no more files */
+X		if (ifile == NULL)
+X			return(NULL);
+X		else if (istart) {	/* already done the end line */
+X			istart = 0;
+X			namep = ifile;
+X			ifile = NULL;
+X		} else {		/* supply end line before ifile */
+X			istart = 1;
+X			return(inname);
+X		}
+X	} else
+X		argvp++;
+X
+X	if (in != NULL)
+X		(void) fclose(in);
+X
+X	if (STREQ(namep, "-")) {
+X		in = stdin;
+X		namep = "stdin";
+X	} else {
+X		in = efopen(namep, "r");
+X		if (fstat(fileno(in), &statbuf) < 0)
+X			error("can't fstat `%s'", namep);
+X		if ((statbuf.st_mode & S_IFMT) == S_IFDIR)
+X			error("`%s' is directory!", namep);
+X	}
+X
+X	lineno = 0;
+X	return(namep);
+X}
+X
+X/*
+X - fail - complain and die
+X */
+Xvoid
+Xfail(s1, s2)
+Xchar *s1;
+Xchar *s2;
+X{
+X	fprintf(stderr, "%s: (file `%s', line %ld) ", progname,
+X			(filename != NULL) ? filename : inname, lineno);
+X	fprintf(stderr, s1, s2);
+X	fprintf(stderr, "\n");
+X	exit(1);
+X}
+X
+X/*
+X - warn - just complain
+X */
+Xvoid
+Xwarn(s1, s2)
+Xchar *s1;
+Xchar *s2;
+X{
+X	if (!dowarn)
+X		return;
+X
+X	fprintf(stderr, "%s: (file `%s', line %ld) (warning) ", progname,
+X			(filename != NULL) ? filename : inname, lineno);
+X	fprintf(stderr, s1, s2);
+X	fprintf(stderr, "\n");
+X}
+X
+X/*
+X - process - process input data
+X *
+X * The MAXBODY check is over-conservative in that it will blow up a few
+X * characters too early on an insertion-point or body-end line; big deal.
+X */
+Xvoid
+Xprocess()
+X{
+X	char line[MAXSTR];
+X#	define	LINSIZ	((int)sizeof(line))
+X	register int len;
+X	register int seg;
+X	int firstbody;		/* first time body has been output? */
+X	int firstins;		/* first line of first insertion in body? */
+X	int firstline;		/* first line of an insertion? */
+X
+X	/* pick up the body */
+X	while ((len = getbody(line, LINSIZ)) > 0) {
+X		if (nbody + len >= MAXBODY-1)	/* -1 for final NUL */
+X			fail("document too large", "");
+X		line[len-1] = '\0';		/* get rid of newline */
+X		if (STREQ(line, inspoint)) {
+X			nbody++;		/* NUL ends that segment */
+X			body[nbody] = '\0';	/* start new segment */
+X			segs[nsegs++] = body + nbody;
+X		} else {
+X			line[len-1] = '\n';	/* put newline back */
+X			(void) strcpy(body+nbody, line);
+X			nbody += len;
+X		}
+X	}
+X	if (nsegs <= 1)
+X		fail("no insertion points (%s's) found!", inspoint);
+X
+X	/* insertions */
+X	firstbody = 1;
+X	while (getline(line, LINSIZ) != NULL) {
+X		if (!firstbody) {	/* first body doesn't need separator */
+X			(void) fputs(separator, stdout);
+X			(void) fputs("\n", stdout);
+X		}
+X		firstbody = 0;
+X		firstins = 1;
+X		(void) fputs(segs[0], stdout);
+X		for (seg = 1; seg < nsegs; seg++) {
+X			firstline = 1;
+X			for (;;) {
+X				if (!firstins) {	/* first line read */
+X					if (firstline)
+X						getfirst(line, LINSIZ);
+X					else
+X						getins(line, LINSIZ);
+X				}
+X				firstins = 0;
+X				firstline = 0;
+X				if (STREQ(line, "\n"))
+X					break;
+X				(void) fputs(line, stdout);
+X			}
+X			(void) fputs(segs[seg], stdout);
+X		}
+X	}
+X	if (firstbody)
+X		warn("no inserts supplied!", "");
+X}
+X
+X/*
+X - getbody - get a body line
+X */
+Xint				/* length of line; 0 means end of body */
+Xgetbody(buf, nbuf)
+Xchar *buf;
+Xint nbuf;
+X{
+X	register int len;
+X
+X	if (getline(buf, nbuf) == NULL)
+X		return(0);
+X	len = strlen(buf);
+X	if (buf[len-1] != '\n')
+X		fail("line too long", "");
+X	buf[len-1] = '\0';
+X	if (STREQ(buf, endbody))
+X		return(0);
+X	buf[len-1] = '\n';
+X	return(len);
+X}
+X
+X/*
+X - getfirst - get first line of insert, EOF turning into empty line
+X */
+Xvoid
+Xgetfirst(buf, nbuf)
+Xchar *buf;
+Xint nbuf;
+X{
+X	static int grumped = 0;
+X
+X	if (getline(buf, nbuf) == NULL) {
+X		if (!grumped)
+X			warn("ran out of inserts in mid-document!", "");
+X		grumped = 1;
+X		(void) strcpy(buf, "\n");
+X	}
+X}
+X
+X/*
+X - getins - get an insert line, EOF turning into empty line
+X *
+X * like getfirst except that EOF just ends the insert
+X */
+Xvoid
+Xgetins(buf, nbuf)
+Xchar *buf;
+Xint nbuf;
+X{
+X	if (getline(buf, nbuf) == NULL)
+X		(void) strcpy(buf, "\n");
+X}
+!
+echo done
+
+

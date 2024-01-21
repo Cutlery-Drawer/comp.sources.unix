@@ -1,0 +1,1525 @@
+Subject:  v14i068:  Jove, an emacs variant, version 4.9, Part12/21
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Jonathan Payne <jpayne@cs.rochester.edu>
+Posting-number: Volume 14, Issue 68
+Archive-name: jove4.9/part12
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 12 (of 21)."
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f './io.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'./io.c'\"
+else
+echo shar: Extracting \"'./io.c'\" \(28324 characters\)
+sed "s/^X//" >'./io.c' <<'END_OF_FILE'
+X/***************************************************************************
+X * This program is Copyright (C) 1986, 1987, 1988 by Jonathan Payne.  JOVE *
+X * is provided to you without charge, and with no warranty.  You may give  *
+X * away copies of JOVE, including sources, provided that this notice is    *
+X * included in all the files.                                              *
+X ***************************************************************************/
+X 
+X#include "jove.h"
+X#include "io.h"
+X#include "termcap.h"
+X
+X#ifdef IPROCS
+X#   include <signal.h>
+X#endif
+X
+X#ifdef MAC
+X#	include "mac.h"
+X#else
+X#	include <sys/stat.h>
+X#endif
+X
+X#ifdef UNIX
+X#include <sys/file.h>
+X#endif
+X
+X#ifdef MSDOS
+X#include <fcntl.h>
+X#include <io.h>
+X#ifdef CHDIR
+X#include <direct.h>
+X#include <dos.h>
+X#endif
+X#endif /* MSDOS */
+X#include <errno.h>
+X
+X#ifdef MAC
+X#	undef private
+X#	define private
+X#endif
+X
+X#ifdef	LINT_ARGS
+private struct block
+X	* b_unlink(struct block *),
+X	* lookup(short);
+X
+private char
+X	* dbackup(char *, char *, char),
+X#if defined(MSDOS) && defined(CHDIR)
+X	* fixpath(char *),
+X#endif
+X	* getblock(disk_line, int);
+X	
+private void
+X#if defined(MSDOS) && defined(CHDIR)
+X	abspath(char *, char *),
+X#endif
+X	fake_blkio(struct block *, int (*)()),
+X	LRUunlink(struct block *),
+X	real_blkio(struct block *, int (*)());
+X
+private int
+X#if defined(MSDOS) && defined(CHDIR)
+X	Dchdir(char *),
+X#endif	
+X	dfollow(char *, char *);
+X	
+X#else
+private struct block
+X	* b_unlink(),
+X	* lookup();
+X
+private char
+X	* dbackup(),
+X#if defined(MSDOS) && defined(CHDIR)
+X	* fixpath(),
+X#endif
+X	* getblock();
+X
+private void
+X#if defined(MSDOS) && defined(CHDIR)
+X	abspath(),
+X#endif
+X	fake_blkio(),
+X	LRUunlink(),
+X	real_blkio();
+X
+private int
+X#if defined(MSDOS) && defined(CHDIR)
+X	Dchdir(),
+X#endif	
+X	dfollow();
+X#endif	/* LINT_ARGS */
+X
+X#ifdef MAC
+X#	undef private
+X#	define private static
+X#endif
+X
+X
+X#ifndef W_OK
+X#   define W_OK	2
+X#   define F_OK	0
+X#endif
+X
+long	io_chars;		/* number of chars in this open_file */
+int	io_lines;		/* number of lines in this open_file */
+X
+X#if defined(VMUNIX)||defined(MSDOS)
+char	iobuff[LBSIZE],
+X	genbuf[LBSIZE],
+X	linebuf[LBSIZE];
+X#else
+char	*iobuff,
+X	*genbuf,
+X	*linebuf;
+X#endif
+X
+X#ifdef BACKUPFILES
+int	BkupOnWrite = 0;
+X#endif
+X
+void
+close_file(fp)
+File	*fp;
+X{
+X	if (fp) {
+X		if (fp->f_flags & F_TELLALL)
+X			add_mess(" %d lines, %D characters.",
+X				 io_lines,
+X				 io_chars);
+X		f_close(fp);
+X	}
+X}
+X
+X/* Write the region from line1/char1 to line2/char2 to FP.  This
+X   never CLOSES the file since we don't know if we want to. */
+X
+int	EndWNewline = 1;
+X
+void
+putreg(fp, line1, char1, line2, char2, makesure)
+register File	*fp;
+Line	*line1,
+X	*line2;
+X{
+X	register int	c;
+X	register char	*lp;
+X
+X	if (makesure)
+X		(void) fixorder(&line1, &char1, &line2, &char2);
+X	while (line1 != line2->l_next) {
+X		lp = lcontents(line1) + char1;
+X		if (line1 == line2) {
+X			fputnchar(lp, (char2 - char1), fp);
+X			io_chars += (char2 - char1);
+X		} else while (c = *lp++) {
+X			putc(c, fp);
+X			io_chars += 1;
+X		}
+X		if (line1 != line2) {
+X			io_lines += 1;
+X			io_chars += 1;
+X#ifdef MSDOS
+X			putc('\r', fp);
+X#endif /* MSDOS */
+X			putc('\n', fp);
+X		}
+X		line1 = line1->l_next;
+X		char1 = 0;
+X	}
+X	flush(fp);
+X}
+X
+void
+read_file(file, is_insert)
+char	*file;
+X{
+X	Bufpos	save;
+X	File	*fp;
+X	if (!is_insert) {
+X		curbuf->b_ntbf = 0;
+X		set_ino(curbuf);
+X	}
+X	fp = open_file(file, iobuff, F_READ, !COMPLAIN, !QUIET);
+X	if (fp == NIL) {
+X		if (!is_insert && errno == ENOENT)
+X			s_mess("(new file)");
+X		else
+X			s_mess(IOerr("open", file));
+X		return;
+X	}
+X	DOTsave(&save);
+X	dofread(fp);
+X	if (is_insert && io_chars > 0) {
+X		modify();
+X		set_mark();
+X	}
+X	SetDot(&save);
+X	getDOT();
+X	close_file(fp);
+X}
+X
+void
+dofread(fp)
+register File	*fp;
+X{
+X	char	end[LBSIZE];
+X	int	xeof = 0;
+X	Line	*savel = curline;
+X	int	savec = curchar;
+X	extern disk_line	f_getputl();
+X
+X	strcpy(end, linebuf + curchar);
+X	xeof = f_gets(fp, linebuf + curchar, LBSIZE - curchar);
+X	SavLine(curline, linebuf);
+X	if (!xeof) do {
+X		curline = listput(curbuf, curline);
+X		xeof = f_getputl(curline, fp);
+X	} while (!xeof);
+X	getDOT();
+X	linecopy(linebuf, (curchar = strlen(linebuf)), end);
+X	SavLine(curline, linebuf);
+X	IFixMarks(savel, savec, curline, curchar);
+X}
+X
+void
+SaveFile()
+X{
+X	if (IsModified(curbuf)) {
+X		if (curbuf->b_fname == 0)
+X			WriteFile();
+X		else {
+X			filemunge(curbuf->b_fname);
+X#ifndef MAC
+X#ifndef MSDOS	/* not sure - kg - */
+X			chk_mtime(curbuf, curbuf->b_fname, "save");
+X#endif /* MSDOS */
+X#endif /* MAC */
+X			file_write(curbuf->b_fname, 0);
+X			unmodify();
+X		}
+X	} else
+X		message("No changes need to be written.");
+X}
+X
+char	*HomeDir;	/* home directory */
+int	HomeLen = -1;	/* length of home directory string */
+X
+X#ifndef CHDIR
+X
+char *
+pr_name(fname, okay_home)
+char	*fname;
+X{
+X	if (fname == 0)
+X		return 0;
+X
+X	if (okay_home == YES && strncmp(fname, HomeDir, HomeLen) == 0) {
+X		static char	name_buf[100];
+X
+X		sprintf(name_buf, "~%s", fname + HomeLen);
+X		return name_buf;
+X	}
+X
+X	return fname;
+X}
+X
+X#else
+X
+X#define NDIRS	5
+X
+private char	*DirStack[NDIRS] = {0};
+private int	DirSP = 0;	/* Directory stack pointer */
+X#define PWD	(DirStack[DirSP])
+X
+char *
+pwd()
+X{
+X	return PWD;
+X}
+X
+char *
+pr_name(fname, okay_home)
+char	*fname;
+X{
+X	int	n;
+X
+X	if (fname == 0)
+X		return 0;
+X	n = numcomp(fname, PWD);
+X
+X	if ((PWD[n] == 0) &&	/* Matched to end of PWD */
+X	    (fname[n] == '/'))
+X		return fname + n + 1;
+X
+X	if (okay_home == YES && strcmp(HomeDir, "/") != 0 && strncmp(fname, HomeDir, HomeLen) == 0) {
+X		static char	name_buf[100];
+X
+X		sprintf(name_buf, "~%s", fname + HomeLen);
+X		return name_buf;
+X	}
+X
+X	return fname;	/* return entire path name */
+X}
+X
+extern unsigned int fmask;
+X
+Chdir()
+X{
+X	char	dirbuf[FILESIZE];
+X
+X#ifdef MSDOS
+X	fmask = 0x10;
+X#endif	
+X	(void) ask_file((char *) 0, PWD, dirbuf);
+X#ifdef MSDOS
+X	fmask = 0x13;
+X	if (Dchdir(dirbuf) == -1)
+X#else
+X	if (chdir(dirbuf) == -1)
+X#endif
+X	{
+X		s_mess("cd: cannot change into %s.", dirbuf);
+X		return;
+X	}
+X	UpdModLine = YES;
+X	setCWD(dirbuf);
+X	prCWD();
+X#ifdef MAC
+X	Bufchange++;
+X#endif
+X}
+X
+X#ifdef UNIX
+X#ifndef JOB_CONTROL
+char *
+getwd()
+X{
+X	Buffer	*old = curbuf;
+X	char	*ret_val;
+X
+X	SetBuf(do_select((Window *) 0, "pwd-output"));
+X	curbuf->b_type = B_PROCESS;
+X	(void) UnixToBuf("pwd-output", NO, 0, YES, "/bin/pwd", (char *) 0);
+X	ToFirst();
+X	ret_val = sprint(linebuf);
+X	SetBuf(old);
+X	return ret_val;
+X}
+X#endif
+X#endif /* UNIX */
+X
+setCWD(d)
+char	*d;
+X{
+X	if (PWD == 0)
+X		PWD = malloc((unsigned) strlen(d) + 1);
+X	else {
+X		extern char	*ralloc();
+X
+X		PWD = ralloc(PWD, strlen(d) + 1);
+X	}
+X	strcpy(PWD, d);
+X}
+X
+getCWD()
+X{
+X	char	*cwd;
+X#ifndef MSDOS
+X#ifdef JOB_CONTROL
+X	extern char	*getwd();
+X	char	pathname[FILESIZE];
+X#endif
+X#else
+X	extern char	*getcwd();
+X	char	pathname[FILESIZE];
+X#endif
+X
+X#ifndef MSDOS
+X	cwd = getenv("CWD");
+X	if (cwd == 0)
+X		cwd = getenv("PWD");
+X	if (cwd == 0)
+X#ifdef JOB_CONTROL
+X		cwd = getwd(pathname);
+X#else
+X		cwd = getwd();
+X#endif
+X#else /* MSDOS */
+X		cwd = fixpath(getcwd(pathname, FILESIZE));
+X#endif /* MSDOS */
+X
+X	setCWD(cwd);
+X}	
+X
+prDIRS()
+X{
+X	register int	i;
+X
+X	s_mess(": %f ");
+X	for (i = DirSP; i >= 0; i--)
+X		add_mess("%s ", pr_name(DirStack[i], YES));
+X}
+X
+prCWD()
+X{
+X	s_mess(": %f => \"%s\"", PWD);
+X}
+X
+Pushd()
+X{
+X	char	*newdir,
+X		dirbuf[FILESIZE];
+X
+X#ifdef MSDOS
+X	fmask = 0x10;
+X#endif	
+X	newdir = ask_file((char *) 0, NullStr, dirbuf);
+X#ifdef MSDOS
+X	fmask = 0x13;
+X#endif	
+X	UpdModLine = YES;
+X	if (*newdir == 0) {	/* Wants to swap top two entries */
+X		char	*old_top;
+X
+X		if (DirSP == 0)
+X			complain("pushd: no other directory.");
+X		old_top = PWD;
+X		DirStack[DirSP] = DirStack[DirSP - 1];
+X		DirStack[DirSP - 1] = old_top;
+X#ifdef MSDOS
+X		(void) Dchdir(PWD);
+X#else
+X		(void) chdir(PWD);
+X#endif
+X	} else {
+X#ifdef MSDOS
+X		if (Dchdir(dirbuf) == -1) {
+X#else
+X		if (chdir(dirbuf) == -1) {
+X#endif
+X			s_mess("pushd: cannot change into %s.", dirbuf);
+X			return;
+X		}
+X
+X		if (DirSP + 1 >= NDIRS)
+X			complain("pushd: full stack; max of %d pushes.", NDIRS);
+X		DirSP += 1;
+X		setCWD(dirbuf);
+X	}
+X	prDIRS();
+X}
+X
+Popd()
+X{
+X	if (DirSP == 0)
+X		complain("popd: directory stack is empty.");
+X	UpdModLine = YES;
+X	free(PWD);
+X	PWD = 0;
+X	DirSP -= 1;
+X#ifdef MSDOS
+X	(void) Dchdir(PWD);	/* If this doesn't work, we's in deep shit. */
+X#else
+X	(void) chdir(PWD);	/* If this doesn't work, we's in deep shit. */
+X#endif
+X	prDIRS();
+X}
+X
+private char *
+dbackup(base, offset, c)
+register char	*base,
+X		*offset,
+X		c;
+X{
+X	while (offset > base && *--offset != c)
+X		;
+X	return offset;
+X}
+X
+private
+dfollow(file, into)
+char	*file,
+X	*into;
+X{
+X	char	*dp,
+X#ifdef MSDOS
+X		filefix[FILESIZE],
+X#endif		
+X		*sp;
+X
+X#ifndef MSDOS
+X	if (*file == '/') {		/* Absolute pathname */
+X		strcpy(into, "/");
+X		file += 1;
+X	} else
+X		strcpy(into, PWD);
+X#else
+X	abspath(file, filefix);		/* convert to absolute pathname */
+X	strcpy(into, filefix);		/* and forget about drives	*/
+X	into[3] = 0;
+X	into = &(into[2]);
+X	file = &(filefix[3]);
+X#endif	
+X	dp = into + strlen(into);
+X
+X	sp = file;
+X	do {
+X		if (*file == 0)
+X			break;
+X		if (sp = index(file, '/'))
+X			*sp = 0;
+X		if (strcmp(file, ".") == 0)
+X			;	/* So it will get to the end of the loop */
+X		else if (strcmp(file, "..") == 0) {
+X			*(dp = dbackup(into, dp, '/')) = 0;
+X			if (dp == into)
+X				strcpy(into, "/"), dp = into + 1;
+X		} else {
+X			if (into[strlen(into) - 1] != '/')
+X				(void) strcat(into, "/"), dp += 1;
+X			(void) strcat(into, file);
+X			dp += strlen(file);	/* stay at the end */
+X		}
+X		file = sp + 1;
+X	} while (sp != 0);
+X}
+X
+X#endif /* CHDIR */
+X
+X#ifdef UNIX
+private
+get_hdir(user, buf)
+register char	*user,
+X		*buf;
+X{
+X	char	fbuf[LBSIZE],
+X		pattern[100];
+X	register int	u_len;
+X	File	*fp;
+X
+X	u_len = strlen(user);
+X	fp = open_file("/etc/passwd", fbuf, F_READ, COMPLAIN, QUIET);
+X	sprintf(pattern, "%s:[^:]*:[^:]*:[^:]*:[^:]*:\\([^:]*\\):", user);
+X	while (f_gets(fp, genbuf, LBSIZE) != EOF)
+X		if ((strncmp(genbuf, user, u_len) == 0) &&
+X		    (LookingAt(pattern, genbuf, 0))) {
+X			putmatch(1, buf, FILESIZE);
+X			close_file(fp);
+X			return;
+X		}
+X	f_close(fp);
+X	complain("[unknown user: %s]", user);
+X}
+X#endif /* UNIX */
+X
+void
+PathParse(name, intobuf)
+char	*name,
+X	*intobuf;
+X{
+X	char	localbuf[FILESIZE];
+X
+X	intobuf[0] = localbuf[0] = '\0';
+X	if (*name == '\0')
+X		return;
+X	if (*name == '~') {
+X		if (name[1] == '/' || name[1] == '\0') {
+X			strcpy(localbuf, HomeDir);
+X			name += 1;
+X#if !(defined(MSDOS) || defined(MAC))	/* may add for mac in future */
+X		} else {
+X			char	*uendp = index(name, '/'),
+X				unamebuf[30];
+X
+X			if (uendp == 0)
+X				uendp = name + strlen(name);
+X			name = name + 1;
+X			null_ncpy(unamebuf, name, uendp - name);
+X			get_hdir(unamebuf, localbuf);
+X			name = uendp;
+X#endif 
+X		}
+X	} 
+X#ifndef MSDOS
+X	 else if (*name == '\\')
+X		name += 1;
+X#endif /* MSDOS */
+X	(void) strcat(localbuf, name);
+X#ifdef CHDIR
+X	dfollow(localbuf, intobuf);
+X#else
+X	strcpy(intobuf, localbuf);
+X#endif
+X}
+X
+void
+filemunge(newname)
+char	*newname;
+X{
+X	struct stat	stbuf;
+X
+X	if (newname == 0)
+X		return;
+X	if (stat(newname, &stbuf))
+X		return;
+X#ifndef MSDOS
+X	if (((stbuf.st_dev != curbuf->b_dev) ||
+X	     (stbuf.st_ino != curbuf->b_ino)) &&
+X#else /* MSDOS */
+X	if ( /* (stbuf.st_ino != curbuf->b_ino) && */
+X#endif /* MSDOS */
+X#ifndef MAC
+X	    ((stbuf.st_mode & S_IFMT) != S_IFCHR) &&
+X#endif
+X	    (strcmp(newname, curbuf->b_fname) != 0)) {
+X		rbell();
+X		confirm("\"%s\" already exists; overwrite it? ", newname);
+X	}
+X}
+X
+void
+WrtReg()
+X{
+X	DoWriteReg(NO);
+X}
+X
+void
+AppReg()
+X{
+X	DoWriteReg(YES);
+X}
+X
+int	CreatMode = DFLT_MODE;
+X
+void
+DoWriteReg(app)
+X{
+X	char	fnamebuf[FILESIZE],
+X		*fname;
+X	Mark	*mp = CurMark();
+X	File	*fp;
+X
+X	/* Won't get here if there isn't a Mark */
+X	fname = ask_file((char *) 0, (char *) 0, fnamebuf);
+X
+X#ifdef BACKUPFILES
+X	if (app == NO) {
+X		filemunge(fname);
+X
+X		if (BkupOnWrite)
+X			file_backup(fname);
+X	}
+X#else
+X	if (!app)
+X		filemunge(fname);
+X#endif
+X
+X	fp = open_file(fname, iobuff, app ? F_APPEND : F_WRITE, COMPLAIN, !QUIET);
+X	putreg(fp, mp->m_line, mp->m_char, curline, curchar, YES);
+X	close_file(fp);
+X}
+X
+int	OkayBadChars = 0;
+X
+void
+WriteFile()
+X{
+X	char	*fname,
+X		fnamebuf[FILESIZE];
+X#ifdef MAC
+X	if(Macmode) {
+X		if(!(fname = pfile(fnamebuf))) return;
+X	}
+X	else
+X#endif /* MAC */
+X
+X	fname = ask_file((char *) 0, curbuf->b_fname, fnamebuf);
+X	/* Don't allow bad characters when creating new files. */
+X	if (!OkayBadChars && strcmp(curbuf->b_fname, fnamebuf) != 0) {
+X#ifdef UNIX
+X		static char	*badchars = "!$^&*()~`{}\"'\\|<>? ";
+X#endif /* UNIX */
+X#ifdef MSDOS
+X		static char	*badchars = "*|<>? ";
+X#endif /* MSDOS */
+X#ifdef MAC
+X		static char *badchars = ":";
+X#endif /* MAC */
+X		register char	*cp = fnamebuf;
+X		register int	c;
+X
+X		while (c = *cp++ & CHARMASK)	/* avoid sign extension... */
+X			if (c < ' ' || c == '\177' || index(badchars, c))
+X				complain("'%p': bad character in filename.", c);
+X	}
+X
+X#ifndef MAC
+X#ifndef MSDOS
+X	chk_mtime(curbuf, fname, "write");
+X#endif /* MSDOS */
+X#endif /* MAC */
+X	filemunge(fname);
+X	curbuf->b_type = B_FILE;  	/* in case it wasn't before */
+X	setfname(curbuf, fname);
+X	file_write(fname, 0);
+X	unmodify();
+X}
+X
+X/* Open file FNAME supplying the buffer IO routine with buffer BUF.
+X   HOW is F_READ, F_WRITE or F_APPEND.  IFBAD == COMPLAIN means that
+X   if we fail at opening the file, call complain.  LOUDNESS says
+X   whether or not to print the "reading ..." message on the message
+X   line.
+X
+X   NOTE:  This opens the pr_name(fname, NO) of fname.  That is, FNAME
+X	  is usually an entire pathname, which can be slow when the
+X	  pathname is long and there are lots of symbolic links along
+X	  the way (which has become very common in my experience).  So,
+X	  this speeds up opens file names in the local directory.  It
+X	  will not speed up things like "../scm/foo.scm" simple because
+X	  by the time we get here that's already been expanded to an
+X	  absolute pathname.  But this is a start.
+X   */
+X
+File *
+open_file(fname, buf, how, ifbad, loudness)
+register char	*fname;
+char	*buf;
+register int	how;
+X{
+X	register File	*fp;
+X
+X	io_chars = 0;
+X	io_lines = 0;
+X
+X	fp = f_open(pr_name(fname, NO), how, buf, LBSIZE);
+X	if (fp == NIL) {
+X                message(IOerr((how == F_READ) ? "open" : "create", fname));
+X		if (ifbad == COMPLAIN)
+X			complain((char *) 0);
+X	} else {
+X		int	readonly = FALSE;
+X#ifndef MAC
+X		if (access(pr_name(fname, NO), W_OK) == -1 && errno != ENOENT)
+X			readonly = TRUE;
+X#endif				 
+X		if (loudness != QUIET) {
+X			fp->f_flags |= F_TELLALL;
+X			f_mess("\"%s\"%s", pr_name(fname, YES),
+X				   readonly ? " [Read only]" : NullStr);
+X		}
+X	}
+X	return fp;
+X}
+X
+X#ifndef MSDOS
+X/* Check to see if the file has been modified since it was
+X   last written.  If so, make sure they know what they're
+X   doing.
+X
+X   I hate to use another stat(), but to use confirm we gotta
+X   do this before we open the file.
+X
+X   NOTE: This stats FNAME after converting it to a path-relative
+X	 name.  I can't see why this would cause a problem ...
+X   */
+X
+chk_mtime(thisbuf, fname, how)
+Buffer	*thisbuf;
+char	*fname,
+X	*how;
+X{
+X	struct stat	stbuf;
+X	Buffer	*b;
+X    	char	*mesg = "Shall I go ahead and %s anyway? ";
+X
+X	if ((thisbuf->b_mtime != 0) &&		/* if we care ... */
+X	    (b = file_exists(fname)) &&		/* we already have this file */
+X	    (b == thisbuf) &&			/* and it's the current buffer */
+X	    (stat(pr_name(fname, NO), &stbuf) != -1) &&	/* and we can stat it */
+X	    (stbuf.st_mtime != b->b_mtime)) {	/* and there's trouble. */
+X	    	rbell();
+X		redisplay();	/* Ring that bell! */
+X	    	TOstart("Warning", TRUE);
+X	    	Typeout("\"%s\" now saved on disk is not what you last", pr_name(fname, YES));
+X		Typeout("visited or saved.  Probably someone else is editing");
+X		Typeout("your file at the same time.");
+X	    	if (how) {
+X			Typeout("");
+X			Typeout("Type \"y\" if I should %s, anyway.", how);
+X		    	f_mess(mesg, how);
+X		}
+X	    	TOstop();
+X	    	if (how)
+X		    	confirm(mesg, how);
+X	}
+X}
+X
+X#endif /* MSDOS */
+X
+void
+file_write(fname, app)
+char	*fname;
+X{
+X	File	*fp;
+X
+X#ifdef BACKUPFILES
+X	if (!app && BkupOnWrite)
+X		file_backup(fname);
+X#endif
+X
+X	fp = open_file(fname, iobuff, app ? F_APPEND : F_WRITE, COMPLAIN, !QUIET);
+X
+X	if (EndWNewline) {	/* Make sure file ends with a newLine */
+X		Bufpos	save;
+X
+X		DOTsave(&save);
+X		ToLast();
+X		if (length(curline))	/* Not a blank Line */
+X			LineInsert(1);
+X		SetDot(&save);
+X	}
+X	putreg(fp, curbuf->b_first, 0, curbuf->b_last, length(curbuf->b_last), NO);
+X	set_ino(curbuf);
+X	close_file(fp);
+X}
+X
+void
+ReadFile()
+X{
+X	Buffer	*bp;
+X	char	*fname,
+X		fnamebuf[FILESIZE];
+X	int	lineno;
+X
+X#ifdef MAC
+X	if(Macmode) {
+X		if(!(fname = gfile(fnamebuf))) return;
+X	}
+X	else
+X#endif /* MAC */
+X	fname = ask_file((char *) 0, curbuf->b_fname, fnamebuf);
+X#ifndef MAC
+X#ifndef MSDOS
+X	chk_mtime(curbuf, fname, "read");
+X#endif /* MSDOS */
+X#endif /* MAC */
+X
+X	if (IsModified(curbuf)) {
+X		char	*y_or_n;
+X		int	c;
+X
+X		for (;;) {
+X			rbell();
+X			y_or_n = ask(NullStr, "Shall I make your changes to \"%s\" permanent? ", curbuf->b_name);
+X			c = CharUpcase(*y_or_n);
+X			if (c == 'Y' || c == 'N')
+X				break;
+X		}			
+X		if (c == 'Y')
+X			SaveFile();
+X	}
+X
+X	if ((bp = file_exists(fnamebuf)) &&
+X	    (bp == curbuf))
+X		lineno = pnt_line() - 1;
+X	else
+X		lineno = 0;
+X
+X	unmodify();
+X	initlist(curbuf);
+X	setfname(curbuf, fname);
+X	read_file(fname, 0);
+X	SetLine(next_line(curbuf->b_first, lineno));
+X}
+X
+void
+InsFile()
+X{
+X	char	*fname,
+X		fnamebuf[FILESIZE];
+X#ifdef MAC
+X	if(Macmode) {
+X		if(!(fname = gfile(fnamebuf))) return;
+X	}
+X	else
+X#endif /* MAC */
+X	fname = ask_file((char *) 0, curbuf->b_fname, fnamebuf);
+X	read_file(fname, 1);
+X}
+X
+X#include "temp.h"
+X
+int	DOLsave = 0;	/* Do Lsave flag.  If lines aren't being save
+X			   when you think they should have been, this
+X			   flag is probably not being set, or is being
+X			   cleared before lsave() was called. */
+X
+private int	nleft,	/* number of good characters left in current block */
+X		tmpfd = -1;
+disk_line	DFree = 1;
+X			/* pointer to end of tmp file */
+private char	*tfname;
+X
+void
+tmpinit()
+X{
+X	char	buf[FILESIZE];
+X
+X#ifdef MAC
+X	sprintf(buf, "%s/%s", HomeDir, d_tempfile);
+X#else
+X	sprintf(buf, "%s/%s", TmpFilePath, d_tempfile);
+X#endif
+X	tfname = copystr(buf);
+X	tfname = mktemp(tfname);
+X	(void) close(creat(tfname, 0600));
+X#ifndef MSDOS
+X	tmpfd = open(tfname, 2);
+X#else /* MSDOS */
+X	tmpfd = open(tfname, 0x8002);	/* MSDOS fix	*/
+X#endif /* MSDOS */
+X	if (tmpfd == -1)
+X		complain("Warning: cannot create tmp file!");
+X}
+X
+void
+tmpclose()
+X{
+X	if (tmpfd == -1)
+X		return;
+X	(void) close(tmpfd);
+X	tmpfd = -1;
+X	(void) unlink(tfname);
+X}
+X
+X/* get a line at `tl' in the tmp file into `buf' which should be LBSIZE
+X   long */
+X
+int	Jr_Len;		/* length of Just Read Line */
+X
+X#ifdef MAC	/* The Lighspeed compiler can't copy with static here */
+X	char	*getblock();
+X#else
+private char	*getblock();
+X#endif
+void
+getline(addr, buf)
+disk_line	addr;
+register char	*buf;
+X{
+X	register char	*bp,
+X			*lp;
+X
+X	lp = buf;
+X	bp = getblock(addr >> 1, READ);
+X	while (*lp++ = *bp++)
+X		;
+X	Jr_Len = (lp - buf) - 1;
+X}
+X
+X/* Put `buf' and return the disk address */
+X
+disk_line
+putline(buf)
+char	*buf;
+X{
+X	register char	*bp,
+X			*lp;
+X	register int	nl;
+X	disk_line	free_ptr;
+X
+X	lp = buf;
+X	free_ptr = DFree;
+X	bp = getblock(free_ptr, WRITE);
+X	nl = nleft;
+X	free_ptr = blk_round(free_ptr);
+X	while (*bp = *lp++) {
+X		if (*bp++ == '\n') {
+X			*--bp = 0;
+X			break;
+X		}
+X		if (--nl == 0) {
+X			free_ptr = forward_block(free_ptr);
+X			DFree = free_ptr;
+X			bp = getblock(free_ptr, WRITE);
+X			lp = buf;	/* start over ... */
+X			nl = nleft;
+X		}
+X	}
+X	free_ptr = DFree;
+X	DFree += (((lp - buf) + CH_SIZE - 1) / CH_SIZE);
+X	         /* (lp - buf) includes the null */
+X	return (free_ptr << 1);
+X}
+X
+X/* The theory is that critical section of code inside this procedure
+X   will never cause a problem to occur.  Basically, we need to ensure
+X   that two blocks are in memory at the same time, but I think that
+X   this can never screw up. */
+X
+X#define lockblock(addr)
+X#define unlockblock(addr)
+X
+disk_line
+f_getputl(line, fp)
+Line	*line;
+register File	*fp;
+X{
+X	register char	*bp;
+X	register int	c,
+X			nl,
+X			max = LBSIZE;
+X	disk_line	free_ptr;
+X	char		*base;
+X#ifdef MSDOS
+X	char crleft = 0;
+X#endif /* MSDOS */
+X
+X	free_ptr = DFree;
+X	base = bp = getblock(free_ptr, WRITE);
+X	nl = nleft;
+X	free_ptr = blk_round(free_ptr);
+X	while (--max > 0) {
+X#ifdef MSDOS
+X		if (crleft) {
+X		   c = crleft;
+X		   crleft = 0;
+X		} else
+X#endif /* MSDOS */
+X		c = getc(fp);
+X		if (c == EOF || c == '\n')
+X			break;
+X#ifdef MSDOS
+X		if (c == '\r') 
+X		    if ((crleft = getc(fp)) == '\n') {
+X			    crleft = 0;
+X			    break;
+X			}
+X#endif /* MSDOS */
+X		if (--nl == 0) {
+X			char	*newbp;
+X			int	nbytes;
+X
+X			lockblock(free_ptr);
+X			DFree = free_ptr = forward_block(free_ptr);
+X			nbytes = bp - base;
+X			newbp = getblock(free_ptr, WRITE);
+X			nl = nleft;
+X			byte_copy(base, newbp, nbytes);
+X			bp = newbp + nbytes;
+X			base = newbp;
+X			unlockblock(free_ptr);
+X		}
+X		*bp++ = c;
+X	}
+X	*bp++ = '\0';
+X	free_ptr = DFree;
+X	DFree += (((bp - base) + CH_SIZE - 1) / CH_SIZE);
+X	line->l_dline = (free_ptr << 1);
+X	if (max == 0) {
+X		add_mess(" [Line too long]");
+X		rbell();
+X		return EOF;
+X	}
+X	if (c == EOF) {
+X		if (--bp != base)
+X			add_mess(" [Incomplete last line]");
+X		return EOF;
+X	}
+X	io_lines += 1;
+X	return 0;
+X}
+X
+typedef struct block {
+X	short	b_dirty,
+X		b_bno;
+X	char	b_buf[BUFSIZ];
+X	struct block
+X		*b_LRUnext,
+X		*b_LRUprev,
+X		*b_HASHnext;
+X} Block;
+X
+X#define HASHSIZE	7	/* Primes work best (so I'm told) */
+X#define B_HASH(bno)	(bno % HASHSIZE)
+X
+X#ifdef MAC
+private Block	*b_cache,
+X#else
+private Block	b_cache[NBUF],
+X#endif
+X		*bht[HASHSIZE] = {0},		/* Block hash table */
+X		*f_block = 0,
+X		*l_block = 0;
+private int	max_bno = -1,
+X		NBlocks;
+X
+X#ifdef MAC
+void (*blkio)();
+X#else
+X#ifdef LINT_ARGS
+private int	(*blkio)(Block *, int (*)());
+X#else
+private int (*blkio)();
+X#endif
+X#endif /* MAC */
+X
+X#ifdef MAC
+make_cache()	/* Only 32K of static space on Mac, so... */
+X{
+X	return((b_cache = (Block *) calloc(NBUF,sizeof(Block))) == 0 ? 0 : 1);
+X}
+X#endif /* MAC */
+X
+extern int read(), write();
+X
+private void
+real_blkio(b, iofcn)
+register Block	*b;
+X#ifdef LINT_ARGS
+register int	(*iofcn)(int, char *, unsigned int);
+X#else
+register int	(*iofcn)();
+X#endif
+X{
+X	(void) lseek(tmpfd, (long) ((unsigned) b->b_bno) * BUFSIZ, 0);
+X	if ((*iofcn)(tmpfd, b->b_buf, BUFSIZ) != BUFSIZ)
+X		error("[Tmp file %s error; to continue editing would be dangerous]", (iofcn == read) ? "READ" : "WRITE");
+X}
+X
+private void
+fake_blkio(b, iofcn)
+register Block	*b;
+register int	(*iofcn)();
+X{
+X	tmpinit();
+X	blkio = real_blkio;
+X	real_blkio(b, iofcn);
+X}
+X
+void
+d_cache_init()
+X{
+X	register Block	*bp,	/* Block pointer */
+X			**hp;	/* Hash pointer */
+X	register short	bno;
+X
+X	for (bp = b_cache, bno = NBUF; --bno >= 0; bp++) {
+X		NBlocks += 1;
+X		bp->b_dirty = 0;
+X		bp->b_bno = bno;
+X		if (l_block == 0)
+X			l_block = bp;
+X		bp->b_LRUprev = 0;
+X		bp->b_LRUnext = f_block;
+X		if (f_block != 0)
+X			f_block->b_LRUprev = bp;
+X		f_block = bp;
+X
+X		bp->b_HASHnext = *(hp = &bht[B_HASH(bno)]);
+X		*hp = bp;
+X	}
+X	blkio = fake_blkio;
+X}
+X
+void
+SyncTmp()
+X{
+X	register Block	*b;
+X#ifdef IBMPC
+X	register int	bno = 0;
+X	Block	*lookup();
+X
+X	/* sync the blocks in order, for floppy disks */
+X	for (bno = 0; bno <= max_bno; ) {
+X		if ((b = lookup(bno++)) && b->b_dirty) {
+X			(*blkio)(b, write);
+X			b->b_dirty = 0;
+X		}
+X	}
+X#else
+X	for (b = f_block; b != 0; b = b->b_LRUnext)
+X		if (b->b_dirty) {
+X			(*blkio)(b, write);
+X			b->b_dirty = 0;
+X		}
+X#endif
+X}
+X
+private Block *
+lookup(bno)
+register short	bno;
+X{
+X	register Block	*bp;
+X
+X	for (bp = bht[B_HASH(bno)]; bp != 0; bp = bp->b_HASHnext)
+X		if (bp->b_bno == bno)
+X			break;
+X	return bp;
+X}
+X
+private void
+LRUunlink(b)
+register Block	*b;
+X{
+X	if (b->b_LRUprev == 0)
+X		f_block = b->b_LRUnext;
+X	else
+X		b->b_LRUprev->b_LRUnext = b->b_LRUnext;
+X	if (b->b_LRUnext == 0)
+X		l_block = b->b_LRUprev;
+X	else
+X		b->b_LRUnext->b_LRUprev = b->b_LRUprev;
+X}
+X
+private Block *
+b_unlink(bp)
+register Block	*bp;
+X{
+X	register Block	*hp,
+X			*prev = 0;
+X
+X	LRUunlink(bp);
+X	/* Now that we have the block, we remove it from its position
+X	   in the hash table, so we can THEN put it somewhere else with
+X	   it's new block assignment. */
+X
+X	for (hp = bht[B_HASH(bp->b_bno)]; hp != 0; prev = hp, hp = hp->b_HASHnext)
+X		if (hp == bp)
+X			break;
+X	if (hp == 0) {
+X		printf("\rBlock %d missing!", bp->b_bno);
+X		finish(0);
+X	}
+X	if (prev)
+X		prev->b_HASHnext = hp->b_HASHnext;
+X	else
+X		bht[B_HASH(bp->b_bno)] = hp->b_HASHnext;
+X
+X	if (bp->b_dirty) {	/* do, now, the delayed write */
+X		(*blkio)(bp, write);
+X		bp->b_dirty = 0;
+X	}
+X
+X	return bp;
+X}
+X
+X/* Get a block which contains at least part of the line with the address
+X   atl.  Returns a pointer to the block and sets the global variable
+X   nleft (number of good characters left in the buffer). */
+X
+private char *
+getblock(atl, iof)
+disk_line	atl;
+X{
+X	register int	bno,
+X			off;
+X	register Block	*bp;
+X	static Block	*lastb = 0;
+X
+X	bno = da_to_bno(atl);
+X	off = da_to_off(atl);
+X	if (da_too_huge(atl))
+X		error("Tmp file too large.  Get help!");
+X	nleft = BUFSIZ - off;
+X	if (lastb != 0 && lastb->b_bno == bno) {
+X		lastb->b_dirty |= iof;
+X		return lastb->b_buf + off;
+X	}
+X
+X	/* The requested block already lives in memory, so we move
+X	   it to the end of the LRU list (making it Most Recently Used)
+X	   and then return a pointer to it. */
+X	if (bp = lookup(bno)) {
+X		if (bp != l_block) {
+X			LRUunlink(bp);
+X			if (l_block == 0)
+X				f_block = l_block = bp;
+X			else
+X				l_block->b_LRUnext = bp;
+X			bp->b_LRUprev = l_block;
+X			l_block = bp;
+X			bp->b_LRUnext = 0;
+X		}
+X		if (bp->b_bno > max_bno)
+X			max_bno = bp->b_bno;
+X		bp->b_dirty |= iof;
+X		lastb = bp;
+X		return bp->b_buf + off;
+X	}
+X
+X	/* The block we want doesn't reside in memory so we take the
+X	   least recently used clean block (if there is one) and use
+X	   it.  */
+X	bp = f_block;
+X	if (bp->b_dirty)	/* The best block is dirty ... */
+X		SyncTmp();
+X
+X	bp = b_unlink(bp);
+X	if (l_block == 0)
+X		l_block = f_block = bp;
+X	else
+X		l_block->b_LRUnext = bp;	/* Place it at the end ... */
+X	bp->b_LRUprev = l_block;
+X	l_block = bp;
+X	bp->b_LRUnext = 0;		/* so it's Most Recently Used */
+X
+X	bp->b_dirty = iof;
+X	bp->b_bno = bno;
+X	bp->b_HASHnext = bht[B_HASH(bno)];
+X	bht[B_HASH(bno)] = bp;
+X
+X	/* Get the current contents of the block UNLESS this is a new
+X	   block that's never been looked at before, i.e., it's past
+X	   the end of the tmp file. */
+X
+X	if (bp->b_bno <= max_bno)
+X		(*blkio)(bp, read);
+X	else
+X		max_bno = bno;
+X
+X	lastb = bp;
+X	return bp->b_buf + off;
+X}
+X
+char *
+lbptr(line)
+Line	*line;
+X{
+X	return getblock(line->l_dline >> 1, READ);
+X}
+X
+X/* save the current contents of linebuf, if it has changed */
+X
+void
+lsave()
+X{
+X	if (curbuf == 0 || !DOLsave)	/* Nothing modified recently */
+X		return;
+X
+X	if (strcmp(lbptr(curline), linebuf) != 0)
+X		SavLine(curline, linebuf);	/* Put linebuf on the disk. */
+X	DOLsave = 0;
+X}
+X
+X#ifdef BACKUPFILES
+void
+file_backup(fname)
+char *fname;
+X{
+X#ifndef MSDOS
+X	char	*s;
+X	register int	i;
+X	int	fd1,
+X		fd2;
+X	char	tmp1[BUFSIZ],
+X		tmp2[BUFSIZ];
+X 	struct stat buf;
+X 	int	mode;
+X
+X	strcpy(tmp1, fname);
+X	if ((s = rindex(tmp1, '/')) == NULL)
+X		sprintf(tmp2, "#%s", fname);
+X	else {
+X		*s++ = '\0';
+X		sprintf(tmp2, "%s/#%s", tmp1, s);
+X	}
+X
+X	if ((fd1 = open(fname, 0)) < 0)
+X		return;
+X
+X	/* create backup file with same mode as input file */
+X#ifndef MAC
+X	if (fstat(fd1, &buf) != 0)
+X		mode = CreatMode;
+X	else
+X#endif
+X		mode = buf.st_mode;
+X		
+X	if ((fd2 = creat(tmp2, mode)) < 0) {
+X		(void) close(fd1);
+X		return;
+X	}
+X	while ((i = read(fd1, tmp1, sizeof(tmp1))) > 0)
+X		write(fd2, tmp1, i);
+X#ifdef BSD4_2
+X	(void) fsync(fd2);
+X#endif
+X	(void) close(fd2);
+X	(void) close(fd1);
+X#else /* MSDOS */
+X	char	*dot,
+X			*slash,
+X			tmp[FILESIZE];
+X	
+X	strcpy(tmp, fname);
+X	slash = basename(tmp);
+X	if (dot = rindex(slash, '.')) {
+X	   if (!stricmp(dot,".bak")) 
+X		return;
+X	   else *dot = 0;
+X	}
+X	strcat(tmp, ".bak");
+X	unlink(tmp);
+X	rename(fname, tmp);
+X#endif /* MSDOS */
+X}
+X#endif
+X
+X#if defined(MSDOS) && defined (CHDIR)
+X
+private int			/* chdir + drive */
+Dchdir(to)
+char *to;
+X{
+X	unsigned d, dd, n;
+X	
+X	if (to[1] == ':') {
+X		d = to[0];
+X		if (d >= 'a') d = d - 'a' + 1;
+X		if (d >= 'A') d = d - 'A' + 1;
+X		_dos_getdrive(&dd);
+X		if (dd != d)
+X			_dos_setdrive(d, &n);
+X		if (to[2] == 0)
+X			return 0;
+X	}
+X	return chdir(to);
+X}
+X
+private char *
+fixpath(p)
+char *p;
+X{
+X	char *pp = p;
+X
+X	while (*p) {
+X		if (*p == '\\')
+X			*p = '/';
+X		p++;
+X	}
+X	return(strlwr(pp));
+X}
+X	
+X
+private void
+abspath(so, dest)
+char *so, *dest;
+X{
+X	char cwd[FILESIZE], cwdD[3], cwdDIR[FILESIZE], cwdF[9], cwdEXT[5],
+X	     soD[3], soDIR[FILESIZE], soF[9], soEXT[5];
+X	char *drive, *path;
+X
+X	_splitpath(fixpath(so), soD, soDIR, soF, soEXT);
+X	getcwd(cwd, FILESIZE);
+X	if (*soD != 0) {
+X		Dchdir(soD);				/* this is kinda messy	*/
+X		getcwd(cwdDIR, FILESIZE);	/* should probably just	*/
+X		Dchdir(cwd);				/* call DOS to do it	*/
+X		strcpy(cwd, cwdDIR);
+X	}
+X	(void) fixpath(cwd);
+X	if (cwd[strlen(cwd)-1] != '/')
+X		strcat(cwd, "/x.x");	/* need dummy filename */
+X
+X	_splitpath(fixpath(cwd), cwdD, cwdDIR, cwdF, cwdEXT);
+X
+X	drive = (*soD == 0) ? cwdD : soD;
+X		
+X	if (*soDIR != '/')
+X		path = strcat(cwdDIR, soDIR);
+X	else
+X		path = soDIR;
+X	_makepath(dest, drive, path, soF, soEXT);
+X	fixpath(dest);	/* can't do it often enough */
+X}
+X
+X#endif
+END_OF_FILE
+if test 28324 -ne `wc -c <'./io.c'`; then
+    echo shar: \"'./io.c'\" unpacked with wrong size!
+fi
+# end of './io.c'
+fi
+echo shar: End of archive 12 \(of 21\).
+cp /dev/null ark12isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 21 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

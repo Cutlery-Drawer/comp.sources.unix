@@ -1,0 +1,1578 @@
+Subject: v06i077:  MicroEmacs, Version 3.7 (uEmacs3.7), Part07/12
+Newsgroups: mod.sources
+Approved: rs@mirror.UUCP
+
+Submitted by: ihnp4!pur-ee!pur-phy!duncan!lawrence
+Mod.sources: Volume 6, Issue 77
+Archive-name: uEmacs3.7/Part07
+
+[  This is the latest revision of one of two programs named "MicroEmacs";
+   when discussing these on the net, or in contacting the authors, make
+   sure to mention the version number -- in this case 3.7 -- as that is
+   the easiest way to distinguish between them.  Daniel will be posting
+   uuencoded executables in net.micro.pc and net.micro.amiga; the file
+   'readme' contains information on how to also get these from him
+   directly.   --r$ ]
+
+echo extracting - line.c
+sed 's/^X//' > line.c << 'FRIDAY_NIGHT'
+X/*
+X * The functions in this file are a general set of line management utilities.
+X * They are the only routines that touch the text. They also touch the buffer
+X * and window structures, to make sure that the necessary updating gets done.
+X * There are routines in this file that handle the kill buffer too. It isn't
+X * here for any good reason.
+X *
+X * Note that this code only updates the dot and mark values in the window list.
+X * Since all the code acts on the current window, the buffer that we are
+X * editing must be being displayed, which means that "b_nwnd" is non zero,
+X * which means that the dot and mark values in the buffer headers are nonsense.
+X */
+X
+X#include        <stdio.h>
+X#include	"estruct.h"
+X#include        "edef.h"
+X
+XKILL *ykbuf;	/* ptr to current kill buffer chunk being yanked */
+Xint ykboff;	/* offset into that chunk */
+X
+X/*
+X * This routine allocates a block of memory large enough to hold a LINE
+X * containing "used" characters. The block is always rounded up a bit. Return
+X * a pointer to the new block, or NULL if there isn't any memory left. Print a
+X * message in the message line if no space.
+X */
+XLINE    *
+Xlalloc(used)
+Xregister int    used;
+X{
+X        register LINE   *lp;
+X        register int    size;
+X	char *malloc();
+X
+X        size = (used+NBLOCK-1) & ~(NBLOCK-1);
+X        if (size == 0)                          /* Assume that an empty */
+X                size = NBLOCK;                  /* line is for type-in. */
+X        if ((lp = (LINE *) malloc(sizeof(LINE)+size)) == NULL) {
+X                mlwrite("Cannot allocate %d bytes", size);
+X                return (NULL);
+X        }
+X        lp->l_size = size;
+X        lp->l_used = used;
+X        return (lp);
+X}
+X
+X/*
+X * Delete line "lp". Fix all of the links that might point at it (they are
+X * moved to offset 0 of the next line. Unlink the line from whatever buffer it
+X * might be in. Release the memory. The buffers are updated too; the magic
+X * conditions described in the above comments don't hold here.
+X */
+Xlfree(lp)
+Xregister LINE   *lp;
+X{
+X        register BUFFER *bp;
+X        register WINDOW *wp;
+X
+X        wp = wheadp;
+X        while (wp != NULL) {
+X                if (wp->w_linep == lp)
+X                        wp->w_linep = lp->l_fp;
+X                if (wp->w_dotp  == lp) {
+X                        wp->w_dotp  = lp->l_fp;
+X                        wp->w_doto  = 0;
+X                }
+X                if (wp->w_markp == lp) {
+X                        wp->w_markp = lp->l_fp;
+X                        wp->w_marko = 0;
+X                }
+X                wp = wp->w_wndp;
+X        }
+X        bp = bheadp;
+X        while (bp != NULL) {
+X                if (bp->b_nwnd == 0) {
+X                        if (bp->b_dotp  == lp) {
+X                                bp->b_dotp = lp->l_fp;
+X                                bp->b_doto = 0;
+X                        }
+X                        if (bp->b_markp == lp) {
+X                                bp->b_markp = lp->l_fp;
+X                                bp->b_marko = 0;
+X                        }
+X                }
+X                bp = bp->b_bufp;
+X        }
+X        lp->l_bp->l_fp = lp->l_fp;
+X        lp->l_fp->l_bp = lp->l_bp;
+X        free((char *) lp);
+X}
+X
+X/*
+X * This routine gets called when a character is changed in place in the current
+X * buffer. It updates all of the required flags in the buffer and window
+X * system. The flag used is passed as an argument; if the buffer is being
+X * displayed in more than 1 window we change EDIT t HARD. Set MODE if the
+X * mode line needs to be updated (the "*" has to be set).
+X */
+Xlchange(flag)
+Xregister int    flag;
+X{
+X        register WINDOW *wp;
+X
+X        if (curbp->b_nwnd != 1)                 /* Ensure hard.         */
+X                flag = WFHARD;
+X        if ((curbp->b_flag&BFCHG) == 0) {       /* First change, so     */
+X                flag |= WFMODE;                 /* update mode lines.   */
+X                curbp->b_flag |= BFCHG;
+X        }
+X        wp = wheadp;
+X        while (wp != NULL) {
+X                if (wp->w_bufp == curbp)
+X                        wp->w_flag |= flag;
+X                wp = wp->w_wndp;
+X        }
+X}
+X
+Xinsspace(f, n)	/* insert spaces forward into text */
+X
+Xint f, n;	/* default flag and numeric argument */
+X
+X{
+X	linsert(n, ' ');
+X	backchar(f, n);
+X}
+X
+X/*
+X * Insert "n" copies of the character "c" at the current location of dot. In
+X * the easy case all that happens is the text is stored in the line. In the
+X * hard case, the line has to be reallocated. When the window list is updated,
+X * take special care; I screwed it up once. You always update dot in the
+X * current window. You update mark, and a dot in another window, if it is
+X * greater than the place where you did the insert. Return TRUE if all is
+X * well, and FALSE on errors.
+X */
+Xlinsert(n, c)
+X{
+X        register char   *cp1;
+X        register char   *cp2;
+X        register LINE   *lp1;
+X        register LINE   *lp2;
+X        register LINE   *lp3;
+X        register int    doto;
+X        register int    i;
+X        register WINDOW *wp;
+X
+X	if (curbp->b_mode&MDVIEW)	/* don't allow this command if	*/
+X		return(rdonly());	/* we are in read only mode	*/
+X        lchange(WFEDIT);
+X        lp1 = curwp->w_dotp;                    /* Current line         */
+X        if (lp1 == curbp->b_linep) {            /* At the end: special  */
+X                if (curwp->w_doto != 0) {
+X                        mlwrite("bug: linsert");
+X                        return (FALSE);
+X                }
+X                if ((lp2=lalloc(n)) == NULL)    /* Allocate new line    */
+X                        return (FALSE);
+X                lp3 = lp1->l_bp;                /* Previous line        */
+X                lp3->l_fp = lp2;                /* Link in              */
+X                lp2->l_fp = lp1;
+X                lp1->l_bp = lp2;
+X                lp2->l_bp = lp3;
+X                for (i=0; i<n; ++i)
+X                        lp2->l_text[i] = c;
+X                curwp->w_dotp = lp2;
+X                curwp->w_doto = n;
+X                return (TRUE);
+X        }
+X        doto = curwp->w_doto;                   /* Save for later.      */
+X        if (lp1->l_used+n > lp1->l_size) {      /* Hard: reallocate     */
+X                if ((lp2=lalloc(lp1->l_used+n)) == NULL)
+X                        return (FALSE);
+X                cp1 = &lp1->l_text[0];
+X                cp2 = &lp2->l_text[0];
+X                while (cp1 != &lp1->l_text[doto])
+X                        *cp2++ = *cp1++;
+X                cp2 += n;
+X                while (cp1 != &lp1->l_text[lp1->l_used])
+X                        *cp2++ = *cp1++;
+X                lp1->l_bp->l_fp = lp2;
+X                lp2->l_fp = lp1->l_fp;
+X                lp1->l_fp->l_bp = lp2;
+X                lp2->l_bp = lp1->l_bp;
+X                free((char *) lp1);
+X        } else {                                /* Easy: in place       */
+X                lp2 = lp1;                      /* Pretend new line     */
+X                lp2->l_used += n;
+X                cp2 = &lp1->l_text[lp1->l_used];
+X                cp1 = cp2-n;
+X                while (cp1 != &lp1->l_text[doto])
+X                        *--cp2 = *--cp1;
+X        }
+X        for (i=0; i<n; ++i)                     /* Add the characters   */
+X                lp2->l_text[doto+i] = c;
+X        wp = wheadp;                            /* Update windows       */
+X        while (wp != NULL) {
+X                if (wp->w_linep == lp1)
+X                        wp->w_linep = lp2;
+X                if (wp->w_dotp == lp1) {
+X                        wp->w_dotp = lp2;
+X                        if (wp==curwp || wp->w_doto>doto)
+X                                wp->w_doto += n;
+X                }
+X                if (wp->w_markp == lp1) {
+X                        wp->w_markp = lp2;
+X                        if (wp->w_marko > doto)
+X                                wp->w_marko += n;
+X                }
+X                wp = wp->w_wndp;
+X        }
+X        return (TRUE);
+X}
+X
+X/*
+X * Insert a newline into the buffer at the current location of dot in the
+X * current window. The funny ass-backwards way it does things is not a botch;
+X * it just makes the last line in the file not a special case. Return TRUE if
+X * everything works out and FALSE on error (memory allocation failure). The
+X * update of dot and mark is a bit easier then in the above case, because the
+X * split forces more updating.
+X */
+Xlnewline()
+X{
+X        register char   *cp1;
+X        register char   *cp2;
+X        register LINE   *lp1;
+X        register LINE   *lp2;
+X        register int    doto;
+X        register WINDOW *wp;
+X
+X	if (curbp->b_mode&MDVIEW)	/* don't allow this command if	*/
+X		return(rdonly());	/* we are in read only mode	*/
+X        lchange(WFHARD);
+X        lp1  = curwp->w_dotp;                   /* Get the address and  */
+X        doto = curwp->w_doto;                   /* offset of "."        */
+X        if ((lp2=lalloc(doto)) == NULL)         /* New first half line  */
+X                return (FALSE);
+X        cp1 = &lp1->l_text[0];                  /* Shuffle text around  */
+X        cp2 = &lp2->l_text[0];
+X        while (cp1 != &lp1->l_text[doto])
+X                *cp2++ = *cp1++;
+X        cp2 = &lp1->l_text[0];
+X        while (cp1 != &lp1->l_text[lp1->l_used])
+X                *cp2++ = *cp1++;
+X        lp1->l_used -= doto;
+X        lp2->l_bp = lp1->l_bp;
+X        lp1->l_bp = lp2;
+X        lp2->l_bp->l_fp = lp2;
+X        lp2->l_fp = lp1;
+X        wp = wheadp;                            /* Windows              */
+X        while (wp != NULL) {
+X                if (wp->w_linep == lp1)
+X                        wp->w_linep = lp2;
+X                if (wp->w_dotp == lp1) {
+X                        if (wp->w_doto < doto)
+X                                wp->w_dotp = lp2;
+X                        else
+X                                wp->w_doto -= doto;
+X                }
+X                if (wp->w_markp == lp1) {
+X                        if (wp->w_marko < doto)
+X                                wp->w_markp = lp2;
+X                        else
+X                                wp->w_marko -= doto;
+X                }
+X                wp = wp->w_wndp;
+X        }
+X        return (TRUE);
+X}
+X
+X/*
+X * This function deletes "n" bytes, starting at dot. It understands how do deal
+X * with end of lines, etc. It returns TRUE if all of the characters were
+X * deleted, and FALSE if they were not (because dot ran into the end of the
+X * buffer. The "kflag" is TRUE if the text should be put in the kill buffer.
+X */
+Xldelete(n, kflag)
+X
+Xlong n;		/* # of chars to delete */
+Xint kflag;	/* put killed text in kill buffer flag */
+X
+X{
+X        register char   *cp1;
+X        register char   *cp2;
+X        register LINE   *dotp;
+X        register int    doto;
+X        register int    chunk;
+X        register WINDOW *wp;
+X
+X	if (curbp->b_mode&MDVIEW)	/* don't allow this command if	*/
+X		return(rdonly());	/* we are in read only mode	*/
+X        while (n != 0) {
+X                dotp = curwp->w_dotp;
+X                doto = curwp->w_doto;
+X                if (dotp == curbp->b_linep)     /* Hit end of buffer.   */
+X                        return (FALSE);
+X                chunk = dotp->l_used-doto;      /* Size of chunk.       */
+X                if (chunk > n)
+X                        chunk = n;
+X                if (chunk == 0) {               /* End of line, merge.  */
+X                        lchange(WFHARD);
+X                        if (ldelnewline() == FALSE
+X                        || (kflag!=FALSE && kinsert('\n')==FALSE))
+X                                return (FALSE);
+X                        --n;
+X                        continue;
+X                }
+X                lchange(WFEDIT);
+X                cp1 = &dotp->l_text[doto];      /* Scrunch text.        */
+X                cp2 = cp1 + chunk;
+X                if (kflag != FALSE) {           /* Kill?                */
+X                        while (cp1 != cp2) {
+X                                if (kinsert(*cp1) == FALSE)
+X                                        return (FALSE);
+X                                ++cp1;
+X                        }
+X                        cp1 = &dotp->l_text[doto];
+X                }
+X                while (cp2 != &dotp->l_text[dotp->l_used])
+X                        *cp1++ = *cp2++;
+X                dotp->l_used -= chunk;
+X                wp = wheadp;                    /* Fix windows          */
+X                while (wp != NULL) {
+X                        if (wp->w_dotp==dotp && wp->w_doto>=doto) {
+X                                wp->w_doto -= chunk;
+X                                if (wp->w_doto < doto)
+X                                        wp->w_doto = doto;
+X                        }
+X                        if (wp->w_markp==dotp && wp->w_marko>=doto) {
+X                                wp->w_marko -= chunk;
+X                                if (wp->w_marko < doto)
+X                                        wp->w_marko = doto;
+X                        }
+X                        wp = wp->w_wndp;
+X                }
+X                n -= chunk;
+X        }
+X        return (TRUE);
+X}
+X
+X/*
+X * Delete a newline. Join the current line with the next line. If the next line
+X * is the magic header line always return TRUE; merging the last line with the
+X * header line can be thought of as always being a successful operation, even
+X * if nothing is done, and this makes the kill buffer work "right". Easy cases
+X * can be done by shuffling data around. Hard cases require that lines be moved
+X * about in memory. Return FALSE on error and TRUE if all looks ok. Called by
+X * "ldelete" only.
+X */
+Xldelnewline()
+X{
+X        register char   *cp1;
+X        register char   *cp2;
+X        register LINE   *lp1;
+X        register LINE   *lp2;
+X        register LINE   *lp3;
+X        register WINDOW *wp;
+X
+X	if (curbp->b_mode&MDVIEW)	/* don't allow this command if	*/
+X		return(rdonly());	/* we are in read only mode	*/
+X        lp1 = curwp->w_dotp;
+X        lp2 = lp1->l_fp;
+X        if (lp2 == curbp->b_linep) {            /* At the buffer end.   */
+X                if (lp1->l_used == 0)           /* Blank line.          */
+X                        lfree(lp1);
+X                return (TRUE);
+X        }
+X        if (lp2->l_used <= lp1->l_size-lp1->l_used) {
+X                cp1 = &lp1->l_text[lp1->l_used];
+X                cp2 = &lp2->l_text[0];
+X                while (cp2 != &lp2->l_text[lp2->l_used])
+X                        *cp1++ = *cp2++;
+X                wp = wheadp;
+X                while (wp != NULL) {
+X                        if (wp->w_linep == lp2)
+X                                wp->w_linep = lp1;
+X                        if (wp->w_dotp == lp2) {
+X                                wp->w_dotp  = lp1;
+X                                wp->w_doto += lp1->l_used;
+X                        }
+X                        if (wp->w_markp == lp2) {
+X                                wp->w_markp  = lp1;
+X                                wp->w_marko += lp1->l_used;
+X                        }
+X                        wp = wp->w_wndp;
+X                }
+X                lp1->l_used += lp2->l_used;
+X                lp1->l_fp = lp2->l_fp;
+X                lp2->l_fp->l_bp = lp1;
+X                free((char *) lp2);
+X                return (TRUE);
+X        }
+X        if ((lp3=lalloc(lp1->l_used+lp2->l_used)) == NULL)
+X                return (FALSE);
+X        cp1 = &lp1->l_text[0];
+X        cp2 = &lp3->l_text[0];
+X        while (cp1 != &lp1->l_text[lp1->l_used])
+X                *cp2++ = *cp1++;
+X        cp1 = &lp2->l_text[0];
+X        while (cp1 != &lp2->l_text[lp2->l_used])
+X                *cp2++ = *cp1++;
+X        lp1->l_bp->l_fp = lp3;
+X        lp3->l_fp = lp2->l_fp;
+X        lp2->l_fp->l_bp = lp3;
+X        lp3->l_bp = lp1->l_bp;
+X        wp = wheadp;
+X        while (wp != NULL) {
+X                if (wp->w_linep==lp1 || wp->w_linep==lp2)
+X                        wp->w_linep = lp3;
+X                if (wp->w_dotp == lp1)
+X                        wp->w_dotp  = lp3;
+X                else if (wp->w_dotp == lp2) {
+X                        wp->w_dotp  = lp3;
+X                        wp->w_doto += lp1->l_used;
+X                }
+X                if (wp->w_markp == lp1)
+X                        wp->w_markp  = lp3;
+X                else if (wp->w_markp == lp2) {
+X                        wp->w_markp  = lp3;
+X                        wp->w_marko += lp1->l_used;
+X                }
+X                wp = wp->w_wndp;
+X        }
+X        free((char *) lp1);
+X        free((char *) lp2);
+X        return (TRUE);
+X}
+X
+X/*
+X * Delete all of the text saved in the kill buffer. Called by commands when a
+X * new kill context is being created. The kill buffer array is released, just
+X * in case the buffer has grown to immense size. No errors.
+X */
+Xkdelete()
+X{
+X	KILL *kp;	/* ptr to scan kill buffer chunk list */
+X
+X        if (kbufh != NULL) {
+X
+X		/* first, delete all the chunks */
+X        	kbufp = kbufh;
+X        	while (kbufp != NULL) {
+X        		kp = kbufp->d_next;
+X        		free(kbufp);
+X        		kbufp = kp;
+X        	}
+X
+X		/* and reset all the kill buffer pointers */
+X		kbufh = kbufp = NULL;
+X		kused = KBLOCK;        		
+X        }
+X}
+X
+X/*
+X * Insert a character to the kill buffer, allocating new chunks as needed.
+X * Return TRUE if all is well, and FALSE on errors.
+X */
+X
+Xkinsert(c)
+X
+Xint c;		/* character to insert in the kill buffer */
+X
+X{
+X	KILL *nchunk;	/* ptr to newly malloced chunk */
+X
+X	/* check to see if we need a new chunk */
+X	if (kused >= KBLOCK) {
+X		if ((nchunk = (KILL *)malloc(sizeof(KILL))) == NULL)
+X			return(FALSE);
+X		if (kbufh == NULL)	/* set head ptr if first time */
+X			kbufh = nchunk;
+X		if (kbufp != NULL)	/* point the current to this new one */
+X			kbufp->d_next = nchunk;
+X		kbufp = nchunk;
+X		kbufp->d_next = NULL;
+X		kused = 0;
+X	}
+X
+X	/* and now insert the character */
+X	kbufp->d_chunk[kused++] = c;
+X	return(TRUE);
+X}
+X
+X/*
+X * Yank text back from the kill buffer. This is really easy. All of the work
+X * is done by the standard insert routines. All you do is run the loop, and
+X * check for errors. Bound to "C-Y".
+X */
+Xyank(f, n)
+X{
+X        register int    c;
+X        register int    i;
+X	register char	*sp;	/* pointer into string to insert */
+X	KILL *kp;		/* pointer into kill buffer */
+X
+X	if (curbp->b_mode&MDVIEW)	/* don't allow this command if	*/
+X		return(rdonly());	/* we are in read only mode	*/
+X        if (n < 0)
+X                return (FALSE);
+X	/* make sure there is something to yank */
+X	if (kbufh == NULL)
+X		return(TRUE);		/* not an error, just nothing */
+X
+X	/* for each time.... */
+X        while (n--) {
+X		kp = kbufh;
+X		while (kp != NULL) {
+X			if (kp->d_next == NULL)
+X				i = kused;
+X			else
+X				i = KBLOCK;
+X			sp = kp->d_chunk;
+X			while (i--) {
+X	                        if ((c = *sp++) == '\n') {
+X        	                        if (lnewline(FALSE, 1) == FALSE)
+X                	                        return (FALSE);
+X	                        } else {
+X        	                        if (linsert(1, c) == FALSE)
+X                	                        return (FALSE);
+X	                        }
+X	                }
+X	                kp = kp->d_next;
+X                }
+X        }
+X        return (TRUE);
+X}
+X
+X
+FRIDAY_NIGHT
+echo extracting - lock.c
+sed 's/^X//' > lock.c << 'FRIDAY_NIGHT'
+X/*	LOCK:	File locking command routines for MicroEMACS
+X		written by Daniel Lawrence
+X								*/
+X
+X#include <stdio.h>
+X#include "estruct.h"
+X#include "edef.h"
+X
+X#if	FILOCK
+X#if	BSD
+X#include <sys/errno.h>
+X
+Xextern int sys_nerr;		/* number of system error messages defined */
+Xextern char *sys_errlist[];	/* list of message texts */
+Xextern int errno;		/* current error */
+X
+Xchar *lname[NLOCKS];	/* names of all locked files */
+Xint numlocks;		/* # of current locks active */
+X
+X/* lockchk:	check a file for locking and add it to the list */
+X
+Xlockchk(fname)
+X
+Xchar *fname;	/* file to check for a lock */
+X
+X{
+X	register int i;		/* loop indexes */
+X	register int status;	/* return status */
+X	char *undolock();
+X
+X	/* check to see if that file is already locked here */
+X	if (numlocks > 0)
+X		for (i=0; i < numlocks; ++i)
+X			if (strcmp(fname, lname[i]) == 0)
+X				return(TRUE);
+X
+X	/* if we have a full locking table, bitch and leave */
+X	if (numlocks == NLOCKS) {
+X		mlwrite("LOCK ERROR: Lock table full");
+X		return(ABORT);
+X	}
+X
+X	/* next, try to lock it */
+X	status = lock(fname);
+X	if (status == ABORT)	/* file is locked, no override */
+X		return(ABORT);
+X	if (status == FALSE)	/* locked, overriden, dont add to table */
+X		return(TRUE);
+X
+X	/* we have now locked it, add it to our table */
+X	lname[++numlocks - 1] = (char *)malloc(strlen(fname) + 1);
+X	if (lname[numlocks - 1] == NULL) {	/* malloc failure */
+X		undolock(fname);		/* free the lock */
+X		mlwrite("Cannot lock, out of memory");
+X		--numlocks;
+X		return(ABORT);
+X	}
+X
+X	/* everthing is cool, add it to the table */
+X	strcpy(lname[numlocks-1], fname);
+X	return(TRUE);
+X}
+X
+X/*	lockrel:	release all the file locks so others may edit */
+X
+Xlockrel()
+X
+X{
+X	register int i;		/* loop index */
+X	register int status;	/* status of locks */
+X	register int s;		/* status of one unlock */
+X
+X	status = TRUE;
+X	if (numlocks > 0)
+X		for (i=0; i < numlocks; ++i) {
+X			if ((s = unlock(lname[i])) != TRUE)
+X				status = s;
+X			free(lname[i]);
+X		}
+X	numlocks = 0;
+X	return(status);
+X}
+X
+X/* lock:	Check and lock a file from access by others
+X		returns	TRUE = files was not locked and now is
+X			FALSE = file was locked and overridden
+X			ABORT = file was locked, abort command
+X*/
+X
+Xlock(fname)
+X
+Xchar *fname;	/* file name to lock */
+X
+X{
+X	register char *locker;	/* lock error message */
+X	register int status;	/* return status */
+X	char msg[NSTRING];	/* message string */
+X	char *dolock();
+X
+X	/* attempt to lock the file */
+X	locker = dolock(fname);
+X	if (locker == NULL)	/* we win */
+X		return(TRUE);
+X
+X	/* file failed...abort */
+X	if (strncmp(locker, "LOCK", 4) == 0) {
+X		lckerror(locker);
+X		return(ABORT);
+X	}
+X
+X	/* someone else has it....override? */
+X	strcpy(msg, "File in use by ");
+X	strcat(msg, locker);
+X	strcat(msg, ", overide?");
+X	status = mlyesno(msg);		/* ask them */
+X	if (status == TRUE)
+X		return(FALSE);
+X	else
+X		return(ABORT);
+X}
+X
+X/*	unlock:	Unlock a file
+X		this only warns the user if it fails
+X							*/
+X
+Xunlock(fname)
+X
+Xchar *fname;	/* file to unlock */
+X
+X{
+X	register char *locker;	/* undolock return string */
+X	char *undolock();
+X
+X	/* unclock and return */
+X	locker = undolock(fname);
+X	if (locker == NULL)
+X		return(TRUE);
+X
+X	/* report the error and come back */
+X	lckerror(locker);
+X	return(FALSE);
+X}
+X
+Xlckerror(errstr)	/* report a lock error */
+X
+Xchar *errstr;		/* lock error string to print out */
+X
+X{
+X	char obuf[NSTRING];	/* output buffer for error message */
+X
+X	strcpy(obuf, errstr);
+X	strcat(obuf, " - ");
+X	if (errno < sys_nerr)
+X		strcat(obuf, sys_errlist[errno]);
+X	else
+X		strcat(obuf, "[can not get system error message]");
+X	mlwrite(obuf);
+X}
+X#endif
+X#else
+Xlckhello()	/* dummy function */
+X{
+X}
+X#endif
+FRIDAY_NIGHT
+echo extracting - main.c
+sed 's/^X//' > main.c << 'FRIDAY_NIGHT'
+X/*
+X * This program is in public domain; written by Dave G. Conroy.
+X * This file contains the main driving routine, and some keyboard processing
+X * code, for the MicroEMACS screen editor.
+X *
+X * REVISION HISTORY:
+X *
+X * 1.0  Steve Wilhite, 30-Nov-85
+X *      - Removed the old LK201 and VT100 logic. Added code to support the
+X *        DEC Rainbow keyboard (which is a LK201 layout) using the the Level
+X *        1 Console In ROM INT. See "rainbow.h" for the function key defs
+X *      Steve Wilhite, 1-Dec-85
+X *      - massive cleanup on code in display.c and search.c
+X *
+X * 2.0  George Jones, 12-Dec-85
+X *      - Ported to Amiga.
+X *
+X * 3.0  Daniel Lawrence, 29-Dec-85
+X *      - rebound keys/added new fast buffered I/O for AMIGA
+X *	- added META- repeat commands
+X *	- added reposition default to center screen (yeah!)
+X *	- changed exit with modified buffers message
+X *	- made filesave tell us what it is doing
+X *	- changed search string entry to terminate with <ESC>
+X *	  so we can use <NL> in search/replace strings
+X *	- updated version number in mode line to 3.0
+X *	12-Jan-86
+X *	- Added code to reconize the Search/replace functions
+X *	- Added code to perform search/replace & query functions
+X *	14-Jan-86
+X *	- moved search logic to separate function in search.c
+X *	- added replace and query replace functions
+X *	- separated out control key expansions to be used by others in search.c
+X *	15-Jan-86
+X *	- changed "visiting" to finding
+X *	- changed yes/no responces to not need return
+X *	- cleaned up various messages
+X *	16-jan-86
+X *	- fixed spurious spawn message in MSDOS
+X *	- added ^X-S synonime to save command
+X *	- moved escape to shell to ^X-C
+X *	21-jan-86
+X *	- added code to suspend shell under BSD
+X *	22-jan-86
+X *	- added function key support (SPEC) under MSDOS
+X *	- Abort now prints [Aborted] on message line
+X *	23-jan-86
+X *	- Added modes and commends to set/unset them
+X *	24-jan-86
+X *	- Added Goto Line command
+X *	- added Rename Buffer command
+X *	28-jan-86
+X *	- added goto begining and end of paragraph commands (META-P/META-N)
+X *	- re-wrote kdelete to use realloc. gained MUCH speed here when
+X *	  doing large wipes both on UNIX and MSDOS. Changed kill buffer
+X *	  allocation block size from 256 bytes to 1 k
+X *	29-jan-86
+X *	- moved extern function declarations to efunc.h
+X *	- made name[] name binding table
+X *	30-jan-86
+X *	- fixed Previous/Next paragraph command not to wrap around EOF
+X *	- added Fill Paragraph command (META-Q)
+X *	4-feb-86
+X *	- added code to properly display long lines, scrolling them right
+X *	  to left
+X *	5-feb-85
+X *	- rewrote code to right/left scroll...much better
+X *	- added shifted arror keys on IBMPC
+X *	6-feb-85
+X *	- add option to allow forword-word to jump to begining of
+X *	  next word instead of end of current one. This is different from
+X *	  other emacs' but can be configured off in estruct.h
+X *	- added VIEW mode to allow a buffer to be read only
+X *	   (-v switch on command line will activate this)
+X *	- changed quick exit to write out ALL changed buffers!!!
+X *	  MAKE SURE YOU KNOW THIS WHEN META-Zing
+X *	10-feb-86
+X *	- added handling of lines longer than allowed on file read in
+X *	  (they wrap on additional lines)
+X *	- made having space clear the message line and NOT insert itself
+X *	  a configuration option in ed.h
+X *	11-feb-86
+X *	- added Describe-command and Help commands.
+X *	13-feb-86
+X *	- added View file command (^X ^V) and finished HELP command
+X *	14-feb-86
+X *	- added option to let main loop skip update if type ahead commands
+X *	   are queued up
+X *	16-feb-86
+X *	- added Insert File command
+X *	17-feb-86
+X *	- added scroll next window up/down commands
+X *	18-feb-86
+X *	- added CMODE indentation
+X *	- re-arranged header files to standerdize extern and global
+X *	  definitions
+X *	- changed version number to 3.2
+X *	- added numeric arguments to search, reverse search and
+X *	  search and replace
+X *	24-feb-86
+X *	- added Bind To Key function (^C for now) to allow the user
+X *	  to change his command keys
+X *	- added Unbind key function (M-^C for now)
+X *	- added execute named command to execute unbound commands (M-X)
+X *	- added describe bindings command (not bound)
+X *	- changed version number to 3.3
+X *	25-feb-86
+X *	- scrapped CERROR mode (too many compilers)
+X *	- added EXACT mode for case sensitive searchers
+X *	26-feb-86
+X *	- added command completion on execute named command and
+X *	  all routined grabbing a command name
+X *	- adding execute-command-line command and its support functions
+X *	  (in preporation for sourcing files)
+X *	- added Execute Buffer command
+X *	27-feb-86
+X *	- added execute(source) file command and added code to automatically
+X *	  execute emacs.rc (or .emacsrc on UNIX) before initial read in
+X *	- changed version number to 3.4
+X *	4-mar-86
+X *	- changed word delete to be consistant with word move (it gets
+X *	  rid of the inter word space now) This is configurable with the
+X *	  NFWORD symbol in estruct.h
+X *	- added B_ACTIVE entry to the buffer table. Let emacs read multiple
+X *	  file names from the command line and only read them in as needed
+X *	5-mar-85
+X *	- rewrote command line parser to get rid of my patchy code
+X *	- changed version number to 3.5
+X *	1-apr-86
+X *	- added support for Aztec C 3.20e under MSDOS
+X *	- fixed bug in mlwrite on ADM3's and thier ilk under V7
+X *	- added insertion of pounds in column one under CMODE
+X *	- changed version number to 3.6
+X *	3-apr-86
+X *	- added next-buffer command (^X-X)
+X *	5-apr-86
+X *	- added kill paragraph command (M-^W)
+X *	- changed fill-paragraph to leave 2 spaces after a period at the
+X *	  end of a word.
+X *	- added OVERWRITE mode
+X *	7-apr-86
+X *	- fixed overwrite mode to handle tabs
+X *	8-apr-86
+X *	- added add/delete global mode (<ESC>M & <ESC> ^M) commands
+X *	9-apr-86
+X *	- added insert space command
+X *	- moved bindings around		^C	insert space
+X *					M-K	bind-to-key
+X *					INSERT	insert space
+X *					DELETE	forwdel
+X *	- added hunt forward and hunt reverse commands
+X *	10-apr-86
+X *	- fixed bug in DOBUF with non-terminated command string
+X *	15-apr-86
+X *	- fixed tab expansion bug in DISPLAY which hung the AMIGA
+X *	  (send in by Dawn Banks)
+X *	- fixed curcol problen if forwline/backline during keyboard
+X *	  macro execution (sent in by Ernst Christen)
+X *	- added AMIGA function/cursor key support
+X *	- fixed nonterminating <NL> replacement bug
+X *	- fixed word wrapping problems
+X *	16-apr-86
+X *	- updated documentation and froze development for 3.6 net release
+X *	23-apr-86	version 3.6a
+X *	- added forground and background colors. Setable with the
+X *	  add mode commands for the moment
+X *	24-apr-86
+X *	- added command to pipe CLI output to a buffer
+X *	25-apr-86
+X *	- added Dana Hoggat's code to replace lattice's sick system()
+X *	  function, now we no longer care what the switchar is.
+X *	- cleaned up the positioning on several of the spawing commands
+X *	26-apr-86
+X *	- added a output flush in vttidy(). Unix really appreciates this.
+X *	- added filter-buffer (^X#) command to send a buffer through
+X *	  a dos filter
+X *	- made automatic CMODE on .c and .h file compilation dependant
+X *	  in estruct.h
+X *	1-may-86
+X *	- optimized some code in update(). It certainly need a lot more.
+X *	- added AZTEC profiling capabilities. These are conditional on
+X *	  the APROF symbol in estruct.h
+X *	2-may-86
+X *	- added (u)ndo command in query-replace. undoes last repalce.
+X *	6-may-86
+X *	- re-orginized and wrote the update() function in display.c
+X *	  now my color hacks are in the right places and the code can be
+X *	  understood.
+X *	[Released version 3.6f for BETA test sites]
+X *	8-may-86
+X *	- fixed bug in new display routine to wrap cursor on extended
+X *	  lines at the right time
+X *	- modified the buffer-position command to give reasonable info
+X *	9-may-86
+X *	- improved the word wrap algorithm as not to discard non-space
+X *	  delimiters. The backscan now looks for white space rather than
+X *	  !inword().
+X *	[Released version 3.6g to Krannert]
+X *	10-may-86
+X *	- Added IBMPC.C an IBM-PC specific display driver. This makes paging
+X *	  4-6 times faster. Also made some conditional changes to DISPLAY.C
+X *	  to eliminate the pscreen[] if using the PC driver.
+X *	[changed version number to 3.6i]
+X *	12-may-86
+X *	- added delete-window (^X 0) command to dispose of a single window
+X *	- fixed problem with multiple prefixes from a command line which
+X *	  was reported by John Gamble
+X *	14-may-86
+X *	- Added AZTEC support for the IBMPC display driver. Had to
+X *	  readjust some includes and defines for this.
+X *	- fixed bug in delete-window.
+X *	- fixed some bizarre behavior with the cursor after coming back
+X *	  from spawn calls.
+X *	[changed version number to 3.7 Freezing development for net release]
+X *	15-may-86
+X *	- (that didn't last long...) Added execute-macro-(1 thru 20) commands
+X *	  to execute macro buffers (named "[Macro nn]")
+X *	- changed BFTEMP to BFINVS and cleaned up treatment of invisable
+X *	  buffers.
+X *	16-may-86
+X *	- added store-macro (unbound) to store any executed command lines to
+X *	  macro buffer.
+X *	- added clear-message-line (unbound) command to do just that
+X *	- added resize-window command to change a window's size to the
+X *	  specified argument
+X *	- improved help's logic not to re-read the file if it was already
+X *	  in a buffer
+X *	- added MAGIC mode to all structures and command tables, but the
+X *	  regular expression code that John Gamble is writting is not ready.
+X *	18-may-86
+X *	- added interactive prompt requests in command line execution. IE
+X *	  while executing a macro, a parameter starting with an at sign (@)
+X *	  causes emacs to prompt with the rest of the parameter and return
+X *	  the resulting input as the value of the parameter.
+X *	- added arguments to split-current-window to force the cursor into
+X *	  the upper or lower window.
+X *	20-may-86
+X *	- added support for the Microsoft C compiler as per the changes
+X *	  send in by Oliver Sharp
+X *	- made some upgrades and fixes for VMS sent in by Guy Streeter
+X *	21-may-86
+X *	- fixed an AZTEC bug in ttgetc by clearing the upper byte
+X *	- fixed buf in CMODE with #preprocesser input (bug fix submitted by
+X *	  Willis of unknown path)
+X *	- added support of alternative startup file ( @<filename> ) in
+X *	  the command line
+X *	- added ^Q quoting in interactive input (mlreplyt()).
+X *	- added re-binding of meta-prefix and ctlx-prefix
+X *	22-may-86
+X *	- reorginize getkey routines to make more sense and let prefix
+X *	  binding work properly.
+X *	23-may-86
+X *	- checked new code on BSD4.2 made a few fixes
+X *	- added optional fence matching while in CMODE
+X *	- added goto and search command line arguments by Mike Spitzer
+X *	26-may-86
+X *	- added parameter fetching from buffers
+X *	27-may-86
+X *	- fixed some HP150 bugs......
+X *	31-may-86
+X *	- Added Wang PC keyboard support from modifications by
+X *	  Sid Shapiro @ Wang Institute
+X *	- Fixed some reverse video bugs with code submitted by Peter Chubb
+X *	- Fixed bug in nextbuffer reported by Dave Forslund
+X *	- added system V support (USG) from Linwood Varney
+X *	2-jun-86
+X *	- changed defines to just define one unix define (for example,
+X *	  just define BSD for Unix BSD 4.2)
+X *	- Added Incremental search functions written by D. R. Banks
+X *	  in file ISEARCH.C
+X *	- added insert-string (unbound) command to help the macro
+X *	  language out.
+X *	- added unmark-buffer (M-~) command to turn off the current buffers
+X *	  change flag
+X *	- fixed nxtarg to truncate strings longer than asked for max length
+X *	4-jun-86
+X *	- added special characters in command line tokens. Tidle (~) is
+X *	  the special leadin character for "nrtb".
+X *	- Fixed bad ifdef in aztec code so it could look at HOME dir
+X *	  for startup, help, and emacs.rc files
+X *	6-jun-86
+X *	- make delete word commands clear the kill buffer if not after another
+X *	  kill command
+X *	11-jun-86
+X *	- made ~@ in string arguments pass as char(192) to nxtarg() so one can
+X *	  quote @ at the begining of string arguments
+X *	- changed buffer size vars in listbuffers() to long (for big files)
+X *	- re-wrote buffer-position command to be much faster
+X *	12-jun-86
+X *	- added count-words (M-^C) command to count the words/chars and
+X *	  lines in a region
+X *	- changed regions so they could be larger than 65535 (short ->
+X *	  long in the REGION structure)
+X *	- changed ldelete() and all callers to use a long size. The kill
+X *	  buffer will still have a problem >65535 that can not be solved
+X *	  until I restructure it.
+X *	- grouped paragraph commands and word count together under symbol
+X *	  WORDPRO to allow them to be conditionally made (or not)
+X *	13-jun-86
+X *	- re-wrote kill buffer routines again. Now they support an unlimited
+X *	  size kill buffer, and are (in theory) faster.
+X *	- changed delete-next-word (M-D) to not eat the newline after a word,
+X *	  instead it checks and eats a newline at the cursor.
+X *	17-jun-85
+X *	- added numeric argument to next/previous-window to access the nth
+X *	  window from the top/bottom
+X *	- added support for the data General 10 MSDOS machine
+X *	- added save-window (unbound) and restore-window (unbound) commands
+X *	  for the use of the menu script. Save-window remembers which window
+X *	  is current, and restore-window returns the cursor to that window.
+X *	20-jun-86
+X *	- fixed a bug with the fence matching locking up near the begining
+X *	of a buffer
+X *	- added argument to update to selectivaly force a complete update
+X *	- added update-screen (unbound) command so macros can force a
+X *	  screen update
+X *	21-jun-86
+X *	- rearranged token() and nxtarg() calls so that command names and
+X *	  repeat counts could also be prompted and fetched from buffers
+X *	- added write-message (unbound) command to write out a message
+X *	  on the message line (for macros)
+X *	- changed ifdef's so that color modes are reconized as legal in
+X *	  b/w version, and simply do nothing (allowing us to use the same
+X *	  script files)
+X */
+X
+X#include        <stdio.h>
+X
+X/* make global definitions not external */
+X#define	maindef
+X
+X#include        "estruct.h"	/* global structures and defines */
+X#include	"efunc.h"	/* function declarations and name table	*/
+X#include	"edef.h"	/* global definitions */
+X#include	"ebind.h"	/* default key bindings */
+X
+X#if     VMS
+X#include        <ssdef.h>
+X#define GOOD    (SS$_NORMAL)
+X#endif
+X
+X#ifndef GOOD
+X#define GOOD    0
+X#endif
+X
+X#if	APROF	/* Declarations needed for AZTEC C profiling */
+Xint _Corg();	/* first address of program */
+Xint _Cend();	/* last address of program */
+X
+Xshort monbuf[NBUCK];	/* buffer for gather info */
+X#endif
+X
+Xmain(argc, argv)
+Xchar    *argv[];
+X{
+X        register int    c;
+X        register int    f;
+X        register int    n;
+X        register int    mflag;
+X	register BUFFER *bp;
+X	register int	ffile;		/* first file flag */
+X	register int	carg;		/* current arg to scan */
+X	register int	startf;		/* startup executed flag */
+X	int basec;			/* c stripped of meta character */
+X	int viewflag;			/* are we starting in view mode? */
+X        int gotoflag;                   /* do we need to goto a line at start? */
+X        int gline;                      /* if so, what line? */
+X        int searchflag;                 /* Do we need to search at start? */
+X        char bname[NBUFN];		/* buffer name of file to read */
+X
+X#if	APROF
+X	/* if we are doing AZTEC C profiling, start it up */
+X	/*_intr_sp(18);	 set clock interupt for 60/second */
+X	monitor(_Corg, _Cend, monbuf, NBUCK, 0);
+X#endif
+X
+X	/* initialize the editor and process the command line arguments */
+X        strcpy(bname, "main");	/* default buffer name */
+X        vtinit();		/* Displays.            */
+X        edinit(bname);		/* Buffers, windows.    */
+X	viewflag = FALSE;	/* view mode defaults off in command line */
+X	gotoflag = FALSE;	/* set to off to begin with */
+X	searchflag = FALSE;	/* set to off to begin with */
+X	ffile = TRUE;		/* no file to edit yet */
+X	startf = FALSE;		/* startup file not executed yet */
+X#if	COLOR
+X	curwp->w_fcolor = gfcolor;		/* and set colors	*/
+X	curwp->w_bcolor = gbcolor;
+X#endif
+X	
+X	/* scan through the command line and get the files to edit */
+X	for (carg = 1; carg < argc; ++carg) {
+X		/* if its a switch, process it */
+X		if (argv[carg][0] == '-') {
+X			switch (argv[carg][1]) {
+X				case 'v':	/* -v for View File */
+X				case 'V':
+X					viewflag = TRUE;
+X					break;
+X				case 'e':	/* -e for Edit file */
+X				case 'E':
+X					viewflag = FALSE;
+X					break;
+X				case 's':	/* -s for initial search string */
+X				case 'S':
+X					searchflag = TRUE;
+X					strcpy(pat,&argv[carg][2]);
+X					break;
+X				case 'g':	/* -g for initial goto */
+X				case 'G':	
+X					gotoflag = TRUE;
+X					gline = atoi(&argv[carg][2]);
+X					break;
+X				default:	/* unknown switch */
+X					/* ignore this for now */
+X					break;
+X			}
+X		} else 	/* check for a macro file */
+X			if (argv[carg][0]== '@') {
+X
+X			if (startup(&argv[carg][1]) == TRUE)
+X				startf = TRUE;	/* don't execute emacs.rc */
+X
+X		} else {	/* process a file name */
+X			/* if we haven't run emacs.rc, do it now */
+X			if (startf == FALSE) {
+X				startup("");
+X				startf = TRUE;
+X			}
+X
+X			/* set up a buffer for this file */
+X	                makename(bname, argv[carg]);
+X
+X			/* if this is the first file, read it in */
+X			if (ffile) {
+X				bp = curbp;
+X				makename(bname, argv[carg]);
+X				strcpy(bp->b_bname, bname);
+X				strcpy(bp->b_fname, argv[carg]);
+X				if (readin(argv[carg], (viewflag==FALSE))
+X								== ABORT) {
+X					strcpy(bp->b_bname, "main");
+X					strcpy(bp->b_fname, "");
+X				}
+X				bp->b_dotp = bp->b_linep;
+X				bp->b_doto = 0;
+X				ffile = FALSE;
+X			} else {
+X				/* set this to inactive */
+X				bp = bfind(bname, TRUE, 0);
+X				strcpy(bp->b_fname, argv[carg]);
+X				bp->b_active = FALSE;
+X			}
+X
+X			/* set the view mode appropriatly */
+X			if (viewflag)
+X				bp->b_mode |= MDVIEW;
+X		}
+X	}
+X
+X	/* if invoked with nothing, run the startup file here */
+X	if (startf == FALSE) {
+X		startup("");
+X		startf = TRUE;
+X	}
+X 
+X        /* Deal with startup gotos and searches */
+X 
+X        if (gotoflag && searchflag) {
+X        	update(FALSE);
+X		mlwrite("[Can not search and goto at the same time!]");
+X	}
+X        else if (gotoflag) {
+X                if (gotoline(NULL,gline) == FALSE) {
+X                	update(FALSE);
+X			mlwrite("[Bogus goto argument]");
+X		}
+X        } else if (searchflag) {
+X                if (forscan(&pat[0], 2) == FALSE) {
+X                	update(FALSE);
+X			mlwrite("Not found.");
+X		}
+X        }
+X
+X	/* setup to process commands */
+X        lastflag = 0;                           /* Fake last flags.     */
+X	curbp->b_mode = curbp->b_mode | gmode;	/* and set default modes*/
+X	curwp->w_flag |= WFMODE;		/* and force an update	*/
+X#if	COLOR
+X	curwp->w_fcolor = gfcolor;		/* and set colors	*/
+X	curwp->w_bcolor = gbcolor;
+X#endif
+X
+Xloop:
+X        update(FALSE);                          /* Fix up the screen    */
+X        c = getcmd();
+X        if (mpresf != FALSE) {
+X                mlerase();
+X                update(FALSE);
+X#if	CLRMSG
+X                if (c == ' ')                   /* ITS EMACS does this  */
+X                        goto loop;
+X#endif
+X        }
+X        f = FALSE;
+X        n = 1;
+X
+X	/* do META-# processing if needed */
+X
+X	basec = c & ~META;		/* strip meta char off if there */
+X	if ((c & META) && ((basec >= '0' && basec <= '9') || basec == '-')) {
+X		f = TRUE;		/* there is a # arg */
+X		n = 0;			/* start with a zero default */
+X		mflag = 1;		/* current minus flag */
+X		c = basec;		/* strip the META */
+X		while ((c >= '0' && c <= '9') || (c == '-')) {
+X			if (c == '-') {
+X				/* already hit a minus or digit? */
+X				if ((mflag == -1) || (n != 0))
+X					break;
+X				mflag = -1;
+X			} else {
+X				n = n * 10 + (c - '0');
+X			}
+X			if ((n == 0) && (mflag == -1))	/* lonely - */
+X				mlwrite("Arg:");
+X			else
+X				mlwrite("Arg: %d",n * mflag);
+X
+X			c = getcmd();	/* get the next key */
+X		}
+X		n = n * mflag;	/* figure in the sign */
+X	}
+X
+X	/* do ^U repeat argument processing */
+X
+X        if (c == (CTRL|'U')) {                  /* ^U, start argument   */
+X                f = TRUE;
+X                n = 4;                          /* with argument of 4 */
+X                mflag = 0;                      /* that can be discarded. */
+X                mlwrite("Arg: 4");
+X                while ((c=getcmd()) >='0' && c<='9' || c==(CTRL|'U') || c=='-'){
+X                        if (c == (CTRL|'U'))
+X                                n = n*4;
+X                        /*
+X                         * If dash, and start of argument string, set arg.
+X                         * to -1.  Otherwise, insert it.
+X                         */
+X                        else if (c == '-') {
+X                                if (mflag)
+X                                        break;
+X                                n = 0;
+X                                mflag = -1;
+X                        }
+X                        /*
+X                         * If first digit entered, replace previous argument
+X                         * with digit and set sign.  Otherwise, append to arg.
+X                         */
+X                        else {
+X                                if (!mflag) {
+X                                        n = 0;
+X                                        mflag = 1;
+X                                }
+X                                n = 10*n + c - '0';
+X                        }
+X                        mlwrite("Arg: %d", (mflag >=0) ? n : (n ? -n : -1));
+X                }
+X                /*
+X                 * Make arguments preceded by a minus sign negative and change
+X                 * the special argument "^U -" to an effective "^U -1".
+X                 */
+X                if (mflag == -1) {
+X                        if (n == 0)
+X                                n++;
+X                        n = -n;
+X                }
+X        }
+X
+X        if (kbdmip != NULL) {                   /* Save macro strokes.  */
+X                if (c!=(CTLX|')') && kbdmip>&kbdm[NKBDM-6]) {
+X                        ctrlg(FALSE, 0);
+X                        goto loop;
+X                }
+X                if (f != FALSE) {
+X                        *kbdmip++ = (CTRL|'U');
+X                        *kbdmip++ = n;
+X                }
+X                *kbdmip++ = c;
+X        }
+X        execute(c, f, n);                       /* Do it.               */
+X        goto loop;
+X}
+X
+X/*
+X * Initialize all of the buffers and windows. The buffer name is passed down
+X * as an argument, because the main routine may have been told to read in a
+X * file by default, and we want the buffer name to be right.
+X */
+Xedinit(bname)
+Xchar    bname[];
+X{
+X        register BUFFER *bp;
+X        register WINDOW *wp;
+X	char *malloc();
+X
+X        bp = bfind(bname, TRUE, 0);             /* First buffer         */
+X        blistp = bfind("[List]", TRUE, BFINVS); /* Buffer list buffer   */
+X        wp = (WINDOW *) malloc(sizeof(WINDOW)); /* First window         */
+X        if (bp==NULL || wp==NULL || blistp==NULL)
+X                exit(1);
+X        curbp  = bp;                            /* Make this current    */
+X        wheadp = wp;
+X        curwp  = wp;
+X        wp->w_wndp  = NULL;                     /* Initialize window    */
+X        wp->w_bufp  = bp;
+X        bp->b_nwnd  = 1;                        /* Displayed.           */
+X        wp->w_linep = bp->b_linep;
+X        wp->w_dotp  = bp->b_linep;
+X        wp->w_doto  = 0;
+X        wp->w_markp = NULL;
+X        wp->w_marko = 0;
+X        wp->w_toprow = 0;
+X#if	COLOR
+X	/* initalize colors to global defaults */
+X	wp->w_fcolor = gfcolor;
+X	wp->w_bcolor = gbcolor;
+X#endif
+X        wp->w_ntrows = term.t_nrow-1;           /* "-1" for mode line.  */
+X        wp->w_force = 0;
+X        wp->w_flag  = WFMODE|WFHARD;            /* Full.                */
+X}
+X
+X/*
+X * This is the general command execution routine. It handles the fake binding
+X * of all the keys to "self-insert". It also clears out the "thisflag" word,
+X * and arranges to move it to the "lastflag", so that the next command can
+X * look at it. Return the status of command.
+X */
+Xexecute(c, f, n)
+X{
+X        register KEYTAB *ktp;
+X        register int    status;
+X
+X        ktp = &keytab[0];                       /* Look in key table.   */
+X        while (ktp->k_fp != NULL) {
+X                if (ktp->k_code == c) {
+X                        thisflag = 0;
+X                        status   = (*ktp->k_fp)(f, n);
+X                        lastflag = thisflag;
+X                        return (status);
+X                }
+X                ++ktp;
+X        }
+X
+X        /*
+X         * If a space was typed, fill column is defined, the argument is non-
+X         * negative, wrap mode is enabled, and we are now past fill column,
+X	 * and we are not read-only, perform word wrap.
+X         */
+X        if (c == ' ' && (curwp->w_bufp->b_mode & MDWRAP) && fillcol > 0 &&
+X	    n >= 0 && getccol(FALSE) > fillcol &&
+X	    (curwp->w_bufp->b_mode & MDVIEW) == FALSE)
+X                wrapword();
+X
+X        if ((c>=0x20 && c<=0x7E)                /* Self inserting.      */
+X        ||  (c>=0xA0 && c<=0xFE)) {
+X                if (n <= 0) {                   /* Fenceposts.          */
+X                        lastflag = 0;
+X                        return (n<0 ? FALSE : TRUE);
+X                }
+X                thisflag = 0;                   /* For the future.      */
+X
+X		/* if we are in overwrite mode, not at eol,
+X		   and next char is not a tab or we are at a tab stop,
+X		   delete a char forword			*/
+X		if (curwp->w_bufp->b_mode & MDOVER &&
+X		    curwp->w_doto < curwp->w_dotp->l_used &&
+X			(lgetc(curwp->w_dotp, curwp->w_doto) != '\t' ||
+X			 (curwp->w_doto) % 8 == 7))
+X				ldelete(1L, FALSE);
+X
+X		/* do the appropriate insertion */
+X		if (c == '}' && (curbp->b_mode & MDCMOD) != 0)
+X	        	status = insbrace(n, c);
+X	        else if (c == '#' && (curbp->b_mode & MDCMOD) != 0)
+X	        	status = inspound();
+X	        else
+X	                status = linsert(n, c);
+X
+X#if	CFENCE
+X		/* check for CMODE fence matching */
+X		if ((c == '}' || c == ')') && (curbp->b_mode & MDCMOD) != 0)
+X			fmatch(c);
+X#endif
+X
+X                lastflag = thisflag;
+X                return (status);
+X        }
+X	(*term.t_beep)();
+X	mlwrite("[Key not bound]");		/* complain		*/
+X        lastflag = 0;                           /* Fake last flags.     */
+X        return (FALSE);
+X}
+X
+X/*
+X * Fancy quit command, as implemented by Norm. If the any buffer has
+X * changed do a write on that buffer and exit emacs, otherwise simply exit.
+X */
+Xquickexit(f, n)
+X{
+X	register BUFFER *bp;	/* scanning pointer to buffers */
+X
+X	bp = bheadp;
+X	while (bp != NULL) {
+X	        if ((bp->b_flag&BFCHG) != 0	/* Changed.             */
+X        	&& (bp->b_flag&BFINVS) == 0) {	/* Real.                */
+X			curbp = bp;		/* make that buffer cur	*/
+X			mlwrite("[Saving %s]",bp->b_fname);
+X                	filesave(f, n);
+X		}
+X	bp = bp->b_bufp;			/* on to the next buffer */
+X	}
+X        quit(f, n);                             /* conditionally quit   */
+X}
+X
+X/*
+X * Quit command. If an argument, always quit. Otherwise confirm if a buffer
+X * has been changed and not written out. Normally bound to "C-X C-C".
+X */
+Xquit(f, n)
+X{
+X        register int    s;
+X
+X        if (f != FALSE                          /* Argument forces it.  */
+X        || anycb() == FALSE                     /* All buffers clean.   */
+X						/* User says it's OK.   */
+X        || (s=mlyesno("Modified buffers exist. Leave anyway")) == TRUE) {
+X#if	FILOCK
+X		if (lockrel() != TRUE) {
+X			(*term.t_putchar)('\n');
+X			(*term.t_putchar)('\r');
+X			(*term.t_close)();
+X			exit(1);
+X		}
+X#endif
+X                vttidy();
+X#if	APROF
+X		/* if doing AZTEC C profiling, close up and write it out */
+X		monitor(0,0,0,0,0);
+X#endif
+X                exit(GOOD);
+X        }
+X	mlwrite("");
+X        return (s);
+X}
+X
+X/*
+X * Begin a keyboard macro.
+X * Error if not at the top level in keyboard processing. Set up variables and
+X * return.
+X */
+Xctlxlp(f, n)
+X{
+X        if (kbdmip!=NULL || kbdmop!=NULL) {
+X                mlwrite("Not now");
+X                return (FALSE);
+X        }
+X        mlwrite("[Start macro]");
+X        kbdmip = &kbdm[0];
+X        return (TRUE);
+X}
+X
+X/*
+X * End keyboard macro. Check for the same limit conditions as the above
+X * routine. Set up the variables and return to the caller.
+X */
+Xctlxrp(f, n)
+X{
+X        if (kbdmip == NULL) {
+X                mlwrite("Not now");
+X                return (FALSE);
+X        }
+X        mlwrite("[End macro]");
+X        kbdmip = NULL;
+X        return (TRUE);
+X}
+X
+X/*
+X * Execute a macro.
+X * The command argument is the number of times to loop. Quit as soon as a
+X * command gets an error. Return TRUE if all ok, else FALSE.
+X */
+Xctlxe(f, n)
+X{
+X        register int    c;
+X        register int    af;
+X        register int    an;
+X        register int    s;
+X
+X        if (kbdmip!=NULL || kbdmop!=NULL) {
+X                mlwrite("Not now");
+X                return (FALSE);
+X        }
+X        if (n <= 0)
+X                return (TRUE);
+X        do {
+X                kbdmop = &kbdm[0];
+X                do {
+X                        af = FALSE;
+X                        an = 1;
+X                        if ((c = *kbdmop++) == (CTRL|'U')) {
+X                                af = TRUE;
+X                                an = *kbdmop++;
+X                                c  = *kbdmop++;
+X                        }
+X                        s = TRUE;
+X                } while (c!=(CTLX|')') && (s=execute(c, af, an))==TRUE);
+X                kbdmop = NULL;
+X        } while (s==TRUE && --n);
+X        return (s);
+X}
+X
+X/*
+X * Abort.
+X * Beep the beeper. Kill off any keyboard macro, etc., that is in progress.
+X * Sometimes called as a routine, to do general aborting of stuff.
+X */
+Xctrlg(f, n)
+X{
+X        (*term.t_beep)();
+X        if (kbdmip != NULL) {
+X                kbdm[0] = (CTLX|')');
+X                kbdmip  = NULL;
+X        }
+X	mlwrite("[Aborted]");
+X        return (ABORT);
+X}
+X
+X/* tell the user that this command is illegal while we are in
+X   VIEW (read-only) mode				*/
+X
+Xrdonly()
+X
+X{
+X	(*term.t_beep)();
+X	mlwrite("[Key illegal in VIEW mode]");
+X	return(FALSE);
+X}
+X
+Xmeta()	/* dummy function for binding to meta prefix */
+X{
+X}
+X
+Xcex()	/* dummy function for binding to control-x prefix */
+X{
+X}
+X
+X
+FRIDAY_NIGHT
+echo es.7 completed!
+: That's all folks!
+

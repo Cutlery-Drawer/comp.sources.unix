@@ -1,0 +1,2886 @@
+Date: Wed, 13 Mar 85 16:56:41 pst
+From: decvax!ucbvax!UCBJADE!ucbjade:mwm (Mike Meyer)
+Subject: XLISP 1.4 part 3 (of 4)
+
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	xldmem.c
+#	xleval.c
+#	xlfio.c
+#	xlftab.c
+#	xlglob.c
+#	xlinit.c
+#	xlio.c
+#	xlisp.c
+#	xljump.c
+#	xlmath.c
+#	xlprin.c
+#	xlread.c
+# This archive created: Mon Dec  2 10:17:38 1985
+export PATH; PATH=/bin:$PATH
+echo shar: extracting "'xldmem.c'" '(6552 characters)'
+if test -f 'xldmem.c'
+then
+	echo shar: will not over-write existing file "'xldmem.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xldmem.c'
+/* xldmem - xlisp dynamic memory management routines */
+
+#include "xlisp.h"
+
+/* useful definitions */
+#define ALLOCSIZE (sizeof(struct segment) + (anodes-1) * sizeof(NODE))
+
+/* external variables */
+extern NODE *oblist,*keylist;
+extern NODE *xlstack;
+extern NODE *xlenv,*xlnewenv;
+extern long total;
+extern int anodes,nnodes,nsegs,nfree,gccalls;
+extern struct segment *segs;
+extern NODE *fnodes;
+
+/* external procedures */
+extern char *malloc();
+extern char *calloc();
+
+/* newnode - allocate a new node */
+NODE *newnode(type)
+  int type;
+{
+    NODE *nnode;
+
+    /* get a free node */
+    if ((nnode = fnodes) == NIL) {
+	gc();
+	if ((nnode = fnodes) == NIL)
+	    xlabort("insufficient node space");
+    }
+
+    /* unlink the node from the free list */
+    fnodes = cdr(nnode);
+    nfree -= 1;
+
+    /* initialize the new node */
+    nnode->n_type = type;
+    rplacd(nnode,NIL);
+
+    /* return the new node */
+    return (nnode);
+}
+
+/* stralloc - allocate memory for a string adding a byte for the terminator */
+char *stralloc(size)
+  int size;
+{
+    char *sptr;
+
+    /* allocate memory for the string copy */
+    if ((sptr = malloc(size+1)) == NULL) {
+	gc();
+	if ((sptr = malloc(size+1)) == NULL)
+	    xlfail("insufficient string space");
+    }
+    total += (long) (size+1);
+
+    /* return the new string memory */
+    return (sptr);
+}
+
+/* strsave - generate a dynamic copy of a string */
+char *strsave(str)
+  char *str;
+{
+    char *sptr;
+
+    /* create a new string */
+    sptr = stralloc(strlen(str));
+    strcpy(sptr,str);
+
+    /* return the new string */
+    return (sptr);
+}
+
+/* strfree - free string memory */
+strfree(str)
+  char *str;
+{
+    total -= (long) (strlen(str)+1);
+    free(str);
+}
+
+/* gc - garbage collect */
+gc()
+{
+    NODE *p;
+
+    /* mark all accessible nodes */
+    mark(oblist); mark(keylist);
+    mark(xlenv);
+    mark(xlnewenv);
+
+    /* mark the evaluation stack */
+    for (p = xlstack; p; p = cdr(p))
+	mark(car(p));
+
+    /* sweep memory collecting all unmarked nodes */
+    sweep();
+
+    /* if there's still nothing available, allocate more memory */
+    if (fnodes == NIL)
+	addseg();
+
+    /* count the gc call */
+    gccalls++;
+}
+
+/* mark - mark all accessible nodes */
+LOCAL mark(ptr)
+  NODE *ptr;
+{
+    NODE *this,*prev,*tmp;
+
+    /* just return on nil */
+    if (ptr == NIL)
+	return;
+
+    /* initialize */
+    prev = NIL;
+    this = ptr;
+
+    /* mark this list */
+    while (TRUE) {
+
+	/* descend as far as we can */
+	while (TRUE) {
+
+	    /* check for this node being marked */
+	    if (this->n_flags & MARK)
+		break;
+
+	    /* mark it and its descendants */
+	    else {
+
+		/* mark the node */
+		this->n_flags |= MARK;
+
+		/* follow the left sublist if there is one */
+		if (livecar(this)) {
+		    this->n_flags |= LEFT;
+		    tmp = prev;
+		    prev = this;
+		    this = car(prev);
+		    rplaca(prev,tmp);
+		}
+
+		/* otherwise, follow the right sublist if there is one */
+		else if (livecdr(this)) {
+		    this->n_flags &= ~LEFT;
+		    tmp = prev;
+		    prev = this;
+		    this = cdr(prev);
+		    rplacd(prev,tmp);
+		}
+		else
+		    break;
+	    }
+	}
+
+	/* backup to a point where we can continue descending */
+	while (TRUE) {
+
+	    /* check for termination condition */
+	    if (prev == NIL)
+		return;
+
+	    /* check for coming from the left side */
+	    if (prev->n_flags & LEFT)
+		if (livecdr(prev)) {
+		    prev->n_flags &= ~LEFT;
+		    tmp = car(prev);
+		    rplaca(prev,this);
+		    this = cdr(prev);
+		    rplacd(prev,tmp);
+		    break;
+		}
+		else {
+		    tmp = prev;
+		    prev = car(tmp);
+		    rplaca(tmp,this);
+		    this = tmp;
+		}
+
+	    /* otherwise, came from the right side */
+	    else {
+		tmp = prev;
+		prev = cdr(tmp);
+		rplacd(tmp,this);
+		this = tmp;
+	    }
+	}
+    }
+}
+
+/* sweep - sweep all unmarked nodes and add them to the free list */
+LOCAL sweep()
+{
+    struct segment *seg;
+    NODE *p;
+    int n;
+
+    /* empty the free list */
+    fnodes = NIL;
+    nfree = 0;
+
+    /* add all unmarked nodes */
+    for (seg = segs; seg != NULL; seg = seg->sg_next) {
+	p = &seg->sg_nodes[0];
+	for (n = seg->sg_size; n--; p++)
+	    if (!(p->n_flags & MARK)) {
+		switch (ntype(p)) {
+		case STR:
+			if (p->n_strtype == DYNAMIC && p->n_str != NULL)
+			    strfree(p->n_str);
+			break;
+		case FPTR:
+			if (p->n_fp)
+			    fclose(p->n_fp);
+			break;
+		}
+		p->n_type = FREE;
+		p->n_flags = 0;
+		rplaca(p,NIL);
+		rplacd(p,fnodes);
+		fnodes = p;
+		nfree++;
+	    }
+	    else
+		p->n_flags &= ~(MARK | LEFT);
+    }
+}
+
+/* addseg - add a segment to the available memory */
+int addseg()
+{
+    struct segment *newseg;
+    NODE *p;
+    int n;
+
+    /* check for zero allocation */
+    if (anodes == 0)
+	return (FALSE);
+
+    /* allocate a new segment */
+    if ((newseg = (struct segment *) calloc(1,ALLOCSIZE)) != NULL) {
+
+	/* initialize the new segment */
+	newseg->sg_size = anodes;
+	newseg->sg_next = segs;
+	segs = newseg;
+
+	/* add each new node to the free list */
+	p = &newseg->sg_nodes[0];
+	for (n = anodes; n--; ) {
+	    rplacd(p,fnodes);
+	    fnodes = p++;
+	}
+
+	/* update the statistics */
+	total += (long) ALLOCSIZE;
+	nnodes += anodes;
+	nfree += anodes;
+	nsegs++;
+
+	/* return successfully */
+	return (TRUE);
+    }
+    else
+	return (FALSE);
+}
+ 
+/* livecar - do we need to follow the car? */
+LOCAL int livecar(n)
+  NODE *n;
+{
+    switch (ntype(n)) {
+    case SUBR:
+    case FSUBR:
+    case INT:
+    case STR:
+    case FPTR:
+	    return (FALSE);
+    case SYM:
+    case LIST:
+    case OBJ:
+	    return (car(n) != NIL);
+    default:
+	    printf("bad node type (%d) found during left scan\n",ntype(n));
+	    exit();
+    }
+}
+
+/* livecdr - do we need to follow the cdr? */
+LOCAL int livecdr(n)
+  NODE *n;
+{
+    switch (ntype(n)) {
+    case SUBR:
+    case FSUBR:
+    case INT:
+    case STR:
+    case FPTR:
+	    return (FALSE);
+    case SYM:
+    case LIST:
+    case OBJ:
+	    return (cdr(n) != NIL);
+    default:
+	    printf("bad node type (%d) found during right scan\n",ntype(n));
+	    exit();
+    }
+}
+
+/* stats - print memory statistics */
+stats()
+{
+    printf("Nodes:       %d\n",nnodes);
+    printf("Free nodes:  %d\n",nfree);
+    printf("Segments:    %d\n",nsegs);
+    printf("Allocate:    %d\n",anodes);
+    printf("Total:       %ld\n",total);
+    printf("Collections: %d\n",gccalls);
+}
+
+/* xlminit - initialize the dynamic memory module */
+xlminit()
+{
+    /* initialize our internal variables */
+    anodes = NNODES;
+    total = 0L;
+    nnodes = nsegs = nfree = gccalls = 0;
+    fnodes = NIL;
+    segs = NULL;
+
+    /* initialize structures that are marked by the collector */
+    xlstack = xlenv = xlnewenv = oblist = keylist = NIL;
+}
+SHAR_EOF
+if test 6552 -ne "`wc -c < 'xldmem.c'`"
+then
+	echo shar: error transmitting "'xldmem.c'" '(should have been 6552 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xleval.c'" '(7688 characters)'
+if test -f 'xleval.c'
+then
+	echo shar: will not over-write existing file "'xleval.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xleval.c'
+/* xleval - xlisp evaluator */
+
+#include "xlisp.h"
+
+/* external variables */
+extern NODE *xlstack,*xlenv,*xlnewenv;
+extern NODE *s_lambda,*s_macro;
+extern NODE *k_optional,*k_rest,*k_aux;
+extern NODE *s_evalhook,*s_applyhook;
+extern NODE *s_unbound;
+extern NODE *s_stdout;
+
+/* forward declarations */
+XFORWARD NODE *xlxeval();
+XFORWARD NODE *evalhook();
+XFORWARD NODE *evform();
+XFORWARD NODE *evsym();
+XFORWARD NODE *evfun();
+
+/* xleval - evaluate an xlisp expression (checking for *evalhook*) */
+NODE *xleval(expr)
+  NODE *expr;
+{
+    return (s_evalhook->n_symvalue ? evalhook(expr) : xlxeval(expr));
+}
+
+/* xlxeval - evaluate an xlisp expression (bypassing *evalhook*) */
+NODE *xlxeval(expr)
+  NODE *expr;
+{
+    /* evaluate nil to itself */
+    if (expr == NIL)
+	return (NIL);
+
+    /* add trace entry */
+    xltpush(expr);
+
+    /* check type of value */
+    if (consp(expr))
+	expr = evform(expr);
+    else if (symbolp(expr))
+	expr = evsym(expr);
+
+    /* remove trace entry */
+    xltpop();
+
+    /* return the value */
+    return (expr);
+}
+
+/* xlapply - apply a function to a list of arguments */
+NODE *xlapply(fun,args)
+  NODE *fun,*args;
+{
+    NODE *val;
+
+    /* check for a null function */
+    if (fun == NIL)
+	xlfail("bad function");
+
+    /* evaluate the function */
+    if (subrp(fun))
+	val = (*fun->n_subr)(args);
+    else if (consp(fun)) {
+	if (car(fun) != s_lambda)
+	    xlfail("bad function type");
+	val = evfun(fun,args);
+    }
+    else
+	xlfail("bad function");
+
+    /* return the result value */
+    return (val);
+}
+
+/* evform - evaluate a form */
+LOCAL NODE *evform(expr)
+  NODE *expr;
+{
+    NODE *oldstk,fun,args,*val,*type;
+
+    /* create a stack frame */
+    oldstk = xlsave(&fun,&args,NULL);
+
+    /* get the function and the argument list */
+    fun.n_ptr = car(expr);
+    args.n_ptr = cdr(expr);
+
+    /* evaluate the first expression */
+    if ((fun.n_ptr = xleval(fun.n_ptr)) == NIL)
+	xlfail("bad function");
+
+    /* evaluate the function */
+    if (subrp(fun.n_ptr) || fsubrp(fun.n_ptr)) {
+	if (subrp(fun.n_ptr))
+	    args.n_ptr = xlevlist(args.n_ptr);
+	val = (*fun.n_ptr->n_subr)(args.n_ptr);
+    }
+    else if (consp(fun.n_ptr)) {
+	if ((type = car(fun.n_ptr)) == s_lambda) {
+	    args.n_ptr = xlevlist(args.n_ptr);
+	    val = evfun(fun.n_ptr,args.n_ptr);
+	}
+	else if (type == s_macro) {
+	    args.n_ptr = evfun(fun.n_ptr,args.n_ptr);
+	    val = xleval(args.n_ptr);
+	}
+	else
+	    xlfail("bad function type");
+    }
+    else if (objectp(fun.n_ptr))
+	val = xlsend(fun.n_ptr,args.n_ptr);
+    else
+	xlfail("bad function");
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the result value */
+    return (val);
+}
+
+/* evalhook - call the evalhook function */
+LOCAL NODE *evalhook(expr)
+  NODE *expr;
+{
+    NODE *oldstk,*oldenv,fun,args,*val;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&fun,&args,NULL);
+
+    /* get the hook function */
+    fun.n_ptr = s_evalhook->n_symvalue;
+
+    /* make an argument list */
+    args.n_ptr = newnode(LIST);
+    rplaca(args.n_ptr,expr);
+
+    /* rebind the hook functions to nil */
+    oldenv = xlenv;
+    xlsbind(s_evalhook,NIL);
+    xlsbind(s_applyhook,NIL);
+
+    /* call the hook function */
+    val = xlapply(fun.n_ptr,args.n_ptr);
+
+    /* unbind the symbols */
+    xlunbind(oldenv);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the value */
+    return (val);
+}
+
+/* xlevlist - evaluate a list of arguments */
+NODE *xlevlist(args)
+  NODE *args;
+{
+    NODE *oldstk,src,dst,*new,*last,*val;
+
+    /* create a stack frame */
+    oldstk = xlsave(&src,&dst,NULL);
+
+    /* initialize */
+    src.n_ptr = args;
+
+    /* evaluate each argument */
+    for (val = NIL; src.n_ptr; src.n_ptr = cdr(src.n_ptr)) {
+
+	/* check this entry */
+	if (!consp(src.n_ptr))
+	    xlfail("bad argument list");
+
+	/* allocate a new list entry */
+	new = newnode(LIST);
+	if (val)
+	    rplacd(last,new);
+	else
+	    val = dst.n_ptr = new;
+	rplaca(new,xleval(car(src.n_ptr)));
+	last = new;
+    }
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the new list */
+    return (val);
+}
+
+/* evsym - evaluate a symbol */
+LOCAL NODE *evsym(sym)
+  NODE *sym;
+{
+    NODE *p;
+
+    /* check for a reference to an instance variable */
+    if ((p = xlobsym(sym)) != NIL)
+	return (car(p));
+
+    /* get the value of the variable */
+    while ((p = sym->n_symvalue) == s_unbound)
+	xlunbound(sym);
+
+    /* return the value */
+    return (p);
+}
+
+/* xlunbound - signal an unbound variable error */
+xlunbound(sym)
+  NODE *sym;
+{
+    xlcerror("try evaluating symbol again","unbound variable",sym);
+}
+
+/* evfun - evaluate a function */
+LOCAL NODE *evfun(fun,args)
+  NODE *fun,*args;
+{
+    NODE *oldstk,*oldenv,*oldnewenv,cptr,*fargs,*val;
+
+    /* create a stack frame */
+    oldstk = xlsave(&cptr,NULL);
+
+    /* skip the function type */
+    if ((fun = cdr(fun)) == NIL || !consp(fun))
+	xlfail("bad function definition");
+
+    /* get the formal argument list */
+    if ((fargs = car(fun)) && !consp(fargs))
+	xlfail("bad formal argument list");
+
+    /* bind the formal parameters */
+    oldnewenv = xlnewenv; oldenv = xlnewenv = xlenv;
+    xlabind(fargs,args);
+    xlfixbindings();
+
+    /* execute the code */
+    for (cptr.n_ptr = cdr(fun); cptr.n_ptr != NIL; )
+	val = xlevarg(&cptr.n_ptr);
+
+    /* restore the environment */
+    xlunbind(oldenv); xlnewenv = oldnewenv;
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the result value */
+    return (val);
+}
+
+/* xlabind - bind the arguments for a function */
+xlabind(fargs,aargs)
+  NODE *fargs,*aargs;
+{
+    NODE *arg;
+
+    /* evaluate and bind each required argument */
+    while (consp(fargs) && !iskeyword(arg = car(fargs)) && consp(aargs)) {
+
+	/* bind the formal variable to the argument value */
+	xlbind(arg,car(aargs));
+
+	/* move the argument list pointers ahead */
+	fargs = cdr(fargs);
+	aargs = cdr(aargs);
+    }
+
+    /* check for the '&optional' keyword */
+    if (consp(fargs) && car(fargs) == k_optional) {
+	fargs = cdr(fargs);
+
+	/* bind the arguments that were supplied */
+	while (consp(fargs) && !iskeyword(arg = car(fargs)) && consp(aargs)) {
+
+	    /* bind the formal variable to the argument value */
+	    xlbind(arg,car(aargs));
+
+	    /* move the argument list pointers ahead */
+	    fargs = cdr(fargs);
+	    aargs = cdr(aargs);
+	}
+
+	/* bind the rest to nil */
+	while (consp(fargs) && !iskeyword(arg = car(fargs))) {
+
+	    /* bind the formal variable to nil */
+	    xlbind(arg,NIL);
+
+	    /* move the argument list pointer ahead */
+	    fargs = cdr(fargs);
+	}
+    }
+
+    /* check for the '&rest' keyword */
+    if (consp(fargs) && car(fargs) == k_rest) {
+	fargs = cdr(fargs);
+	if (consp(fargs) && (arg = car(fargs)) && !iskeyword(arg))
+	    xlbind(arg,aargs);
+	else
+	    xlfail("symbol missing after &rest");
+	fargs = cdr(fargs);
+	aargs = NIL;
+    }
+
+    /* check for the '&aux' keyword */
+    if (consp(fargs) && car(fargs) == k_aux)
+	while ((fargs = cdr(fargs)) != NIL && consp(fargs))
+	    xlbind(car(fargs),NIL);
+
+    /* make sure the correct number of arguments were supplied */
+    if (fargs != aargs)
+	xlfail(fargs ? "too few arguments" : "too many arguments");
+}
+
+/* iskeyword - check to see if a symbol is a keyword */
+LOCAL int iskeyword(sym)
+  NODE *sym;
+{
+    return (sym == k_optional || sym == k_rest || sym == k_aux);
+}
+
+/* xlsave - save nodes on the stack */
+NODE *xlsave(n)
+  NODE *n;
+{
+    NODE **nptr,*oldstk;
+
+    /* save the old stack pointer */
+    oldstk = xlstack;
+
+    /* save each node */
+    for (nptr = &n; *nptr != NULL; nptr++) {
+	rplaca(*nptr,NIL);
+	rplacd(*nptr,xlstack);
+	xlstack = *nptr;
+    }
+
+    /* return the old stack pointer */
+    return (oldstk);
+}
+SHAR_EOF
+if test 7688 -ne "`wc -c < 'xleval.c'`"
+then
+	echo shar: error transmitting "'xleval.c'" '(should have been 7688 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlfio.c'" '(8960 characters)'
+if test -f 'xlfio.c'
+then
+	echo shar: will not over-write existing file "'xlfio.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlfio.c'
+/* xlfio.c - xlisp file i/o */
+
+#include "xlisp.h"
+#include "ctype.h"
+
+/* external variables */
+extern NODE *s_stdin,*s_stdout;
+extern NODE *xlstack;
+extern int xlfsize;
+extern char buf[];
+
+/* external routines */
+extern FILE *fopen();
+
+/* forward declarations */
+XFORWARD NODE *printit();
+XFORWARD NODE *flatsize();
+XFORWARD NODE *explode();
+XFORWARD NODE *implode();
+XFORWARD NODE *openit();
+XFORWARD NODE *getfile();
+
+/* xread - read an expression */
+NODE *xread(args)
+  NODE *args;
+{
+    NODE *oldstk,fptr,eof,*val;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&fptr,&eof,NULL);
+
+    /* get file pointer and eof value */
+    fptr.n_ptr = (args ? getfile(&args) : s_stdin->n_symvalue);
+    eof.n_ptr = (args ? xlarg(&args) : NIL);
+    xllastarg(args);
+
+    /* read an expression */
+    if (!xlread(fptr.n_ptr,&val))
+	val = eof.n_ptr;
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the expression */
+    return (val);
+}
+
+/* xprint - builtin function 'print' */
+NODE *xprint(args)
+  NODE *args;
+{
+    return (printit(args,TRUE,TRUE));
+}
+
+/* xprin1 - builtin function 'prin1' */
+NODE *xprin1(args)
+  NODE *args;
+{
+    return (printit(args,TRUE,FALSE));
+}
+
+/* xprinc - builtin function princ */
+NODE *xprinc(args)
+  NODE *args;
+{
+    return (printit(args,FALSE,FALSE));
+}
+
+/* xterpri - terminate the current print line */
+NODE *xterpri(args)
+  NODE *args;
+{
+    NODE *fptr;
+
+    /* get file pointer */
+    fptr = (args ? getfile(&args) : s_stdout->n_symvalue);
+    xllastarg(args);
+
+    /* terminate the print line and return nil */
+    xlterpri(fptr);
+    return (NIL);
+}
+
+/* printit - common print function */
+LOCAL NODE *printit(args,pflag,tflag)
+  NODE *args; int pflag,tflag;
+{
+    NODE *oldstk,fptr,val;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&fptr,&val,NULL);
+
+    /* get expression to print and file pointer */
+    val.n_ptr = xlarg(&args);
+    fptr.n_ptr = (args ? getfile(&args) : s_stdout->n_symvalue);
+    xllastarg(args);
+
+    /* print the value */
+    xlprint(fptr.n_ptr,val.n_ptr,pflag);
+
+    /* terminate the print line if necessary */
+    if (tflag)
+	xlterpri(fptr.n_ptr);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the result */
+    return (val.n_ptr);
+}
+
+/* xflatsize - compute the size of a printed representation using prin1 */
+NODE *xflatsize(args)
+  NODE *args;
+{
+    return (flatsize(args,TRUE));
+}
+
+/* xflatc - compute the size of a printed representation using princ */
+NODE *xflatc(args)
+  NODE *args;
+{
+    return (flatsize(args,FALSE));
+}
+
+/* flatsize - compute the size of a printed expression */
+LOCAL NODE *flatsize(args,pflag)
+  NODE *args; int pflag;
+{
+    NODE *oldstk,val;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&val,NULL);
+
+    /* get the expression */
+    val.n_ptr = xlarg(&args);
+    xllastarg(args);
+
+    /* print the value to compute its size */
+    xlfsize = 0;
+    xlprint(NIL,val.n_ptr,pflag);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the length of the expression */
+    val.n_ptr = newnode(INT);
+    val.n_ptr->n_int = xlfsize;
+    return (val.n_ptr);
+}
+
+/* xexplode - explode an expression */
+NODE *xexplode(args)
+  NODE *args;
+{
+    return (explode(args,TRUE));
+}
+
+/* xexplc - explode an expression using princ */
+NODE *xexplc(args)
+  NODE *args;
+{
+    return (explode(args,FALSE));
+}
+
+/* explode - internal explode routine */
+LOCAL NODE *explode(args,pflag)
+  NODE *args; int pflag;
+{
+    NODE *oldstk,val,strm;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&val,&strm,NULL);
+
+    /* get the expression */
+    val.n_ptr = xlarg(&args);
+    xllastarg(args);
+
+    /* create a stream */
+    strm.n_ptr = newnode(LIST);
+
+    /* print the value into the stream */
+    xlprint(strm.n_ptr,val.n_ptr,pflag);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the list of characters */
+    return (car(strm.n_ptr));
+}
+
+/* ximplode - implode a list of characters into a symbol */
+NODE *ximplode(args)
+  NODE *args;
+{
+    return (implode(args,TRUE));
+}
+
+/* xmaknam - implode a list of characters into an uninterned symbol */
+NODE *xmaknam(args)
+  NODE *args;
+{
+    return (implode(args,FALSE));
+}
+
+/* implode - internal implode routine */
+LOCAL NODE *implode(args,intflag)
+  NODE *args; int intflag;
+{
+    NODE *list,*val;
+    char *p;
+
+    /* get the list */
+    list = xlarg(&args);
+    xllastarg(args);
+
+    /* assemble the symbol's pname */
+    for (p = buf; consp(list); list = cdr(list)) {
+	if ((val = car(list)) == NIL || !fixp(val))
+	    xlfail("bad character list");
+	if ((int)(p - buf) < STRMAX)
+	    *p++ = val->n_int;
+    }
+    *p = 0;
+
+    /* create a symbol */
+    val = (intflag ? xlenter(buf,DYNAMIC) : xlmakesym(buf,DYNAMIC));
+
+    /* return the symbol */
+    return (val);
+}
+
+/* xopeni - open an input file */
+NODE *xopeni(args)
+  NODE *args;
+{
+    return (openit(args,"r"));
+}
+
+/* xopeno - open an output file */
+NODE *xopeno(args)
+  NODE *args;
+{
+    return (openit(args,"w"));
+}
+
+/* openit - common file open routine */
+LOCAL NODE *openit(args,mode)
+  NODE *args; char *mode;
+{
+    NODE *fname,*val;
+    FILE *fp;
+
+    /* get the file name */
+    fname = xlmatch(STR,&args);
+    xllastarg(args);
+
+    /* try to open the file */
+    if ((fp = fopen(fname->n_str,mode)) != NULL) {
+	val = newnode(FPTR);
+	val->n_fp = fp;
+	val->n_savech = 0;
+    }
+    else
+	val = NIL;
+
+    /* return the file pointer */
+    return (val);
+}
+
+/* xclose - close a file */
+NODE *xclose(args)
+  NODE *args;
+{
+    NODE *fptr;
+
+    /* get file pointer */
+    fptr = xlmatch(FPTR,&args);
+    xllastarg(args);
+
+    /* make sure the file exists */
+    if (fptr->n_fp == NULL)
+	xlfail("file not open");
+
+    /* close the file */
+    fclose(fptr->n_fp);
+    fptr->n_fp = NULL;
+
+    /* return nil */
+    return (NIL);
+}
+
+/* xrdchar - read a character from a file */
+NODE *xrdchar(args)
+  NODE *args;
+{
+    NODE *fptr,*val;
+    int ch;
+
+    /* get file pointer */
+    fptr = (args ? getfile(&args) : s_stdin->n_symvalue);
+    xllastarg(args);
+
+    /* get character and check for eof */
+    if ((ch = xlgetc(fptr)) == EOF)
+	val = NIL;
+    else {
+	val = newnode(INT);
+	val->n_int = ch;
+    }
+
+    /* return the character */
+    return (val);
+}
+
+/* xpkchar - peek at a character from a file */
+NODE *xpkchar(args)
+  NODE *args;
+{
+    NODE *flag,*fptr,*val;
+    int ch;
+
+    /* peek flag and get file pointer */
+    flag = (args ? xlarg(&args) : NIL);
+    fptr = (args ? getfile(&args) : s_stdin->n_symvalue);
+    xllastarg(args);
+
+    /* skip leading white space and get a character */
+    if (flag)
+	while ((ch = xlpeek(fptr)) != EOF && isspace(ch))
+	    xlgetc(fptr);
+    else
+	ch = xlpeek(fptr);
+
+    /* check for eof */
+    if (ch == EOF)
+	val = NIL;
+    else {
+	val = newnode(INT);
+	val->n_int = ch;
+    }
+
+    /* return the character */
+    return (val);
+}
+
+/* xwrchar - write a character to a file */
+NODE *xwrchar(args)
+  NODE *args;
+{
+    NODE *fptr,*chr;
+
+    /* get the character and file pointer */
+    chr = xlmatch(INT,&args);
+    fptr = (args ? getfile(&args) : s_stdout->n_symvalue);
+    xllastarg(args);
+
+    /* put character to the file */
+    xlputc(fptr,chr->n_int);
+
+    /* return the character */
+    return (chr);
+}
+
+/* xreadline - read a line from a file */
+NODE *xreadline(args)
+  NODE *args;
+{
+    NODE *oldstk,fptr,str;
+    char *p,*sptr;
+    int len,ch;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&fptr,&str,NULL);
+
+    /* get file pointer */
+    fptr.n_ptr = (args ? getfile(&args) : s_stdin->n_symvalue);
+    xllastarg(args);
+
+    /* make a string node */
+    str.n_ptr = newnode(STR);
+    str.n_ptr->n_strtype = DYNAMIC;
+
+    /* get character and check for eof */
+    len = 0; p = buf;
+    while ((ch = xlgetc(fptr.n_ptr)) != EOF && ch != '\n') {
+
+	/* check for buffer overflow */
+	if ((int)(p - buf) == STRMAX) {
+	    *p = 0;
+ 	    sptr = stralloc(len + STRMAX); *sptr = 0;
+	    if (len) {
+		strcpy(sptr,str.n_ptr->n_str);
+		strfree(str.n_ptr->n_str);
+	    }
+	    str.n_ptr->n_str = sptr;
+	    strcat(sptr,buf);
+	    len += STRMAX;
+	    p = buf;
+	}
+
+	/* store the character */
+	*p++ = ch;
+    }
+
+    /* check for end of file */
+    if (len == 0 && p == buf && ch == EOF) {
+	xlstack = oldstk;
+	return (NIL);
+    }
+
+    /* append the last substring */
+    *p = 0;
+    sptr = stralloc(len + (int)(p - buf)); *sptr = 0;
+    if (len) {
+	strcpy(sptr,str.n_ptr->n_str);
+	strfree(str.n_ptr->n_str);
+    }
+    str.n_ptr->n_str = sptr;
+    strcat(sptr,buf);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the string */
+    return (str.n_ptr);
+}
+
+/* getfile - get a file or stream */
+LOCAL NODE *getfile(pargs)
+  NODE **pargs;
+{
+    NODE *arg;
+
+    /* get a file or stream (cons) or nil */
+    if (arg = xlarg(pargs)) {
+	if (filep(arg)) {
+	    if (arg->n_fp == NULL)
+		xlfail("file not open");
+	}
+	else if (!consp(arg))
+	    xlfail("bad argument type");
+    }
+    return (arg);
+}
+SHAR_EOF
+if test 8960 -ne "`wc -c < 'xlfio.c'`"
+then
+	echo shar: error transmitting "'xlfio.c'" '(should have been 8960 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlftab.c'" '(5998 characters)'
+if test -f 'xlftab.c'
+then
+	echo shar: will not over-write existing file "'xlftab.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlftab.c'
+/* xlftab.c - xlisp function table */
+
+#include "xlisp.h"
+
+/* external functions */
+extern NODE
+    *xeval(),*xapply(),*xfuncall(),*xquote(),*xbquote(),
+    *xset(),*xsetq(),*xsetf(),*xdefun(),*xdefmacro(),
+    *xgensym(),*xmakesymbol(),*xintern(),
+    *xsymname(),*xsymvalue(),*xsymplist(),*xget(),*xremprop(),
+    *xcar(),*xcaar(),*xcadr(),*xcdr(),*xcdar(),*xcddr(),
+    *xcons(),*xlist(),*xappend(),*xreverse(),*xlast(),*xnth(),*xnthcdr(),
+    *xmember(),*xassoc(),*xsubst(),*xsublis(),*xremove(),*xlength(),
+    *xmapc(),*xmapcar(),*xmapl(),*xmaplist(),
+    *xrplca(),*xrplcd(),*xnconc(),*xdelete(),
+    *xatom(),*xsymbolp(),*xnumberp(),*xboundp(),*xnull(),*xlistp(),*xconsp(),
+    *xeq(),*xeql(),*xequal(),
+    *xcond(),*xand(),*xor(),*xlet(),*xletstar(),*xif(),
+    *xprog(),*xprogstar(),*xprog1(),*xprog2(),*xprogn(),*xgo(),*xreturn(),
+    *xcatch(),*xthrow(),
+    *xerror(),*xcerror(),*xbreak(),*xerrset(),*xbaktrace(),*xevalhook(),
+    *xdo(),*xdostar(),*xdolist(),*xdotimes(),
+    *xadd(),*xsub(),*xmul(),*xdiv(),*xrem(),*xmin(),*xmax(),*xabs(),
+    *xadd1(),*xsub1(),*xbitand(),*xbitior(),*xbitxor(),*xbitnot(),
+    *xminusp(),*xzerop(),*xplusp(),*xevenp(),*xoddp(),
+    *xlss(),*xleq(),*xequ(),*xneq(),*xgeq(),*xgtr(),
+    *xstrlen(),*xstrcat(),*xsubstr(),*xascii(),*xchr(),*xatoi(),*xitoa(),
+    *xread(),*xprint(),*xprin1(),*xprinc(),*xterpri(),
+    *xflatsize(),*xflatc(),*xexplode(),*xexplc(),*ximplode(),*xmaknam(),
+    *xopeni(),*xopeno(),*xclose(),*xrdchar(),*xpkchar(),*xwrchar(),*xreadline(),
+    *xload(),*xgc(),*xexpand(),*xalloc(),*xmem(),*xtype(),*xexit();
+
+/* the function table */
+struct fdef ftab[] = {
+
+	/* evaluator functions */
+{	"eval",		SUBR,	xeval		},
+{	"apply",	SUBR,	xapply		},
+{	"funcall",	SUBR,	xfuncall	},
+{	"quote",	FSUBR,	xquote		},
+{	"function",	FSUBR,	xquote		},
+{	"backquote",	FSUBR,	xbquote		},
+
+	/* symbol functions */
+{	"set",		SUBR,	xset		},
+{	"setq",		FSUBR,	xsetq		},
+{	"setf",		FSUBR,	xsetf		},
+{	"defun",	FSUBR,	xdefun		},
+{	"defmacro",	FSUBR,	xdefmacro	},
+{	"gensym",	SUBR,	xgensym		},
+{	"make-symbol",	SUBR,	xmakesymbol	},
+{	"intern",	SUBR,	xintern		},
+{	"symbol-name",	SUBR,	xsymname	},
+{	"symbol-value",	SUBR,	xsymvalue	},
+{	"symbol-plist",	SUBR,	xsymplist	},
+{	"get",		SUBR,	xget		},
+{	"remprop",	SUBR,	xremprop	},
+
+	/* list functions */
+{	"car",		SUBR,	xcar		},
+{	"caar",		SUBR,	xcaar		},
+{	"cadr",		SUBR,	xcadr		},
+{	"cdr",		SUBR,	xcdr		},
+{	"cdar",		SUBR,	xcdar		},
+{	"cddr",		SUBR,	xcddr		},
+{	"cons",		SUBR,	xcons		},
+{	"list",		SUBR,	xlist		},
+{	"append",	SUBR,	xappend		},
+{	"reverse",	SUBR,	xreverse	},
+{	"last",		SUBR,	xlast		},
+{	"nth",		SUBR,	xnth		},
+{	"nthcdr",	SUBR,	xnthcdr		},
+{	"member",	SUBR,	xmember		},
+{	"assoc",	SUBR,	xassoc		},
+{	"subst",	SUBR,	xsubst		},
+{	"sublis",	SUBR,	xsublis		},
+{	"remove",	SUBR,	xremove		},
+{	"length",	SUBR,	xlength		},
+{	"mapc",		SUBR,	xmapc		},
+{	"mapcar",	SUBR,	xmapcar		},
+{	"mapl",		SUBR,	xmapl		},
+{	"maplist",	SUBR,	xmaplist	},
+
+	/* destructive list functions */
+{	"rplaca",	SUBR,	xrplca		},
+{	"rplacd",	SUBR,	xrplcd		},
+{	"nconc",	SUBR,	xnconc		},
+{	"delete",	SUBR,	xdelete		},
+
+	/* predicate functions */
+{	"atom",		SUBR,	xatom		},
+{	"symbolp",	SUBR,	xsymbolp	},
+{	"numberp",	SUBR,	xnumberp	},
+{	"boundp",	SUBR,	xboundp		},
+{	"null",		SUBR,	xnull		},
+{	"not",		SUBR,	xnull		},
+{	"listp",	SUBR,	xlistp		},
+{	"consp",	SUBR,	xconsp		},
+{	"minusp",	SUBR,	xminusp		},
+{	"zerop",	SUBR,	xzerop		},
+{	"plusp",	SUBR,	xplusp		},
+{	"evenp",	SUBR,	xevenp		},
+{	"oddp",		SUBR,	xoddp		},
+{	"eq",		SUBR,	xeq		},
+{	"eql",		SUBR,	xeql		},
+{	"equal",	SUBR,	xequal		},
+
+	/* control functions */
+{	"cond",		FSUBR,	xcond		},
+{	"and",		FSUBR,	xand		},
+{	"or",		FSUBR,	xor		},
+{	"let",		FSUBR,	xlet		},
+{	"let*",		FSUBR,	xletstar	},
+{	"if",		FSUBR,	xif		},
+{	"prog",		FSUBR,	xprog		},
+{	"prog*",	FSUBR,	xprogstar	},
+{	"prog1",	FSUBR,	xprog1		},
+{	"prog2",	FSUBR,	xprog2		},
+{	"progn",	FSUBR,	xprogn		},
+{	"go",		FSUBR,	xgo		},
+{	"return",	SUBR,	xreturn		},
+{	"do",		FSUBR,	xdo		},
+{	"do*",		FSUBR,	xdostar		},
+{	"dolist",	FSUBR,	xdolist		},
+{	"dotimes",	FSUBR,	xdotimes	},
+{	"catch",	FSUBR,	xcatch		},
+{	"throw",	SUBR,	xthrow		},
+
+	/* debugging and error handling functions */
+{	"error",	SUBR,	xerror		},
+{	"cerror",	SUBR,	xcerror		},
+{	"break",	SUBR,	xbreak		},
+{	"errset",	FSUBR,	xerrset		},
+{	"baktrace",	SUBR,	xbaktrace	},
+{	"evalhook",	SUBR,	xevalhook	},
+
+	/* arithmetic functions */
+{	"+",		SUBR,	xadd		},
+{	"-",		SUBR,	xsub		},
+{	"*",		SUBR,	xmul		},
+{	"/",		SUBR,	xdiv		},
+{	"1+",		SUBR,	xadd1		},
+{	"1-",		SUBR,	xsub1		},
+{	"rem",		SUBR,	xrem		},
+{	"min",		SUBR,	xmin		},
+{	"max",		SUBR,	xmax		},
+{	"abs",		SUBR,	xabs		},
+
+	/* bitwise logical functions */
+{	"bit-and",	SUBR,	xbitand		},
+{	"bit-ior",	SUBR,	xbitior		},
+{	"bit-xor",	SUBR,	xbitxor		},
+{	"bit-not",	SUBR,	xbitnot		},
+
+	/* numeric comparison functions */
+{	"<",		SUBR,	xlss		},
+{	"<=",		SUBR,	xleq		},
+{	"=",		SUBR,	xequ		},
+{	"/=",		SUBR,	xneq		},
+{	">=",		SUBR,	xgeq		},
+{	">",		SUBR,	xgtr		},
+
+	/* string functions */
+{	"strlen",	SUBR,	xstrlen		},
+{	"strcat",	SUBR,	xstrcat		},
+{	"substr",	SUBR,	xsubstr		},
+{	"ascii",	SUBR,	xascii		},
+{	"chr",		SUBR,	xchr		},
+{	"atoi",		SUBR,	xatoi		},
+{	"itoa",		SUBR,	xitoa		},
+
+	/* I/O functions */
+{	"read",		SUBR,	xread		},
+{	"print",	SUBR,	xprint		},
+{	"prin1",	SUBR,	xprin1		},
+{	"princ",	SUBR,	xprinc		},
+{	"terpri",	SUBR,	xterpri		},
+{	"flatsize",	SUBR,	xflatsize	},
+{	"flatc",	SUBR,	xflatc		},
+{	"explode",	SUBR,	xexplode	},
+{	"explodec",	SUBR,	xexplc		},
+{	"implode",	SUBR,	ximplode	},
+{	"maknam",	SUBR,	xmaknam		},
+
+	/* file I/O functions */
+{	"openi",	SUBR,	xopeni		},
+{	"openo",	SUBR,	xopeno		},
+{	"close",	SUBR,	xclose		},
+{	"read-char",	SUBR,	xrdchar		},
+{	"peek-char",	SUBR,	xpkchar		},
+{	"write-char",	SUBR,	xwrchar		},
+{	"readline",	SUBR,	xreadline	},
+
+	/* system functions */
+{	"load",		SUBR,	xload		},
+{	"gc",		SUBR,	xgc		},
+{	"expand",	SUBR,	xexpand		},
+{	"alloc",	SUBR,	xalloc		},
+{	"mem",		SUBR,	xmem		},
+{	"type",		SUBR,	xtype		},
+{	"exit",		SUBR,	xexit		},
+
+{	0					}
+};
+SHAR_EOF
+if test 5998 -ne "`wc -c < 'xlftab.c'`"
+then
+	echo shar: error transmitting "'xlftab.c'" '(should have been 5998 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlglob.c'" '(2114 characters)'
+if test -f 'xlglob.c'
+then
+	echo shar: will not over-write existing file "'xlglob.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlglob.c'
+/* xlglobals - xlisp global variables */
+
+#include "xlisp.h"
+
+/* symbols */
+NODE *true = NIL;
+NODE *s_quote = NIL, *s_function = NIL;
+NODE *s_bquote = NIL, *s_comma = NIL, *s_comat = NIL;
+NODE *s_evalhook = NIL, *s_applyhook = NIL;
+NODE *s_lambda = NIL, *s_macro = NIL;
+NODE *s_stdin = NIL, *s_stdout = NIL;
+NODE *s_tracenable = NIL, *s_tlimit = NIL, *s_breakenable = NIL;
+NODE *s_continue = NIL, *s_quit = NIL;
+NODE *s_car = NIL, *s_cdr = NIL;
+NODE *s_get = NIL, *s_svalue = NIL, *s_splist = NIL;
+NODE *s_eql = NIL, *k_test = NIL, *k_tnot = NIL;
+NODE *k_optional = NIL, *k_rest = NIL, *k_aux = NIL;
+NODE *a_subr = NIL, *a_fsubr = NIL;
+NODE *a_list = NIL, *a_sym = NIL, *a_int = NIL;
+NODE *a_str = NIL, *a_obj = NIL, *a_fptr = NIL;
+NODE *oblist = NIL, *keylist = NIL, *s_unbound = NIL;
+
+/* evaluation variables */
+NODE *xlstack = NIL;
+NODE *xlenv = NIL;
+NODE *xlnewenv = NIL;
+
+/* exception handling variables */
+CONTEXT *xlcontext = NULL;	/* current exception handler */
+NODE *xlvalue = NIL;		/* exception value */
+
+/* debugging variables */
+int xldebug = 0;		/* debug level */
+int xltrace = -1;		/* trace stack pointer */
+NODE **trace_stack = NULL;	/* trace stack */
+
+/* gensym variables */
+char gsprefix[STRMAX+1] = { 'G',0 };	/* gensym prefix string */
+int gsnumber = 1;		/* gensym number */
+
+/* i/o variables */
+int xlplevel = 0;		/* prompt nesting level */
+int xlfsize = 0;		/* flat size of current print call */
+int prompt = TRUE;		/* input prompt flag */
+
+/* dynamic memory variables */
+long total = 0L;		/* total memory in use */
+int anodes = 0;			/* number of nodes to allocate */
+int nnodes = 0;			/* number of nodes allocated */
+int nsegs = 0;			/* number of segments allocated */
+int nfree = 0;			/* number of nodes free */
+int gccalls = 0;		/* number of gc calls */
+struct segment *segs = NULL;	/* list of allocated segments */
+NODE *fnodes = NIL;		/* list of free nodes */
+
+/* object programming variables */
+NODE *self = NIL, *class = NIL, *object = NIL;
+NODE *new = NIL, *isnew = NIL, *msgcls = NIL, *msgclass = NIL;
+int varcnt = 0;
+
+/* general purpose string buffer */
+char buf[STRMAX+1] = { 0 };
+SHAR_EOF
+if test 2114 -ne "`wc -c < 'xlglob.c'`"
+then
+	echo shar: error transmitting "'xlglob.c'" '(should have been 2114 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlinit.c'" '(3268 characters)'
+if test -f 'xlinit.c'
+then
+	echo shar: will not over-write existing file "'xlinit.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlinit.c'
+/* xlinit.c - xlisp initialization module */
+
+#include "xlisp.h"
+
+/* external variables */
+extern NODE *true;
+extern NODE *s_quote,*s_function,*s_bquote,*s_comma,*s_comat;
+extern NODE *s_lambda,*s_macro;
+extern NODE *s_stdin,*s_stdout;
+extern NODE *s_evalhook,*s_applyhook;
+extern NODE *s_tracenable,*s_tlimit,*s_breakenable;
+extern NODE *s_continue,*s_quit;
+extern NODE *s_car,*s_cdr,*s_get,*s_svalue,*s_splist,*s_eql;
+extern NODE *k_test,*k_tnot,*k_optional,*k_rest,*k_aux;
+extern NODE *a_subr,*a_fsubr;
+extern NODE *a_list,*a_sym,*a_int,*a_str,*a_obj,*a_fptr;
+extern struct fdef ftab[];
+
+/* xlinit - xlisp initialization routine */
+xlinit()
+{
+    struct fdef *fptr;
+    NODE *sym;
+
+    /* initialize xlisp (must be in this order) */
+    xlminit();	/* initialize xldmem.c */
+    xlsinit();	/* initialize xlsym.c */
+    xldinit();	/* initialize xldbug.c */
+    xloinit();	/* initialize xlobj.c */
+
+    /* enter the builtin functions */
+    for (fptr = ftab; fptr->f_name; fptr++)
+	xlsubr(fptr->f_name,fptr->f_type,fptr->f_fcn);
+
+    /* enter the 't' symbol */
+    true = xlsenter("t");
+    true->n_symvalue = true;
+
+    /* enter some important symbols */
+    s_quote	= xlsenter("quote");
+    s_function	= xlsenter("function");
+    s_bquote	= xlsenter("backquote");
+    s_comma	= xlsenter("comma");
+    s_comat	= xlsenter("comma-at");
+    s_lambda	= xlsenter("lambda");
+    s_macro	= xlsenter("macro");
+    s_eql	= xlsenter("eql");
+    s_continue	= xlsenter("continue");
+    s_quit	= xlsenter("quit");
+
+    /* enter setf place specifiers */
+    s_car	= xlsenter("car");
+    s_cdr	= xlsenter("cdr");
+    s_get	= xlsenter("get");
+    s_svalue	= xlsenter("symbol-value");
+    s_splist	= xlsenter("symbol-plist");
+
+    /* enter parameter list keywords */
+    k_test	= xlsenter(":test");
+    k_tnot	= xlsenter(":test-not");
+
+    /* enter lambda list keywords */
+    k_optional	= xlsenter("&optional");
+    k_rest	= xlsenter("&rest");
+    k_aux	= xlsenter("&aux");
+
+    /* enter *standard-input* and *standard-output* */
+    s_stdin = xlsenter("*standard-input*");
+    s_stdin->n_symvalue = newnode(FPTR);
+    s_stdin->n_symvalue->n_fp = stdin;
+    s_stdin->n_symvalue->n_savech = 0;
+    s_stdout = xlsenter("*standard-output*");
+    s_stdout->n_symvalue = newnode(FPTR);
+    s_stdout->n_symvalue->n_fp = stdout;
+    s_stdout->n_symvalue->n_savech = 0;
+
+    /* enter the eval and apply hook variables */
+    s_evalhook = xlsenter("*evalhook*");
+    s_evalhook->n_symvalue = NIL;
+    s_applyhook = xlsenter("*applyhook*");
+    s_applyhook->n_symvalue = NIL;
+
+    /* enter the error traceback and the error break enable flags */
+    s_tracenable = xlsenter("*tracenable*");
+    s_tracenable->n_symvalue = NIL;
+    s_tlimit = xlsenter("*tracelimit*");
+    s_tlimit->n_symvalue = NIL;
+    s_breakenable = xlsenter("*breakenable*");
+    s_breakenable->n_symvalue = true;
+
+    /* enter a copyright notice into the oblist */
+    sym = xlsenter("**Copyright-1985-by-David-Betz**");
+    sym->n_symvalue = true;
+
+    /* enter type names */
+    a_subr	= xlsenter("SUBR");
+    a_fsubr	= xlsenter("FSUBR");
+    a_list	= xlsenter("LIST");
+    a_sym	= xlsenter("SYM");
+    a_int	= xlsenter("INT");
+    a_str	= xlsenter("STR");
+    a_obj	= xlsenter("OBJ");
+    a_fptr	= xlsenter("FPTR");
+}
+SHAR_EOF
+if test 3268 -ne "`wc -c < 'xlinit.c'`"
+then
+	echo shar: error transmitting "'xlinit.c'" '(should have been 3268 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlio.c'" '(2897 characters)'
+if test -f 'xlio.c'
+then
+	echo shar: will not over-write existing file "'xlio.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlio.c'
+/* xlio - xlisp i/o routines */
+
+#include "xlisp.h"
+
+/* external variables */
+extern int xlplevel;
+extern int xlfsize;
+extern NODE *xlstack;
+extern NODE *s_stdin;
+extern int xldebug;
+extern int prompt;
+
+/* xlgetc - get a character from a file or stream */
+int xlgetc(fptr)
+  NODE *fptr;
+{
+    NODE *lptr,*cptr;
+    FILE *fp;
+    int ch;
+
+    /* check for input from nil */
+    if (fptr == NIL)
+	ch = EOF;
+
+    /* otherwise, check for input from a stream */
+    else if (consp(fptr)) {
+	if ((lptr = car(fptr)) == NIL)
+	    ch = EOF;
+	else {
+	    if (!consp(lptr) ||
+		(cptr = car(lptr)) == NIL || !fixp(cptr))
+		xlfail("bad stream");
+	    if (rplaca(fptr,cdr(lptr)) == NIL)
+		rplacd(fptr,NIL);
+	    ch = cptr->n_int;
+	}
+    }
+
+    /* otherwise, check for a buffered file character */
+    else if (ch = fptr->n_savech)
+	fptr->n_savech = 0;
+
+    /* otherwise, get a new character */
+    else {
+
+	/* get the file pointer */
+	fp = fptr->n_fp;
+
+	/* prompt if necessary */
+	if (prompt && fp == stdin) {
+
+	    /* print the debug level */
+	    if (xldebug)
+		printf("%d:",xldebug);
+
+	    /* print the nesting level */
+	    if (xlplevel > 0)
+		printf("%d",xlplevel);
+
+	    /* print the prompt */
+	    printf("> ");
+	    prompt = FALSE;
+	}
+
+	/* get the character */
+	if (((ch = getc(fp)) == '\n' || ch == EOF) && fp == stdin)
+	    prompt = TRUE;
+
+	/* check for input abort */
+	if (fp == stdin && ch == '\007') {
+	    putchar('\n');
+	    xlabort("input aborted");
+	}
+    }
+
+    /* return the character */
+    return (ch);
+}
+
+/* xlpeek - peek at a character from a file or stream */
+int xlpeek(fptr)
+  NODE *fptr;
+{
+    NODE *lptr,*cptr;
+    int ch;
+
+    /* check for input from nil */
+    if (fptr == NIL)
+	ch = EOF;
+
+    /* otherwise, check for input from a stream */
+    else if (consp(fptr)) {
+	if ((lptr = car(fptr)) == NIL)
+	    ch = EOF;
+	else {
+	    if (!consp(lptr) ||
+		(cptr = car(lptr)) == NIL || !fixp(cptr))
+		xlfail("bad stream");
+	    ch = cptr->n_int;
+	}
+    }
+
+    /* otherwise, get the next file character and save it */
+    else
+	ch = fptr->n_savech = xlgetc(fptr);
+
+    /* return the character */
+    return (ch);
+}
+
+/* xlputc - put a character to a file or stream */
+xlputc(fptr,ch)
+  NODE *fptr; int ch;
+{
+    NODE *oldstk,lptr;
+
+    /* count the character */
+    xlfsize++;
+
+    /* check for output to nil */
+    if (fptr == NIL)
+	;
+
+    /* otherwise, check for output to a stream */
+    else if (consp(fptr)) {
+	oldstk = xlsave(&lptr,NULL);
+	lptr.n_ptr = newnode(LIST);
+	rplaca(lptr.n_ptr,newnode(INT));
+	car(lptr.n_ptr)->n_int = ch;
+	if (cdr(fptr))
+	    rplacd(cdr(fptr),lptr.n_ptr);
+	else
+	    rplaca(fptr,lptr.n_ptr);
+	rplacd(fptr,lptr.n_ptr);
+	xlstack = oldstk;
+    }
+
+    /* otherwise, output the character to a file */
+    else
+	putc(ch,fptr->n_fp);
+}
+
+/* xlflush - flush the input buffer */
+int xlflush()
+{
+    if (!prompt)
+	while (xlgetc(s_stdin->n_symvalue) != '\n')
+	    ;
+}
+SHAR_EOF
+if test 2897 -ne "`wc -c < 'xlio.c'`"
+then
+	echo shar: error transmitting "'xlio.c'" '(should have been 2897 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlisp.c'" '(1820 characters)'
+if test -f 'xlisp.c'
+then
+	echo shar: will not over-write existing file "'xlisp.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlisp.c'
+/* xlisp - an experimental version of lisp that supports object-oriented
+           programming */
+
+#include "xlisp.h"
+
+/* define the banner line string */
+#define BANNER	"XLISP version 1.4 - 14-FEB-1985, by David Betz"
+
+/* external variables */
+extern NODE *s_stdin,*s_stdout;
+extern NODE *s_evalhook,*s_applyhook;
+extern NODE *true;
+
+/* main - the main routine */
+main()
+/*
+main(argc,argv)
+  int argc; char *argv[];
+*/
+{
+    NODE expr;
+    CONTEXT cntxt;
+    int i;
+
+    /* print the banner line */
+#ifdef MEGAMAX
+    _autowin(BANNER);
+#else
+    printf("%s\n",BANNER);
+#endif
+
+    /* setup initialization error handler */
+    xlbegin(&cntxt,CF_ERROR,(NODE *) 1);
+    if (setjmp(cntxt.c_jmpbuf)) {
+	printf("fatal initialization error\n");
+	exit();
+    }
+
+    /* initialize xlisp */
+    xlinit();
+    xlend(&cntxt);
+
+    /* reset the error handler */
+    xlbegin(&cntxt,CF_ERROR,true);
+
+    /* load "init.lsp" */
+    if (setjmp(cntxt.c_jmpbuf) == 0)
+	xlload("init",FALSE,FALSE);
+
+    /* load any files mentioned on the command line */
+/**
+    if (setjmp(cntxt.c_jmpbuf) == 0)
+	for (i = 1; i < argc; i++)
+	    if (!xlload(argv[i],TRUE,FALSE)) xlfail("can't load file");
+**/
+
+    /* create a new stack frame */
+    xlsave(&expr,NULL);
+
+    /* main command processing loop */
+    while (TRUE) {
+
+	/* setup the error return */
+	if (setjmp(cntxt.c_jmpbuf)) {
+	    s_evalhook->n_symvalue = NIL;
+	    s_applyhook->n_symvalue = NIL;
+	    xlflush();
+	}
+
+	/* read an expression */
+	if (!xlread(s_stdin->n_symvalue,&expr.n_ptr))
+	    break;
+
+	/* evaluate the expression */
+	expr.n_ptr = xleval(expr.n_ptr);
+
+	/* print it */
+	stdprint(expr.n_ptr);
+    }
+    xlend(&cntxt);
+}
+
+/* stdprint - print to standard output */
+stdprint(expr)
+  NODE *expr;
+{
+    xlprint(s_stdout->n_symvalue,expr,TRUE);
+    xlterpri(s_stdout->n_symvalue);
+}
+SHAR_EOF
+if test 1820 -ne "`wc -c < 'xlisp.c'`"
+then
+	echo shar: error transmitting "'xlisp.c'" '(should have been 1820 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xljump.c'" '(2300 characters)'
+if test -f 'xljump.c'
+then
+	echo shar: will not over-write existing file "'xljump.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xljump.c'
+/* xljump - execution context routines */
+
+#include "xlisp.h"
+
+/* external variables */
+extern CONTEXT *xlcontext;
+extern NODE *xlvalue;
+extern NODE *xlstack,*xlenv,*xlnewenv;
+extern int xltrace,xldebug;
+
+/* xlbegin - beginning of an execution context */
+xlbegin(cptr,flags,expr)
+  CONTEXT *cptr; int flags; NODE *expr;
+{
+    cptr->c_flags = flags;
+    cptr->c_expr = expr;
+    cptr->c_xlstack = xlstack;
+    cptr->c_xlenv = xlenv;
+    cptr->c_xlnewenv = xlnewenv;
+    cptr->c_xltrace = xltrace;
+    cptr->c_xlcontext = xlcontext;
+    xlcontext = cptr;
+}
+
+/* xlend - end of an execution context */
+xlend(cptr)
+  CONTEXT *cptr;
+{
+    xlcontext = cptr->c_xlcontext;
+}
+
+/* xljump - jump to a saved execution context */
+xljump(cptr,type,val)
+  CONTEXT *cptr; int type; NODE *val;
+{
+    /* restore the state */
+    xlvalue = val;
+    xlstack = cptr->c_xlstack;
+    xlunbind(cptr->c_xlenv);
+    xlnewenv = cptr->c_xlnewenv;
+    xltrace = cptr->c_xltrace;
+
+    /* call the handler */
+    longjmp(cptr->c_jmpbuf,type);
+}
+
+/* xlgo - go to a label */
+xlgo(label)
+  NODE *label;
+{
+    CONTEXT *cptr;
+    NODE *p;
+
+    /* find a tagbody context */
+    for (cptr = xlcontext; cptr; cptr = cptr->c_xlcontext)
+	if (cptr->c_flags & CF_GO)
+	    for (p = cptr->c_expr; consp(p); p = cdr(p))
+		if (car(p) == label)
+		    xljump(cptr,CF_GO,p);
+    xlfail("no target for go");
+}
+
+/* xlreturn - return from a block */
+xlreturn(val)
+  NODE *val;
+{
+    CONTEXT *cptr;
+
+    /* find a block context */
+    for (cptr = xlcontext; cptr; cptr = cptr->c_xlcontext)
+	if (cptr->c_flags & CF_RETURN)
+	    xljump(cptr,CF_RETURN,val);
+    xlfail("no target for return");
+}
+
+/* xlthrow - throw to a catch */
+xlthrow(tag,val)
+  NODE *tag,*val;
+{
+    CONTEXT *cptr;
+
+    /* find a catch context */
+    for (cptr = xlcontext; cptr; cptr = cptr->c_xlcontext)
+	if ((cptr->c_flags & CF_THROW) && cptr->c_expr == tag)
+	    xljump(cptr,CF_THROW,val);
+    xlfail("no target for throw");
+}
+
+/* xlsignal - signal an error */
+xlsignal(emsg,arg)
+  char *emsg; NODE *arg;
+{
+    CONTEXT *cptr;
+
+    /* find an error catcher */
+    for (cptr = xlcontext; cptr; cptr = cptr->c_xlcontext)
+	if (cptr->c_flags & CF_ERROR) {
+	    if (cptr->c_expr)
+		xlerrprint("error",NULL,emsg,arg);
+	    xljump(cptr,CF_ERROR,NIL);
+	}
+    xlfail("no target for error");
+}
+SHAR_EOF
+if test 2300 -ne "`wc -c < 'xljump.c'`"
+then
+	echo shar: error transmitting "'xljump.c'" '(should have been 2300 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlmath.c'" '(5921 characters)'
+if test -f 'xlmath.c'
+then
+	echo shar: will not over-write existing file "'xlmath.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlmath.c'
+/* xlmath - xlisp builtin arithmetic functions */
+
+#include "xlisp.h"
+
+/* external variables */
+extern NODE *xlstack;
+extern NODE *true;
+
+/* forward declarations */
+XFORWARD NODE *unary();
+XFORWARD NODE *binary();
+XFORWARD NODE *predicate();
+XFORWARD NODE *compare();
+
+/* xadd - builtin function for addition */
+NODE *xadd(args)
+  NODE *args;
+{
+    return (binary(args,'+'));
+}
+
+/* xsub - builtin function for subtraction */
+NODE *xsub(args)
+  NODE *args;
+{
+    return (binary(args,'-'));
+}
+
+/* xmul - builtin function for multiplication */
+NODE *xmul(args)
+  NODE *args;
+{
+    return (binary(args,'*'));
+}
+
+/* xdiv - builtin function for division */
+NODE *xdiv(args)
+  NODE *args;
+{
+    return (binary(args,'/'));
+}
+
+/* xrem - builtin function for remainder */
+NODE *xrem(args)
+  NODE *args;
+{
+    return (binary(args,'%'));
+}
+
+/* xmin - builtin function for minimum */
+NODE *xmin(args)
+  NODE *args;
+{
+    return (binary(args,'m'));
+}
+
+/* xmax - builtin function for maximum */
+NODE *xmax(args)
+  NODE *args;
+{
+    return (binary(args,'M'));
+}
+
+/* xbitand - builtin function for bitwise and */
+NODE *xbitand(args)
+  NODE *args;
+{
+    return (binary(args,'&'));
+}
+
+/* xbitior - builtin function for bitwise inclusive or */
+NODE *xbitior(args)
+  NODE *args;
+{
+    return (binary(args,'|'));
+}
+
+/* xbitxor - builtin function for bitwise exclusive or */
+NODE *xbitxor(args)
+  NODE *args;
+{
+    return (binary(args,'^'));
+}
+
+/* binary - handle binary operations */
+LOCAL NODE *binary(args,fcn)
+  NODE *args; int fcn;
+{
+    int ival,iarg;
+    NODE *val;
+
+    /* get the first argument */
+    ival = xlmatch(INT,&args)->n_int;
+
+    /* treat '-' with a single argument as a special case */
+    if (fcn == '-' && args == NIL)
+	ival = -ival;
+
+    /* handle each remaining argument */
+    while (args) {
+
+	/* get the next argument */
+	iarg = xlmatch(INT,&args)->n_int;
+
+	/* accumulate the result value */
+	switch (fcn) {
+	case '+':	ival += iarg; break;
+	case '-':	ival -= iarg; break;
+	case '*':	ival *= iarg; break;
+	case '/':	ival /= iarg; break;
+	case '%':	ival %= iarg; break;
+	case 'M':	if (iarg > ival) ival = iarg; break;
+	case 'm':	if (iarg < ival) ival = iarg; break;
+	case '&':	ival &= iarg; break;
+	case '|':	ival |= iarg; break;
+	case '^':	ival ^= iarg; break;
+	}
+    }
+
+    /* initialize value */
+    val = newnode(INT);
+    val->n_int = ival;
+
+    /* return the result value */
+    return (val);
+}
+
+/* xbitnot - bitwise not */
+NODE *xbitnot(args)
+  NODE *args;
+{
+    return (unary(args,'~'));
+}
+
+/* xabs - builtin function for absolute value */
+NODE *xabs(args)
+  NODE *args;
+{
+    return (unary(args,'A'));
+}
+
+/* xadd1 - builtin function for adding one */
+NODE *xadd1(args)
+  NODE *args;
+{
+    return (unary(args,'+'));
+}
+
+/* xsub1 - builtin function for subtracting one */
+NODE *xsub1(args)
+  NODE *args;
+{
+    return (unary(args,'-'));
+}
+
+/* unary - handle unary operations */
+LOCAL NODE *unary(args,fcn)
+  NODE *args; int fcn;
+{
+    NODE *val;
+    int ival;
+
+    /* get the argument */
+    ival = xlmatch(INT,&args)->n_int;
+    xllastarg(args);
+
+    /* compute the result */
+    switch (fcn) {
+    case '~':	ival = ~ival; break;
+    case 'A':	if (ival < 0) ival = -ival; break;
+    case '+':	ival++; break;
+    case '-':	ival--; break;
+    }
+
+    /* convert the value  */
+    val = newnode(INT);
+    val->n_int = ival;
+
+    /* return the result value */
+    return (val);
+}
+
+/* xminusp - is this number negative? */
+NODE *xminusp(args)
+  NODE *args;
+{
+    return (predicate(args,'-'));
+}
+
+/* xzerop - is this number zero? */
+NODE *xzerop(args)
+  NODE *args;
+{
+    return (predicate(args,'Z'));
+}
+
+/* xplusp - is this number positive? */
+NODE *xplusp(args)
+  NODE *args;
+{
+    return (predicate(args,'+'));
+}
+
+/* xevenp - is this number even? */
+NODE *xevenp(args)
+  NODE *args;
+{
+    return (predicate(args,'E'));
+}
+
+/* xoddp - is this number odd? */
+NODE *xoddp(args)
+  NODE *args;
+{
+    return (predicate(args,'O'));
+}
+
+/* predicate - handle a predicate function */
+LOCAL NODE *predicate(args,fcn)
+  NODE *args; int fcn;
+{
+    NODE *val;
+    int ival;
+
+    /* get the argument */
+    ival = xlmatch(INT,&args)->n_int;
+    xllastarg(args);
+
+    /* compute the result */
+    switch (fcn) {
+    case '-':	ival = (ival < 0); break;
+    case 'Z':	ival = (ival == 0); break;
+    case '+':	ival = (ival > 0); break;
+    case 'E':	ival = ((ival & 1) == 0); break;
+    case 'O':	ival = ((ival & 1) != 0); break;
+    }
+
+    /* return the result value */
+    return (ival ? true : NIL);
+}
+
+/* xlss - builtin function for < */
+NODE *xlss(args)
+  NODE *args;
+{
+    return (compare(args,'<'));
+}
+
+/* xleq - builtin function for <= */
+NODE *xleq(args)
+  NODE *args;
+{
+    return (compare(args,'L'));
+}
+
+/* equ - builtin function for = */
+NODE *xequ(args)
+  NODE *args;
+{
+    return (compare(args,'='));
+}
+
+/* xneq - builtin function for /= */
+NODE *xneq(args)
+  NODE *args;
+{
+    return (compare(args,'#'));
+}
+
+/* xgeq - builtin function for >= */
+NODE *xgeq(args)
+  NODE *args;
+{
+    return (compare(args,'G'));
+}
+
+/* xgtr - builtin function for > */
+NODE *xgtr(args)
+  NODE *args;
+{
+    return (compare(args,'>'));
+}
+
+/* compare - common compare function */
+LOCAL NODE *compare(args,fcn)
+  NODE *args; int fcn;
+{
+    NODE *arg1,*arg2;
+    int cmp;
+
+    /* get the two arguments */
+    arg1 = xlarg(&args);
+    arg2 = xlarg(&args);
+    xllastarg(args);
+
+    /* do the compare */
+    if (stringp(arg1) && stringp(arg2))
+	cmp = strcmp(arg1->n_str,arg2->n_str);
+    else if (fixp(arg1) && fixp(arg2))
+	cmp = arg1->n_int - arg2->n_int;
+    else
+	cmp = (int)(arg1 - arg2);
+
+    /* compute result of the compare */
+    switch (fcn) {
+    case '<':	cmp = (cmp < 0); break;
+    case 'L':	cmp = (cmp <= 0); break;
+    case '=':	cmp = (cmp == 0); break;
+    case '#':	cmp = (cmp != 0); break;
+    case 'G':	cmp = (cmp >= 0); break;
+    case '>':	cmp = (cmp > 0); break;
+    }
+
+    /* return the result */
+    return (cmp ? true : NIL);
+}
+SHAR_EOF
+if test 5921 -ne "`wc -c < 'xlmath.c'`"
+then
+	echo shar: error transmitting "'xlmath.c'" '(should have been 5921 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlprin.c'" '(2789 characters)'
+if test -f 'xlprin.c'
+then
+	echo shar: will not over-write existing file "'xlprin.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlprin.c'
+/* xlprint - xlisp print routine */
+
+#include "xlisp.h"
+
+/* external variables */
+extern NODE *xlstack;
+extern char buf[];
+
+/* xlprint - print an xlisp value */
+xlprint(fptr,vptr,flag)
+  NODE *fptr,*vptr; int flag;
+{
+    NODE *nptr,*next;
+
+    /* print nil */
+    if (vptr == NIL) {
+	putstr(fptr,"nil");
+	return;
+    }
+
+    /* check value type */
+    switch (ntype(vptr)) {
+    case SUBR:
+	    putatm(fptr,"Subr",vptr);
+	    break;
+    case FSUBR:
+	    putatm(fptr,"FSubr",vptr);
+	    break;
+    case LIST:
+	    xlputc(fptr,'(');
+	    for (nptr = vptr; nptr != NIL; nptr = next) {
+	        xlprint(fptr,car(nptr),flag);
+		if (next = cdr(nptr))
+		    if (consp(next))
+			xlputc(fptr,' ');
+		    else {
+			putstr(fptr," . ");
+			xlprint(fptr,next,flag);
+			break;
+		    }
+	    }
+	    xlputc(fptr,')');
+	    break;
+    case SYM:
+	    putstr(fptr,xlsymname(vptr));
+	    break;
+    case INT:
+	    putdec(fptr,vptr->n_int);
+	    break;
+    case STR:
+	    if (flag)
+		putstring(fptr,vptr->n_str);
+	    else
+		putstr(fptr,vptr->n_str);
+	    break;
+    case FPTR:
+	    putatm(fptr,"File",vptr);
+	    break;
+    case OBJ:
+	    putatm(fptr,"Object",vptr);
+	    break;
+    case FREE:
+	    putatm(fptr,"Free",vptr);
+	    break;
+    default:
+	    putatm(fptr,"Foo",vptr);
+	    break;
+    }
+}
+
+/* xlterpri - terminate the current print line */
+xlterpri(fptr)
+  NODE *fptr;
+{
+    xlputc(fptr,'\n');
+}
+
+/* putstring - output a string */
+LOCAL putstring(fptr,str)
+  NODE *fptr; char *str;
+{
+    int ch;
+
+    /* output the initial quote */
+    xlputc(fptr,'"');
+
+    /* output each character in the string */
+    while (ch = *str++)
+
+	/* check for a control character */
+	if (ch < 040 || ch == '\\') {
+	    xlputc(fptr,'\\');
+	    switch (ch) {
+	    case '\033':
+		    xlputc(fptr,'e');
+		    break;
+	    case '\n':
+		    xlputc(fptr,'n');
+		    break;
+	    case '\r':
+		    xlputc(fptr,'r');
+		    break;
+	    case '\t':
+		    xlputc(fptr,'t');
+		    break;
+	    case '\\':
+		    xlputc(fptr,'\\');
+		    break;
+	    default:
+		    putoct(fptr,ch);
+		    break;
+	    }
+	}
+
+	/* output a normal character */
+	else
+	    xlputc(fptr,ch);
+
+    /* output the terminating quote */
+    xlputc(fptr,'"');
+}
+
+/* putatm - output an atom */
+LOCAL putatm(fptr,tag,val)
+  NODE *fptr; char *tag; NODE *val;
+{
+    sprintf(buf,"#<%s: #",tag); putstr(fptr,buf);
+    sprintf(buf,AFMT,val); putstr(fptr,buf);
+    xlputc(fptr,'>');
+}
+
+/* putdec - output a decimal number */
+LOCAL putdec(fptr,n)
+  NODE *fptr; int n;
+{
+    sprintf(buf,"%d",n);
+    putstr(fptr,buf);
+}
+
+/* putoct - output an octal byte value */
+LOCAL putoct(fptr,n)
+  NODE *fptr; int n;
+{
+    sprintf(buf,"%03o",n);
+    putstr(fptr,buf);
+}
+
+/* putstr - output a string */
+LOCAL putstr(fptr,str)
+  NODE *fptr; char *str;
+{
+    while (*str)
+	xlputc(fptr,*str++);
+}
+SHAR_EOF
+if test 2789 -ne "`wc -c < 'xlprin.c'`"
+then
+	echo shar: error transmitting "'xlprin.c'" '(should have been 2789 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'xlread.c'" '(8381 characters)'
+if test -f 'xlread.c'
+then
+	echo shar: will not over-write existing file "'xlread.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'xlread.c'
+/* xlread - xlisp expression input routine */
+
+#include "xlisp.h"
+#include "ctype.h"
+
+/* external variables */
+extern NODE *s_stdout,*true;
+extern NODE *s_quote,*s_function,*s_bquote,*s_comma,*s_comat;
+extern NODE *xlstack;
+extern int xlplevel;
+
+/* external routines */
+extern FILE *fopen();
+
+/* forward declarations */
+XFORWARD NODE *plist();
+XFORWARD NODE *pstring();
+XFORWARD NODE *pquote();
+XFORWARD NODE *pname();
+
+/* xlload - load a file of xlisp expressions */
+int xlload(name,vflag,pflag)
+  char *name; int vflag,pflag;
+{
+    NODE *oldstk,fptr,expr;
+    char fname[50];
+    CONTEXT cntxt;
+    int sts;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&fptr,&expr,NULL);
+
+    /* allocate a file node */
+    fptr.n_ptr = newnode(FPTR);
+    fptr.n_ptr->n_fp = NULL;
+    fptr.n_ptr->n_savech = 0;
+
+    /* create the file name and print the information line */
+    strcpy(fname,name); strcat(fname,".lsp");
+    if (vflag)
+	printf("; loading \"%s\"\n",fname);
+
+    /* open the file */
+    if ((fptr.n_ptr->n_fp = fopen(fname,"r")) == NULL) {
+	xlstack = oldstk;
+	return (FALSE);
+    }
+
+    /* read, evaluate and possibly print each expression in the file */
+    xlbegin(&cntxt,CF_ERROR,true);
+    if (setjmp(cntxt.c_jmpbuf))
+	sts = FALSE;
+    else {
+	while (xlread(fptr.n_ptr,&expr.n_ptr)) {
+	    expr.n_ptr = xleval(expr.n_ptr);
+	    if (pflag)
+		stdprint(expr.n_ptr);
+	}
+	sts = TRUE;
+    }
+    xlend(&cntxt);
+
+    /* close the file */
+    fclose(fptr.n_ptr->n_fp);
+    fptr.n_ptr->n_fp = NULL;
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return status */
+    return (sts);
+}
+
+/* xlread - read an xlisp expression */
+int xlread(fptr,pval)
+  NODE *fptr,**pval;
+{
+    /* initialize */
+    xlplevel = 0;
+
+    /* parse an expression */
+    return (parse(fptr,pval));
+}
+
+/* parse - parse an xlisp expression */
+LOCAL int parse(fptr,pval)
+  NODE *fptr,**pval;
+{
+    int ch;
+
+    /* keep looking for a node skipping comments */
+    while (TRUE)
+
+	/* check next character for type of node */
+	switch (ch = nextch(fptr)) {
+	case EOF:
+		xlgetc(fptr);
+		return (FALSE);
+	case '\'':			/* a quoted expression */
+		xlgetc(fptr);
+		*pval = pquote(fptr,s_quote);
+		return (TRUE);
+	case '#':			/* a quoted function */
+		xlgetc(fptr);
+		if ((ch = xlgetc(fptr)) == '<')
+		    xlfail("unreadable atom");
+		else if (ch != '\'')
+		    xlfail("expected quote after #");
+		*pval = pquote(fptr,s_function);
+		return (TRUE);
+	case '`':			/* a back quoted expression */
+		xlgetc(fptr);
+		*pval = pquote(fptr,s_bquote);
+		return (TRUE);
+	case ',':			/* a comma or comma-at expression */
+		xlgetc(fptr);
+		if (xlpeek(fptr) == '@') {
+		    xlgetc(fptr);
+		    *pval = pquote(fptr,s_comat);
+		}
+		else
+		    *pval = pquote(fptr,s_comma);
+		return (TRUE);
+	case '(':			/* a sublist */
+		*pval = plist(fptr);
+		return (TRUE);
+	case ')':			/* closing paren - shouldn't happen */
+		xlfail("extra right paren");
+	case '.':			/* dot - shouldn't happen */
+		xlfail("misplaced dot");
+	case ';':			/* a comment */
+		pcomment(fptr);
+		break;
+	case '"':			/* a string */
+		*pval = pstring(fptr);
+		return (TRUE);
+	default:
+		if (issym(ch))		/* a name */
+		    *pval = pname(fptr);
+		else
+		    xlfail("invalid character");
+		return (TRUE);
+	}
+}
+
+/* pcomment - parse a comment */
+LOCAL pcomment(fptr)
+  NODE *fptr;
+{
+    int ch;
+
+    /* skip to end of line */
+    while ((ch = checkeof(fptr)) != EOF && ch != '\n')
+	;
+}
+
+/* plist - parse a list */
+LOCAL NODE *plist(fptr)
+  NODE *fptr;
+{
+    NODE *oldstk,val,*lastnptr,*nptr,*p;
+    int ch;
+
+    /* increment the nesting level */
+    xlplevel += 1;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&val,NULL);
+
+    /* skip the opening paren */
+    xlgetc(fptr);
+
+    /* keep appending nodes until a closing paren is found */
+    lastnptr = NIL;
+    for (lastnptr = NIL; (ch = nextch(fptr)) != ')'; lastnptr = nptr) {
+
+	/* check for end of file */
+	if (ch == EOF)
+	    badeof(fptr);
+
+	/* check for a dotted pair */
+	if (ch == '.') {
+
+	    /* skip the dot */
+	    xlgetc(fptr);
+
+	    /* make sure there's a node */
+	    if (lastnptr == NIL)
+		xlfail("invalid dotted pair");
+
+	    /* parse the expression after the dot */
+	    if (!parse(fptr,&p))
+		badeof(fptr);
+	    rplacd(lastnptr,p);
+
+	    /* make sure its followed by a close paren */
+	    if (nextch(fptr) != ')')
+		xlfail("invalid dotted pair");
+
+	    /* done with this list */
+	    break;
+	}
+
+	/* allocate a new node and link it into the list */
+	nptr = newnode(LIST);
+	if (lastnptr == NIL)
+	    val.n_ptr = nptr;
+	else
+	    rplacd(lastnptr,nptr);
+
+	/* initialize the new node */
+	if (!parse(fptr,&p))
+	    badeof(fptr);
+	rplaca(nptr,p);
+    }
+
+    /* skip the closing paren */
+    xlgetc(fptr);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* decrement the nesting level */
+    xlplevel -= 1;
+
+    /* return successfully */
+    return (val.n_ptr);
+}
+
+/* pstring - parse a string */
+LOCAL NODE *pstring(fptr)
+  NODE *fptr;
+{
+    NODE *oldstk,val;
+    char sbuf[STRMAX+1];
+    int ch,i,d1,d2,d3;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&val,NULL);
+
+    /* skip the opening quote */
+    xlgetc(fptr);
+
+    /* loop looking for a closing quote */
+    for (i = 0; i < STRMAX && (ch = checkeof(fptr)) != '"'; i++) {
+	switch (ch) {
+	case EOF:
+		badeof(fptr);
+	case '\\':
+		switch (ch = checkeof(fptr)) {
+		case 'e':
+			ch = '\033';
+			break;
+		case 'n':
+			ch = '\n';
+			break;
+		case 'r':
+			ch = '\r';
+			break;
+		case 't':
+			ch = '\t';
+			break;
+		default:
+			if (ch >= '0' && ch <= '7') {
+			    d1 = ch - '0';
+			    d2 = checkeof(fptr) - '0';
+			    d3 = checkeof(fptr) - '0';
+			    ch = (d1 << 6) + (d2 << 3) + d3;
+			}
+			break;
+		}
+	}
+	sbuf[i] = ch;
+    }
+    sbuf[i] = 0;
+
+    /* initialize the node */
+    val.n_ptr = newnode(STR);
+    val.n_ptr->n_str = strsave(sbuf);
+    val.n_ptr->n_strtype = DYNAMIC;
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the new string */
+    return (val.n_ptr);
+}
+
+/* pquote - parse a quoted expression */
+LOCAL NODE *pquote(fptr,sym)
+  NODE *fptr,*sym;
+{
+    NODE *oldstk,val,*p;
+
+    /* create a new stack frame */
+    oldstk = xlsave(&val,NULL);
+
+    /* allocate two nodes */
+    val.n_ptr = newnode(LIST);
+    rplaca(val.n_ptr,sym);
+    rplacd(val.n_ptr,newnode(LIST));
+
+    /* initialize the second to point to the quoted expression */
+    if (!parse(fptr,&p))
+	badeof(fptr);
+    rplaca(cdr(val.n_ptr),p);
+
+    /* restore the previous stack frame */
+    xlstack = oldstk;
+
+    /* return the quoted expression */
+    return (val.n_ptr);
+}
+
+/* pname - parse a symbol name */
+LOCAL NODE *pname(fptr)
+  NODE *fptr;
+{
+    char sname[STRMAX+1];
+    NODE *val;
+    int i;
+
+    /* get symbol name */
+    for (i = 0; i < STRMAX && issym(xlpeek(fptr)); )
+	sname[i++] = xlgetc(fptr);
+    sname[i] = 0;
+
+    /* check for a number or enter the symbol into the oblist */
+    return (isnumber(sname,&val) ? val : xlenter(sname,DYNAMIC));
+}
+
+/* nextch - look at the next non-blank character */
+LOCAL int nextch(fptr)
+  NODE *fptr;
+{
+    int ch;
+
+    /* return and save the next non-blank character */
+    while ((ch = xlpeek(fptr)) != EOF && isspace(ch))
+	xlgetc(fptr);
+    return (ch);
+}
+
+/* checkeof - get a character and check for end of file */
+LOCAL int checkeof(fptr)
+  NODE *fptr;
+{
+    int ch;
+
+    if ((ch = xlgetc(fptr)) == EOF)
+	badeof(fptr);
+    return (ch);
+}
+
+/* badeof - unexpected eof */
+LOCAL badeof(fptr)
+  NODE *fptr;
+{
+    xlgetc(fptr);
+    xlfail("unexpected EOF");
+}
+
+/* isnumber - check if this string is a number */
+int isnumber(str,pval)
+  char *str; NODE **pval;
+{
+    char *p;
+    int d;
+
+    /* initialize */
+    p = str; d = 0;
+
+    /* check for a sign */
+    if (*p == '+' || *p == '-')
+	p++;
+
+    /* check for a string of digits */
+    while (isdigit(*p))
+	p++, d++;
+
+    /* make sure there was at least one digit and this is the end */
+    if (d == 0 || *p)
+	return (FALSE);
+
+    /* convert the string to an integer and return successfully */
+    *pval = newnode(INT);
+    (*pval)->n_int = atoi(*str == '+' ? ++str : str);
+    return (TRUE);
+}
+
+/* issym - check whether a character if valid in a symbol name */
+LOCAL int issym(ch)
+  int ch;
+{
+    if (ch <= ' ' || ch >= 0177 ||
+    	ch == '(' ||
+    	ch == ')' ||
+    	ch == ';' || 
+	ch == ',' ||
+	ch == '`' ||
+    	ch == '"' ||
+    	ch == '\'')
+	return (FALSE);
+    else
+	return (TRUE);
+}
+SHAR_EOF
+if test 8381 -ne "`wc -c < 'xlread.c'`"
+then
+	echo shar: error transmitting "'xlread.c'" '(should have been 8381 characters)'
+fi
+fi # end of overwriting check
+#	End of shell archive
+exit 0
+

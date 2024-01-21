@@ -1,0 +1,1733 @@
+Newsgroups: comp.sources.unix
+From: dbell@pdact.pd.necisa.oz.au (David I. Bell)
+Subject: v26i033: CALC - An arbitrary precision C-like calculator, Part07/21
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: dbell@pdact.pd.necisa.oz.au (David I. Bell)
+Posting-Number: Volume 26, Issue 33
+Archive-Name: calc/part07
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 21)."
+# Contents:  alloc.c math.h obj.c
+# Wrapped by dbell@elm on Tue Feb 25 15:21:02 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'alloc.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'alloc.c'\"
+else
+echo shar: Extracting \"'alloc.c'\" \(13396 characters\)
+sed "s/^X//" >'alloc.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1992 David I. Bell
+X * Permission is granted to use, distribute, or modify this source,
+X * provided that this copyright notice remains intact.
+X *
+X * Description:
+X *	This is a very fast storage allocator. It allocates blocks of a small
+X *	number of different sizes, and keeps free lists of each size.  Blocks
+X *	that don't exactly fit are passed up to the next larger size.  In this
+X *	implementation, the available sizes are 2^n-4 (or 2^n-12) bytes long.
+X *	This is designed for use in a program that uses vast quantities of
+X *	memory, but bombs when it runs out.
+X *
+X * Abnormal Conditions
+X *	This is a public domain storage allocator.
+X *
+X * Modifications:
+X *	Date		Programmer		Description of modification
+X *	27-FEB-90	Landon Curt Noll	unix does not need most of this
+X *	2-OCT-89	David I. Bell		Add free list. Sbrk now optional
+X *	30-JUN-87	Peter Miller		Made it work on Slimos.
+X *	21-FEB-82	Chris Kingsley		Initial Coding
+X *			kingsley@cit-20		Caltech
+X */
+X
+X#include <stdio.h>
+X#include "alloc.h"
+X#include "have_stdlib.h"
+X
+X#if 0
+X#define DEBUG	1		/* defined if debugging code enabled */
+X#define MSTATS	1		/* defined if memory statistics kept */
+X#endif
+X#define	NO_SBRK	1		/* defined if cannot use sbrk */
+X
+X
+X#if !defined(UNIX_MALLOC)
+X/*
+X * Make these functions really accessible here.
+X */
+X#undef	malloc
+X#undef	realloc
+X#undef	free
+X
+X
+X#ifdef DEBUG
+X#define assert(x,v) if ((x)==0) assertfailed(v)
+X#else
+X#define assert(x,v)
+X#endif
+X
+Xtypedef unsigned char u_char;
+Xtypedef unsigned short u_short;
+Xtypedef unsigned int u_int;
+Xtypedef char * caddr_t;
+X
+X#ifdef NO_SBRK
+Xextern char * malloc();
+Xextern char * realloc();
+X#else
+Xextern char * sbrk();
+X#endif
+X
+X
+X/*
+X * The overhead on a block is at least 4 bytes.  When free, this space
+X * contains a pointer to the next free block, and the bottom two bits must
+X * be zero.  When in use, the first byte is set to MAGIC, and the second
+X * byte is the size index.  The remaining bytes are for alignment.
+X * If range checking (RCHECK) is enabled and the size of the block fits
+X * in two bytes, then the top two bytes hold the size of the requested block
+X * plus the range checking words, and the header word MINUS ONE.
+X */
+X
+Xunion overhead
+X{
+X	union overhead * ov_next;	/* when free */
+X	struct
+X	{
+X		u_char ovu_magic;	/* magic number */
+X		u_char ovu_index;	/* bucket # */
+X#define ov_magic ovu.ovu_magic
+X#define ov_index ovu.ovu_index
+X#ifdef RCHECK
+X		u_short ovu_size;	/* actual block size */
+X		u_int ovu_rmagic;	/* range magic number */
+X#define ov_size ovu.ovu_size
+X#define ov_rmagic ovu.ovu_rmagic
+X#endif
+X	} ovu;
+X};
+X
+X#define QUANTUM_NBITS	4
+X#define QUANTUM		(1<<QUANTUM_NBITS)
+X
+X#define MAGIC	0xff		/* magic # on accounting info */
+X#define RMAGIC	0x55555555	/* magic # on range info */
+X#ifdef RCHECK
+X#define RSLOP	sizeof(u_int)
+X#else
+X#define RSLOP	0
+X#endif
+X
+X/*
+X * nextf[i] is the pointer to the next free block of size 2^(i+3).  The
+X * smallest allocatable block is 8 bytes.  The overhead information
+X * precedes the data area returned to the user.
+X */
+X
+X#define NBUCKETS	32	/* we can't run out on a 32 bit machine! */
+Xstatic union overhead * nextf[NBUCKETS];
+Xstatic union overhead *watchloc = 0;	/* location to be watched */
+X
+X#ifdef MSTATS
+X
+X/*
+X * nmalloc[i] is the difference between the number of mallocs and frees
+X * for a given block size.
+X */
+X
+Xstatic u_int nmalloc[NBUCKETS];
+X
+X#endif
+X
+X
+X/*
+X * Watch some allocated memory to see if it gets blasted.
+X */
+Xallocwatch(cp)
+X	char *cp;
+X{
+X	if (cp == NULL) {
+X		watchloc = NULL;
+X		return;
+X	}
+X	watchloc = (union overhead *)cp - 1;
+X	assert(watchloc->ov_magic == MAGIC, 10);
+X}
+X
+X
+Xalloccheck()
+X{
+X	assert((watchloc == NULL) || (watchloc->ov_magic == MAGIC), 11);
+X}
+X
+X
+X/*
+X * NAME
+X *	morecore - get more memory
+X *
+X * SYNOPSIS
+X *	void
+X *	morecore(bucket)
+X *	int bucket;
+X *
+X * DESCRIPTION
+X *	Morecore is used to allocate more memory to the indicated bucket.
+X *
+X * RETURNS
+X *	void
+X */
+Xstatic void
+Xmorecore(bucket)
+X	register u_int	bucket;
+X{
+X	register union overhead * op;
+X	register u_int	rnu;	/* 2^rnu bytes will be requested */
+X	register u_int	nblks;	/* become nblks blocks of the desired size */
+X	register u_int	siz;
+X
+X	assert(bucket >= QUANTUM_NBITS, 1);
+X	assert(bucket < NBUCKETS, 2);
+X	assert(!nextf[bucket], 3);
+X#ifndef NO_SBRK
+X	/*
+X	 * Insure memory is allocated on a page boundary.
+X	 * Should make getpageize() call?
+X	 */
+X#define PAGE_SIZE (1<<10)
+X	siz = (u_int)sbrk(0);
+X	if(siz & (PAGE_SIZE-1))
+X		sbrk(PAGE_SIZE - (siz & (PAGE_SIZE-1)));
+X#endif
+X
+X	/* take 2k unless the block is bigger than that */
+X	rnu = (bucket <= 11) ? 11 : bucket;
+X	assert(rnu >= bucket, 4);
+X	nblks = 1L << (rnu - bucket); /* how many blocks to get */
+X	siz = 1L << rnu;
+X
+X#ifndef NO_SBRK
+X	op = (union overhead *)sbrk(siz);
+X	/* no more room! */
+X	if ((int)op == -1)
+X		return;
+X	/*
+X	 * Round up to minimum allocation size boundary
+X	 * and deduct from block count to reflect.
+X	 */
+X	if((int)op & (QUANTUM-1))
+X	{
+X		op = (union overhead *)(((int)op + QUANTUM) &~ (QUANTUM-1));
+X		nblks--;
+X	}
+X#else
+X	op = (union overhead *)malloc(siz);
+X	/* no more room! */
+X	if (!op)
+X		return;
+X#endif
+X	/*
+X	 * Add new memory allocated to the
+X	 * free list for this hash bucket.
+X	 */
+X	nextf[bucket] = op;
+X	siz = 1L << bucket;
+X	while (--nblks)
+X	{
+X		op->ov_next = (union overhead *)((caddr_t)op + siz);
+X		op = op->ov_next;
+X	}
+X}
+X
+X
+X/*
+X * NAME
+X *	mem_alloc - memory allocator
+X *
+X * SYNOPSIS
+X *	char *
+X *	mem_alloc()
+X *
+X * DESCRIPTION
+X *	Mem_alloc is used to allocate memory large enought to fit the requested
+X *	size, and on a boundary suitable for placing any value.
+X *
+X * RETURNS
+X *	char *, pointer to base of dynamic memory allocated
+X *
+X * CAVEAT
+X *	Use mem_free() when you are finished with the space.
+X */
+Xchar *
+Xmem_alloc(nbytes)
+X	register unsigned long int nbytes;
+X{
+X	register union overhead *p;
+X	register int	bucket;
+X	register unsigned long int shiftr;
+X
+X	if (nbytes > ((unsigned int) -1))
+X		return NULL;
+X	assert((watchloc == NULL) || (watchloc->ov_magic == MAGIC), 12);
+X	/*
+X	 * Convert amount of memory requested into
+X	 * closest block size stored in hash buckets
+X	 * which satisfies request.  Account for
+X	 * space used per block for accounting.
+X	 */
+X	nbytes = (nbytes + sizeof (union overhead) + RSLOP + (QUANTUM-1)) &~ (QUANTUM-1);
+X	shiftr = (nbytes - 1) >> QUANTUM_NBITS;
+X	/* apart from this loop, this is O(1) */
+X	bucket = QUANTUM_NBITS;
+X	while(shiftr)
+X	{
+X		shiftr >>= 1;
+X		bucket++;
+X	}
+X
+X	/*
+X	 * If nothing in hash bucket right now,
+X	 * request more memory from the system.
+X	 */
+X	if (!nextf[bucket])
+X		morecore(bucket);
+X	if (!(p = nextf[bucket]))
+X		return (char*)0;
+X	/* remove from linked list */
+X	nextf[bucket] = p->ov_next;
+X	p->ov_magic = MAGIC;
+X	p->ov_index = bucket;
+X#ifdef MSTATS
+X	nmalloc[bucket]++;
+X#endif
+X#ifdef RCHECK
+X	/*
+X	 * Record allocated size of block and
+X	 * bound space with magic numbers
+X	 */
+X	if (nbytes <= (1L<<16))
+X		p->ov_size = nbytes - 1;
+X	p->ov_rmagic = RMAGIC;
+X	*((u_int *)((caddr_t)p + nbytes - RSLOP)) = RMAGIC;
+X#endif
+X	return ((char *)(p + 1));
+X}
+X
+X
+X/*
+X * NAME
+X *	mem_free - free memory
+X *
+X * SYNOPSIS
+X *	int
+X *	mem_free(cp)
+X *	char * cp;
+X *
+X * DESCRIPTION
+X *	Mem_free is used to release space allocated by mem_alloc
+X *	or mem_realloc.
+X *
+X * RETURNS
+X *	int
+X *
+X * CAVEAT
+X *	do not pass mem_free() an argument that was returned by mem_alloc()
+X *	or mem_realloc().
+X */
+Xint
+Xmem_free(cp)
+X	char *	cp;
+X{
+X	register u_int	bucket;
+X	register union overhead *op;
+X
+X	assert((watchloc == NULL) || (watchloc->ov_magic == MAGIC), 13);
+X	if (!cp)
+X		return;
+X	op = (union overhead *)cp - 1;
+X	assert(op->ov_magic == MAGIC, 5);	/* make sure it was in use */
+X	assert(op->ov_index < NBUCKETS, 6);
+X	assert(op->ov_index >= QUANTUM_NBITS, 7);
+X#ifdef RCHECK
+X	assert(op->ov_index > 16 || op->ov_size == (1L<<op->ov_index)-1, 8);
+X	assert(op->ov_rmagic == RMAGIC, 9);
+X	assert(op->ov_index > 16 || *(u_int *)((caddr_t)op + op->ov_size + 1 - RSLOP) == RMAGIC, 10);
+X#endif
+X#ifndef DEBUG
+X	if(op->ov_magic != MAGIC)
+X		return;		/* sanity */
+X#endif
+X	bucket = op->ov_index;
+X	op->ov_next = nextf[bucket];
+X	nextf[bucket] = op;
+X#ifdef MSTATS
+X	nmalloc[bucket]--;
+X#endif
+X}
+X
+X
+X/*
+X * NAME
+X *	findbucket - find a bucket
+X *
+X * SYNOPSIS
+X *	int
+X *	findbucket(freep, srchlen)
+X *	union overhead * freep;
+X *	int srchlen;
+X *
+X * DESCRIPTION
+X *	Findbucket is used to find the bucket a free block is in.
+X *	Search ``srchlen'' elements of each free list for a block whose
+X *	header starts at ``freep''.  If srchlen is -1 search the whole list.
+X *
+X * RETURNS
+X *	bucket number, or -1 if not found.
+X */
+Xstatic int
+Xfindbucket(freep, srchlen)
+X	union overhead *	freep;
+X	int	srchlen;
+X{
+X	register union overhead *p;
+X	register int	i, j;
+X
+X	for (i = 0; i < NBUCKETS; i++)
+X	{
+X		j = 0;
+X		for (p = nextf[i]; p && j != srchlen; p = p->ov_next)
+X		{
+X			if (p == freep)
+X				return i;
+X			j++;
+X		}
+X	}
+X	return -1;
+X}
+X
+X
+X/*
+X * When a program attempts "storage compaction" as mentioned in the
+X * old malloc man page, it realloc's an already freed block.  Usually
+X * this is the last block it freed; occasionally it might be farther
+X * back.  We have to search all the free lists for the block in order
+X * to determine its bucket: first we make one pass thru the lists
+X * checking only the first block in each; if that fails we search
+X * ``realloc_srchlen'' blocks in each list for a match (the variable
+X * is extern so the caller can modify it).  If that fails we just copy
+X * however many bytes was given to realloc() and hope it's not huge.
+X */
+X
+Xstatic int realloc_srchlen = 4;	/* 4 should be plenty, -1 =>'s whole list */
+X
+X/*
+X * NAME
+X *	mem_realloc - change size
+X *
+X * SYNOPSIS
+X *	char
+X *	mem_realloc(cp, nbytes)
+X *	char * cp;
+X *	u_int nbytes;
+X *
+X * DESCRIPTION
+X *	Mem_realloc is used to enlarge a chunk of memory
+X *	returned by mem_alloc() or mem_realloc().
+X *
+X * RETURNS
+X *	char *, pointer to base of dynamic memory allocated
+X *
+X * CAVEAT
+X *	Use mem_free() when you are finished with the space.
+X */
+Xchar *
+Xmem_realloc(cp, nbytes)
+X	char *cp;
+X	unsigned long	nbytes;
+X{
+X	register u_int	old_nbytes;
+X	register union overhead *op;
+X	char *	res;
+X	register u_int	old_bucket;
+X	short	was_alloced = 0;
+X
+X	if (nbytes > ((unsigned int) -1))
+X		return NULL;
+X	assert((watchloc == NULL) || (watchloc->ov_magic == MAGIC), 14);
+X	if (!cp)
+X		return mem_alloc(nbytes);
+X	op = (union overhead *)((caddr_t)cp - sizeof (union overhead));
+X	if (op->ov_magic == MAGIC)
+X	{
+X		was_alloced++;
+X		old_bucket = op->ov_index;
+X	}
+X	else
+X	{
+X		/*
+X		 * Already free, doing "compaction".
+X		 *
+X		 * Search for the old block of memory on the
+X		 * free list. First, check the most common
+X		 * case (last element free'd), then (this failing)
+X		 * the last ``realloc_srchlen'' items free'd.
+X		 * If all lookups fail, then assume the size of
+X		 * the memory block being realloc'd is the
+X		 * smallest possible.
+X		 */
+X		if
+X		(
+X			(old_bucket = findbucket(op, 1)) == -1
+X		&&
+X			(old_bucket = findbucket(op, realloc_srchlen)) == -1
+X		)
+X			old_bucket = QUANTUM_NBITS;
+X	}
+X	old_nbytes = (1L << old_bucket) - sizeof(union overhead) - RSLOP;
+X
+X	/*
+X	 * avoid the copy if same size block
+X	 */
+X	if
+X	(
+X		was_alloced
+X	&&
+X		nbytes <= old_nbytes
+X	&&
+X		nbytes > (old_nbytes >> 1) - sizeof(union overhead) - RSLOP
+X	)
+X		return cp;
+X
+X	/*
+X	 * grab another chunk
+X	 */
+X	if(!(res = mem_alloc(nbytes)))
+X		return (char*)0;
+X	assert(cp != res, 11);
+X	memcpy(res, cp, (nbytes < old_nbytes) ? nbytes : old_nbytes);
+X	if(was_alloced)
+X		mem_free(cp);
+X	return res;
+X}
+X
+X#else /*!UNIX_MALLOC*/
+X
+X#undef MSTATS
+X
+X#endif /*!UNIX_MALLOC*/
+X
+X
+X
+X/*
+X * Allocate a new item from the specified free list.
+X * Returns NULL if no item can be allocated.
+X */
+XALLOCITEM *
+Xallocitem(fp)
+X	FREELIST *fp;		/* free list header */
+X{
+X	FREEITEM *ip;		/* allocated item */
+X
+X	if (fp->curfree > 0) {
+X		fp->curfree--;
+X		ip = fp->freelist;
+X		fp->freelist = ip->next;
+X		return (ALLOCITEM *) ip;
+X	}
+X	ip = (FREEITEM *) malloc(fp->itemsize);
+X	if (ip == NULL)
+X		return NULL;
+X	return (ALLOCITEM *) ip;
+X}
+X
+X
+X/*
+X * Free an item by placing it back on a free list.
+X * If too many items are on the list, it is really freed.
+X */
+Xvoid
+Xfreeitem(fp, ip)
+X	FREELIST *fp;		/* freelist header */
+X	FREEITEM *ip;		/* item to be freed */
+X{
+X	if (ip == NULL)
+X		return;
+X	if (fp->curfree >= fp->maxfree) {
+X		free((char *) ip);
+X		return;
+X	}
+X	ip->next = fp->freelist;
+X	fp->freelist = ip;
+X	fp->curfree++;
+X}
+X
+X
+X/*
+X * NAME
+X *	mem_stats - print memory statistics
+X *
+X * SYNOPSIS
+X *	void
+X *	mem_stats(s)
+X *	char * s;
+X *
+X * DESCRIPTION
+X *	Mem_stats is used to print out statistics about current memory usage.
+X *	``s'' is the title string
+X *
+X *	Prints two lines of numbers, one showing the length of the free list
+X *	for each size category, the second showing the number of mallocs -
+X *	frees for each size category.
+X *
+X * RETURNS
+X *	void
+X */
+X/*ARGSUSED*/
+Xvoid
+Xmem_stats(s)
+X	char *	s;
+X{
+X#ifdef MSTATS
+X	register int	i, j;
+X	register union overhead *p;
+X	int	totfree = 0;
+X	int	totused = 0;
+X
+X	fprintf(stderr, "Memory allocation statistics %s\n", s);
+X	fprintf(stderr, "%11s:%12s%12s%12s\n", "Bucket", "In Use", "Free", "Sum");
+X	for (i = 0; i < NBUCKETS; i++)
+X	{
+X		for (j = 0, p = nextf[i]; p; p = p->ov_next, j++)
+X			;
+X		if(!j && !nmalloc[i])
+X			continue;
+X		fprintf(stderr, "%11d:%12d%12d%12d\n", (1L<<i), nmalloc[i], j, j+nmalloc[i]);
+X		totfree += j * (1L << i);
+X		totused += nmalloc[i] * (1L << i);
+X	}
+X	fprintf(stderr, "%11s:%12d%12d%12d\n", "Totals", totused, totfree, totused+totfree);
+X#else
+X	fprintf(stderr, 
+X	    "Memory allocation stats were not compiled into calc\n");
+X#endif
+X}
+X
+X#ifdef DEBUG
+Xvoid
+Xassertfailed(n)
+X{
+X	printf("Assertion %d failed\n", n);
+X	exit(1);
+X}
+X#endif
+X
+X/* END CODE */
+END_OF_FILE
+if test 13396 -ne `wc -c <'alloc.c'`; then
+    echo shar: \"'alloc.c'\" unpacked with wrong size!
+fi
+# end of 'alloc.c'
+fi
+if test -f 'math.h' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'math.h'\"
+else
+echo shar: Extracting \"'math.h'\" \(15034 characters\)
+sed "s/^X//" >'math.h' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1992 David I. Bell
+X * Permission is granted to use, distribute, or modify this source,
+X * provided that this copyright notice remains intact.
+X *
+X * Data structure declarations for extended precision arithmetic.
+X * The assumption made is that a long is 32 bits and shorts are 16 bits,
+X * and longs must be addressible on word boundaries.
+X */
+X
+X#include "alloc.h"
+X
+X#include "have_stdlib.h"
+X#ifdef HAVE_STDLIB_H
+X# include <stdlib.h>
+X#endif
+X
+X
+X#ifndef	NULL
+X#define	NULL	0
+X#endif
+X
+X/*#define ALLOCTEST 1*/
+X
+X#ifndef ALLOCTEST
+X# if defined(UNIX_MALLOC)
+X#  define freeh(p) { if ((p != _zeroval_) && (p != _oneval_)) free((void *)p); }
+X# else
+X#  define freeh(p) ((p == _zeroval_) || (p == _oneval_) || free(p))
+X# endif
+X#endif
+X
+Xtypedef	short FLAG;			/* small value (e.g. comparison) */
+Xtypedef unsigned short BOOL;		/* TRUE or FALSE value */
+X
+X#if !defined(TRUE)
+X#define	TRUE	((BOOL) 1)			/* booleans */
+X#endif
+X#if !defined(FALSE)
+X#define	FALSE	((BOOL) 0)
+X#endif
+X
+X
+X/*
+X * NOTE: FULL must be twice the storage size of a HALF
+X *	 LEN storage size must be <= FULL storage size
+X */
+Xtypedef unsigned short HALF;		/* unit of number storage */
+Xtypedef unsigned long FULL;		/* double unit of number storage */
+Xtypedef long LEN;			/* unit of length storage */
+X
+X#define BASE	((FULL) 65536)		/* base for calculations (2^16) */
+X#define BASE1	((FULL) (BASE - 1))	/* one less than base */
+X#define BASEB	16			/* number of bits in base */
+X#define	BASEDIG	5			/* number of digits in base */
+X#define	MAXHALF	((FULL) 0x7fff)		/* largest positive half value */
+X#define	MAXFULL	((FULL) 0x7fffffff)	/* largest positive full value */
+X#define	TOPHALF	((FULL) 0x8000)		/* highest bit in half value */
+X#define	TOPFULL	((FULL) 0x80000000)	/* highest bit in full value */
+X#define MAXLEN	((LEN)	0x7fffffff)	/* longest value allowed */
+X#define	MAXREDC	5			/* number of entries in REDC cache */
+X#define	SQ_ALG2	20			/* size for alternative squaring */
+X#define	MUL_ALG2 20			/* size for alternative multiply */
+X#define	POW_ALG2 40			/* size for using REDC for powers */
+X#define	REDC_ALG2 50			/* size for using alternative REDC */
+X
+X
+X
+Xtypedef union {
+X	FULL	ivalue;
+X	struct {
+X		HALF Svalue1;
+X		HALF Svalue2;
+X	} sis;
+X} SIUNION;
+X
+X
+X#ifdef LITTLE_ENDIAN
+X
+X#define silow	sis.Svalue1	/* low order half of full value */
+X#define sihigh	sis.Svalue2	/* high order half of full value */
+X
+X#else
+X
+X#define silow	sis.Svalue2	/* low order half of full value */
+X#define sihigh	sis.Svalue1	/* high order half of full value */
+X
+X#endif
+X
+X
+Xtypedef struct {
+X	HALF	*v;		/* pointer to array of values */
+X	LEN	len;		/* number of values in array */
+X	BOOL	sign;		/* sign, nonzero is negative */
+X} ZVALUE;
+X
+X
+X
+X/*
+X * Function prototypes for integer math routines.
+X */
+X#if defined(__STDC__)
+X#define proto(a) a
+X#else
+X#define proto(a) ()
+X#endif
+X
+Xextern HALF * alloc proto((LEN len));
+X#ifdef	ALLOCTEST
+Xextern void freeh proto((HALF *));
+X#endif
+X
+X
+Xextern long iigcd proto((long i1, long i2));
+Xextern void itoz proto((long i, ZVALUE * res));
+Xextern long ztoi proto((ZVALUE z));
+Xextern void zcopy proto((ZVALUE z, ZVALUE * res));
+Xextern void zadd proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zsub proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zmul proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zsquare proto((ZVALUE z, ZVALUE * res));
+Xextern void zreduce proto((ZVALUE z1, ZVALUE z2,
+X	ZVALUE * z1res, ZVALUE * z2res));
+Xextern void zdiv proto((ZVALUE z1, ZVALUE z2,
+X	ZVALUE * res, ZVALUE * rem));
+Xextern void zquo proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zmod proto((ZVALUE z1, ZVALUE z2, ZVALUE * rem));
+Xextern BOOL zdivides proto((ZVALUE z1, ZVALUE z2));
+Xextern void zor proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zand proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zxor proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zshift proto((ZVALUE z, long n, ZVALUE * res));
+Xextern long zlowbit proto((ZVALUE z));
+Xextern long zhighbit proto((ZVALUE z));
+Xextern BOOL zisset proto((ZVALUE z, long n));
+Xextern BOOL zisonebit proto((ZVALUE z));
+Xextern BOOL zisallbits proto((ZVALUE z));
+Xextern void zbitvalue proto((long n, ZVALUE * res));
+Xextern FLAG ztest proto((ZVALUE z));
+Xextern FLAG zrel proto((ZVALUE z1, ZVALUE z2));
+Xextern BOOL zcmp proto((ZVALUE z1, ZVALUE z2));
+Xextern void trim proto((ZVALUE * z));
+Xextern void shiftr proto((ZVALUE z, long n));
+Xextern void shiftl proto((ZVALUE z, long n));
+Xextern void zfact proto((ZVALUE z, ZVALUE * dest));
+Xextern void zpfact proto((ZVALUE z, ZVALUE * dest));
+Xextern void zlcmfact proto((ZVALUE z, ZVALUE * dest));
+Xextern void zperm proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zcomb proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern BOOL zprimetest proto((ZVALUE z, long count));
+Xextern FLAG zjacobi proto((ZVALUE z1, ZVALUE z2));
+Xextern void zfib proto((ZVALUE z, ZVALUE * res));
+Xextern void zpowi proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void ztenpow proto((long power, ZVALUE * res));
+Xextern void zpowermod proto((ZVALUE z1, ZVALUE z2,
+X	ZVALUE z3, ZVALUE * res));
+Xextern BOOL zmodinv proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zgcd proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern void zlcm proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern BOOL zrelprime proto((ZVALUE z1, ZVALUE z2));
+Xextern long zlog proto((ZVALUE z1, ZVALUE z2));
+Xextern long zlog10 proto((ZVALUE z));
+Xextern long zdivcount proto((ZVALUE z1, ZVALUE z2));
+Xextern long zfacrem proto((ZVALUE z1, ZVALUE z2, ZVALUE * rem));
+Xextern void zgcdrem proto((ZVALUE z1, ZVALUE z2, ZVALUE * res));
+Xextern long zlowfactor proto((ZVALUE z, long count));
+Xextern long zdigits proto((ZVALUE z1));
+Xextern FLAG zdigit proto((ZVALUE z1, long n));
+Xextern BOOL zsqrt proto((ZVALUE z1, ZVALUE * dest));
+Xextern void zroot proto((ZVALUE z1, ZVALUE z2, ZVALUE * dest));
+Xextern BOOL zissquare proto((ZVALUE z));
+Xextern void zmuli proto((ZVALUE z, long n, ZVALUE *res));
+Xextern long zmodi proto((ZVALUE z, long n));
+Xextern long zdivi proto((ZVALUE z, long n, ZVALUE * res));
+Xextern HALF *zalloctemp proto((LEN len));
+X
+X#if 0
+Xextern void zapprox proto((ZVALUE z1, ZVALUE z2, ZVALUE* res1, ZVALUE* res2));
+X#endif
+X
+X
+X/*
+X * Modulo arithmetic definitions.
+X * Structure holding state of REDC initialization.
+X * Multiple instances of this structure can be used allowing
+X * calculations with more than one modulus at the same time.
+X * Len of zero means the structure is not initialized.
+X */
+Xtypedef	struct {
+X	LEN len;		/* number of words in binary modulus */
+X	ZVALUE mod;		/* modulus REDC is computing with */
+X	ZVALUE inv;		/* inverse of modulus in binary modulus */
+X	ZVALUE one;		/* REDC format for the number 1 */
+X} REDC;
+X
+X#if 0
+Xextern void zmulmod proto((ZVALUE z1, ZVALUE z2, ZVALUE z3, ZVALUE *res));
+Xextern void zsquaremod proto((ZVALUE z1, ZVALUE z2, ZVALUE *res));
+Xextern void zsubmod proto((ZVALUE z1, ZVALUE z2, ZVALUE z3, ZVALUE *res));
+X#endif
+Xextern void zminmod proto((ZVALUE z1, ZVALUE z2, ZVALUE *res));
+Xextern BOOL zcmpmod proto((ZVALUE z1, ZVALUE z2, ZVALUE z3));
+Xextern REDC *zredcalloc proto((ZVALUE z1));
+Xextern void zredcfree proto((REDC *rp));
+Xextern void zredcencode proto((REDC *rp, ZVALUE z1, ZVALUE *res));
+Xextern void zredcdecode proto((REDC *rp, ZVALUE z1, ZVALUE *res));
+Xextern void zredcmul proto((REDC *rp, ZVALUE z1, ZVALUE z2, ZVALUE *res));
+Xextern void zredcsquare proto((REDC *rp, ZVALUE z1, ZVALUE *res));
+Xextern void zredcpower proto((REDC *rp, ZVALUE z1, ZVALUE z2, ZVALUE *res));
+X
+X
+X/*
+X * Rational arithmetic definitions.
+X */
+Xtypedef struct {
+X	ZVALUE num, den;
+X	long links;
+X} NUMBER;
+X
+Xextern NUMBER *qadd(), *qsub(), *qmul(), *qdiv(), *qquo(), *qmod(), *qcomb();
+Xextern NUMBER *qsquare(), *qgcd(), *qlcm(), *qmin(), *qmax(), *qand(), *qor();
+Xextern NUMBER *qxor(), *qpowermod(), *qpowi(), *qpower(), *qneg(), *qsign();
+Xextern NUMBER *qfact(), *qpfact(), *qsqrt(), *qshift(), *qminv();
+Xextern NUMBER *qint(), *qfrac(), *qnum(), *qden(), *qinv(), *qabs(), *qroot();
+Xextern NUMBER *qfacrem(), *qcopy(), *atoq(), *itoq(), *iitoq();
+Xextern NUMBER *qperm(), *qgcdrem(), *qtrunc(), *qround(), *qalloc();
+Xextern NUMBER *qlowfactor(), *qfib(), *qcfappr(), *qcos(), *qsin(), *qexp();
+Xextern NUMBER *qscale(), *qln(), *qbtrunc(), *qbround(), *qisqrt();
+Xextern NUMBER *qtan(), *qacos(), *qasin(), *qatan(), *qatan2(), *qjacobi();
+Xextern NUMBER *qinc(), *qdec(), *qhypot(), *qcosh(), *qsinh(), *qtanh();
+Xextern NUMBER *qacosh(), *qasinh(), *qatanh(), *qlegtoleg(), *qiroot();
+Xextern NUMBER *qpi(), *qbappr(), *qdivi(), *qlcmfact(), *qminmod();
+Xextern NUMBER *qredcin(), *qredcout(), *qredcmul(), *qredcsquare();
+Xextern NUMBER *qredcpower();
+Xextern BOOL qcmp(), qcmpi(), qprimetest(), qissquare();
+Xextern BOOL qisset(), qcmpmod(), qquomod();
+Xextern FLAG qrel(), qreli(), qnear(), qdigit();
+Xextern long qtoi(), qprecision(), qplaces(), qdigits();
+Xextern long qilog2(), qilog10(), qparse();
+Xextern void qfreenum();
+Xextern void qprintnum();
+Xextern void setepsilon();
+X
+X#if 0
+Xextern NUMBER *qbitvalue(), *qmuli(), *qmulmod(), *qsquaremod();
+Xextern NUMBER *qaddmod(), *qsubmod(), *qreadval(), *qnegmod();
+Xextern BOOL qbittest();
+Xextern FLAG qtest();
+X#endif
+X
+X#ifdef CODE
+Xextern NUMBER *qaddi();
+X#endif
+X
+X
+X/*
+X * Complex arithmetic definitions.
+X */
+Xtypedef struct {
+X	NUMBER *real;		/* real part of number */
+X	NUMBER *imag;		/* imaginary part of number */
+X	long links;		/* link count */
+X} COMPLEX;
+X
+Xextern COMPLEX *cadd(), *csub(), *cmul(), *cdiv(), *csquare();
+Xextern COMPLEX *cneg(), *cinv();
+Xextern COMPLEX *comalloc(), *caddq(), *csubq(), *cmulq(), *cdivq();
+Xextern COMPLEX *cpowi(), *csqrt(), *cscale(), *cshift(), *cround();
+Xextern COMPLEX *cbround(), *cint(), *cfrac(), *croot(), *cexp(), *cln();
+Xextern COMPLEX *ccos(), *csin(), *cpolar(), *cpower(), *cmodq(), *cquoq();
+Xextern void comfree(), comprint();
+Xextern BOOL ccmp();
+Xextern void cprintfr();
+X
+X#if 0
+Xextern COMPLEX *cconj(), *creal(), *cimag(), *qqtoc();
+X#endif
+X
+X
+X/*
+X * macro expansions to speed this thing up
+X */
+X#define iseven(z)	(!(*(z).v & 01))
+X#define isodd(z)	(*(z).v & 01)
+X#define iszero(z)	((*(z).v == 0) && ((z).len == 1))
+X#define isneg(z)	((z).sign)
+X#define ispos(z)	(((z).sign == 0) && (*(z).v || ((z).len > 1)))
+X#define isunit(z)	((*(z).v == 1) && ((z).len == 1))
+X#define isone(z)	((*(z).v == 1) && ((z).len == 1) && !(z).sign)
+X#define isnegone(z)	((*(z).v == 1) && ((z).len == 1) && (z).sign)
+X#define istwo(z)	((*(z).v == 2) && ((z).len == 1) && !(z).sign)
+X#define isleone(z)	((*(z).v <= 1) && ((z).len == 1))
+X#define istiny(z)	((z).len == 1)
+X#define issmall(z)	(((z).len < 2) || (((z).len == 2) && (((short)(z).v[1]) >= 0)))
+X#define isbig(z)	(((z).len > 2) || (((z).len == 2) && (((short)(z).v[1]) < 0)))
+X#define z1tol(z)	((long)((z).v[0]))
+X#define z2tol(z)	(((long)((z).v[0])) + \
+X				(((long)((z).v[1] & MAXHALF)) << BASEB))
+X
+X#define qiszero(q)	(iszero((q)->num))
+X#define qisneg(q)	(isneg((q)->num))
+X#define qispos(q)	(ispos((q)->num))
+X#define qisint(q)	(isunit((q)->den))
+X#define qisfrac(q)	(!isunit((q)->den))
+X#define qisunit(q)	(isunit((q)->num) && isunit((q)->den))
+X#define qisone(q)	(isone((q)->num) && isunit((q)->den))
+X#define qisnegone(q)	(isnegone((q)->num) && isunit((q)->den))
+X#define qistwo(q)	(istwo((q)->num) && isunit((q)->den))
+X#define qiseven(q)	(isunit((q)->den) && iseven((q)->num))
+X#define qisodd(q)	(isunit((q)->den) && isodd((q)->num))
+X#define qistwopower(q)	(isunit((q)->den) && zistwopower((q)->num))
+X#define qhighbit(q)	(zhighbit((q)->num))
+X#define qlowbit(q)	(zlowbit((q)->num))
+X#define qdivides(q1, q2)	(zdivides((q1)->num, (q2)->num))
+X#define qdivcount(q1, q2)	(zdivcount((q1)->num, (q2)->num))
+X#define qilog(q1, q2)	(zlog((q1)->num, (q2)->num))
+X#define qlink(q)	((q)->links++, (q))
+X
+X#define qfree(q)	{if (--((q)->links) <= 0) qfreenum(q);}
+X#define quicktrim(z)	{if (((z).len > 1) && ((z).v[(z).len-1] == 0)) (z).len--;}
+X
+X#define cisreal(c)	(qiszero((c)->imag))
+X#define cisimag(c)	(qiszero((c)->real) && !cisreal(c))
+X#define ciszero(c)	(cisreal(c) && qiszero((c)->real))
+X#define cisone(c)	(cisreal(c) && qisone((c)->real))
+X#define cisnegone(c)	(cisreal(c) && qisnegone((c)->real))
+X#define cisrunit(c)	(cisreal(c) && qisunit((c)->real))
+X#define cisiunit(c)	(qiszero((c)->real) && qisunit((c)->imag))
+X#define cistwo(c)	(cisreal(c) && qistwo((c)->real))
+X#define cisint(c)	(qisint((c)->real) && qisint((c)->imag))
+X#define ciseven(c)	(qiseven((c)->real) && qiseven((c)->imag))
+X#define cisodd(c)	(qisodd((c)->real) || qisodd((c)->imag))
+X#define clink(c)	((c)->links++, (c))
+X
+X#define	clearval(z)	memset((z).v, 0, (z).len * sizeof(HALF))
+X#define	copyval(z1, z2)	memcpy((z2).v, (z1).v, (z1).len * sizeof(HALF))
+X
+X
+X/*
+X * Flags for qparse calls
+X */
+X#define QPF_SLASH	0x1	/* allow slash for fractional number */
+X#define QPF_IMAG	0x2	/* allow trailing 'i' for imaginary number */
+X
+X
+X/*
+X * Output modes for numeric displays.
+X */
+X#define MODE_DEFAULT	0
+X#define MODE_FRAC	1
+X#define MODE_INT	2
+X#define MODE_REAL	3
+X#define MODE_EXP	4
+X#define MODE_HEX	5
+X#define MODE_OCTAL	6
+X#define MODE_BINARY	7
+X#define MODE_MAX	7
+X
+X#define MODE_INITIAL	MODE_REAL
+X
+X
+X/*
+X * Output routines for either FILE handles or strings.
+X */
+Xextern void math_chr(), math_str(), math_flush();
+Xextern void divertio(), cleardiversions(), setfp();
+Xextern char *getdivertedio();
+Xextern void setmode();		/* set output mode for numeric output */
+Xextern void setdigits();	/* set # of digits for float or exp output */
+X
+X#ifdef VARARGS
+Xextern void math_fmt();
+X#else
+X# ifdef __STDC__
+Xextern void math_fmt(char *, ...);
+X# else
+Xextern void math_fmt();
+X# endif
+X#endif
+X
+X/*
+X * Print a formatted string containing arbitrary numbers, similar to printf.
+X */
+X#ifdef VARARGS
+Xextern void qprintf();
+X#else
+X# ifdef __STDC__
+Xextern void qprintf(char *, ...);
+X# else
+Xextern void qprintf();
+X# endif
+X#endif
+X
+X/*
+X * constants used often by the arithmetic routines
+X */
+Xextern HALF _zeroval_[], _oneval_[], _twoval_[], _tenval_[];
+Xextern ZVALUE _zero_, _one_, _ten_;
+Xextern NUMBER _qzero_, _qone_, _qnegone_, _qonehalf_;
+Xextern COMPLEX _czero_, _cone_;
+X
+X#if 0
+Xextern NUMBER _conei_;
+X#endif
+X
+Xextern BOOL _sinisneg_;		/* whether sin(x) < 0 (set by cos(x)) */
+Xextern BOOL _math_abort_;	/* nonzero to abort calculations */
+Xextern long _epsilonprec_;	/* binary precision of epsilon */
+Xextern NUMBER *_epsilon_;	/* default error for real functions */
+Xextern ZVALUE _tenpowers_[32];	/* table of 10^2^n */
+Xextern long _outdigits_;	/* current output digits for float or exp */
+Xextern int _outmode_;		/* current output mode */
+Xextern LEN _mul2_;		/* size of number to use multiply algorithm 2 */
+Xextern LEN _sq2_;		/* size of number to use square algorithm 2 */
+Xextern LEN _pow2_;		/* size of modulus to use REDC for powers */
+Xextern LEN _redc2_;		/* size of modulus to use REDC algorithm 2 */
+Xextern HALF *bitmask;		/* bit rotation, norm 0 */
+X
+X#if 0
+Xextern char *_mallocptr_;	/* pointer for malloc calls */
+X#endif
+X
+X/*
+X * misc function declarations - most to keep lint happy
+X */
+Xextern void initmasks();	/* init the bitmask rotation arrays */
+X
+X#ifdef VARARGS
+Xvoid error();
+X#else
+X# ifdef __STDC__
+Xvoid error(char *, ...);
+X# else
+Xvoid error();
+X# endif
+X#endif
+X
+X
+X/* END CODE */
+END_OF_FILE
+if test 15034 -ne `wc -c <'math.h'`; then
+    echo shar: \"'math.h'\" unpacked with wrong size!
+fi
+# end of 'math.h'
+fi
+if test -f 'obj.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'obj.c'\"
+else
+echo shar: Extracting \"'obj.c'\" \(14633 characters\)
+sed "s/^X//" >'obj.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1992 David I. Bell
+X * Permission is granted to use, distribute, or modify this source,
+X * provided that this copyright notice remains intact.
+X *
+X * "Object" handling primatives.
+X * This simply means that user-specified routines are called to perform
+X * the indicated operations.
+X */
+X
+X#include "calc.h"
+X#include "opcodes.h"
+X#include "func.h"
+X#include "symbol.h"
+X#include "string.h"
+X
+X
+X/*
+X * Types of values returned by calling object routines.
+X */
+X#define A_VALUE	0	/* returns arbitrary value */
+X#define A_INT	1	/* returns integer value */
+X#define A_UNDEF	2	/* returns no value */
+X
+X/*
+X * Error handling actions for when the function is undefined.
+X */
+X#define E_NONE	0	/* no special action */
+X#define E_PRINT	1	/* print element */
+X#define E_CMP	2	/* compare two values */
+X#define E_TEST	3	/* test value for nonzero */
+X#define E_POW	4	/* call generic power routine */
+X#define E_ONE	5	/* return number 1 */
+X#define E_INC	6	/* increment by one */
+X#define E_DEC	7	/* decrement by one */
+X#define E_SQUARE 8	/* square value */
+X
+X
+Xstatic struct objectinfo {
+X	short args;	/* number of arguments */
+X	short retval;	/* type of return value */
+X	short error;	/* special action on errors */
+X	char *name;	/* name of function to call */
+X	char *comment;	/* useful comment if any */
+X} objectinfo[] = {
+X	1, A_UNDEF, E_PRINT, "print",	"print value, default prints elements",
+X	1, A_VALUE, E_ONE,   "one",	"multiplicative identity, default is 1",
+X	1, A_INT,   E_TEST,  "test",	"logical test (false,true => 0,1), default tests elements",
+X	2, A_VALUE, E_NONE,  "add",	NULL,
+X	2, A_VALUE, E_NONE,  "sub",	NULL,
+X	1, A_VALUE, E_NONE,  "neg",	"negative",
+X	2, A_VALUE, E_NONE,  "mul",	NULL,
+X	2, A_VALUE, E_NONE,  "div",	"non-integral division",
+X	1, A_VALUE, E_NONE,  "inv",	"multiplicative inverse",
+X	2, A_VALUE, E_NONE,  "abs",	"absolute value within given error",
+X	1, A_VALUE, E_NONE,  "norm",	"square of absolute value",
+X	1, A_VALUE, E_NONE,  "conj",	"conjugate",
+X	2, A_VALUE, E_POW,   "pow",	"integer power, default does multiply, square, inverse",
+X	1, A_INT,   E_NONE,  "sgn",	"sign of value (-1, 0, 1)",
+X	2, A_INT,   E_CMP,   "cmp",	"equality (equal,nonequal => 0,1), default tests elements",
+X	2, A_INT,   E_NONE,  "rel",	"inequality (less,equal,greater => -1,0,1)",
+X	2, A_VALUE, E_NONE,  "quo",	"integer quotient",
+X	2, A_VALUE, E_NONE,  "mod",	"remainder of division",
+X	1, A_VALUE, E_NONE,  "int",	"integer part",
+X	1, A_VALUE, E_NONE,  "frac",	"fractional part",
+X	1, A_VALUE, E_INC,   "inc",	"increment, default adds 1",
+X	1, A_VALUE, E_DEC,   "dec",	"decrement, default subtracts 1",
+X	1, A_VALUE, E_SQUARE,"square",	"default multiplies by itself",
+X	2, A_VALUE, E_NONE,  "scale",	"multiply by power of 2",
+X	2, A_VALUE, E_NONE,  "shift",	"shift left by n bits (right if negative)",
+X	2, A_VALUE, E_NONE,  "round",	"round to given number of decimal places",
+X	2, A_VALUE, E_NONE,  "bround",	"round to given number of binary places",
+X	3, A_VALUE, E_NONE,  "root",	"root of value within given error",
+X	2, A_VALUE, E_NONE,  "sqrt",	"square root within given error",
+X	0, 0, 0, NULL
+X};
+X
+X
+Xstatic STRINGHEAD objectnames;	/* names of objects */
+Xstatic STRINGHEAD elements;	/* element names for parts of objects */
+Xstatic OBJECTACTIONS *objects[MAXOBJECTS]; /* table of actions for objects */
+X
+X
+X/*
+X * Free list of usual small objects.
+X */
+Xstatic FREELIST	freelist = {
+X	sizeof(OBJECT),		/* size of typical objects */
+X	100			/* number of free objects to keep */
+X};
+X
+X
+Xstatic VALUE objpowi();
+Xstatic BOOL objtest(), objcmp();
+Xstatic void objprint();
+X
+X
+X/*
+X * Show all the routine names available for objects.
+X */
+Xvoid
+Xshowobjfuncs()
+X{
+X	register struct objectinfo *oip;
+X
+X	printf("\nThe following object routines are definable.\n");
+X	printf("Note: xx represents the actual object type name.\n\n");
+X	printf("Name	Args	Comments\n");
+X	for (oip = objectinfo; oip->name; oip++) {
+X		printf("xx_%-8s %d	%s\n", oip->name, oip->args,
+X			oip->comment ? oip->comment : "");
+X	}
+X	printf("\n");
+X}
+X
+X
+X/*
+X * Call the appropriate user-defined routine to handle an object action.
+X * Returns the value that the routine returned.
+X */
+X/*VARARGS*/
+XVALUE
+Xobjcall(action, v1, v2, v3)
+X	VALUE *v1, *v2, *v3;
+X{
+X	FUNC *fp;		/* function to call */
+X	OBJECTACTIONS *oap;	/* object to call for */
+X	struct objectinfo *oip;	/* information about action */
+X	long index;		/* index of function (negative if undefined) */
+X	VALUE val;		/* return value */
+X	VALUE tmp;		/* temp value */
+X	char name[SYMBOLSIZE+1];	/* full name of user routine to call */
+X
+X	if ((unsigned)action > OBJ_MAXFUNC)
+X		error("Illegal action for object call");
+X	oip = &objectinfo[action];
+X	if (v1->v_type == V_OBJ)
+X		oap = v1->v_obj->o_actions;
+X	else if (v2->v_type == V_OBJ)
+X		oap = v2->v_obj->o_actions;
+X	else
+X		error("Object routine called with non-object");
+X	index = oap->actions[action];
+X	if (index == 0) {
+X		strcpy(name, oap->name);
+X		strcat(name, "_");
+X		strcat(name, oip->name);
+X		index = adduserfunc(name);
+X		oap->actions[action] = index;
+X	}
+X	fp = NULL;
+X	if (index > 0)
+X		fp = findfunc(index);
+X	if (fp == NULL) {
+X		switch (oip->error) {
+X			case E_PRINT:
+X				objprint(v1->v_obj);
+X				val.v_type = V_NULL;
+X				break;
+X			case E_CMP:
+X				val.v_type = V_INT;
+X				if (v1->v_type != v2->v_type) {
+X					val.v_int = 1;
+X					return val;
+X				}
+X				val.v_int = objcmp(v1->v_obj, v2->v_obj);
+X				break;
+X			case E_TEST:
+X				val.v_type = V_INT;
+X				val.v_int = objtest(v1->v_obj);
+X				break;
+X			case E_POW:
+X				if (v2->v_type != V_NUM)
+X					error("Non-real power");
+X				val = objpowi(v1, v2->v_num);
+X				break;
+X			case E_ONE:
+X				val.v_type = V_NUM;
+X				val.v_num = qlink(&_qone_);
+X				break;
+X			case E_INC:
+X				tmp.v_type = V_NUM;
+X				tmp.v_num = &_qone_;
+X				val = objcall(OBJ_ADD, v1, &tmp);
+X				break;
+X			case E_DEC:
+X				tmp.v_type = V_NUM;
+X				tmp.v_num = &_qone_;
+X				val = objcall(OBJ_SUB, v1, &tmp);
+X				break;
+X			case E_SQUARE:
+X				val = objcall(OBJ_MUL, v1, v1);
+X				break;
+X			default:
+X				error("Function \"%s\" is undefined", namefunc(index));
+X		}
+X		return val;
+X	}
+X	switch (oip->args) {
+X		case 0:
+X			break;
+X		case 1:
+X			++stack;
+X			stack->v_addr = v1;
+X			stack->v_type = V_ADDR;
+X			break;
+X		case 2:
+X			++stack;
+X			stack->v_addr = v1;
+X			stack->v_type = V_ADDR;
+X			++stack;
+X			stack->v_addr = v2;
+X			stack->v_type = V_ADDR;
+X			break;
+X		case 3:
+X			++stack;
+X			stack->v_addr = v1;
+X			stack->v_type = V_ADDR;
+X			++stack;
+X			stack->v_addr = v2;
+X			stack->v_type = V_ADDR;
+X			++stack;
+X			stack->v_addr = v3;
+X			stack->v_type = V_ADDR;
+X			break;
+X		default:
+X			error("Bad number of args to calculate");
+X	}
+X	calculate(fp, oip->args);
+X	switch (oip->retval) {
+X		case A_VALUE:
+X			return *stack--;
+X		case A_UNDEF:
+X			freevalue(stack--);
+X			val.v_type = V_NULL;
+X			break;
+X		case A_INT:
+X			if ((stack->v_type != V_NUM) || qisfrac(stack->v_num))
+X				error("Integer return value required");
+X			index = qtoi(stack->v_num);
+X			qfree(stack->v_num);
+X			stack--;
+X			val.v_type = V_INT;
+X			val.v_int = index;
+X			break;
+X		default:
+X			error("Bad object return");
+X	}
+X	return val;
+X}
+X
+X
+X/*
+X * Routine called to clear the cache of known undefined functions for
+X * the objects.  This changes negative indices back into positive ones
+X * so that they will all be checked for existence again.
+X */
+Xvoid
+Xobjuncache()
+X{
+X	register int *ip;
+X	int i, j;
+X
+X	i = objectnames.h_count;
+X	while (--i >= 0) {
+X		ip = objects[i]->actions;
+X		for (j = OBJ_MAXFUNC; j-- >= 0; ip++)
+X			if (*ip < 0)
+X				*ip = -*ip;
+X	}
+X}
+X
+X
+X/*
+X * Print the elements of an object in short and unambiguous format.
+X * This is the default routine if the user's is not defined.
+X */
+Xstatic void
+Xobjprint(op)
+X	OBJECT *op;		/* object being printed */
+X{
+X	int count;		/* number of elements */
+X	int i;			/* index */
+X
+X	count = op->o_actions->count;
+X	math_fmt("obj %s {", op->o_actions->name);
+X	for (i = 0; i < count; i++) {
+X		if (i)
+X			math_str(", ");
+X		printvalue(&op->o_table[i], PRINT_SHORT | PRINT_UNAMBIG);
+X	}
+X	math_chr('}');
+X}
+X
+X
+X/*
+X * Test an object for being "nonzero".
+X * This is the default routine if the user's is not defined.
+X * Returns TRUE if any of the elements are "nonzero".
+X */
+Xstatic BOOL
+Xobjtest(op)
+X	OBJECT *op;
+X{
+X	int i;			/* loop counter */
+X
+X	i = op->o_actions->count;
+X	while (--i >= 0) {
+X		if (testvalue(&op->o_table[i]))
+X			return TRUE;
+X	}
+X	return FALSE;
+X}
+X
+X
+X/*
+X * Compare two objects for equality, returning TRUE if they differ.
+X * This is the default routine if the user's is not defined.
+X * For equality, all elements must be equal.
+X */
+Xstatic BOOL
+Xobjcmp(op1, op2)
+X	OBJECT *op1, *op2;
+X{
+X	int i;			/* loop counter */
+X
+X	if (op1->o_actions != op2->o_actions)
+X		return TRUE;
+X	i = op1->o_actions->count;
+X	while (--i >= 0) {
+X		if (comparevalue(&op1->o_table[i], &op2->o_table[i]))
+X			return TRUE;
+X	}
+X	return FALSE;
+X}
+X
+X
+X/*
+X * Raise an object to an integral power.
+X * This is the default routine if the user's is not defined.
+X * Negative powers mean the positive power of the inverse.
+X * Zero means the multiplicative identity.
+X */
+Xstatic VALUE
+Xobjpowi(vp, q)
+X	VALUE *vp;		/* value to be powered */
+X	NUMBER *q;		/* power to raise number to */
+X{
+X	VALUE res, tmp;
+X	long power;		/* power to raise to */
+X	unsigned long bit;	/* current bit value */
+X
+X	if (qisfrac(q))
+X		error("Raising object to non-integral power");
+X	if (isbig(q->num))
+X		error("Raising object to very large power");
+X	power = (istiny(q->num) ? z1tol(q->num) : z2tol(q->num));
+X	if (qisneg(q))
+X		power = -power;
+X	/*
+X	 * Handle some low powers specially
+X	 */
+X	if ((power <= 2) && (power >= -2)) {
+X		switch ((int) power) {
+X			case 0:
+X				return objcall(OBJ_ONE, vp);
+X			case 1:
+X				res.v_obj = objcopy(vp->v_obj);
+X				res.v_type = V_OBJ;
+X				return res;
+X			case -1:
+X				return objcall(OBJ_INV, vp);
+X			case 2:
+X				return objcall(OBJ_SQUARE, vp);
+X		}
+X	}
+X	if (power < 0)
+X		power = -power;
+X	/*
+X	 * Compute the power by squaring and multiplying.
+X	 * This uses the left to right method of power raising.
+X	 */
+X	bit = TOPFULL;
+X	while ((bit & power) == 0)
+X		bit >>= 1L;
+X	bit >>= 1L;
+X	res = objcall(OBJ_SQUARE, vp);
+X	if (bit & power) {
+X		tmp = objcall(OBJ_MUL, &res, vp);
+X		objfree(res.v_obj);
+X		res = tmp;
+X	}
+X	bit >>= 1L;
+X	while (bit) {
+X		tmp = objcall(OBJ_SQUARE, &res);
+X		objfree(res.v_obj);
+X		res = tmp;
+X		if (bit & power) {
+X			tmp = objcall(OBJ_MUL, &res, vp);
+X			objfree(res.v_obj);
+X			res = tmp;
+X		}
+X		bit >>= 1L;
+X	}
+X	if (qisneg(q)) {
+X		tmp = objcall(OBJ_INV, &res);
+X		objfree(res.v_obj);
+X		return tmp;
+X	}
+X	return res;
+X}
+X
+X
+X/*
+X * Define a (possibly) new class of objects.
+X * Returns the index of the object name which identifies it.
+X * This index can then be used to reference the object actions.
+X * The list of indexes for the element names is also specified here,
+X * and the number of elements defined for the object.
+X */
+Xdefineobject(name, indices, count)
+X	char *name;		/* name of object type */
+X	int indices[];		/* table of indices for elements */
+X{
+X	OBJECTACTIONS *oap;	/* object definition structure */
+X	STRINGHEAD *hp;
+X	int index;
+X
+X	hp = &objectnames;
+X	if (hp->h_list == NULL)
+X		initstr(hp);
+X	index = findstr(hp, name);
+X	if (index >= 0)
+X		error("Object type \"%s\" is already defined", name);
+X	if (hp->h_count >= MAXOBJECTS)
+X		error("Too many object types in use");
+X	oap = (OBJECTACTIONS *) malloc(objectactionsize(count));
+X	if (oap)
+X		name = addstr(hp, name);
+X	if ((oap == NULL) || (name == NULL))
+X		error("Cannot allocate object type");
+X	oap->name = name;
+X	oap->count = count;
+X	for (index = OBJ_MAXFUNC; index >= 0; index--)
+X		oap->actions[index] = 0;
+X	for (index = 0; index < count; index++)
+X		oap->elements[index] = indices[index];
+X	index = findstr(hp, name);
+X	objects[index] = oap;
+X	return index;
+X}
+X
+X
+X/*
+X * Check an object name to see if it is currently defined.
+X * If so, the index for the object type is returned.
+X * If the object name is currently unknown, then -1 is returned.
+X */
+Xcheckobject(name)
+X	char *name;
+X{
+X	STRINGHEAD *hp;
+X
+X	hp = &objectnames;
+X	if (hp->h_list == NULL)
+X		return -1;
+X	return findstr(hp, name);
+X}
+X
+X
+X/*
+X * Define a (possibly) new element name for an object.
+X * Returns an index which identifies the element name.
+X */
+Xaddelement(name)
+X	char *name;
+X{
+X	STRINGHEAD *hp;
+X	int index;
+X
+X	hp = &elements;
+X	if (hp->h_list == NULL)
+X		initstr(hp);
+X	index = findstr(hp, name);
+X	if (index >= 0)
+X		return index;
+X	if (addstr(hp, name) == NULL)
+X		error("Cannot allocate element name");
+X	return findstr(hp, name);
+X}
+X
+X
+X/*
+X * Return the index which identifies an element name.
+X * Returns minus one if the element name is unknown.
+X */
+Xfindelement(name)
+X	char *name;		/* element name */
+X{
+X	if (elements.h_list == NULL)
+X		return -1;
+X	return findstr(&elements, name);
+X}
+X
+X
+X/*
+X * Return the value table offset to be used for an object element name.
+X * This converts the element index from the element table into an offset
+X * into the object value array.  Returns -1 if the element index is unknown.
+X */
+Xobjoffset(op, index)
+X	OBJECT *op;
+X	long index;
+X{
+X	register OBJECTACTIONS *oap;
+X	int offset;			/* offset into value array */
+X
+X	oap = op->o_actions;
+X	for (offset = oap->count - 1; offset >= 0; offset--) {
+X		if (oap->elements[offset] == index)
+X			return offset;
+X	}
+X	return -1;
+X}
+X
+X
+X/*
+X * Allocate a new object structure with the specified index.
+X */
+XOBJECT *
+Xobjalloc(index)
+X	long index;
+X{
+X	OBJECTACTIONS *oap;
+X	OBJECT *op;
+X	VALUE *vp;
+X	int i;
+X
+X	if ((unsigned) index >= MAXOBJECTS)
+X		error("Allocating bad object index");
+X	oap = objects[index];
+X	if (oap == NULL)
+X		error("Object type not defined");
+X	i = oap->count;
+X	if (i < USUAL_ELEMENTS)
+X		i = USUAL_ELEMENTS;
+X	if (i == USUAL_ELEMENTS)
+X		op = (OBJECT *) allocitem(&freelist);
+X	else
+X		op = (OBJECT *) malloc(objectsize(i));
+X	if (op == NULL)
+X		error("Cannot allocate object");
+X	op->o_actions = oap;
+X	vp = op->o_table;
+X	for (i = oap->count; i-- > 0; vp++)
+X		vp->v_type = V_NULL;
+X	return op;
+X}
+X
+X
+X/*
+X * Free an object structure.
+X */
+Xvoid
+Xobjfree(op)
+X	register OBJECT *op;
+X{
+X	VALUE *vp;
+X	int i;
+X
+X	vp = op->o_table;
+X	for (i = op->o_actions->count; i-- > 0; vp++) {
+X		if (vp->v_type == V_NUM) {
+X			qfree(vp->v_num);
+X		} else
+X			freevalue(vp);
+X	}
+X	if (op->o_actions->count <= USUAL_ELEMENTS)
+X		freeitem(&freelist, (FREEITEM *) op);
+X	else
+X		free((char *) op);
+X}
+X
+X
+X/*
+X * Copy an object value
+X */
+XOBJECT *
+Xobjcopy(op)
+X	OBJECT *op;
+X{
+X	VALUE *v1, *v2;
+X	OBJECT *np;
+X	int i;
+X
+X	i = op->o_actions->count;
+X	if (i < USUAL_ELEMENTS)
+X		i = USUAL_ELEMENTS;
+X	if (i == USUAL_ELEMENTS)
+X		np = (OBJECT *) allocitem(&freelist);
+X	else
+X		np = (OBJECT *) malloc(objectsize(i));
+X	if (np == NULL)
+X		error("Cannot allocate object");
+X	np->o_actions = op->o_actions;
+X	v1 = op->o_table;
+X	v2 = np->o_table;
+X	for (i = op->o_actions->count; i-- > 0; v1++, v2++) {
+X		if (v1->v_type == V_NUM) {
+X			v2->v_num = qlink(v1->v_num);
+X			v2->v_type = V_NUM;
+X		} else
+X			copyvalue(v1, v2);
+X	}
+X	return np;
+X}
+X
+X/* END CODE */
+END_OF_FILE
+if test 14633 -ne `wc -c <'obj.c'`; then
+    echo shar: \"'obj.c'\" unpacked with wrong size!
+fi
+# end of 'obj.c'
+fi
+echo shar: End of archive 7 \(of 21\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 21 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

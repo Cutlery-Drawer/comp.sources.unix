@@ -1,0 +1,1590 @@
+Subject:  v21i100:  An Automounter for NFS systems, Part12/13
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: 60838ad5 301504fc 75b51c90 692b9c79
+
+Submitted-by: Jan-Simon Pendry <jsp@doc.ic.ac.uk>
+Posting-number: Volume 21, Issue 100
+Archive-name: amd/part12
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 12 (of 13)."
+# Contents:  afs_ops.c
+# Wrapped by rsalz@papaya.bbn.com on Tue Apr 10 15:12:16 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'afs_ops.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'afs_ops.c'\"
+else
+echo shar: Extracting \"'afs_ops.c'\" \(34481 characters\)
+sed "s/^X//" >'afs_ops.c' <<'END_OF_FILE'
+X/*
+X * $Id: afs_ops.c,v 5.1.1.3 90/01/11 16:58:01 jsp Exp Locker: jsp $
+X *
+X * Copyright (c) 1990 Jan-Simon Pendry
+X * Copyright (c) 1990 Imperial College of Science, Technology & Medicine
+X * Copyright (c) 1990 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Jan-Simon Pendry at Imperial College, London.
+X *
+X * Redistribution and use in source and binary forms are permitted
+X * provided that the above copyright notice and this paragraph are
+X * duplicated in all such forms and that any documentation,
+X * advertising materials, and other materials related to such
+X * distribution and use acknowledge that the software was developed
+X * by Imperial College of Science, Technology and Medicine, London, UK.
+X * The names of the College and University may not be used to endorse
+X * or promote products derived from this software without specific
+X * prior written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+X * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+X * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X *
+X *	%W% (Berkeley) %G%
+X */
+X
+X#include "am.h"
+X
+X#define NFS
+X#define NFSCLIENT
+X
+X#include <sys/stat.h>
+X#ifdef NFS_3
+Xtypedef nfs_fh fhandle_t;
+X#endif
+X#ifdef NFS_HDR
+X#include NFS_HDR
+X#endif
+X#include <sys/mount.h>
+X#include "mount.h"
+X
+X/*
+X * Automount file system
+X */
+X
+X/*
+X * Interval between forced retries of a mount.
+X */
+X#define RETRY_INTERVAL	2
+X
+X/*
+X * AFS needs nothing in particular.
+X */
+Xstatic int afs_match(fo)
+Xam_opts *fo;
+X{
+X	char *p = fo->opt_rfs;
+X	if (!fo->opt_rfs) {
+X		plog(XLOG_USER, "auto: no mount point named (rfs:=)");
+X		return 0;
+X	}
+X	if (!fo->opt_fs) {
+X		plog(XLOG_USER, "auto: no map named (fs:=)");
+X		return 0;
+X	}
+X	/*
+X	 * Swap round fs:= and rfs:= options
+X	 * ... historical (jsp)
+X	 */
+X	fo->opt_rfs = fo->opt_fs;
+X	fo->opt_fs = p;
+X	/*
+X	 * fs_mtab turns out to be the name of the mount map
+X	 */
+X	fo->fs_mtab = strealloc(fo->fs_mtab, fo->opt_rfs ? fo->opt_rfs : ".");
+X	return 1;
+X}
+X
+Xstatic int afs_init(mf)
+Xmntfs *mf;
+X{
+X	/*
+X	 * Fill in attribute fields
+X	 */
+X	mf->mf_fattr.type = NFDIR;
+X	mf->mf_fattr.mode = NFSMODE_DIR | 0555;
+X	mf->mf_fattr.nlink = 2;
+X	mf->mf_fattr.size = 512;
+X
+X	return 0;
+X}
+X
+X/*
+X * Mount the an automounter directory.
+X * The automounter is connected into the system
+X * as a user-level NFS server.  mount_afs constructs
+X * the necessary NFS parameters to be given to the
+X * kernel so that it will talk back to us.
+X */
+Xstatic int mount_afs(dir, fs_name, opts)
+Xchar *dir;
+Xchar *fs_name;
+Xchar *opts;
+X{
+X	struct nfs_args nfs_args;
+X	struct mntent mnt;
+X	int retry;
+X	struct sockaddr_in sin;
+X	unsigned short port;
+X	int flags;
+X	extern nfs_fh *root_fh();
+X	char fs_hostname[MAXHOSTNAMELEN+MAXPATHLEN+1];
+X
+X	MTYPE_TYPE type = MOUNT_TYPE_NFS;
+X
+X	bzero((voidp) &nfs_args, sizeof(nfs_args));	/* Paranoid */
+X
+X	mnt.mnt_dir = dir;
+X	mnt.mnt_fsname = fs_name;
+X	mnt.mnt_type = MNTTYPE_AUTO;
+X	mnt.mnt_opts = opts;
+X	mnt.mnt_freq = 0;
+X	mnt.mnt_passno = 0;
+X
+X	retry = hasmntval(&mnt, "retry");
+X	if (retry <= 0)
+X		retry = 2;	/* XXX */
+X
+X	/*
+X	 * get fhandle of remote path for automount point
+X	 */
+X	nfs_args.fh = (NFS_FH_TYPE) root_fh(fs_name);
+X
+X	if (!nfs_args.fh) {
+X		plog(XLOG_FATAL, "Can't find root file handle for %s", fs_name);
+X		return EINVAL;
+X	}
+X
+X	/*
+X	 * Create sockaddr to point to the local machine.  127.0.0.1
+X	 * is not used since that will not work in HP-UX clusters and
+X	 * this is no more expensive.
+X	 */
+X	bzero((voidp) &sin, sizeof(sin));
+X	sin.sin_family = AF_INET;
+X	sin.sin_addr = myipaddr;
+X	if (port = hasmntval(&mnt, "port")) {
+X		sin.sin_port = htons(port);
+X	} else {
+X		plog(XLOG_ERROR, "no port number specified for %s", fs_name);
+X		return EINVAL;
+X	}
+X
+X	/*
+X	 * set mount args
+X	 */
+X	nfs_args.addr = &sin;
+X
+X	/*
+X	 * Make a ``hostname'' string for the kernel
+X	 */
+X#ifdef SHORT_MOUNT_NAME
+X	sprintf(fs_hostname, "amd:%d", mypid);
+X#else
+X	sprintf(fs_hostname, "pid%d@%s:%s", mypid, hostname, dir);
+X#endif
+X	nfs_args.hostname = fs_hostname;
+X	nfs_args.flags |= NFSMNT_HOSTNAME;
+X#ifdef HOSTNAMESZ
+X	/*
+X	 * Most kernels have a name length restriction.
+X	 */
+X	if (strlen(fs_hostname) >= HOSTNAMESZ)
+X		strcpy(fs_hostname + HOSTNAMESZ - 3, "..");
+X#endif
+X
+X	/*
+X	 * Parse a subset of the standard nfs options.  The
+X	 * others are probably irrelevant for this application
+X	 */
+X	if (nfs_args.timeo = hasmntval(&mnt, "timeo"))
+X		nfs_args.flags |= NFSMNT_TIMEO;
+X
+X	if (nfs_args.retrans = hasmntval(&mnt, "retrans"))
+X		nfs_args.flags |= NFSMNT_RETRANS;
+X
+X#if defined(NFSMNT_ACREGMIN) && defined(NFSMNT_ACREGMAX)
+X	/*
+X	 * Don't cache attributes - they are changing under
+X	 * the kernel's feet...
+X	 */
+X	nfs_args.acregmin = nfs_args.acregmax = 1;
+X	nfs_args.flags |= NFSMNT_ACREGMIN|NFSMNT_ACREGMAX;
+X#endif
+X	/*
+X	 * These two are constructed internally by the calling routine
+X	 */
+X	if (hasmntopt(&mnt, MNTOPT_SOFT) != NULL)
+X		nfs_args.flags |= NFSMNT_SOFT;
+X
+X#ifdef MNTOPT_INTR
+X	if (hasmntopt(&mnt, MNTOPT_INTR) != NULL)
+X		nfs_args.flags |= NFSMNT_INT;
+X#endif
+X
+X	flags = compute_mount_flags(&mnt);
+X#ifdef ULTRIX_HACK
+X	nfs_args.gfs_flags = flags;
+X	flags &= M_RDONLY;
+X	if (flags & M_RDONLY)
+X		nfs_args.flags |= NFSMNT_RONLY;
+X#endif
+X	return mount_fs(&mnt, flags, (caddr_t) &nfs_args, retry, type);
+X}
+X
+Xstatic int afs_mount(mp)
+Xam_node *mp;
+X{
+X	mntfs *mf = mp->am_mnt;
+X
+X	/*
+X	 * There are two cases to consider...
+X	 */
+X	if (mp->am_parent && mp->am_parent->am_parent) {
+X		/*
+X		 * If this am_node has a parent which is not the root node, in
+X		 * which case we are supplying a pseudo-directory, in which
+X		 * case no action is needed.  Pseudo-directories are used to
+X		 * provide some structure to the automounted directories instead
+X		 * of putting them all in the top-level automount directory.
+X		 */
+X		mp->am_parent->am_mnt->mf_fattr.nlink++;
+X		/*
+X		 * Info field of . means use parent's info field.
+X		 */
+X		if (mf->mf_info[0] == '.' && mf->mf_info[1] == '\0')
+X			mf->mf_info = strealloc(mf->mf_info, mp->am_parent->am_mnt->mf_info);
+X		/*
+X		 * Compute prefix:
+X		 *
+X		 * If there is an option prefix then use that else
+X		 * If the parent had a prefix then use that with name
+X		 *	of this node appended else
+X		 * Use the name of this node.
+X		 *
+X		 * That means if you want no prefix you must say so
+X		 * in the map.
+X		 */
+X		if (mf->mf_fo->opt_pref) {
+X			/*
+X			 * the prefix specified as an option
+X			 */
+X			mp->am_pref = strdup(mf->mf_fo->opt_pref);
+X		} else {
+X			/*
+X			 * else the parent's prefix
+X			 * followed by the name
+X			 * followed by /
+X			 */
+X			char *ppref = mp->am_parent->am_pref;
+X			if (ppref == 0)
+X				ppref = "";
+X			mp->am_pref = str3cat((char *) 0, ppref, mp->am_name, "/");
+X		}
+X	} else {
+X		/*
+X		 * Otherwise, we are mounting the automounter.  In which case
+X		 * we need to make sure the mount directory exists, construct
+X		 * the mount options and call the mount_afs routine.
+X		 */
+X		struct stat stb;
+X		char opts[256];
+X		int error;
+X
+X		/*
+X		 * Top-level mount - so make
+X		 * sure the mount point exists
+X		 * and is a directory.
+X		 */
+X		error = mkdirs(mp->am_path, 0555);
+X		if (error)
+X			return error;
+X		mp->am_flags |= AMF_MKPATH;
+X
+X		if (stat(mp->am_path, &stb) < 0) {
+X			return errno;
+X		} else if ((stb.st_mode & S_IFMT) != S_IFDIR) {
+X			plog(XLOG_WARNING, "%s is not a directory", mp->am_path);
+X			return ENOTDIR;
+X		}
+X
+X		mf->mf_mount = strealloc(mf->mf_mount, mp->am_path);
+X
+X		/*
+X		 * Construct some mount options
+X		 */
+X		sprintf(opts,
+X#ifdef MNTOPT_INTR
+X			"%s,%s,%s=%d,%s=%d,%s=%d,%sdirect",
+X			MNTOPT_INTR,
+X#else
+X			"%s,%s=%d,%s=%d,%s=%d,%sdirect",
+X#endif
+X#ifdef AUTOMOUNT_RO
+X			MNTOPT_RO,	/* You don't really want this... */
+X#else
+X			"rw",
+X#endif
+X			"port", nfs_port,
+X			"timeo", afs_timeo,
+X			"retrans", afs_retrans,
+X			mf->mf_ops == &afs_ops ? "in" : "");
+X
+X		error = mount_afs(mp->am_path, mp->am_name, opts);
+X		if (error) {
+X			errno = error;
+X			plog(XLOG_FATAL, "mount_afs: %m");
+X			return error;
+X		}
+X		mp->am_name = pid_fsname;
+X	}
+X
+X	/*
+X	 * Build a new map cache for this node, or re-use
+X	 * an existing cache for the same map.
+X	 */
+X	{ char *cache;
+X	  if (mf->mf_fo->opt_cache)
+X	  	cache = mf->mf_fo->opt_cache;
+X	  else
+X	  	cache = "none";
+X	  mf->mf_private = (voidp) mapc_find(mf->mf_info, cache);
+X	  mf->mf_prfree = mapc_free;
+X	}
+X
+X	return 0;
+X}
+X
+X/*
+X * Unmount an automount node
+X */
+Xstatic int afs_umount(mp)
+Xam_node *mp;
+X{
+X	int error;
+X
+X	/*
+X	 * If this is a pseudo-directory then just adjust the link count
+X	 * in the parent, otherwise call the generic unmount routine
+X	 */
+X	if (!mp->am_parent) {
+X		error = 0;
+X	} else if (mp->am_parent && mp->am_parent->am_parent) {
+X		--mp->am_parent->am_mnt->mf_fattr.nlink;
+X		error = 0;
+X	} else {
+X		struct stat stb;
+Xagain:
+X		/*
+X		 * The lstat is needed if this mount is type=direct.
+X		 * When that happens, the kernel cache gets confused
+X		 * between the underlying type (dir) and the mounted
+X		 * type (link) and so needs to be re-synced before
+X		 * the unmount.  This is all because the unmount system
+X		 * call follows links and so can't actually unmount
+X		 * a link (stupid!).  It was noted that doing and ls -ld
+X		 * of the mount point to see why things were not working
+X		 * actually fixed the problem - so simulate an ls -ld here.
+X		 */
+X		if (lstat(mp->am_path, &stb) < 0) {
+X#ifdef DEBUG
+X			dlog("lstat(%s): %m", mp->am_path);
+X#endif
+X		}
+X		error = UMOUNT_FS(mp->am_path);
+X		if (error == EBUSY) {
+X			plog(XLOG_WARNING, "afs_unmount retrying %s in 1s", mp->am_path);
+X			sleep(1);	/* XXX */
+X			goto again;
+X		}
+X	}
+X
+X	return error;
+X}
+X
+X/*
+X * Unmount an automount node
+X */
+Xstatic void afs_umounted(mp)
+Xam_node *mp;
+X{
+X	/*
+X	 * If this is a pseudo-directory then just adjust the link count
+X	 * in the parent, otherwise call the generic unmount routine
+X	 */
+X	if (mp->am_parent && mp->am_parent->am_parent)
+X		--mp->am_parent->am_mnt->mf_fattr.nlink;
+X}
+X
+X/*
+X * Mounting a file system may take a significant period of time.  The
+X * problem is that if this is done in the main process thread then
+X * the entire automounter could be blocked, possibly hanging lots of
+X * processes on the system.  Instead we use a continuation scheme to
+X * allow mounts to be attempted in a sub-process.  When the sub-process
+X * exits we pick up the exit status (by convention a UN*X error number)
+X * and continue in a notifier.  The notifier gets handed a data structure
+X * and can then determine whether the mount was successful or not.  If
+X * not, it updates the data structure and tries again until there are no
+X * more ways to try the mount, or some other permanent error occurs.
+X * In the mean time no RPC reply is sent, even after the mount is succesful.
+X * We rely on the RPC retry mechanism to resend the lookup request which
+X * can then be handled.
+X */
+X
+X
+Xstruct continuation {
+X	char **ivec;		/* Current mount info */
+X	am_node *mp;		/* Node we are trying to mount */
+X	char *key;		/* Map key */
+X	char *info;		/* Info string */
+X	char **xivec;		/* Saved strsplit vector */
+X	char *opts;		/* Mount options */
+X	am_opts fs_opts;	/* Filesystem options */
+X	char *def_opts;		/* Default options */
+X	int retry;		/* Try again? */
+X	int tried;		/* Have we tried any yet? */
+X	time_t start;		/* Time we started this mount */
+X	int callout;		/* Callout identifier */
+X};
+X
+X/*
+X * Discard an old continuation
+X */
+Xstatic void free_continuation(cp)
+Xstruct continuation *cp;
+X{
+X	if (cp->callout)
+X		untimeout(cp->callout);
+X	free((voidp) cp->key);
+X	free((voidp) cp->xivec);
+X	free((voidp) cp->info);
+X	free((voidp) cp->opts);
+X	free((voidp) cp->def_opts);
+X	free_opts(&cp->fs_opts);
+X	free((voidp) cp);
+X}
+X
+Xstatic int afs_bgmount P((struct continuation*, int));
+X
+X/*
+X * Discard the underlying mount point and replace
+X * with a reference to an error filesystem.
+X */
+Xstatic void assign_error_mntfs(mp)
+Xam_node *mp;
+X{
+X	if (mp->am_error > 0) {
+X		/*
+X		 * Save the old error code
+X		 */
+X		int error = mp->am_error;
+X		/*
+X		 * Discard the old filesystem
+X		 */
+X		free_mntfs(mp->am_mnt);
+X		/*
+X		 * Allocate a new error reference
+X		 */
+X		mp->am_mnt = new_mntfs();
+X		/*
+X		 * Put back the error code
+X		 */
+X		mp->am_mnt->mf_error = error;
+X		mp->am_mnt->mf_flags |= MFF_ERROR;
+X		/*
+X		 * Zero the error in the mount point
+X		 */
+X		mp->am_error = 0;
+X	}
+X}
+X
+X/*
+X * The continuation function.  This is called by
+X * the task notifier when a background mount attempt
+X * completes.
+X */
+Xstatic void afs_cont(rc, term, closure)
+Xint rc;
+Xint term;
+Xvoidp closure;
+X{
+X	struct continuation *cp = (struct continuation *) closure;
+X	mntfs *mf = cp->mp->am_mnt;
+X
+X	/*
+X	 * Definitely not trying to mount at the moment
+X	 */
+X	mf->mf_flags &= ~MFF_MOUNTING;
+X	/*
+X	 * While we are mounting - try to avoid race conditions
+X	 */
+X	new_ttl(cp->mp);
+X
+X	/*
+X	 * Wakeup anything waiting for this mount
+X	 */
+X	wakeup((voidp) mf);
+X
+X	/*
+X	 * Check for termination signal or exit status...
+X	 */
+X	if (rc || term) {
+X		if (term) {
+X			/*
+X			 * Not sure what to do for an error code.
+X			 */
+X			mf->mf_error = EIO;	/* XXX ? */
+X			mf->mf_flags |= MFF_ERROR;
+X			plog(XLOG_ERROR, "mount for %s got signal %d", cp->mp->am_path, term);
+X		} else {
+X			/*
+X			 * Check for exit status...
+X			 */
+X			mf->mf_error = rc;
+X			mf->mf_flags |= MFF_ERROR;
+X			errno = rc;	/* XXX */
+X			plog(XLOG_ERROR, "%s: mount (afs_cont): %m", cp->mp->am_path);
+X		}
+X
+X		/*
+X		 * If we get here then that attempt didn't work, so
+X		 * move the info vector pointer along by one and
+X		 * call the background mount routine again
+X		 */
+X		amd_stats.d_merr++;
+X		cp->ivec++;
+X		(void) afs_bgmount(cp, 0);
+X		assign_error_mntfs(cp->mp);
+X	} else {
+X		/*
+X		 * The mount worked.
+X		 */
+X		am_mounted(cp->mp);
+X		free_continuation(cp);
+X	}
+X
+X	reschedule_timeout_mp();
+X}
+X
+X/*
+X * Retry a mount
+X */
+X/*ARGSUSED*/
+Xstatic void afs_retry(rc, term, closure)
+Xint rc;
+Xint term;
+Xvoidp closure;
+X{
+X	struct continuation *cp = (struct continuation *) closure;
+X	int error = 0;
+X
+X#ifdef DEBUG
+X	dlog("Commencing retry for mount of %s", cp->mp->am_path);
+X#endif
+X
+X	if ((cp->start + ALLOWED_MOUNT_TIME) < clocktime()) {
+X		/*
+X		 * The entire mount has timed out.
+X		 * Set the error code and skip past
+X		 * all the info vectors so that
+X		 * afs_bgmount will not have any more
+X		 * ways to try the mount, so causing
+X		 * an error.
+X		 */
+X		plog(XLOG_INFO, "mount of \"%s\" has timed out", cp->mp->am_path);
+X		error = ETIMEDOUT;
+X		new_ttl(cp->mp);
+X		while (*cp->ivec)
+X			cp->ivec++;
+X	}
+X
+X	(void) afs_bgmount(cp, error);
+X	reschedule_timeout_mp();
+X}
+X
+X/*
+X * Try to mount a file system.  Can be called
+X * directly or in a sub-process by run_task
+X */
+Xstatic int try_mount(mp)
+Xam_node *mp;
+X{
+X	/*
+X	 * Mount it!
+X	 */
+X	int error;
+X
+X	error = mount_node(mp);
+X#ifdef DEBUG
+X	if (error) {
+X		errno = error;
+X		dlog("afs call to mount_node failed: %m");
+X	}
+X#endif
+X	return error;
+X}
+X
+X/*
+X * Pick a file system to try mounting and
+X * do that in the background if necessary
+X *
+XFor each location:
+X	if it is new -defaults then
+X		extract and process
+X		continue;
+X	fi
+X	if it is a cut then
+X		if a location has been tried then
+X			break;
+X		fi
+X		continue;
+X	fi
+X	parse mount location
+X	discard previous mount location if required
+X	find matching mounted filesystem
+X	if not applicable then
+X		this_error = No such file or directory
+X		continue
+X	fi
+X	if the filesystem failed to be mounted then
+X		this_error = error from filesystem
+X	elif the filesystem is mounting or unmounting then
+X		this_error = -1
+X	elif the fileserver is down then
+X		this_error = -1
+X	elif the filesystem is already mounted
+X		this_error = 0
+X		break
+X	fi
+X	if no error on this mount then
+X		this_error = initialise mount point
+X	fi
+X	if no error on this mount and mount is delayed then
+X		this_error = -1
+X	fi
+X	if this_error < 0 then
+X		retry = true
+X	fi
+X	if no error on this mount then
+X		make mount point if required
+X	fi
+X	if no error on this mount then
+X		if mount in background then
+X			run mount in background
+X			return -1
+X		else
+X			this_error = mount in foreground
+X		fi
+X	fi
+X	if an error occured on this mount then
+X		update stats
+X		save error in mount point
+X	fi
+Xendfor
+X */
+X
+Xstatic int afs_bgmount(cp, mpe)
+Xstruct continuation *cp;
+Xint mpe;
+X{
+X	mntfs *mf = cp->mp->am_mnt;	/* Current mntfs */
+X	mntfs *mf_retry = 0;		/* First mntfs which needed retrying */
+X	int this_error = -1;		/* Per-mount error */
+X	int hard_error = -1;
+X	int mp_error = mpe;
+X
+X	/*
+X	 * Try to mount each location.
+X	 * At the end:
+X	 * hard_error == 0 indicates something was mounted.
+X	 * hard_error > 0 indicates everything failed with a hard error
+X	 * hard_error < 0 indicates nothing could be mounted now
+X	 */
+X	for (; this_error && *cp->ivec; cp->ivec++) {
+X		am_ops *p;
+X		am_node *mp = cp->mp;
+X		char *link_dir;
+X		int dont_retry;
+X
+X		if (hard_error < 0)
+X			hard_error = this_error;
+X
+X		this_error = -1;
+X
+X		if (**cp->ivec == '-') {
+X			/*
+X			 * Pick up new defaults
+X			 */
+X			if (cp->opts && *cp->opts)
+X				cp->def_opts = str3cat(cp->def_opts, cp->opts, ";", *cp->ivec+1);
+X			else
+X				cp->def_opts = strealloc(cp->def_opts, *cp->ivec+1);
+X#ifdef DEBUG
+X			dlog("Setting def_opts to \"%s\"", cp->def_opts);
+X#endif
+X			continue;
+X		}
+X
+X		/*
+X		 * If a mount has been attempted, and we find
+X		 * a cut then don't try any more locations.
+X		 */
+X		if (strcmp(*cp->ivec, "/") == 0 || strcmp(*cp->ivec, "||") == 0) {
+X			if (cp->tried) {
+X#ifdef DEBUG
+X				dlog("Cut: not trying any more locations for %s",
+X					mp->am_path);
+X#endif
+X				break;
+X			}
+X			continue;
+X		}
+X
+X#ifdef SUNOS4_COMPAT
+X		/*
+X		 * By default, you only get this bit on SunOS4.
+X		 * If you want this anyway, then define SUNOS4_COMPAT
+X		 * in the relevant "os-blah.h" file.
+X		 *
+X		 * We make the observation that if the local key line contains
+X		 * no '=' signs then either it is sick, or it is a SunOS4-style
+X		 * "host:fs[:link]" line.  In the latter case the am_opts field
+X		 * is also assumed to be in old-style, so you can't mix & match.
+X		 * You can use ${} expansions for the fs and link bits though...
+X		 *
+X		 * Actually, this doesn't really cover all the possibilities for
+X		 * the latest SunOS automounter and it is debatable whether there
+X		 * is any point bothering.
+X		 */
+X		if (strchr(*cp->ivec, '=') == 0)
+X			p = sunos4_match(&cp->fs_opts, *cp->ivec, cp->def_opts, mp->am_path, cp->key, mp->am_parent->am_mnt->mf_info);
+X		else
+X#endif /* SUNOS4_COMPAT */
+X			p = ops_match(&cp->fs_opts, *cp->ivec, cp->def_opts, mp->am_path, cp->key, mp->am_parent->am_mnt->mf_info);
+X
+X		/*
+X		 * Find a mounted filesystem for this node.
+X		 */
+X		mp->am_mnt = mf = realloc_mntfs(mf, p, &cp->fs_opts, cp->fs_opts.opt_fs,
+X						cp->fs_opts.fs_mtab, cp->opts);
+X
+X		p = mf->mf_ops;
+X#ifdef DEBUG
+X		dlog("Got a hit with %s", p->fs_type);
+X#endif
+X		/*
+X		 * Note whether this is a real mount attempt
+X		 */
+X		if (p == &efs_ops) {
+X			plog(XLOG_MAP, "Map entry %s for %s failed to match", *cp->ivec, mp->am_path);
+X			if (this_error <= 0)
+X				this_error = ENOENT;
+X			continue;
+X		} else {
+X			if (cp->fs_opts.fs_mtab) {
+X				plog(XLOG_MAP, "Trying mount of %s on %s fstype %s",
+X					cp->fs_opts.fs_mtab, mp->am_path, p->fs_type);
+X			}
+X			cp->tried = TRUE;
+X		}
+X
+X		this_error = 0;
+X		dont_retry = FALSE;
+X
+X		if (mp->am_link) {
+X			free(mp->am_link);
+X			mp->am_link = 0;
+X		}
+X
+X		link_dir = mf->mf_fo->opt_sublink;
+X
+X		if (link_dir && *link_dir) {
+X			if (*link_dir == '/') {
+X				mp->am_link = strdup(link_dir);
+X			} else {
+X				mp->am_link = str3cat((char *) 0,
+X					mf->mf_fo->opt_fs, "/", link_dir);
+X			}
+X		}
+X
+X		if (mf->mf_error > 0) {
+X			this_error = mf->mf_error;
+X		} else if (mf->mf_flags & (MFF_MOUNTING|MFF_UNMOUNTING)) {
+X			/*
+X			 * Still mounting - retry later
+X			 */
+X#ifdef DEBUG
+X			dlog("Duplicate pending fstype %s mount", p->fs_type);
+X#endif
+X			this_error = -1;
+X		} else if (FSRV_ISDOWN(mf->mf_server)) {
+X			/*
+X			 * Would just mount from the same place
+X			 * as a hung mount - so give up
+X			 */
+X#ifdef DEBUG
+X			dlog("%s is already hung - giving up", mf->mf_mount);
+X#endif
+X			mp_error = EWOULDBLOCK;
+X			dont_retry = TRUE;
+X			this_error = -1;
+X		} else if (mf->mf_flags & MFF_MOUNTED) {
+X#ifdef DEBUG
+X			dlog("duplicate mount of \"%s\" ...", mf->mf_info);
+X#endif
+X			this_error = 0;
+X			break;
+X		}
+X
+X		/*
+X		 * Will usually need to play around with the mount nodes
+X		 * file attribute structure.  This must be done here.
+X		 */
+X		if (!this_error) {
+X			/*
+X			 * Fill in attribute fields
+X			 */
+X			mf->mf_fattr.type = NFLNK;
+X			mf->mf_fattr.mode = NFSMODE_LNK | 0777;
+X			mf->mf_fattr.nlink = 1;
+X			mf->mf_fattr.size = MAXPATHLEN / 4;	/* Conservative */
+X			mf->mf_fattr.fileid = mp->am_gen;
+X
+X			if (p->fs_init)
+X				this_error = (*p->fs_init)(mf);
+X		}
+X
+X		if (!this_error && mf->mf_fo->opt_delay) {
+X			/*
+X			 * If there is a delay timer on the mount
+X			 * then don't try to mount if the timer
+X			 * has not expired.
+X			 */
+X			int i = atoi(mf->mf_fo->opt_delay);
+X			if (i > 0 && (cp->start + i) < clocktime()) {
+X#ifdef DEBUG
+X				dlog("Mount of %s delayed by %ds", mf->mf_mount, i);
+X#endif
+X				this_error = -1;
+X			}
+X		}
+X
+X		if (this_error < 0 && !dont_retry) {
+X			if (!mf_retry)
+X				mf_retry = dup_mntfs(mf);
+X			cp->retry = TRUE;
+X		}
+X
+X		if (!this_error) {
+X			/*
+X			 * If the directory is not yet made and
+X			 * it needs to be made, then make it!
+X			 */
+X			 if (!(mf->mf_flags & MFF_MKMNT) &&
+X				 	p->fs_flags & FS_MKMNT) {
+X				this_error = mkdirs(mf->mf_mount, 0555);
+X				if (!this_error)
+X					mf->mf_flags |= MFF_MKMNT;
+X			}
+X		}
+X
+X		if (!this_error)
+X		if (p->fs_flags & FS_MBACKGROUND) {
+X			mf->mf_flags |= MFF_MOUNTING;	/*XXX*/
+X#ifdef DEBUG
+X			dlog("backgrounding mount of \"%s\"", mf->mf_info);
+X#endif
+X			if (cp->callout) {
+X				untimeout(cp->callout);
+X				cp->callout = 0;
+X			}
+X			run_task(try_mount, (voidp) mp, afs_cont, (voidp) cp);
+X			if (mf_retry) free_mntfs(mf_retry);
+X			return -1;
+X		} else {
+X#ifdef DEBUG
+X			dlog("foreground mount of \"%s\" ...", mf->mf_info);
+X#endif
+X			this_error = try_mount(mp);
+X		}
+X
+X		if (this_error >= 0) {
+X			if (this_error > 0) {
+X				amd_stats.d_merr++;
+X				if (mf != mf_retry) {
+X					mf->mf_error = this_error;
+X					mf->mf_flags |= MFF_ERROR;
+X				}
+X			}
+X			/*
+X			 * Wakeup anything waiting for this mount
+X			 */
+X			wakeup((voidp) mf);
+X		}
+X	}
+X
+X	if (this_error && cp->retry) {
+X		free_mntfs(mf);
+X		mf = cp->mp->am_mnt = mf_retry;
+X		/*
+X		 * Not retrying again (so far)
+X		 */
+X		cp->retry = FALSE;
+X		cp->tried = FALSE;
+X		/*
+X		 * Start at the beginning.
+X		 * Rewind the location vector and
+X		 * reset the default options.
+X		 */
+X		cp->ivec = cp->xivec;
+X		cp->def_opts = strealloc(cp->def_opts, cp->opts);
+X		/*
+X		 * Arrange that afs_bgmount is called
+X		 * after anything else happens.
+X		 */
+X#ifdef DEBUG
+X		dlog("Arranging to retry mount of %s", cp->mp->am_path);
+X#endif
+X		sched_task(afs_retry, (voidp) cp, (voidp) mf);
+X		if (cp->callout)
+X			untimeout(cp->callout);
+X		cp->callout = timeout(RETRY_INTERVAL, wakeup, (voidp) mf);
+X
+X		cp->mp->am_ttl = clocktime() + RETRY_INTERVAL;
+X
+X		/*
+X		 * Not done yet - so don't return anything
+X		 */
+X		return -1;
+X	}
+X
+X	/*
+X	 * Discard handle on duff filesystem.
+X	 * This should never happen since it
+X	 * should be caught by the case above.
+X	 */
+X	if (mf_retry) {
+X		plog(XLOG_ERROR, "discarding a retry mntfs for %s", mf_retry->mf_mount);
+X		free_mntfs(mf_retry);
+X	}
+X
+X	if (hard_error < 0 || !this_error)
+X		hard_error = this_error;
+X
+X	/*
+X	 * If we get here, then either the mount succeeded or
+X	 * there is no more mount information available.
+X	 */
+X	if (hard_error < 0 && mp_error)
+X		hard_error = cp->mp->am_error = mp_error;
+X	if (hard_error > 0) {
+X		/*
+X		 * Set a small(ish) timeout on an error node if
+X		 * the error was not a time out.
+X		 */
+X		switch (hard_error) {
+X		case ETIMEDOUT:
+X		case EWOULDBLOCK:
+X			cp->mp->am_timeo = 5;
+X			break;
+X		default:
+X			cp->mp->am_timeo = 17;
+X			break;
+X		}
+X		cp->mp->am_timeo_w = 0;
+X	}
+X
+X	/*
+X	 * Make sure that the error value in the mntfs has a
+X	 * reasonable value.
+X	 */
+X	if (mf->mf_error < 0) {
+X		mf->mf_error = hard_error;
+X		if (hard_error)
+X			mf->mf_flags |= MFF_ERROR;
+X	}
+X
+X	/*
+X	 * In any case we don't need the continuation any more
+X	 */
+X	free_continuation(cp);
+X
+X	return hard_error;
+X}
+X
+X/*
+X * Automount interface to RPC lookup routine
+X */
+Xstatic am_node *afs_lookuppn(mp, fname, error_return, op)
+Xam_node *mp;
+Xchar *fname;
+Xint *error_return;
+Xint op;
+X{
+X#define ereturn(x) { *error_return = x; return 0; }
+X
+X	/*
+X	 * Find the corresponding entry and return
+X	 * the file handle for it.
+X	 */
+X	am_node *ap, *new_mp, *ap_hung;
+X	char *info;			/* Mount info - where to get the file system */
+X	char **ivec, **xivec;		/* Split version of info */
+X	char *opts;			/* Mount options */
+X	int error = 0;			/* Error so far */
+X	char path_name[MAXPATHLEN];	/* General path name buffer */
+X	char *pfname;			/* Path for database lookup */
+X	struct continuation *cp;	/* Continuation structure if we need to mount */
+X	int in_progress = 0;		/* # of (un)mount in progress */
+X	char *dflts;
+X	mntfs *mf;
+X
+X#ifdef DEBUG
+X	dlog("in afs_lookuppn");
+X#endif
+X
+X	/*
+X	 * If the server is shutting down
+X	 * then don't return information
+X	 * about the mount point.
+X	 */
+X	if (amd_state == Finishing) {
+X#ifdef DEBUG
+X		dlog("%s/%s mount ignored - going down",
+X			mp->am_path, fname);
+X#endif
+X		ereturn(ENOENT);
+X	}
+X
+X	/*
+X	 * Handle special case of "." and ".."
+X	 */
+X	if (fname[0] == '.') {
+X		if (fname[1] == '\0')
+X			return mp;	/* "." is the current node */
+X		if (fname[1] == '.' && fname[2] == '\0') {
+X			if (mp->am_parent) {
+X#ifdef DEBUG
+X				dlog(".. in %s gives %s", mp->am_path, mp->am_parent->am_path);
+X#endif
+X				return mp->am_parent;	/* ".." is the parent node */
+X			}
+X			ereturn(ESTALE);
+X		}
+X	}
+X
+X	/*
+X	 * Check for valid key name.
+X	 * If it is invalid then pretend it doesn't exist.
+X	 */
+X	if (!valid_key(fname)) {
+X		plog(XLOG_WARNING, "Key \"%s\" contains a disallowed character", fname);
+X		ereturn(ENOENT);
+X	}
+X
+X	/*
+X	 * Expand key name.
+X	 * fname is now a private copy.
+X	 */
+X	fname = expand_key(fname);
+X
+X	for (ap_hung = 0, ap = mp->am_child; ap; ap = ap->am_osib) {
+X		/*
+X		 * Otherwise search children of this node
+X		 */
+X		if (FSTREQ(ap->am_name, fname)) {
+X			mf = ap->am_mnt;
+X			if (ap->am_error) {
+X				error = ap->am_error;
+X				continue;
+X			}
+X
+X			/*
+X			 * If the error code is undefined then it must be
+X			 * in progress.
+X			 */
+X			if (mf->mf_error < 0)
+X				goto in_progrss;
+X
+X			/*
+X			 * Check for a hung node
+X			 */
+X			if (FSRV_ISDOWN(mf->mf_server)) {
+X				ap_hung = ap;
+X				continue;
+X			}
+X
+X			/*
+X			 * If there was a previous error with this node
+X			 * then return that error code.
+X			 */
+X			if (mf->mf_flags & MFF_ERROR) {
+X				error = mf->mf_error;
+X				continue;
+X			}
+X
+X			if (!(mf->mf_flags & MFF_MOUNTED) /*|| (mf->mf_flags & MFF_UNMOUNTING)*/) {
+Xin_progrss:
+X				/*
+X				 * If the fs is not mounted or it is unmounting then there
+X				 * is a background (un)mount in progress.  In this case
+X				 * we just drop the RPC request (return nil) and
+X				 * wait for a retry, by which time the (un)mount may
+X				 * have completed.
+X				 */
+X#ifdef DEBUG
+X				dlog("ignoring mount of %s in %s -- in progress",
+X					fname, mf->mf_mount);
+X#endif
+X				in_progress++;
+X				continue;
+X			}
+X
+X			/*
+X			 * Otherwise we have a hit: return the current mount point.
+X			 */
+X#ifdef DEBUG
+X			dlog("matched %s in %s", fname, ap->am_path);
+X#endif
+X			free(fname);
+X			return ap;
+X		}
+X	}
+X
+X	if (in_progress) {
+X#ifdef DEBUG
+X		dlog("Waiting while %d mount(s) in progress", in_progress);
+X#endif
+X		free(fname);
+X		ereturn(-1);
+X	}
+X
+X	/*
+X	 * If an error occured then return it.
+X	 */
+X	if (error) {
+X#ifdef DEBUG
+X		errno = error; /* XXX */
+X		dlog("Returning error: %m", error);
+X#endif
+X		free(fname);
+X		ereturn(error);
+X	}
+X
+X	/*
+X	 * If doing a delete then don't create again!
+X	 */
+X	switch (op) {
+X	case VLOOK_DELETE:
+X		ereturn(ENOENT);
+X		break;
+X
+X	case VLOOK_CREATE:
+X		break;
+X
+X	default:
+X		plog(XLOG_FATAL, "Unknown op to afs_lookuppn: 0x%x", op);
+X		ereturn(EINVAL);
+X		break;
+X	}
+X
+X	/*
+X	 * If the server is going down then just return,
+X	 * don't try to mount any more file systems
+X	 */
+X	if ((int)amd_state >= (int)Finishing) {
+X#ifdef DEBUG
+X		dlog("not found - server going down anyway");
+X#endif
+X		free(fname);
+X		ereturn(ENOENT);
+X	}
+X
+X	/*
+X	 * If we get there then this is a reference to an,
+X	 * as yet, unknown name so we need to search the mount
+X	 * map for it.
+X	 */
+X	if (mp->am_pref) {
+X		sprintf(path_name, "%s%s", mp->am_pref, fname);
+X		pfname = path_name;
+X	} else {
+X		pfname = fname;
+X	}
+X
+X	mf = mp->am_mnt;
+X
+X#ifdef DEBUG
+X	dlog("will search map info in %s to find %s", mf->mf_info, pfname);
+X#endif
+X	/*
+X	 * Consult the oracle for some mount information.
+X	 * info is malloc'ed and belongs to this routine.
+X	 * It ends up being free'd in free_continuation().
+X	 *
+X	 * Note that this may return -1 indicating that information
+X	 * is not yet available.
+X	 */
+X	error = mapc_search((mnt_map*) mf->mf_private, pfname, &info);
+X	if (error) {
+X		plog(XLOG_MAP, "No map entry for %s", pfname);
+X		free(fname);
+X		ereturn(error);
+X	}
+X
+X#ifdef DEBUG
+X	dlog("mount info is %s", info);
+X#endif
+X
+X	/*
+X	 * Split info into an argument vector.
+X	 * The vector is malloc'ed and belongs to
+X	 * this routine.  It is free'd in free_continuation()
+X	 */
+X	xivec = ivec = strsplit(info, '\"');
+X
+X	/*
+X	 * Default error code...
+X	 */
+X	if (ap_hung)
+X		error = EWOULDBLOCK;
+X	else
+X		error = ENOENT;
+X
+X	/*
+X	 * Allocate a new map
+X	 */
+X	new_mp = exported_ap_alloc();
+X	if (new_mp == 0) {
+X		free((voidp) xivec);
+X		free((voidp) info);
+X		free((voidp) fname);
+X		ereturn(ENOSPC);
+X	}
+X
+X	if (mf->mf_opts)
+X		opts = mf->mf_opts;
+X	else
+X		opts = "";
+X
+X	opts = strdup(opts);
+X
+X#ifdef DEBUG
+X	dlog("searching for /defaults entry");
+X#endif
+X	if (mapc_search((mnt_map*) mf->mf_private, "/defaults", &dflts) == 0) {
+X	  	char *dfl;
+X		char **rvec;
+X#ifdef DEBUG
+X		dlog("/defaults gave %s", dflts);
+X#endif
+X		if (*dflts == '-')
+X			dfl = dflts+1;
+X		else
+X			dfl = dflts;
+X
+X		/*
+X		 * Chop the defaults up
+X		 */
+X		rvec = strsplit(dfl, '\"');
+X		/*
+X		 * Extract first value
+X		 */
+X		dfl = rvec[0];
+X
+X		/*
+X		 * Log error if there were other values
+X		 */
+X		if (rvec[1]) {
+X#ifdef DEBUG
+X			dlog("/defaults chopped into %s", dfl);
+X#endif
+X			plog(XLOG_USER, "More than a single value for /defaults in %s", mf->mf_info);
+X		}
+X
+X		/*
+X		 * Don't need info vector any more
+X		 */
+X		free((voidp) rvec);
+X
+X		/*
+X		 * If there were any values at all...
+X		 */
+X		if (dfl) {
+X			/*
+X			 * Prepend to existing defaults if they exist,
+X			 * otherwise just use these defaults.
+X			 */
+X			if (*opts && *dfl) {
+X				char *nopts = (char *) xmalloc(strlen(opts)+strlen(dfl)+2);
+X				sprintf(nopts, "%s;%s", dfl, opts);
+X				free(opts);
+X				opts = nopts;
+X			} else if (*dfl) {
+X				opts = strealloc(opts, dfl);
+X			}
+X		}
+X		free(dflts);
+X	}
+X
+X	/*
+X	 * Fill it in
+X	 */
+X	init_map(new_mp, fname);
+X
+X	/*
+X	 * Put it in the table
+X	 */
+X	insert_am(new_mp, mp);
+X
+X	/*
+X	 * Fill in some other fields,
+X	 * path and mount point
+X	 */
+X	new_mp->am_path = str3cat(new_mp->am_path, mp->am_path, *fname == '/' ? "" : "/", fname);
+X
+X#ifdef DEBUG
+X	dlog("setting path to %s", new_mp->am_path);
+X#endif
+X
+X	/*
+X	 * Take private copy of pfname
+X	 */
+X	pfname = strdup(pfname);
+X
+X	/*
+X	 * Construct a continuation
+X	 */
+X	cp = ALLOC(continuation);
+X	cp->mp = new_mp;
+X	cp->xivec = xivec;
+X	cp->ivec = ivec;
+X	cp->info = info;
+X	cp->key = pfname;
+X	cp->opts = opts;
+X	cp->retry = FALSE;
+X	cp->tried = FALSE;
+X	cp->start = clocktime();
+X	cp->def_opts = strdup(opts);
+X	bzero((voidp) &cp->fs_opts, sizeof(cp->fs_opts));
+X
+X	/*
+X	 * Try and mount the file system
+X	 * If this succeeds immediately (possible
+X	 * for a ufs file system) then return
+X	 * the attributes, otherwise just
+X	 * return an error.
+X	 */
+X	error = afs_bgmount(cp, error);
+X	reschedule_timeout_mp();
+X	if (!error) {
+X		free(fname);
+X		return new_mp;
+X	}
+X
+X	assign_error_mntfs(cp->mp);
+X
+X	free(fname);
+X
+X	ereturn(error);
+X#undef ereturn
+X}
+X
+X/*
+X * Locate next node in sibling list which is mounted
+X * and is not an error node.
+X */
+Xstatic am_node *next_nonerror_node(xp)
+Xam_node *xp;
+X{
+X	mntfs *mf;
+X
+X	/*
+X	 * Bug report (7/12/89) from Rein Tollevik <rein@ifi.uio.no>
+X	 * Fixes a race condition when mounting direct automounts.
+X	 * Also fixes a problem when doing a readdir on a directory
+X	 * containing hung automounts.
+X	 */
+X	while (xp &&
+X	       (!(mf = xp->am_mnt) ||			/* No mounted filesystem */
+X	        mf->mf_error != 0 ||			/* There was a mntfs error */
+X	        xp->am_error != 0 ||			/* There was a mount error */
+X	        !(mf->mf_flags & MFF_MOUNTED) ||	/* The fs is not mounted */
+X	        (mf->mf_server->fs_flags & FSF_DOWN))	/* The fs may be down */
+X		)
+X		xp = xp->am_osib;
+X
+X	return xp;
+X}
+X
+Xstatic int afs_readdir(mp, cookie, dp, ep)
+Xam_node *mp;
+Xnfscookie cookie;
+Xstruct dirlist *dp;
+Xstruct entry *ep;
+X{
+X	unsigned int gen = *(unsigned int*) cookie;
+X	am_node *xp;
+X
+X	dp->eof = FALSE;
+X
+X	if (gen == 0) {
+X		/*
+X		 * In the default instance (which is used to
+X		 * start a search) we return "." and "..".
+X		 *
+X		 * This assumes that the count is big enough
+X		 * to allow both "." and ".." to be returned in
+X		 * a single packet.  If it isn't (which would
+X		 * be fairly unbelievable) then tough.
+X		 */
+X#ifdef DEBUG
+X		dlog("default search");
+X#endif
+X		xp = next_nonerror_node(mp->am_child);
+X		dp->entries = ep;
+X
+X		/* construct "." */
+X		ep[0].fileid = mp->am_gen;
+X		ep[0].name = ".";
+X		ep[0].nextentry = &ep[1];
+X		*(unsigned int *) ep[0].cookie = 0;
+X
+X		/* construct ".." */
+X		if (mp->am_parent)
+X			ep[1].fileid = mp->am_parent->am_gen;
+X		else
+X			ep[1].fileid = mp->am_gen;
+X		ep[1].name = "..";
+X		ep[1].nextentry = 0;
+X		*(unsigned int *) ep[1].cookie =
+X			xp ? xp->am_gen : ~(unsigned int)0;
+X
+X		return 0;
+X	}
+X
+X#ifdef DEBUG
+X	dlog("real child");
+X#endif
+X
+X	if (gen == ~(unsigned int)0) {
+X#ifdef DEBUG
+X		dlog("End of readdir in %s", mp->am_path);
+X#endif
+X		dp->eof = TRUE;
+X		dp->entries = 0;
+X		return 0;
+X	}
+X
+X	xp = mp->am_child;
+X	while (xp && xp->am_gen != gen)
+X		xp = xp->am_osib;
+X
+X	if (xp) {
+X		am_node *xp_next = next_nonerror_node(xp->am_osib);
+X
+X		if (xp_next) {
+X			*(unsigned int *) ep->cookie = xp_next->am_gen;
+X		} else {
+X			*(unsigned int *) ep->cookie = ~(unsigned int)0;
+X		}
+X
+X		ep->fileid = xp->am_gen;
+X		ep->name = xp->am_name;
+X
+X		ep->nextentry = 0;
+X		dp->entries = ep;
+X
+X		return 0;
+X	}
+X
+X	return ESTALE;
+X
+X}
+X
+Xstatic char *dfs_readlink(mp, error_return)
+Xam_node *mp;
+Xint *error_return;
+X{
+X	am_node *xp;
+X	int rc = 0;
+X
+X	xp = next_nonerror_node(mp->am_child);
+X	if (!xp)
+X		xp = afs_lookuppn(mp, mp->am_path+1, &rc, VLOOK_CREATE);
+X
+X	if (xp) {
+X		new_ttl(xp);	/* (7/12/89) from Rein Tollevik */
+X		return xp->am_link ? xp->am_link : xp->am_mnt->mf_mount;
+X	}
+X	if (amd_state == Finishing)
+X		return "/tmp";
+X	*error_return = rc;
+X	return 0;
+X}
+X
+X/*
+X * Ops structure
+X */
+Xam_ops afs_ops = {
+X	MNTTYPE_AUTO,
+X	afs_match,
+X	afs_init,
+X	afs_mount,
+X	afs_umount,
+X	afs_lookuppn,
+X	afs_readdir,
+X	0, /* afs_readlink */
+X	0, /* afs_mounted */
+X	afs_umounted,
+X	find_afs_srvr,
+X	FS_NOTIMEOUT|FS_UBACKGROUND|FS_AMQINFO,
+X	&afs_srvr_list
+X};
+X
+Xam_ops dfs_ops = {
+X	"direct",
+X	afs_match,
+X	0, /* dfs_init */
+X	afs_mount,
+X	afs_umount,
+X	efs_lookuppn,
+X	efs_readdir,
+X	dfs_readlink,
+X	0, /* afs_mounted */
+X	afs_umounted,
+X	find_afs_srvr,
+X	FS_NOTIMEOUT|FS_UBACKGROUND|FS_AMQINFO,
+X	&afs_srvr_list
+X};
+END_OF_FILE
+if test 34481 -ne `wc -c <'afs_ops.c'`; then
+    echo shar: \"'afs_ops.c'\" unpacked with wrong size!
+fi
+# end of 'afs_ops.c'
+fi
+echo shar: End of archive 12 \(of 13\).
+cp /dev/null ark12isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 13 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+exit 0 # Just in case...

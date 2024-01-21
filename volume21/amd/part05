@@ -1,0 +1,2289 @@
+Subject:  v21i093:  An Automounter for NFS systems, Part05/13
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: 2d5da923 05358962 b9646f3f 02868ace
+
+Submitted-by: Jan-Simon Pendry <jsp@doc.ic.ac.uk>
+Posting-number: Volume 21, Issue 93
+Archive-name: amd/part05
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 5 (of 13)."
+# Contents:  am.c amd-man amq_subr.c mk-amd-map.c mntfs.c nfs_prot.h
+#   nfs_prot.x
+# Wrapped by rsalz@papaya.bbn.com on Tue Apr 10 15:12:04 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'am.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'am.c'\"
+else
+echo shar: Extracting \"'am.c'\" \(7064 characters\)
+sed "s/^X//" >'am.c' <<'END_OF_FILE'
+X/*
+X * $Id: am.c,v 5.1.1.1 90/01/11 16:58:29 jsp Exp Locker: jsp $
+X *
+X * Copyright (c) 1989 Jan-Simon Pendry
+X * Copyright (c) 1989 Imperial College of Science, Technology & Medicine
+X * Copyright (c) 1989 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Jan-Simon Pendry at Imperial College, London.
+X *
+X * Redistribution and use in source and binary forms are permitted
+X * provided that the above copyright notice and this paragraph are
+X * duplicated in all such forms and that any documentation,
+X * advertising materials, and other materials related to such
+X * distribution and use acknowledge that the software was developed
+X * by Imperial College of Science, Technology and Medicine, London, UK.
+X * The names of the College and University may not be used to endorse
+X * or promote products derived from this software without specific
+X * prior written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+X * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+X * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X *
+X *	%W% (Berkeley) %G%
+X */
+X
+X/*
+X * Automounter
+X */
+X
+X#include "am.h"
+X#include <sys/signal.h>
+X#include <netdb.h>
+X#include <sys/ioctl.h>
+X#include <fcntl.h>
+X#include <setjmp.h>
+X
+Xchar pid_fsname[16 + MAXHOSTNAMELEN];	/* "kiska.southseas.nz:(pid%d)" */
+Xchar *progname;				/* "amd" */
+Xchar *auto_dir = "/a";
+Xchar *hostdomain = "unknown.domain";
+Xchar hostname[MAXHOSTNAMELEN];		/* Hostname */
+Xchar hostd[2*MAXHOSTNAMELEN];		/* Host+domain */
+Xchar *op_sys = OS_REP;			/* Name of current op_sys */
+Xchar *arch = ARCH_REP;			/* Name of current architecture */
+Xchar *endian = ARCH_ENDIAN;		/* Big or Little endian */
+Xint foreground = 1;			/* This is the top-level server */
+Xint mypid;				/* Current process id */
+Xint immediate_abort;			/* Should close-down unmounts be retried */
+Xstruct in_addr myipaddr;		/* (An) IP address of this host */
+Xserv_state amd_state = Start;
+Xstruct amd_stats amd_stats;		/* Server statistics */
+Xtime_t do_mapc_reload = 0;		/* mapc_reload() call required? */
+Xjmp_buf select_intr;
+Xint select_intr_valid;
+Xint orig_umask;
+X
+X/*
+X * Signal handler:
+X * SIGINT - tells amd to do a full shutdown, including unmounting all filesystem.
+X * SIGTERM - tells amd to shutdown now.  Just unmounts the automount nodes.
+X */
+Xstatic void sigterm(sig)
+Xint sig;
+X{
+X#ifdef SYS5_SIGNALS
+X	signal(sig, sigterm);
+X#endif
+X
+X	switch (sig) {
+X	case SIGINT:
+X		immediate_abort = 15;
+X		break;
+X
+X	case SIGTERM:
+X		immediate_abort = -1;
+X		/* fall through... */
+X
+X	default:
+X		plog(XLOG_WARNING, "WARNING: automounter going down on signal %d", sig);
+X		break;
+X	}
+X	if (select_intr_valid)
+X		longjmp(select_intr, sig);
+X}
+X
+X/*
+X * Hook for cache reload.
+X * When a SIGHUP arrives it schedules a call to mapc_reload
+X */
+Xstatic void sighup(sig)
+Xint sig;
+X{
+X#ifdef SYS5_SIGNALS
+X	signal(sig, sighup);
+X#endif
+X
+X#ifdef DEBUG
+X	if (sig != SIGHUP)
+X		dlog("spurious call to sighup");
+X#endif
+X	/*
+X	 * Force a reload by zero'ing the timer
+X	 */
+X	if (amd_state == Run)
+X		do_mapc_reload = 0;
+X}
+X
+Xstatic void parent_exit(sig)
+Xint sig;
+X{
+X	exit(0);
+X}
+X
+Xstatic int daemon_mode(P_void)
+X{
+X	int bgpid = background();
+X
+X	if (bgpid != 0) {
+X		if (print_pid) {
+X			printf("%d\n", bgpid);
+X			fflush(stdout);
+X		}
+X		/*
+X		 * Now wait for the automount points to
+X		 * complete.
+X		 */
+X		signal(SIGQUIT, parent_exit);
+X		for (;;)
+X			pause();
+X	}
+X
+X	/*
+X	 * Pretend we are in the foreground again
+X	 */
+X	foreground = 1;
+X#ifdef TIOCNOTTY
+X	{
+X		int t = open("/dev/tty", O_RDWR);
+X		if (t < 0) {
+X			if (errno != ENXIO)	/* not an error if already no controlling tty */
+X				plog(XLOG_WARNING, "Could not open controlling tty: %m");
+X		} else if (ioctl(t, TIOCNOTTY, 0) < 0) {
+X			plog(XLOG_WARNING, "Could not disassociate tty (TIOCNOTTY): %m");
+X		}
+X	}
+X#else
+X	(void) setpgrp();
+X#endif
+X
+X	return getppid();
+X}
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	struct hostent *hp, *gethostbyname();
+X	char *domdot;
+X	int ppid = 0;
+X	int error;
+X
+X	/*
+X	 * Make sure some built-in assumptions are true before we start
+X	 */
+X	assert(sizeof(nfscookie) >= sizeof (unsigned int));
+X	assert(sizeof(int) >= 4);
+X
+X	/*
+X	 * Set processing status.
+X	 */
+X	amd_state = Start;
+X
+X	/*
+X	 * Get local machine name
+X	 */
+X	if (gethostname(hostname, sizeof(hostname)) < 0) {
+X		plog(XLOG_FATAL, "gethostname: %m");
+X		going_down(1);
+X	}
+X	/*
+X	 * Check it makes sense
+X	 */
+X	if (!*hostname) {
+X		plog(XLOG_FATAL, "host name is not set");
+X		going_down(1);
+X	}
+X	/*
+X	 * Partially initialise hostd[].  This
+X	 * is completed in get_args().
+X	 */
+X	if (domdot = strchr(hostname, '.')) {
+X		/*
+X		 * Hostname already contains domainname.
+X		 * Split out hostname and domainname
+X		 * components
+X		 */
+X		*domdot++ = '\0';
+X		hostdomain = domdot;
+X	}
+X	strcpy(hostd, hostname);
+X
+X	/*
+X	 * Trap interrupts for shutdowns.
+X	 */
+X	(void) signal(SIGINT, sigterm);
+X
+X	/*
+X	 * Hangups tell us to reload the cache
+X	 */
+X	(void) signal(SIGHUP, sighup);
+X
+X	/*
+X	 * Trap Terminate so that we can shutdown gracefully (some chance)
+X	 */
+X	(void) signal(SIGTERM, sigterm);
+X	/*
+X	 * Trap Death-of-a-child.  These allow us to
+X	 * pick up the exit status of backgrounded mounts.
+X	 * See "sched.c".
+X	 */
+X	(void) signal(SIGCHLD, sigchld);
+X
+X	/*
+X	 * Initialise process id.  This is kept
+X	 * cached since it is used for generating
+X	 * and using file handles.
+X	 */
+X	mypid = getpid();
+X
+X#ifdef notdef
+X/*
+X * XXX - Doing this plugs most of a memory leak in
+X * gethostbyname on SunOS 4.  I see no good reason
+X * why the host database needs to grab 1.5K of
+X * private data space...  However, for the moment,
+X * I will take its word that it is a _good thing_
+X * (jsp)
+X */
+X	(void) sethostent(0);
+X#endif
+X
+X	/*
+X	 * Fix-up any umask problems.  Most systems default
+X	 * to 002 which is not too convenient for our purposes
+X	 */
+X	orig_umask = umask(0);
+X
+X	/*
+X	 * Determine command-line arguments
+X	 */
+X	get_args(argc, argv);
+X
+X	/*
+X	 * Get our own IP address so that we
+X	 * can mount the automounter.  There
+X	 * is probably a better way of doing
+X	 * this, but messing about with SIOCGCONF
+X	 * seems to be heading towards the non-portable
+X	 * arena.
+X	 */
+X	hp = gethostbyname(hostname);
+X	if (!hp || hp->h_addrtype != AF_INET) {
+X		plog(XLOG_FATAL, "Can't determine IP address of this host (%s)", hostname);
+X		going_down(1);
+X	}
+X	myipaddr = *(struct in_addr *) hp->h_addr;
+X
+X	/*
+X	 * Now check we are root.
+X	 */
+X	if (geteuid() != 0) {
+X		plog(XLOG_FATAL, "Must be root to mount filesystems (euid = %d)", geteuid());
+X		going_down(1);
+X	}
+X
+X#ifdef HAS_YP_MAPS
+X	/*
+X	 * If the domain was specified then bind it here
+X	 * to circumvent any default bindings that may
+X	 * be done in the C library.
+X	 */
+X	if (domain && yp_bind(domain)) {
+X		plog(XLOG_FATAL, "Can't bind to domain \"%s\"", domain);
+X		going_down(1);
+X	}
+X#endif
+X
+X#ifdef DEBUG
+X	Debug(D_DAEMON)
+X#endif
+X	ppid = daemon_mode();
+X
+X	sprintf(pid_fsname, "%s:(pid%d)", hostname, mypid);
+X
+X	do_mapc_reload = clocktime() + ONE_HOUR;
+X
+X	/*
+X	 * Register automounter with system
+X	 */
+X	error = mount_automounter(ppid);
+X	if (error && ppid)
+X		kill(SIGALRM, ppid);
+X	going_down(error);
+X
+X	abort();
+X}
+END_OF_FILE
+if test 7064 -ne `wc -c <'am.c'`; then
+    echo shar: \"'am.c'\" unpacked with wrong size!
+fi
+# end of 'am.c'
+fi
+if test -f 'amd-man' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'amd-man'\"
+else
+echo shar: Extracting \"'amd-man'\" \(6057 characters\)
+sed "s/^X//" >'amd-man' <<'END_OF_FILE'
+X'\" $Id: amd-man,v 5.1 89/11/17 18:23:51 jsp Exp Locker: jsp $
+X'\" Copyright (c) 1989 Jan-Simon Pendry
+X'\" Copyright (c) 1989 Imperial College of Science, Technology & Medicine
+X'\" Copyright (c) 1989 The Regents of the University of California.
+X'\" All rights reserved.
+X'\"
+X'\" This code is derived from software contributed to Berkeley by
+X'\" Jan-Simon Pendry at Imperial College, London.
+X'\"
+X'\" Redistribution and use in source and binary forms are permitted
+X'\" provided that the above copyright notice and this paragraph are
+X'\" duplicated in all such forms and that any documentation,
+X'\" advertising materials, and other materials related to such
+X'\" distribution and use acknowledge that the software was developed
+X'\" by Imperial College of Science, Technology and Medicine, London, UK.
+X'\" The names of the College and University may not be used to endorse
+X'\" or promote products derived from this software without specific
+X'\" prior written permission.
+X'\" THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+X'\" IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+X'\" WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X'\"
+X'\"	%W% (Berkeley) %G%
+X'\"
+X.TH AMD 8 "3 November 1989"
+X.SH NAME
+Xamd \- automatically mount file systems
+X.SH SYNOPSIS
+X.B amd
+X[
+X.B \-nprv
+X] [
+X.BI \-a " mount_point"
+X] [
+X.BI \-c " duration"
+X] [
+X.BI \-d " domain"
+X] [
+X.BI \-k " kernel-arch"
+X] [
+X.BI \-l " logfile"
+X] [
+X.BI \-t " interval.interval"
+X] [
+X.BI \-w " interval"
+X] [
+X.BI \-x " log-option"
+X] [
+X.BI \-y " YP-domain"
+X] [
+X.BI \-C " cluster-name"
+X] [
+X.BI \-D " option"
+X]
+X[
+X.I directory
+X.I mapname
+X.RI [ " \-map-options " ]
+X] .\|.\|.
+X.SH DESCRIPTION
+X.B Amd
+Xis a daemon that automatically mounts filesystems
+Xwhenever a file or directory
+Xwithin that filesystem is accessed.
+XFilesystems are automatically unmounted when they
+Xappear to have become quiescent.
+X.LP
+X.B Amd
+Xhas been designed as a value-added replacement
+Xfor the SunOS 4
+X.IR automount (8)
+Xprogram.
+XConsiderable design effort has been expended in making
+X.B amd
+Xrobust in the face of
+X.SM NFS
+Xservers going down.
+X.B Amd
+Xoperates by attaching itself as an
+X.SM NFS
+Xserver to each of the specified
+X.IB directories .
+XLookups within the specified directories
+Xare handled by
+X.BR amd ,
+Xwhich uses the map contained in
+X.I mapname
+Xto determine how to resolve the lookup.
+XGenerally, this will be a host name, some filesystem information
+Xand some mount options for the given filesystem.
+X.SH OPTIONS
+X.TP
+X.B \-n
+XNormalize hostnames.
+XThe name refered to by ${rhost} are normalized relative to the
+Xhost database before being used.  The effect is to translate
+Xaliases into ``official'' names.
+X.TP
+X.B \-p
+XPrint PID.
+XOutputs the process-id of
+X.B amd
+Xto standard output where it can be saved into a file.
+X.TP
+X.B \-r
+XRestart existing mounts.
+X.B Amd
+Xwill scan the mount file table to determine which filesystems
+Xare currently mounted.  Whenever one of these would have
+Xbeen auto-mounted,
+X.B amd
+X.I inherits
+Xit.
+X.TP
+X.B \-v
+XVersion.  Displays version and configuration information on standard error.
+XIf you send a bug report, this should be used to determine
+Xwhich version of
+X.B amd
+Xyou are using.
+X.TP
+X.BI \-a " temporary-directory"
+XSpecify an alternative location for the real mount points.
+XThe default is
+X.BR /a .
+X.TP
+X.BI \-c " duration"
+XSpecify a
+X.IR duration ,
+Xin seconds, that a looked up name remains
+Xcached when not in use.  The default is 5 minutes.
+X.TP
+X.BI \-d " domain"
+XSpecify the local domain name.  If this option is not
+Xgiven the domain name is determined from the hostname.
+X.TP
+X.BI \-k " kernel-arch"
+XSpecifies the kernel architecture.  This is used solely
+Xto set the ${karch} selector.
+X.TP
+X.BI \-l " logfile"
+XSpecify a logfile in which to record mount and unmount events.
+XIf
+X.I logfile
+Xis the string
+X.B syslog
+Xthen the log messages will be sent to the system log daemon by
+X.IR syslog (3).
+XThis is only available on certain systems (e.g.
+X.I not
+X.SM HP-UX
+Xand early versions of Ultrix).
+X.TP
+X.BI \-t " interval.interval"
+XSpecify the
+X.IR interval ,
+Xin tenths of a second, between NFS/RPC/UDP retries.
+XThe default is 0.8 seconds.
+XThe second values alters the restransmit counter.
+XUseful defaults are supplied if either or both
+Xvalues are missing.
+X.TP
+X.BI \-w " interval"
+XSpecify an
+X.IR interval ,
+Xin seconds, between attempts to dismount
+Xfilesystems that have exceeded their cached times.
+XThe default is 2 minutes.
+X.TP
+X.BI \-y " domain"
+XSpecify an alternative YP domain from which to fetch the YP maps.
+XThe default is the system domain name.
+X.TP
+X.BI \-x " options"
+XSpecify run-time logging options.  The options are a comma separated
+Xlist chosen from: fatal, error, user, warn, info, all.
+X.TP
+X.BI \-D " option"
+XSelect from a variety of debug options.  Prefixing an
+Xoption with the strings
+X.B no
+Xreverses the effect of that option.  Options are cumulative.
+XThe most useful option is
+X.BR all .
+XSince
+X.I \-D
+Xis only used for debugging other options are not documented here:
+Xthe current supported set of options is listed by the \-v option
+Xand a fuller description is available in the program source.
+X.SH FILES
+X.PD 0
+X.TP 5
+X.B /a
+Xdirectory under which filesystems are dynamically mounted
+X.PD
+X.SH CAVEATS
+XSome care may be required when creating a mount map.
+X.LP
+XSymbolic links on an NFS filesystem are incredibly inefficient.
+XTheir interpolations are not cached by the kernel and each time a symlink is
+Xencountered during a
+X.I lookuppn
+Xtranslation it costs an RPC call to the NFS server.
+XIt would appear that a large improvement in real-time
+Xperformance could be gained by adding a cache somewhere.
+XReplacing symlinks with a suitable incarnation of the auto-mounter
+Xresults in a large real-time speedup, but also causes a large
+Xnumber of process context switches.
+X.LP
+XA weird imagination is most useful to gain full advantage of all
+Xthe features.
+X.SH "SEE ALSO"
+X.BR domainname (1),
+X.BR hostname (1),
+X.BR automount (8),
+X.BR mount (8),
+X.BR umount (8),
+X.BR mtab (5),
+X.LP
+X.I "Amd \- An Automounter"
+X.SH AUTHOR
+XJan-Simon Pendry <jsp@doc.ic.ac.uk>, Department of Computing, Imperial College, London, UK.
+END_OF_FILE
+if test 6057 -ne `wc -c <'amd-man'`; then
+    echo shar: \"'amd-man'\" unpacked with wrong size!
+fi
+# end of 'amd-man'
+fi
+if test -f 'amq_subr.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'amq_subr.c'\"
+else
+echo shar: Extracting \"'amq_subr.c'\" \(7290 characters\)
+sed "s/^X//" >'amq_subr.c' <<'END_OF_FILE'
+X/*
+X * $Id: amq_subr.c,v 5.1.1.1 90/01/11 17:03:40 jsp Exp Locker: jsp $
+X *
+X * Copyright (c) 1990 Jan-Simon Pendry
+X * Copyright (c) 1990 Imperial College of Science, Technology & Medicine
+X * Copyright (c) 1990 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Jan-Simon Pendry at Imperial College, London.
+X *
+X * Redistribution and use in source and binary forms are permitted
+X * provided that the above copyright notice and this paragraph are
+X * duplicated in all such forms and that any documentation,
+X * advertising materials, and other materials related to such
+X * distribution and use acknowledge that the software was developed
+X * by Imperial College of Science, Technology and Medicine, London, UK.
+X * The names of the College and University may not be used to endorse
+X * or promote products derived from this software without specific
+X * prior written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+X * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+X * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X *
+X *	%W% (Berkeley) %G%
+X */
+X/*
+X * Auxilliary routines for amq tool
+X */
+X
+X#include "am.h"
+X#include "amq.h"
+X
+X#include <sys/param.h>
+X
+X/*ARGSUSED*/
+Xvoidp
+Xamqproc_null_1(argp, rqstp)
+Xvoidp argp;
+Xstruct svc_req *rqstp;
+X{
+X	static char res;
+X
+X	return (voidp) &res;
+X}
+X
+X/*
+X * Return a sub-tree of mounts
+X */
+X/*ARGSUSED*/
+Xamq_mount_tree_p *
+Xamqproc_mnttree_1(argp, rqstp)
+Xvoidp argp;
+Xstruct svc_req *rqstp;
+X{
+X	static am_node *mp;
+X	mp = find_ap(*(char **) argp);
+X	return (amq_mount_tree_p *) &mp;
+X}
+X
+X/*
+X * Unmount a single node
+X */
+X/*ARGSUSED*/
+Xvoidp
+Xamqproc_umnt_1(argp, rqstp)
+Xvoidp argp;
+Xstruct svc_req *rqstp;
+X{
+X	static char res;
+X	am_node *mp = find_ap(*(char **) argp);
+X	if (mp)
+X		forcibly_timeout_mp(mp);
+X
+X	return (voidp) &res;
+X}
+X
+X/*
+X * Return global statistics
+X */
+X/*ARGSUSED*/
+Xamq_mount_stats *
+Xamqproc_stats_1(argp, rqstp)
+Xvoidp argp;
+Xstruct svc_req *rqstp;
+X{
+X	return (amq_mount_stats *) &amd_stats;
+X}
+X
+X/*
+X * Return the entire tree of mount nodes
+X */
+X/*ARGSUSED*/
+Xamq_mount_tree_list *
+Xamqproc_export_1(argp, rqstp)
+Xvoidp argp;
+Xstruct svc_req *rqstp;
+X{
+X	static amq_mount_tree_list aml;
+X
+X#ifdef oldcode
+X	static am_node **mvec;
+X	int i;
+X	int n = 0;
+X
+X	mvec = (struct am_node **)
+X		xrealloc(mvec, (1+last_used_map) * sizeof(am_node *));
+X	for (i = last_used_map; i >= 0; --i) {
+X		am_node *mp = exported_ap[i];
+X		if (mp && (mp->am_flags & AMF_ROOT))
+X			mvec[n++] = mp;
+X	}
+X
+X	aml.amq_mount_tree_list_val = (amq_mount_tree_p *) mvec;
+X	aml.amq_mount_tree_list_len = n;
+X#else
+X	aml.amq_mount_tree_list_val = (amq_mount_tree_p *) &exported_ap[0];
+X	aml.amq_mount_tree_list_len = 1;	/* XXX */
+X#endif
+X	return &aml;
+X}
+X
+Xint *
+Xamqproc_setopt_1(argp, rqstp)
+Xvoidp argp;
+Xstruct svc_req *rqstp;
+X{
+X	static int rc;
+X
+X	amq_setopt *opt = (amq_setopt *) argp;
+X
+X	rc = 0;
+X	switch (opt->as_opt) {
+X	case AMOPT_DEBUG:
+X#ifdef DEBUG
+X		if (debug_option(opt->as_str))
+X			rc = EINVAL;
+X#else
+X		rc = EINVAL;
+X#endif
+X		break;
+X
+X	case AMOPT_LOGFILE:
+X#ifdef not_yet
+X		if (switch_to_logfile(opt->as_str))
+X			rc = EINVAL;
+X#else
+X		rc = EACCES;
+X#endif
+X		break;
+X
+X	case AMOPT_XLOG:
+X		if (switch_option(opt->as_str))
+X			rc = EINVAL;
+X		break;
+X
+X	case AMOPT_FLUSHMAPC:
+X		if (amd_state == Run) {
+X			plog(XLOG_INFO, "amq says flush cache");
+X			do_mapc_reload = 0;
+X		}
+X		break;
+X	}
+X	return &rc;
+X}
+X
+Xamq_mount_info_list *
+Xamqproc_getmntfs_1(argp, rqstp)
+Xvoidp argp;
+Xstruct svc_req *rqstp;
+X{
+Xextern qelem mfhead;
+X	return (amq_mount_info_list *) &mfhead;	/* XXX */
+X}
+X
+X/*
+X * XDR routines.
+X */
+Xbool_t
+Xxdr_amq_string(xdrs, objp)
+X	XDR *xdrs;
+X	amq_string *objp;
+X{
+X	if (!xdr_string(xdrs, objp, AMQ_STRLEN)) {
+X		return (FALSE);
+X	}
+X	return (TRUE);
+X}
+X
+Xbool_t
+Xxdr_amq_setopt(xdrs, objp)
+X	XDR *xdrs;
+X	amq_setopt *objp;
+X{
+X	if (!xdr_enum(xdrs, (enum_t *)&objp->as_opt)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_string(xdrs, &objp->as_str, AMQ_STRLEN)) {
+X		return (FALSE);
+X	}
+X	return (TRUE);
+X}
+X
+X/*
+X * More XDR routines  - Should be used for OUTPUT ONLY.
+X */
+Xbool_t
+Xxdr_amq_mount_tree(xdrs, objp)
+X	XDR *xdrs;
+X	amq_mount_tree *objp;
+X{
+X	am_node *mp = (am_node *) objp;
+X
+X	if (!xdr_amq_string(xdrs, &mp->am_mnt->mf_info)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_amq_string(xdrs, &mp->am_path)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_amq_string(xdrs, mp->am_link ? &mp->am_link : &mp->am_mnt->mf_mount)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_amq_string(xdrs, &mp->am_mnt->mf_ops->fs_type)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_long(xdrs, &mp->am_stats.s_mtime)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_u_short(xdrs, &mp->am_stats.s_uid)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &mp->am_stats.s_getattr)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &mp->am_stats.s_lookup)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &mp->am_stats.s_readdir)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &mp->am_stats.s_readlink)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &mp->am_stats.s_statfs)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_pointer(xdrs, (char **)&mp->am_osib, sizeof(amq_mount_tree), xdr_amq_mount_tree)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_pointer(xdrs, (char **)&mp->am_child, sizeof(amq_mount_tree), xdr_amq_mount_tree)) {
+X		return (FALSE);
+X	}
+X	return (TRUE);
+X}
+X
+Xbool_t
+Xxdr_amq_mount_tree_p(xdrs, objp)
+X	XDR *xdrs;
+X	amq_mount_tree_p *objp;
+X{
+X	if (!xdr_pointer(xdrs, (char **)objp, sizeof(amq_mount_tree), xdr_amq_mount_tree)) {
+X		return (FALSE);
+X	}
+X	return (TRUE);
+X}
+X
+X
+Xbool_t
+Xxdr_amq_mount_stats(xdrs, objp)
+X	XDR *xdrs;
+X	amq_mount_stats *objp;
+X{
+X	if (!xdr_int(xdrs, &objp->as_drops)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &objp->as_stale)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &objp->as_mok)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &objp->as_merr)) {
+X		return (FALSE);
+X	}
+X	if (!xdr_int(xdrs, &objp->as_uerr)) {
+X		return (FALSE);
+X	}
+X	return (TRUE);
+X}
+X
+X
+Xbool_t
+Xxdr_amq_mount_tree_list(xdrs, objp)
+X	XDR *xdrs;
+X	amq_mount_tree_list *objp;
+X{
+X	 if (!xdr_array(xdrs, (char **)&objp->amq_mount_tree_list_val, (u_int *)&objp->amq_mount_tree_list_len, ~0, sizeof(amq_mount_tree_p), xdr_amq_mount_tree_p)) {
+X		return (FALSE);
+X	}
+X	return (TRUE);
+X}
+X
+Xxdr_amq_mount_info_qelem(xdrs, qhead)
+X	XDR *xdrs;
+X	qelem *qhead;
+X{
+X	/*
+X	 * Compute length of list
+X	 */
+X	mntfs *mf;
+X	u_int len = 0;
+X	for (mf = LAST(mntfs, qhead); mf != HEAD(mntfs, qhead); mf = PREV(mntfs, mf)) {
+X		if (!(mf->mf_ops->fs_flags & FS_AMQINFO))
+X			continue;
+X		len++;
+X	}
+X	xdr_u_int(xdrs, &len);
+X
+X	/*
+X	 * Send individual data items
+X	 */
+X	for (mf = LAST(mntfs, qhead); mf != HEAD(mntfs, qhead); mf = PREV(mntfs, mf)) {
+X		int up;
+X		if (!(mf->mf_ops->fs_flags & FS_AMQINFO))
+X			continue;
+X
+X		if (!xdr_amq_string(xdrs, &mf->mf_ops->fs_type)) {
+X			return (FALSE);
+X		}
+X		if (!xdr_amq_string(xdrs, &mf->mf_mount)) {
+X			return (FALSE);
+X		}
+X		if (!xdr_amq_string(xdrs, &mf->mf_info)) {
+X			return (FALSE);
+X		}
+X		if (!xdr_amq_string(xdrs, &mf->mf_server->fs_host)) {
+X			return (FALSE);
+X		}
+X		if (!xdr_int(xdrs, &mf->mf_error)) {
+X			return (FALSE);
+X		}
+X		if (!xdr_int(xdrs, &mf->mf_refc)) {
+X			return (FALSE);
+X		}
+X		if (mf->mf_server->fs_flags & FSF_ERROR)
+X			up = 0;
+X		else switch (mf->mf_server->fs_flags & (FSF_DOWN|FSF_VALID)) {
+X		case FSF_DOWN|FSF_VALID: up = 0; break;
+X		case FSF_VALID: up = 1; break;
+X		default: up = -1; break;
+X		}
+X		if (!xdr_int(xdrs, &up)) {
+X			return (FALSE);
+X		}
+X	}
+X	return (TRUE);
+X}
+END_OF_FILE
+if test 7290 -ne `wc -c <'amq_subr.c'`; then
+    echo shar: \"'amq_subr.c'\" unpacked with wrong size!
+fi
+# end of 'amq_subr.c'
+fi
+if test -f 'mk-amd-map.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mk-amd-map.c'\"
+else
+echo shar: Extracting \"'mk-amd-map.c'\" \(6603 characters\)
+sed "s/^X//" >'mk-amd-map.c' <<'END_OF_FILE'
+X/*
+X * $Id: mk-amd-map.c,v 5.1.1.2 90/01/11 17:09:31 jsp Exp Locker: jsp $
+X *
+X * Copyright (c) 1990 Jan-Simon Pendry
+X * Copyright (c) 1990 Imperial College of Science, Technology & Medicine
+X * Copyright (c) 1990 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Jan-Simon Pendry at Imperial College, London.
+X *
+X * Redistribution and use in source and binary forms are permitted
+X * provided that the above copyright notice and this paragraph are
+X * duplicated in all such forms and that any documentation,
+X * advertising materials, and other materials related to such
+X * distribution and use acknowledge that the software was developed
+X * by Imperial College of Science, Technology and Medicine, London, UK.
+X * The names of the College and University may not be used to endorse
+X * or promote products derived from this software without specific
+X * prior written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+X * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+X * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X */
+X
+X/*
+X * Convert a file map into an ndbm map
+X */
+X
+X#ifndef lint
+Xchar copyright[] = "\
+X@(#)Copyright (c) 1990 Jan-Simon Pendry\n\
+X@(#)Copyright (c) 1990 Imperial College of Science, Technology & Medicine\n\
+X@(#)Copyright (c) 1990 The Regents of the University of California.\n\
+X@(#)All rights reserved.\n";
+X#endif /* not lint */
+X
+X#ifndef lint
+Xstatic char rcsid[] = "$Id: mk-amd-map.c,v 5.1.1.2 90/01/11 17:09:31 jsp Exp Locker: jsp $";
+Xstatic char sccsid[] = "%W% (Berkeley) %G%";
+X#endif /* not lint */
+X
+X#include "am.h"
+X
+X#ifdef OS_HAS_GDBM
+X#define HAS_DATABASE
+X#include "gdbm.h"
+X#endif
+X
+X#ifndef HAS_DATABASE
+X#ifdef OS_HAS_NDBM
+X#define HAS_DATABASE
+X#define	USE_NDBM
+X#include <ndbm.h>
+X
+X#define create_database(name) dbm_open(name, O_RDWR|O_CREAT, 0444)
+X
+Xstatic int store_data(db, k, v)
+Xvoidp db;
+Xchar *k, *v;
+X{
+X	datum key, val;
+X
+X	key.dptr = k; val.dptr = v;
+X	key.dsize = strlen(k) + 1;
+X	val.dsize = strlen(v) + 1;
+X	return dbm_store((DBM *) db, key, val, DBM_INSERT);
+X}
+X
+X#endif /* OS_HAS_NDBM */
+X#endif /* !OS_HAS_DATABASE */
+X
+X#ifdef HAS_DATABASE
+X#include <fcntl.h>
+X#include <ctype.h>
+X
+Xstatic int read_line(buf, size, fp)
+Xchar *buf;
+Xint size;
+XFILE *fp;
+X{
+X	int done = 0;
+X
+X	do {
+X		while (fgets(buf, size, fp)) {
+X			int len = strlen(buf);
+X			done += len;
+X			if (len > 1 && buf[len-2] == '\\' &&
+X					buf[len-1] == '\n') {
+X				int ch;
+X				buf += len - 2;
+X				size -= len - 2;
+X				/*
+X				 * Skip leading white space on next line
+X				 */
+X				while ((ch = getc(fp)) != EOF &&
+X					isascii(ch) && isspace(ch))
+X						;
+X				(void) ungetc(ch, fp);
+X			} else {
+X				return done;
+X			}
+X		}
+X	} while (size > 0 && !feof(fp));
+X
+X	return done;
+X}
+X
+X/*
+X * Read through a map
+X */
+Xstatic int read_file(fp, map, db)
+XFILE *fp;
+Xchar *map;
+Xvoidp db;
+X{
+X	char key_val[2048];
+X	int chuck = 0;
+X	int line_no = 0;
+X	int errs = 0;
+X
+X	while (read_line(key_val, sizeof(key_val), fp)) {
+X		char *kp;
+X		char *cp;
+X		char *hash;
+X		int len = strlen(key_val);
+X		line_no++;
+X
+X		/*
+X		 * Make sure we got the whole line
+X		 */
+X		if (key_val[len-1] != '\n') {
+X			fprintf(stderr, "line %d in \"%s\" is too long", line_no, map);
+X			chuck = 1;
+X		} else {
+X			key_val[len-1] = '\0';
+X		}
+X
+X		/*
+X		 * Strip comments
+X		 */
+X		hash = strchr(key_val, '#');
+X		if (hash)
+X			*hash = '\0';
+X
+X		/*
+X		 * Find start of key
+X		 */
+X		for (kp = key_val; *kp && isascii(*kp) && isspace(*kp); kp++)
+X			;
+X
+X		/*
+X		 * Ignore blank lines
+X		 */
+X		if (!*kp)
+X			goto again;
+X
+X		/*
+X		 * Find end of key
+X		 */
+X		for (cp = kp; *cp&&(!isascii(*cp)||!isspace(*cp)); cp++)
+X			;
+X
+X		/*
+X		 * Check whether key matches, or whether
+X		 * the entry is a wildcard entry.
+X		 */
+X		if (*cp)
+X			*cp++ = '\0';
+X		while (*cp && isascii(*cp) && isspace(*cp))
+X			cp++;
+X		if (*kp == '+') {
+X			fprintf(stderr, "Can't interpolate %s\n", kp);
+X			errs++;
+X		} else if (*cp) {
+X#ifdef DEBUG
+X			printf("%s\t%s\n", kp, cp);
+X#endif
+X			if (store_data(db, kp, cp) < 0) {
+X				fprintf(stderr, "Could store %s -> %s\n", kp, cp);
+X				errs++;
+X			}
+X		} else {
+X			fprintf(stderr, "%s: line %d has no value field", map, line_no);
+X			errs++;
+X		}
+X
+Xagain:
+X		/*
+X		 * If the last read didn't get a whole line then
+X		 * throw away the remainder before continuing...
+X		 */
+X		if (chuck) {
+X			while (fgets(key_val, sizeof(key_val), fp) &&
+X				!strchr(key_val, '\n'))
+X					;
+X			chuck = 0;
+X		}
+X	}
+X	return errs;
+X}
+X
+Xstatic int remove(f)
+Xchar *f;
+X{
+X	if (unlink(f) < 0 && errno != ENOENT)
+X		return -1;
+X	return 0;
+X}
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	FILE *mapf;
+X	char *map;
+X	int rc = 0;
+X	DBM *mapd;
+X	char *maptmp = "dbmXXXXXX";
+X	char maptpag[16], maptdir[16];
+X	char *mappag, *mapdir;
+X	int len;
+X	char *sl;
+X
+X	if (argc != 2) {
+X		fputs("Usage: mk-amd-map file-map\n", stderr);
+X		exit(1);
+X	}
+X
+X	map = argv[1];
+X	sl = strrchr(map, '/');
+X	if (sl) {
+X		*sl = '\0';
+X		if (chdir(map) < 0) {
+X			fputs("Can't chdir to ", stderr);
+X			perror(map);
+X			exit(1);
+X		}
+X		map = sl + 1;
+X	}
+X#ifdef USE_NDBM
+X	len = strlen(map);
+X	mappag = (char *) malloc(len + 5);
+X	mapdir = (char *) malloc(len + 5);
+X	if (!mappag || !mapdir) {
+X		perror("malloc");
+X		exit(1);
+X	}
+X	mktemp(maptmp);
+X	sprintf(maptpag, "%s.pag", maptmp);
+X	sprintf(maptdir, "%s.dir", maptmp);
+X	if (remove(maptpag) < 0 || remove(maptdir) < 0) {
+X		fprintf(stderr, "Can't remove existing temporary files; %s and", maptpag);
+X		perror(maptdir);
+X		exit(1);
+X	}
+X#endif
+X	mapf =  fopen(map, "r");
+X	if (mapf)
+X		mapd = create_database(maptmp);
+X	else
+X		mapd = 0;
+X#ifndef DEBUG
+X	signal(SIGINT, SIG_IGN);
+X#endif
+X	if (mapd) {
+X		int error = read_file(mapf, map, mapd);
+X		(void) fclose(mapf);
+X		if (error) {
+X			fprintf(stderr, "Error creating ndbm map for %s\n", map);
+X			rc = 1;
+X		}
+X#ifdef USE_NDBM
+X		sprintf(mappag, "%s.pag", map);
+X		sprintf(mapdir, "%s.dir", map);
+X		if (rename(maptpag, mappag) < 0) {
+X			fprintf(stderr, "Couldn't rename %s to ", maptpag);
+X			perror(mappag);
+X			/* Throw away the temporary map */
+X			unlink(maptpag);
+X			unlink(maptdir);
+X			rc = 1;
+X		} else if (rename(maptdir, mapdir) < 0) {
+X			fprintf(stderr, "Couldn't rename %s to ", maptdir);
+X			perror(mapdir);
+X			/* Put the .pag file back */
+X			rename(mappag, maptpag);
+X			/* Throw away remaining part of original map */
+X			unlink(mapdir);
+X			fprintf(stderr, "WARNING: existing map \"%s.{dir,pag}\" destroyed\n", map);
+X			rc = 1;
+X		}
+X#endif
+X	} else {
+X#ifdef USE_NDBM
+X		fprintf(stderr, "Can't open \"%s.{dir,pag}\" for ", map);
+X#endif
+X		perror("writing");
+X		rc = 1;
+X	}
+X	exit(rc);
+X}
+X#else
+Xmain()
+X{
+X	fputs("This system does not support hashed database files\n", stderr);
+X	exit(0);
+X}
+X#endif
+END_OF_FILE
+if test 6603 -ne `wc -c <'mk-amd-map.c'`; then
+    echo shar: \"'mk-amd-map.c'\" unpacked with wrong size!
+fi
+# end of 'mk-amd-map.c'
+fi
+if test -f 'mntfs.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mntfs.c'\"
+else
+echo shar: Extracting \"'mntfs.c'\" \(6936 characters\)
+sed "s/^X//" >'mntfs.c' <<'END_OF_FILE'
+X/*
+X * $Id: mntfs.c,v 5.1.1.3 90/01/11 17:10:07 jsp Exp Locker: jsp $
+X *
+X * Copyright (c) 1990 Jan-Simon Pendry
+X * Copyright (c) 1990 Imperial College of Science, Technology & Medicine
+X * Copyright (c) 1990 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Jan-Simon Pendry at Imperial College, London.
+X *
+X * Redistribution and use in source and binary forms are permitted
+X * provided that the above copyright notice and this paragraph are
+X * duplicated in all such forms and that any documentation,
+X * advertising materials, and other materials related to such
+X * distribution and use acknowledge that the software was developed
+X * by Imperial College of Science, Technology and Medicine, London, UK.
+X * The names of the College and University may not be used to endorse
+X * or promote products derived from this software without specific
+X * prior written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+X * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+X * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X *
+X *	%W% (Berkeley) %G%
+X */
+X
+X#include "am.h"
+X
+Xextern qelem mfhead;
+Xqelem mfhead = { &mfhead, &mfhead };
+X
+Xint mntfs_allocated;
+X
+X/*
+X * This is the default attributes field which
+X * is copied into every new node to be created.
+X * The individual filesystem fs_init() routines
+X * patch the copy to represent the particular
+X * details for the relevant filesystem type
+X */
+Xstatic struct fattr gen_fattr = {
+X	NFDIR,				/* type */
+X	NFSMODE_DIR | 0555,		/* mode */
+X	2,				/* nlink */
+X	0,				/* uid */
+X	0,				/* gid */
+X	512,				/* size */
+X	4096,				/* blocksize */
+X	0,				/* rdev */
+X	1,				/* blocks */
+X	0,				/* fsid */
+X	0,				/* fileid */
+X	{ 0, 0 },			/* atime */
+X	{ 0, 0 },			/* mtime */
+X	{ 0, 0 },			/* ctime */
+X};
+X
+Xmntfs *dup_mntfs(mf)
+Xmntfs *mf;
+X{
+X	if (mf->mf_refc == 0) {
+X		untimeout(mf->mf_cid);
+X		mf->mf_cid = 0;
+X		mf->mf_error = -1;
+X		mf->mf_error &= ~MFF_ERROR;
+X	}
+X	mf->mf_refc++;
+X	return mf;
+X}
+X
+Xstatic init_mntfs(mf, ops, mo, mp, info, opts)
+Xmntfs *mf;
+Xam_ops *ops;
+Xam_opts *mo;
+Xchar *mp;
+Xchar *info;
+Xchar *opts;
+X{
+X	mf->mf_ops = ops;
+X	mf->mf_fo = mo;
+X	mf->mf_mount = strdup(mp);
+X	mf->mf_info = strdup(info);
+X	mf->mf_opts = strdup(opts);
+X	mf->mf_refc = 1;
+X	mf->mf_flags = 0;
+X	mf->mf_error = -1;
+X	mf->mf_cid = 0;
+X	mf->mf_private = 0;
+X	mf->mf_prfree = 0;
+X	mf->mf_attr.status = NFS_OK;
+X	mf->mf_fattr = gen_fattr;
+X	mf->mf_fattr.fsid = 42;
+X	mf->mf_fattr.fileid = 0;
+X	mf->mf_fattr.atime.seconds = clocktime();
+X	mf->mf_fattr.atime.useconds = 0;
+X	mf->mf_fattr.mtime = mf->mf_fattr.ctime = mf->mf_fattr.atime;
+X
+X	if (ops->ffserver)
+X		mf->mf_server = (*ops->ffserver)(mf);
+X	else
+X		mf->mf_server = 0;
+X}
+X
+Xstatic mntfs *alloc_mntfs(ops, mo, mp, info, opts)
+Xam_ops *ops;
+Xam_opts *mo;
+Xchar *mp;
+Xchar *info;
+Xchar *opts;
+X{
+X	mntfs *mf = ALLOC(mntfs);
+X	init_mntfs(mf, ops, mo, mp, info, opts);
+X	ins_que(&mf->mf_q, &mfhead);
+X	mntfs_allocated++;
+X
+X	return mf;
+X}
+X
+Xmntfs *find_mntfs(ops, mo, mp, info, opts)
+Xam_ops *ops;
+Xam_opts *mo;
+Xchar *mp;
+Xchar *info;
+Xchar *opts;
+X{
+X	mntfs *mf;
+X
+X#ifdef DEBUG
+X	dlog("Locating mntfs reference to %s", mp);
+X#endif
+X	ITER(mf, mntfs, &mfhead) {
+X		if (STREQ(mf->mf_mount, mp)) {
+X			/*
+X			 * Handle cases where error ops are involved
+X			 */
+X			if (ops == &efs_ops) {
+X				/*
+X				 * If the existing ops are not efs_ops
+X				 * then continue...
+X				 */
+X				if (mf->mf_ops != &efs_ops)
+X					continue;
+X			} else /* ops != &efs_ops */ {
+X				/*
+X				 * If the existing ops are efs_ops
+X				 * then continue...
+X				 */
+X				if (mf->mf_ops == &efs_ops)
+X					continue;
+X			}
+X
+X			if ((mf->mf_flags & MFF_RESTART) && amd_state == Run) {
+X				/*
+X				 * Restart a previously mounted filesystem.
+X				 */
+X				mntfs *mf2 = alloc_mntfs(&ifs_ops, mo, mp, info, opts);
+X#ifdef DEBUG
+X				dlog("Restarting filesystem %s", mf->mf_mount);
+X#endif
+X				/*
+X				 * Remember who we are restarting
+X				 */
+X				mf2->mf_private = (voidp) dup_mntfs(mf);
+X				mf2->mf_prfree = free_mntfs;
+X				return mf2;
+X			}
+X			mf->mf_fo = mo;
+X			if (!(mf->mf_flags & (MFF_MOUNTED|MFF_MOUNTING|MFF_UNMOUNTING))) {
+X				fserver *fs;
+X				mf->mf_opts = strealloc(mf->mf_opts, opts);
+X				mf->mf_info = strealloc(mf->mf_info, info);
+X				fs = ops->ffserver ? (*ops->ffserver)(mf) : (fserver *) 0;
+X				if (mf->mf_server)
+X					free_srvr(mf->mf_server);
+X				mf->mf_server = fs;
+X			}
+X			return dup_mntfs(mf);
+X		}
+X	}
+X
+X	return alloc_mntfs(ops, mo, mp, info, opts);
+X}
+X
+Xmntfs *new_mntfs()
+X{
+X	return alloc_mntfs(&efs_ops, (am_opts *) 0, "//nil//", ".", "");
+X}
+X
+Xstatic void uninit_mntfs(mf, rmd)
+Xmntfs *mf;
+Xint rmd;
+X{
+X	if (mf->mf_mount) free((voidp) mf->mf_mount);
+X	if (mf->mf_opts) free((voidp) mf->mf_opts);
+X	if (mf->mf_info) free((voidp) mf->mf_info);
+X	if (mf->mf_private && mf->mf_prfree)
+X		(*mf->mf_prfree)(mf->mf_private);
+X	/*
+X	 * Clean up any directories that were made
+X	 */
+X	if (rmd && (mf->mf_flags & MFF_MKMNT))
+X		rmdirs(mf->mf_mount);
+X
+X	/*
+X	 * Clean up the file server
+X	 */
+X	if (mf->mf_server)
+X		free_srvr(mf->mf_server);
+X
+X	/*
+X	 * Don't do a callback on this mount
+X	 */
+X	if (mf->mf_cid) {
+X		untimeout(mf->mf_cid);
+X		mf->mf_cid = 0;
+X	}
+X}
+X
+Xstatic void discard_mntfs(mf)
+Xmntfs *mf;
+X{
+X	rem_que(&mf->mf_q);
+X	/*
+X	 * Free memory
+X	 */
+X	uninit_mntfs(mf, TRUE);
+X	free((voidp) mf);
+X
+X	--mntfs_allocated;
+X}
+X
+Xvoid flush_mntfs()
+X{
+X	mntfs *mf;
+X
+X	mf = FIRST(mntfs, &mfhead);
+X	while (mf != HEAD(mntfs, &mfhead)) {
+X		mntfs *mf2 = mf;
+X		mf = NEXT(mntfs, mf);
+X		if (mf2->mf_refc == 0 && mf2->mf_cid)
+X			discard_mntfs(mf2);
+X	}
+X}
+X
+Xvoid free_mntfs(mf)
+Xmntfs *mf;
+X{
+X	if (--mf->mf_refc == 0) {
+X		if (mf->mf_flags & MFF_MOUNTED) {
+X			int quoted;
+X			mf->mf_flags &= ~MFF_MOUNTED;
+X
+X			/*
+X			 * Record for posterity
+X			 */
+X			quoted = strchr(mf->mf_info, ' ') != 0;	/* cheap */
+X			plog(XLOG_INFO, "%s%s%s %sed fstype %s from %s",
+X				quoted ? "\"" : "",
+X				mf->mf_info,
+X				quoted ? "\"" : "",
+X				mf->mf_error ? "discard" : "unmount",
+X				mf->mf_ops->fs_type, mf->mf_mount);
+X		}
+X
+X		if (mf->mf_ops->fs_flags & FS_DISCARD) {
+X#ifdef DEBUG
+X			dlog("Immediately discarding mntfs for %s", mf->mf_mount);
+X#endif
+X			discard_mntfs(mf);
+X		} else {
+X#ifdef DEBUG
+X			if (mf->mf_flags & MFF_RESTART) {
+X				dlog("Discarding remount hook for %s", mf->mf_mount);
+X			} else {
+X				dlog("Discarding last mntfs reference to %s fstype %s",
+X					mf->mf_mount, mf->mf_ops->fs_type);
+X			}
+X			if (mf->mf_flags & (MFF_MOUNTED|MFF_MOUNTING|MFF_UNMOUNTING))
+X				dlog("mntfs reference for %s still active", mf->mf_mount);
+X#endif
+X			mf->mf_cid = timeout(ALLOWED_MOUNT_TIME, discard_mntfs, (voidp) mf);
+X		}
+X	}
+X}
+X
+Xmntfs *realloc_mntfs(mf, ops, mo, mp, info, opts)
+Xmntfs *mf;
+Xam_ops *ops;
+Xam_opts *mo;
+Xchar *mp;
+Xchar *info;
+Xchar *opts;
+X{
+X	mntfs *mf2;
+X	if (mf->mf_refc == 1 && mf->mf_ops == &ifs_ops && STREQ(mf->mf_mount, mp)) {
+X		/*
+X		 * If we are inheriting then just return
+X		 * the same node...
+X		 */
+X		return mf;
+X	}
+X	mf2 = find_mntfs(ops, mo, mp, info, opts);
+X	free_mntfs(mf);
+X	return mf2;
+X}
+END_OF_FILE
+if test 6936 -ne `wc -c <'mntfs.c'`; then
+    echo shar: \"'mntfs.c'\" unpacked with wrong size!
+fi
+# end of 'mntfs.c'
+fi
+if test -f 'nfs_prot.h' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'nfs_prot.h'\"
+else
+echo shar: Extracting \"'nfs_prot.h'\" \(6142 characters\)
+sed "s/^X//" >'nfs_prot.h' <<'END_OF_FILE'
+X/* $Id: nfs_prot.h,v 5.1 89/11/17 18:21:14 jsp Exp Locker: jsp $ */
+X
+X#define	xdr_nfsstat xdr_enum
+X#define	xdr_ftype xdr_enum
+X
+X#define NFS_PORT 2049
+X#define NFS_MAXDATA 8192
+X#define NFS_MAXPATHLEN 1024
+X#define NFS_MAXNAMLEN 255
+X#define NFS_FHSIZE 32
+X#define NFS_COOKIESIZE 4
+X#define NFS_FIFO_DEV -1
+X#define NFSMODE_FMT 0170000
+X#define NFSMODE_DIR 0040000
+X#define NFSMODE_CHR 0020000
+X#define NFSMODE_BLK 0060000
+X#define NFSMODE_REG 0100000
+X#define NFSMODE_LNK 0120000
+X#define NFSMODE_SOCK 0140000
+X#define NFSMODE_FIFO 0010000
+X
+Xenum nfsstat {
+X	NFS_OK = 0,
+X	NFSERR_PERM = 1,
+X	NFSERR_NOENT = 2,
+X	NFSERR_IO = 5,
+X	NFSERR_NXIO = 6,
+X	NFSERR_ACCES = 13,
+X	NFSERR_EXIST = 17,
+X	NFSERR_NODEV = 19,
+X	NFSERR_NOTDIR = 20,
+X	NFSERR_ISDIR = 21,
+X	NFSERR_FBIG = 27,
+X	NFSERR_NOSPC = 28,
+X	NFSERR_ROFS = 30,
+X	NFSERR_NAMETOOLONG = 63,
+X	NFSERR_NOTEMPTY = 66,
+X	NFSERR_DQUOT = 69,
+X	NFSERR_STALE = 70,
+X	NFSERR_WFLUSH = 99
+X};
+Xtypedef enum nfsstat nfsstat;
+Xbool_t xdr_nfsstat();
+X
+X
+Xenum ftype {
+X	NFNON = 0,
+X	NFREG = 1,
+X	NFDIR = 2,
+X	NFBLK = 3,
+X	NFCHR = 4,
+X	NFLNK = 5,
+X	NFSOCK = 6,
+X	NFBAD = 7,
+X	NFFIFO = 8
+X};
+Xtypedef enum ftype ftype;
+X/* static bool_t xdr_ftype(); */
+X
+X
+Xstruct nfs_fh {
+X	char data[NFS_FHSIZE];
+X};
+Xtypedef struct nfs_fh nfs_fh;
+Xbool_t xdr_nfs_fh();
+X
+X
+Xstruct nfstime {
+X	u_int seconds;
+X	u_int useconds;
+X};
+Xtypedef struct nfstime nfstime;
+X/* static bool_t xdr_nfstime(); */
+X
+X
+Xstruct fattr {
+X	ftype type;
+X	u_int mode;
+X	u_int nlink;
+X	u_int uid;
+X	u_int gid;
+X	u_int size;
+X	u_int blocksize;
+X	u_int rdev;
+X	u_int blocks;
+X	u_int fsid;
+X	u_int fileid;
+X	nfstime atime;
+X	nfstime mtime;
+X	nfstime ctime;
+X};
+Xtypedef struct fattr fattr;
+X/* static bool_t xdr_fattr(); */
+X
+X
+Xstruct sattr {
+X	u_int mode;
+X	u_int uid;
+X	u_int gid;
+X	u_int size;
+X	nfstime atime;
+X	nfstime mtime;
+X};
+Xtypedef struct sattr sattr;
+X/* static bool_t xdr_sattr(); */
+X
+X
+Xtypedef char *filename;
+X/* static bool_t xdr_filename(); */
+X
+X
+Xtypedef char *nfspath;
+Xbool_t xdr_nfspath();
+X
+X
+Xstruct attrstat {
+X	nfsstat status;
+X	union {
+X		fattr attributes;
+X	} attrstat_u;
+X};
+Xtypedef struct attrstat attrstat;
+Xbool_t xdr_attrstat();
+X
+X
+Xstruct sattrargs {
+X	nfs_fh file;
+X	sattr attributes;
+X};
+Xtypedef struct sattrargs sattrargs;
+Xbool_t xdr_sattrargs();
+X
+X
+Xstruct diropargs {
+X	nfs_fh dir;
+X	filename name;
+X};
+Xtypedef struct diropargs diropargs;
+Xbool_t xdr_diropargs();
+X
+X
+Xstruct diropokres {
+X	nfs_fh file;
+X	fattr attributes;
+X};
+Xtypedef struct diropokres diropokres;
+Xbool_t xdr_diropokres();
+X
+X
+Xstruct diropres {
+X	nfsstat status;
+X	union {
+X		diropokres diropres;
+X	} diropres_u;
+X};
+Xtypedef struct diropres diropres;
+Xbool_t xdr_diropres();
+X
+X
+Xstruct readlinkres {
+X	nfsstat status;
+X	union {
+X		nfspath data;
+X	} readlinkres_u;
+X};
+Xtypedef struct readlinkres readlinkres;
+Xbool_t xdr_readlinkres();
+X
+X
+Xstruct readargs {
+X	nfs_fh file;
+X	u_int offset;
+X	u_int count;
+X	u_int totalcount;
+X};
+Xtypedef struct readargs readargs;
+Xbool_t xdr_readargs();
+X
+X
+Xstruct readokres {
+X	fattr attributes;
+X	struct {
+X		u_int data_len;
+X		char *data_val;
+X	} data;
+X};
+Xtypedef struct readokres readokres;
+Xbool_t xdr_readokres();
+X
+X
+Xstruct readres {
+X	nfsstat status;
+X	union {
+X		readokres reply;
+X	} readres_u;
+X};
+Xtypedef struct readres readres;
+Xbool_t xdr_readres();
+X
+X
+Xstruct writeargs {
+X	nfs_fh file;
+X	u_int beginoffset;
+X	u_int offset;
+X	u_int totalcount;
+X	struct {
+X		u_int data_len;
+X		char *data_val;
+X	} data;
+X};
+Xtypedef struct writeargs writeargs;
+Xbool_t xdr_writeargs();
+X
+X
+Xstruct createargs {
+X	diropargs where;
+X	sattr attributes;
+X};
+Xtypedef struct createargs createargs;
+Xbool_t xdr_createargs();
+X
+X
+Xstruct renameargs {
+X	diropargs from;
+X	diropargs to;
+X};
+Xtypedef struct renameargs renameargs;
+Xbool_t xdr_renameargs();
+X
+X
+Xstruct linkargs {
+X	nfs_fh from;
+X	diropargs to;
+X};
+Xtypedef struct linkargs linkargs;
+Xbool_t xdr_linkargs();
+X
+X
+Xstruct symlinkargs {
+X	diropargs from;
+X	nfspath to;
+X	sattr attributes;
+X};
+Xtypedef struct symlinkargs symlinkargs;
+Xbool_t xdr_symlinkargs();
+X
+X
+Xtypedef char nfscookie[NFS_COOKIESIZE];
+X/* static bool_t xdr_nfscookie(); */
+X
+X
+Xstruct readdirargs {
+X	nfs_fh dir;
+X	nfscookie cookie;
+X	u_int count;
+X};
+Xtypedef struct readdirargs readdirargs;
+Xbool_t xdr_readdirargs();
+X
+X
+Xstruct entry {
+X	u_int fileid;
+X	filename name;
+X	nfscookie cookie;
+X	struct entry *nextentry;
+X};
+Xtypedef struct entry entry;
+X/* static bool_t xdr_entry(); */
+X
+X
+Xstruct dirlist {
+X	entry *entries;
+X	bool_t eof;
+X};
+Xtypedef struct dirlist dirlist;
+X/* static bool_t xdr_dirlist(); */
+X
+X
+Xstruct readdirres {
+X	nfsstat status;
+X	union {
+X		dirlist reply;
+X	} readdirres_u;
+X};
+Xtypedef struct readdirres readdirres;
+Xbool_t xdr_readdirres();
+X
+X
+Xstruct statfsokres {
+X	u_int tsize;
+X	u_int bsize;
+X	u_int blocks;
+X	u_int bfree;
+X	u_int bavail;
+X};
+Xtypedef struct statfsokres statfsokres;
+Xbool_t xdr_statfsokres();
+X
+X
+Xstruct statfsres {
+X	nfsstat status;
+X	union {
+X		statfsokres reply;
+X	} statfsres_u;
+X};
+Xtypedef struct statfsres statfsres;
+Xbool_t xdr_statfsres();
+X
+X
+X#define NFS_PROGRAM ((u_long)100003)
+X#define NFS_VERSION ((u_long)2)
+X#define NFSPROC_NULL ((u_long)0)
+Xextern voidp nfsproc_null_2();
+X#define NFSPROC_GETATTR ((u_long)1)
+Xextern attrstat *nfsproc_getattr_2();
+X#define NFSPROC_SETATTR ((u_long)2)
+Xextern attrstat *nfsproc_setattr_2();
+X#define NFSPROC_ROOT ((u_long)3)
+Xextern voidp nfsproc_root_2();
+X#define NFSPROC_LOOKUP ((u_long)4)
+Xextern diropres *nfsproc_lookup_2();
+X#define NFSPROC_READLINK ((u_long)5)
+Xextern readlinkres *nfsproc_readlink_2();
+X#define NFSPROC_READ ((u_long)6)
+Xextern readres *nfsproc_read_2();
+X#define NFSPROC_WRITECACHE ((u_long)7)
+Xextern voidp nfsproc_writecache_2();
+X#define NFSPROC_WRITE ((u_long)8)
+Xextern attrstat *nfsproc_write_2();
+X#define NFSPROC_CREATE ((u_long)9)
+Xextern diropres *nfsproc_create_2();
+X#define NFSPROC_REMOVE ((u_long)10)
+Xextern nfsstat *nfsproc_remove_2();
+X#define NFSPROC_RENAME ((u_long)11)
+Xextern nfsstat *nfsproc_rename_2();
+X#define NFSPROC_LINK ((u_long)12)
+Xextern nfsstat *nfsproc_link_2();
+X#define NFSPROC_SYMLINK ((u_long)13)
+Xextern nfsstat *nfsproc_symlink_2();
+X#define NFSPROC_MKDIR ((u_long)14)
+Xextern diropres *nfsproc_mkdir_2();
+X#define NFSPROC_RMDIR ((u_long)15)
+Xextern nfsstat *nfsproc_rmdir_2();
+X#define NFSPROC_READDIR ((u_long)16)
+Xextern readdirres *nfsproc_readdir_2();
+X#define NFSPROC_STATFS ((u_long)17)
+Xextern statfsres *nfsproc_statfs_2();
+X
+END_OF_FILE
+if test 6142 -ne `wc -c <'nfs_prot.h'`; then
+    echo shar: \"'nfs_prot.h'\" unpacked with wrong size!
+fi
+# end of 'nfs_prot.h'
+fi
+if test -f 'nfs_prot.x' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'nfs_prot.x'\"
+else
+echo shar: Extracting \"'nfs_prot.x'\" \(6368 characters\)
+sed "s/^X//" >'nfs_prot.x' <<'END_OF_FILE'
+X/*
+X * nfs_prot.x 1.3 88/02/08
+X * Copyright 1987 Sun Microsystems, Inc.
+X */
+Xconst NFS_PORT          = 2049;
+Xconst NFS_MAXDATA       = 8192;
+Xconst NFS_MAXPATHLEN    = 1024;
+Xconst NFS_MAXNAMLEN	= 255;
+Xconst NFS_FHSIZE	= 32;
+Xconst NFS_COOKIESIZE	= 4;
+Xconst NFS_FIFO_DEV	= -1;	/* size kludge for named pipes */
+X
+X/*
+X * File types
+X */
+Xconst NFSMODE_FMT  = 0170000;	/* type of file */
+Xconst NFSMODE_DIR  = 0040000;	/* directory */
+Xconst NFSMODE_CHR  = 0020000;	/* character special */
+Xconst NFSMODE_BLK  = 0060000;	/* block special */
+Xconst NFSMODE_REG  = 0100000;	/* regular */
+Xconst NFSMODE_LNK  = 0120000;	/* symbolic link */
+Xconst NFSMODE_SOCK = 0140000;	/* socket */
+Xconst NFSMODE_FIFO = 0010000;	/* fifo */
+X
+X/*
+X * Error status
+X */
+Xenum nfsstat {
+X	NFS_OK= 0,		/* no error */
+X	NFSERR_PERM=1,		/* Not owner */
+X	NFSERR_NOENT=2,		/* No such file or directory */
+X	NFSERR_IO=5,		/* I/O error */
+X	NFSERR_NXIO=6,		/* No such device or address */
+X	NFSERR_ACCES=13,	/* Permission denied */
+X	NFSERR_EXIST=17,	/* File exists */
+X	NFSERR_NODEV=19,	/* No such device */
+X	NFSERR_NOTDIR=20,	/* Not a directory*/
+X	NFSERR_ISDIR=21,	/* Is a directory */
+X	NFSERR_FBIG=27,		/* File too large */
+X	NFSERR_NOSPC=28,	/* No space left on device */
+X	NFSERR_ROFS=30,		/* Read-only file system */
+X	NFSERR_NAMETOOLONG=63,	/* File name too long */
+X	NFSERR_NOTEMPTY=66,	/* Directory not empty */
+X	NFSERR_DQUOT=69,	/* Disc quota exceeded */
+X	NFSERR_STALE=70,	/* Stale NFS file handle */
+X	NFSERR_WFLUSH=99	/* write cache flushed */
+X};
+X
+X/*
+X * File types
+X */
+Xenum ftype {
+X	NFNON = 0,	/* non-file */
+X	NFREG = 1,	/* regular file */
+X	NFDIR = 2,	/* directory */
+X	NFBLK = 3,	/* block special */
+X	NFCHR = 4,	/* character special */
+X	NFLNK = 5,	/* symbolic link */
+X	NFSOCK = 6,	/* unix domain sockets */
+X	NFBAD = 7,	/* unused */
+X	NFFIFO = 8 	/* named pipe */
+X};
+X
+X/*
+X * File access handle
+X */
+Xstruct nfs_fh {
+X	opaque data[NFS_FHSIZE];
+X};
+X
+X/* 
+X * Timeval
+X */
+Xstruct nfstime {
+X	unsigned seconds;
+X	unsigned useconds;
+X};
+X
+X
+X/*
+X * File attributes
+X */
+Xstruct fattr {
+X	ftype type;		/* file type */
+X	unsigned mode;		/* protection mode bits */
+X	unsigned nlink;		/* # hard links */
+X	unsigned uid;		/* owner user id */
+X	unsigned gid;		/* owner group id */
+X	unsigned size;		/* file size in bytes */
+X	unsigned blocksize;	/* prefered block size */
+X	unsigned rdev;		/* special device # */
+X	unsigned blocks;	/* Kb of disk used by file */
+X	unsigned fsid;		/* device # */
+X	unsigned fileid;	/* inode # */
+X	nfstime	atime;		/* time of last access */
+X	nfstime	mtime;		/* time of last modification */
+X	nfstime	ctime;		/* time of last change */
+X};
+X
+X/*
+X * File attributes which can be set
+X */
+Xstruct sattr {
+X	unsigned mode;	/* protection mode bits */
+X	unsigned uid;	/* owner user id */
+X	unsigned gid;	/* owner group id */
+X	unsigned size;	/* file size in bytes */
+X	nfstime	atime;	/* time of last access */
+X	nfstime	mtime;	/* time of last modification */
+X};
+X
+X
+Xtypedef string filename<NFS_MAXNAMLEN>; 
+Xtypedef string nfspath<NFS_MAXPATHLEN>;
+X
+X/*
+X * Reply status with file attributes
+X */
+Xunion attrstat switch (nfsstat status) {
+Xcase NFS_OK:
+X	fattr attributes;
+Xdefault:
+X	void;
+X};
+X
+Xstruct sattrargs {
+X	nfs_fh file;
+X	sattr attributes;
+X};
+X
+X/*
+X * Arguments for directory operations
+X */
+Xstruct diropargs {
+X	nfs_fh	dir;	/* directory file handle */
+X	filename name;		/* name (up to NFS_MAXNAMLEN bytes) */
+X};
+X
+Xstruct diropokres {
+X	nfs_fh file;
+X	fattr attributes;
+X};
+X
+X/*
+X * Results from directory operation
+X */
+Xunion diropres switch (nfsstat status) {
+Xcase NFS_OK:
+X	diropokres diropres;
+Xdefault:
+X	void;
+X};
+X
+Xunion readlinkres switch (nfsstat status) {
+Xcase NFS_OK:
+X	nfspath data;
+Xdefault:
+X	void;
+X};
+X
+X/*
+X * Arguments to remote read
+X */
+Xstruct readargs {
+X	nfs_fh file;		/* handle for file */
+X	unsigned offset;	/* byte offset in file */
+X	unsigned count;		/* immediate read count */
+X	unsigned totalcount;	/* total read count (from this offset)*/
+X};
+X
+X/*
+X * Status OK portion of remote read reply
+X */
+Xstruct readokres {
+X	fattr	attributes;	/* attributes, need for pagin*/
+X	opaque data<NFS_MAXDATA>;
+X};
+X
+Xunion readres switch (nfsstat status) {
+Xcase NFS_OK:
+X	readokres reply;
+Xdefault:
+X	void;
+X};
+X
+X/*
+X * Arguments to remote write 
+X */
+Xstruct writeargs {
+X	nfs_fh	file;		/* handle for file */
+X	unsigned beginoffset;	/* beginning byte offset in file */
+X	unsigned offset;	/* current byte offset in file */
+X	unsigned totalcount;	/* total write count (to this offset)*/
+X	opaque data<NFS_MAXDATA>;
+X};
+X
+Xstruct createargs {
+X	diropargs where;
+X	sattr attributes;
+X};
+X
+Xstruct renameargs {
+X	diropargs from;
+X	diropargs to;
+X};
+X
+Xstruct linkargs {
+X	nfs_fh from;
+X	diropargs to;
+X};
+X
+Xstruct symlinkargs {
+X	diropargs from;
+X	nfspath to;
+X	sattr attributes;
+X};
+X
+X
+Xtypedef opaque nfscookie[NFS_COOKIESIZE];
+X
+X/*
+X * Arguments to readdir
+X */
+Xstruct readdirargs {
+X	nfs_fh dir;		/* directory handle */
+X	nfscookie cookie;
+X	unsigned count;		/* number of directory bytes to read */
+X};
+X
+Xstruct entry {
+X	unsigned fileid;
+X	filename name;
+X	nfscookie cookie;
+X	entry *nextentry;
+X};
+X
+Xstruct dirlist {
+X	entry *entries;
+X	bool eof;
+X};
+X
+Xunion readdirres switch (nfsstat status) {
+Xcase NFS_OK:
+X	dirlist reply;
+Xdefault:
+X	void;
+X};
+X
+Xstruct statfsokres {
+X	unsigned tsize;	/* preferred transfer size in bytes */
+X	unsigned bsize;	/* fundamental file system block size */
+X	unsigned blocks;	/* total blocks in file system */
+X	unsigned bfree;	/* free blocks in fs */
+X	unsigned bavail;	/* free blocks avail to non-superuser */
+X};
+X
+Xunion statfsres switch (nfsstat status) {
+Xcase NFS_OK:
+X	statfsokres reply;
+Xdefault:
+X	void;
+X};
+X
+X/*
+X * Remote file service routines
+X */
+Xprogram NFS_PROGRAM {
+X	version NFS_VERSION {
+X		void 
+X		NFSPROC_NULL(void) = 0;
+X
+X		attrstat 
+X		NFSPROC_GETATTR(nfs_fh) =	1;
+X
+X		attrstat 
+X		NFSPROC_SETATTR(sattrargs) = 2;
+X
+X		void 
+X		NFSPROC_ROOT(void) = 3;
+X
+X		diropres 
+X		NFSPROC_LOOKUP(diropargs) = 4;
+X
+X		readlinkres 
+X		NFSPROC_READLINK(nfs_fh) = 5;
+X
+X		readres 
+X		NFSPROC_READ(readargs) = 6;
+X
+X		void 
+X		NFSPROC_WRITECACHE(void) = 7;
+X
+X		attrstat
+X		NFSPROC_WRITE(writeargs) = 8;
+X
+X		diropres
+X		NFSPROC_CREATE(createargs) = 9;
+X
+X		nfsstat
+X		NFSPROC_REMOVE(diropargs) = 10;
+X
+X		nfsstat
+X		NFSPROC_RENAME(renameargs) = 11;
+X
+X		nfsstat
+X		NFSPROC_LINK(linkargs) = 12;
+X
+X		nfsstat
+X		NFSPROC_SYMLINK(symlinkargs) = 13;
+X
+X		diropres
+X		NFSPROC_MKDIR(createargs) = 14;
+X
+X		nfsstat
+X		NFSPROC_RMDIR(diropargs) = 15;
+X
+X		readdirres
+X		NFSPROC_READDIR(readdirargs) = 16;
+X
+X		statfsres
+X		NFSPROC_STATFS(nfs_fh) = 17;
+X	} = 2;
+X} = 100003;
+X
+END_OF_FILE
+if test 6368 -ne `wc -c <'nfs_prot.x'`; then
+    echo shar: \"'nfs_prot.x'\" unpacked with wrong size!
+fi
+# end of 'nfs_prot.x'
+fi
+echo shar: End of archive 5 \(of 13\).
+cp /dev/null ark5isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 13 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+exit 0 # Just in case...

@@ -1,0 +1,1876 @@
+Subject:  v20i026:  Deliver, flexible email delivery system, Part04/04
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Chip Salzenberg <chip@ateng.com>
+Posting-number: Volume 20, Issue 26
+Archive-name: deliver2.0/part04
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of shell archive."
+# Contents:  mbox.c procs.c subs.c sysdep.c unctime.y uucp.c
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'mbox.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mbox.c'\"
+else
+echo shar: Extracting \"'mbox.c'\" \(4366 characters\)
+sed "s/^X//" >'mbox.c' <<'END_OF_FILE'
+X/* $Header: mbox.c,v 2.1 89/06/09 12:25:33 network Exp $
+X *
+X * Finally!  Put the message in the specified mailbox(es).
+X *
+X * $Log:	mbox.c,v $
+X * Revision 2.1  89/06/09  12:25:33  network
+X * Update RCS revisions.
+X * 
+X * Revision 1.6  89/06/09  12:23:55  network
+X * Baseline for 2.0 release.
+X * 
+X */
+X
+X#include "deliver.h"
+X#include <sys/stat.h>
+X#include <errno.h>
+X
+X/*
+X * External data.
+X */
+X
+Xextern  int     errno;
+X
+X/*
+X * Local functions.
+X */
+X
+Xstatic          mbox_one();
+Xstatic  int     mbox_write();
+X
+X/*----------------------------------------------------------------------
+X * Deliver mail to all valid destinations.
+X */
+X
+Xmbox_deliver()
+X{
+X	DEST    *d;
+X
+X	for (d = first_dest(); d; d = next_dest(d))
+X	{
+X		switch (d->d_class)
+X		{
+X		case CL_USER:
+X		case CL_MBOX:
+X			if (d->d_state == ST_WORKING)
+X				mbox_one(d);
+X			break;
+X		}
+X	}
+X}
+X
+X/*----------------------------------------------------------------------
+X * Deliver mail to one destination.
+X */
+X
+Xstatic
+Xmbox_one(d)
+XDEST    *d;
+X{
+X	CONTEXT *ct;
+X	int     ret = 0;
+X
+X	if (printaddrs)
+X	{
+X		(void) printf("%s", d->d_name);
+X		if (d->d_class == CL_MBOX)
+X			(void) printf(":%s", d->d_mailbox);
+X		(void) printf("\n");
+X	}
+X
+X	if (dryrun)
+X	{
+X		d->d_state = ST_DONE;
+X		return;
+X	}
+X
+X	if ((ct = name_context(d->d_name)) == NULL)
+X	{
+X		dest_err(d, E_CTLOST);
+X		return;
+X	}
+X
+X	if (! ok_context(ct))
+X	{
+X		dest_err(d, E_CTPERM);
+X		return;
+X	}
+X
+X	if (d->d_class == CL_MBOX)
+X	{
+X		if (sfork() == 0)
+X		{
+X			if (become(ct, !boxdelivery) < 0)
+X				exit(1);
+X			if (mbox_write(d->d_mailbox, ct, FALSE) < 0)
+X				exit(1);
+X			exit(0);
+X		}
+X
+X		if (await_child() != 0)
+X			ret = -1;
+X	}
+X	else
+X	{
+X		char    mailbox[100];
+X
+X		(void) sprintf(mailbox, "%s/%s",
+X#ifdef MBX_DIR
+X			MBX_DIR, d->d_name
+X#else
+X			d->d_home, MBX_NAME
+X#endif
+X			);
+X
+X		if (mbox_write(mailbox, ct, TRUE) < 0)
+X			ret = -1;
+X	}
+X
+X	if (ret >= 0)
+X		d->d_state = ST_DONE;
+X	else
+X		dest_err(d, E_MBOX);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Write mail to the named mailbox.
+X * If we have to create the mailbox, give it to the specified user.
+X * If "is_sys" is true, then we're writing to a system mailbox.
+X */
+X
+Xstatic int
+Xmbox_write(mailbox, ct, is_sys)
+Xchar    *mailbox;
+XCONTEXT *ct;
+Xint     is_sys;
+X{
+X	struct stat st;
+X	int     fd, t, mbox_uid, mbox_gid;
+X	int     ret = 0;
+X
+X	if (verbose)
+X	{
+X		message("As %s, delivering to %s mailbox %s\n",
+X			ct->ct_name, (is_sys ? "system" : "user"), mailbox);
+X	}
+X
+X	if (name_lock(mailbox) < 0)
+X		return -1;
+X
+X	while ((fd = open(mailbox, O_WRONLY)) == -1)
+X	{
+X		if (errno != ENOENT)
+X		{
+X			syserr("can't open %s", mailbox);
+X			break;
+X		}
+X
+X#ifdef O_CREAT
+X		fd = open(mailbox, O_WRONLY|O_CREAT|O_EXCL, MBX_MODE);
+X
+X		/* If it exists now, try open() again. */
+X		if (fd == -1 && errno == EEXIST)
+X			continue;
+X#else
+X		fd = creat(mailbox, MBX_MODE);
+X#endif
+X		if (fd == -1)
+X		{
+X			syserr("can't create %s", mailbox);
+X			break;
+X		}
+X
+X		/* Make sure the mailbox receives the correct modes */
+X
+X		mbox_uid = ct->ct_uid;
+X		mbox_gid = ct->ct_gid;
+X
+X#ifdef MBX_GROUP
+X		if (is_sys)
+X		{
+X			static int mbox_sv_gid = -2;
+X
+X			if (mbox_sv_gid == -2)
+X				mbox_sv_gid = group_id(MBX_GROUP);
+X
+X			if (mbox_sv_gid < 0)
+X				message("%s: no such group\n", MBX_GROUP);
+X			else
+X				mbox_gid = mbox_sv_gid;
+X		}
+X#endif /* MBX_GROUP */
+X
+X		if (fstat(fd, &st) == -1)
+X		{
+X			syserr("can't fstat open mailbox?!");
+X			(void) close(fd);
+X			fd = -1;
+X			break;
+X		}
+X
+X		/* Change mailbox ownership if it's not already correct. */
+X
+X		if ((st.st_uid != mbox_uid || st.st_gid != mbox_gid)
+X		 && chown(mailbox, mbox_uid, mbox_gid) == -1)
+X		{
+X			/* print a message, but that's all. (???) */
+X			syserr("can't chown %s to %d,%d",
+X				mailbox, mbox_uid, mbox_gid);
+X		}
+X
+X		/* It's open now, so we can stop looping now. */
+X
+X		break;
+X	}
+X
+X	if (fd == -1)
+X	{
+X		(void) name_unlock(mailbox);
+X		return -1;
+X	}
+X
+X	if (fd_lock(fd) < 0)
+X	{
+X		(void) close(fd);
+X		(void) name_unlock(mailbox);
+X		return -1;
+X	}
+X
+X	(void) lseek(fd, 0L, 2); /* No error check: may be a special file */
+X
+X	for (t = T_HDR; t <= T_BODY; ++t)
+X	{
+X		if (lseek(tfd[t], 0L, 0) == -1)
+X		{
+X			syserr("lseek in %s file %s", ttype[t], tfile[t]);
+X			ret = -1;
+X			break;
+X		}
+X
+X		if (copyfd(tfd[t], fd) < 0)
+X		{
+X			ret = -1;
+X			break;
+X		}
+X	}
+X
+X	if (verbose)
+X	{
+X		if (ret >= 0)
+X			message("wrote message to %s\n", mailbox);
+X	}
+X
+X	if (fd_unlock(fd) < 0)
+X		ret = -1;
+X	(void) close(fd);
+X	if (name_unlock(mailbox) < 0)
+X		ret = -1;
+X
+X	return ret;
+X}
+END_OF_FILE
+if test 4366 -ne `wc -c <'mbox.c'`; then
+    echo shar: \"'mbox.c'\" unpacked with wrong size!
+fi
+# end of 'mbox.c'
+fi
+if test -f 'procs.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'procs.c'\"
+else
+echo shar: Extracting \"'procs.c'\" \(5039 characters\)
+sed "s/^X//" >'procs.c' <<'END_OF_FILE'
+X/* $Header: procs.c,v 2.1 89/06/09 12:25:37 network Exp $
+X *
+X * Process management and misc support.
+X *
+X * $Log:	procs.c,v $
+X * Revision 2.1  89/06/09  12:25:37  network
+X * Update RCS revisions.
+X * 
+X * Revision 1.5  89/06/09  12:23:57  network
+X * Baseline for 2.0 release.
+X * 
+X */
+X
+X#include "deliver.h"
+X#include <errno.h>
+X#include <signal.h>
+X
+X/*
+X * External data.
+X */
+X
+Xextern  int     errno;
+X
+X/*
+X * Local data.
+X */
+X
+Xstatic  int     child_pid = -1;
+Xstatic  SIGTYPE (*saved_sigpipe)() = SIG_DFL;
+X
+X/*----------------------------------------------------------------------
+X * Like popen(), but execute the child in a specific context.
+X * Also, the argument list is already a vector.
+X */
+X
+XFILE *
+Xct_popenv(ct, prog, av, mode)
+XCONTEXT *ct;
+Xchar    *prog;
+Xchar    **av;
+Xchar    *mode;
+X{
+X	char    ch;
+X	int     child, parent;
+X	int     pfd[2];
+X
+X	if (!ct || !prog || !av || !mode)
+X		return NULL;
+X
+X	if (mode[0] == 'r' && mode[1] == 0)
+X		child = 1, parent = 0;
+X	else if (mode[0] == 'w' && mode[1] == 0)
+X		child = 0, parent = 1;
+X	else
+X		return NULL;
+X
+X	/* We can't have more than one child at a time. */
+X
+X	if (child_pid >= 0)
+X	{
+X		error("in ct_popen: a process is already open\n");
+X		return NULL;
+X	}
+X
+X	/* Make a stab at predicting uid-related failure. */
+X
+X	if (! ok_context(ct))
+X	{
+X		error("in ct_popen: no permissions to become %s\n",
+X		      ct->ct_name);
+X		return NULL;
+X	}
+X
+X	/* Pipes?  Like, tubular, fer shur! */
+X
+X	if (pipe(pfd) == -1)
+X	{
+X		syserr("can't create a pipe");
+X		return NULL;
+X	}
+X
+X	/* Generate a debugging message. */
+X
+X	if (verbose)
+X	{
+X		int a;
+X
+X		message("Spawning");
+X		for (a = 0; av[a]; ++a)
+X			message(" %s", av[a]);
+X		message("\n");
+X	}
+X
+X	/* Handle the child case */
+X
+X	if (sfork() == 0)
+X	{
+X		if (child == 0)
+X		{
+X			(void) close(0);
+X			(void) dup(pfd[0]);     /* ass_u_me 0 */
+X		}
+X		else
+X		{
+X			(void) close(0);
+X			if (open("/dev/null", O_RDONLY) != 0)
+X			{
+X				/* This should _never_ happen, but... */
+X				syserr("can't open /dev/null");
+X				(void) dup(1);  /* ass_u_me 0 */
+X			}
+X
+X			(void) close(1);
+X			(void) dup(pfd[1]);     /* ass_u_me 1 */
+X		}
+X
+X		if (become(ct, TRUE) < 0)
+X			(void) write(pfd[1], "n", 1);
+X		else
+X		{
+X			int     t;
+X
+X			(void) write(pfd[1], "y", 1);
+X
+X			(void) close(pfd[child]);
+X			(void) close(pfd[parent]);
+X			for (t = 0; t < T_MAX; ++t)
+X				(void) close(tfd[t]);
+X
+X			(void) execv(prog, av);
+X			syserr("can't execute %s", prog);
+X		}
+X
+X		exit(127);
+X	}
+X
+X	/* Make sure that a broken pipe won't kill us */
+X
+X	saved_sigpipe = signal(SIGPIPE, SIG_IGN);
+X
+X	/* The child must report "OK" before we continue. */
+X
+X	if ((read(pfd[0], &ch, 1) < 1) || (ch != 'y'))
+X	{
+X		(void) close(pfd[0]);
+X		(void) close(pfd[1]);
+X		(void) await_child();
+X		return NULL;
+X	}
+X
+X	(void) close(pfd[child]);
+X	return fdopen(pfd[parent], mode);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Close the stream opened by ct_popen().
+X */
+X
+Xct_pclose(fp)
+XFILE    *fp;
+X{
+X	if (fp)
+X		(void) fclose(fp);
+X	return await_child();
+X}
+X
+X/*----------------------------------------------------------------------
+X * Assume the identity of the given user.
+X */
+X
+Xint
+Xbecome(ct, chd)
+XCONTEXT *ct;
+Xint     chd;
+X{
+X	char    env_path[32];
+X
+X	/*
+X	 * Assume a new identity.
+X	 * Note the importance of doing the setgid() before the setuid().
+X	 */
+X
+X	if (setgid(ct->ct_gid) == -1)
+X	{
+X		syserr("can't setgid to %d", ct->ct_gid);
+X		return -1;
+X	}
+X	if (setuid(ct->ct_uid) == -1)
+X	{
+X		syserr("can't setgid to %u", ct->ct_uid);
+X		return -1;
+X	}
+X	if (chd && chdir(ct->ct_home) == -1)
+X	{
+X		syserr("can't chdir to %s", ct->ct_home);
+X		return -1;
+X	}
+X
+X	/* Set up the environment */
+X
+X	(void) sprintf(env_path, "%s:/bin:/usr/bin",
+X			((ct->ct_uid == 0) ? "/etc" : "."));
+X	alloc_env("HOME", ct->ct_home);
+X	alloc_env("PATH", env_path);
+X
+X	/* I guess it worked. */
+X
+X	return 0;
+X}
+X
+X/*----------------------------------------------------------------------
+X * Safe fork.  If it doesn't work, it exits.
+X */
+X
+Xint
+Xsfork()
+X{
+X	int     tries;
+X
+X	/*
+X	 * A few safety measures.
+X	 */
+X
+X	(void) await_child();
+X	(void) fflush(stdout);
+X	(void) fflush(stderr);
+X
+X	/*
+X	 * Be patient in waiting for a fork().
+X	 */
+X
+X	for (tries = 0; tries < 10; ++tries)
+X	{
+X		if (tries)
+X			snooze(3);
+X		if ((child_pid = fork()) >= 0)
+X			return child_pid;
+X		if (errno != EAGAIN)
+X			break;
+X	}
+X
+X	syserr("can't fork");
+X	leave(1);
+X	/* NOTREACHED */
+X}
+X
+X/*----------------------------------------------------------------------
+X * Wait for our child (if any) to exit.
+X * Returns child's exit status or -1 if there is a problem.
+X */
+X
+Xint
+Xawait_child()
+X{
+X	int     wpid, st;
+X
+X	if (child_pid < 0)
+X		return -1;
+X
+X	while ((wpid = wait(&st)) >= 0)
+X	{
+X		if (wpid == child_pid)
+X			break;
+X	}
+X
+X	child_pid = -1;
+X	if (wpid == -1)
+X		syserr("waiting for child");
+X
+X	(void) signal(SIGPIPE, saved_sigpipe);
+X	saved_sigpipe = SIG_DFL;
+X
+X	if (wpid == -1)
+X		return -1;
+X
+X	if (st & 0xFF)
+X	{
+X		error("child process died%s due to signal %d.\n",
+X			((st & 0x80) ? " and dumped core" : ""),
+X			(st & 0x7F));
+X
+X		return -1;
+X	}
+X
+X	if (verbose)
+X	{
+X		message("child process exited with status %d.\n",
+X			(st >> 8) & 0xFF);
+X	}
+X
+X	return ((st >> 8) & 0xFF);
+X}
+END_OF_FILE
+if test 5039 -ne `wc -c <'procs.c'`; then
+    echo shar: \"'procs.c'\" unpacked with wrong size!
+fi
+# end of 'procs.c'
+fi
+if test -f 'subs.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'subs.c'\"
+else
+echo shar: Extracting \"'subs.c'\" \(2650 characters\)
+sed "s/^X//" >'subs.c' <<'END_OF_FILE'
+X/* $Header: subs.c,v 2.1 89/06/09 12:25:39 network Exp $
+X *
+X * Miscellaneous subroutines.
+X *
+X * $Log:	subs.c,v $
+X * Revision 2.1  89/06/09  12:25:39  network
+X * Update RCS revisions.
+X * 
+X * Revision 1.8  89/06/09  12:23:58  network
+X * Baseline for 2.0 release.
+X * 
+X */
+X
+X#include "deliver.h"
+X
+X/*----------------------------------------------------------------------
+X * Allocate memory for an environment variable, and putenv() it.
+X */
+X
+Xalloc_env(name, value)
+Xchar    *name;
+Xchar    *value;
+X{
+X	char    *s;
+X
+X	if (!name || !value)
+X		return;
+X
+X	s = zalloc((unsigned) (strlen(name) + strlen(value) + 2));
+X	(void) sprintf(s, "%s=%s", name, value);
+X	if (putenv(s))
+X		nomem();
+X}
+X
+X/*----------------------------------------------------------------------
+X * Remove an environment variable.
+X */
+X
+Xdel_env(name)
+Xchar    *name;
+X{
+X	int     len;
+X	char    **e;
+X
+X	if (!name)
+X		return;
+X
+X	len = strlen(name);
+X
+X	for (e = environ; *e; ++e)
+X	{
+X		char    c;
+X
+X		if (strncmp(*e, name, len) != 0)
+X			continue;
+X
+X		c = (*e)[len];
+X		if (c == '=' || c == '\0')
+X			break;
+X	}
+X
+X	for (; *e; ++e)
+X		*e = *(e + 1);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Allocate and clear.  If it fails, it takes the emergency exit.
+X */
+X
+Xchar *
+Xzalloc(size)
+Xunsigned size;
+X{
+X	char    *p;
+X
+X	if ((p = malloc(size)) == NULL)
+X		nomem();
+X
+X	Zero(p, size);
+X	return p;
+X}
+X
+X/*----------------------------------------------------------------------
+X * Reallocate to new size.  If it fails, it takes the emergency exit.
+X */
+X
+Xchar *
+Xsrealloc(ptr, size)
+Xchar    *ptr;
+Xunsigned size;
+X{
+X	char    *p;
+X
+X	if ((p = realloc(ptr, size)) == NULL)
+X		nomem();
+X
+X	return p;
+X}
+X
+X/*----------------------------------------------------------------------
+X * Make an allocated copy of a string.
+X */
+X
+Xchar *
+Xcopystr(s)
+Xchar    *s;
+X{
+X	char    *p;
+X
+X	if (s == NULL)
+X		return NULL;
+X
+X	if ((p = malloc((unsigned) strlen(s) + 1)) == NULL)
+X		nomem();
+X
+X	(void) strcpy(p, s);
+X	return p;
+X}
+X
+X/*----------------------------------------------------------------------
+X * Emergency exit for memory loss.
+X */
+X
+Xnomem()
+X{
+X	error("out of memory\n");
+X	leave(1);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Return the last component of the given pathname.
+X */
+X
+Xchar *
+Xbasename(name)
+Xchar    *name;
+X{
+X	char    *b;
+X
+X	if ((b = strrchr(name, '/')) != NULL)
+X		++b;
+X	else
+X		b = name;
+X
+X	return (b);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Check an address for validity.
+X */
+X
+Xvalid_address(addr)
+Xchar    *addr;
+X{
+X	char    *p;
+X	static char sanitize[] = SANITIZE;
+X
+X	for (p = addr; *p; ++p)
+X	{
+X		if (strchr(sanitize, *p))
+X			return FALSE;
+X	}
+X
+X	return TRUE;
+X}
+END_OF_FILE
+if test 2650 -ne `wc -c <'subs.c'`; then
+    echo shar: \"'subs.c'\" unpacked with wrong size!
+fi
+# end of 'subs.c'
+fi
+if test -f 'sysdep.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'sysdep.c'\"
+else
+echo shar: Extracting \"'sysdep.c'\" \(6647 characters\)
+sed "s/^X//" >'sysdep.c' <<'END_OF_FILE'
+X/* $Header: sysdep.c,v 2.1 89/06/09 12:25:40 network Exp $
+X *
+X * Routines which are (or might well be) system-dependant.
+X * I've put the message routines here since you may need to use
+X * the ANSI <stdarg.h> instead of <varargs.h>.
+X *
+X * $Log:	sysdep.c,v $
+X * Revision 2.1  89/06/09  12:25:40  network
+X * Update RCS revisions.
+X * 
+X * Revision 1.8  89/06/09  12:23:59  network
+X * Baseline for 2.0 release.
+X * 
+X */
+X
+X#include "deliver.h"
+X#include <errno.h>
+X#ifdef HAS_STDARG
+X#include <stdarg.h>
+X#else
+X#ifdef HAS_VARARGS
+X#include <varargs.h>
+X#else
+X/*
+X * Non-portable home-grown varargs.  Use at your own risk.
+X * Especially note that if sizeof(int) > sizeof(short), then
+X * "va_arg(..,short)" is broken.
+X */
+Xtypedef char *va_list;
+X#define va_dcl          int va_alist;
+X#define va_start(ap)    ap = (char *) &va_alist
+X#define va_arg(ap,type) *(type *)(ap += sizeof(type), ap - sizeof(type))
+X#define va_end(ap)      /* nothing */
+X#endif
+X#endif
+X
+X#ifdef UNAME
+X#include <sys/utsname.h>
+X#endif
+X
+X/*
+X * External functions.
+X */
+X
+X#ifdef M_XENIX
+Xextern  long    nap();
+X#else
+Xextern  unsigned sleep();
+X#endif
+X
+X/*
+X * External data.
+X */
+X
+Xextern  int     errno;
+Xextern  int     sys_nerr;
+Xextern  char    *sys_errlist[];
+X
+X/*----------------------------------------------------------------------
+X * Print a message.
+X */
+X
+X/* VARARGS */
+X#ifdef HAS_STDARG
+Xmessage(char *fmt, ...)
+X#else
+Xmessage(va_alist) va_dcl
+X#endif
+X{
+X	va_list ap;
+X
+X#ifdef HAS_STDARG
+X	va_start(ap, fmt);
+X#else
+X	char    *fmt;
+X	va_start(ap);
+X	fmt = va_arg(ap, char *);
+X#endif
+X
+X	(void) vfprintf(stderr, fmt, ap);
+X
+X	va_end(ap);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Print an error message.
+X */
+X
+X/* VARARGS */
+X#ifdef HAS_STDARG
+Xerror(char *fmt, ...)
+X#else
+Xerror(va_alist) va_dcl
+X#endif
+X{
+X	va_list ap;
+X
+X#ifdef HAS_STDARG
+X	va_start(ap, fmt);
+X#else
+X	char    *fmt;
+X	va_start(ap);
+X	fmt = va_arg(ap, char *);
+X#endif
+X
+X	(void) fprintf(stderr, "%s: ", progname);
+X	(void) vfprintf(stderr, fmt, ap);
+X
+X	va_end(ap);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Report an error returned from a system call.
+X */
+X
+X/* VARARGS */
+X#ifdef HAS_STDARG
+Xsyserr(char *fmt, ...)
+X#else
+Xsyserr(va_alist) va_dcl
+X#endif
+X{
+X	int     e = errno;
+X	va_list ap;
+X
+X#ifdef HAS_STDARG
+X	va_start(ap, fmt);
+X#else
+X	char    *fmt;
+X	va_start(ap);
+X	fmt = va_arg(ap, char *);
+X#endif
+X
+X	(void) fprintf(stderr, "%s: ", progname);
+X	(void) vfprintf(stderr, fmt, ap);
+X	if (e <= sys_nerr)
+X		(void) fprintf(stderr, ": %s\n", sys_errlist[e]);
+X	else
+X		(void) fprintf(stderr, ": unknown system error %d\n", e);
+X
+X	va_end(ap);
+X}
+X
+X/*----------------------------------------------------------------------
+X * Sleep for the given number of seconds.
+X */
+X
+Xsnooze(n)
+Xint     n;
+X{
+X#ifdef M_XENIX
+X	(void) nap(n * 1000L);
+X#else
+X	(void) sleep(n);
+X#endif
+X}
+X
+X/*----------------------------------------------------------------------
+X * Get the host name from HOSTFILE.
+X */
+X
+X#ifdef HOSTFILE
+X
+Xchar *
+Xgethost()
+X{
+X	int     fd, rd;
+X	char    *p;
+X	static char name[32];
+X
+X	if ((fd = open(HOSTFILE, O_RDONLY)) == -1)
+X		return NULL;
+X	rd = read(fd, name, sizeof(name) - 1);
+X	(void) close(fd);
+X
+X	if (rd < 1)
+X		return NULL;
+X	name[rd] = 0;
+X	if ((p = strchr(name, '\n')) != NULL)
+X		*p = 0;
+X
+X	return (name[0] ? name : NULL);
+X}
+X
+X#endif /* HOSTFILE */
+X
+X/*----------------------------------------------------------------------
+X * Get the host name via the uname() system call.
+X */
+X
+X#ifdef UNAME
+X
+Xchar *
+Xgethost()
+X{
+X	static struct utsname u;
+X
+X	uname(&u);
+X	return (u.nodename[0] ? u.nodename : NULL);
+X}
+X
+X#endif /* UNAME */
+X
+X/*----------------------------------------------------------------------
+X * Get the host name via the gethostname() system call.
+X */
+X
+X#ifdef GETHOSTNAME
+X
+Xchar *
+Xgethost()
+X{
+X	static char hostname[64];
+X
+X	if (gethostname(hostname, sizeof(hostname)) == -1)
+X		return NULL;
+X
+X	return hostname;
+X}
+X
+X#endif /* GETHOSTNAME */
+X
+X/*----------------------------------------------------------------------
+X * Return a pre-defined HOSTNAME.
+X */
+X
+X#ifdef HOSTNAME
+X
+Xchar *
+Xgethost()
+X{
+X	return HOSTNAME;
+X}
+X
+X#endif /* HOSTNAME */
+X
+X/*----------------------------------------------------------------------
+X * Variable-argument-list output, System V style.
+X */
+X
+X#ifndef HAS_VPRINTF
+X
+Xvprintf(fmt, ap)
+Xchar    *fmt;
+Xva_list ap;
+X{
+X	int     a,b,c,d,e,f,g,h;
+X
+X	a = va_arg(ap, int);
+X	b = va_arg(ap, int);
+X	c = va_arg(ap, int);
+X	d = va_arg(ap, int);
+X	e = va_arg(ap, int);
+X	f = va_arg(ap, int);
+X	g = va_arg(ap, int);
+X	h = va_arg(ap, int);
+X
+X	(void) printf(fmt, a,b,c,d,e,f,g,h);
+X}
+X
+Xvfprintf(fp, fmt, ap)
+XFILE    *fp;
+Xchar    *fmt;
+Xva_list ap;
+X{
+X	int     a,b,c,d,e,f,g,h;
+X
+X	a = va_arg(ap, int);
+X	b = va_arg(ap, int);
+X	c = va_arg(ap, int);
+X	d = va_arg(ap, int);
+X	e = va_arg(ap, int);
+X	f = va_arg(ap, int);
+X	g = va_arg(ap, int);
+X	h = va_arg(ap, int);
+X
+X	(void) fprintf(fp, fmt, a,b,c,d,e,f,g,h);
+X}
+X
+Xvsprintf(s, fmt, ap)
+Xchar    *s;
+Xchar    *fmt;
+Xva_list ap;
+X{
+X	int     a,b,c,d,e,f,g,h;
+X
+X	a = va_arg(ap, int);
+X	b = va_arg(ap, int);
+X	c = va_arg(ap, int);
+X	d = va_arg(ap, int);
+X	e = va_arg(ap, int);
+X	f = va_arg(ap, int);
+X	g = va_arg(ap, int);
+X	h = va_arg(ap, int);
+X
+X	(void) sprintf(s, fmt, a,b,c,d,e,f,g,h);
+X}
+X
+X#endif  /* !HAS_VPRINTF */
+X
+X/*----------------------------------------------------------------------
+X * Add a new environment variable.
+X */
+X
+X#ifndef HAS_PUTENV
+X
+Xint
+Xputenv(s)
+Xchar *s;
+X{
+X	static  char    **env_array;
+X	static  int     env_size;
+X	char    *e;
+X	int     i, j;
+X
+X	if (env_array == NULL)
+X	{
+X		for (i = 0; environ[i]; ++i)
+X			{}
+X		env_size = i + 10;      /* arbitrary */
+X		env_array = (char **) zalloc(env_size * sizeof(char *));
+X		Copy((char *)env_array, (char *)environ,
+X		     (int) ((i + 1) * sizeof(char *)));
+X		environ = env_array;
+X	}
+X	else if (environ != env_array)
+X		message("putenv: warning: someone moved environ!\n");
+X
+X	if ((e = strchr(s, '=')) != NULL)
+X		++e;
+X	else
+X		e = s + strlen(s);
+X
+X	j = 0;
+X	for (i = 0; env_array[i]; ++i)
+X	{
+X		if (strncmp(env_array[i], s, e - s) != 0)
+X			env_array[j++] = env_array[i];
+X	}
+X
+X	if ((j + 1) >= env_size)
+X	{
+X		env_size += 10;                 /* arbitrary */
+X		env_array = (char **) srealloc((char *)env_array,
+X					env_size * sizeof(char **));
+X	}
+X
+X	env_array[j++] = s;
+X	env_array[j] = NULL;
+X
+X	environ = env_array;
+X	return 0;
+X}
+X
+X#endif  /* !HAS_PUTENV */
+X
+X/*----------------------------------------------------------------------
+X * Memory copy.
+X */
+X
+X#ifdef MEMFUNCS
+X
+XCopy(dest, src, len)
+Xchar    *dest;
+Xchar    *src;
+Xint     len;
+X{
+X	while (len-- > 0)
+X		*dest++ = *src++;
+X}
+X
+X#endif
+X
+X/*----------------------------------------------------------------------
+X * Memory clear.
+X */
+X
+X#ifdef MEMFUNCS
+X
+XZero(dest, len)
+Xchar    *dest;
+Xint     len;
+X{
+X	while (len-- > 0)
+X		*dest++ = 0;
+X}
+X
+X#endif
+END_OF_FILE
+if test 6647 -ne `wc -c <'sysdep.c'`; then
+    echo shar: \"'sysdep.c'\" unpacked with wrong size!
+fi
+# end of 'sysdep.c'
+fi
+if test -f 'unctime.y' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'unctime.y'\"
+else
+echo shar: Extracting \"'unctime.y'\" \(11397 characters\)
+sed "s/^X//" >'unctime.y' <<'END_OF_FILE'
+X/*
+X * $Header: unctime.y,v 2.1 89/06/09 12:25:42 network Exp $
+X *
+X * Conversion of ctime-style date string back to a time_t.
+X * This module is in a different style from the rest of deliver
+X * because Chip Salzenberg didn't write it.
+X *
+X * $Log:	unctime.y,v $
+X * Revision 2.1  89/06/09  12:25:42  network
+X * Update RCS revisions.
+X * 
+X * Revision 1.3  89/06/09  12:24:01  network
+X * Baseline for 2.0 release.
+X * 
+X */
+X
+X/* time_t
+X   unctime(s)
+X  	char *s;
+X
+XConvert s, which may be in almost any reasonable date format, to
+Xa time_t integer suitable for consumption by ctime(3).  Coincidentally
+Xdestroys the contents of s.  Return -1 if s is not a recognizable legal date.
+X
+XAny parts of the time left unspecified take on the current values.
+X
+X"4 CST + 23[:10]" adds 23 minutes and optionally 10 seconds to the correction.
+X"# nnnnnn" forces exactly nnnnnn seconds GMT since Jan. 1, 1970.
+X  
+XCopyright 1988, Michael J. Haertel.  Use this routine at your own risk.
+XYou may redistribute verbatim copies of this file.  You may redistribute
+Xmodified versions of this file so long as (1) you state who last changed
+Xit, and (2) this copyright notice appears unmodified.
+X
+XSome debugging by W. Anthony Smith.
+X
+XBug fix, minor enhancements, and non-BSD modifications by David MacKenzie.
+X
+XSeveral changes by Chip Salzenberg for use with deliver:
+X    Include "deliver.h".
+X    Handle military timezones as per RFC822.
+X    Elimination of "#if FTIME" in favor of "#if !USG".
+X    Don't modify input string.
+X    Consider extra junk in date string an error.
+X*/
+X
+X%{
+X#include "deliver.h"
+X#include <ctype.h>
+X#ifdef BSD
+X# include <sys/time.h>
+X#else
+X# include <time.h>
+X# ifndef USG
+X#  include <sys/timeb.h>
+X# endif
+X#endif
+X
+Xextern long atol();
+X
+X/* Delta is correction to turn specified time into GMT. */
+X/* if (zoneflag), a timezone was explicitly specified. */
+Xstatic year, month, day, hour, minute, second, delta, zoneflag, errorflag, iflag;
+Xstatic long iresult;
+X
+X#define YYSTYPE long
+X%}
+X
+X%token NUM MONTH AM PM
+X
+X%%
+X
+Xdate:
+X  day time year
+X  | day year time
+X  | time day year
+X  | time day
+X  | day time
+X  | day year
+X  | day
+X  | time
+X  | '#' NUM		{ iflag = TRUE; iresult = $2; }
+X  ;			/* previous line forces exact time in seconds GMT */
+X
+Xday:
+X  NUM MONTH		{ month = $2; day = $1; }
+X  | MONTH NUM		{ month = $1; day = $2; }
+X  | NUM '/' NUM		{ month = $1; day = $3; }
+X  ;
+X
+Xyear:
+X  ',' NUM		{ year = $2; }
+X  | '/' NUM		{ year = $2; }
+X  | NUM			{ year = $1; }
+X  ;
+X
+Xtime:
+X  clock AM		{ hour %= 12; }
+X  | clock PM		{ hour = hour % 12 + 12; }
+X  | clock
+X  ;
+X
+Xclock:
+X  NUM ':' NUM ':' NUM	{ hour = $1; minute = $3; second = $5; }
+X  | NUM ':' NUM		{ hour = $1; minute = $3; }
+X  ;
+X
+X%%
+X
+X/* Return true if s is a prefix of t; e.g. prefix("mar", "march") = true.
+X   Note that comparison is case-insensitive. */
+Xstatic
+Xprefix(s,t)
+X     char *s, *t;
+X{
+X  while (*s && *t && tolower(*s) == tolower(*t))
+X    s++, t++;
+X  return *s == 0;
+X}
+X
+Xstatic char *lexptr;
+X
+Xstatic void
+Xinitlex(s)
+X     char *s;
+X{
+X  lexptr = s;
+X}
+X
+Xstatic char *
+Xmonths[] =
+X{
+X  "jan",
+X  "feb",
+X  "mar",
+X  "apr",
+X  "may",
+X  "jun",
+X  "jul",
+X  "aug",
+X  "sep",
+X  "oct",
+X  "nov",
+X  "dec",
+X  0
+X};
+X
+Xstruct zonename
+X{
+X  char *name;			/* Name of the time zone. */
+X  int delta;			/* Correction to add to GMT (in minutes) */
+X};
+X
+Xstatic struct zonename zones[] =
+X{
+X  "gmt", 0,
+X  "ut",  0,
+X  "est", -5 * 60,       /* North American time zones */
+X  "edt", -6 * 60,
+X  "cst", -6 * 60,
+X  "cdt", -7 * 60,
+X  "mst", -7 * 60,
+X  "mdt", -8 * 60,
+X  "pst", -8 * 60,
+X  "pdt", -9 * 60,
+X  "z",   0,             /* Military time zones */
+X  "a",   -1 * 60,
+X  "b",   -2 * 60,
+X  "c",   -3 * 60,
+X  "d",   -4 * 60,
+X  "e",   -5 * 60,
+X  "f",   -6 * 60,
+X  "g",   -7 * 60,
+X  "h",   -8 * 60,
+X  "i",   -9 * 60,
+X  "k",   -10 * 60,
+X  "l",   -11 * 60,
+X  "m",   -12 * 60,
+X  "n",   1 * 60,
+X  "o",   2 * 60,
+X  "p",   3 * 60,
+X  "q",   4 * 60,
+X  "r",   5 * 60,
+X  "s",   6 * 60,
+X  "t",   7 * 60,
+X  "u",   8 * 60,
+X  "v",   9 * 60,
+X  "w",   10 * 60,
+X  "x",   11 * 60,
+X  "y",   12 * 60,
+X  0, 0
+X};
+X
+X/* Lexical analyzer.  Gather alphabetics into tokens; if they are unknown
+X   strings ignore them, and if they are months return the appropriate value.
+X   If the token is the name of the time zone set delta = correction and
+X   zoneflag = TRUE, and skip ahead to the next token (the parser itself
+X   never sees time zones).
+X   If the token is a number, return its value.
+X   If it is a punctuation mark, return the character code.
+X   Ignore white space.  */
+Xstatic
+Xyylex()
+X{
+X  register i;
+X  char token[40];	/* Probably paranoid. */
+X  
+X  for (;;)
+X    {
+X      while (isspace(*lexptr))
+X	lexptr++;
+X      if (*lexptr == 0)
+X	return 0;
+X      else if (isalpha(*lexptr))
+X	{
+X	  i = 0;
+X	  while (isalpha(*lexptr))
+X	    token[i++] = *lexptr++;	/* Null termination is automatic. */
+X	  for (i = 0; months[i]; i++)
+X	    if (prefix(months[i],token))
+X	      {
+X		yylval = i + 1;
+X		return MONTH;
+X	      }
+X	  for (i = 0; zones[i].name; i++)
+X	    if (prefix(zones[i].name,token))
+X	      {
+X		int oper, next;
+X
+X		zoneflag = TRUE;
+X		delta = zones[i].delta;
+X		oper = yylex();
+X		/* Syntax: "4 CST + 23[:10]" adds 23 minutes and
+X		optionally 10 seconds to delta (the correction). */
+X		if (oper == '+' || oper == '-')
+X		  {
+X		    (void) yylex();
+X		    delta += (oper == '+' ? 60 : -60) * yylval;
+X		    next = yylex();
+X		    if (next == ':')
+X		      {
+X			(void) yylex();
+X			delta += (oper == '+' ? 1 : -1) * yylval;
+X		      }
+X		    else
+X		      return next;
+X		  }
+X		else
+X		  return oper;
+X	      }
+X	  if (prefix("pm",token) || prefix("p.m.", token))
+X	    return PM;
+X	  if (prefix("am",token) || prefix("a.m.", token))
+X	    return AM;
+X	  continue;
+X	}
+X      else if (isdigit(*lexptr))
+X	{
+X	  i = 0;
+X	  while (isdigit(*lexptr))
+X	    token[i++] = *lexptr++;
+X	  token[i] = '\0';
+X	  yylval = atoi(token);
+X	  return NUM;
+X	}
+X      else
+X	return *lexptr++;
+X    }
+X}
+X
+X/* ARGSUSED */
+Xstatic
+Xyyerror(s)
+X     char *s;
+X{
+X  errorflag = TRUE;
+X}
+X
+X/* Is y a leap year? */
+X#define leap(y) (((y) % 4 == 0 && (y) % 100 != 0) || (y) % 400 == 0)
+X
+X/* Number of leap years from 1970 to y (not including y itself) */
+X#define nleap(y) (((y) - 1969) / 4 - ((y) - 1901) / 100 + ((y) - 1601) / 400)
+X
+X/* This macro returns the "day" number of the sunday immediately
+X   preceding or equal to the argument in the current year. */
+X#define FIRST_SUNDAY 3
+X#define dayofepoch(day) ((day) + (year - 1970) * 365 + nleap(year))
+X#define sunday(day)  ((day) - (dayofepoch(day) + 7 - FIRST_SUNDAY) % 7)
+X
+X/* correction()
+X   returns the daylight savings correction in seconds to ADD to GMT
+X   to get correct local time.
+X   Since we are converting local back to GMT, we SUBTRACT this later on
+X   (local = gmt + correction(); gmt = local - correction()).
+X
+X   While we're at it, we also add the longitude correction for minutes
+X   west of Greenwich.  To do this, we have all these fascinating tables
+X   here . . .  */
+X
+X#ifdef BSD
+X
+Xstruct dstinfo
+X{
+X  int year;			/* Info is for this year, or default if zero. */
+X  int start;			/* DST begins sunday before this day. */
+X  int end;			/* DST ends sunday before this day. */
+X};
+X
+X/* USA. */
+Xstatic struct dstinfo
+Xusa_dst[] =
+X{
+X  1974, 5, 333,
+X  1975, 58, 303,
+X  0, 119, 303
+X};
+X
+X/* Australia. */
+Xstatic struct dstinfo
+Xaus_dst[] =
+X{
+X  1970, 999, 0,
+X  1971, 303, 0,
+X  1972, 303, 58,
+X  0, 303, 65
+X};
+X
+X/* Western Europe. */
+Xstatic struct dstinfo
+Xweur_dst[] =
+X{
+X  1983, 89, 296,
+X  0, 89, 303
+X};
+X
+X/* Middle Europe (also used for Eastern Europe, for lack of better
+X   information). */
+Xstatic struct dstinfo
+Xmeur_dst[] =
+X{
+X  1983, 89, 296,
+X  0, 89, 272
+X};
+X
+X/* Canada is same as US, except no early 70's insanity. */
+Xstatic struct dstinfo
+Xcan_dst[] =
+X{
+X  0, 119, 303
+X};
+X
+Xstruct dst_rules
+X{
+X  int magic;			/* Gettimeofday magic number for rule type */
+X  struct dstinfo *entry;	/* Pointer to struct dstinfo array. */
+X  int correction;		/* Correction in minutes to GMT. */
+X};
+X
+Xstatic struct dst_rules
+Xdstrules[] =
+X{
+X  DST_USA, usa_dst, 60,
+X  DST_AUST, aus_dst, -60,	/* Southern hemisphere */
+X  DST_WET, weur_dst, 60,
+X  DST_MET, meur_dst, 60,
+X  DST_EET, meur_dst, 60,
+X  DST_CAN, can_dst, 60,
+X  -1, 0, 0
+X};
+X
+Xstatic
+Xcorrection(day,tz)
+X     int day;				/* Day number in current year.  */
+X     struct timezone *tz;
+X{
+X  int i, correc = 0;
+X  struct dstinfo *dst;
+X  
+X  /* Did the user specify in the input string a timezone correction to use? */
+X  if (zoneflag)
+X    return delta * 60;
+X
+X  /* Since no correction was explicitly specified, we use local time zone and
+X     DST, as returned by gettimeofday() earlier . . . */
+X  if (tz->tz_dsttime)
+X    for (i = 0; dstrules[i].magic != -1; i++)
+X      if (dstrules[i].magic == tz->tz_dsttime)
+X	{
+X	  dst = dstrules[i].entry;
+X	  while (dst->year != year && dst->year)
+X	    dst++;
+X	  if (sunday(dst->start) <= day && day <= sunday(dst->end)
+X	      /* For some reason, DST starts/ends at 2 am sunday mornings. */
+X	      && !(day == sunday(dst->start) && hour < 2)
+X	      && !(day == sunday(dst->end) && hour >= 2))
+X	    correc = dstrules[i].correction;
+X	  break;
+X	}
+X  correc -= tz->tz_minuteswest;
+X  return correc * 60;
+X}
+X
+X#else /* !BSD */
+X
+Xstatic
+Xcorrection()
+X{
+X#ifdef USG
+X  extern long timezone;
+X#else
+X  struct timeb tb;
+X#endif
+X  
+X  /* Did the user specify in the input string a timezone correction to use? */
+X  if (zoneflag)
+X    return delta * 60;
+X
+X  /* Since no correction was explicitly specified, we use local time zone. */
+X#ifdef USG
+X  tzset();
+X  return (int) -timezone;
+X#else
+X  ftime(&tb);
+X  return tb.timezone * -60;
+X#endif
+X}
+X
+X#endif /* !BSD */
+X
+Xstatic short
+Xmonthlens[] =
+X{
+X  31,				/* January */
+X  28,				/* February */
+X  31,				/* March */
+X  30,				/* April */
+X  31,				/* May */
+X  30,				/* June */
+X  31,				/* July */
+X  31,				/* August */
+X  30,				/* September */
+X  31,				/* October */
+X  30,				/* November */
+X  31				/* December */
+X};
+X
+Xtime_t
+Xunctime(s)
+X     char *s;
+X{
+X#ifdef BSD
+X  struct timeval tv;
+X  struct timezone tz;
+X#else
+X  time_t now;
+X#endif
+X  struct tm *tm;
+X  int dayofyear;
+X
+X#ifdef BSD
+X  (void) gettimeofday(&tv,&tz);
+X  /* The cast is required to shut lint up.  Berkeley goes to all the effort
+X     to define time_t, why don't they use it? */
+X  tm = localtime(&(time_t) tv.tv_sec);
+X#else
+X  (void) time(&now);
+X  tm = localtime(&now);
+X#endif
+X  year = tm->tm_year;
+X  month = tm->tm_mon + 1;
+X  day = tm->tm_mday;
+X  hour = tm->tm_hour;
+X  minute = tm->tm_min;
+X  second = tm->tm_sec;
+X  zoneflag = FALSE;
+X  errorflag = FALSE;
+X
+X  initlex(s);
+X  (void) yyparse();
+X
+X  if (errorflag)
+X    return -1;
+X
+X  /* If garbage beyond valid date, that's an error. */
+X  while (*lexptr && isspace(*lexptr))
+X    ++lexptr;
+X  if (*lexptr)
+X     return -1;
+X
+X  /* User forced the exact time in seconds GMT, no further work necessary. */
+X  if (iflag)
+X    return iresult;
+X
+X  /* Try to keep the year reasonable (i.e., within the domain of ctime()). */
+X  if (year < 1970)
+X    year += 1900;
+X  if (year < 1970)
+X    year += 100;
+X
+X  /* Check for preposterous months/days/times. */
+X  if (month < 1 || month > 12 || day < 1 ||
+X      day > monthlens[month - 1] && !(month == 2 && day == 29 && leap(year))
+X      || hour > 23 || minute > 59 || second > 59)
+X    return -1;
+X
+X  /* Mostly for convenience in sunday() macro, we use zero-origin days. */
+X  dayofyear = day - 1;
+X  if (month > 2 && leap(year))
+X    ++dayofyear;
+X  while (--month > 0)
+X    dayofyear += monthlens[month - 1];
+X
+X  /* Wow! */
+X  return 86400 * (dayofyear + 365 * (year - 1970) + nleap(year))
+X    + 3600 * hour + 60 * minute + second
+X#ifdef BSD
+X	- correction(dayofyear,&tz)
+X#else
+X	- correction()
+X#endif
+X    ;
+X}
+END_OF_FILE
+if test 11397 -ne `wc -c <'unctime.y'`; then
+    echo shar: \"'unctime.y'\" unpacked with wrong size!
+fi
+# end of 'unctime.y'
+fi
+if test -f 'uucp.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'uucp.c'\"
+else
+echo shar: Extracting \"'uucp.c'\" \(3117 characters\)
+sed "s/^X//" >'uucp.c' <<'END_OF_FILE'
+X/* $Header: uucp.c,v 2.1 89/06/09 12:25:44 network Exp $
+X *
+X * Handle mail destined for other hosts via UUCP.
+X * Deliver is intended as a very low-level program, so we don't
+X * do anything fancy here.  We just hand the message to uux.
+X *
+X * $Log:	uucp.c,v $
+X * Revision 2.1  89/06/09  12:25:44  network
+X * Update RCS revisions.
+X * 
+X * Revision 1.5  89/06/09  12:24:02  network
+X * Baseline for 2.0 release.
+X * 
+X */
+X
+X#include "deliver.h"
+X#include <sys/stat.h>
+X
+X/*
+X * Local functions.
+X */
+X
+Xstatic  int     uucp_copy();
+X
+X/*----------------------------------------------------------------------
+X * Send mail to UUCP addresses (if any).
+X * This is a simple implementation: invoke uux once per address.
+X */
+X
+Xuucp_deliver()
+X{
+X	struct stat st;
+X	DEST    *d;
+X	char    *uux;
+X	static char uux1[] = "/bin/uux";
+X	static char uux2[] = "/usr/bin/uux";
+X
+X	if (stat(uux1, &st) == 0)
+X		uux = uux1;
+X	else if (stat(uux2, &st) == 0)
+X		uux = uux2;
+X	else
+X	{
+X		error("can't find uux!?\n");
+X		return;
+X	}
+X
+X	for (d = first_dest(); d; d = next_dest(d))
+X	{
+X		FILE    *uux_fp;
+X		char    *bang;
+X		char    *av[5];
+X		char    rmail[40];
+X		char    who[BUFSIZ];
+X
+X		if (d->d_class != CL_UUCP || d->d_state != ST_WORKING)
+X			continue;
+X
+X		if (printaddrs)
+X			(void) printf("%s\n", d->d_name);
+X
+X		if (dryrun)
+X		{
+X			d->d_state = ST_DONE;
+X			continue;
+X		}
+X
+X		bang = strchr(d->d_name, '!');
+X		*bang = 0;
+X		(void) sprintf(rmail, "%s!rmail", d->d_name);
+X		*bang++ = '!';
+X		(void) sprintf(who, "(%s)", bang);
+X
+X		av[0] = "uux";
+X		av[1] = "-";
+X		av[2] = rmail;
+X		av[3] = who;
+X		av[4] = NULL;
+X		if ((uux_fp = ct_popenv(eff_ct, uux, av, "w")) == NULL)
+X			continue;
+X
+X		if (uucp_copy(uux_fp) < 0)
+X			dest_err(d, E_UUX);
+X
+X		if (ct_pclose(uux_fp))
+X		{
+X			/* "No such host" overrides piping problems. */
+X			dest_err(d, E_NSHOST);
+X		}
+X		else
+X			d->d_state = ST_DONE;
+X	}
+X}
+X
+X/*----------------------------------------------------------------------
+X * Write the message for UUCP transmission to the given file.
+X */
+X
+Xstatic int
+Xuucp_copy(ofp)
+XFILE    *ofp;
+X{
+X	FILE    *ifp;
+X	char    *p;
+X	register int c;
+X	int     fd;
+X	char    buf[BUFSIZ];
+X
+X	if ((fd = dup(tfd[T_HDR])) == -1)
+X	{
+X		syserr("can't dup header fd");
+X		return -1;
+X	}
+X	(void) lseek(fd, 0L, 0);
+X	if ((ifp = fdopen(fd, "r")) == NULL)
+X	{
+X		error("can't fdopen header fd");
+X		return -1;
+X	}
+X
+X	/*
+X	 * Copy the header, but tack "remote from" onto the end of the
+X	 * From_ line.  (If it weren't for dealing with the From_ line,
+X	 * I'd skip stream I/O altogether and use read/write.  Maybe
+X	 * I should save the length of the From_ line when I copy it...)
+X	 */
+X
+X	(void) fgets(buf, GETSIZE(buf), ifp);
+X	if ((p = strchr(buf, '\n')) != NULL)
+X		*p = 0;
+X	(void) fprintf(ofp, "%s remote from %s\n", buf, hostname);
+X
+X	while ((c = getc(ifp)) != EOF)
+X		(void) putc(c, ofp);
+X
+X	(void) fclose(ifp);
+X
+X	/*
+X	 * Copy the body
+X	 */
+X
+X	if ((fd = dup(tfd[T_BODY])) == -1)
+X	{
+X		syserr("can't dup body fd");
+X		return -1;
+X	}
+X	(void) lseek(fd, 0L, 0);
+X	if ((ifp = fdopen(fd, "r")) == NULL)
+X	{
+X		error("can't fdopen body fd");
+X		(void) close(fd);
+X		return -1;
+X	}
+X
+X	while ((c = getc(ifp)) != EOF)
+X		(void) putc(c, ofp);
+X
+X	(void) fclose(ifp);
+X	return 0;
+X}
+END_OF_FILE
+if test 3117 -ne `wc -c <'uucp.c'`; then
+    echo shar: \"'uucp.c'\" unpacked with wrong size!
+fi
+# end of 'uucp.c'
+fi
+echo shar: End of shell archive.
+exit 0
+
+

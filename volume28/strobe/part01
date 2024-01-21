@@ -1,0 +1,1822 @@
+Newsgroups: comp.sources.unix
+From: proff@suburbia.apana.org.au (Julian Assange)
+Subject: v28i211: strobe - super optimized TCP port surveyor (V0.92), Part01/01
+Message-id: <1.793817892.24832@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: proff@suburbia.apana.org.au (Julian Assange)
+Posting-Number: Volume 28, Issue 211
+Archive-Name: strobe/part01
+
+[ If you are one of the good guys, you should run this program against your
+  own systems (all of them), because the bad guys certainly will.  There is
+  no new technology here, but this program is more time-efficient than others
+  I've seen that implement the same kind of, um, security audit.   --vix ]
+
+strobe - Super optimised TCP port prober
+
+SYNOPSIS
+
+	strobe [ -vVbetnSilfs ] [host1 ... [hostn]]
+
+DESCRIPTION
+
+	strobe locates and describes all listening tcp ports on a (remote)
+	host or on many hosts in a bandwidth utilisation maximising, and
+	process resource minimising manner.
+
+#!/bin/sh
+# shar:	Shell Archiver  (v1.22)
+#
+#	Run the following text with /bin/sh to create:
+#	  strobe.c
+#	  strobe.1
+#	  Makefile
+#	  INSTALL
+#	  VERSION
+#	  strobe.services
+#
+sed 's/^X//' << 'SHAR_EOF' > strobe.c &&
+X/*
+X * Strobe v0.92 (c) 1994 *Proff* (proff@suburbia.apana.org.au), All
+X * rights reserved.
+X *
+X * use of this program is at your own, or others risk. the author is
+X * not considered a member of either group. comprehend?
+X */
+X
+X#include <stdio.h>
+X#include <unistd.h>
+X#include <stdlib.h>
+X#include <sys/types.h>
+X#include <sys/time.h>
+X#include <ctype.h>
+X#include <fcntl.h>
+X#include <sys/stat.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <arpa/inet.h>
+X#include <netdb.h>
+X#include <string.h>
+X#include <errno.h>
+X
+X#if !defined(solaris) && !defined(linux) && !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__GCC__)
+X#  define fvoid
+Xextern int optind;
+Xextern char *optarg;
+X#else
+X#  define fvoid void
+X#endif
+X#define bool char
+X
+X#ifndef INADDR_NONE
+X#  define INADDR_NONE ((unsigned long)-1)
+X#endif
+X
+X/*
+X * the below should be set via the Makefile, but if not...
+X */
+X
+X#ifndef ETC_SERVICES
+X#  define ETC_SERVICES "/etc/services"
+X#endif
+X#ifndef STROBE_SERVICES
+X#  define STROBE_SERVICES "strobe.services"
+X#endif
+X#ifndef LIB_STROBE_SERVICES
+X#  define LIB_STROBE_SERVICES "/usr/local/lib/strobe.services"
+X#endif
+X
+Xint a_timeout = 20;
+Xchar *a_output = NULL;
+Xchar *a_services = "strobe.services";
+Xchar *a_input = NULL;
+Xint a_start = 1;
+Xint a_end = 65535;
+Xint a_sock_max = 64;
+Xint a_abort = 0;
+Xbool f_linear = 0;
+Xbool f_verbose = 0;
+Xbool f_verbose_stats = 0;
+Xbool f_fast = 0;
+Xbool f_stats = 0;
+Xbool f_quiet = 0;
+Xbool f_delete_dupes = 0;
+X
+Xbool f_set;
+Xint connects;
+Xint hosts_done=-1;
+Xint attempts_done;
+Xstruct timeval time_start;
+X
+Xint host_n;
+Xint Argc;
+Xchar **Argv;
+X
+XFILE *fh_input;
+X
+X#define HO_ABORT 1
+X#define HO_COMPLETING 2
+X
+Xstruct hosts_s
+X{
+X    char *name;
+X    struct in_addr in_addr;
+X    unsigned int port;
+X    struct timeval time_used;
+X    struct timeval time_start;
+X    int attempts;
+X    int attempts_done;
+X    int attempts_highest_done;
+X    int connects;
+X    time_t notice_abort;
+X    int status;
+X};
+Xstruct hosts_s *hosts;
+X
+X#define HT_SOCKET 1
+X#define HT_CONNECTING 2
+X
+Xstruct htuple
+X{
+X    char *name;
+X    struct in_addr in_addr;
+X    unsigned int port;
+X    int sfd;
+X    int status;
+X    struct timeval sock_start;
+X    int timeout;
+X    struct hosts_s *host;
+X};
+X
+Xstruct htuple ht_initial;
+Xstruct htuple *attempt;
+X
+Xstruct port_desc_s
+X{
+X    char *name;
+X    char *portname;
+X    struct port_desc_s *next;
+X};
+X
+Xstruct port_desc_s *port_descs[65536];
+X
+Xchar *
+XSmalloc (len)
+X  int len;
+X{
+X    char *p;
+X    while (!(p = malloc (len)))
+X	sleep (1);
+X    return p;
+X}
+X
+Xfvoid
+Xsock_block (sfd)
+X  int sfd;
+X{
+X    int flags;
+X    flags = (~O_NONBLOCK) & fcntl (sfd, F_GETFL);
+X    fcntl (sfd, F_SETFL, flags);
+X}
+X
+Xfvoid
+Xsock_unblock (sfd)
+X  int sfd;
+X{
+X    int flags;
+X    flags = O_NONBLOCK | fcntl (sfd, F_GETFL);
+X    fcntl (sfd, F_SETFL, flags);
+X}
+X
+Xint
+Xtimeval_subtract (result, x, y)
+X  struct timeval *result, *x, *y;
+X{
+X/* Perform the carry for the later subtraction by updating y. */
+Xif (x->tv_usec < y->tv_usec) {
+X int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
+X y->tv_usec -= 1000000 * nsec;
+X y->tv_sec += nsec;
+X}
+Xif (x->tv_usec - y->tv_usec > 1000000) {
+X int nsec = (y->tv_usec - x->tv_usec) / 1000000;
+X y->tv_usec += 1000000 * nsec;
+X y->tv_sec -= nsec;
+X}
+X
+X/* Compute the time remaining to wait.
+X  `tv_usec' is certainly positive. */
+Xresult->tv_sec = x->tv_sec - y->tv_sec;
+Xresult->tv_usec = x->tv_usec - y->tv_usec;
+X
+X/* Return 1 if result is negative. */
+Xreturn x->tv_sec < y->tv_sec;
+X}
+X
+Xfvoid
+Xattempt_clear (h)
+X  struct htuple *h;
+X{
+X    if (h->status & HT_SOCKET)
+X    {
+X	struct timeval tv1, tv2;
+X	gettimeofday(&tv1, NULL);
+X	timeval_subtract(&tv2, &tv1, &(h->sock_start));
+X	h->host->time_used.tv_sec+=tv2.tv_sec;
+X	if ((h->host->time_used.tv_usec+=tv2.tv_usec) >= 1000000)
+X	{
+X	    h->host->time_used.tv_usec -= 1000000;
+X	    h->host->time_used.tv_sec++;
+X	}
+X        attempts_done++;
+X	h->host->attempts_done++;
+X	if (h->port > h->host->attempts_highest_done)
+X	    h->host->attempts_highest_done=h->port;
+X	sock_unblock (h->sfd);
+X	shutdown (h->sfd, 2);
+X	close (h->sfd);
+X    }
+X    *h = ht_initial;
+X}
+X
+Xfvoid
+Xclear_all ()
+X{
+X    int n;
+X    for (n = 0; n < a_sock_max; n++)
+X	attempt_clear (&attempt[n]);
+X}
+X
+Xfvoid
+Xattempt_init ()
+X{
+X    int n;
+X    for (n = 0; n < a_sock_max; n++)
+X	attempt[n] = ht_initial;
+X}
+X
+Xint
+Xsc_connect (h)
+X  struct htuple *h;
+X{
+X    struct sockaddr_in sa_in;
+X    int sopts1 = 1;
+X    struct linger slinger;
+X    sa_in.sin_family = AF_INET;
+X    sa_in.sin_addr = h->in_addr;
+X    sa_in.sin_port = htons (h->port);
+X    if ((h->sfd = socket (PF_INET, SOCK_STREAM, 0)) == -1)
+X	return 0;
+X    h->status |= HT_SOCKET;
+X    gettimeofday(&(h->sock_start), NULL);
+X    sock_unblock (h->sfd);
+X    setsockopt (h->sfd, SOL_SOCKET, SO_REUSEADDR, (char *) &sopts1, sizeof (sopts1));
+X    setsockopt (h->sfd, SOL_SOCKET, SO_OOBINLINE, (char *) &sopts1, sizeof (sopts1));
+X    slinger.l_onoff = 0;	/* off */
+X    setsockopt (h->sfd, SOL_SOCKET, SO_LINGER, (char *) &slinger, sizeof (slinger));
+X    if (connect (h->sfd, (struct sockaddr *) &sa_in, sizeof (sa_in)) == -1)
+X    {
+X	switch (errno)
+X	{
+X	case EINPROGRESS:
+X	case EWOULDBLOCK:
+X	    break;
+X	case ETIMEDOUT:
+X	case ECONNREFUSED:
+X	case EADDRNOTAVAIL:
+X	    if (f_verbose)
+X	    {
+X		fprintf(stderr, "%s:%d ", h->name, h->port);
+X		perror("");
+X	    }
+X	    h->host->attempts++;
+X	    attempt_clear (h);
+X	    return 1;
+X	default:
+X	    if (!f_quiet)
+X	    {
+X	    	fprintf(stderr, "%s:%d ", h->name, h->port);
+X	    	perror ("");
+X	    }
+X	    attempt_clear (h);
+X	    return 0;
+X	}
+X    }
+X    h->host->attempts++;
+X    h->status |= HT_CONNECTING;
+X    sock_block (h->sfd);
+X    return 1;
+X}
+X
+Xint
+Xgatherer_tcp (h)
+X  struct htuple *h;
+X{
+X    struct port_desc_s *pd;
+X    if ((pd = port_descs[h->port]))
+X    {
+X	    printf ("%-30s %-16s %5d/tcp %s\n", h->name, pd->portname, h->port, pd->name);
+X	while (!f_delete_dupes && (pd=pd->next))
+X	    printf ("#%-29s %-16s %5d/tcp %s\n", h->name, pd->portname, h->port, pd->name);
+X    }
+X    else
+X	    printf ("%-30s %-16s %5d/tcp unassigned\n", h->name, "unknown", h->port);
+X    h->host->connects++;
+X    connects++;
+X        attempt_clear (h);
+X    return 1;
+X}
+X
+Xbool
+Xgather ()
+X{
+X    fd_set set_sel_r;
+X    fd_set set_sel_w;
+X    struct timeval timeout;
+X    struct htuple *h;
+X    int n;
+X    /* We regenerate the entire set rather than just use set=old_set
+X     * because in some implimentations fs_set is just an array
+X     */
+X    FD_ZERO(&set_sel_r);
+X    FD_ZERO(&set_sel_w);
+X    for (f_set=n=0; n<a_sock_max; n++)
+X    {
+X        h=&attempt[n];
+X	if (h->status & HT_CONNECTING)
+X        {
+X            FD_SET(h->sfd, &set_sel_r);
+X            FD_SET(h->sfd, &set_sel_w);
+X	    f_set=1;
+X        }
+X    }
+X    if (!f_set) return 1;
+X    timeout.tv_sec = 0;
+X    timeout.tv_usec = 50;
+X    switch (select (FD_SETSIZE, &set_sel_r, &set_sel_w, 0, &timeout))
+X    {
+X    case -1:
+X	perror ("select");
+X	return 0;
+X    case 0:
+X	return 1;
+X    }
+X    for (n = 0; n < a_sock_max; n++)
+X    {
+X	h = &attempt[n];
+X	if (h->status & HT_CONNECTING)
+X	{
+X	    if (FD_ISSET (h->sfd, &set_sel_r) || FD_ISSET (h->sfd, &set_sel_w))
+X	    {
+X		struct sockaddr_in in;
+X		int len = sizeof (in);
+X		/* select() lies occasionaly
+X                 */
+X		if (getpeername (h->sfd, (struct sockaddr *) &in, &len) == 0)
+X		    gatherer_tcp (h);
+X		else
+X		    attempt_clear (h);
+X	    }
+X	}
+X    }
+X    return 1;
+X}
+X
+Xbool
+Xadd_attempt (add)
+X  struct htuple *add;
+X{
+X    struct htuple *h;
+X    static time_t oldtime;
+X    int n;
+X    for (;;)
+X    {
+X	for (n = 0; n < a_sock_max; n++)
+X	{
+X	    time_t tim = time (0);
+X	    h = &attempt[n];
+X	    if (!h->status)
+X		goto foundfree;
+X	    if ((h->status & HT_SOCKET) &&
+X		((h->sock_start.tv_sec + h->timeout) < tim))
+X	    {
+X		attempt_clear (h);
+X		goto foundfree;
+X	    }
+X	}
+X	gather ();
+X	continue;
+X      foundfree:
+X	*h = *add;
+X	if (!sc_connect (h))
+X	{
+X	    gather ();
+X	    continue;
+X	}
+X	if ((oldtime + 1) < time (0))
+X	{
+X	    oldtime = time (0);
+X	    gather ();
+X	}
+X	break;
+X    }
+X    return 1;
+X}
+X
+Xint
+Xscatter (host, timeout)
+X  struct hosts_s *host;
+X  int timeout;
+X{
+X    static struct htuple add;
+X    add = ht_initial;
+X    add.host = host;
+X    add.name = host->name;
+X    add.in_addr = host->in_addr;
+X    add.port = host->port;
+X    add.timeout = a_timeout;
+X    if (f_verbose)
+X	fprintf (stderr, "attempting port=%d host=%s\n", add.port, add.name);
+X    add_attempt (&add);
+X    return 1;
+X}
+X
+Xfvoid
+Xwait_end (t)
+X  int t;
+X{
+X    time_t st;
+X    st = time (0);
+X    while ((st + t) > time (0))
+X    {
+X	gather ();
+X	if (!f_set) break;
+X    }
+X}
+X
+Xstruct in_addr
+Xresolve (name)
+X  char *name;
+X{
+X    static struct in_addr in;
+X    unsigned long l;
+X    struct hostent *ent;
+X    if ((l = inet_addr (name)) != INADDR_NONE)
+X    {
+X	in.s_addr = l;
+X	return in;
+X    }
+X    if (!(ent = gethostbyname (name)))
+X    {
+X	perror (name);
+X	in.s_addr = INADDR_NONE;
+X	return in;
+X    }
+X    return *(struct in_addr *) ent->h_addr;
+X}
+X
+Xchar *
+Xnext_host ()
+X{
+X    static char lbuf[512];
+X    hosts_done++;
+X    if (a_input)
+X    {
+X	int n;
+Xreread:
+X	if (!fgets (lbuf, sizeof (lbuf), fh_input))
+X	{
+X	    fclose (fh_input);
+X	    return NULL;
+X	}
+X	if (strchr("# \t\n", lbuf[0])) goto reread;
+X	n = strcspn (lbuf, " \t\n");
+X	if (n)
+X	    lbuf[n] = '\0';
+X	return lbuf;
+X    }
+X    if (++host_n >= Argc)
+X	return NULL;
+X    return Argv[host_n];
+X}
+X
+Xbool
+Xhost_init (h, name, nocheck)
+X  struct hosts_s *h;
+X  char *name;
+X  bool nocheck;
+X{
+X    int n;
+X    h->name = 0;
+X    h->in_addr = resolve (name);
+X    if (h->in_addr.s_addr == INADDR_NONE)
+X	return 0;
+X    if (!nocheck)
+X        for (n=0; n<a_sock_max; n++)
+X   	{ 
+X	    if (hosts[n].name && hosts[n].in_addr.s_addr==h->in_addr.s_addr)
+X	    {
+X		if (!f_quiet)
+X		    fprintf(stderr, "ip duplication: %s == %s (last host ignored)\n",
+X		        hosts[n].name, name);
+X		return 0;
+X	    }
+X        }
+X    h->name = (char *) Smalloc (strlen (name) + 1);
+X    strcpy (h->name, name);
+X    h->port = a_start;
+X    h->time_used.tv_sec
+X      = h->time_used.tv_usec
+X      = h->attempts_done 
+X      = h->attempts
+X      = h->connects
+X      = h->notice_abort
+X      = h->attempts_highest_done
+X      = h->status = 0;
+X    gettimeofday(&(h->time_start), NULL);
+X    return 1;
+X}
+X
+Xfvoid
+Xhost_clear (h)
+X  struct hosts_s *h;
+X{
+X    if (h->name)
+X    {
+X    	free (h->name);
+X    	h->name = NULL;
+X    }
+X}
+X
+Xfvoid
+Xhost_stats (h)
+X  struct hosts_s *h;
+X{
+X    struct timeval tv, tv2;
+X    float t, st;
+X    gettimeofday(&tv, NULL);
+X    timeval_subtract(&tv2, &tv, &(h->time_start));
+X    t = tv2.tv_sec+(float)tv2.tv_usec/1000000.0;
+X    st = h->time_used.tv_sec+(float)h->time_used.tv_usec/1000000.0;
+X    fprintf(stderr, "stats: host = %s trys = %d cons = %d time = %.2fs trys/s = %.2f trys/ss = %.2f\n",
+X	h->name, h->attempts_done, h->connects, t, h->attempts_done/t, h->attempts_done/st);
+X}
+X
+Xfvoid
+Xfinal_stats()
+X{
+X    struct timeval tv, tv2;
+X    float t;
+X    gettimeofday(&tv, NULL);
+X    timeval_subtract(&tv2, &tv, &(time_start));
+X    t = tv2.tv_sec+(float)tv2.tv_usec/1000000.0;
+X    fprintf(stderr, "stats: hosts = %d trys = %d cons = %d time = %.2fs trys/s = %.2f\n",
+X	hosts_done, attempts_done, connects, t, attempts_done/t);
+X}
+X
+Xbool skip_host(h)
+X  struct hosts_s *h;
+X{
+X    if (a_abort && !h->connects && (h->attempts_highest_done >= a_abort)) /* async pain */
+X    {
+X	if (h->status & HO_ABORT)
+X	{
+X	    if ((time(NULL)-h->notice_abort)>a_timeout)
+X	    {
+X		if (f_verbose)
+X		    fprintf(stderr, "skipping: %s (no connects in %d attempts)\n",
+X			h->name, h->attempts_done);
+X		return 1;
+X	    }
+X	} else 
+X        {
+X		h->notice_abort=time(NULL);
+X		h->status|=HO_ABORT;
+X	}
+X    }
+X    return 0;
+X}
+X
+Xfvoid
+Xscan_ports_linear ()
+X{
+X    struct hosts_s host;
+X    char *name;
+X    int n;
+X    while ((name = next_host ()))
+X    {
+X	if (!host_init(&host, name, 1)) continue;
+X	for (n = a_start; n <= a_end; n++)
+X	{
+X	    if (f_fast && !port_descs[n])
+X		continue;
+X	    host.port = n;
+X	    scatter (&host, a_timeout);
+X	    if (skip_host(&host)) break;
+X	}
+X	wait_end (a_timeout);
+X	if (f_verbose_stats)
+X	    host_stats (&host);
+X	clear_all ();
+X	host_clear(&host);
+X    }
+X}
+X
+X/* Huristics:
+X *  o  fast connections have priority == maximise bandwidth i.e 
+X *     a port in the hand is worth two in the bush
+X *  o  newer hosts have priority == lower ports checked more quickly
+X *  o  all hosts eventually get equal "socket time" == despite
+X *     priorities let no one host hog the sockets permanently
+X *  o  when host usage times are equal (typically on or shortly after
+X *     initial startup) distribute hosts<->sockets evenly rather than
+X *     play a game of chaotic bifurcation ping-pong
+X */
+X          
+Xfvoid
+Xscan_ports_paralell ()
+X{
+X    int n;
+X    struct timeval smallest_val;
+X    int smallest_cnt;
+X    char *name;
+X    struct hosts_s *h, *smallest = &hosts[0];
+X    while (smallest)
+X    {
+X	smallest_val.tv_sec=0xfffffff;
+X	smallest_val.tv_usec=0;
+X	for (n = 0, smallest_cnt = 0xfffffff, smallest = NULL; n < a_sock_max; n++)
+X	{
+X	    h = &hosts[n];
+X	    if (!h->name && ((name = next_host ())))
+X		if (!host_init (h, name, 0))
+X		{
+X		    host_clear (h);
+X		    continue;
+X		}
+X	    if (h->name)
+X	    {
+X		if (((h->time_used.tv_sec < smallest_val.tv_sec) ||
+X		     ((h->time_used.tv_sec == smallest_val.tv_sec) &&
+X		      (h->time_used.tv_usec <= h->time_used.tv_usec))) &&
+X		    (((h->time_used.tv_sec!=smallest_val.tv_sec) &&
+X		      (h->time_used.tv_usec!=smallest_val.tv_sec)) ||
+X		     (h->attempts < smallest_cnt)))
+X	        {
+X	  	    smallest_cnt = h->attempts;
+X		    smallest_val = h->time_used;
+X		    smallest = h;
+X		 }
+X	    }
+X	}
+X	if (smallest)
+X	{
+X	    if (!(smallest->status & HO_COMPLETING))
+X	    {
+X		scatter (smallest, a_timeout);
+X	        if (f_fast)
+X	  	    while ((++(smallest->port) < a_end) &&
+X		       !port_descs[(smallest->port)]);
+X	        else
+X		    smallest->port++;
+X	        if (smallest->port >= a_end) smallest->status|=HO_COMPLETING;
+X	    }
+X	    else
+X		gather();
+X	    if (((smallest->status & HO_COMPLETING) &&
+X                 (smallest->attempts_done == smallest->attempts)) ||
+X                skip_host(smallest))
+X	    {
+X		if (f_verbose_stats) host_stats (smallest);
+X		host_clear (smallest);
+X	    }
+X	}
+X    }
+X}
+X
+Xfvoid
+Xloaddescs ()
+X{
+X    FILE *fh;
+X    char lbuf[1024];
+X    char desc[256];
+X    char portname[17];
+X    char prot[4];
+X    int port;
+X    prot[3]='\0';
+X    if (!(fh = fopen (a_services, "r")) &&
+X        !(fh = fopen (LIB_STROBE_SERVICES, "r")) &&
+X        !(fh = fopen (ETC_SERVICES, "r")))
+X    {
+X	perror (a_services);
+X	exit (1);
+X    }
+X    while (fgets (lbuf, sizeof (lbuf), fh))
+X    {
+X	char *p;
+X	struct port_desc_s *pd, *pdp;
+X	if (strchr("*# \t\n", lbuf[0])) continue;
+X	if (!(p = strchr (lbuf, '/'))) continue;
+X	*p = ' ';
+X	desc[0]='\0';
+X	if (sscanf (lbuf, "%16s %u %3s %255[^\r\n]", portname, &port, prot, desc) <3 || strcmp (prot, "tcp") || (port > 65535))
+X	    continue;
+X	pdp = (struct port_desc_s *) Smalloc (sizeof (*pd) + strlen (desc) + 1 + strlen (portname) + 1);
+X	if ((pd = port_descs[port]))
+X	{
+X	    for (; pd->next; pd = pd->next);
+X	    pd->next = pdp;
+X	    pd = pd->next;
+X	}
+X	else 
+X	{
+X	    pd = pdp;
+X	    pd->next = NULL;
+X	    port_descs[port] = pd;
+X	}
+X	pd->name = (char *) (pd) + sizeof (*pd);
+X	pd->portname = pd->name + strlen(desc)+1;
+X	strcpy (pd->name, desc);
+X	strcpy (pd->portname, portname);
+X    }
+X}
+X
+Xfvoid
+Xusage ()
+X{
+X    fprintf (stderr, "\
+Xusage: strobe [-v(erbose)]\n\
+X	      [-V(erbose_stats]\n\
+X	      [-s(tatistics)]\n\
+X	      [-q(uiet)]\n\
+X              [-o output_file]\n\
+X              [-b begin_port_n]\n\
+X              [-e end_port_n]\n\
+X              [-t timeout_n]\n\
+X              [-n num_sockets_n]\n\
+X              [-S services_file]\n\
+X              [-i hosts_input_file]\n\
+X              [-l(inear)]\n\
+X              [-f(ast)]\n\
+X              [-a abort_port_n]\n\
+X              [host1 [...host_n]]\n");
+X    exit (1);
+X}
+X
+Xint
+Xmain (argc, argv)
+X  int argc;
+X  char **argv;
+X{
+X    char c;
+X    if (argc < 2)
+X	usage ();
+X    while ((c = getopt (argc, argv, "o:dvVb:e:a:t:n:S:i:lfsq")) != -1)
+X	switch (c)
+X	{
+X	case 'o':
+X	    a_output = optarg;
+X	    break;
+X	case 'd':
+X	    f_delete_dupes=1;
+X	    break;
+X	case 'v':
+X	    f_verbose = 1;
+X	    break;
+X	case 'V':
+X	    f_verbose_stats = 1;
+X	    break;
+X	case 'b':
+X	    a_start = atoi (optarg);
+X	    break;
+X	case 'e':
+X	    a_end = atoi (optarg);
+X	    break;
+X	case 'a':
+X	    a_abort = atoi (optarg);
+X	    break;
+X	case 't':
+X	    a_timeout = atoi (optarg);
+X	    break;
+X	case 'n':
+X	    a_sock_max = atoi (optarg);
+X	    break;
+X	case 'S':
+X	    a_services = optarg;
+X	    break;
+X	case 'i':
+X	    a_input = optarg;
+X	    break;
+X	case 'l':
+X	    f_linear = 1;
+X	    break;
+X	case 'f':
+X	    f_fast = 1;
+X	    break;
+X	case 's':
+X	    f_stats = 1;
+X	    break;
+X        case 'q':
+X	    f_quiet = 1;
+X	    break;
+X	case '?':
+X	default:
+X	    fprintf (stderr, "unknown option %s\n", argv[optind]);
+X	    usage ();
+X	    /* NOT_REACHED */
+X	}
+X    host_n = optind - 1;
+X    if (!f_quiet)
+X        fprintf (stderr, "strobe (c) 1994 *Proff* All Rights Reserved.\n");
+X    if (a_input)
+X    {
+X	if (!(fh_input = fopen (a_input, "r")))
+X	{
+X	    perror (a_input);
+X	    exit (1);
+X	}
+X    }
+X    if (a_output)
+X    {
+X        int fd;
+X        if ((fd=open(a_output, O_WRONLY|O_CREAT|O_TRUNC, 0666))==-1)
+X	{
+X		perror(a_output);
+X		exit(1);
+X	}
+X	dup2(fd, 1);
+X    }
+X    Argc = argc;
+X    Argv = argv;
+X    if (!a_input && optind==argc-1)
+X	f_linear=1;
+X    attempt = (struct htuple *) Smalloc (a_sock_max * sizeof (struct htuple));
+X    if (!f_linear)
+X    	hosts = (struct hosts_s *) Smalloc (a_sock_max * sizeof (struct hosts_s));
+X    loaddescs ();
+X    gettimeofday(&time_start, NULL);
+X    f_linear ? scan_ports_linear ():
+X 	       scan_ports_paralell ();
+X    if (f_stats || f_verbose_stats)
+X	final_stats();
+X    exit (0);
+X}
+SHAR_EOF
+chmod 0600 strobe.c || echo "restore of strobe.c fails"
+sed 's/^X//' << 'SHAR_EOF' > strobe.1 &&
+X.\" "%W% %G%"
+X.TH STROBE\ 0.92 1
+X.SH NAME
+Xstrobe \- Super optimised TCP port prober
+X.SH SYNOPSIS
+X.B strobe
+X[ -vVbetnSilfs ] [host1 ... [hostn]]
+X.SH DESCRIPTION
+X.I strobe
+Xlocates and describes all listening tcp ports on a (remote) host or on
+Xmany hosts in a bandwidth utilisation maximising, and process resource 
+Xminimising manner.
+X.SH OPTIONS
+X.TP
+X.B \-v
+XVerbose output.
+X.TP
+X.B \-V
+XVerbose statistical output.
+X.TP
+X.B \-s
+XStatistical information describing the average of all hosts probed is sent to
+Xstderr on completion.
+X.TP
+X.B \-q
+XQuiet mode. Don't print non-fatal errors or the (c) message.
+X.TP
+X.B \-d
+XDisplay only the first description in the port services entry file (Cf.
+X.BR \-B ).
+X.TP
+X.B \-o file
+XDirect output (but not any messages which can be affected by
+X.BR \-q )
+Xto file.
+X.TP
+X.B \-b number
+XBeginning (starting) port number.
+X.TP
+X.B \-e
+XEnding port number.
+X.TP
+X.B \-t number
+XTime after which a connection attempt to a completely unresponsive host/port is
+Xaborted.
+X.TP
+X.B \-n number
+XUse this number of sockets in paralell (defaults to 64). 
+X.I strobe
+Xattempts to figure out if
+X.B number
+Xis greater than the quantity of available sockets at any point in time -- and
+Xif so, only use the amount found. On some UNIX implimentations such as Solaris,
+Xthis appears not to work correctly and you may find yourself with unusual errors
+Xsuch as
+X.B NO ROUTE TO HOST
+Xwhen you hit the socket ceiling. Remember that 
+X.I strobe
+Xprobably isn't the only process on the system desiring a socket or two. Having
+X.I strobe
+Xpilfer all the spare sockets away from 
+X.BR inetd (8)
+Xand other daemons and clients isn't such a crash hot idea, unless you want
+Xto stop all new incoming and outgoing connections.
+X.TP
+X.B \-S file
+XChange the default port services description file to
+X.BR file .
+XNote that if 
+X.B \-S
+Xis not specified port services are loaded from one of
+X.BR strobe.services ,
+X.BR /usr/local/lib/strobe.services ,
+Xor
+X.BR /etc/services .
+X.TP
+X.B \-i file
+XObtain hostnames to strobe from 
+X.B file
+Xrather than from the command line. Note that only the first white-space
+Xseperated word in each line of
+X.B file
+Xis used, so one can feed in files such as
+X.BR /etc/hosts .
+X.TP
+X.B \-l
+XProbe hosts linearly (sequentually) rather than in paralell. The actuall
+Xports on each host are still checked in a paralell manner (with a paralellism
+Xof -n (defaults to 64)).
+X.TP
+X.B \-f
+XFast mode, probe only the tcp ports detailed in the port services file (see
+X.BR \-S ).
+X.TP
+X.B \-a number
+XAbort and skip to the next host after ports to
+X.B number
+Xhave been probed and still no connections have occurred.
+X.SH EXAMPLE
+X.PP
+Xstrobe -n 120 -a 80 -i /etc/hosts -s -f -V -S services -o out
+X.PP
+X.I strobe
+Xall entries in
+X.B /etc/hosts
+X(identical ip addresses are skipped automagically)
+Xusing 120 sockets in paralell, but only check the individual tcp ports mentioned
+Xin
+X.BR services .
+XIf we have probed up to port 80 on a host
+Xand have still not yet evidenced a connection, then skip that host. Display speed/time
+Xstatistics for each host and for the totality of hosts to stderr. Place the regular
+Xoutput in
+X.BR out .
+X.SH AUTHOR
+X.PP
+X.I Julian Assange
+X.RS
+X.nf
+X		proff@suburbia.apana.org.au
+X		proff@four.net
+X		proff@gnu.ai.mit.edu
+X.fi
+X.RE
+X.SH COPYRIGHT
+X.PP
+XCopyright (c) Julian Assange 1994, 1995, All rights reserved.
+X.SH BUGS
+X.PP
+XNo doubt.
+SHAR_EOF
+chmod 0600 strobe.1 || echo "restore of strobe.1 fails"
+sed 's/^X//' << 'SHAR_EOF' > Makefile &&
+X# Strobe v0.92 (c) 1994,1995 Julian Assange, All rights reserved.
+X# (proff@suburbia.apana.org.au || proff@four.net || proff@gnu.ai.mit.edu)
+X
+X# Modifty the below to suit your filesystem
+X
+XINSTALLDIR=/usr/local/bin
+XLIBDIR=/usr/local/lib
+XMANDIR=/usr/local/man/man1
+X
+X#CC=gcc
+XCC=cc
+XFLAGS=-O #-g
+XLIBS= #-lnsl -lsocket	# SYSVR4 / SOLARIS
+XETC_SERVICES=/etc/services
+X
+X# Don't change anything from this point on.
+X
+XOBJS=strobe.o
+XBIN=strobe
+XMAN=strobe.1
+XDATA=strobe.services
+XEXTRA=Makefile INSTALL VERSION
+X
+XDEFS=-DLIB_STROBE_SERVICES='"$(LIBDIR)/$(DATA)"'\
+X     -DSTROBE_SERVICES='"$(DATA)"'\
+X     -DETC_SERVICES='"$(ETC_SERVICES)"'
+X
+XCFLAGS=$(FLAGS) $(DEFS)
+X
+X$(BIN): $(OBJS)
+X	$(CC) $(CFLAGS) -o $(BIN) $(OBJS) $(LIBS)
+X$(OBJS):
+X$(DATA):
+X$(MAN):
+X$(INSTALLDIR)/$(BIN): $(BIN)
+X	-rm -f $(INSTALLDIR)/$(BIN)
+X	install -m 755 -s $(BIN) $(INSTALLDIR)/$(BIN)
+X$(LIBDIR)/$(DATA): $(DATA)
+X	-rm -f $(LIBDIR)/$(DATA)
+X	install -m 644 $(DATA) $(LIBDIR)/$(DATA)
+X$(MANDIR)/$(MAN): $(MAN)
+X	-rm -f $(MANDIR)/$(MAN)
+X	install -m 644 $(MAN) $(MANDIR)/$(MAN)
+Xinstall: $(INSTALLDIR)/$(BIN) $(LIBDIR)/$(DATA) $(MANDIR)/$(MAN)
+Xtar:
+X	(cd .. ; tar -zcf strobe.tgz strobe)
+Xshar:
+X	shar > strobe.shar *.c *.1 $(EXTRA) $(DATA)
+Xclean:
+X	rm -f $(BIN) *.o *.bak *.\~ errlist *.shar *.tgz
+SHAR_EOF
+chmod 0600 Makefile || echo "restore of Makefile fails"
+sed 's/^X//' << 'SHAR_EOF' > INSTALL &&
+X(1) Edit the Makefile to suit your system -- follow the descriptions therein.
+X(2) type "make install"
+X(3) type "man strobe"
+X
+X-Julian Assange (proff@suburbia.apana.org.au)
+SHAR_EOF
+chmod 0600 INSTALL || echo "restore of INSTALL fails"
+sed 's/^X//' << 'SHAR_EOF' > VERSION &&
+X1995/02/17	V0.92
+SHAR_EOF
+chmod 0600 VERSION || echo "restore of VERSION fails"
+sed 's/^X//' << 'SHAR_EOF' > strobe.services &&
+X# list compiled by Julian Assange (proff@suburbia.apana.org.au)
+X#
+Xreserved             0/tcp Reserved [JBP]        
+Xreserved             0/udp Reserved [JBP]        
+Xtcpmux               1/tcp TCP Port Service Multiplexer [MKL]     
+Xtcpmux               1/udp TCP Port Service Multiplexer [MKL]     
+Xcompressnet          2/tcp Management Utility [BV15]       
+Xcompressnet          2/udp Management Utility [BV15]       
+Xcompressnet          3/tcp Compression Process [BV15]       
+Xcompressnet          3/udp Compression Process [BV15]       
+Xrje                  5/tcp Remote Job Entry [12,JBP]      
+Xrje                  5/udp Remote Job Entry [12,JBP]      
+Xecho                 7/tcp Echo [95,JBP]        
+Xecho                 7/udp Echo [95,JBP]        
+Xdiscard              9/tcp Discard [94,JBP]        
+Xdiscard              9/udp Discard [94,JBP]        
+Xsystat              11/tcp Active Users [89,JBP]       
+Xsystat              11/udp Active Users [89,JBP]       
+Xdaytime             13/tcp Daytime [93,JBP]        
+Xdaytime             13/udp Daytime [93,JBP]        
+Xnetstat             15/tcp Netstat
+Xqotd                17/tcp Quote of the Day [100,JBP]     
+Xqotd                17/udp Quote of the Day [100,JBP]     
+Xmsp                 18/tcp Message Send Protocol [RXN]      
+Xmsp                 18/udp Message Send Protocol [RXN]      
+Xchargen             19/tcp Character Generator [92,JBP]       
+Xchargen             19/udp Character Generator [92,JBP]       
+Xftp-data            20/tcp File Transfer [Default Data] [96,JBP]     
+Xftp-data            20/udp File Transfer [Default Data] [96,JBP]     
+Xftp                 21/tcp File Transfer [Control] [96,JBP]      
+Xftp                 21/udp File Transfer [Control] [96,JBP]      
+Xtelnet              23/tcp Telnet [112,JBP]        
+Xtelnet              23/udp Telnet [112,JBP]        
+Xpriv-mail           24/tcp any private mail system [RA11]     
+Xpriv-mail           24/udp any private mail system [RA11]     
+Xsmtp                25/tcp Simple Mail Transfer [102,JBP]      
+Xsmtp                25/udp Simple Mail Transfer [102,JBP]      
+Xnsw-fe              27/tcp NSW User System FE [24,RHT]     
+Xnsw-fe              27/udp NSW User System FE [24,RHT]     
+Xmsg-icp             29/tcp MSG ICP [85,RHT]       
+Xmsg-icp             29/udp MSG ICP [85,RHT]       
+Xmsg-auth            31/tcp MSG Authentication [85,RHT]       
+Xmsg-auth            31/udp MSG Authentication [85,RHT]       
+Xdsp                 33/tcp Display Support Protocol [EXC]      
+Xdsp                 33/udp Display Support Protocol [EXC]      
+Xpriv-print          35/tcp any private printer server [JBP]     
+Xpriv-print          35/udp any private printer server [JBP]     
+Xtime                37/tcp Time [108,JBP]        
+Xtime                37/udp Time [108,JBP]        
+Xrlp                 39/tcp Resource Location Protocol [MA]      
+Xrlp                 39/udp Resource Location Protocol [MA]      
+Xgraphics            41/tcp Graphics [129,JBP]        
+Xgraphics            41/udp Graphics [129,JBP]        
+Xnameserver          42/tcp Host Name Server [99,JBP]      
+Xnameserver          42/udp Host Name Server [99,JBP]      
+Xnicname             43/tcp Who Is [55,ANM2]       
+Xnicname             43/udp Who Is [55,ANM2]       
+Xmpm-flags           44/tcp MPM FLAGS Protocol [JBP]      
+Xmpm-flags           44/udp MPM FLAGS Protocol [JBP]      
+Xmpm                 45/tcp Message Processing Module [recv] [98,JBP]     
+Xmpm                 45/udp Message Processing Module [recv] [98,JBP]     
+Xmpm-snd             46/tcp MPM [default send] [98,JBP]      
+Xmpm-snd             46/udp MPM [default send] [98,JBP]      
+Xni-ftp              47/tcp NI FTP [134,SK8]       
+Xni-ftp              47/udp NI FTP [134,SK8]       
+Xlogin               49/tcp Login Host Protocol [PHD1]      
+Xlogin               49/udp Login Host Protocol [PHD1]      
+Xre-mail-ck          50/tcp Remote Mail Checking Protocol [171,SXD1]     
+Xre-mail-ck          50/udp Remote Mail Checking Protocol [171,SXD1]     
+Xla-maint            51/tcp IMP Logical Address Maintenance [76,AGM]     
+Xla-maint            51/udp IMP Logical Address Maintenance [76,AGM]     
+Xxns-time            52/tcp XNS Time Protocol [SXA]      
+Xxns-time            52/udp XNS Time Protocol [SXA]      
+Xdomain              53/tcp Domain Name Server [81,95,PM1]      
+Xdomain              53/udp Domain Name Server [81,95,PM1]      
+Xxns-ch              54/tcp XNS Clearinghouse [SXA]       
+Xxns-ch              54/udp XNS Clearinghouse [SXA]       
+Xisi-gl              55/tcp ISI Graphics Language [7,RB9]      
+Xisi-gl              55/udp ISI Graphics Language [7,RB9]      
+Xxns-auth            56/tcp XNS Authentication [SXA]       
+Xxns-auth            56/udp XNS Authentication [SXA]       
+Xpriv-term           57/tcp any private terminal access [JBP]     
+Xpriv-term           57/udp any private terminal access [JBP]     
+Xmtp                 57/tcp 
+Xxns-mail            58/tcp XNS Mail [SXA]       
+Xxns-mail            58/udp XNS Mail [SXA]       
+Xpriv-file           59/tcp any private file service [JBP]     
+Xpriv-file           59/udp any private file service [JBP]     
+Xni-mail             61/tcp NI MAIL [5,SK8]       
+Xni-mail             61/udp NI MAIL [5,SK8]       
+Xacas                62/tcp ACA Services [EXW]       
+Xacas                62/udp ACA Services [EXW]       
+Xvia-ftp             63/tcp VIA Systems - FTP [DXD]     
+Xvia-ftp             63/udp VIA Systems - FTP [DXD]     
+Xcovia               64/tcp Communications Integrator (CI) [TXD]      
+Xcovia               64/udp Communications Integrator (CI) [TXD]      
+Xtacacs-ds           65/tcp TACACS-Database Service [3,KH43]       
+Xtacacs-ds           65/udp TACACS-Database Service [3,KH43]       
+Xsql*net             66/tcp Oracle SQL*NET [JFH2]       
+Xsql*net             66/udp Oracle SQL*NET [JFH2]       
+Xbootps              67/tcp Bootstrap Protocol Server [36,WJC2]      
+Xbootps              67/udp Bootstrap Protocol Server [36,WJC2]      
+Xbootpc              68/tcp Bootstrap Protocol Client [36,WJC2]      
+Xbootpc              68/udp Bootstrap Protocol Client [36,WJC2]      
+Xtftp                69/tcp Trivial File Transfer [126,DDC1]      
+Xtftp                69/udp Trivial File Transfer [126,DDC1]      
+Xgopher              70/tcp Gopher [MXC1]        
+Xgopher              70/udp Gopher [MXC1]        
+Xnetrjs-1            71/tcp Remote Job Service [10,RTB3]      
+Xnetrjs-1            71/udp Remote Job Service [10,RTB3]      
+Xnetrjs-2            72/tcp Remote Job Service [10,RTB3]      
+Xnetrjs-2            72/udp Remote Job Service [10,RTB3]      
+Xnetrjs-3            73/tcp Remote Job Service [10,RTB3]      
+Xnetrjs-3            73/udp Remote Job Service [10,RTB3]      
+Xnetrjs-4            74/tcp Remote Job Service [10,RTB3]      
+Xnetrjs-4            74/udp Remote Job Service [10,RTB3]      
+Xpriv-dial           75/tcp any private dial out service [JBP]    
+Xpriv-dial           75/udp any private dial out service [JBP]    
+Xpriv-rje            77/tcp any private RJE service [JBP]     
+Xpriv-rje            77/udp any private RJE service [JBP]     
+Xvettcp              78/tcp vettcp [CXL1]        
+Xvettcp              78/udp vettcp [CXL1]        
+Xfinger              79/tcp Finger [52,KLH]        
+Xfinger              79/udp Finger [52,KLH]        
+Xwww                 80/tcp World Wide Web HTTP [TXL]     
+Xwww                 80/udp World Wide Web HTTP [TXL]     
+Xhosts2-ns           81/tcp HOSTS2 Name Server [EAK1]      
+Xhosts2-ns           81/udp HOSTS2 Name Server [EAK1]      
+Xxfer                82/tcp XFER Utility [TXS2]       
+Xxfer                82/udp XFER Utility [TXS2]       
+Xmit-ml-dev          83/tcp MIT ML Device [DXR3]      
+Xmit-ml-dev          83/udp MIT ML Device [DXR3]      
+Xctf                 84/tcp Common Trace Facility [HXT]      
+Xctf                 84/udp Common Trace Facility [HXT]      
+Xmit-ml-dev          85/tcp MIT ML Device [DXR3]      
+Xmit-ml-dev          85/udp MIT ML Device [DXR3]      
+Xmfcobol             86/tcp Micro Focus Cobol [SXE]      
+Xmfcobol             86/udp Micro Focus Cobol [SXE]      
+Xpriv-term-l         87/tcp any private terminal link [JBP]     
+Xpriv-term-l         87/udp any private terminal link [JBP]     
+Xkerberos            88/tcp Kerberos [BCN]        
+Xkerberos            88/udp Kerberos [BCN]        
+Xsu-mit-tg           89/tcp SU/MIT Telnet Gateway [MRC]      
+Xsu-mit-tg           89/udp SU/MIT Telnet Gateway [MRC]      
+Xdnsix               90/tcp DNSIX Securit Attribute Token Map [CXW1]    
+Xdnsix               90/udp DNSIX Securit Attribute Token Map [CXW1]    
+Xmit-dov             91/tcp MIT Dover Spooler [EBM]      
+Xmit-dov             91/udp MIT Dover Spooler [EBM]      
+Xnpp                 92/tcp Network Printing Protocol [LXM]      
+Xnpp                 92/udp Network Printing Protocol [LXM]      
+Xdcp                 93/tcp Device Control Protocol [DT15]      
+Xdcp                 93/udp Device Control Protocol [DT15]      
+Xobjcall             94/tcp Tivoli Object Dispatcher [TXB1]      
+Xobjcall             94/udp Tivoli Object Dispatcher [TXB1]      
+Xsupdup              95/tcp SUPDUP [27,MRC]        
+Xsupdup              95/udp SUPDUP [27,MRC]        
+Xdixie               96/tcp DIXIE Protocol Specification [TXH1]      
+Xdixie               96/udp DIXIE Protocol Specification [TXH1]      
+Xswift-rvf           97/tcp Swift Remote Vitural File Protocol [MXR]    
+Xswift-rvf           97/udp Swift Remote Vitural File Protocol [MXR]    
+Xtacnews             98/tcp TAC News [ANM2]       
+Xtacnews             98/udp TAC News [ANM2]       
+Xmetagram            99/tcp Metagram Relay [GEOF]       
+Xmetagram            99/udp Metagram Relay [GEOF]       
+Xnewacct            100/tcp [unauthorized use]        
+Xhostname           101/tcp NIC Host Name Server [54,ANM2]     
+Xhostname           101/udp NIC Host Name Server [54,ANM2]     
+Xiso-tsap           102/tcp ISO-TSAP [16,MTR]        
+Xiso-tsap           102/udp ISO-TSAP [16,MTR]        
+Xgppitnp            103/tcp Genesis Point-to-Point Trans Net [PXM1]     
+Xgppitnp            103/udp Genesis Point-to-Point Trans Net [PXM1]     
+Xx400               103/tcp ISO Mail
+Xacr-nema           104/tcp ACR-NEMA Digital Imag. & Comm. 300 [PXM1]   
+Xacr-nema           104/udp ACR-NEMA Digital Imag. & Comm. 300 [PXM1]   
+Xx400-snd           104/tcp ISO Mail
+Xcsnet-ns           105/tcp Mailbox Name Nameserver [127,MS56]      
+Xcsnet-ns           105/udp Mailbox Name Nameserver [127,MS56]      
+X3com-tsmux         106/tcp 3COM-TSMUX [JXS5]        
+X3com-tsmux         106/udp 3COM-TSMUX [JXS5]        
+Xrtelnet            107/tcp Remote Telnet Service [101,JBP]      
+Xrtelnet            107/udp Remote Telnet Service [101,JBP]      
+Xsnagas             108/tcp SNA Gateway Access Server [KXM]     
+Xsnagas             108/udp SNA Gateway Access Server [KXM]     
+Xpop2               109/tcp Post Office Protocol - Version 2 [14,JKR1]   
+Xpop2               109/udp Post Office Protocol - Version 2 [14,JKR1]   
+Xpop3               110/tcp Post Office Protocol - Version 3 [122,MTR]   
+Xpop3               110/udp Post Office Protocol - Version 3 [122,MTR]   
+Xsunrpc             111/tcp SUN Remote Procedure Call [DXG]     
+Xsunrpc2             111/tcp SUN Remote Procedure Call [DXG]2
+Xsunrpc             111/udp SUN Remote Procedure Call [DXG]     
+Xmcidas             112/tcp McIDAS Data Transmission Protocol [GXD]     
+Xmcidas             112/udp McIDAS Data Transmission Protocol [GXD]     
+Xauth               113/tcp Authentication Service [130,MCSJ]       
+Xauth               113/udp Authentication Service [130,MCSJ]       
+Xaudionews          114/tcp Audio News Multicast [MXF2]      
+Xaudionews          114/udp Audio News Multicast [MXF2]      
+Xsftp               115/tcp Simple File Transfer Protocol [73,MKL1]     
+Xsftp               115/udp Simple File Transfer Protocol [73,MKL1]     
+Xansanotify         116/tcp ANSA REX Notify [NXH]      
+Xansanotify         116/udp ANSA REX Notify [NXH]      
+Xuucp-path          117/tcp UUCP Path Service [44,MAE]      
+Xuucp-path          117/udp UUCP Path Service [44,MAE]      
+Xsqlserv            118/tcp SQL Services [LXB3]       
+Xsqlserv            118/udp SQL Services [LXB3]       
+Xnntp               119/tcp Network News Transfer Protocol [65,PL4]     
+Xnntp               119/udp Network News Transfer Protocol [65,PL4]     
+Xcfdptkt            120/tcp CFDPTKT [JXO3]        
+Xcfdptkt            120/udp CFDPTKT [JXO3]        
+Xerpc               121/tcp Encore Expedited Remote Pro.Call [132,JXO]     
+Xerpc               121/udp Encore Expedited Remote Pro.Call [132,JXO]     
+Xsmakynet           122/tcp SMAKYNET [MXO]        
+Xsmakynet           122/udp SMAKYNET [MXO]        
+Xntp                123/tcp Network Time Protocol [80,DLM1]      
+Xntp                123/udp Network Time Protocol [80,DLM1]      
+Xansatrader         124/tcp ANSA REX Trader [NXH]      
+Xansatrader         124/udp ANSA REX Trader [NXH]      
+Xlocus-map          125/tcp Locus PC-Interface Net Map Ser [137,EP53]    
+Xlocus-map          125/udp Locus PC-Interface Net Map Ser [137,EP53]    
+Xunitary            126/tcp Unisys Unitary Login [FEIL]      
+Xunitary            126/udp Unisys Unitary Login [FEIL]      
+Xlocus-con          127/tcp Locus PC-Interface Conn Server [137,EP53]     
+Xlocus-con          127/udp Locus PC-Interface Conn Server [137,EP53]     
+Xgss-xlicen         128/tcp GSS X License Verification [JXL]     
+Xgss-xlicen         128/udp GSS X License Verification [JXL]     
+Xpwdgen             129/tcp Password Generator Protocol [141,FJW]      
+Xpwdgen             129/udp Password Generator Protocol [141,FJW]      
+Xcisco-fna          130/tcp cisco FNATIVE [WXB]       
+Xcisco-fna          130/udp cisco FNATIVE [WXB]       
+Xcisco-tna          131/tcp cisco TNATIVE [WXB]       
+Xcisco-tna          131/udp cisco TNATIVE [WXB]       
+Xcisco-sys          132/tcp cisco SYSMAINT [WXB]       
+Xcisco-sys          132/udp cisco SYSMAINT [WXB]       
+Xstatsrv            133/tcp Statistics Service [DLM1]       
+Xstatsrv            133/udp Statistics Service [DLM1]       
+Xingres-net         134/tcp INGRES-NET Service [MXB]       
+Xingres-net         134/udp INGRES-NET Service [MXB]       
+Xloc-srv            135/tcp Location Service [JXP]       
+Xloc-srv            135/udp Location Service [JXP]       
+Xprofile            136/tcp PROFILE Naming System [LLP]      
+Xprofile            136/udp PROFILE Naming System [LLP]      
+Xnetbios-ns         137/tcp NETBIOS Name Service [JBP]      
+Xnetbios-ns         137/udp NETBIOS Name Service [JBP]      
+Xnetbios-dgm        138/tcp NETBIOS Datagram Service [JBP]      
+Xnetbios-dgm        138/udp NETBIOS Datagram Service [JBP]      
+Xnetbios-ssn        139/tcp NETBIOS Session Service [JBP]      
+Xnetbios-ssn        139/udp NETBIOS Session Service [JBP]      
+Xemfis-data         140/tcp EMFIS Data Service [GB7]      
+Xemfis-data         140/udp EMFIS Data Service [GB7]      
+Xemfis-cntl         141/tcp EMFIS Control Service [GB7]      
+Xemfis-cntl         141/udp EMFIS Control Service [GB7]      
+Xbl-idm             142/tcp Britton-Lee IDM [SXS1]       
+Xbl-idm             142/udp Britton-Lee IDM [SXS1]       
+Ximap2              143/tcp Interim Mail Access Protocol v2 [MRC]    
+Ximap2              143/udp Interim Mail Access Protocol v2 [MRC]    
+Xnews               144/tcp NewS window system [JAG]        
+Xnews               144/udp NewS window system [JAG]        
+Xuaac               145/tcp UAAC Protocol [DAG4]       
+Xuaac               145/udp UAAC Protocol [DAG4]       
+Xiso-tp0            146/tcp ISO-IP0 [86,MTR]        
+Xiso-tp0            146/udp ISO-IP0 [86,MTR]        
+Xiso-ip             147/tcp ISO-IP [MTR]        
+Xiso-ip             147/udp ISO-IP [MTR]        
+Xcronus             148/tcp CRONUS-SUPPORT [135,JXB]        
+Xcronus             148/udp CRONUS-SUPPORT [135,JXB]        
+Xaed-512            149/tcp AED 512 Emulation Service [AXB]     
+Xaed-512            149/udp AED 512 Emulation Service [AXB]     
+Xsql-net            150/tcp SQL-NET [MXP]        
+Xsql-net            150/udp SQL-NET [MXP]        
+Xhems               151/tcp HEMS [87,CXT]        
+Xhems               151/udp HEMS [87,CXT]        
+Xbftp               152/tcp Background File Transfer Program [AD14]     
+Xbftp               152/udp Background File Transfer Program [AD14]     
+Xsgmp               153/tcp SGMP [37,MS9]        
+Xsgmp               153/udp SGMP [37,MS9]        
+Xnetsc-prod         154/tcp NETSC [SH37]        
+Xnetsc-prod         154/udp NETSC [SH37]        
+Xnetsc-dev          155/tcp NETSC [SH37]        
+Xnetsc-dev          155/udp NETSC [SH37]        
+Xsqlsrv             156/tcp SQL Service [CMR]       
+Xsqlsrv             156/udp SQL Service [CMR]       
+Xknet-cmp           157/tcp KNET/VM Command/Message Protocol[77,GSM11]       
+Xknet-cmp           157/udp KNET/VM Command/Message Protocol[77,GSM11]       
+Xpcmail-srv         158/tcp PCMail Server [19,MXL]       
+Xpcmail-srv         158/udp PCMail Server [19,MXL]       
+Xnss-routing        159/tcp NSS-Routing [JXR]        
+Xnss-routing        159/udp NSS-Routing [JXR]        
+Xsgmp-traps         160/tcp SGMP-TRAPS [37,MS9]        
+Xsgmp-traps         160/udp SGMP-TRAPS [37,MS9]        
+Xsnmp               161/tcp SNMP [15,MTR]        
+Xsnmp               161/udp SNMP [15,MTR]        
+Xsnmptrap           162/tcp SNMPTRAP [15,MTR]        
+Xsnmptrap           162/udp SNMPTRAP [15,MTR]        
+Xcmip-man           163/tcp CMIP/TCP Manager [4,AXB1]       
+Xcmip-man           163/udp CMIP/TCP Manager [4,AXB1]       
+Xcmip-agent         164/tcp CMIP/TCP Agent [4,AXB1]       
+Xsmip-agent         164/udp CMIP/TCP Agent [4,AXB1]       
+Xxns-courier        165/tcp Xerox 144,SXA]        
+Xxns-courier        165/udp Xerox [144,SXA]        
+Xs-net              166/tcp Sirius Systems [BXL]       
+Xs-net              166/udp Sirius Systems [BXL]       
+Xnamp               167/tcp NAMP [MS9]        
+Xnamp               167/udp NAMP [MS9]        
+Xrsvd               168/tcp RSVD [NT12]        
+Xrsvd               168/udp RSVD [NT12]        
+Xsend               169/tcp SEND [WDW11]        
+Xsend               169/udp SEND [WDW11]        
+Xprint-srv          170/tcp Network PostScript [BKR]       
+Xprint-srv          170/udp Network PostScript [BKR]       
+Xmultiplex          171/tcp Network Innovations Multiplex [KXD]      
+Xmultiplex          171/udp Network Innovations Multiplex [KXD]      
+Xcl/1               172/tcp Network Innovations CL/1 [KXD]      
+Xcl/1               172/udp Network Innovations CL/1 [KXD]      
+Xxyplex-mux         173/tcp Xyplex [BXS]        
+Xxyplex-mux         173/udp Xyplex [BXS]        
+Xmailq              174/tcp MAILQ [RXZ]        
+Xmailq              174/udp MAILQ [RXZ]        
+Xvmnet              175/tcp VMNET [CXT]        
+Xvmnet              175/udp VMNET [CXT]        
+Xgenrad-mux         176/tcp GENRAD-MUX [RXT]        
+Xgenrad-mux         176/udp GENRAD-MUX [RXT]        
+Xxdmcp              177/tcp X Display Manager Control Protocol [RWS4]    
+Xxdmcp              177/udp X Display Manager Control Protocol [RWS4]    
+Xnextstep           178/tcp NextStep Window Server [LXH]      
+XNextStep           178/udp NextStep Window Server [LXH]      
+Xbgp                179/tcp Border Gateway Protocol [KSL]      
+Xbgp                179/udp Border Gateway Protocol [KSL]      
+Xris                180/tcp Intergraph [DXB]        
+Xris                180/udp Intergraph [DXB]        
+Xunify              181/tcp Unify [VXS]        
+Xunify              181/udp Unify [VXS]        
+Xaudit              182/tcp Unisys Audit SITP [GXG]      
+Xaudit              182/udp Unisys Audit SITP [GXG]      
+Xocbinder           183/tcp OCBinder [JXO1]        
+Xocbinder           183/udp OCBinder [JXO1]        
+Xocserver           184/tcp OCServer [JXO1]        
+Xocserver           184/udp OCServer [JXO1]        
+Xremote-kis         185/tcp Remote-KIS [RXD1]        
+Xremote-kis         185/udp Remote-KIS [RXD1]        
+Xkis                186/tcp KIS Protocol [RXD1]       
+Xkis                186/udp KIS Protocol [RXD1]       
+Xaci                187/tcp Application Communication Interface [RXC1]      
+Xaci                187/udp Application Communication Interface [RXC1]      
+Xmumps              188/tcp Plus Five's MUMPS [HS23]      
+Xmumps              188/udp Plus Five's MUMPS [HS23]      
+Xqft                189/tcp Queued File Transport [WXS]      
+Xqft                189/udp Queued File Transport [WXS]      
+Xgacp               190/tcp Gateway Access Control Protocol [PCW]     
+Xcacp               190/udp Gateway Access Control Protocol [PCW]     
+Xprospero           191/tcp Prospero [BCN]        
+Xprospero           191/udp Prospero [BCN]        
+Xosu-nms            192/tcp OSU Network Monitoring System [DXK]     
+Xosu-nms            192/udp OSU Network Monitoring System [DXK]     
+Xsrmp               193/tcp Spider Remote Monitoring Protocol [TXS]     
+Xsrmp               193/udp Spider Remote Monitoring Protocol [TXS]     
+Xirc                194/tcp Internet Relay Chat Protocol [JXO2]     
+Xirc                194/udp Internet Relay Chat Protocol [JXO2]     
+Xdn6-nlm-aud        195/tcp DNSIX Network Level Module Audit [LL69]    
+Xdn6-nlm-aud        195/udp DNSIX Network Level Module Audit [LL69]    
+Xdn6-smm-red        196/tcp DNSIX Session Mgt Module Audit Redir[LL69]    
+Xdn6-smm-red        196/udp DNSIX Session Mgt Module Audit Redir[LL69]    
+Xdls                197/tcp Directory Location Service [SXB]      
+Xdls                197/udp Directory Location Service [SXB]      
+Xdls-mon            198/tcp Directory Location Service Monitor [SXB]     
+Xdls-mon            198/udp Directory Location Service Monitor [SXB]     
+Xsmux               199/tcp SMUX [MTR]        
+Xsmux               199/udp SMUX [MTR]        
+Xsrc                200/tcp IBM System Resource Controller [GXM]     
+Xsrc                200/udp IBM System Resource Controller [GXM]     
+Xat-rtmp            201/tcp AppleTalk Routing Maintenance [RXC]      
+Xat-rtmp            201/udp AppleTalk Routing Maintenance [RXC]      
+Xat-nbp             202/tcp AppleTalk Name Binding [RXC]      
+Xat-nbp             202/udp AppleTalk Name Binding [RXC]      
+Xat-3               203/tcp AppleTalk Unused [RXC]       
+Xat-3               203/udp AppleTalk Unused [RXC]       
+Xat-echo            204/tcp AppleTalk Echo [RXC]       
+Xat-echo            204/udp AppleTalk Echo [RXC]       
+Xat-5               205/tcp AppleTalk Unused [RXC]       
+Xat-5               205/udp AppleTalk Unused [RXC]       
+Xat-zis             206/tcp AppleTalk Zone Information [RXC]      
+Xat-zis             206/udp AppleTalk Zone Information [RXC]      
+Xat-7               207/tcp AppleTalk Unused [RXC]       
+Xat-7               207/udp AppleTalk Unused [RXC]       
+Xat-8               208/tcp AppleTalk Unused [RXC]       
+Xat-8               208/udp AppleTalk Unused [RXC]       
+Xtam                209/tcp Trivial Authenticated Mail Protocol [DXB1]     
+Xtam                209/udp Trivial Authenticated Mail Protocol [DXB1]     
+Xz39.50             210/tcp ANSI Z39.50 [MXN]       
+Xz39.50             210/udp ANSI Z39.50 [MXN]       
+X914c/g             211/tcp Texas Instruments 914C/G Terminal [BXH1]     
+X914c/g             211/udp Texas Instruments 914C/G Terminal [BXH1]     
+Xanet               212/tcp ATEXSSTR [JXT]        
+Xanet               212/udp ATEXSSTR [JXT]        
+Xipx                213/tcp IPX [DP666]        
+Xipx                213/udp IPX [DP666]        
+Xvmpwscs            214/tcp VM PWSCS [DXS]       
+Xvmpwscs            214/udp VM PWSCS [DXS]       
+Xsoftpc             215/tcp Insignia Solutions [MXT]       
+Xsoftpc             215/udp Insignia Solutions [MXT]       
+Xatls               216/tcp Access Technology License Server [LXD]     
+Xatls               216/udp Access Technology License Server [LXD]     
+Xdbase              217/tcp dBASE Unix [DXG1]       
+Xdbase              217/udp dBASE Unix [DXG1]       
+Xmpp                218/tcp Netix Message Posting Protocol [STY]     
+Xmpp                218/udp Netix Message Posting Protocol [STY]     
+Xuarps              219/tcp Unisys ARPs [AXM1]       
+Xuarps              219/udp Unisys ARPs [AXM1]       
+Ximap3              220/tcp Interactive Mail Access Protocol v3 [JXR2]    
+Ximap3              220/udp Interactive Mail Access Protocol v3 [JXR2]    
+Xfln-spx            221/tcp Berkeley rlogind with SPX auth [KXA]    
+Xfln-spx            221/udp Berkeley rlogind with SPX auth [KXA]    
+Xfsh-spx            222/tcp Berkeley rshd with SPX auth [KXA]    
+Xfsh-spx            222/udp Berkeley rshd with SPX auth [KXA]    
+Xcdc                223/tcp Certificate Distribution Center [KXA]      
+Xcdc                223/udp Certificate Distribution Center [KXA]      
+Xsur-meas           243/tcp Survey Measurement [6,DDC1]       
+Xsur-meas           243/udp Survey Measurement [6,DDC1]       
+Xlink               245/tcp LINK [1,RDB2]        
+Xlink               245/udp LINK [1,RDB2]        
+Xdsp3270            246/tcp Display Systems Protocol [39,WJS1]      
+Xdsp3270            246/udp Display Systems Protocol [39,WJS1]      
+Xpawserv            345/tcp Perf Analysis Workbench       
+Xpawserv            345/udp Perf Analysis Workbench       
+Xzserv              346/tcp Zebra server        
+Xzserv              346/udp Zebra server        
+Xfatserv            347/tcp Fatmen Server        
+Xfatserv            347/udp Fatmen Server        
+Xclearcase          371/tcp Clearcase [DXL1]        
+Xclearcase          371/udp Clearcase [DXL1]        
+Xulistserv          372/tcp Unix Listserv [AXK]       
+Xulistserv          372/udp Unix Listserv [AXK]       
+Xlegent-1           373/tcp Legent Corporation [KXB]       
+Xlegent-1           373/udp Legent Corporation [KXB]       
+Xlegent-2           374/tcp Legent Corporation [KXB]       
+Xlegent-2           374/udp Legent Corporation [KXB]       
+Xexec               512/tcp remote process execution (rexecd)
+Xbiff               512/udp used by mail system to notify users of new mail
+Xlogin              513/tcp remote login (rlogind)       
+Xwho                513/udp who's logged in (rwhod)
+Xshell              514/tcp rlogin style exec (rshd)
+Xcmd                514/tcp rlogin style exec (rshd)
+Xsyslog             514/udp          
+Xprinter            515/tcp spooler (lpd)
+Xprinter            515/udp spooler (lpd)
+Xtalk               517/tcp 
+Xntalk              518/tcp (talkd)
+Xntalk              518/udp (talkd)
+Xutime              519/tcp unixtime         
+Xutime              519/udp unixtime         
+Xefs                520/tcp extended file name server      
+Xrouter             520/udp local routing process (on site); uses variant of Xerox NS
+Xtimed              525/tcp timeserver         
+Xtimed              525/udp timeserver         
+Xtempo              526/tcp newdate         
+Xtempo              526/udp newdate         
+Xcourier            530/tcp rpc         
+Xcourier            530/udp rpc         
+Xconference         531/tcp chat         
+Xconference         531/udp chat         
+Xnetnews            532/tcp readnews         
+Xnetnews            532/udp readnews         
+Xnetwall            533/tcp for emergency broadcasts       
+Xnetwall            533/udp for emergency broadcasts       
+Xuucp               540/tcp uucpd         
+Xuucp               540/udp uucpd         
+Xklogin             543/tcp          
+Xklogin             543/udp          
+Xkshell             544/tcp krcmd         
+Xkshell             544/udp krcmd         
+Xnew-rwho           550/tcp new-who         
+Xnew-rwho           550/udp new-who         
+Xdsf                555/tcp          
+Xdsf                555/udp          
+Xremotefs           556/tcp rfs server        
+Xremotefs           556/udp rfs server        
+Xrmonitor           560/tcp rmonitord         
+Xrmonitor           560/udp rmonitord         
+Xmonitor            561/tcp          
+Xmonitor            561/udp          
+Xchshell            562/tcp chcmd         
+Xchshell            562/udp chcmd         
+X9pfs               564/tcp plan 9 file service      
+X9pfs               564/udp plan 9 file service      
+Xwhoami             565/tcp whoami         
+Xwhoami             565/udp whoami         
+Xmeter              570/tcp demon         
+Xmeter              570/udp demon         
+Xmeter              571/tcp udemon         
+Xmeter              571/udp udemon         
+Xipcserver          600/tcp Sun IPC server       
+Xipcserver          600/udp Sun IPC server       
+Xpcserver           600/tcp ECD Integrated PC board srvr
+Xmount              635/udp NFS Mount Service
+Xnqs                607/tcp nqs         
+Xnqs                607/udp nqs         
+Xpcnfs              640/udp PC-NFS DOS Authentication
+Xbwnfs              650/udp BW-NFS DOS Authentication
+Xmdqs               666/tcp          
+Xmdqs               666/udp          
+Xelcsd              704/tcp errlog copy/server daemon       
+Xelcsd              704/udp errlog copy/server daemon       
+Xnetcp              740/tcp NETscout Control Protocol [AXS2]      
+Xnetcp              740/udp NETscout Control Protocol [AXS2]      
+Xnetgw              741/tcp netGW [OXK]        
+Xnetgw              741/udp netGW [OXK]        
+Xnetrcs             742/tcp Network based Rev. Cont. Sys. [GXC2]    
+Xnetrcs             742/udp Network based Rev. Cont. Sys. [GXC2]    
+Xflexlm             744/tcp Flexible License Manager [MXC2]      
+Xflexlm             744/udp Flexible License Manager [MXC2]      
+Xfujitsu-dev        747/tcp Fujitsu Device Control       
+Xfujitsu-dev        747/udp Fujitsu Device Control       
+Xris-cm             748/tcp Russell Info Sci Calendar Manager     
+Xris-cm             748/udp Russell Info Sci Calendar Manager     
+Xkerberos-adm       749/tcp kerberos administration        
+Xkerberos-adm       749/udp kerberos administration        
+Xrfile              750/tcp          
+Xloadav             750/udp          
+Xpump               751/tcp          
+Xpump               751/udp          
+Xqrh                752/tcp          
+Xqrh                752/udp          
+Xrrh                753/tcp          
+Xrrh                753/udp          
+Xtell               754/tcp send         
+Xtell               754/udp send         
+Xnlogin             758/tcp          
+Xnlogin             758/udp          
+Xcon                759/tcp          
+Xcon                759/udp          
+Xns                 760/tcp          
+Xns                 760/udp          
+Xrxe                761/tcp          
+Xrxe                761/udp          
+Xquotad             762/tcp          
+Xquotad             762/udp          
+Xcycleserv          763/tcp          
+Xcycleserv          763/udp          
+Xomserv             764/tcp          
+Xomserv             764/udp          
+Xwebster            765/tcp          
+Xwebster            765/udp          
+Xphonebook          767/tcp phone         
+Xphonebook          767/udp phone         
+Xvid                769/tcp          
+Xvid                769/udp          
+Xcadlock            770/tcp          
+Xcadlock            770/udp          
+Xrtip               771/tcp          
+Xrtip               771/udp          
+Xcycleserv2         772/tcp          
+Xcycleserv2         772/udp          
+Xsubmit             773/tcp          
+Xnotify             773/udp          
+Xrpasswd            774/tcp          
+Xacmaint_dbd        774/udp          
+Xentomb             775/tcp          
+Xacmaint_transd     775/udp          
+Xwpages             776/tcp          
+Xwpages             776/udp          
+Xwpgs               780/tcp          
+Xwpgs               780/udp          
+Xhp-collector       781/tcp hp performance data collector      
+Xhp-collector       781/udp hp performance data collector      
+Xhp-managed-node    782/tcp hp performance data managed node     
+Xhp-managed-node    782/udp hp performance data managed node     
+Xhp-alarm-mgr       783/tcp hp performance data alarm manager     
+Xhp-alarm-mgr       783/udp hp performance data alarm manager     
+Xmdbs_daemon        800/tcp          
+Xmdbs_daemon        800/udp          
+Xdevice             801/tcp          
+Xdevice             801/udp          
+Xxtreelic           996/tcp XTREE License Server       
+Xxtreelic           996/udp XTREE License Server       
+Xmaitrd             997/tcp          
+Xmaitrd             997/udp          
+Xbusboy             998/tcp          
+Xpuparp             998/udp          
+Xgarcon             999/tcp          
+Xapplix             999/udp Applix ac        
+Xpuprouter          999/tcp          
+Xpuprouter          999/udp          
+Xcadlock           1000/tcp          
+Xock               1000/udp          
+Xblackjack         1025/tcp network blackjack        
+Xblackjack         1025/udp network blackjack        
+Xlisten            1025/tcp listener RFS remote_file_sharing
+Xnterm             1026/tcp remote_login network_terminal
+Xhermes            1248/tcp          
+Xhermes            1248/udp          
+Xbbn-mmc           1347/tcp multi media conferencing       
+Xbbn-mmc           1347/udp multi media conferencing       
+Xbbn-mmx           1348/tcp multi media conferencing       
+Xbbn-mmx           1348/udp multi media conferencing       
+Xsbook             1349/tcp Registration Network Protocol [SXS4]      
+Xsbook             1349/udp Registration Network Protocol [SXS4]      
+Xeditbench         1350/tcp Registration Network Protocol [SXS4]      
+Xeditbench         1350/udp Registration Network Protocol [SXS4]      
+Xequationbuilder   1351/tcp Digital Tool Works (MIT) [TXT1]     
+Xequationbuilder   1351/udp Digital Tool Works (MIT) [TXT1]     
+Xlotusnote         1352/tcp Lotus Note [GXP1]       
+Xlotusnote         1352/udp Lotus Note [GXP1]       
+Xingreslock        1524/tcp ingres         
+Xingreslock        1524/udp ingres         
+Xorasrv            1525/tcp oracle         
+Xorasrv            1525/udp oracle         
+Xprospero-np       1525/tcp prospero non-privileged        
+Xprospero-np       1525/udp prospero non-privileged        
+Xtlisrv            1527/tcp oracle         
+Xtlisrv            1527/udp oracle         
+Xcoauthor          1529/tcp oracle         
+Xcoauthor          1529/udp oracle         
+Xissd              1600/tcp          
+Xissd              1600/udp          
+Xtnet              1600/tcp transputer net daemon
+Xnkd               1650/tcp          
+Xnkd               1650/udp          
+Xcallbook          2000/tcp          
+Xcallbook          2000/udp          
+Xdc                2001/tcp          
+Xwizard            2001/udp curry         
+Xglobe             2002/tcp          
+Xglobe             2002/udp          
+Xmailbox           2004/tcp          
+Xemce              2004/udp CCWS mm conf       
+Xberknet           2005/tcp          
+Xoracle            2005/udp          
+Xinvokator         2006/tcp          
+Xraid-cc           2006/udp raid         
+Xdectalk           2007/tcp          
+Xraid-am           2007/udp          
+Xconf              2008/tcp          
+Xterminaldb        2008/udp          
+Xnews              2009/tcp          
+Xwhosockami        2009/udp          
+Xsearch            2010/tcp          
+Xpipe_server       2010/udp          
+Xraid-cc           2011/tcp raid         
+Xservserv          2011/udp          
+Xttyinfo           2012/tcp          
+Xraid-ac           2012/udp          
+Xraid-am           2013/tcp          
+Xraid-cd           2013/udp          
+Xtroff             2014/tcp          
+Xraid-sf           2014/udp          
+Xcypress           2015/tcp          
+Xraid-cs           2015/udp          
+Xbootserver        2016/tcp          
+Xbootserver        2016/udp          
+Xcypress-stat      2017/tcp          
+Xbootclient        2017/udp          
+Xterminaldb        2018/tcp          
+Xrellpack          2018/udp          
+Xwhosockami        2019/tcp          
+Xabout             2019/udp          
+Xxinupageserver    2020/tcp          
+Xxinupageserver    2020/udp          
+Xservexec          2021/tcp          
+Xxinuexpansion1    2021/udp          
+Xdown              2022/tcp          
+Xxinuexpansion2    2022/udp          
+Xxinuexpansion3    2023/tcp          
+Xxinuexpansion3    2023/udp          
+Xxinuexpansion4    2024/tcp          
+Xxinuexpansion4    2024/udp          
+Xellpack           2025/tcp          
+Xxribs             2025/udp          
+Xscrabble          2026/tcp          
+Xscrabble          2026/udp          
+Xshadowserver      2027/tcp          
+Xshadowserver      2027/udp          
+Xsubmitserver      2028/tcp          
+Xsubmitserver      2028/udp          
+Xdevice2           2030/tcp          
+Xdevice2           2030/udp          
+Xblackboard        2032/tcp          
+Xblackboard        2032/udp          
+Xglogger           2033/tcp          
+Xglogger           2033/udp          
+Xscoremgr          2034/tcp          
+Xscoremgr          2034/udp          
+Ximsldoc           2035/tcp          
+Ximsldoc           2035/udp          
+Xobjectmanager     2038/tcp          
+Xobjectmanager     2038/udp          
+Xlam               2040/tcp          
+Xlam               2040/udp          
+Xinterbase         2041/tcp          
+Xinterbase         2041/udp          
+Xisis              2042/tcp          
+Xisis              2042/udp          
+Xisis-bcast        2043/tcp          
+Xisis-bcast        2043/udp          
+Xrimsl             2044/tcp          
+Xrimsl             2044/udp          
+Xcdfunc            2045/tcp          
+Xcdfunc            2045/udp          
+Xsdfunc            2046/tcp          
+Xsdfunc            2046/udp          
+Xdls               2047/tcp          
+Xdls               2047/udp          
+Xdls-monitor       2048/tcp          
+Xdls-monitor       2048/udp          
+Xnfs               2049/tcp networked file system
+Xnfs               2049/udp networked file system
+Xshilp             2049/tcp          
+Xshilp             2049/udp          
+Xwww-dev           2784/tcp world wide web - development     
+Xwww-dev           2784/udp world wide web - development     
+XNSWS              3049/tcp          
+Xrfa               4672/tcp remote file access server      
+Xrfa               4672/udp remote file access server      
+Xcommplex-main     5000/tcp          
+Xcommplex-main     5000/udp          
+Xcommplex-link     5001/tcp          
+Xcommplex-link     5001/udp          
+Xrfe               5002/tcp radio free ethernet       
+Xrfe               5002/udp radio free ethernet       
+Xrmonitor_secure   5145/tcp          
+Xrmonitor_secure   5145/udp          
+Xpadl2sim          5236/tcp          
+Xpadl2sim          5236/udp          
+Xxterm             6000/tcp x-windows server
+Xsub-process       6111/tcp HP SoftBench Sub-Process Control      
+Xsub-process       6111/udp HP SoftBench Sub-Process Control      
+Xxdsxdm            6558/udp          
+Xxdsxdm            6558/tcp          
+Xirc-serv          6666/tcp internet relay chat server      
+Xirc               6667/tcp internet relay chat       
+Xafs3-fileserver   7000/tcp file server itself       
+Xafs3-fileserver   7000/udp file server itself       
+Xdos               7000/tcp msdos
+Xafs3-callback     7001/tcp callbacks to cache managers      
+Xafs3-callback     7001/udp callbacks to cache managers      
+Xafs3-prserver     7002/tcp users & groups database      
+Xafs3-prserver     7002/udp users & groups database      
+Xafs3-vlserver     7003/tcp volume location database       
+Xafs3-vlserver     7003/udp volume location database       
+Xafs3-kaserver     7004/tcp AFS/Kerberos authentication service       
+Xafs3-kaserver     7004/udp AFS/Kerberos authentication service       
+Xafs3-volser       7005/tcp volume managment server       
+Xafs3-volser       7005/udp volume managment server       
+Xafs3-errors       7006/tcp error interpretation service       
+Xafs3-errors       7006/udp error interpretation service       
+Xafs3-bos          7007/tcp basic overseer process       
+Xafs3-bos          7007/udp basic overseer process       
+Xafs3-update       7008/tcp server-to-server updater        
+Xafs3-update       7008/udp server-to-server updater        
+Xafs3-rmtsys       7009/tcp remote cache manager service      
+Xafs3-rmtsys       7009/udp remote cache manager service      
+Xman               9535/tcp          
+Xman               9535/udp          
+Xisode-dua        17007/tcp          
+Xisode-dua        17007/udp          
+SHAR_EOF
+chmod 0600 strobe.services || echo "restore of strobe.services fails"
+exit 0
+

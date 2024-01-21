@@ -1,0 +1,1629 @@
+Subject:  v18i095:  Elm mail system, release 2.2, Part16/24
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: dsinc!syd@uunet.UU.NET (Syd Weinstein)
+Posting-number: Volume 18, Issue 95
+Archive-name: elm2.2/part16
+
+#!/bin/sh
+# this is part 16 of a multipart archive
+# do not concatenate these parts, unpack them in order with /bin/sh
+# file src/leavembox.c continued
+#
+CurArch=16
+if test ! -r s2_seq_.tmp
+then echo "Please unpack part 1 first!"
+     exit 1; fi
+( read Scheck
+  if test "$Scheck" != $CurArch
+  then echo "Please unpack part $Scheck next!"
+       exit 1;
+  else exit 0; fi
+) < s2_seq_.tmp || exit 1
+echo "x - Continuing file src/leavembox.c"
+sed 's/^X//' << 'SHAR_EOF' >> src/leavembox.c
+X *******************************************************************************
+X * $Log:	leavembox.c,v $
+X * Revision 2.26  89/03/25  21:46:33  syd
+X * Initial 2.2 Release checkin
+X * 
+X *
+X ******************************************************************************/
+X
+X/** leave current folder, updating etc. as needed...
+X  
+X**/
+X
+X#include "headers.h"
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#ifdef LOCK_BY_FLOCK
+X#include <sys/file.h>
+X#endif
+X#include <errno.h>
+X
+X/**********
+X   Since a number of machines don't seem to bother to define the utimbuf
+X   structure for some *very* obscure reason.... 
+X
+X   Suprise, though, BSD has a different utime() entirely...*sigh*
+X**********/
+X
+X#ifndef BSD
+X# ifdef NOUTIMBUF
+X
+Xstruct utimbuf {
+X	time_t	actime;		/** access time       **/ 
+X	time_t	modtime;	/** modification time **/
+X       };
+X
+X
+X# endif /* NOUTIMBUF */
+X#endif /* BSD */
+X
+Xextern int errno;
+X
+Xchar *error_name(), *error_description(), *strcpy();
+Xunsigned short getegid();
+Xunsigned long sleep();
+X
+Xint
+Xleave_mbox(resyncing, quitting, prompt)
+Xint resyncing, quitting, prompt;
+X{
+X	/** Close folder, deleting some messages, storing others in mbox,
+X	    and keeping others, as directed by user input and elmrc options.
+X
+X	    Return	1	Folder altered
+X			0	Folder not altered
+X			-1	New mail arrived during the process and
+X					closing was aborted.
+X	    If "resyncing" we are just writing out folder to reopen it. We
+X		therefore only consider deletes and keeps, not stores to mbox.
+X		Also we don't remove NEW status so that it can be preserved
+X		across the resync.
+X
+X	    If "quitting" prompting for user input is based on truth of
+X	    	"prompt". Otherwise prompting is dependent upon the variable
+X		question_me, as set by an elmrc option.
+X		This is because when called as part of quitting, the user
+X		selects run-time between the 'q' and 'Q' commands to tell
+X		elm whether s/he wants to be prompted or not. This would
+X		render use of the elmrc option moot (i.e. overridden).
+X		Prompted quit vs quick quit.
+X	**/
+X
+X	FILE *temp;
+X	char temp_keep_file[SLEN], buffer[SLEN];
+X	struct stat    buf;		/* stat command  */
+X#ifdef BSD
+X	time_t utime_buffer[2];		/* utime command */
+X#else
+X	struct utimbuf utime_buffer;	/* utime command */
+X#endif
+X	register int to_delete = 0, to_store = 0, to_keep = 0, i,
+X		     marked_deleted, marked_read, marked_unread,
+X		     last_sortby, ask_questions,  asked_storage_q,
+X		     num_chgd_status, need_to_copy;
+X	char answer;
+X	long bytes();
+X
+X	dprint(1, (debugfile, "\n\n-- leaving folder --\n\n"));
+X
+X	if (message_count == 0)
+X	  return(0);	/* nothing changed */
+X
+X	ask_questions = (quitting ? prompt : question_me);
+X
+X	/* YES or NO on softkeys */
+X	if (hp_softkeys && ask_questions) {
+X	  define_softkeys(YESNO);
+X	  softkeys_on();
+X	}
+X
+X	/* Clear the exit dispositions of all messages, just in case
+X	 * they were left set by a previous call to this function
+X	 * that was interrupted by the receipt of new mail.
+X	 */
+X	for(i = 0; i < message_count; i++)
+X	  headers[i]->exit_disposition = UNSET;
+X	  
+X	/* Determine if deleted messages are really to be deleted */
+X
+X	/* we need to know if there are none, or one, or more to delete */
+X	for (marked_deleted=0, i=0; i<message_count && marked_deleted<2; i++)
+X	  if (ison(headers[i]->status, DELETED))
+X	    marked_deleted++;
+X
+X        if(marked_deleted) {
+X	  answer = (always_del ? 'y' : 'n');	/* default answer */
+X	  if(ask_questions) {
+X	    sprintf(buffer, "Delete message%s? (y/n) ", plural(marked_deleted));
+X	    answer = want_to(buffer, answer);
+X	  }
+X
+X	  if(answer == 'y') {
+X	    for (i = 0; i < message_count; i++) {
+X	      if (ison(headers[i]->status, DELETED)) {
+X		headers[i]->exit_disposition = DELETE;
+X		to_delete++;
+X	      }
+X	    }
+X	  }
+X	}
+X	dprint(3, (debugfile, "Messages to delete: %d\n", to_delete));
+X
+X	/* If this is a non spool file, or if we are merely resyncing,
+X	 * all messages with an unset disposition (i.e. not slated for
+X	 * deletion) are to be kept.
+X	 * Otherwise, we need to determine if read and unread messages
+X	 * are to be stored or kept.
+X	 */
+X	if(folder_type == NON_SPOOL || resyncing) {
+X	  to_store = 0;
+X	  for (i = 0; i < message_count; i++) {
+X	    if(headers[i]->exit_disposition == UNSET) {
+X	      headers[i]->exit_disposition = KEEP;
+X	      to_keep++;
+X	    }
+X	  }
+X	} else {
+X
+X	  /* Let's first see if user wants to store read messages 
+X	   * that aren't slated for deletion */
+X
+X	  asked_storage_q = FALSE;
+X
+X	  /* we need to know if there are none, or one, or more marked read */
+X	  for (marked_read=0, i=0; i < message_count && marked_read < 2; i++) {
+X	    if((isoff(headers[i]->status, UNREAD))
+X	      && (headers[i]->exit_disposition == UNSET))
+X		marked_read++;
+X	  }
+X	  if(marked_read) {
+X	    answer = (always_store ? 'y' : 'n');	/* default answer */
+X	    if(ask_questions) {
+X	      sprintf(buffer, "Store read message%s in \"received\" folder? (y/n) ",
+X	        plural(marked_read));
+X	      answer = want_to(buffer, answer);
+X	      asked_storage_q = TRUE;
+X	    }
+X
+X	    for (i = 0; i < message_count; i++) {
+X	      if((isoff(headers[i]->status, UNREAD)) 
+X		&& (headers[i]->exit_disposition == UNSET)) {
+X
+X		  if(answer == 'y') {
+X		    headers[i]->exit_disposition = STORE;
+X		    to_store++;
+X		  } else {
+X		    headers[i]->exit_disposition = KEEP;
+X		    to_keep++;
+X		  }
+X	      }
+X	    } 
+X	  }
+X
+X	  /* If we asked the user if read messages should be stored,
+X	   * and if the user wanted them kept instead, then certainly the
+X	   * user would want the unread messages kept as well.
+X	   */
+X	  if(asked_storage_q && answer == 'n') {
+X
+X	    for (i = 0; i < message_count; i++) {
+X	      if((ison(headers[i]->status, UNREAD))
+X		&& (headers[i]->exit_disposition == UNSET)) {
+X		  headers[i]->exit_disposition = KEEP;
+X		  to_keep++;
+X	      }
+X	    }
+X
+X	  } else {
+X
+X	    /* Determine if unread messages are to be kept */
+X
+X	    /* we need to know if there are none, or one, or more unread */
+X	    for (marked_unread=0, i=0; i<message_count && marked_unread<2; i++)
+X	      if((ison(headers[i]->status, UNREAD))
+X		&& (headers[i]->exit_disposition == UNSET))
+X		  marked_unread++;
+X
+X	    if(marked_unread) {
+X	      answer = (always_keep ? 'y' : 'n');	/* default answer */
+X	      if(ask_questions) {
+X		sprintf(buffer,
+X		  "Keep unread message%s in incoming mailbox? (y/n) ",
+X		  plural(marked_unread));
+X		answer = want_to(buffer, answer);
+X	      }
+X
+X	      for (i = 0; i < message_count; i++) {
+X		if((ison(headers[i]->status, UNREAD))
+X		  && (headers[i]->exit_disposition == UNSET)) {
+X
+X		    if(answer == 'n') {
+X		      headers[i]->exit_disposition = STORE;
+X		      to_store++;
+X		    } else {
+X		      headers[i]->exit_disposition = KEEP;
+X		      to_keep++;
+X		    }
+X	      
+X		}
+X	      }
+X	    }
+X	  }
+X	}
+X
+X	dprint(3, (debugfile, "Messages to store: %d\n", to_store));
+X	dprint(3, (debugfile, "Messages to keep: %d\n", to_keep));
+X
+X	if(to_delete + to_store + to_keep != message_count) {
+X	  dprint(1, (debugfile,
+X	  "Error: %d to delete + %d to store + %d to keep != %d message cnt\n",
+X	    to_delete, to_store, to_keep, message_count));
+X	  error("Something wrong in message counts! Folder unchanged.");
+X	  emergency_exit();
+X	}
+X	  
+X
+X	/* If we are not resyncing, we are leaving the mailfile and
+X	 * the new messages are new no longer. Note that this changes
+X	 * their status.
+X	 */
+X	if(!resyncing) {
+X	  for (i = 0; i < message_count; i++) {
+X	    if (ison(headers[i]->status, NEW)) {
+X	      clearit(headers[i]->status, NEW);
+X	      headers[i]->status_chgd = TRUE;
+X	    }
+X	  }
+X	}
+X
+X	/* If all messages are to be kept and none have changed status
+X	 * we don't need to do anything because the current folder won't
+X	 * be changed by our writing it out - unless we are resyncing, in
+X	 * which case we force the writing out of the mailfile.
+X	 */
+X
+X	for (num_chgd_status = 0, i = 0; i < message_count; i++)
+X	  if(headers[i]->status_chgd == TRUE)
+X	    num_chgd_status++;
+X	
+X	if(!to_delete && !to_store && !num_chgd_status && !resyncing) {
+X	  dprint(3, (debugfile, "Folder keep as is!\n"));
+X	  error("Folder unchanged.");
+X	  return(0);
+X	}
+X
+X	/** we have to check to see what the sorting order was...so that
+X	    the order in which we write messages is the same as the order
+X	    of the messages originally.
+X	    We only need to do this if there are any messages to be
+X	    written out (either to keep or to store). **/
+X
+X	if ((to_keep || to_store ) && sortby != MAILBOX_ORDER) {
+X	  last_sortby = sortby;
+X	  sortby = MAILBOX_ORDER;
+X	  sort_mailbox(message_count, FALSE);
+X	  sortby = last_sortby;
+X	}
+X
+X	/* Formulate message as to number of keeps, stores, and deletes.
+X	 * This is only complex so that the message is good English.
+X	 */
+X	if (to_keep > 0) {
+X	  if (to_store > 0) {
+X	    if (to_delete > 0)
+X	      sprintf(buffer,
+X	            "[Keeping %d message%s, storing %d, and deleting %d.]", 
+X		    to_keep, plural(to_keep), to_store, to_delete);
+X	    else
+X	      sprintf(buffer, "[Keeping %d message%s and storing %d.]", 
+X		    to_keep, plural(to_keep), to_store);
+X	  } else {
+X	    if (to_delete > 0)
+X	      sprintf(buffer, "[Keeping %d message%s and deleting %d.]", 
+X		    to_keep, plural(to_keep), to_delete);
+X	    else
+X	      sprintf(buffer, "[Keeping %s.]",
+X		    to_keep > 1 ? "all messages" : "message");
+X	  }
+X	} else if (to_store > 0) {
+X	  if (to_delete > 0)
+X	    sprintf(buffer, "[Storing %d message%s and deleting %d.]", 
+X		  to_store, plural(to_store), to_delete);
+X	  else 
+X	    sprintf(buffer, "[Storing %s.]",
+X		  to_store > 1? "all messages" : "message");
+X
+X	} else {
+X	  if (to_delete > 0)
+X	    sprintf(buffer, "[Deleting all messages.]");
+X	  else
+X	    buffer[0] = '\0';
+X	}
+X	/* NOTE: don't use variable "buffer" till message is output later */
+X
+X	/** next, let's lock the file up and make one last size check **/
+X
+X	if (folder_type == SPOOL)
+X	  lock(OUTGOING);
+X	
+X	if (mailfile_size != bytes(cur_folder)) {
+X	  unlock();
+X	  error("New mail has just arrived. Resynchronizing...");
+X	  return(-1);
+X	}
+X	
+X	/* Everything's GO - so ouput that user message and go to it. */
+X
+X	dprint(2, (debugfile, "Action: %s\n", buffer));
+X	error(buffer);
+X
+X	/* Store messages slated for storage in received mail folder */
+X	if (to_store > 0) {
+X	  if ((errno = can_open(recvd_mail, "a"))) {
+X	    error1(
+X	      "Permission to append to %s denied!  Leaving folder intact.\n",
+X	      recvd_mail);
+X	    dprint(1, (debugfile,
+X	      "Error: Permission to append to folder %s denied!! (%s)\n",
+X	      recvd_mail, "leavembox"));
+X	    dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X	      error_description(errno)));
+X	    unlock();
+X	    return(0);
+X	  }
+X	  if ((temp = fopen(recvd_mail,"a")) == NULL) {
+X	    unlock();
+X	    dprint(1, (debugfile, "Error: could not append to file %s\n", 
+X	      recvd_mail));
+X	    dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X	      error_description(errno)));
+X	    sprintf(buffer, "Could not append to folder %s!", recvd_mail);
+X	    Centerline(LINES-1, buffer);
+X	    emergency_exit();
+X	  }
+X	  dprint(2, (debugfile, "Storing message%s ", plural(to_store)));
+X	  for (i = 0; i < message_count; i++) {
+X	    if(headers[i]->exit_disposition == STORE) {
+X	      current = i+1;
+X	      dprint(2, (debugfile, "#%d, ", current));
+X	      copy_message("", temp, FALSE, FALSE, TRUE);
+X	    }
+X	  }
+X	  fclose(temp);
+X	  dprint(2, (debugfile, "\n\n"));
+X	  chown(recvd_mail, userid, groupid);
+X	}
+X
+X	/* If there are any messages to keep, first copy them to a
+X	 * temp file, then remove original and copy whole temp file over.
+X	 */
+X	if (to_keep > 0) {
+X	  sprintf(temp_keep_file, "%s%d", temp_file, getpid());
+X	  if ((errno = can_open(temp_keep_file, "w"))) {
+X	    error1(
+X"Permission to create temp file %s for writing denied! Leaving folder intact.",
+X	      temp_keep_file);
+X	    dprint(1, (debugfile,
+X	      "Error: Permission to create temp file %s denied!! (%s)\n",
+X	      temp_keep_file, "leavembox"));
+X	    dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X	      error_description(errno)));
+X	    unlock();
+X	    return(0);
+X	  }
+X	  if ((temp = fopen(temp_keep_file,"w")) == NULL) {
+X	    unlock();
+X	    dprint(1, (debugfile, "Error: could not create file %s\n", 
+X	      temp_keep_file));
+X	    dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X	      error_description(errno)));
+X	    sprintf(buffer, "Could not create temp file %s!", temp_keep_file);
+X	    Centerline(LINES-1, buffer);
+X	    emergency_exit();
+X	  }
+X	  dprint(2, (debugfile, "Copying to temp file message%s to be kept ",
+X	    plural(to_keep)));
+X	  for (i = 0; i < message_count; i++) {
+X	    if(headers[i]->exit_disposition == KEEP) {
+X	      current = i+1;
+X	      dprint(2, (debugfile, "#%d, ", current));
+X	      copy_message("", temp, FALSE, FALSE, TRUE);
+X	    }
+X	  }
+X	  fclose(temp);
+X	  dprint(2, (debugfile, "\n\n"));
+X
+X	} else if (folder_type == NON_SPOOL && !keep_empty_files) {
+X
+X	  /* i.e. if no messages were to be kept and this is not a spool
+X	   * folder and we aren't keeping empty non-spool folders,
+X	   * simply remove the old original folder and that's it!
+X	   */
+X	  (void)unlink(cur_folder);
+X	  return(1);
+X	}
+X
+X	/* Otherwise we have some work left to do! */
+X
+X	/* Get original permissions and access time of the original
+X	 * mail folder before we remove it.
+X	 */
+X	if(save_file_stats(cur_folder) != 0) {
+X	  error1("Problems saving permissions of folder %s!", cur_folder);
+X	  sleep(2);
+X	}
+X	  
+X        if (stat(cur_folder, &buf) != 0) {
+X	  dprint(1, (debugfile, "Error: errno %s attempting to stat file %s\n", 
+X		     error_name(errno), cur_folder));
+X          error3("Error %s (%s) on stat(%s).", error_name(errno), 
+X		error_description(errno), cur_folder);
+X	}
+X
+X	/* Close and remove the original folder.
+X	 * However, if we are going to copy a temp file of kept messages
+X	 * to it, and this is a locked (spool) mailbox, we need to keep
+X	 * it locked during this process. Unfortunately,
+X	 * if we did our LOCK_BY_FLOCK, unlinking the original will kill the
+X	 * lock, so we have to resort to copying the temp file to the original
+X	 * file while keeping the original open.
+X	 */
+X
+X	fclose(mailfile);
+X
+X	if(to_keep) {
+X#ifdef LOCK_BY_FLOCK
+X	  need_to_copy = (folder_type == SPOOL ? TRUE : FALSE);
+X#else
+X	  need_to_copy = FALSE;
+X#endif
+X	  if(!need_to_copy) {
+X	    unlink(cur_folder);
+X	    if (link(temp_keep_file, cur_folder) != 0) {
+X	      if(errno == EXDEV || errno == EEXIST) {
+X		/* oops - can't link across file systems - use copy instead */
+X		need_to_copy = TRUE;
+X	      } else {
+X		dprint(1, (debugfile, "link(%s, %s) failed (leavembox)\n", 
+X		       temp_keep_file, cur_folder));
+X		dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X			  error_description(errno)));
+X		error2("Link failed! %s - %s.", error_name(errno),
+X		  error_description(errno));
+X		unlock();
+X		emergency_exit();
+X	      }
+X	    }
+X	  }
+X
+X	  if(need_to_copy) {
+X
+X	    if (copy(temp_keep_file, cur_folder) != 0) {
+X
+X	      /* copy to cur_folder failed - try to copy to special file */
+X	      dprint(1, (debugfile, "leavembox: copy(%s, %s) failed;",
+X		      temp_keep_file, cur_folder));
+X	      dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X		   error_description(errno)));
+X	      error("Couldn't modify folder!");
+X	      sleep(1);
+X	      sprintf(cur_folder,"%s/%s", home, unedited_mail);
+X	      if (copy(temp_keep_file, cur_folder) != 0) {
+X
+X		/* couldn't copy to special file either */
+X		dprint(1, (debugfile, 
+X			"leavembox: couldn't copy to %s either!!  Help;", 
+X			cur_folder));
+X		dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X			error_description(errno)));
+X		error("Something godawful is happening to me!!!");
+X		unlock();
+X		emergency_exit();
+X	      } else {
+X		dprint(1, (debugfile,
+X			"\nWoah! Confused - Saved mail in %s (leavembox)\n", 
+X			cur_folder));
+X		error1("Saved mail in %s.", cur_folder);
+X		sleep(1);
+X	      }
+X	    }
+X	  }
+X
+X	  /* link or copy complete - remove temp keep file */
+X	  unlink(temp_keep_file);
+X
+X	} else if(folder_type == SPOOL || keep_empty_files) {
+X
+X	  /* if this is an empty spool file, or if this is an empty non spool 
+X	   * file and we keep empty non spool files (we always keep empty
+X	   * spool files), create an empty file */
+X
+X	  if(folder_type == NON_SPOOL)
+X	    error1("Keeping empty folder '%s'.", cur_folder);
+X	  temp = fopen(cur_folder, "w");
+X	  fclose(temp);
+X	}
+X
+X	/* restore permissions and access times of folder */
+X
+X	if(restore_file_stats(cur_folder) != 1) {
+X	  error1("Problems restoring permissions of folder %s!", cur_folder);
+X	  sleep(2);
+X	}
+X
+X#ifdef BSD
+X	utime_buffer[0]     = buf.st_atime;
+X	utime_buffer[1]     = buf.st_mtime;
+X#else
+X	utime_buffer.actime = buf.st_atime;
+X	utime_buffer.modtime= buf.st_mtime;
+X#endif
+X
+X#ifdef BSD
+X	if (utime(cur_folder, utime_buffer) != 0) {
+X#else
+X	if (utime(cur_folder, &utime_buffer) != 0) {
+X#endif
+X	  dprint(1, (debugfile, 
+X		 "Error: encountered error doing utime (leavmbox)\n"));
+X	  dprint(1, (debugfile, "** %s - %s **\n", error_name(errno), 
+X		   error_description(errno)));
+X	  error2("Error %s trying to change file %s access time.", 
+X		   error_name(errno), cur_folder);
+X	}
+X
+X
+X	mailfile_size = bytes(cur_folder);
+X	unlock();	/* remove the lock on the file ASAP! */
+X
+X	return(1);	
+X}
+X
+Xstatic int  lock_state = OFF;
+X
+Xstatic char lock_name[SLEN];
+X
+Xchar *
+Xmk_lockname(file_to_lock)
+Xchar *file_to_lock;
+X{
+X	/** Create the proper name of the lock file for file_to_lock,
+X	    which is presumed to be a spool file full path (see
+X	    get_folder_type()), and put it in the static area lock_name.
+X	    Return lock_name for informational purposes.
+X	 **/
+X
+X#ifdef XENIX
+X	/* lock is /tmp/[basename of file_to_lock].mlk */
+X	sprintf(lock_name, "/tmp/%.10s.mlk", strrchr(file_to_lock, '/')+1);
+X#else
+X	/* lock is [file_to_lock].lock */
+X	sprintf(lock_name, "%s.lock", file_to_lock);
+X#endif
+X	return(lock_name);
+X}
+X
+X
+Xstatic int flock_fd,	/* file descriptor for flocking mailbox itself */
+X	   create_fd;	/* file descriptor for creating lock file */
+X
+Xlock(direction)
+Xint direction;
+X{
+X      /** Create lock file to ensure that we don't get any mail 
+X	  while altering the folder contents!
+X	  If it already exists sit and spin until 
+X	     either the lock file is removed...indicating new mail
+X	  or
+X	     we have iterated MAX_ATTEMPTS times, in which case we
+X	     either fail or remove it and make our own (determined
+X	     by if REMOVE_AT_LAST is defined in header file
+X
+X	  If direction == INCOMING then DON'T remove the lock file
+X	  on the way out!  (It'd mess up whatever created it!).
+X
+X	  But if that succeeds and if we are also locking by flock(),
+X	  follow a similar algorithm. Now if we can't lock by flock(),
+X	  we DO need to remove the lock file, since if we got this far,
+X	  we DID create it, not another process.
+X      **/
+X
+X      register int create_iteration = 0,
+X		   flock_iteration = 0;
+X
+X      /* formulate lock file name */
+X      mk_lockname(cur_folder);
+X
+X      /* try to assert create lock file MAX_ATTEMPTS times */
+X      do {
+X
+X	errno = 0;
+X	if((create_fd=open(lock_name,O_WRONLY | O_CREAT | O_EXCL,0777)) != -1)
+X	  break;
+X	else {
+X	  if(errno != EEXIST) {
+X	    /* Creation of lock failed NOT because it already exists!!! */
+X
+X	    if (direction == OUTGOING) {
+X	      dprint(1, (debugfile, 
+X		"Error encountered attempting to create lock %s\n", lock_name));
+X	      dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X		    error_description(errno)));
+X	      MoveCursor(LINES, 0);
+X	      printf(
+X	   "\n\rError encountered while attempting to create lock file %s;\n\r",
+X		lock_name);
+X	      printf("** %s - %s.**\n\r\n\r",
+X		error_name(errno), error_description(errno));
+X	    } else {	/* incoming - permission denied in the middle?  Odd. */
+X	      dprint(1, (debugfile,
+X	       "Can't create lock file: creat(%s) raises error %s (lock)\n", 
+X		lock_name, error_name(errno)));
+X	      error1(
+X	       "Can't create lock file! Need write permission in \"%s\".\n\r",
+X		mailhome);
+X	    }
+X	    leave();
+X	  }
+X	}
+X	dprint(2, (debugfile,"File '%s' already exists!  Waiting...(lock)\n", 
+X	  lock_name));
+X	error1(
+X	  "Waiting to read mailbox while mail is being received: attempt #%d",
+X	  create_iteration);
+X	sleep(5);
+X      } while (create_iteration++ < MAX_ATTEMPTS);
+X      clear_error();
+X
+X      if(errno != 0) {
+X	
+X	/* we weren't able to create the lock file */
+X
+X#ifdef REMOVE_AT_LAST
+X
+X	/** time to waste the lock file!  Must be there in error! **/
+X	dprint(2, (debugfile, 
+X	   "Warning: I'm giving up waiting - removing lock file(lock)\n"));
+X	if (direction == INCOMING)
+X	  PutLine0(LINES, 0,"\nTimed out - removing current lock file...");
+X	else
+X	  error("Throwing away the current lock file!");
+X
+X	if (unlink(lock_name) != 0) {
+X	  dprint(1, (debugfile,
+X	    "Error %s (%s)\n\ttrying to unlink file %s (%s)\n", 
+X	    error_name(errno), error_description(errno), lock_name, "lock"));
+X	  PutLine1(LINES, 0, 
+X	    "\n\rCouldn't remove the current lock file %s\n\r", lock_name);
+X	  PutLine2(LINES, 0, "** %s - %s **\n\r", error_name(errno),
+X	    error_description(errno));
+X	  if (direction == INCOMING)
+X	    leave();
+X	  else
+X	    emergency_exit();
+X	}
+X
+X	/* we've removed the bad lock, let's try to assert lock once more */
+X	if((create_fd=open(lock_name,O_WRONLY | O_CREAT | O_EXCL,0777)) == -1){
+X
+X	  /* still can't lock it - just give up */
+X	  dprint(1, (debugfile, 
+X	    "Error encountered attempting to create lock %s\n", lock_name));
+X	  dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X	    error_description(errno)));
+X	  MoveCursor(LINES, 0);
+X	  printf(
+X	  "\n\rError encountered while attempting to create lock file %s;\n\r",
+X	    lock_name);
+X	  printf("** %s - %s.**\n\r\n\r", error_name(errno),
+X	    error_description(errno));
+X	  leave();
+X	}
+X#else
+X	/* Okay...we die and leave, not updating the mailfile mbox or
+X	   any of those! */
+X
+X	if (direction == INCOMING) {
+X	  PutLine1(LINES, 0, "\n\r\n\rGiving up after %d iterations.\n\r", 
+X	    create_iteration);
+X	  PutLine0(LINES, 0, 
+X	  "\n\rPlease try to read your mail again in a few minutes.\n\r\n\r");
+X	  dprint(1, (debugfile, 
+X	    "Warning: bailing out after %d iterations...(lock)\n",
+X	    create_iteration));
+X	  leave_locked(0);
+X	} else {
+X	  dprint(1, (debugfile, 
+X	   "Warning: after %d iterations, timed out! (lock)\n",
+X	   create_iteration));
+X	  leave(error("Timed out on locking mailbox.  Leaving program."));
+X	}
+X#endif
+X      }
+X
+X      /* If we're here we successfully created the lock file */
+X      dprint(5,
+X	(debugfile, "Lock %s %s for file %s on.\n", lock_name,
+X	(direction == INCOMING ? "incoming" : "outgoing"), cur_folder));
+X
+X      (void)close(create_fd);
+X
+X#ifdef LOCK_BY_FLOCK
+X      /* Now we also need to lock the file with flock(2) */
+X
+X      /* Open mail file separately for locking */
+X      if((flock_fd = open(cur_folder, O_RDONLY)) < 0) {
+X	dprint(1, (debugfile, 
+X	    "Error encountered attempting to reopen %s for lock\n", cur_folder));
+X	dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X	    error_description(errno)));
+X	MoveCursor(LINES, 0);
+X	printf(
+X "\n\rError encountered while attempting to reopen mailbox %s for lock;\n\r", 
+X	      cur_folder);
+X	printf("** %s - %s.**\n\r\n\r", error_name(errno),
+X	      error_description(errno));
+X	(void)unlink(lock_name);
+X	leave();
+X      }
+X
+X      /* try to assert lock MAX_ATTEMPTS times */
+X      do {
+X
+X	errno = 0;
+X	if(flock(flock_fd, LOCK_NB | LOCK_EX) != -1)
+X	  break;
+X	else {
+X	  if(errno != EWOULDBLOCK) {
+X
+X	    /* Creation of lock failed NOT because it already exists!!! */
+X
+X	    dprint(1, (debugfile, 
+X		  "Error encountered attempting to flock %s\n", cur_folder));
+X	    dprint(1, (debugfile, "** %s - %s **\n", error_name(errno),
+X		  error_description(errno)));
+X	    MoveCursor(LINES, 0);
+X	    printf(
+X	 "\n\rError encountered while attempting to flock mailbox %s;\n\r", 
+X		  cur_folder);
+X	    printf("** %s - %s.**\n\r\n\r", error_name(errno),
+X		  error_description(errno));
+X	    (void)unlink(lock_name);
+X	    leave();
+X	  }
+X	}
+X	dprint(2, (debugfile,
+X	  "Mailbox '%s' already locked!  Waiting...(lock)\n", cur_folder));
+X	error1(
+X	  "Waiting to read mailbox while mail is being received: attempt #%d",
+X	  flock_iteration);
+X	sleep(5);
+X      } while (flock_iteration++ < MAX_ATTEMPTS);
+X      clear_error();
+X
+X      if(errno != 0) {
+X
+X	/* We couldn't lock the file. We die and leave not updating
+X	 * the mailfile mbox or any of those! */
+X
+X	if (direction == INCOMING) {
+X	  PutLine1(LINES, 0, "\n\r\n\rGiving up after %d iterations.\n\r", 
+X	    flock_iteration);
+X	  PutLine0(LINES, 0, 
+X	  "\n\rPlease try to read your mail again in a few minutes.\n\r\n\r");
+X	  dprint(1, (debugfile, 
+X	    "Warning: bailing out after %d iterations...(lock)\n",
+X	    flock_iteration));
+X	} else {
+X	  dprint(1, (debugfile, 
+X	   "Warning: after %d iterations, timed out! (lock)\n",
+X	   flock_iteration));
+X	}
+X	(void)unlink(lock_name);
+X	leave(error("Timed out on locking mailbox. Leaving program."));
+X      }
+X
+X      /* We locked the file */
+X      dprint(5,
+X	(debugfile, "Lock %s on file %s on.\n",
+X	(direction == INCOMING ? "incoming" : "outgoing"), cur_folder));
+X#endif
+X
+X      dprint(5,
+X	(debugfile, "Lock %s for file %s on successfully.\n",
+X	(direction == INCOMING ? "incoming" : "outgoing"), cur_folder));
+X      lock_state = ON;
+X      return(0);
+X}
+X
+Xint
+Xunlock()
+X{
+X	/** Remove the lock file!    This must be part of the interrupt
+X	    processing routine to ensure that the lock file is NEVER
+X	    left sitting in the mailhome directory!
+X
+X	    If also using flock(), remove the file lock as well.
+X	 **/
+X
+X	int retcode = 0;
+X
+X	dprint(5,
+X	  (debugfile, "Lock %s for file %s %s off.\n",
+X	    (*lock_name ? lock_name : "none"), cur_folder,
+X	    (lock_state == ON ? "going" : "already")));
+X
+X	if(lock_state == ON) {
+X
+X#ifdef LOCK_BY_FLOCK
+X	  if((retcode = flock(flock_fd, LOCK_UN)) == -1) {
+X	    dprint(1, (debugfile,
+X	      "Error %s (%s)\n\ttrying to unlock file %s (%s)\n", 
+X	      error_name(errno), error_description(errno), cur_folder, "unlock"));
+X
+X	    /* try to force unlock by closing file */
+X	    if(close(flock_fd) == -1) {
+X	      dprint(1, (debugfile,
+X	  "Error %s (%s)\n\ttrying to force unlock file %s via close() (%s)\n", 
+X	      error_name(errno), error_description(errno), cur_folder, "unlock"));
+X	      error1("Couldn't unlock my own mailbox %s!", cur_folder);
+X	      return(retcode);
+X	    }
+X	  }
+X	  (void)close(flock_fd);
+X#endif
+X	  if((retcode = unlink(lock_name)) == 0) {	/* remove lock file */
+X	    *lock_name = '\0';		/* null lock file name */
+X	    lock_state = OFF;		/* indicate we don't have a lock on */
+X	  } else {
+X	    dprint(1, (debugfile,
+X	      "Error %s (%s)\n\ttrying to unlink file %s (%s)\n", 
+X	      error_name(errno), error_description(errno), lock_name,"unlock"));
+X	      error1("Couldn't remove my own lock file %s!", lock_name);
+X	  }
+X	}
+X	return(retcode);
+X}
+SHAR_EOF
+echo "File src/leavembox.c is complete"
+chmod 0444 src/leavembox.c || echo "restore of src/leavembox.c fails"
+echo "x - extracting src/limit.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > src/limit.c &&
+X
+Xstatic char rcsid[] = "@(#)$Id: limit.c,v 2.8 89/03/25 21:46:36 syd Exp $";
+X
+X/*******************************************************************************
+X *  The Elm Mail System  -  $Revision: 2.8 $   $State: Exp $
+X *
+X * 			Copyright (c) 1986, 1987 Dave Taylor
+X * 			Copyright (c) 1988, 1989 USENET Community Trust
+X *******************************************************************************
+X * Bug reports, patches, comments, suggestions should be sent to:
+X *
+X *	Syd Weinstein, Elm Coordinator
+X *	elm@dsinc.UUCP			dsinc!elm
+X *
+X *******************************************************************************
+X * $Log:	limit.c,v $
+X * Revision 2.8  89/03/25  21:46:36  syd
+X * Initial 2.2 Release checkin
+X * 
+X *
+X ******************************************************************************/
+X
+X/** This stuff is inspired by MH and dmail and is used to 'select'
+X    a subset of the existing mail in the folder based on one of a
+X    number of criteria.  The basic tricks are pretty easy - we have
+X    as status of VISIBLE associated with each header stored in the
+X    (er) mind of the computer (!) and simply modify the commands to
+X    check that flag...the global variable `selected' is set to the
+X    number of messages currently selected, or ZERO if no select.
+X**/
+X
+X#include "headers.h"
+X
+X#define TO		1
+X#define FROM		2
+X
+Xchar *shift_lower();
+X
+Xint
+Xlimit()
+X{
+X	/** returns non-zero if we changed selection criteria = need redraw **/
+X	
+X	char criteria[STRING], first[STRING], rest[STRING], msg[STRING];
+X	static char prompt[] = "Enter criteria or '?' for help: ";
+X	int  last_selected, all;
+X
+X	last_selected = selected;
+X	all = 0;
+X
+X	if (selected) {
+X	  PutLine1(LINES-2, 0, 
+X		"Already have selection criteria - add more? (y/n) n%c",
+X		BACKSPACE);
+X	  criteria[0] = ReadCh();
+X	  if (tolower(criteria[0]) == 'y') {
+X	    Write_to_screen("Yes.", 0);
+X	    PutLine0(LINES-3, COLUMNS-30, "Adding criteria...");
+X	  } else {
+X	    Write_to_screen("No.", 0);
+X	    selected = 0;
+X	    PutLine0(LINES-3, COLUMNS-30, "Change criteria...");
+X	  }
+X	}
+X
+X	while(1) {
+X	  PutLine1(LINES-2, 0, prompt);
+X	  CleartoEOLN();
+X
+X	  criteria[0] = '\0';
+X	  optionally_enter(criteria, LINES-2, strlen(prompt), FALSE, FALSE);
+X	  error("");
+X	  
+X	  if (strlen(criteria) == 0) {
+X	    /* no change */
+X	    selected = last_selected;
+X	    return(FALSE);	
+X	  }
+X
+X	  split_word(criteria, first, rest);
+X
+X	  if (equal(first, "?")) {
+X	     if(last_selected)
+X	       error(
+X	          "Enter: {\"subject\",\"to\",\"from\"} [pattern] OR \"all\"");
+X	     else
+X	       error("Enter: {\"subject\",\"to\",\"from\"} [pattern]");
+X	     continue;
+X	  } else if (equal(first, "all")) {
+X	    all++;
+X	    selected = 0;
+X	  }
+X	  else if (equal(first, "subj") || equal(first, "subject"))
+X	    selected = limit_selection(SUBJECT, rest, selected);
+X	  else if (equal(first, "to"))
+X	    selected = limit_selection(TO, rest, selected);
+X	  else if (equal(first, "from"))
+X	    selected = limit_selection(FROM, rest, selected);
+X	  else {
+X	    error1("\"%s\" not a valid criterion.", first);
+X	    continue;
+X	  }
+X	  break;
+X	}
+X
+X	if(all && last_selected)
+X	  strcpy(msg, "Returned to unlimited display.");
+X	else if(selected)
+X	  sprintf(msg, "%d message%s selected.", selected, plural(selected));
+X	else
+X	  strcpy(msg, "No messages selected.");
+X	set_error(msg);
+X
+X	/* we need a redraw if there had been a selection or there is now. */
+X	if(last_selected || selected) {
+X	  /* if current message won't be on new display, go to first message */
+X	  if(selected && !(headers[current-1]->status & VISIBLE))
+X	    current = visible_to_index(1)+1;
+X	  return(TRUE);
+X	} else {
+X	  return(FALSE);
+X	}
+X}
+X
+Xint
+Xlimit_selection(based_on, pattern, additional_criteria)
+Xint based_on, additional_criteria;
+Xchar *pattern;
+X{
+X	/** Given the type of criteria, and the pattern, mark all
+X	    non-matching headers as ! VISIBLE.  If additional_criteria,
+X	    don't mark as visible something that isn't currently!
+X	**/
+X
+X	register int iindex, count = 0;
+X
+X	dprint(2, (debugfile, "\n\n\n**limit on %d - '%s' - (%s) **\n\n",
+X		   based_on, pattern, additional_criteria?"add'tl":"base"));
+X
+X	if (based_on == SUBJECT) {
+X	  for (iindex = 0; iindex < message_count; iindex++)
+X	    if (! in_string(shift_lower(headers[iindex]->subject), pattern))
+X	      headers[iindex]->status &= ~VISIBLE;
+X	    else if (additional_criteria && 	
+X		     !(headers[iindex]->status & VISIBLE))
+X	      headers[iindex]->status &= ~VISIBLE;	/* shut down! */
+X	    else { /* mark it as readable */
+X	      headers[iindex]->status |= VISIBLE;
+X	      count++;
+X	      dprint(5, (debugfile,
+X		     "  Message %d (%s from %s) marked as visible\n",
+X			iindex, headers[iindex]->subject,
+X			headers[iindex]->from));
+X	    }
+X	}
+X	else if (based_on == FROM) {
+X	  for (iindex = 0; iindex < message_count; iindex++)
+X	    if (! in_string(shift_lower(headers[iindex]->from), pattern))
+X	      headers[iindex]->status &= ~VISIBLE;
+X	    else if (additional_criteria && 	
+X		     !(headers[iindex]->status & VISIBLE))
+X	      headers[iindex]->status &= ~VISIBLE;	/* shut down! */
+X	    else { /* mark it as readable */
+X	      headers[iindex]->status |= VISIBLE;
+X	      count++;
+X	      dprint(5, (debugfile, 
+X			"  Message %d (%s from %s) marked as visible\n",
+X			iindex, headers[iindex]->subject,
+X			headers[iindex]->from));
+X	    }
+X	}
+X	else if (based_on == TO) {
+X	  for (iindex = 0; iindex < message_count; iindex++)
+X	    if (! in_string(shift_lower(headers[iindex]->to), pattern))
+X	      headers[iindex]->status &= ~VISIBLE;
+X	    else if (additional_criteria && 	
+X		     !(headers[iindex]->status & VISIBLE))
+X	      headers[iindex]->status &= ~VISIBLE;	/* shut down! */
+X	    else { /* mark it as readable */
+X	      headers[iindex]->status |= VISIBLE;
+X	      count++;
+X	      dprint(5, (debugfile,
+X			"  Message %d (%s from %s) marked as visible\n",
+X			iindex, headers[iindex]->subject,
+X			headers[iindex]->from));
+X	    }
+X	}
+X
+X	dprint(4, (debugfile, "\n** returning %d selected **\n\n\n", count));
+X
+X	return(count);
+X}
+X
+Xint
+Xnext_message(iindex, skipdel)
+Xregister int iindex, skipdel;
+X{
+X	/** Given 'iindex', this routine will return the actual iindex into the
+X	    array of the NEXT message, or '-1' iindex is the last.
+X	    If skipdel, return the iindex for the NEXT undeleted message.
+X	    If selected, return the iindex for the NEXT message marked VISIBLE.
+X	**/
+X
+X	register int remember_for_debug;
+X
+X	if(iindex < 0) return(-1);	/* invalid argument value! */
+X
+X	remember_for_debug = iindex;
+X
+X	for(iindex++;iindex < message_count; iindex++)
+X	  if (((headers[iindex]->status & VISIBLE) || (!selected))
+X	    && (!(headers[iindex]->status & DELETED) || (!skipdel))) {
+X	      dprint(9, (debugfile, "[Next%s%s: given %d returning %d]\n", 
+X		  (skipdel ? " undeleted" : ""),
+X		  (selected ? " visible" : ""),
+X		  remember_for_debug+1, iindex+1));
+X	      return(iindex);
+X	  }
+X	return(-1);
+X}
+X
+Xint
+Xprev_message(iindex, skipdel)
+Xregister int iindex, skipdel;
+X{
+X	/** Like next_message, but the PREVIOUS message. **/
+X
+X	register int remember_for_debug;
+X
+X	if(iindex >= message_count) return(-1);	/* invalid argument value! */
+X
+X	remember_for_debug = iindex;
+X	for(iindex--; iindex >= 0; iindex--)
+X	  if (((headers[iindex]->status & VISIBLE) || (!selected))
+X	    && (!(headers[iindex]->status & DELETED) || (!skipdel))) {
+X	      dprint(9, (debugfile, "[Previous%s%s: given %d returning %d]\n", 
+X		  (skipdel ? " undeleted" : ""),
+X		  (selected ? " visible" : ""),
+X		  remember_for_debug+1, iindex+1));
+X	      return(iindex);
+X	  }
+X	return(-1);
+X}
+X
+X
+Xint
+Xcompute_visible(message)
+Xint message;
+X{
+X	/** return the 'virtual' iindex of the specified message in the
+X	    set of messages - that is, if we have the 25th message as
+X	    the current one, but it's #2 based on our limit criteria,
+X	    this routine, given 25, will return 2.
+X	**/
+X
+X	register int iindex, count = 0;
+X
+X	if (! selected) return(message);
+X
+X	if (message < 1) message = 1;	/* normalize */
+X
+X	for (iindex = 0; iindex < message; iindex++)
+X	   if (headers[iindex]->status & VISIBLE) 
+X	     count++;
+X
+X	dprint(4, (debugfile,
+X		"[compute-visible: displayed message %d is actually %d]\n",
+X		count, message));
+X
+X	return(count);
+X}
+X
+Xint
+Xvisible_to_index(message)
+Xint message;
+X{
+X	/** Given a 'virtual' iindex, return a real one.  This is the
+X	    flip-side of the routine above, and returns (message_count+1)
+X	    if it cannot map the virtual iindex requested (too big) 
+X	**/
+X
+X	register int iindex = 0, count = 0;
+X
+X	for (iindex = 0; iindex < message_count; iindex++) {
+X	   if (headers[iindex]->status & VISIBLE) 
+X	     count++;
+X	   if (count == message) {
+X	     dprint(4, (debugfile,
+X		     "visible-to-index: (up) index %d is displayed as %d\n",
+X		     message, iindex));
+X	     return(iindex);
+X	   }
+X	}
+X
+X	dprint(4, (debugfile, "index %d is NOT displayed!\n", message));
+X
+X	return(message_count+1);
+X}
+SHAR_EOF
+chmod 0444 src/limit.c || echo "restore of src/limit.c fails"
+echo "x - extracting src/mailmsg1.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > src/mailmsg1.c &&
+X
+Xstatic char rcsid[] = "@(#)$Id: mailmsg1.c,v 2.15 89/03/25 21:46:38 syd Exp $";
+X
+X/*******************************************************************************
+X *  The Elm Mail System  -  $Revision: 2.15 $   $State: Exp $
+X *
+X * 			Copyright (c) 1986, 1987 Dave Taylor
+X * 			Copyright (c) 1988, 1989 USENET Community Trust
+X *******************************************************************************
+X * Bug reports, patches, comments, suggestions should be sent to:
+X *
+X *	Syd Weinstein, Elm Coordinator
+X *	elm@dsinc.UUCP			dsinc!elm
+X *
+X *******************************************************************************
+X * $Log:	mailmsg1.c,v $
+X * Revision 2.15  89/03/25  21:46:38  syd
+X * Initial 2.2 Release checkin
+X * 
+X *
+X ******************************************************************************/
+X
+X/** Interface to allow mail to be sent to users.  Part of ELM  **/
+X
+X
+X#include "headers.h"
+X
+X/** strings defined for the hdrconfg routines **/
+X
+Xchar subject[SLEN], in_reply_to[SLEN], expires[SLEN], 
+X     action[SLEN], priority[SLEN], reply_to[SLEN], to[VERY_LONG_STRING], 
+X     cc[VERY_LONG_STRING], expanded_to[VERY_LONG_STRING], 
+X     expanded_cc[VERY_LONG_STRING], user_defined_header[SLEN],
+X     bcc[VERY_LONG_STRING], expanded_bcc[VERY_LONG_STRING];
+X
+Xchar *format_long(), *strip_commas(), *tail_of_string(), *strcpy();
+Xunsigned long sleep();
+X
+Xint
+Xsendmsg(given_to, given_cc, given_subject, edit_message, form_letter, replying)
+Xchar *given_to, *given_cc, *given_subject;
+Xint   edit_message, form_letter, replying;
+X{
+X	/** Prompt for fields and then call mail() to send the specified
+X	    message.  If 'edit_message' is true then don't allow the
+X            message to be edited. 'form_letter' can be "YES" "NO" or "MAYBE".
+X	    if YES, then add the header.  If MAYBE, then add the M)ake form
+X	    option to the last question (see mailsg2.c) etc. etc. 
+X	    if (replying) then add an In-Reply-To: header...
+X	    Return TRUE if the main part of the screen has been changed
+X	    (useful for knowing whether a redraw is needed.
+X	**/
+X
+X	int  copy_msg = FALSE, is_a_response = FALSE;
+X
+X	/* First: zero all current global message strings */
+X
+X	cc[0] = bcc[0] = reply_to[0] = expires[0] = '\0';
+X	action[0] = priority[0] = user_defined_header[0] = in_reply_to[0] ='\0';
+X	expanded_to[0] = expanded_cc[0] = expanded_bcc[0] = '\0';
+X
+X	strcpy(subject, given_subject);		/* copy given subject */
+X	strcpy(to, given_to);			/* copy given to:     */
+X	strcpy(cc, given_cc);			/*  and so on..       */
+X
+X	/******* And now the real stuff! *******/
+X
+X	copy_msg=copy_the_msg(&is_a_response); /* copy msg into edit buffer? */
+X
+X	if (get_to(to, expanded_to) == 0)   /* get the To: address and expand */
+X	  return(0);
+X
+X	/** if we're batchmailing, let's send it and GET OUTTA HERE! **/
+X
+X	if (batch_only) {
+X	  return(mail(FALSE, FALSE, form_letter));
+X	}
+X
+X	display_to(expanded_to);	/* display the To: field on screen... */
+X
+X	dprint(3, (debugfile, "\nMailing to %s\n", expanded_to));
+X  
+X	if (get_subject(subject) == 0)	    /* get the Subject: field */
+X	  return(0);
+X
+X	dprint(4, (debugfile, "Subject is %s\n", subject));
+X
+X	if (prompt_for_cc) {
+X	  if (get_copies(cc, expanded_to, expanded_cc, copy_msg) == 0)
+X	    return(0);
+X
+X	  if (strlen(cc) > 0)
+X	    dprint(4, (debugfile, "Copies to %s\n", expanded_cc));
+X	}
+X
+X	MoveCursor(LINES,0);	/* so you know you've hit <return> ! */
+X
+X	/** generate the In-Reply-To: header... **/
+X
+X	if (is_a_response && replying)
+X	  generate_reply_to(current-1);
+X
+X	/* and mail that puppy outta here! */
+X	
+X	return(mail(copy_msg, edit_message, form_letter));
+X}
+X
+Xget_to(to_field, address)
+Xchar *to_field, *address;
+X{
+X	/** prompt for the "To:" field, expanding into address if possible.
+X	    This routine returns ZERO if errored, or non-zero if okay **/
+X
+X	if (strlen(to_field) == 0) {
+X	  if (user_level < 2) {
+X	    PutLine0(LINES-2, 0, "Send the message to: ");
+X	    (void) optionally_enter(to_field, LINES-2, 21, FALSE, FALSE); 
+X	  }
+X	  else {
+X	    PutLine0(LINES-2, 0, "To: ");
+X	    (void) optionally_enter(to_field, LINES-2, 4, FALSE, FALSE); 
+X	  }
+X	  if (strlen(to_field) == 0) {
+X	    ClearLine(LINES-2);	
+X	    return(0);
+X	  }
+X	  (void) build_address(strip_commas(to_field), address); 
+X	}
+X	else if (mail_only) 
+X	  (void) build_address(strip_commas(to_field), address); 
+X	else 
+X	  strcpy(address, to_field);
+X	
+X	if (strlen(address) == 0) {	/* bad address!  Removed!! */
+X	  ClearLine(LINES-2);
+X	  return(0);
+X	}
+X
+X	return(1);		/* everything is okay... */
+X}
+X
+Xget_subject(subject_field)
+Xchar *subject_field;
+X{
+X	char	ch;
+X
+X	/** get the subject and return non-zero if all okay... **/
+X	int len = 9, prompt_line;
+X
+X	prompt_line = mail_only ? 4 : LINES-2;
+X
+X	if (user_level == 0) {
+X	  PutLine0(prompt_line,0,"Subject of message: ");
+X	  len = 20;
+X	}
+X	else
+X	  PutLine0(prompt_line,0,"Subject: ");
+X
+X	CleartoEOLN();
+X
+X	if(optionally_enter(subject_field, prompt_line, len, TRUE, FALSE)==-1){
+X	  /** User hit the BREAK key! **/
+X	  MoveCursor(prompt_line,0); 	
+X	  CleartoEOLN();
+X	  error("Mail not sent.");
+X	  return(0);
+X	}
+X
+X	if (strlen(subject_field) == 0) {	/* zero length subject?? */
+X	  PutLine1(prompt_line,0,
+X	    "No subject - Continue with message? (y/n) n%c", BACKSPACE);
+X
+X	  ch = ReadCh();
+X	  if (tolower(ch) != 'y') {	/* user says no! */
+X	    Write_to_screen("No.", 0);
+X	    ClearLine(prompt_line);
+X	    error("Mail not sent.");
+X	    return(0);
+X	  }
+X	  else {
+X	    Write_to_screen("Yes.", 0);
+X	    PutLine0(prompt_line,0,"Subject: <none>");
+X	    CleartoEOLN();
+X	  }
+X	}
+X
+X	return(1);		/** everything is cruising along okay **/
+X}
+X
+Xget_copies(cc_field, address, addressII, copy_message)
+Xchar *cc_field, *address, *addressII;
+Xint   copy_message;
+X{
+X	/** Get the list of people that should be cc'd, returning ZERO if
+X	    any problems arise.  Address and AddressII are for expanding
+X	    the aliases out after entry! 
+X	    If 'bounceback' is nonzero, add a cc to ourselves via the remote
+X	    site, but only if hops to machine are > bounceback threshold.
+X	    If copy-message, that means that we're going to have to invoke
+X	    a screen editor, so we'll need to delay after displaying the
+X	    possibly rewritten Cc: line...
+X	**/
+X	int prompt_line;
+X
+X	prompt_line = mail_only ? 5 : LINES - 1;
+X	PutLine0(prompt_line,0,"Copies to: ");
+X
+X	fflush(stdout);
+X
+X	if (optionally_enter(cc_field, prompt_line, 11, FALSE, FALSE) == -1) {
+X	  ClearLine(prompt_line-1);
+X	  ClearLine(prompt_line);
+X	  
+X	  error("Mail not sent.");
+X	  return(0);
+X	}
+X	
+X	/** The following test is that if the build_address routine had
+X	    reason to rewrite the entry given, then, if we're mailing only
+X	    print the new Cc line below the old one.  If we're not, then
+X	    assume we're in screen mode and replace the incorrect entry on
+X	    the line above where we are (e.g. where we originally prompted
+X	    for the Cc: field).
+X	**/
+X
+X	if (build_address(strip_commas(cc_field), addressII)) {
+X	  PutLine1(prompt_line, 11, "%s", addressII);
+X	  if ((strcmp(editor, "builtin") != 0 && strcmp(editor, "none") != 0)
+X	      || copy_message)
+X	    sleep(2);
+X	}
+X
+X	if (strlen(address) + strlen(addressII) > VERY_LONG_STRING) {
+X	  dprint(2, (debugfile, 
+X		"String length of \"To:\" + \"Cc\" too long! (get_copies)\n"));
+X	  error("Too many people. Copies ignored.");
+X	  sleep(2);
+X	  cc_field[0] = '\0';
+X	}
+X
+X	return(1);		/* everything looks okay! */
+X}
+X	
+Xint
+Xcopy_the_msg(is_a_response)
+Xint *is_a_response;
+X{
+X	/** Returns True iff the user wants to copy the message being
+X	    replied to into the edit buffer before invoking the editor! 
+X	    Sets "is_a_response" to true if message is a response...
+X	**/
+X
+X	int answer = FALSE;
+X
+X	if (forwarding)
+X	  answer = TRUE;
+X	else if (strlen(to) > 0 && !mail_only) {  /* predefined 'to' line! */
+X	  if (auto_copy) 
+X	    answer = TRUE;
+X	  else 
+X	    answer = (want_to("Copy message? (y/n) ", 'n') == 'y');
+X	  *is_a_response = TRUE;
+X	}
+X
+X	return(answer);
+X}
+X
+Xstatic int to_line, to_col;
+X
+Xdisplay_to(address)
+Xchar *address;
+X{
+X	/** Simple routine to display the "To:" line according to the
+X	    current configuration (etc) 			      
+X	 **/
+X	register int open_paren;
+X
+X	to_line = mail_only ? 3 : LINES - 3;
+X	to_col = mail_only ? 0 : COLUMNS - 50;
+X	if (names_only)
+X	  if ((open_paren = chloc(address, '(')) > 0) {
+X	    if (open_paren < chloc(address, ')')) {
+X	      output_abbreviated_to(address);
+X	      return;
+X	    } 
+X	  }
+X	if(mail_only)
+X	  if(strlen(address) > 80)
+X	    PutLine1(to_line, to_col, "To: (%s)", 
+X	        tail_of_string(address, 75));
+X	  else
+X	    PutLine1(to_line, to_col, "To: %s", address);
+X	else if (strlen(address) > 45) 
+X	  PutLine1(to_line, to_col, "To: (%s)", 
+X	      tail_of_string(address, 40));
+X	else {
+X	  if (strlen(address) > 30) 
+X	    PutLine1(to_line, to_col, "To: %s", address);
+X	  else
+X	    PutLine1(to_line, to_col, "          To: %s", address);
+X	  CleartoEOLN();
+X	}
+X}
+X
+Xoutput_abbreviated_to(address)
+Xchar *address;
+X{
+X	/** Output just the fields in parens, separated by commas if need
+X	    be, and up to COLUMNS-50 characters...This is only used if the
+X	    user is at level BEGINNER.
+X	**/
+X
+X	char newaddress[LONG_STRING];
+X	register int iindex, newindex = 0, in_paren = 0;
+X
+X	iindex = 0;
+X
+X	while (newindex < 55 && iindex < strlen(address)) {
+X	  if (address[iindex] == '(') in_paren++;
+X	  else if (address[iindex] == ')') { 
+X	    in_paren--;
+X	    if (iindex < strlen(address)-4) {
+X	      newaddress[newindex++] = ',';
+X	      newaddress[newindex++] = ' ';
+X	    }
+X	  }
+X	  
+X	  /* copy if in_paren but not at the opening outer parens */
+X	  if (in_paren && !(address[iindex] == '(' && in_paren == 1))
+X	      newaddress[newindex++] = address[iindex];
+X	     
+X	  iindex++;
+X	}
+X
+X	newaddress[newindex] = '\0';
+X
+X	if (mail_only)
+X	  if (strlen(newaddress) > 80) 
+X	    PutLine1(to_line, to_col, "To: (%s)", 
+X	       tail_of_string(newaddress, 60));
+X	  else
+X	    PutLine1(to_line, to_col, "To: %s", newaddress);
+X	else if (strlen(newaddress) > 50) 
+X	   PutLine1(to_line, to_col, "To: (%s)", 
+X	       tail_of_string(newaddress, 40));
+X	 else {
+X	   if (strlen(newaddress) > 30)
+X	     PutLine1(to_line, to_col, "To: %s", newaddress);
+X	   else
+X	     PutLine1(to_line, to_col, "          To: %s", newaddress);
+X	   CleartoEOLN();
+X	 }
+X
+X	return;
+X}
+SHAR_EOF
+chmod 0444 src/mailmsg1.c || echo "restore of src/mailmsg1.c fails"
+echo "x - extracting src/mailmsg2.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > src/mailmsg2.c &&
+X
+Xstatic char rcsid[] = "@(#)$Id: mailmsg2.c,v 2.29 89/03/25 21:46:43 syd Exp $";
+X
+X/*******************************************************************************
+X *  The Elm Mail System  -  $Revision: 2.29 $   $State: Exp $
+X *
+X * 			Copyright (c) 1986, 1987 Dave Taylor
+X * 			Copyright (c) 1988, 1989 USENET Community Trust
+X *******************************************************************************
+X * Bug reports, patches, comments, suggestions should be sent to:
+X *
+X *	Syd Weinstein, Elm Coordinator
+X *	elm@dsinc.UUCP			dsinc!elm
+X *
+X *******************************************************************************
+X * $Log:	mailmsg2.c,v $
+X * Revision 2.29  89/03/25  21:46:43  syd
+X * Initial 2.2 Release checkin
+X * 
+X *
+X ******************************************************************************/
+X
+X/** Interface to allow mail to be sent to users.  Part of ELM  **/
+X
+X
+X#include "headers.h"
+X#include <errno.h>
+X
+Xextern int errno;
+Xextern char version_buff[];
+X
+Xchar *error_name(), *error_description(), *strip_parens();
+Xchar *strcat(), *strcpy();
+Xchar *format_long(), *strip_commas(), *tail_of_string(); 
+X
+Xunsigned long sleep();
+X
+X#ifdef SITE_HIDING 
+X char *get_ctime_date();
+X#endif
+XFILE *write_header_info();
+X
+X/* these are all defined in the mailmsg1.c file! */
+X
+Xextern char subject[SLEN], in_reply_to[SLEN], expires[SLEN], 
+X            action[SLEN], priority[SLEN], reply_to[SLEN], to[VERY_LONG_STRING], 
+X	    cc[VERY_LONG_STRING], expanded_to[VERY_LONG_STRING], 
+X	    expanded_cc[VERY_LONG_STRING], user_defined_header[SLEN],
+X	    bcc[VERY_LONG_STRING], expanded_bcc[VERY_LONG_STRING];
+X
+X
+Xint  gotten_key;
+Xchar *bounce_off_remote();
+X
+Xmail(copy_msg, edit_message, form)
+Xint  copy_msg, edit_message, form;
+X{
+X	/** Given the addresses and various other miscellany (specifically, 
+X	    'copy-msg' indicates whether a copy of the current message should 
+X	    be included, 'edit_message' indicates whether the message should 
+X	    be edited) this routine will invoke an editor for the user and 
+X	    then actually mail off the message. 'form' can be YES, NO, or
+X	    MAYBE.  YES=add "Content-Type: mailform" header, MAYBE=add the
+X	    M)ake form option to last question, and NO=don't worry about it!
+X	    Also, if 'copy_msg' = FORM, then grab the form temp file and use
+SHAR_EOF
+echo "End of part 16"
+echo "File src/mailmsg2.c is continued in part 17"
+echo "17" > s2_seq_.tmp
+exit 0
+

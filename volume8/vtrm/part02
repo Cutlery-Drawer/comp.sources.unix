@@ -1,0 +1,1843 @@
+Subject:  v08i060:  A Unix/PC virtual terminal package, Part02/02
+Newsgroups: mod.sources
+Approved: mirror!rs
+
+Submitted by: Guido van Rossum <seismo!mcvax!guido>
+Mod.sources: Volume 8, Issue 60
+Archive-name: vtrm/Part02
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+# If all goes well, you will see the message "End of archive 2 (of 2)."
+# Contents:  vtrm.c
+PATH=/bin:/usr/bin:/usr/ucb; export PATH
+echo shar: extracting "'vtrm.c'" '(38157 characters)'
+if test -f 'vtrm.c' ; then 
+  echo shar: will not over-write existing file "'vtrm.c'"
+else
+sed 's/^X//' >vtrm.c <<'@//E*O*F vtrm.c//'
+X/* Copyright (c) Stichting Mathematisch Centrum, Amsterdam, 1986. */
+X
+X#define lenline len_line /* Avoid name conflict with lenline in tex.c */
+X
+X/*
+X * Virtual TeRMinal package.
+X * (For a description see at the end of this file.)
+X *
+X * TO DO:
+X *	- add interrupt handling (trminterrupt)
+X *	- adapt to changed window size when suspended or at SIGWINCH
+X *	  (unfortunately, the calling module must be changed first --
+X *	  it is not prepared for the changed window size...)
+X */
+X
+X/*
+X * Includes and data definitions.
+X */
+X
+X#include <stdio.h>
+X#ifndef TERMIO
+X#include <sgtty.h>
+X#else
+X#include <termio.h>
+X#endif TERMIO
+X#include <signal.h>
+X#include <ctype.h>
+X
+X#include "trm.h"
+X
+Xchar *getenv();
+Xint tgetent();
+Xint tgetnum();
+Xint tgetflag();
+Xchar *tgetstr();
+X
+X#ifdef TRACE
+X#define Tprintf(args) fprintf args
+X#else
+X#define Tprintf(args) /*empty*/
+X#endif
+X
+X#ifdef lint
+X#define VOID (void)
+X#else
+X#define VOID
+X#endif
+X
+X#define Forward
+X#define Visible
+X#define Hidden static
+X#define Procedure
+X
+Xtypedef char *string;
+Xtypedef int bool;
+X#define Yes 1
+X#define No  0
+X
+X#define Min(a,b) ((a) <= (b) ? (a) : (b))
+X
+X/* tty modes */
+X#ifndef TERMIO
+X
+X/* v7/BSD tty control */
+XHidden struct sgttyb oldtty, newtty;
+X#ifdef TIOCSETN
+X/* Redefine stty to uses TIOCSETN, so type-ahead is not flushed */
+X#define stty(fd, bp) VOID ioctl(fd, (int) TIOCSETN, (char *) bp)
+X#endif
+X
+X#ifdef TIOCSLTC /* BSD -- local special chars, must all be turned off */
+Xstatic struct ltchars oldltchars;
+Xstatic struct ltchars newltchars= {-1, -1, -1, -1, -1, -1};
+X#endif TIOCSLTC
+X
+X#ifdef TIOCSETC /* V7 -- standard special chars, some must be turned off too */
+Xstatic struct tchars oldtchars;
+Xstatic struct tchars newtchars;
+X#endif TIOCSETC
+X
+X#else TERMIO
+X
+X/* AT&T tty control */
+XHidden struct termio oldtty, newtty;
+X#define gtty(fd,bp) ioctl(fd, TCGETA, (char *) bp)
+X#define stty(fd,bp) VOID ioctl(fd, TCSETAW, (char *) bp)
+X
+X#endif TERMIO
+X
+XHidden bool know_ttys = No;
+X
+X/* visible data for termcap */
+Xchar PC;
+Xchar *BC;
+Xchar *UP;
+Xshort ospeed;
+X
+XForward int outchar(); 		/* procedure for termcap's tputs */
+X#define Putstr(str)	tputs((str), 1, outchar)
+Xextern char *tgoto();
+X
+X/* termcap terminal capabilities */
+X
+XHidden int lines;
+XHidden int cols;
+X
+X/*
+X * String-valued capabilities are saved in one big array.
+X * Extend this only at the end (even though it disturbs the sorting)
+X * because otherwise you have to change all macros...
+X */
+X
+X#define par_al_str strcaps[0]	/* parametrized al (AL) */
+X#define cap_cm_str strcaps[1]	/* screen-relative cursor motion (CM) */
+X#define par_dl_str strcaps[2]	/* parametrized dl (DL) */
+X#define al_str strcaps[3] 	/* add new blank line */
+X#define cd_str strcaps[4] 	/* clear to end of display */
+X#define ce_str strcaps[5] 	/* clear to end of line */
+X#define cl_str strcaps[6] 	/* cursor home and clear screen */
+X#define cm_str strcaps[7] 	/* cursor motion */
+X#define cp_str strcaps[8]	/* cursor position sense reply */
+X#define cr_str strcaps[9] 	/* carriage return */
+X#define cs_str strcaps[10] 	/* change scrolling region */
+X#define dc_str strcaps[11] 	/* delete character */
+X#define dl_str strcaps[12] 	/* delete line */
+X#define dm_str strcaps[13] 	/* enter delete mode */
+X#define do_str strcaps[14] 	/* cursor down one line */
+X#define ed_str strcaps[15] 	/* end delete mode */
+X#define ei_str strcaps[16] 	/* end insert mode */
+X#define ho_str strcaps[17]	/* cursor home */
+X#define ic_str strcaps[18] 	/* insert character (if necessary; may pad) */
+X#define im_str strcaps[19] 	/* enter insert mode */
+X#define nd_str strcaps[20] 	/* cursor right (non-destructive space) */
+X#define nl_str strcaps[21]	/* newline */
+X#define se_str strcaps[22] 	/* end standout mode */
+X#define sf_str strcaps[23] 	/* scroll text up (from bottom of region) */
+X#define so_str strcaps[24] 	/* begin standout mode */
+X#define sp_str strcaps[25]	/* sense cursor position */
+X#define sr_str strcaps[26] 	/* scroll text down (from top of region) */
+X#define te_str strcaps[27] 	/* end termcap */
+X#define ti_str strcaps[28] 	/* start termcap */
+X#define vb_str strcaps[29] 	/* visible bell */
+X#define ve_str strcaps[30] 	/* make cursor visible again */
+X#define vi_str strcaps[31] 	/* make cursor invisible */
+X#define le_str strcaps[32] 	/* cursor left */
+X#define bc_str strcaps[33]	/* backspace character */
+X#define up_str strcaps[34] 	/* cursor up */
+X#define pc_str strcaps[35]	/* pad character */
+X#define ks_str strcaps[36]	/* keypad mode start */
+X#define ke_str strcaps[37]	/* keypad mode end */
+X/* Insert new entries here only! Don't forget to change the next line! */
+X#define NSTRCAPS 38 /* One more than the last entry's index */
+X
+XHidden char *strcaps[NSTRCAPS];
+XHidden char strcapnames[] =
+X"ALCMDLalcdceclcmcpcrcsdcdldmdoedeihoicimndnlsesfsospsrtetivbvevilebcuppckske";
+X
+X/* Same for Boolean-valued capabilities */
+X
+X#define has_am flagcaps[0]	/* has automatic margins */
+X#define has_da flagcaps[1]	/* display may be retained above screen */
+X#define has_db flagcaps[2]	/* display may be retained below screen */
+X#define has_in flagcaps[3]	/* not save to have null chars on the screen */
+X#define has_mi flagcaps[4]	/* move safely in insert (and delete?) mode */
+X#define has_ms flagcaps[5]	/* move safely in standout mode */
+X#define has_xs flagcaps[6]	/* standout not erased by overwriting */
+X#define has_bs flagcaps[7]	/* terminal can backspace */
+X#define hardcopy flagcaps[8]	/* hardcopy terminal */
+X#define NFLAGS 9
+X
+XHidden char flagcaps[NFLAGS];
+XHidden char flagnames[]= "amdadbinmimsxsbshc";
+X
+XHidden Procedure
+Xgetcaps(parea)
+X	register char *parea;
+X{
+X	register char *capname;
+X	register char **capvar;
+X	register char *flagvar;
+X
+X	for (capname= flagnames, flagvar= flagcaps;
+X			*capname != '\0'; capname += 2, ++flagvar)
+X		*flagvar= tgetflag(capname);
+X
+X	for (capname= strcapnames, capvar= strcaps;
+X			*capname != '\0'; capname += 2, ++capvar)
+X		*capvar= tgetstr(capname, parea);
+X}
+X
+X/* terminal status */
+X
+X/* calling order of Visible Procs */
+XHidden bool started = No;
+X
+X/* to exports the capabilities mentioned in vtrm.h: */
+XHidden int flags = 0;
+X
+X/* cost for impossible operations */
+X#define Infinity 9999
+X	/* Allow for adding Infinity+Infinity within range */
+X	/* (Range is assumed at least 2**15 - 1) */
+X
+X/* The following for all sorts of undefined things (except for UNKNOWN char) */
+X#define Undefined (-1)
+X
+X/* current mode of putting char's */
+X#define Normal	0
+X#define Insert	1
+X#define	Delete	2
+XHidden short mode = Normal;
+X
+X/* current standout mode */
+X#define Off	0
+X#define On	0200
+XHidden short so_mode = Off;
+X
+X/* masks for char's and short's */
+X#define NULCHAR	'\000'
+X#define CHAR	0177
+X#define SOBIT	On
+X#define SOCHAR	0377
+X/* if (has_xs) record cookies placed on screen in extra bit */
+X/* type of cookie is determined by the SO bit */
+X#define XSBIT	0400
+X#define SOCOOK	0600
+X#define COOKBITS SOCOOK
+X#define UNKNOWN	1
+X#define NOCOOK	UNKNOWN
+X
+X/* current cursor position */
+XHidden short cur_y = Undefined, cur_x = Undefined;
+X
+X/* "line[y][x]" holds the char on the terminal, with the SOBIT and XSBIT.
+X * the SOBIT tells whether the character is standing out, the XSBIT whether
+X * there is a cookie on the screen at this position.
+X * In particular a standend-cookie may be recorded AFTER the line
+X * (just in case some trmputdata will write after that position).
+X * "lenline[y]" holds the length of the line.
+X * Unknown chars will be 1, so the optimising compare in putline will fail.
+X * (Partially) empty lines are distinghuished by "lenline[y] < cols".
+X */
+XHidden short **line = 0, *lenline = 0;
+X
+X/* Clear the screen initially iff only memory cursor addressing available */
+XHidden bool mustclear = No;
+X
+X/* Make the cursor invisible when trmsync() tries to move outside the screen */
+XHidden bool no_cursor = No;
+X
+X/* Optimise cursor motion */
+XHidden int abs_cost; 		/* cost of absolute cursor motion */
+XHidden int cr_cost; 		/* cost of carriage return */
+XHidden int do_cost; 		/* cost of down */
+XHidden int le_cost; 		/* cost of left */
+XHidden int nd_cost; 		/* cost of right */
+XHidden int up_cost; 		/* cost of up */
+X
+X/* Optimise trailing match in put_line, iff the terminal can insert and delete
+X * characters; the cost per n characters will be:
+X * 	n * MultiplyFactor + OverHead
+X */
+XHidden int ins_mf, ins_oh, del_mf, del_oh;
+XHidden int ed_cost, ei_cost; 		/* used in move() */
+X
+X/* The type of scrolling possible determines which routines get used;
+X * these may be:
+X * (1) with addline and deleteline (termcap: al_str & dl_str);
+X * (2) with a settable scrolling region, like VT100 (cs_str, sr_str, sf_str);
+X * (3) no scrolling available. (NOT YET IMPLEMENTED)
+X */
+XHidden Procedure (*scr_up)();
+XHidden Procedure (*scr_down)();
+XForward Procedure scr1up();
+XForward Procedure scr1down();
+XForward Procedure scr2up();
+XForward Procedure scr2down();
+X/*Forward Procedure scr3up(); */
+X/*Forward Procedure scr3down(); */
+X
+X/*
+X * Starting, Ending and (fatal) Error.
+X */
+X
+X/* 
+X * Initialization call.
+X * Determine terminal capabilities from termcap.
+X * Set up tty modes.
+X * Start up terminal and internal administration.
+X * Return 0 if all well, error code if in trouble.
+X */
+XVisible int
+Xtrmstart(plines, pcols, pflags)
+Xint *plines;
+Xint *pcols;
+Xint *pflags;
+X{
+X	register int err;
+X	
+X	Tprintf((stderr, "\ttrmstart(&li, &co, &fl);\n"));
+X	if (started)
+X		return TE_TWICE;
+X	err= gettermcaps();
+X	if (err != TE_OK)
+X		return err;
+X	err= setttymode();
+X	if (err != TE_OK)
+X		return err;
+X	err= start_trm();
+X	if (err != TE_OK) {
+X		trmend();
+X		return err;
+X	}
+X
+X	*plines = lines;
+X	*pcols = cols;
+X	*pflags = flags;
+X
+X	started = Yes;
+X	return TE_OK;
+X}
+X
+X/*
+X * Termination call.
+X * Reset tty modes, etc.
+X * Beware that it might be called by a caught interrupt even in the middle
+X * of trmstart()!
+X */
+XVisible Procedure
+Xtrmend()
+X{
+X	Tprintf((stderr, "\ttrmend();\n"));
+X	set_mode(Normal);
+X	if (so_mode != Off)
+X		standend();
+X	Putstr(ke_str);
+X	Putstr(te_str);
+X	VOID fflush(stdout);
+X	resetttymode();
+X
+X	started = No;
+X}
+X
+X/*
+X * Set all internal statuses to undefined, especially the contents of
+X * the screen, so a hard redraw will not be optimised to heaven.
+X */
+XVisible Procedure
+Xtrmundefined()
+X{
+X	register int y, x;
+X	Tprintf((stderr, "\ttrmundefined();\n"));
+X
+X	cur_y = cur_x = Undefined;
+X	mode = so_mode = Undefined;
+X	
+X	for (y = 0; y < lines; y++) {
+X		for (x = 0; x <= cols; x++)
+X			line[y][x] = 1; /* impossible char, no so bits */
+X		lenline[y] = cols;
+X	}
+X}
+X
+X#ifndef NDEBUG
+XHidden Procedure
+Xcheck_started(m)
+Xchar *m;
+X{
+X	if (!started) {
+X		trmend();
+X		fprintf(stderr, "bad VTRM call\n");
+X		abort();
+X	}
+X}
+X#else
+X#define check_started(m) /*empty*/
+X#endif
+X
+XHidden int ccc;
+X
+X/*ARGSUSED*/
+XHidden Procedure
+Xcountchar(ch)
+Xchar ch;
+X{
+X	ccc++;
+X}
+X
+XHidden int
+Xstrcost(str)
+Xchar *str;
+X{
+X	if (str == NULL)
+X		return Infinity;
+X	return str0cost(str);
+X}
+X
+XHidden int
+Xstr0cost(str)
+Xchar *str;
+X{
+X	ccc = 0;
+X	tputs(str, 1, countchar);
+X	return ccc;
+X}
+X
+X/*
+X * Get terminal capabilities from termcap and compute related static
+X * properties.  Return TE_OK if all well, error code otherwise.
+X *
+X * TO DO:
+X *	- use the curses trick of a reading the capabilities in a loop
+X *	  rather than one at a time.
+X */
+X
+XHidden int
+Xgettermcaps() 
+X{
+X	string trmname;
+X	char tc_buf[1024];
+X	static char strbuf[1024];
+X	char *area = strbuf;
+X	int sg;
+X	static bool tc_initialized = No;
+X#ifdef TIOCGWINSZ
+X	struct winsize win;
+X#endif
+X
+X	if (tc_initialized)
+X		return TE_OK;
+X	
+X	trmname=getenv("TERM");
+X	if (trmname == NULL || trmname[0] == '\0')
+X		return TE_NOTERM;
+X	if (tgetent(tc_buf, trmname) != 1)
+X		return TE_BADTERM;
+X
+X	getcaps(&area); /* Read all flag and string type capabilities */
+X	if (hardcopy)
+X		return TE_DUMB;
+X	BC = le_str;
+X	if (BC == NULL) {
+X		BC = bc_str;
+X		if (BC == NULL) {
+X			if (has_bs)
+X				BC = "\b";
+X			else
+X				return TE_DUMB;
+X		}
+X	}
+X	UP = up_str;
+X	if (UP == NULL)
+X		return TE_DUMB;
+X	PC = (pc_str != NULL? pc_str[0] : NULCHAR);
+X
+X	if (cm_str == NULL) {
+X		cm_str = cap_cm_str;
+X		if (cm_str == NULL) {
+X			if (ho_str == NULL || do_str == NULL || nd_str == NULL)
+X				return TE_DUMB;
+X		}
+X		else
+X			mustclear = Yes;
+X	}
+X	if (al_str && dl_str) {
+X		scr_up = scr1up;
+X		scr_down = scr1down;
+X		flags |= CAN_SCROLL;
+X	}
+X	else {
+X		if (sf_str == NULL)
+X			sf_str = "\n";
+X		if (cs_str && sr_str) {
+X			scr_up = scr2up;
+X			scr_down = scr2down;
+X			flags |= CAN_SCROLL;
+X		}
+X		else
+X			return TE_DUMB;
+X	}
+X		
+X	lines = tgetnum("li");
+X	cols = tgetnum("co");
+X#ifdef TIOCGWINSZ
+X	if (ioctl(0, TIOCGWINSZ, &win) == 0) {
+X		if (win.ws_col > 0)
+X			cols = win.ws_col;
+X		if (win.ws_row > 0)
+X			lines = win.ws_row;
+X	}
+X#endif
+X	if (lines < 0) lines = 24;
+X	if (cols < 0) cols = 80;
+X	
+X	if ((sg=tgetnum("sg")) == 0)
+X		has_xs = Yes;
+X	else if (sg > 0)
+X		return TE_DUMB;
+X	
+X	if (!ce_str)
+X		return TE_DUMB;
+X	if (cr_str == NULL) cr_str = "\r";
+X	if (do_str == NULL) {
+X		do_str = nl_str;
+X		if (do_str == NULL) do_str = "\n";
+X	}
+X	le_str = BC;
+X	up_str = UP;
+X	if (vb_str == NULL) 	/* then we will do with the audible bell */
+X		vb_str = "\007";
+X	
+X	/* cursor sensing (non standard) */
+X	if (cp_str != NULL && sp_str != NULL)
+X		flags |= CAN_SENSE;
+X
+X	if (so_str != NULL && se_str != NULL)
+X		flags |= HAS_STANDOUT;
+X
+X	/* calculate costs of local and absolute cursor motions */
+X	if (cm_str == NULL)
+X		abs_cost = Infinity;
+X	else
+X		abs_cost = strcost(tgoto(cm_str, 0, 0));
+X	cr_cost = strcost(cr_str);
+X	do_cost = strcost(do_str);
+X	le_cost = strcost(le_str);
+X	nd_cost = strcost(nd_str);
+X	up_cost = strcost(up_str);
+X
+X	/* cost of leaving insert or delete mode, used in move() */
+X	ei_cost = str0cost(ei_str);
+X	ed_cost = str0cost(ed_str);
+X	
+X	/* calculate insert and delete cost multiply_factor and overhead */
+X	if (((im_str && ei_str) || ic_str) && dc_str) {
+X		flags |= CAN_OPTIMISE;
+X		ins_mf = 1 + str0cost(ic_str);
+X		ins_oh = str0cost(im_str) + ei_cost;
+X		del_mf = str0cost(dc_str);
+X		del_oh = str0cost(dm_str) + ed_cost;
+X	}
+X		
+X	tc_initialized = Yes;
+X	return TE_OK;
+X}
+X
+XHidden int
+Xsetttymode()
+X{
+X	if (!know_ttys) {
+X		if (gtty(0, &oldtty) != 0 || gtty(0, &newtty) != 0)
+X			return TE_NOTTY;
+X#ifndef TERMIO
+X		ospeed = oldtty.sg_ospeed;
+X#ifdef PWB
+X		newtty.sg_flags = (newtty.sg_flags & ~ECHO & ~CRMOD & ~XTABS)
+X				  | RAW;
+X#else PWB
+X		newtty.sg_flags = (newtty.sg_flags & ~ECHO & ~CRMOD & ~XTABS)
+X				  | CBREAK;
+X#endif PWB
+X#ifdef TIOCSLTC
+X	VOID ioctl(0, (int) TIOCGLTC, (char *) &oldltchars);
+X#endif
+X#ifdef TIOCSETC
+X	VOID ioctl(0, (int) TIOCGETC, (char *) &oldtchars);
+X#endif
+X
+X#else TERMIO
+X		ospeed= oldtty.c_lflag & CBAUD;
+X		newtty.c_iflag &= ~ICRNL; /* No CR->NL mapping on input */
+X		newtty.c_oflag &= ~ONLCR; /* NL doesn't output CR */
+X		newtty.c_lflag &= ~(ICANON|ECHO); /* No line editing, no echo */
+X		newtty.c_cc[VMIN]= 3; /* wait for 3 characters */
+X		newtty.c_cc[VTIME]= 1; /* or 0.1 sec. */
+X#endif TERMIO
+X		know_ttys = Yes;
+X	}
+X	stty(0, &newtty);
+X#ifndef TERMIO
+X#ifdef TIOCSLTC
+X	VOID ioctl(0, (int) TIOCSLTC, (char *) &newltchars);
+X#endif TIOCSLTC
+X#ifdef TIOCSETC
+X	VOID ioctl(0, (int) TIOCGETC, (char *) &newtchars);
+X	newtchars.t_intrc= -1;
+X#ifndef DEBUG
+X	newtchars.t_quitc= -1;
+X#endif
+X	newtchars.t_eofc= -1;
+X	newtchars.t_brkc= -1;
+X	VOID ioctl(0, (int) TIOCSETC, (char *) &newtchars);
+X#endif TIOCSETC
+X#endif TERMIO
+X	return TE_OK;
+X}
+X
+XHidden Procedure
+Xresetttymode()
+X{
+X	if (know_ttys) {
+X		stty(0, &oldtty);
+X#ifndef TERMIO
+X#ifdef TIOCSLTC
+X		VOID ioctl(0, (int) TIOCSLTC, (char *) &oldltchars);
+X#endif TIOCSLTC
+X#ifdef TIOCSETC
+X		VOID ioctl(0, (int) TIOCSETC, (char *) &oldtchars);
+X#endif TIOCSETC
+X#endif TERMIO
+X		know_ttys= No;
+X	}
+X}
+X
+XHidden int
+Xstart_trm()
+X{
+X	register int y;
+X
+X	if (line == NULL) {
+X		if ((line = (short**) malloc(lines * sizeof(short*))) == NULL)
+X			return TE_NOMEM;
+X		for (y = 0; y < lines; y++) {
+X			if ((line[y] = (short*)
+X				malloc((cols+1) * sizeof(short))) == NULL)
+X				return TE_NOMEM;
+X		}
+X	}
+X	if (lenline == NULL) {
+X		if ((lenline = (short*) malloc(lines * sizeof(short))) == NULL)
+X			return TE_NOMEM;
+X	}
+X
+X	trmundefined();
+X
+X	Putstr(ti_str);
+X	Putstr(ks_str);
+X	if (cs_str)
+X		Putstr(tgoto(cs_str, lines-1, 0));
+X	if (mustclear)
+X		clear_lines(0, lines-1);
+X	return TE_OK;
+X}
+X
+X
+X/*
+X * Sensing and moving the cursor.
+X */
+X
+X/*
+X * Sense the current (y, x) cursor position, after a possible manual
+X * change by the user with local cursor motions.
+X * If the terminal cannot be asked for the current cursor position,
+X * or if the string returned by the terminal is garbled,
+X * the position is made Undefined.
+X */
+X
+XVisible Procedure
+Xtrmsense(py, px)
+X	int *py;
+X	int *px;
+X{
+X	bool getpos();
+X
+X	Tprintf((stderr, "\ttrmsense(&yy, &xx);\n"));
+X	check_started("trmsense");
+X
+X	*py = *px = Undefined;
+X	set_mode(Normal);
+X	if (so_mode != Off)
+X		standend();
+X	
+X	if (flags&CAN_SENSE && getpos(py, px)) {
+X		if (*py < 0 || lines <= *py || *px < 0 || cols <= *px)
+X			*py = *px = Undefined;
+X	}
+X	cur_y = Undefined;
+X	cur_x = Undefined;
+X}
+X
+XHidden bool
+Xgetpos(py, px)
+Xint *py, *px;
+X{
+X	char *format = cp_str;
+X	int fc; 		/* current format character */
+X	int ic; 		/* current input character */
+X	int num;
+X	int on_y = 1;
+X	bool incr_orig = No;
+X	int i, ni;
+X
+X	Putstr(sp_str);
+X	VOID fflush(stdout);
+X
+X	while (fc = *format++) {
+X		if (fc != '%') {
+X			if (trminput() != fc)
+X				return No;
+X		}
+X		else {
+X			switch (fc = *format++) {
+X			case '%':
+X				if (trminput() != '%')
+X					return No;
+X				continue;
+X			case 'r':
+X				on_y = 1 - on_y;
+X				continue;
+X			case 'i':
+X				incr_orig = Yes;
+X				continue;
+X			case 'd':
+X				ic = trminput();
+X				if (!isdigit(ic))
+X					return No;
+X				num = ic - '0';
+X				while (isdigit(ic=trminput()))
+X					num = 10*num + ic - '0';
+X				trmpushback(ic);
+X				break;
+X			case '2':
+X			case '3':
+X				ni = fc - '0';
+X		    		num = 0;
+X				for (i=0; i<ni; i++) {
+X					ic = trminput();
+X					if (isdigit(ic))
+X						num = 10*num + ic - '0';
+X					else
+X						return No;
+X				}
+X				break;
+X			case '+':
+X				num = trminput() - *format++;
+X				break;
+X			case '-':
+X				num = trminput() + *format++;
+X				break;
+X			default:
+X				return No;
+X			}
+X			/* assign num to parameter */
+X			if (incr_orig)
+X				num--;
+X			if (on_y)
+X				*py = num;
+X			else
+X				*px = num;
+X			on_y = 1 - on_y;
+X		}
+X	}
+X
+X	return Yes;
+X}
+X		
+X/* 
+X * To move over characters by rewriting them, we have to check:
+X * (1) that the screen has been initialised on these positions;
+X * (2) we do not screw up characters
+X * when rewriting line[y] from x_from upto x_to
+X */
+XHidden bool
+Xrewrite_ok(y, xfrom, xto)
+Xint y, xfrom, xto;
+X{
+X	register short *plnyx, *plnyto;
+X	
+X	if (xto > lenline[y])
+X		return No;
+X
+X	plnyto = &line[y][xto];
+X	for (plnyx = &line[y][xfrom]; plnyx <= plnyto; plnyx++)
+X		if (*plnyx == UNKNOWN
+X		    ||
+X		    (!has_xs && (*plnyx & SOBIT) != so_mode)
+X		   )
+X			return No;
+X	return Yes;
+X}
+X		
+X/*
+X * Move to position y,x on the screen
+X */
+X/* possible move types for y and x respectively: */
+X#define None	0
+X#define Down	1
+X#define Up	2
+X#define Right	1
+X#define ReWrite	2
+X#define Left	3
+X#define CrWrite	4
+X
+XHidden Procedure
+Xmove(y, x)
+Xint y, x;
+X{
+X	int dy, dx;
+X	int y_cost, x_cost, y_move, x_move;
+X	int mode_cost;
+X	int xi;
+X	
+X	if (cur_y == y && cur_x == x)
+X		return;
+X	
+X	if (!has_mi || mode == Undefined)
+X		set_mode(Normal);
+X	if (!has_xs && ((!has_ms && so_mode != Off) || so_mode == Undefined))
+X		standend();
+X	
+X	if (cur_y == Undefined || cur_x == Undefined)
+X		goto absmove;
+X	
+X	dy = y - cur_y;
+X	dx = x - cur_x;
+X
+X	if (dy > 0) {
+X		y_move = Down;
+X		y_cost = dy * do_cost;
+X	}
+X	else if (dy < 0) {
+X		y_move = Up;
+X		y_cost = -dy * up_cost;
+X	}
+X	else {
+X		y_move = None;
+X		y_cost = 0;
+X	}
+X	if (y_cost < abs_cost) {
+X		switch (mode) {
+X		case Normal:
+X			mode_cost = 0;
+X			break;
+X		case Insert:
+X			mode_cost = ei_cost;
+X			break;
+X		case Delete:
+X			mode_cost = ed_cost;
+X			break;
+X		}
+X		if (dx > 0) {
+X			x_cost = dx + mode_cost;
+X			if (dx*nd_cost < x_cost || !rewrite_ok(y, cur_x, x)) {
+X				x_cost = dx * nd_cost;
+X				x_move = Right;
+X			}
+X			else
+X				x_move = ReWrite;
+X		}
+X		else if (dx < 0) {
+X			x_cost = -dx * le_cost;
+X			x_move = Left;
+X		}
+X		else {
+X			x_cost = 0;
+X			x_move = None;
+X		}
+X		if (cr_cost + x + mode_cost < x_cost && rewrite_ok(y, 0, x)) {
+X			x_move = CrWrite;
+X			x_cost = cr_cost + x + mode_cost;
+X		}
+X	}
+X	else
+X		x_cost = abs_cost;
+X
+X	if (y_cost + x_cost < abs_cost) {
+X		switch (y_move) {
+X		case Down:
+X			while (dy-- > 0) Putstr(do_str);
+X			break;
+X		case Up:
+X			while (dy++ < 0) Putstr(up_str);
+X			break;
+X		}
+X		switch (x_move) {
+X		case Right:
+X			while (dx-- > 0) Putstr(nd_str);
+X			break;
+X		case Left:
+X			while (dx++ < 0) Putstr(le_str);
+X			break;
+X		case CrWrite:
+X			Putstr(cr_str);
+X			cur_x = 0;
+X			/* FALL THROUGH */
+X		case ReWrite:
+X			set_mode(Normal);
+X			for (xi = cur_x; xi < x; xi++)
+X				putchar(line[y][xi]);
+X			break;
+X		}
+X	}
+X	else
+X	{
+X    absmove:
+X		if (cm_str == NULL) {
+X			Putstr(ho_str);
+X			for (cur_y = 0; cur_y < y; ++cur_y)
+X				Putstr(do_str);
+X			/* Should try to use tabs here: */
+X			for (cur_x = 0; cur_x < x; ++cur_x)
+X				Putstr(nd_str);
+X		}
+X		else
+X			Putstr(tgoto(cm_str, x, y));
+X	}
+X	
+X	cur_y = y;
+X	cur_x = x;
+X}
+X
+X
+X/*
+X * Putting data on the screen.
+X */
+X
+X/*
+X * Fill screen area with given data.
+X * Characters with the SO-bit (0200) set are put in standout mode.
+X */
+XVisible Procedure
+Xtrmputdata(yfirst, ylast, indent, data)
+Xint yfirst;
+Xint ylast;
+Xregister int indent;
+Xregister string data;
+X{
+X	register int y;
+X	int x, len, lendata, space;
+X		
+X	Tprintf((stderr, "\ttrmputdata(%d, %d, %d, \"%s\");\n", yfirst, ylast, indent, data));
+X	check_started("trmputdata");
+X	
+X	if (yfirst < 0)
+X		yfirst = 0;
+X	if (ylast >= lines)
+X		ylast = lines-1;
+X	space = cols*(ylast-yfirst+1) - indent;
+X	if (space <= 0)
+X		return;
+X	yfirst += indent/cols;
+X	indent %= cols;
+X	y= yfirst;
+X	if (!data)
+X		data= ""; /* Safety net */
+X	x = indent;
+X	lendata = strlen(data);
+X	if (ylast == lines-1 && lendata >= space)
+X		lendata = space - 1;
+X	len = Min(lendata, cols-x);
+X	while (y <= ylast) {
+X		put_line(y, x, data, len);
+X		y++;
+X		lendata -= len;
+X		if (lendata > 0) {
+X			x = 0;
+X			data += len;
+X			len = Min(lendata, cols);
+X		}
+X		else
+X			break;
+X	}
+X	if (y <= ylast)
+X		clear_lines(y, ylast);
+X}
+X
+X/* 
+X * We will first try to get the picture:
+X *
+X *                  op>>>>>>>>>>>op          oq<<<<<<<<<<<<<<<<<<<<<<<<oq
+X *                  ^            ^           ^                         ^
+X *           <xskip><-----m1----><----od-----><-----------m2----------->
+X *   OLD:   "You're in a maze of twisty little pieces of code, all alike"
+X *   NEW:          "in a maze of little twisting pieces of code, all alike"
+X *                  <-----m1----><-----nd------><-----------m2----------->
+X *                  ^            ^             ^                         ^
+X *                  np>>>>>>>>>>>np            nq<<<<<<<<<<<<<<<<<<<<<<<<nq
+X * where
+X *	op, oq, np, nq are pointers to start and end of Old and New data,
+X * and
+X *	xskip = length of indent to be skipped,
+X *	m1 = length of Matching part at start,
+X *	od = length of Differing mid on screen,
+X *	nd = length of Differing mid in data to be put,
+X *	m2 = length of Matching trail.
+X *
+X * Then we will try to find a long blank-or-cleared piece in <nd+m2>:
+X *
+X *    <---m1---><---d1---><---nb---><---d2---><---m2--->
+X *              ^         ^         ^        ^         ^
+X *              np        bp        bq1      nq        nend
+X * where
+X *	bp, bq are pointers to start and AFTER end of blank piece,
+X * and
+X *	d1 = length of differing part before blank piece,
+X *	nb = length of blank piece to be skipped,
+X *	d2 = length of differing part after blank piece.
+X * Remarks:
+X *	d1 + nb + d2 == nd,
+X * and
+X *	d2 maybe less than 0.
+X */
+XHidden int
+Xput_line(y, xskip, data, len)
+Xint y, xskip;
+Xstring data;
+Xint len;
+X{
+X	register short *op, *oq;
+X	register char *np, *nq, *nend;
+X	char *bp, *bq1, *p, *q;
+X	int m1, m2, od, nd, delta, dd, d1, nb, d2;
+X	bool skipping;
+X	int cost, o_cost; 	/* normal and optimising cost */
+X	
+X	/* calculate the magic parameters */
+X	op = &line[y][xskip];
+X	oq = &line[y][lenline[y]-1];
+X	np = data;
+X	nq = nend = data + len - 1;
+X	m1 = m2 = 0;
+X	while ((*op&SOCHAR) == (((short)*np)&SOCHAR) && op <= oq && np <= nq)
+X		op++, np++, m1++;
+X	if (flags & CAN_OPTIMISE)
+X		while ((*oq&SOCHAR) == (((short)*nq)&SOCHAR) && op <= oq && np <= nq)
+X			oq--, nq--, m2++;
+X	od = oq - op + 1;
+X	nd = nq - np + 1;
+X	/* now we have the first picture above */
+X
+X	if (od==0 && nd==0)
+X		return;
+X	delta = nd - od;
+X
+X	/* find the blank piece */
+X	p = q = bp = bq1 = np;
+X	oq += m2; 		/* back to current eol */
+X	if (!has_in) {
+X		while (p <= nend) {
+X			while (q<=nend && *q==' ' && (op>oq || *op==' '))
+X				q++, op++;
+X			if (q - p > bq1 - bp)
+X				bp = p, bq1 = q;
+X			p = ++q;
+X			op++;
+X		}
+X	}
+X	d1 = bp - np;
+X	nb = bq1 - bp;
+X	d2 = nq - bq1 + 1;
+X	
+X	/* what is cheapest:
+X	 *	normal: put nd+m2;                         (dd = nd+m2)
+X	 *	skipping: put d1, skip nb, put d2+m2;      (dd = d2+m2)
+X	 *	optimise: put dd, insert or delete delta.  (dd = min(od,nd))
+X	 */
+X	cost = nd + m2; 	/* normal cost */
+X	if (nb > abs_cost || (d1 == 0 && nb > 0)) {
+X		skipping = Yes;
+X		cost -= nb - (d1>0 ? abs_cost : 0); /* skipping cost */
+X		dd = d2;
+X	}
+X	else {
+X		skipping = No;
+X		dd = nd;
+X	}
+X	
+X	if (m2 != 0) {
+X		/* try optimising */
+X		o_cost = Min(od, nd);
+X		if (delta > 0)
+X			o_cost += delta * ins_mf + ins_oh;
+X		else if (delta < 0)
+X			o_cost += -delta * del_mf + del_oh;
+X		if (o_cost >= cost) {
+X			/* discard m2, no optimise */
+X			dd += m2;
+X			m2 = 0;
+X		}
+X		else {
+X			dd = Min(od, nd);
+X			skipping = No;
+X		}
+X	}
+X
+X	/* and now for the real work */
+X	if (!skipping || d1 > 0)
+X		move(y, xskip + m1);
+X
+X	if (has_xs)
+X		get_so_mode();
+X	
+X	if (skipping) {
+X		if (d1 > 0) {
+X			set_mode(Normal);
+X			put_str(np, d1, No);
+X		}
+X		if (has_xs && so_mode != Off)
+X			standend();
+X		set_blanks(y, xskip+m1+d1, xskip+m1+d1+nb);
+X		if (dd != 0 || delta < 0) {
+X			move(y, xskip+m1+d1+nb);
+X			np = bq1;
+X		}
+X	}
+X	
+X	if (dd > 0) {
+X		set_mode(Normal);
+X		put_str(np, dd, No);
+X	}
+X	
+X	if (m2 > 0) {
+X		if (delta > 0) {
+X			set_mode(Insert);
+X			ins_str(np+dd, delta);
+X		}
+X		else if (delta < 0) {
+X			if (so_mode != Off)
+X				standend();
+X				/* Some terminals fill with standout spaces! */
+X			set_mode(Delete);
+X			del_str(-delta);
+X		}
+X	}
+X	else {
+X		if (delta < 0) {
+X			clr_to_eol();
+X			return;
+X		}
+X	}
+X	
+X	lenline[y] = xskip + len;
+X	if (cur_x == cols) {
+X		if (!has_mi)
+X			set_mode(Normal);
+X		if (!has_ms)
+X			so_mode = Undefined;
+X		if (has_am)
+X			cur_y++;
+X		else
+X			Putstr(cr_str);
+X		cur_x = 0;
+X	}
+X	else if (has_xs) {
+X		if (m2 == 0) {
+X			if (so_mode == On)
+X				standend();
+X		}
+X		else {
+X			if (!(line[cur_y][cur_x] & XSBIT)) {
+X				if (so_mode != (line[cur_y][cur_x] & SOBIT))
+X					(so_mode ? standend() : standout());
+X			}
+X		}
+X	}
+X}
+X
+XHidden Procedure
+Xset_mode(m)
+Xint m;
+X{
+X	if (m == mode)
+X		return;
+X	switch (mode) {
+X	case Insert:
+X		Putstr(ei_str);
+X		break;
+X	case Delete:
+X		Putstr(ed_str);
+X		break;
+X	case Undefined:
+X		Putstr(ei_str);
+X		Putstr(ed_str);
+X		break;
+X	}
+X	switch (m) {
+X	case Insert:
+X		Putstr(im_str);
+X		break;
+X	case Delete:
+X		Putstr(dm_str);
+X		break;
+X	}
+X	mode = m;
+X}
+X
+XHidden Procedure
+Xget_so_mode()
+X{
+X	if (cur_x >= lenline[cur_y] || line[cur_y][cur_x] == UNKNOWN)
+X		so_mode = Off;
+X	else
+X		so_mode = line[cur_y][cur_x] & SOBIT;
+X}
+X
+XHidden Procedure
+Xstandout()
+X{
+X	Putstr(so_str);
+X	so_mode = On;
+X	if (has_xs)
+X		line[cur_y][cur_x] |= SOCOOK;
+X}
+X
+XHidden Procedure
+Xstandend()
+X{
+X	Putstr(se_str);
+X	so_mode = Off;
+X	if (has_xs)
+X		line[cur_y][cur_x] = (line[cur_y][cur_x] & ~SOBIT) | XSBIT;
+X}
+X
+XHidden Procedure
+Xput_str(data, n, inserting)
+Xchar *data;
+Xint n;
+Xbool inserting;
+X{
+X	register short c, so;
+X	short *ln_y_x, *ln_y_end;
+X	
+X	so = so_mode;
+X	if (has_xs) {
+X		ln_y_x = &line[cur_y][cur_x];
+X		ln_y_end = &line[cur_y][lenline[cur_y]];
+X	}
+X	while (n-- > 0) {
+X		if (has_xs && ln_y_x <= ln_y_end && ((*ln_y_x)&XSBIT))
+X			so = so_mode = (*ln_y_x)&SOBIT;
+X			/* this also checks for the standend cookie AFTER */
+X			/* the line because off the equals sign in <= */
+X		c = ((short)(*data++))&SOCHAR;
+X		if ((c&SOBIT) != so) {
+X			so = c&SOBIT;
+X			so ? standout() : standend();
+X 		}
+X		if (inserting)
+X			Putstr(ic_str);
+X		put_c(c);
+X		if (has_xs)
+X			ln_y_x++;
+X	}
+X}
+X
+XHidden Procedure
+Xins_str(data, n)
+Xchar *data;
+Xint n;
+X{
+X	int x;
+X	
+X	/* x will start AFTER the line, because there might be a cookie */
+X	for (x = lenline[cur_y]; x >= cur_x; x--)
+X		line[cur_y][x+n] = line[cur_y][x];
+X	put_str(data, n, Yes);
+X}
+X
+XHidden Procedure
+Xdel_str(n)
+Xint n;
+X{
+X	int x, xto;
+X	
+X	xto = lenline[cur_y] - n; /* again one too far because of cookie */
+X	if (has_xs) {
+X		for (x = cur_x + n; x >= cur_x; x--) {
+X			if (line[cur_y][x] & XSBIT)
+X				break;
+X		}
+X		if (x >= cur_x)
+X			line[cur_y][cur_x+n] =
+X				(line[cur_y][cur_x+n] & CHAR)
+X				|
+X				(line[cur_y][x] & COOKBITS);
+X	}
+X	for (x = cur_x; x <= xto; x++)
+X		line[cur_y][x] = line[cur_y][x+n];
+X	while (n-- > 0)
+X		Putstr(dc_str);
+X}
+X
+XHidden Procedure
+Xput_c(c)
+Xint c;
+X{
+X	char ch;
+X	short xs_flag;
+X	
+X	ch = c&CHAR;
+X	if (!isprint(ch) && ch != ' ') /* V7 isprint doesn't include blank */
+X		ch= '?';
+X	putchar(ch);
+X	if (has_xs)
+X		xs_flag = line[cur_y][cur_x]&XSBIT;
+X	else
+X		xs_flag = 0;
+X	line[cur_y][cur_x] = (c&SOCHAR)|xs_flag;
+X	cur_x++;
+X}
+X
+XHidden Procedure
+Xclear_lines(yfirst, ylast)
+Xint yfirst, ylast ;
+X{
+X	register int y;
+X	
+X	if (!has_xs && so_mode != Off)
+X		standend();
+X	if (cl_str && yfirst == 0 && ylast == lines-1) {
+X		Putstr(cl_str);
+X		cur_y = cur_x = 0;
+X		for (y = 0; y < lines; ++y) {
+X			lenline[y] = 0;
+X			if (has_xs) line[y][0] = NOCOOK;
+X		}
+X		return;
+X	}
+X	for (y = yfirst; y <= ylast; y++) {
+X		if (lenline[y] > 0) {
+X			move(y, 0);
+X			if (ylast == lines-1 && cd_str) {
+X				Putstr(cd_str);
+X				while (y <= ylast) {
+X					if (has_xs) line[y][0] = NOCOOK;
+X					lenline[y++] = 0;
+X				}
+X				break;
+X			}
+X			else {
+X				clr_to_eol();
+X			}
+X		}
+X	}
+X}
+X
+XHidden Procedure
+Xclr_to_eol()
+X{
+X	lenline[cur_y] = cur_x;
+X	if (!has_xs && so_mode != Off)
+X		standend();
+X	Putstr(ce_str);
+X	if (has_xs) {
+X		if (cur_x == 0)
+X			line[cur_y][0] = NOCOOK;
+X		else if (line[cur_y][cur_x-1]&SOBIT)
+X			standend();
+X	}
+X}
+X
+XHidden Procedure
+Xset_blanks
+X(y, xfrom, xto)
+Xint y, xfrom, xto;
+X{
+X	register int x;
+X	
+X	for (x = xfrom; x < xto; x++) {
+X		line[y][x] = (line[y][x]&XSBIT) | ' ';
+X	}
+X}
+X
+X/* 
+X * outchar() is used by termcap's tputs;
+X * we can't use putchar because that's probably a macro
+X */
+XHidden int
+Xoutchar(ch)
+Xchar ch;
+X{
+X	putchar(ch);
+X}
+X
+X/*
+X * Scrolling (part of) the screen up (or down, dy<0).
+X */
+X
+XVisible Procedure
+Xtrmscrollup(yfirst, ylast, by)
+Xregister int yfirst;
+Xregister int ylast;
+Xregister int by;
+X{
+X	Tprintf((stderr, "\ttrmscrollup(%d, %d, %d);\n", yfirst, ylast, by));
+X	check_started("trmscrollup");
+X	
+X	if (yfirst < 0)
+X		yfirst = 0;
+X	if (ylast >= lines)
+X		ylast = lines-1;
+X
+X	if (yfirst > ylast)
+X		return;
+X
+X	if (!has_xs && so_mode != Off)
+X		standend();
+X	
+X	if (by > 0 && yfirst + by > ylast
+X	    ||
+X	    by < 0 && yfirst - by > ylast)
+X	{
+X		clear_lines(yfirst, ylast);
+X		return;
+X	}
+X	
+X	if (by > 0) {
+X		(*scr_up)(yfirst, ylast, by);
+X		scr_lines(yfirst, ylast, by, 1);
+X	}
+X	else if (by < 0) {
+X		(*scr_down)(yfirst, ylast, -by);
+X		scr_lines(ylast, yfirst, -by, -1);
+X	}
+X}
+X
+XHidden Procedure
+Xscr_lines(yfrom, yto, n, dy)
+Xint yfrom, yto, n, dy;
+X{
+X	register int y;
+X	short *saveln;
+X	
+X	while (n-- > 0) {
+X		saveln = line[yfrom];
+X		for (y = yfrom; y != yto; y += dy) {
+X			line[y] = line[y+dy];
+X			lenline[y] = lenline[y+dy];
+X		}
+X		line[yto] = saveln;
+X		lenline[yto] = 0;
+X		if (has_xs) line[yto][0] = NOCOOK;
+X	}
+X}
+X
+XHidden Procedure
+Xscr1up(yfirst, ylast, n)
+X	int yfirst;
+X	int ylast;
+X	int n;
+X{
+X	move(yfirst, 0);
+X	dellines(n);
+X	if (ylast < lines-1) {
+X		move(ylast-n+1, 0);
+X		addlines(n);
+X	}
+X}
+X
+X
+XHidden Procedure
+Xscr1down(yfirst, ylast, n)
+X	int yfirst;
+X	int ylast;
+X	int n;
+X{
+X	if (ylast == lines-1) {
+X		clear_lines(ylast-n+1, ylast);
+X	}
+X	else {
+X		move(ylast-n+1, 0);
+X		dellines(n);
+X	}
+X	move(yfirst, 0);
+X	addlines(n);
+X}
+X
+X
+XHidden Procedure
+Xaddlines(n)
+Xregister int n;
+X{
+X	if (par_al_str && n > 1)
+X			Putstr(tgoto(par_al_str, n, n));
+X	else {
+X		while (n-- > 0)
+X			Putstr(al_str);
+X	}
+X}
+X
+X
+XHidden Procedure
+Xdellines(n)
+Xregister int n;
+X{
+X	if (par_dl_str && n > 1)
+X		Putstr(tgoto(par_dl_str, n, n));
+X	else {
+X		while (n-- > 0)
+X			Putstr(dl_str);
+X	}
+X}
+X
+X
+XHidden Procedure
+Xscr2up(yfirst, ylast, n)
+Xint yfirst, ylast, n;
+X{
+X	Putstr(tgoto(cs_str, ylast, yfirst));
+X	cur_y = cur_x = Undefined;
+X	move(ylast, 0);
+X	while (n-- > 0) {
+X		Putstr(sf_str);
+X		if (has_db && ylast == lines-1)
+X			clr_to_eol();
+X	}
+X	Putstr(tgoto(cs_str, lines-1, 0));
+X	cur_y = cur_x = Undefined;
+X}
+X
+X
+XHidden Procedure
+Xscr2down(yfirst, ylast, n)
+Xint yfirst, ylast, n;
+X{
+X	Putstr(tgoto(cs_str, ylast, yfirst));
+X	cur_y = cur_x = Undefined;
+X	move(yfirst, 0);
+X	while (n-- > 0) {
+X		Putstr(sr_str);
+X		if (has_da && yfirst == 0)
+X			clr_to_eol();
+X	}
+X	Putstr(tgoto(cs_str, lines-1, 0));
+X	cur_y = cur_x = Undefined;
+X}
+X
+X
+X/*
+X * Synchronization, move cursor to given position (or previous if < 0).
+X */
+X
+XVisible Procedure
+Xtrmsync(y, x)
+X	int y;
+X	int x;
+X{
+X	Tprintf((stderr, "\ttrmsync(%d, %d);\n", y, x));
+X	check_started("trmsync");
+X	
+X	if (0 <= y && y < lines && 0 <= x && x < cols) {
+X		move(y, x);
+X		if (no_cursor) {
+X			Putstr(ve_str);
+X			no_cursor = No;
+X		}
+X	}
+X	else if (no_cursor == No) {
+X		Putstr(vi_str);
+X		no_cursor = Yes;
+X	}
+X	VOID fflush(stdout);
+X}
+X
+X
+X/*
+X * Send a bell, visible if possible.
+X */
+X
+XVisible Procedure
+Xtrmbell()
+X{
+X	Tprintf((stderr, "\ttrmbell();\n"));
+X	check_started("trmbell");
+X	
+X	Putstr(vb_str);
+X	VOID fflush(stdout);
+X}
+X
+X
+X#ifdef SHOW
+X
+X/*
+X * Show the current internal statuses of the screen on stderr.
+X * For debugging only.
+X */
+X
+XVisible Procedure
+Xtrmshow(s)
+Xchar *s;
+X{
+X	int y, x;
+X	
+X	fprintf(stderr, "<<< %s >>>\n", s);
+X	for (y = 0; y < lines; y++) {
+X		for (x = 0; x <= lenline[y] /*** && x < cols-1 ***/ ; x++) {
+X			fputc(line[y][x]&CHAR, stderr);
+X		}
+X		fputc('\n', stderr);
+X		for (x = 0; x <= lenline[y] && x < cols-1; x++) {
+X			if (line[y][x]&SOBIT)
+X				fputc('-', stderr);
+X			else
+X				fputc(' ', stderr);
+X		}
+X		fputc('\n', stderr);
+X		for (x = 0; x <= lenline[y] && x < cols-1; x++) {
+X			if (line[y][x]&XSBIT)
+X				fputc('+', stderr);
+X			else
+X				fputc(' ', stderr);
+X		}
+X		fputc('\n', stderr);
+X	}
+X	fprintf(stderr, "CUR_Y = %d, CUR_X = %d.\n", cur_y, cur_x);
+X	VOID fflush(stderr);
+X}
+X#endif
+X
+X
+X/*
+X * Return the next input character, or -1 if read fails.
+X * Only the low 7 bits are returned, so reading in RAW mode is permissible
+X * (although CBREAK is preferred if implemented).
+X * To avoid having to peek in the input buffer for trmavail, we use the
+X * 'read' system call rather than getchar().
+X * (The interface allows 8-bit characters to be returned, to accomodate
+X * larger character sets!)
+X */
+X
+XHidden int pushback= -1;
+X
+Xint
+Xtrminput()
+X{
+X	char c;
+X
+X	if (pushback >= 0) {
+X		c= pushback;
+X		pushback= -1;
+X		return c;
+X	}
+X	if (read(0, &c, 1) <= 0)
+X		return -1;
+X	return c & 0177;
+X}
+X
+Xtrmpushback(c)
+X	int c;
+X{
+X	pushback= c;
+X}
+X
+X
+X/*
+X * See if there's input available from the keyboard.
+X * The code to do this is dependent on the type of Unix you have
+X * (BSD, System V, ...).
+X * Return value: 0 -- no input; 1 -- input; -1 -- unimplementable.
+X * Note that each implementation form should first check pushback.
+X *
+X * TO DO:
+X *	- Implement it for other than 4.x BSD! (notably System 5)
+X */
+X
+X#ifdef SELECT
+X
+X#include <sys/time.h>
+X
+Xint
+Xtrmavail()
+X{
+X	int nfound, nfds, readfds;
+X	static struct timeval timeout= {0, 0};
+X
+X	if (pushback >= 0)
+X		return 1;
+X	readfds= 1 << 0;
+X	nfds= 0+1;
+X	nfound= select(nfds, &readfds, (int*) NIL, (int*) NIL, &timeout);
+X	return nfound > 0;
+X}
+X
+X#define TRMAVAIL_DEFINED
+X
+X#endif SELECT
+X
+X#if !defined(TRMAVAIL_DEFINED) && defined(FIONREAD)
+X
+Xint
+Xtrmavail()
+X{
+X	long n;
+X
+X	if (pushback >= 0)
+X		return 1;
+X	ioctl(0, (int) FIONREAD, (char *) &n);
+X	return n > 0;
+X}
+X
+X#define TRMAVAIL_DEFINED
+X
+X#endif FIONREAD
+X
+X#ifndef TRMAVAIL_DEFINED
+X
+Xint
+Xtrmavail()
+X{
+X	if (pushback >= 0)
+X		return 1;
+X	return -1;
+X}
+X
+X#endif
+X
+X
+X/*
+X * Suspend the editor.
+X * Should be called only after trmend and before trmstart!
+X */
+X
+Xtrmsuspend()
+X{
+X	int (*oldsig)();
+X	
+X	oldsig= signal(SIGTSTP, SIG_IGN);
+X	if (oldsig == SIG_IGN)
+X		return; /* Could spawn a subshell here... */
+X	trmend(); /* Safety net */
+X	signal(SIGTSTP, oldsig);
+X	kill(0, SIGSTOP);
+X}
+X
+X
+X/*
+X * DESCRIPTION.
+X *
+X * This package uses termcap to determine the terminal capabilities.
+X *
+X * The lines and columns of our virtual terminal are numbered 
+X *	y = {0...lines-1} from top to bottom, and
+X *	x = {0...cols-1} from left to right,
+X * respectively.
+X *
+X * The Visible Procedures in this package are:
+X *
+X * trmstart(&lines, &cols, &flags)
+X * 	Obligatory initialization call (sets tty modes etc.),
+X * 	Returns the height and width of the screen to the integers
+X * 	whose addresses are passed as parameters, and a flag that
+X *	describes some capabilities.
+X *	Function return value: 0 if all went well, an error code if there
+X *	is any trouble.  No messages are printed for errors.
+X *
+X * trmundefined()
+X *	Sets internal representation of screen and attributes to undefined.
+X *	This is necessary for a hard redraw, which would get optimised to
+X *	oblivion,
+X *
+X * trmsense(&y, &x)
+X *	Returns the cursor position through its parameters
+X *	after a possible manual change by the user.
+X *
+X * trmputdata(yfirst, ylast, indent, data)
+X * 	Fill lines {yfirst..ylast} with data, after skipping the initial
+X *	'indent' positions. It is assumed that these positions do not contain
+X *	anything dangerous (like standout cookies or null characters).
+X *
+X * trmscrollup(yfirst, ylast, by)
+X * 	Shift lines {yfirst..ylast} up by lines (down |by| if by < 0).
+X *
+X * trmsync(y, x)
+X * 	Call to output data to the terminal and set cursor position.
+X *
+X * trmbell()
+X *	Send a (possibly visible) bell, immediately (flushing stdout).
+X *
+X * trmend()
+X * 	Obligatory termination call (resets tty modes etc.).
+X *
+X * You may call these as one or more cycles of:
+X * 	+ trmstart
+X * 	+    zero or more times any of the other routines
+X * 	+ trmend
+X * Trmend may be called even in the middle of trmstart; this is necessary
+X * to make it possible to write an interrupt handler that resets the tty
+X * state before exiting the program.
+X *
+X * ADDITIONAL SPECIFICATIONS (ROUTINES FOR CHARACTER INPUT)
+X *
+X * trminput()
+X *	Return the next input character (with its parity bit cleared
+X *	if any).  This value is a nonnegative int.  Returns -1 if the
+X *	input can't be read any more.
+X *
+X * trmavail()
+X *	Return 1 if there is an input character immediately available,
+X *	0 if not.  Return -1 if not implementable.
+X *
+X * trminterrupt()
+X *	Return 1 if an interrupt has occurred since the last call to
+X *	trminput or trmavail, 0 else.  [Currently not implemented.]
+X *
+X * trmsuspend()
+X *	When called in the proper environment (4BSD with job control
+X *	enabled), suspends the editor, temporarily popping back to
+X *	the calling shell.  The caller should have called trmend()
+X *	first, and must call trmstart again afterwards.
+X *	BUG: there is a timing window where keyboard-generated
+X *	signals (such as interrupt) can reach the program.
+X */
+@//E*O*F vtrm.c//
+if test 38157 -ne "`wc -c <'vtrm.c'`"; then
+    echo shar: error transmitting "'vtrm.c'" '(should have been 38157 characters)'
+fi
+fi # end of overwriting check
+echo shar: "End of archive 2 (of 2)."
+cp /dev/null ark2isdone
+DONE=true
+for I in 1 2; do
+    if test -! f ark${I}isdone; then
+        echo "You still need to run archive ${I}."
+        DONE=false
+    fi
+done
+case $DONE in
+    true)
+        echo "You have run all 2 archives."
+        echo 'Now see the README'
+        ;;
+esac
+##  End of shell archive.
+exit 0

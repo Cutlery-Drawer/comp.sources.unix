@@ -1,0 +1,3148 @@
+Newsgroups: comp.sources.unix
+From: ross@zooid.guild.org (Ross Ridge)
+Subject: v26i079: mytinfo - a replacement for terminfo and termcap, Part03/03
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: ross@zooid.guild.org (Ross Ridge)
+Posting-Number: Volume 26, Issue 79
+Archive-Name: mytinfo/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 3)."
+# Contents:  tconv.c tparm.c tset.c
+# Wrapped by vixie@cognition.pa.dec.com on Sun Dec 27 14:45:20 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'tconv.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'tconv.c'\"
+else
+echo shar: Extracting \"'tconv.c'\" \(26474 characters\)
+sed "s/^X//" >'tconv.c' <<'END_OF_FILE'
+X/*
+X * tconv.c
+X *
+X * Ross Ridge 
+X * Public Domain
+X * 92/02/01 07:30:23
+X *
+X * tconv [-b] [-c [-OUGd]] [-i] [-B [-D dir]] [-I] [-k] [-V] [-t term] [file]
+X *
+X * -c		convert from termcap
+X * -i		convert from terminfo source
+X * -b		convert from terminfo binary
+X * -B		convert to terminfo binary
+X * -I		convert to terminfo source
+X * -V		print version info
+X *
+X * The following switches are available when converting from termcap:
+X * -d		don't supply any defaults for missing capabilities
+X * -O		include obsolete termcap capabilities
+X * -G		include GNU capabilities
+X * -U		include UW capabilities
+X *
+X * -k		keep comments
+X * -D dir	directory to put terminfo binaries in
+X *
+X * -t term	name of terminal to translate
+X * file		filename of termcap/terminfo database to use 
+X *
+X * If a file is specifed and no terminal is given the entire file we be
+X * translated.
+X * If no terminal and no file is specified then the terminal name will be
+X * taken from the environment variable TERM.
+X * Unless compiling to a terminfo binary, output is to stdout.
+X *
+X */
+X
+X#define NOTLIB
+X#include "defs.h"
+X#define SINGLE
+X#include "term.h"
+X
+X#include <ctype.h>
+X#include <fcntl.h>
+X#ifdef USE_STDDEF
+X#include <sys/types.h>
+X#endif
+X#include <sys/stat.h>
+X
+X#include "strtok.c"
+X#include "mkdir.c"
+X
+X#ifndef lint
+static const char SCCSid[] = "@(#) mytinfo tconv.c 3.2 92/02/01 public domain, By Ross Ridge";
+X#endif
+X
+extern int errno;
+X
+X/* the right margin of the output */
+X#define LINELEN 76
+X
+struct term_path *path;	/* returned from _buildpath */
+X
+TERMINAL _term_buf;
+char buf[MAX_BUF+1];	/* buffer for the termcap entry */
+X
+int noOT = 1;		/* -O */
+int noGNU = 1;		/* -G */
+int noUW = 1;		/* -W */
+int dodefault = 1;	/* -d */
+int keepcomments = 0;	/* -k */
+int compile = 0;	/* -B */
+int from_tcap = 0;	/* -c */
+int from_tinfo = 0;	/* -i */
+int from_tbin = 0;	/* -b */
+char *directory = NULL; /* -D */
+X
+int continued = 0;
+int termcap = 1;
+X
+int lineno = 0;		/* current line number */
+X
+X/* print the first part of a warning message */
+void
+warn() {
+X	if (lineno == 0)
+X		fprintf(stderr, "warning: ");
+X	else
+X		fprintf(stderr, "(%s)%d: warning: ",
+X			_term_buf.name_long, lineno);
+X}
+X
+X/* output a string indenting at the beginning of a line, and wraping
+X * at the right margin. 
+X */
+void
+putstr(s)
+char *s; {
+X	static pos = 0;
+X	int l;
+X
+X	if (s == NULL) {
+X		if (pos != 0) {
+X			pos = 0;
+X			putchar('\n');
+X		}
+X		return;
+X	}
+X	
+X	if (termcap && noOT && *s == 'O')
+X		return;
+X	if (termcap && noGNU && *s == 'G')
+X		return;
+X	if (termcap && noUW && *s == 'U')
+X		return;
+X
+X	l = strlen(s) + 2;
+X
+X	if (l + pos > LINELEN && pos != 0) {
+X		putchar('\n');
+X		pos = 0;
+X	}
+X
+X	if (pos == 0) {
+X		putchar('\t');
+X		pos = 8;
+X	} else
+X		putchar(' ');
+X
+X	printf("%s,", s);
+X
+X	pos += l;
+X}
+X
+X#ifndef MAX_PUSHED
+X/* maximum # of parameters that can be pushed onto the stack */
+X#define MAX_PUSHED 16
+X#endif
+X
+int stack[MAX_PUSHED];	/* the stack */
+int stackptr;		/* the next empty place on the stack */
+int onstack;		/* the top of stack */
+int seenm;		/* seen a %m */
+int seenn;		/* seen a %n */
+int seenr;		/* seen a %r */
+int param;		/* current parameter */
+char *dp;		/* pointer to the end of the converted string */
+X
+X/* push onstack on to the stack */
+void
+push() {
+X	if (stackptr > MAX_PUSHED) {
+X		warn();
+X		fprintf(stderr, "string to complex to covert\n");
+X	} else
+X		stack[stackptr++] = onstack;
+X}
+X
+X/* pop the top of the stack into onstack */
+void
+pop() {
+X	if (stackptr == 0) 
+X		if (onstack == 0) {
+X			warn();
+X			fprintf(stderr, "I'm confused\n");
+X		} else
+X			onstack = 0;
+X	else
+X		onstack = stack[--stackptr];
+X	param++;
+X}
+X
+X/* convert a character to a terminfo push */
+static int
+cvtchar(sp)
+register char *sp; {
+X	char c;
+X	int l;
+X
+X	switch(*sp) {
+X	case '\\':
+X		switch(*++sp) {
+X		case '\'':
+X		case '$':
+X		case '\\':
+X		case '%':
+X			c = *sp;
+X			l = 2;
+X			break;
+X		case '\0':
+X			c = '\\';
+X			l = 1;
+X			break;
+X		case '0':
+X			if (sp[1] == '0' && sp[2] == '0') {
+X				c = '\0';
+X				l = 4;
+X			} else {
+X				c = '\200'; /* '\0' ???? */
+X				l = 2;
+X			}
+X			break;
+X		default:
+X			c = *sp;
+X			l = 2;
+X			break;
+X		}
+X		break;
+X	default:
+X		c = *sp;
+X		l = 1;
+X	}
+X	c &= 0177;
+X	if (isgraph(c) && c != ',' && c != '\'' && c != '\\' && c != ':') {
+X		*dp++ = '%'; *dp++ = '\''; *dp++ = c; *dp++ = '\'';
+X	} else {
+X		*dp++ = '%'; *dp++ = '{';
+X		if (c > 99)
+X			*dp++ = c / 100 + '0';
+X		if (c > 9)
+X			*dp++ = (c / 10) % 10 + '0';
+X		*dp++ = c % 10 + '0';
+X		*dp++ = '}';
+X	}
+X	return l;
+X}
+X
+X/* push n copies of param on the terminfo stack if not already there */
+void
+getparm(parm, n)
+int parm;
+int n; {
+X	if (seenr)  {
+X		if (parm == 1)
+X			parm = 2;
+X		else if (parm == 2)
+X			parm = 1;
+X	}
+X	if (onstack == parm) {
+X		if (n > 1) {
+X			warn();
+X			fprintf(stderr, "string may not be optimal");
+X			*dp++ = '%'; *dp++ = 'P'; *dp++ = 'a';
+X			while(n--) {
+X				*dp++ = '%'; *dp++ = 'g'; *dp++ = 'a';
+X			}
+X		}
+X		return;
+X	}
+X	if (onstack != 0)
+X		push();
+X
+X	onstack = parm;
+X	
+X	while(n--) {		/* %p0 */
+X		*dp++ = '%'; *dp++ = 'p'; *dp++ = '0' + parm;
+X	}
+X
+X	if (seenn && parm < 3) { /* %{96}%^ */
+X		*dp++ = '%'; *dp++ = '{'; *dp++ = '9'; *dp++ = '6'; *dp++ = '}';
+X		*dp++ = '%'; *dp++ = '^';
+X	}
+X	
+X	if (seenm && parm < 3) { /* %{127}%^ */
+X		*dp++ = '%'; *dp++ = '{'; *dp++ = '1'; *dp++ = '2'; *dp++ = '7';
+X		*dp++ = '}'; *dp++ = '%'; *dp++ = '^';
+X	}
+X}
+X
+X/* convert a string to terminfo format */
+char *
+convstr(s, i)
+register char *s;
+int i; {
+X	static char line[MAX_LINE];
+X	register char *cap;
+X	int nocode = 0;
+X
+X	stackptr = 0;
+X	onstack = 0;
+X	seenm = 0;
+X	seenn = 0;
+X	seenr = 0;
+X	param = 1;
+X
+X	dp = line;
+X	cap = strnames[i];
+X#if 0
+X	if (cap[0] == 'k'
+X	    || ((cap[0] == 'i' || cap[0] == 'r') && cap[1] == 's'
+X		&& (cap[2] == '1' || cap[2] == '2' || cap[2] == '3')))
+X	/* if (k.* || [ir]s[123]) */
+X		nocode = 1;
+X#else
+X	if (_strflags[i] != 'G')
+X		nocode = 1;
+X#endif
+X	if (!nocode) {
+X		char *d = s;
+X		while(*s != '\0') {
+X			if (s[0] == '\\' && s[1] != '\0')
+X				s++;
+X			else if (s[0] == '%' && s[1] != '\0') {
+X				if (s[1] == 'p') {
+X					if (termcap) {
+X						warn();
+X						fprintf(stderr,
+X"string '%s' already in terminfo format\n", strcodes[i]);
+X						nocode = 1;
+X						break;
+X					} else
+X						nocode = 1;
+X				}
+X				s++;
+X			}
+X			s++;
+X		}
+X		if (!nocode && !termcap) {
+X			warn();
+X			fprintf(stderr,
+X"string '%s' not in terminfo format, converting...\n", cap);
+X		}
+X		s = d;
+X	}
+X	while(*s != '\0') {
+X		switch(*s) {
+X		case '%':
+X			s++;
+X			if (nocode) {
+X				*dp++ = '%';
+X				break;
+X			}
+X			switch(*s++) {
+X			case '%': *dp++ = '%'; break;
+X			case 'r':
+X				if (seenr++ == 1) {
+X					warn();
+X					fprintf(stderr, "seen %%r twice\n");
+X				}
+X				break;
+X			case 'm':
+X				if (seenm++ == 1) {
+X					warn();
+X					fprintf(stderr, "seen %%m twice\n");
+X				}
+X				break;
+X			case 'n':
+X				if (seenn++ == 1) {
+X					warn();
+X					fprintf(stderr, "seen %%n twice\n");
+X				}
+X				break;
+X			case 'i': *dp++ = '%'; *dp++ = 'i'; break;
+X			case '6': 
+X			case 'B':
+X				getparm(param, 2);
+X				/* %{6}%*%+ */
+X				*dp++ = '%'; *dp++ = '{'; *dp++ = '6';
+X				*dp++ = '}'; *dp++ = '%'; *dp++ = '*';
+X				*dp++ = '%'; *dp++ = '+';
+X				break;
+X			case '8':
+X			case 'D':
+X				getparm(param, 2);
+X				/* %{2}%*%- */
+X				*dp++ = '%'; *dp++ = '{'; *dp++ = '2';
+X				*dp++ = '}'; *dp++ = '%'; *dp++ = '*';
+X				*dp++ = '%'; *dp++ = '-';
+X				break;
+X			case '>':
+X				getparm(param, 2);
+X				/* %?%{x}%>%t%{y}%+%; */
+X				*dp++ = '%'; *dp++ = '?'; 
+X				s += cvtchar(s);
+X				*dp++ = '%'; *dp++ = '>';
+X				*dp++ = '%'; *dp++ = 't';
+X				s += cvtchar(s);
+X				*dp++ = '%'; *dp++ = '+';
+X				*dp++ = '%'; *dp++ = ';';
+X				break;
+X			case 'a':
+X				if ((*s == '=' || *s == '+' || *s == '-'
+X				     || *s == '*' || *s == '/')
+X				    && (s[1] == 'p' || s[1] == 'c')
+X			            && s[2] != '\0') {
+X					int l;
+X					l = 2;
+X					if (*s != '=')
+X						getparm(param, 1);
+X					if (s[1] == 'p') {
+X						getparm(param + s[2] - '@', 1);
+X						if (param != onstack) {
+X							pop();
+X							param--;
+X						}
+X						l++;
+X					} else
+X						l += cvtchar(s + 2);
+X					switch(*s) {
+X					case '+':
+X						*dp++ = '%'; *dp++ = '+';
+X						break;
+X					case '-':
+X						*dp++ = '%'; *dp++ = '-';
+X						break;
+X					case '*':
+X						*dp++ = '%'; *dp++ = '*';
+X						break;
+X					case '/':
+X						*dp++ = '%'; *dp++ = '/';
+X						break;
+X					case '=':
+X						if (seenr)
+X							if (param == 1)
+X								onstack = 2;
+X							else if (param == 2)
+X								onstack = 1;
+X							else
+X								onstack = param;
+X						else
+X							onstack = param;
+X						break;
+X					}
+X					s += l;
+X					break;
+X				}
+X				getparm(param, 1);
+X				s += cvtchar(s);
+X				*dp++ = '%'; *dp++ = '+';
+X				break;
+X			case '+':
+X				getparm(param, 1);
+X				s += cvtchar(s);
+X				*dp++ = '%'; *dp++ = '+';
+X				*dp++ = '%'; *dp++ = 'c';
+X				pop();
+X				break;
+X			case 's':
+X				s += cvtchar(s);
+X				getparm(param, 1);
+X				*dp++ = '%'; *dp++ = '-';
+X				break;
+X			case '-':
+X				s += cvtchar(s);
+X				getparm(param, 1);
+X				*dp++ = '%'; *dp++ = '-';
+X				*dp++ = '%'; *dp++ = 'c';
+X				pop();
+X				break;
+X			case '.':
+X				getparm(param, 1);
+X				*dp++ = '%'; *dp++ = 'c';
+X				pop();
+X				break;
+X			case '2':
+X				getparm(param, 1);
+X				*dp++ = '%'; *dp++ = '0';
+X				*dp++ = '2'; *dp++ = 'd';
+X				pop();
+X				break;
+X			case '3':
+X				getparm(param, 1);
+X				*dp++ = '%'; *dp++ = '0';
+X				*dp++ = '3'; *dp++ = 'd';
+X				pop();
+X				break;
+X			case 'd':
+X				getparm(param, 1);
+X				*dp++ = '%'; *dp++ = 'd';
+X				pop();
+X				break;
+X			case 'f':
+X				param++;
+X				break;
+X			case 'b':
+X				param--;
+X				break;
+X			default:
+X				warn();
+X				*dp++ = '%';
+X				s--;
+X				fprintf(stderr, "'%s' unknown %% code %%c",
+X					strcodes[i], *s);
+X				if (*s >= 0 && *s < 32)
+X					fprintf(stderr, "^%c\n", *s + '@');
+X				else if (*s < 0 || *s >= 127)
+X					fprintf(stderr, "\\%03o\n", *s & 0377);
+X				else
+X					fprintf(stderr, "%c\n", *s);
+X				break;
+X			}
+X			break;
+X		case '\\':
+X			if (!compile) {*dp++ = *s++; *dp++ = *s++; break;}
+X			/* FALLTHROUGH */
+X		case '\n':
+X			if (!compile) {*dp++ = '\\'; *dp++ = 'n'; s++; break;}
+X			/* FALLTHROUGH */
+X		case '\t':
+X			if (!compile) {*dp++ = '\\'; *dp++ = 't'; s++; break;}
+X			/* FALLTHROUGH */
+X		case '\r':
+X			if (!compile) {*dp++ = '\\'; *dp++ = 'r'; s++; break;}
+X			/* FALLTHROUGH */
+X		case '\200':
+X			if (!compile) {*dp++ = '\\'; *dp++ = '0'; s++; break;}
+X			/* FALLTHROUGH */
+X		case '\f':
+X			if (!compile) {*dp++ = '\\'; *dp++ = 'f'; s++; break;}
+X			/* FALLTHROUGH */
+X		case '\b':
+X			if (!compile) {*dp++ = '\\'; *dp++ = 'b'; s++; break;}
+X			/* FALLTHROUGH */
+X		case ' ':
+X			if (!compile) {*dp++ = '\\'; *dp++ = 's'; s++; break;}
+X			/* FALLTHROUGH */
+X		case '^':
+X			if (!compile) {*dp++ = '\\'; *dp++ = '^'; s++; break;}
+X			/* FALLTHROUGH */
+X		case ':':
+X			if (!compile) {*dp++ = '\\'; *dp++ = ':'; s++; break;}
+X			/* FALLTHROUGH */
+X		case ',':
+X			if (!compile) {*dp++ = '\\'; *dp++ = ','; s++; break;}
+X			/* FALLTHROUGH */
+X#if 0
+X		case '\'':
+X			if (!compile) {*dp++ = '\\'; *dp++ = '\''; s++; break;}
+X			/* FALLTHROUGH */
+X#endif
+X		default:
+X			if (compile) 
+X				*dp++ = *s++;
+X			else if (*s > 0 && *s < 32) {
+X				*dp++ = '^';
+X				*dp++ = *s + '@';
+X				s++;
+X			} else if (*s <= 0 || *s >= 127) {
+X				*dp++ = '\\';
+X				*dp++ = ((*s & 0300) >> 6) + '0';
+X				*dp++ = ((*s & 0070) >> 3) + '0';
+X				*dp++ = (*s & 0007) + '0';
+X				s++;
+X			} else
+X				*dp++ = *s++;
+X			break;
+X		}
+X	}
+X	*dp = '\0';
+X	return line;
+X}
+X
+X#define LSB(n) ((unsigned) (n) & 0377)
+X#define MSB(n) (((unsigned) (n) >> 8) & 0377)
+X
+void
+writebin(fd, name)
+int fd;
+char *name; {
+X	static char bin[MAX_BUF + 1];
+X	register char *s;
+X	register char *d;
+X	register int i;
+X	register char *t;
+X	register int n;
+X	char *strtbl;
+X	int sz_name, n_bools, n_nums, n_offs, sz_strs;
+X	extern int _boolorder[], _numorder[], _strorder[];
+X
+X	strncpy(bin + 12, name, 127);
+X	bin[12 + 128] = '\0';
+X	sz_name = strlen(name) + 1;
+X	if (sz_name > 128)
+X		sz_name = 128;
+X
+X	s = bin + 12 + sz_name;
+X	for(i = 0; _boolorder[i] != -1; i++) {
+X		switch(_term_buf.bools[i]) {
+X		case -1: *s++ = 0; break;
+X		case  0: *s++ = 0377; break;
+X		default: *s++ = 1; break;
+X		}
+X	}
+X	n_bools = i;
+X	if ((sz_name + n_bools) & 1)
+X		n_bools++;
+X
+X	s = bin + 12 + sz_name + n_bools;
+X	for(i = 0; _numorder[i] != -1; i++) {
+X		n = _term_buf.nums[_numorder[i]];
+X		switch(n) {
+X		case -2: *s++ = 0377; *s++ = 0377; break;
+X		case -1: *s++ = 0376; *s++ = 0377; break;
+X		default:
+X			*s++ = LSB(n);
+X			*s++ = MSB(n);
+X		}
+X	}
+X	n_nums = i;
+X
+X	s = bin + 12 + sz_name + n_bools + n_nums * 2;
+X	for(i = 0; _strorder[i] != -1; i++) {
+X		if (_term_buf.strs[_strorder[i]] == (char *) 0) {
+X			*s++ = 0376; *s++ = 0377;
+X		} else {
+X			*s++ = 0377; *s++ = 0377;
+X		}
+X	}
+X	n_offs = i;
+X
+X	s = bin + 12 + sz_name + n_bools + n_nums * 2;
+X	strtbl = d = s + n_offs * 2;
+X	for(i = 0; _strorder[i] != -1; i++) {
+X		t = _term_buf.strs[_strorder[i]];
+X		if (t == (char *) -1 || t == (char *)  0)
+X			s += 2;
+X		else {
+X			n = d - strtbl;
+X			*s++ = LSB(n);
+X			*s++ = MSB(n);
+X			t = convstr(t, _strorder[i]);
+X			while(*t != '\0') {
+X				*d++ = *t++;
+X				if (d >= bin + MAX_BUF - 1) {
+X					warn();
+X					fprintf(stderr,
+X					"compiled entry to big\n");
+X					*d++ = '\0';
+X					goto toobig;
+X				}
+X			}
+X			*d++ = '\0';
+X		}
+X	}
+X
+toobig:
+X	sz_strs = d - strtbl;
+X
+X	bin[0] = 032;
+X	bin[1] = 01;
+X	bin[2] = LSB(sz_name);
+X	bin[3] = MSB(sz_name);
+X	bin[4] = LSB(n_bools);
+X	bin[5] = MSB(n_bools);
+X	bin[6] = LSB(n_nums);
+X	bin[7] = MSB(n_nums);
+X	bin[8] = LSB(n_offs);
+X	bin[9] = MSB(n_offs);
+X	bin[10] = LSB(sz_strs);
+X	bin[11] = MSB(sz_strs);
+X
+X	if (write(fd, bin, d - bin) == -1) 
+X		quit(errno, "can't write binary file");
+X
+X	return;
+X}
+X
+void
+find_directory() {
+X	struct term_path *p;
+X	struct stat st;
+X
+X	if (directory != NULL)
+X		return;
+X
+X	p = path;
+X	while(p->type != -1 && p->file != NULL) {
+X		if (stat(p->file, &st) == 0) {
+X			if ((st.st_mode & 0170000) == 0040000) {
+X				directory = p->file;
+X				return;
+X			}
+X		}
+X		p++;
+X	}
+X	quit(-1, "can't find a terminfo directory");
+X}
+X
+X/* convert a terminal name to a binary filename */
+char *
+binfile(name)
+char *name; {
+X	static char line[MAX_LINE+1];
+X
+X	sprintf(line, "%s/%c/%s", directory, *name, name);
+X	return line;
+X}
+X
+char *
+bindir(name)
+char *name; {
+X	static char line[MAX_LINE+1];
+X
+X	sprintf(line, "%s/%c", directory, *name);
+X	return line;
+X}
+X
+int
+badname(name)
+char *name; {
+X	while(*name) {
+X		if (*name == '/' || !isgraph(*name))
+X			return 1;
+X		name++;
+X	}
+X	return 0;
+X}
+X
+X/* output a terminfo binary */
+void
+outputbin(name)
+char *name; {
+X	register char *s, *d, *last;
+X	char tmp[MAX_LINE+1];
+X	char line[MAX_LINE+1];
+X	int fd;
+X
+X	find_directory();
+X
+X	s = name;
+X	d = line;
+X	while(*s != '\0' && d < line + MAX_LINE) {
+X		*d++ = *s++;
+X	}
+X
+X	while(d > line && d[-1] == '|') {
+X		d--;
+X	}
+X
+X	*d = '\0';
+X
+X	s = strtok(line, "|");
+X	last = NULL;
+X
+X	while(s != NULL && last == NULL) {
+X		if (*s == '\0') {
+X			;
+X		} else if (badname(s)) {
+X			if (lineno)
+X				warn();
+X			fprintf(stderr, "bad terminal name '%s', ingored.\n",
+X				s);
+X		} else {
+X			if (access(bindir(s), 2) == -1) {
+X				if (errno != ENOENT) 
+X					quit(errno,
+X					     "can't access directory '%s'",
+X					     bindir(s));
+X				if (mkdir(bindir(s), 0777) == -1) 
+X					quit(errno, "can't make directory '%s'",
+X					     bindir(s));
+X			}
+X			fd = open(binfile(s), O_WRONLY | O_CREAT | O_EXCL,
+X				  0666);
+X			if (fd == -1) {
+X				if (errno != EEXIST)
+X					quit(errno, "can't open file '%s'",
+X					     binfile(s));
+X				if (unlink(binfile(s)) == -1) 
+X					quit(errno, "can't unlink file '%s'",
+X					     binfile(s));
+X				fd = open(binfile(s),
+X					  O_WRONLY | O_CREAT | O_EXCL, 0666);
+X				if (fd == -1)
+X					quit(errno, "can't create file '%s'",
+X					     binfile(s));
+X			}
+X			writebin(fd, name);
+X			close(fd);
+X			last = s;
+X		}
+X		s = strtok(NULL, "|");
+X	}
+X
+X	if (last == NULL) {
+X		if (lineno)
+X			warn();
+X		fprintf(stderr, "no terminal name, entry ignored.\n");
+X		return;
+X	}
+X
+X	while(s != NULL && s + strlen(s) != d) {
+X		if (*s == '\0' || strcmp(s, last) == 0) {
+X			;
+X		} else if (badname(s)) {
+X			if (lineno)
+X				warn();
+X			fprintf(stderr, "bad terminal name '%s', ingored.\n",
+X				s);
+X		} else {
+X			if (access(bindir(s), 2) == -1) {
+X				if (errno != ENOENT) 
+X					quit(errno,
+X					     "can't access directory '%s'",
+X					     bindir(s));
+X				if (mkdir(bindir(s), 0777) == -1) 
+X					quit(errno, "can't make directory '%s'",
+X					     bindir(s));
+X			}
+X			if (access(binfile(s), 0) == -1) {
+X				if (errno != ENOENT)
+X					quit(errno, "can't access file '%s'",
+X					     binfile(s));
+X			} else if (unlink(binfile(s)) == -1) {
+X					quit(errno, "can't unlink file '%s'",
+X					     binfile(s));
+X			}
+X			strcpy(tmp, binfile(last));
+X			if (link(tmp, binfile(s)) == -1) {
+X				quit(errno, "can't link '%s' to '%s'",
+X				     last, binfile(s));
+X			}
+X		}
+X		s = strtok(NULL, "|");
+X	}
+X	return;
+X}
+X
+X/* output an entry in terminfo source format */
+void
+outputinfo(name)
+char *name; {
+X	int i;
+X	char line[MAX_LINE];
+X
+X	printf("%s,\n", name);
+X
+X	for(i = 0; i < NUM_OF_BOOLS; i++)
+X		if (_term_buf.bools[i] == 0) {
+X			sprintf(line, "%s@", boolnames[i]);
+X			putstr(line);
+X		} else if (_term_buf.bools[i] != -1)
+X			putstr(boolnames[i]);
+X
+X	for(i = 0; i < NUM_OF_NUMS; i++)
+X		if (_term_buf.nums[i] == -1) {
+X			sprintf(line, "%s@", numnames[i]);
+X			putstr(line);
+X		} else if (_term_buf.nums[i] != -2) {
+X			sprintf(line, "%s#%d", numnames[i], _term_buf.nums[i]);
+X			putstr(line);
+X		}
+X
+X	for(i = 0; i < NUM_OF_STRS; i++)
+X		if (_term_buf.strs[i] == NULL) {
+X			sprintf(line, "%s@", strnames[i]);
+X			putstr(line);
+X		} else if (_term_buf.strs[i] != (char *) -1) {
+X			sprintf(line, "%s=%s", strnames[i],
+X				convstr(_term_buf.strs[i], i));
+X			putstr(line);
+X		}
+X	putstr(NULL);
+X}
+X
+X/* convert a terminfo entry to binary format */
+void
+convtinfo() {
+X	int i, r;
+X
+X	termcap = 0;
+X
+X	for(i = 0; i < NUM_OF_BOOLS; i++)
+X		_term_buf.bools[i] = -1;
+X	for(i = 0; i < NUM_OF_NUMS; i++)
+X		_term_buf.nums[i] = -2;
+X	for(i = 0; i < NUM_OF_STRS; i++)
+X		_term_buf.strs[i] = (char *) -1;
+X
+X	_term_buf.name_all = NULL;
+X
+X	r = _gettinfo(buf, &_term_buf, path);
+X	if (r != 0) {
+X		if (lineno == 0)
+X			quit(-1, "problem reading entry");
+X		else {
+X			warn();
+X			fprintf(stderr, "problem reading entry\n");
+X		}
+X	}
+X
+X	if (compile)
+X		outputbin(_term_buf.name_all);
+X	else
+X		outputinfo(_term_buf.name_all);
+X	return;
+X}
+X
+X/* convert a terminfo binary to terminfo source */
+void
+convtbin() {
+X	int i, r;
+X
+X	termcap = 0;
+X
+X	for(i = 0; i < NUM_OF_BOOLS; i++)
+X		_term_buf.bools[i] = -1;
+X	for(i = 0; i < NUM_OF_NUMS; i++)
+X		_term_buf.nums[i] = -2;
+X	for(i = 0; i < NUM_OF_STRS; i++)
+X		_term_buf.strs[i] = (char *) -1;
+X
+X	_term_buf.name_all = NULL;
+X
+X	r = _gettbin(buf, &_term_buf);
+X	if (r != 0) {
+X		if (lineno == 0)
+X			quit(-1, "problem reading entry");
+X		else {
+X			warn();
+X			fprintf(stderr, "problem reading entry\n");
+X		}
+X	}
+X
+X	outputinfo(_term_buf.name_all);
+X
+X	return;
+X}
+X
+X/* convert a termcap entry to terminfo format */
+void
+convtcap() {
+X	int i, r;
+X	char *name;
+X
+X	termcap = 1;
+X
+X	for(i = 0; i < NUM_OF_BOOLS; i++)
+X		_term_buf.bools[i] = -1;
+X	for(i = 0; i < NUM_OF_NUMS; i++)
+X		_term_buf.nums[i] = -2;
+X	for(i = 0; i < NUM_OF_STRS; i++)
+X		_term_buf.strs[i] = (char *) -1;
+X
+X	_term_buf.name_all = NULL;
+X
+X
+X#if DEBUG
+X	printf("%s\n", buf);
+X#endif
+X	r = _gettcap(buf, &_term_buf, path);
+X	if (r != 0) {
+X		if (lineno == 0)
+X			quit(-1, "problem reading entry");
+X		else {
+X			warn();
+X			fprintf(stderr, "problem reading entry\n");
+X		}
+X	}
+X
+X	if (dodefault && !continued)
+X		_tcapdefault();
+X
+X	_tcapconv();
+X
+X	name = _term_buf.name_all;
+X#if DEBUG
+X	printf("...%s\n", name);
+X#endif
+X	if (name[0] != '\0' && name[1] != '\0' && name[2] == '|')
+X		name += 3;	/* skip the 2 letter code */
+X
+X	if (compile) 
+X		outputbin(name);
+X	else
+X		outputinfo(name);
+X}
+X
+void
+convbinfile(file)
+char *file; {
+X	register FILE *f;
+X	int r;
+X
+X	f = fopen(file, "r");
+X
+X	if (f == NULL)
+X		quit(errno, "can't open '%s'", file);
+X
+X	r = fread(buf, sizeof(char), MAX_BUF, f);
+X	if (r < 12 || buf[0] != 032 || buf[1] != 01)
+X		quit(-1, "file '%s' corrupted", file);
+X
+X	convtbin();
+X}
+X
+X/* convert a termcap file to terminfo format */
+void
+convtcfile(file)
+char *file; {
+X	int nocolon;
+X	register int c;
+X	register char *d;
+X	register FILE *f;
+X
+X	f = fopen(file, "r");
+X
+X	if (f == NULL)
+X		quit(errno, "can't open '%s'", file);
+X
+X	d = buf;
+X	c = getc(f);
+X	while(c != EOF) {
+X		lineno++;
+X		if (c == '#') {
+X			if (keepcomments) {
+X				do {
+X					putchar(c);
+X					c = getc(f);
+X				} while(c != '\n' && c != EOF);
+X				putchar('\n');
+X			} else
+X				do
+X					c = getc(f);
+X				while(c != '\n' && c != EOF);
+X			if (c != EOF)
+X				c = getc(f);
+X			continue;
+X		}
+X		while(isspace(c) && c != '\n')
+X			c = getc(f);
+X		if (c == '\n' && buf == d) {
+X			c = getc(f);
+X			continue;
+X		}
+X
+X		while(c != EOF) {
+X			if (c == '\\') {
+X				c = getc(f);
+X				if (c == EOF) 
+X					break;
+X				if (c == '\n') {
+X					c = getc(f);
+X					break;
+X				}
+X				*d++ = '\\';
+X				*d++ = c;
+X			} else if (c == '\n') {
+X				*d = '\0';
+X				if (*--d == ':') {
+X					nocolon = 0;
+X					*d-- = '\0';
+X				} else {
+X					nocolon = 1;
+X				}
+X				while(d > buf && *d != ':')
+X					d--;
+X				if (d[1] == 't' && d[2] == 'c' && d[3] == '=') {
+X					continued = 1;
+X					d[1] = '\0';
+X				} else
+X					continued = 0;
+X				convtcap();
+X				if (nocolon) {
+X					warn();
+X					fprintf(stderr,
+X						"entry doesn't end with :\n");
+X				}
+X				_term_buf.strbuf = _endstr();
+X				_del_strs(&_term_buf);
+X				if (continued) {
+X					printf("\tuse=%s,\n", d + 4);
+X				}
+X				d = buf;
+X				c = getc(f);
+X				break;
+X			} else
+X				*d++ = c;
+X			c = getc(f);
+X		}
+X	}
+X}
+X
+static int
+getln(f, buf, len)
+XFILE *f;
+register char *buf;
+int len; {
+X	register int c, i = 0;
+X
+X	while((c = getc(f)) == '#') {
+X		lineno++;
+X		if (keepcomments) {
+X			putchar('#');
+X			while((c = getc(f)) != '\n') {
+X				if (c == EOF)
+X					return -1;
+X				putchar(c);
+X			}
+X			putchar('\n');
+X		} else {
+X			while((c = getc(f)) != '\n')
+X				if (c == EOF)
+X					return -1;
+X		}
+X	}
+X
+X	lineno++;
+X	while(c != '\n') {
+X		if (c == EOF)
+X			return -1;
+X		if (i < len) {
+X			i++;
+X			*buf++ = c;
+X		}
+X		c = getc(f);
+X	}
+X
+X	while(isspace(*(buf-1))) {
+X		buf--;
+X		i--;
+X	}
+X
+X	*buf = '\0';
+X	return i;
+X}
+X
+void
+convtifile(file)
+char *file; {
+X	static char line[MAX_LINE+1];
+X	int l;
+X	int n;
+X	register FILE *f;
+X
+X	f = fopen(file, "r");
+X
+X	if (f == NULL)
+X		quit(errno, "can't open '%s'", file);
+X
+X	lineno = 0;
+X
+X	l = getln(f, line, MAX_LINE);
+X	while(l != -1) {
+X		if (line[l-1] == ':') {
+X			strncpy(buf, line, MAX_BUF);
+X			convtcap();
+X		} else if (line[l-1] == '\\') {
+X			n = MAX_BUF;
+X			do {
+X				line[--l] = '\0';
+X				if (n > 0)
+X					strncpy(buf + MAX_BUF - n, line, n);
+X				n -= l;
+X				l = getln(f, line, MAX_LINE);
+X			} while(l != -1 && line[l-1] == '\\');
+X			if (n > 0 && l != -1)
+X				strncpy(buf + MAX_BUF - n, line, n);
+X			convtcap();
+X		} else if (line[l-1] == ',') {
+X			n = MAX_BUF;
+X			do {
+X				if (n > 0)
+X					strncpy(buf + MAX_BUF - n, line, n);
+X				n -= l;
+X				l = getln(f, line, MAX_LINE);
+X			} while(l != -1 && isspace(line[0]));
+X#if 0
+X			printf("buf = '%s'\n", buf);
+X#endif
+X			convtinfo();
+X			continue;
+X		} else if (line[0] != '\0') {
+X			warn();
+X			fprintf(stderr, "malformed line\n");
+X			if (keepcomments) {
+X				printf("%s\n", line);
+X			}
+X		}
+X		l = getln(f, line, MAX_LINE);
+X	}
+X	return;
+X}
+X
+X/* dummy routine for quit */
+X/* ARGSUSED */
+void
+do_cleanup(e)
+int e; {
+X	return;
+X}
+X
+X/* print out usage, called by quit */
+X/* ARGSUSED */
+void
+usage(e)
+int e; {
+X	fprintf(stderr,
+X"usage: %s [-b] [-c [-OUGd]] [-i] [-B [-D dir]] [-I] [-k] [-V]\n\t[-t term] [file]\n",
+X		prg_name);
+X	return;
+X}
+X
+int
+main(argc, argv)
+int argc;
+char **argv; {
+X	extern char *optarg;
+X	extern int optind;
+X	extern int opterr;
+X	char *term = NULL;
+X	char *file = NULL;
+X	int r;
+X	char c;
+X	int pversion = 0;
+X
+X	prg_name = strrchr(argv[0], '/');
+X	if (prg_name == NULL)
+X		prg_name = argv[0];
+X	else
+X		prg_name++;
+X
+X	cleanup = usage;
+X
+X	opterr = 0;
+X
+X	if (strcmp(prg_name, "tic") == 0)
+X		compile = 1;
+X
+X	while ((c = getopt(argc, argv, "bciBIOGUdkVD:t:")) != -1) {
+X		switch(c) {
+X		case 'O':
+X			noOT = 0;
+X			break;
+X		case 'G':
+X			noGNU = 0;
+X			break;
+X		case 'U':
+X			noUW = 0;
+X			break;
+X		case 'D':
+X			if (directory != NULL)
+X				quit(-1, "more than one directory specified");
+X			directory = optarg;
+X			break;
+X		case 't':
+X			if (term != NULL)
+X				quit(-1, "more than one terminal specified");
+X			term = optarg;
+X			break;
+X		case 'd': dodefault = 0; break;
+X		case 'k': keepcomments = 1; break;
+X		case 'b': from_tbin = 1; break;
+X		case 'c': from_tcap = 1; break;
+X		case 'i': from_tinfo = 1; break;
+X		case 'B': compile = 1; break;
+X		case 'I': compile = 0; break;
+X		case 'V': pversion = 1; break;
+X		case '?': 
+X		default:
+X			quit(-1, "bad or missing command line argument");
+X		}
+X	}
+X
+X	if (pversion) {
+X		quit(0, "%s\n%s", _mytinfo_version, SCCSid);
+X	}
+X
+X	if (optind == argc - 1)
+X		file = argv[optind];
+X	else if (optind != argc)
+X		quit(-1, "wrong number of arguments");
+X
+X	if (from_tbin + from_tcap + from_tinfo > 1) 
+X		quit(-1, "more than one input file type specified");
+X
+X	if (!from_tcap && !from_tinfo && !from_tbin && file != NULL) {
+X		if (strcmp(prg_name, "cap2info") == 0
+X		    || strcmp(prg_name, "captoinfo") == 0)
+X			from_tcap = 1;
+X		else if (strcmp(prg_name, "tic") == 0)
+X			from_tinfo = 1;
+X		else 
+X			quit(-1, "no input file type specified");
+X	}
+X
+X	if (from_tbin && compile) 
+X		quit(-1, "can't convert from binary to binary");
+X
+X	if (file != NULL) {
+X		if (from_tbin) {
+X			cleanup = do_cleanup;
+X			convbinfile(file);
+X			exit(0);
+X		}
+X		if (!compile)
+X			path = _buildpath(file, 0, NULL, -1);
+X		else {
+X			path = _buildpath(file, 0,
+X					  "$TERMINFO", 2,
+X					  "$MYTERMINFO", 2,
+X#ifdef TERMINFODIR
+X					  TERMINFODIR, 0,
+X#endif
+X					  NULL, -1);
+X		}
+X		if (path == NULL)
+X			quit(-1, "can't build path");
+X		if (term == NULL) {
+X			cleanup = do_cleanup;
+X			if (from_tcap && !compile)
+X				convtcfile(file);
+X			else 
+X				convtifile(file);
+X			exit(0);
+X		}
+X	} else if (from_tcap && !compile)
+X		path = _buildpath("$TERMCAP", 1,
+X#ifdef TERMCAPFILE
+X				  TERMCAPFILE, 0,
+X#endif
+X				  NULL, -1);
+X	else if (from_tinfo || from_tbin)
+X		path = _buildpath("$TERMINFO", 2,
+X				  "$MYTERMINFO", 2,
+X#ifdef TERMINFODIR
+X				  TERMINFODIR, 0,
+X#endif
+X#ifdef TERMINFOSRC
+X				  TERMINFOSRC, 0,
+X#endif
+X				  NULL, -1);
+X	else if (from_tcap)
+X		path = _buildpath("$TERMCAP", 1,
+X#ifdef TERMCAPFILE
+X				  TERMCAPFILE, 0,
+X#endif
+X				  "$TERMINFO", 2,
+X				  "$MYTERMINFO", 2,
+X#ifdef TERMINFODIR
+X				  TERMINFODIR, 0,
+X#endif
+X				  NULL, -1);
+X	else 
+X		path = _buildpath("$TERMINFO", 2,
+X				  "$MYTERMINFO", 2,
+X				  "$TERMCAP", 1,
+X#ifdef TERMINFODIR
+X				  TERMINFODIR, 0,
+X#endif
+X#ifdef TERMINFOSRC
+X				  TERMINFOSRC, 0,
+X#endif
+X#ifdef TERMCAPFILE
+X				  TERMCAPFILE, 0,
+X#endif
+X				  NULL, -1);
+X	if (term == NULL) {
+X		term = getenv("TERM");
+X		if (term == NULL)
+X			quit(-1, "no terminal type given");
+X	}
+X
+X	cleanup = do_cleanup;
+X
+X	r = _findterm(term, path, buf);
+X	switch(r) {
+X	case 1:
+X		convtcap();
+X		break;
+X	case 2:
+X		convtinfo();
+X		break;
+X	case 3:
+X		if (compile)
+X			quit(-1, "entry is already compiled");
+X		convtbin();
+X		break;
+X	default:
+X		quit(-1, "can't find a terminal entry for '%s'", term);
+X	}
+X
+X	exit(0);
+X	return 0;
+X}
+END_OF_FILE
+if test 26474 -ne `wc -c <'tconv.c'`; then
+    echo shar: \"'tconv.c'\" unpacked with wrong size!
+fi
+# end of 'tconv.c'
+fi
+if test -f 'tparm.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'tparm.c'\"
+else
+echo shar: Extracting \"'tparm.c'\" \(16639 characters\)
+sed "s/^X//" >'tparm.c' <<'END_OF_FILE'
+X/*
+X * tparm.c
+X *
+X * By Ross Ridge
+X * Public Domain
+X * 92/02/01 07:30:36
+X *
+X */
+X
+X#include "defs.h"
+X#include "term.h"
+X
+X#include <ctype.h>
+X
+X#ifdef USE_SCCS_IDS
+static const char SCCSid[] = "@(#) mytinfo tparm.c 3.2 92/02/01 public domain, By Ross Ridge";
+X#endif
+X
+X#ifndef MAX_PUSHED
+X#define MAX_PUSHED	32
+X#endif
+X
+X#define ARG	1
+X#define NUM	2
+X
+X#define INTEGER	1
+X#define STRING	2
+X
+typedef struct stack_str {
+X	int	type;
+X	int	argnum;
+X	int	value;
+X} stack;
+X
+static stack S[MAX_PUSHED];
+static stack vars['z'-'a'+1];
+static int pos = 0;
+X
+static struct arg_str {
+X	int type;
+X	int	integer;
+X	char	*string;
+X} arg_list[10];
+X
+static int argcnt;
+X
+static va_list tparm_args;
+X
+static int
+pusharg(arg)
+int arg; {
+X	if (pos == MAX_PUSHED)
+X		return 1;
+X	S[pos].type = ARG;
+X	S[pos++].argnum = arg;
+X	return 0;
+X}
+X
+static int
+pushnum(num)
+int num; {
+X	if (pos == MAX_PUSHED)
+X		return 1;
+X	S[pos].type = NUM;
+X	S[pos++].value = num;
+X	return 0;
+X}
+X
+X/* VARARGS2 */
+static int
+getarg(argnum, type, p)
+int argnum, type;
+anyptr p; {
+X	while (argcnt < argnum) {
+X		arg_list[argcnt].type = INTEGER;
+X		arg_list[argcnt++].integer = (int) va_arg(tparm_args, int);
+X	}
+X	if (argcnt > argnum) {
+X		if (arg_list[argnum].type != type)
+X			return 1;
+X		else if (type == STRING)
+X			*(char **)p = arg_list[argnum].string;
+X		else 
+X			*(int *)p = arg_list[argnum].integer;
+X	} else {
+X		arg_list[argcnt].type = type;
+X		if (type == STRING)
+X			*(char **)p = arg_list[argcnt++].string
+X				= (char *) va_arg(tparm_args, char *);
+X		else
+X			*(int *)p = arg_list[argcnt++].integer = (int) va_arg(tparm_args, int);
+X	}
+X	return 0;
+X}
+X
+X
+static int
+popstring(str)
+char **str; {
+X	if (pos-- == 0)
+X		return 1;
+X	if (S[pos].type != ARG)
+X		return 1;
+X	return(getarg(S[pos].argnum, STRING, (anyptr) str));
+X}
+X
+static int
+popnum(num)
+int *num; {
+X	if (pos-- == 0)
+X		return 1;
+X	switch (S[pos].type) {
+X	case ARG:
+X		return (getarg(S[pos].argnum, INTEGER, (anyptr) num));
+X	case NUM:
+X		*num = S[pos].value;
+X		return 0;
+X	}
+X	return 1;
+X}
+X
+static int
+cvtchar(sp, c)
+register char *sp, *c; {
+X	switch(*sp) {
+X	case '\\':
+X		switch(*++sp) {
+X		case '\'':
+X		case '$':
+X		case '\\':
+X		case '%':
+X			*c = *sp;
+X			return 2;
+X		case '\0':
+X			*c = '\\';
+X			return 1;
+X		case '0':
+X			if (sp[1] == '0' && sp[2] == '0') {
+X				*c = '\0';
+X				return 4;
+X			}
+X			*c = '\200'; /* '\0' ???? */
+X			return 2;
+X		default:
+X			*c = *sp;
+X			return 2;
+X		}
+X	default:
+X		*c = *sp;
+X		return 1;
+X	}
+X}
+X
+static int termcap;
+X
+X/* sigh... this has got to be the ugliest code I've ever written.
+X   Trying to handle everything has its cost, I guess.
+X
+X   It actually isn't to hard to figure out if a given % code is supposed
+X   to be interpeted with its termcap or terminfo meaning since almost
+X   all terminfo codes are invalid unless something has been pushed on
+X   the stack and termcap strings will never push things on the stack
+X   (%p isn't used by termcap). So where we have a choice we make the
+X   decision by wether or not somthing has been pushed on the stack.
+X   The static variable termcap keeps track of this; it starts out set
+X   to 1 and is incremented as each argument processed by a termcap % code,
+X   however if something is pushed on the stack it's set to 0 and the
+X   rest of the % codes are interpeted as terminfo % codes. Another way
+X   of putting it is that if termcap equals one we haven't decided either
+X   way yet, if it equals zero we're looking for terminfo codes, and if
+X   its greater than 1 we're looking for termcap codes.
+X
+X   Terminfo % codes:
+X
+X	%%	output a '%'
+X	%[[:][-+# ][width][.precision]][doxXs]
+X		output pop according to the printf format
+X	%c	output pop as a char
+X	%'c'	push character constant c.
+X	%{n}	push decimal constant n.
+X	%p[1-9] push paramter [1-9]
+X	%g[a-z] push variable [a-z]
+X	%P[a-z] put pop in variable [a-z]
+X	%l	push the length of pop (a string)
+X	%+	add pop to pop and push the result
+X	%-	subtract pop from pop and push the result
+X	%*	multiply pop and pop and push the result
+X	%&	bitwise and pop and pop and push the result
+X	%|	bitwise or pop and pop and push the result
+X	%^	bitwise xor pop and pop and push the result
+X	%~	push the bitwise not of pop
+X	%=	compare if pop and pop are equal and push the result
+X	%>	compare if pop is less than pop and push the result
+X	%<	compare if pop is greater than pop and push the result
+X	%A	logical and pop and pop and push the result
+X	%O	logical or pop and pop and push the result
+X	%!	push the logical not of pop
+X	%? condition %t if_true [%e if_false] %;
+X		if condtion evaulates as true then evaluate if_true,
+X		else evaluate if_false. elseif's can be done:
+X%? cond %t true [%e cond2 %t true2] ... [%e condN %t trueN] [%e false] %;
+X	%i	add one to parameters 1 and 2. (ANSI)
+X
+X  Termcap Codes:
+X
+X	%%	output a %
+X	%.	output parameter as a character
+X	%d	output parameter as a decimal number
+X	%2	output parameter in printf format %02d
+X	%3	output parameter in printf format %03d
+X	%+x	add the character x to parameter and output it as a character
+X(UW)	%-x	subtract parameter FROM the character x and output it as a char
+X(UW)	%ax	add the character x to parameter
+X(GNU)	%a[+*-/=][cp]x
+X		GNU arithmetic. 
+X(UW)	%sx	subtract parameter FROM the character x
+X	%>xy	if parameter > character x then add character y to parameter
+X	%B	convert to BCD (parameter = (parameter/10)*16 + parameter%16)
+X	%D	Delta Data encode (parameter = parameter - 2*(paramter%16))
+X	%i	increment the first two parameters by one
+X	%n	xor the first two parameters by 0140
+X(GNU)	%m	xor the first two parameters by 0177
+X	%r	swap the first two parameters
+X(GNU)	%b	backup to previous parameter
+X(GNU)	%f	skip this parameter
+X
+X  Note the two definitions of %a, the GNU defintion is used if the characters
+X  after the 'a' are valid, otherwise the UW definition is used.
+X
+X  (GNU) used by GNU Emacs termcap libraries
+X  (UW) used by the University of Waterloo (MFCF) termcap libraries
+X
+X*/
+X
+X#ifdef lint
+X/* VARARGS1 */
+char *
+tparm(str)
+char *str; {
+X#else /* lint */
+X#ifdef USE_STDARG
+X#ifdef USE_PROTOTYPES
+char *tparm(char *str, ...) {
+X#else /* USE_PROTOTYPES */
+char *tparm(str)
+char *str; {
+X#endif /* USE_PROTOTYPES */
+X#else /* USE_STDARG */
+char *tparm(va_alist)
+va_dcl {
+X	char *str;
+X#endif
+X#endif
+X	static char OOPS[] = "OOPS";
+X	static char buf[MAX_LINE];
+X	register char *sp, *dp;
+X	register char *fmt;
+X	char conv_char;
+X	char scan_for;
+X	int scan_depth, if_depth;
+X	static int i, j;
+X	static char *s, c;
+X	char fmt_buf[MAX_LINE];
+X	char sbuf[MAX_LINE];
+X
+X#ifdef lint
+X	scan_depth = 0;
+X#else
+X#ifdef USE_STDARG
+X	va_start(tparm_args, str);
+X#else
+X	va_start(tparm_args);
+X	str = (char *) va_arg(tparm_args, char *);
+X#endif
+X#endif
+X
+X	sp = str;
+X	dp = buf;
+X	scan_for = 0;
+X	if_depth = 0;
+X	argcnt = 0;
+X	pos = 0;
+X	termcap = 1;
+X	while(*sp != '\0') {
+X		switch(*sp) {
+X		case '\\':
+X			if (scan_for) {
+X				if (*++sp != '\0')
+X					sp++;
+X				break;
+X			}
+X			*dp++ = *sp++;
+X			if (*sp != '\0')
+X				*dp++ = *sp++;
+X			break;
+X		case '%':
+X			sp++;
+X			if (scan_for) {
+X				if (*sp == scan_for && if_depth == scan_depth) {
+X					if (scan_for == ';')
+X						if_depth--;
+X					scan_for = 0;
+X				} else if (*sp == '?')
+X					if_depth++;
+X				else if (*sp == ';') {
+X					if (if_depth == 0)
+X						return OOPS;
+X					else
+X						if_depth--;
+X				}
+X				sp++;
+X				break;
+X			}
+X			fmt = NULL;
+X			switch(*sp) {
+X			case '%':
+X				*dp++ = *sp++;
+X				break;
+X			case '+':
+X				if (!termcap) {
+X					if (popnum(&j) || popnum(&i))
+X						return OOPS;
+X					i += j;
+X					if (pushnum(i))
+X						return OOPS;
+X					sp++;
+X					break;
+X				}
+X				;/* FALLTHROUGH */
+X			case 'C':
+X				if (*sp == 'C') { 
+X					if (getarg(termcap - 1, INTEGER, &i))
+X						return OOPS;
+X					if (i >= 96) {
+X						i /= 96;
+X						if (i == '$')
+X							*dp++ = '\\';
+X						*dp++ = i;
+X					}
+X				}
+X				fmt = "%c";
+X				/* FALLTHROUGH */
+X			case 'a':
+X				if (!termcap)
+X					return OOPS;
+X				if (getarg(termcap - 1, INTEGER, (anyptr) &i))
+X					return OOPS;
+X				if (*++sp == '\0')
+X					return OOPS;
+X				if ((sp[1] == 'p' || sp[1] == 'c')
+X			            && sp[2] != '\0' && fmt == NULL) {
+X					/* GNU aritmitic parameter, what they
+X					   realy need is terminfo.	      */
+X					int val, lc;
+X					if (sp[1] == 'p'
+X					    && getarg(termcap - 1 + sp[2] - '@',
+X						      INTEGER, (anyptr) &val))
+X						return OOPS;
+X					if (sp[1] == 'c') {
+X						lc = cvtchar(sp + 2, &c) + 2;
+X					/* Mask out 8th bit so \200 can be
+X					   used for \0 as per GNU doc's    */
+X						val = c & 0177;
+X					} else
+X						lc = 2;
+X					switch(sp[0]) {
+X					case '=':
+X						break;
+X					case '+':
+X						val = i + val;
+X						break;
+X					case '-':
+X						val = i - val;
+X						break;
+X					case '*':
+X						val = i * val;
+X						break;
+X					case '/':
+X						val = i / val;
+X						break;
+X					default:
+X					/* Not really GNU's %a after all... */
+X						lc = cvtchar(sp, &c);
+X						val = c + i;
+X						break;
+X					}
+X					arg_list[termcap - 1].integer = val;
+X					sp += lc;
+X					break;
+X				}
+X				sp += cvtchar(sp, &c);
+X				arg_list[termcap - 1].integer = c + i;
+X				if (fmt == NULL)
+X					break;
+X				sp--;
+X				/* FALLTHROUGH */
+X			case '-':
+X				if (!termcap) {
+X					if (popnum(&j) || popnum(&i))
+X						return OOPS;
+X					i -= j;
+X					if (pushnum(i))
+X						return OOPS;
+X					sp++;
+X					break;
+X				}
+X				fmt = "%c";
+X				/* FALLTHROUGH */
+X			case 's':
+X				if (termcap && (fmt == NULL || *sp == '-')) {
+X					if (getarg(termcap - 1, INTEGER, &i))
+X						return OOPS;
+X					if (*++sp == '\0')
+X						return OOPS;
+X					sp += cvtchar(sp, &c);
+X					arg_list[termcap - 1].integer = c - i;
+X					if (fmt == NULL)
+X						break;
+X					sp--;
+X				}
+X				if (!termcap)
+X					return OOPS;
+X				;/* FALLTHROUGH */
+X			case '.':
+X				if (termcap && fmt == NULL) 
+X					fmt = "%c";
+X				;/* FALLTHROUGH */
+X			case 'd':
+X				if (termcap && fmt == NULL) 
+X					fmt = "%d";
+X				;/* FALLTHROUGH */
+X			case '2':
+X				if (termcap && fmt == NULL)
+X					fmt = "%02d";
+X				;/* FALLTHROUGH */
+X			case '3':
+X				if (termcap && fmt == NULL) 
+X					fmt = "%03d";
+X				;/* FALLTHROUGH */
+X			case ':': case ' ': case '#': case 'u':
+X			case 'x': case 'X': case 'o': case 'c':
+X			case '0': case '1': case '4': case '5':
+X			case '6': case '7': case '8': case '9':
+X				if (fmt == NULL) {
+X					if (termcap)
+X						return OOPS;
+X					if (*sp == ':')
+X						sp++;
+X					fmt = fmt_buf;
+X					*fmt++ = '%';
+X					while(*sp != 's' && *sp != 'x' && *sp != 'X' && *sp != 'd' && *sp != 'o' && *sp != 'c' && *sp != 'u') {
+X						if (*sp == '\0')
+X							return OOPS;
+X						*fmt++ = *sp++;
+X					}
+X					*fmt++ = *sp;
+X					*fmt = '\0';
+X					fmt = fmt_buf;
+X				}
+X				conv_char = fmt[strlen(fmt) - 1];
+X				if (conv_char == 's') {
+X					if (popstring(&s))
+X						return OOPS;
+X					sprintf(sbuf, fmt, s);
+X				} else {
+X					if (termcap) {
+X						if (getarg(termcap++ - 1,
+X							   INTEGER, &i))
+X							return OOPS;
+X					} else
+X						if (popnum(&i))
+X							return OOPS;
+X					if (i == 0 && conv_char == 'c')
+X						strcpy(sbuf, "\000");
+X					else
+X						sprintf(sbuf, fmt, i);
+X				}
+X				sp++;
+X				fmt = sbuf;
+X				while(*fmt != '\0') {
+X					if (*fmt == '$') 
+X						*dp++ = '\\';
+X					*dp++ = *fmt++;
+X				}
+X				break;
+X			case 'r':
+X				if (!termcap || getarg(1, INTEGER, &i))
+X					return OOPS;
+X				arg_list[1].integer = arg_list[0].integer;
+X				arg_list[0].integer = i;
+X				sp++;
+X				break;
+X			case 'i':
+X				if (getarg(1, INTEGER, &i)
+X				    || arg_list[0].type != INTEGER)
+X					return OOPS;
+X				arg_list[1].integer++;
+X				arg_list[0].integer++;
+X				sp++;
+X				break;
+X			case 'n':
+X				if (!termcap || getarg(1, INTEGER, &i))
+X					return OOPS;
+X				arg_list[0].integer ^= 0140;
+X				arg_list[1].integer ^= 0140;
+X				sp++;
+X				break;
+X			case '>':
+X				if (!termcap) {
+X					if (popnum(&j) || popnum(&i))
+X						return OOPS;
+X					i = (i > j);
+X					if (pushnum(i))
+X						return OOPS;
+X					sp++;
+X					break;
+X				}
+X				if (getarg(termcap-1, INTEGER, &i))
+X					return OOPS;
+X				sp += cvtchar(sp, &c);
+X				if (i > c) {
+X					sp += cvtchar(sp, &c);
+X					arg_list[termcap-1].integer += c;
+X				} else
+X					sp += cvtchar(sp, &c);
+X				sp++;
+X				break;
+X			case 'B':
+X				if (!termcap || getarg(termcap-1, INTEGER, &i))
+X					return OOPS;
+X				arg_list[termcap-1].integer = 16*(i/10)+i%10;
+X				sp++;
+X				break;
+X			case 'D':
+X				if (!termcap || getarg(termcap-1, INTEGER, &i))
+X					return OOPS;
+X				arg_list[termcap-1].integer = i - 2 * (i % 16);
+X				sp++;
+X				break;
+X			case 'p':
+X				if (termcap > 1)
+X					return OOPS;
+X				if (*++sp == '\0')
+X					return OOPS;
+X				if (*sp == '0')
+X					i = 9;
+X				else
+X					i = *sp - '1';
+X				if (i < 0 || i > 9)
+X					return OOPS;
+X				if (pusharg(i))
+X					return OOPS;
+X				termcap = 0;
+X				sp++;
+X				break;
+X			case 'P':
+X				if (termcap || *++sp == '\0')
+X					return OOPS;
+X				i = *sp++ - 'a';
+X				if (i < 0 || i > 25)
+X					return OOPS;
+X				if (pos-- == 0)
+X					return OOPS;
+X				switch(vars[i].type = S[pos].type) {
+X				case ARG:
+X					vars[i].argnum = S[pos].argnum;
+X					break;
+X				case NUM:
+X					vars[i].value = S[pos].value;
+X					break;
+X				}
+X				break;
+X			case 'g':
+X				if (termcap || *++sp == '\0')
+X					return OOPS;
+X				i = *sp++ - 'a';
+X				if (i < 0 || i > 25)
+X					return OOPS;
+X				switch(vars[i].type) {
+X				case ARG:
+X					if (pusharg(vars[i].argnum))
+X						return OOPS;
+X					break;
+X				case NUM:
+X					if (pushnum(vars[i].value))
+X						return OOPS;
+X					break;
+X				}
+X				break;
+X			case '\'':
+X				if (termcap > 1)
+X					return OOPS;
+X				if (*++sp == '\0')
+X					return OOPS;
+X				sp += cvtchar(sp, &c);
+X				if (pushnum(c) || *sp++ != '\'')
+X					return OOPS;
+X				termcap = 0;
+X				break;
+X			case '{':
+X				if (termcap > 1)
+X					return OOPS;
+X				i = 0;
+X				sp++;
+X				while(isdigit(*sp))
+X					i = 10 * i + *sp++ - '0';
+X				if (*sp++ != '}' || pushnum(i))
+X					return OOPS;
+X				termcap = 0;
+X				break;
+X			case 'l':
+X				if (termcap || popstring(&s))
+X					return OOPS;
+X				i = strlen(s);
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '*':
+X				if (termcap || popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i *= j;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '/':
+X				if (termcap || popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i /= j;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case 'm':
+X				if (termcap) {
+X					if (getarg(1, INTEGER, &i))
+X						return OOPS;
+X					arg_list[0].integer ^= 0177;
+X					arg_list[1].integer ^= 0177;
+X					sp++;
+X					break;
+X				}
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i %= j;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '&':
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i &= j;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '|':
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i |= j;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '^':
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i ^= j;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '=':
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i = (i == j);
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '<':
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i = (i < j);
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case 'A':
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i = (i && j);
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case 'O':
+X				if (popnum(&j) || popnum(&i))
+X					return OOPS;
+X				i = (i || j);
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '!':
+X				if (popnum(&i))
+X					return OOPS;
+X				i = !i;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '~':
+X				if (popnum(&i))
+X					return OOPS;
+X				i = ~i;
+X				if (pushnum(i))
+X					return OOPS;
+X				sp++;
+X				break;
+X			case '?':
+X				if (termcap > 1)
+X					return OOPS;
+X				termcap = 0;
+X				if_depth++;
+X				sp++;
+X				break;
+X			case 't':
+X				if (popnum(&i) || if_depth == 0)
+X					return OOPS;
+X				if (!i) {
+X					scan_for = 'e';
+X					scan_depth = if_depth;
+X				}
+X				sp++;
+X				break;
+X			case 'e':
+X				if (if_depth == 0)
+X					return OOPS;
+X				scan_for = ';';
+X				scan_depth = if_depth;
+X				sp++;
+X				break;
+X			case ';':
+X				if (if_depth-- == 0)
+X					return OOPS;
+X				sp++;
+X				break;
+X			case 'b':
+X				if (--termcap < 1)
+X					return OOPS;
+X				sp++;
+X				break;
+X			case 'f':
+X				if (!termcap++)
+X					return OOPS;
+X				sp++;
+X				break;
+X			}
+X			break;
+X		default:
+X			if (scan_for)
+X				sp++;
+X			else
+X				*dp++ = *sp++;
+X			break;
+X		}
+X	}
+X	va_end(tparm_args);
+X	*dp = '\0';
+X	return buf;
+X}
+X
+X#ifdef TEST
+X
+void
+putch(c)
+int c; {
+X	c &= 0xff;
+X	if (c > 127 || c < 0) {
+X		printf("\\%03o", c);
+X	} else if (c < 32) {
+X		printf("^%c", c + '@');
+X	} else if (c == 127) {
+X		printf("^?");
+X	} else {
+X		putchar(c);
+X	}
+X}
+X
+char line[MAX_LINE];
+X
+int
+main(argc, argv)
+int argc;
+char **argv; {
+X	register char *sp;
+X	putchar('\n');
+X
+X	while(gets(line) != NULL) {
+X		sp = tparm(line, 1, -2, 30, 0, "bob was here");
+X		while(*sp)
+X			putch(*sp++);
+X		putchar('\n');
+X	}
+X	return 0;
+X}
+X#endif
+END_OF_FILE
+if test 16639 -ne `wc -c <'tparm.c'`; then
+    echo shar: \"'tparm.c'\" unpacked with wrong size!
+fi
+# end of 'tparm.c'
+fi
+if test -f 'tset.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'tset.c'\"
+else
+echo shar: Extracting \"'tset.c'\" \(15371 characters\)
+sed "s/^X//" >'tset.c' <<'END_OF_FILE'
+X/*
+X * tset.c
+X * 
+X * By Ross Ridge
+X * Public Domain
+X * 92/02/19 18:53:12
+X *
+X */
+X
+X#define NOTLIB
+X
+X#include "defs.h"
+X
+static const char SCCSid[] = "@(#) mytinfo tset.c 3.3 92/02/19 public domain, By Ross Ridge";
+X
+X#define SINGLE
+X#include "term.h"
+X
+X#include <ctype.h>
+X
+X#ifdef USE_TERMIO
+X
+X#ifndef ICANON
+X#include <termio.h>
+X#endif
+X
+X#undef USE_SUSPEND
+X#ifdef VSUSP
+X#define USE_SUSPEND
+X#endif
+X
+X#define USE_INTERRUPT
+X
+X#ifdef TCSETS
+X#define USE_TERMIOS
+X#else
+X#undef USE_SUSPEND
+X#endif
+X
+X#else /* USE_TERMIO */
+X#ifdef USE_SGTTY
+X
+X#ifndef CBREAK
+X#include <sgtty.h>
+X#endif
+X
+X#undef USE_INTERRUPT
+X#ifdef TIOCGETC
+X#define USE_INTERRUPT
+X#endif
+X
+X#undef USE_SUSPEND
+X#ifdef TIOCGLTC
+X#define USE_SUSPEND
+X#endif
+X
+X#undef USE_NEWBSDTTY
+X#ifdef TIOCSETD
+X#ifdef NTTYDISC
+X#define USE_NEWBSDTTY
+X#endif
+X#endif
+X
+X#else /* USE_SGTTY */
+X
+X#undef USE_SUSPEND
+X#define USE_NOTTY
+X
+X#endif /* else USE_SGTTY */
+X#endif /* else USE_TERMIO */
+X
+X#ifndef key_interrupt_char
+X#undef USE_INTERRUPT
+X#endif
+X
+X#ifndef key_suspend_char
+X#undef USE_SUSPEND
+X#endif
+X
+char *term;
+int asked = 0;
+long baudrate;
+X
+X#ifndef USE_STDLIB
+X#ifdef USE_PROTOTYPES
+long atol(char const *);
+X#else
+long atol();
+X#endif
+X#endif
+X
+X#define OUTPUT_TERM	1
+X#define OUTPUT_SHELL	2
+X#define OUTPUT_TERMCAP	3
+X
+X#define PUTS(s)		tputs(s, 1, putch)
+X#define PUTCHAR(c)	putc(c, stderr)
+X#define FLUSH		fflush(stderr)
+X
+X#ifdef USE_SMALLMEM
+extern unsigned short _baud_tbl[];
+X#else
+extern long _baud_tbl[];
+X#endif
+X
+extern void (*cleanup)();
+X
+static void
+clean(e)
+int e; {
+X	return;
+X}
+X
+static int
+putch(c)
+int c; {
+X	return putc(c, stderr);
+X}
+X
+void
+set_term(name, query)
+char *name;
+int query; {
+X	static char buf[MAX_LINE];
+X	char *s, *t;
+X
+X	if (query) {
+X		fprintf(stderr, "TERM = (%s) ", name);
+X		fflush(stderr);
+X		asked = 1;
+X		if (gets(buf) != NULL) {
+X			s = buf;
+X			while(*s != '\0' && isspace(*s))
+X				s++;
+X			t = s;
+X			while(*s != '\0' && !isspace(*s))
+X				s++;
+X			*s = '\0';
+X			if (*t != '\0') {
+X				term = t;
+X				return;
+X			}
+X		}
+X	}
+X	term = strcpy(buf, name);
+X}
+X
+int
+map_term(map, ask)
+char *map;
+int ask; {
+X	char *type;
+X	char test = 0;
+X	char *baud = NULL;
+X
+X	type = map;
+X#ifndef USE_NOTTY
+X	while(*map && strchr(">@<!:?", *map) == NULL)
+X		map++;
+X	if (*map != '\0' && *map != ':' && *map != '?') {
+X		if (*map == '!') {
+X			switch(*++map) {
+X			case '>': test = 'g'; break;
+X			case '@': test = 'n'; break;
+X			case '<': test = 'l'; break;
+X			default:
+X				quit(-1, "bad argument to 'm' switch");
+X			}
+X		} else
+X			test = *map;
+X		*map++ = '\0';
+X		baud = map;
+X		while(*map && *map != ':')
+X			map++;
+X	}
+X
+X#else
+X	while(*map && *map != ':' && *map != '?')
+X		map++;
+X#endif
+X
+X	if (*map == ':')
+X		*map++ = '\0';
+X	if (*map == '?') {
+X		ask = 1;
+X		*map++ = '\0';
+X	}
+X	if (*map == '\0') 
+X		quit(-1, "bad argument to 'm' switch");
+X
+X	if (type[0] != '\0' && strcmp(type, term) != 0) {
+X		return 0;
+X	}
+X
+X#ifndef USE_NOTTY
+X	switch(test) {
+X	case '>':
+X		if (baudrate <= atol(baud))
+X			return 0;
+X		break;
+X	case '<':
+X		if (baudrate >= atol(baud))
+X			return 0;
+X		break;
+X	case '@':
+X		if (baudrate != atol(baud))
+X			return 0;
+X		break;
+X	case 'l':
+X		if (baudrate < atol(baud))
+X			return 0;
+X		break;
+X	case 'g':
+X		if (baudrate > atol(baud))
+X			return 0;
+X		break;
+X	case 'n':
+X		if (baudrate == atol(baud))
+X			return 0;
+X		break;
+X	}
+X#endif
+X
+X	set_term(map, ask);
+X	return 1;
+X}
+X
+int
+conv_char(s)
+char *s; {
+X	if (s[0] == '^' && s[1] >= '@' && s[1] <= '\177')
+X		return s[1] & 31;
+X	else if (s[0] == '^' && s[1] == '?')
+X		return '\177';
+X	else if (s[0] != '\0')
+X		return s[0];
+X	else
+X		return -2;
+X}
+X
+char *
+expand_char(c)
+int c; {
+X	static char buf[5];
+X
+X	if (c < 0 || c > 127) {
+X		sprintf(buf, "\\%03o", c & 0177);
+X	} else if (c == 127) {
+X		return "DEL";
+X	} else if (c < 32) {
+X		buf[0] = '^';
+X		buf[1] = c + 64;
+X		buf[2] = '\0';
+X	} else {
+X		buf[0] = c;
+X		buf[1] = '\0';
+X	}
+X
+X	return buf;
+X}
+X
+X#define START 	1
+X#define COPY	2
+X#define ESCAPE	3
+X
+void
+compress_buf(buf)
+char *buf; {
+X	char *s, *d;
+X	int state = START;
+X
+X	d = s = buf;
+X
+X	while(*s) {
+X		switch(state) {
+X		case START:
+X			if (isspace(*s) || *s == ':') {
+X				s++;
+X				break;
+X			}
+X			state = COPY;
+X			/* FALLTHROUGH */
+X		case COPY:
+X			switch(*s) {
+X			case '^':
+X			case '\\':
+X				state = ESCAPE;
+X				break;
+X			case ':':
+X				state = START;
+X				break;
+X			}
+X			*d++ = *s++;
+X			break;
+X
+X		case ESCAPE:
+X			*d++ = *s++;
+X			state = COPY;
+X			break;
+X		}
+X	}
+X}
+X
+static void
+usage(e)
+int e; {
+X#ifdef USE_ANSIC
+X	fprintf(stderr, "usage: %s [-] [-"
+X#define ARG(s)	s
+X#else
+X	fprintf(stderr, "usage: %s [-] [-", prg_name);
+X#define ARG(s)	fputs(s, stderr);
+X#endif
+X			ARG("l")
+X#ifndef USE_NOTTY
+X#ifdef USE_NEWBSDTTY
+X			ARG("n")
+X#endif
+X#endif
+X			ARG("rsAI")
+X#ifndef USE_NOTTY
+X			ARG("Q")
+X#endif
+X			ARG("S")
+X#ifndef USE_NOTTY
+X			ARG("T")
+X#endif
+X			ARG("]")
+X#ifndef USE_NOTTY
+X			ARG(" [-e[c]] [-E[c]] [-k[c]]")
+X#ifdef USE_INTERRUPT
+X			ARG(" [-i[c]]")
+X#endif
+X#ifdef USE_SUSPEND
+X			ARG(" [-z[c]]")
+X#endif
+X#endif
+X			ARG("\n\t[-m ident")
+X#ifndef USE_NOTTY
+X			ARG("[[!][<@>]speed]")
+X#endif
+X			ARG(":[?]term] [term]\n")
+X#ifdef USE_ANSIC
+X			, prg_name);
+X#endif
+X
+X#undef ARG
+X
+X	return;
+X}
+X
+int
+main(argc, argv)
+int argc;
+char **argv; {
+X	char *s;
+X	int i, j, r, c;
+X	int ask = 0;
+X#ifndef USE_NOTTY
+X	int erase_char = -1;
+X	int erase_if_bs = 0;
+X	int kill_char = -1;
+X#ifdef USE_INTERRUPT
+X	int interrupt_char = -1;
+X#endif
+X#ifdef USE_SUSPEND
+X	int suspend_char = -1;
+X#endif
+X#ifdef USE_NEWBSDTTY
+X	int newbsdtty = 0;
+X#endif
+X#endif /* !USE_NOTTY */
+X	int output_type = 0;
+X	int no_term_init = 0;
+X	int term_type_is = 0;
+X	int no_set_to = 0;
+X	int reset = 0;
+X	int matched = 0;
+X	int expand_tabs = -1;
+X	int is_csh;
+X#ifndef USE_NOTTTY
+X#ifdef USE_TERMIO
+X#ifdef USE_TERMIOS
+X	struct termios tty;
+X#else
+X	struct termio tty;
+X#endif
+X#else
+X#ifdef USE_SGTTY
+X	struct sgttyb tty;
+X#ifdef USE_INTERRUPT
+X	struct tchars tty2;
+X#endif
+X#ifdef USE_SUSPEND
+X	struct ltchars tty3;
+X#endif
+X#endif /* USE_SGTTY */
+X#endif /* else USE_TERMIO */
+X#endif /* !USE_NOTTY */
+X	struct term_path *path;
+X	char buf[MAX_BUF];
+X	FILE *f;
+X	int datatype;
+X
+X	prg_name = argv[0];
+X	s = strrchr(prg_name, '/');
+X	if (s != NULL && *++s != '\0') {
+X		if (strcmp(s, "reset") == 0) {
+X			reset = 1;
+X		}
+X		prg_name = s;
+X	}
+X
+X	cleanup = clean;
+X
+X#ifndef USE_NOTTY
+X#ifdef USE_TERMIO
+X#ifdef USE_TERMIOS
+X	if (ioctl(2, TCGETS, &tty) == -1)
+X#else
+X	if (ioctl(2, TCGETA, &tty) == -1)
+X#endif
+X	{
+X		quit(errno, "ioctl failed");
+X	}
+X	baudrate = _baud_tbl[tty.c_cflag & CBAUD];
+X#else
+X#ifdef USE_SGTTY
+X	if (gtty(2, &tty) == -1) {
+X		quit(errno, "gtty failed");
+X	}
+X	baudrate = _baud_tbl[tty.sg_ospeed];
+X#ifdef USE_INTERRUPT
+X	if (ioctl(2, TIOCGETC, &tty2) == -1) {
+X		quit(errno, "ioctl failed");
+X	}
+X#endif
+X#ifdef USE_SUSPEND
+X	if (ioctl(2, TIOCGLTC, &tty3) == -1) {
+X		quit(errno, "ioctl failed");
+X	}
+X#endif
+X#endif /* USE_SGTTY */
+X#endif /* else USE_TERMIO */
+X#endif /* !USE_NOTTY */
+X
+X	term = getenv("TERM");
+X
+X	cleanup = usage;
+X
+X	for(i = 1; i < argc; i++) {
+X		if (argv[i][0] != '-') {
+X			if (term == NULL) {
+X				term = argv[i];
+X			}
+X			continue;
+X		}
+X		s = argv[i] + 1;
+X		if (*s == '\0') {
+X			output_type = OUTPUT_TERM;
+X			continue;
+X		}
+X		while (*s != '\0') {
+X			switch(*s++) {
+X			case 'A':
+X				ask = 1;
+X				continue;
+X#ifndef USE_NOTTY
+X			case 'E':
+X				erase_if_bs = 1;
+X				/* FALLTHROUGH */
+X			case 'e':
+X				erase_char = conv_char(s);
+X				break;
+X			case 'k':
+X				kill_char = conv_char(s);
+X				break;
+X#ifdef USE_INTERRUPT
+X			case 'i':
+X				interrupt_char = conv_char(s);
+X				break;
+X#endif
+X#ifdef USE_SUSPEND
+X			case 'z':
+X				suspend_char = conv_char(s);
+X				break;
+X#endif
+X			case 'T':
+X				erase_char = kill_char
+X#ifdef USE_INTERRUPT
+X					= interrupt_char
+X#endif
+X#ifdef USE_SUSPEND
+X					= suspend_char
+X#endif
+X					= -2;
+X				continue;
+X#ifdef USE_NEWBSDTTY
+X			case 'n':
+X				newbsdtty = 1;
+X				continue;
+X#endif
+X			case 'Q':
+X				no_set_to = 1;
+X				continue;
+X#endif /* !USE_NOTTY */
+X			case 'l':
+X			case 'I':
+X				no_term_init = 1;
+X				continue;
+X			case 'r':
+X				term_type_is = 1;
+X				continue;
+X			case 's':
+X				output_type = OUTPUT_SHELL;
+X				continue;
+X			case 'S':
+X				output_type = OUTPUT_TERMCAP;
+X				continue;
+X			case 'm':
+X				if (*s == '\0') {
+X					if (i == argc - 1) {
+X						quit(-1, "'m' switch requires an argument.");
+X					}
+X					s = argv[++i];
+X				}
+X				if (!matched) {
+X					matched = map_term(s, ask);
+X				}
+X				break;
+X			default:
+X				quit(-1, "unknown switch '%c'", s[-1]);
+X				break;
+X			}
+X			break;
+X		}
+X	}
+X	
+X	cleanup = clean;
+X
+X	path = _buildpath("$MYTERMINFO", 2,
+X			  "$TERMINFO", 2,
+X			  "$TERMCAP", 1,
+X#ifdef TERMINFODIR
+X			  TERMINFODIR, 0,
+X#endif
+X#ifdef TERMCAPFILE
+X			  TERMCAPFILE, 0,
+X#endif
+X#ifdef TERMINFOSRC
+X			  TERMINFOSRC, 0,
+X#endif
+X			  NULL, -1);
+X
+X	if (path == NULL) {
+X		quit(-1, "malloc error");
+X	}
+X
+X	do {
+X		if (term == NULL) {
+X			term = "unknown";
+X		}
+X
+X		if (ask && !asked) {
+X			set_term(term, 1);
+X		}
+X
+X		datatype = _fillterm(term, path, buf);
+X
+X		switch(datatype) {
+X		case -3:
+X			quit(-1, "malloc error");
+X			/* NOTREACHED */
+X		case -2:
+X			quit(-1, "database in bad format");
+X			/* NOTREACHED */
+X		case -1:
+X			/* quit(-1, "database not found"); */
+X		case 0:
+X			if (ask || asked) {
+X				fprintf(stderr, "terminal type '%s' unknown.\n",
+X					term);
+X				term = NULL;
+X				ask = 1;
+X				asked = 0;
+X			} else {
+X				quit(-1, "terminal type '%s' unknown.\n", term);
+X			}
+X			break;
+X		case 1:
+X		case 2:
+X		case 3:
+X			break;
+X		default:
+X			quit(-1, "oops...");
+X		}
+X	} while(term == NULL);
+X
+X	_delpath(path);
+X
+X	cur_term->baudrate = baudrate;
+X
+X	if (!no_term_init) {
+X
+X		if (init_prog != NULL) {
+X			system(init_prog);
+X		}
+X		FLUSH;
+X
+X		if (reset && reset_1string != NULL) {
+X			PUTS(reset_1string);
+X		} else if (init_1string != NULL) {
+X			PUTS(init_1string);
+X		}
+X		FLUSH;
+X
+X		if (reset && reset_2string != NULL) {
+X			PUTS(reset_2string);
+X		} else if (init_2string != NULL) {
+X			PUTS(init_2string);
+X		}
+X		FLUSH;
+X
+X		if (set_lr_margin != NULL) {
+X			PUTS(tparm(set_lr_margin, 0, columns - 1));
+X		} else if (set_left_margin_parm != NULL
+X			   && set_right_margin_parm != NULL) {
+X			PUTS(tparm(set_left_margin_parm, 0));
+X			PUTS(tparm(set_right_margin_parm, columns - 1));
+X		} else if (clear_margins != NULL && set_left_margin != NULL
+X			   && set_right_margin != NULL) {
+X			PUTS(clear_margins);
+X			if (carriage_return != NULL) {
+X				PUTS(carriage_return);
+X			} else {
+X				PUTCHAR('\r');
+X			}
+X			PUTS(set_left_margin);
+X			if (parm_right_cursor) {
+X				PUTS(tparm(parm_right_cursor, columns - 1));
+X			} else {
+X				for(i = 0; i < columns - 1; i++) {
+X					PUTCHAR(' ');
+X				}
+X			}
+X			PUTS(set_right_margin);
+X			if (carriage_return != NULL) {
+X				PUTS(carriage_return);
+X			} else {
+X				PUTCHAR('\r');
+X			}
+X		}
+X		FLUSH;
+X
+X		if (init_tabs != 8) {
+X			if (clear_all_tabs != NULL && set_tab != NULL) {
+X				if (carriage_return != NULL) {
+X					PUTS(carriage_return);
+X				} else {
+X					PUTCHAR('\r');
+X				}
+X				PUTS(clear_all_tabs);
+X				PUTS(set_tab);
+X				for(i = 8; i < columns - 1; i += 8) {
+X					if (parm_right_cursor) {
+X						PUTS(tparm(parm_right_cursor,
+X						     8));
+X					} else {
+X						for(j = 0; j < 8; j++) {
+X							PUTCHAR(' ');
+X						}
+X					}
+X					PUTS(set_tab);
+X				}
+X				if (carriage_return != NULL) {
+X					PUTS(carriage_return);
+X				} else {
+X					PUTCHAR('\r');
+X				}
+X				expand_tabs = 0;
+X				FLUSH;
+X			} else {
+X				expand_tabs = 1;
+X			}
+X		} else {
+X			expand_tabs = 0;
+X		}
+X
+X		if (reset && reset_file != NULL) {
+X			f = fopen(reset_file, "r");
+X			if (f == NULL) {
+X				quit(errno, "Can't open reset_file: '%s'",
+X				     reset_file);
+X			}
+X			while((c = fgetc(f)) != EOF) {
+X				PUTCHAR(c);
+X			}
+X			fclose(f);
+X		} else if (init_file != NULL) {
+X			f = fopen(init_file, "r");
+X			if (f == NULL) {
+X				quit(errno, "Can't open init_file: '%s'",
+X				     init_file);
+X			}
+X			while((c = fgetc(f)) != EOF) {
+X				PUTCHAR(c);
+X			}
+X			fclose(f);
+X		}
+X		FLUSH;
+X
+X		if (reset && reset_3string != NULL) {
+X			PUTS(reset_3string);
+X		} else if (init_2string != NULL) {
+X			PUTS(init_3string);
+X		}
+X		FLUSH;
+X	}
+X
+X	if (term_type_is) {
+X		fprintf(stderr, "Terminal type is %s\n", term);
+X	}
+X
+X#ifndef USE_NOTTY
+X#ifdef USE_TERMIO
+X
+X	if (expand_tabs == 0 && (tty.c_cflag & TABDLY) == TAB3) {
+X		tty.c_cflag = tty.c_cflag & ~TABDLY;
+X	} else if (expand_tabs == 1) {
+X		tty.c_cflag = (tty.c_cflag & ~TABDLY) | TAB3;
+X	}
+X
+X#define SETTO(v, m, t, c) (c != tty.c_cc[v] ? (tty.c_cc[v] = c,		  \
+X			   !no_set_to ? fprintf(stderr, "%s set to %s\n", t, \
+X					     expand_char(c)) : 0) : 0)
+X
+X#endif
+X#ifdef USE_SGTTY
+X	
+X#ifdef USE_NEWBSDTTY
+X	if (newbsdtty) {
+X		if (ioctl(2, TIOCSETD, NTTYDISC) == -1) {
+X			quit(errno, "Can't switch tty to new line disc.");
+X		}
+X	}
+X#endif
+X
+X	if (expand_tabs == 0) {
+X		tty.sg_flags &= ~XTABS;
+X	} else if (expand_tabs == 1) {
+X		tty.sg_flags |= XTABS;
+X	}
+X
+X#define SETTO(v, m, t, c) (c != m ? (m = c,				  \
+X			   !no_set_to ? fprintf(stderr, "%s set to %s\n", t, \
+X					     expand_char(c)) : 0) : 0)
+X#endif
+X
+X	if (erase_char != -1
+X            && (!erase_if_bs || backspaces_with_bs
+X	        || (cursor_left == NULL && cursor_left[0] != '\b'))) {
+X		if (erase_char != -2) {
+X			c = erase_char;
+X		} else if (cursor_left == NULL || cursor_left[0] == '\0'
+X			 || cursor_left[1] != '\0') {
+X			c = '\b';
+X		} else {
+X			c = cursor_left[0];
+X		}
+X		SETTO(VERASE, tty.sg_erase, "Erase", c);
+X	}
+X
+X	if (kill_char != -1) {
+X		if (kill_char != -2) {
+X			c = kill_char;
+X		} else if (key_kill_char == NULL || key_kill_char[0] == '\0'
+X			   || key_kill_char[1] != '\0') {
+X			c = '\025';
+X		} else {
+X			c = key_kill_char[0];
+X		}
+X		SETTO(VKILL, tty.sg_kill, "Kill", c);
+X	}
+X
+X	
+X#ifdef USE_INTERRUPT
+X	if (interrupt_char != -1) {
+X		if (interrupt_char != -2) {
+X			c = interrupt_char;
+X		} else if (key_interrupt_char == NULL
+X			   || key_interrupt_char[0] == '\0'
+X			   || key_interrupt_char[1] != '\0') {
+X			c = '\177';
+X		} else {
+X			c = key_interrupt_char[0];
+X		}
+X		SETTO(VINTR, tty2.t_intrc, "Interrupt", c);
+X	}
+X#endif
+X
+X#ifdef USE_SUSPEND
+X	if (suspend_char != -1) {
+X		if (suspend_char != -2) {
+X			c = suspend_char;
+X		} else if (key_suspend_char == NULL
+X			   || key_suspend_char[0] == '\0'
+X			   || key_suspend_char[1] != '\0') {
+X			c = '\032';
+X		} else {
+X			c = key_suspend_char[0];
+X		}
+X		SETTO(VSUSP, tty3.t_suspc, "Suspend", c);
+X	}
+X#endif
+X
+X#ifdef USE_TERMIO
+X#ifdef USE_TERMIOS
+X	if (ioctl(2, TCSETS, &tty) == -1)
+X#else
+X	if (ioctl(2, TCSETA, &tty) == -1)
+X#endif
+X	{
+X		quit(errno, "ioctl failed");
+X	}
+X#else
+X#ifdef USE_SGTTY
+X	if (stty(2, &tty) == -1) {
+X		quit(errno, "stty failed");
+X	}
+X#ifdef USE_INTERRUPT
+X	if (ioctl(2, TIOCSETC, &tty2) == -1) {
+X		quit(errno, "ioctl failed");
+X	}
+X#endif
+X#ifdef USE_SUSPEND
+X	if (ioctl(2, TIOCSLTC, &tty3) == -1) {
+X		quit(errno, "ioctl failed");
+X	}
+X#endif
+X#endif /* USE_SGTTY */
+X#endif /* else USE_TERMIO */
+X#endif /* !USE_NOTTY */
+X
+X	s = getenv("SHELL");
+X	r = strlen(s);
+X
+X	if (r >= 3 && strcmp("csh", s + r - 3) == 0) {
+X		is_csh = 1;
+X	} else {
+X		is_csh = 0;
+X	}
+X
+X	switch(output_type) {
+X	case OUTPUT_TERM:
+X		fprintf(stdout, "%s\n", term);
+X		break;
+X
+X	case OUTPUT_TERMCAP:
+X		if (is_csh) {
+X			if (datatype == 1) {
+X				compress_buf(buf);
+X				fprintf(stdout, "%s %s", term, buf);
+X			} else {
+X				s = getenv("TERMCAP");
+X				if (s == NULL || *s == '\0') {
+X					s = ":";
+X				}
+X				fprintf(stdout, "%s %s", term, s);
+X			}
+X			break;
+X		}
+X		/* FALLTHROUGH */
+X	case OUTPUT_SHELL:
+X		if (is_csh) {
+X			fprintf(stdout, "set noglob;\n");
+X			fprintf(stdout, "setenv TERM '%s';\n", term);
+X			if (datatype == 1) {
+X				compress_buf(buf);
+X				fprintf(stdout, "setenv TERMCAP '%s';\n", buf);
+X			}
+X			fprintf(stdout, "unset noglob;\n");
+X		} else {
+X			fprintf(stdout, "export TERM TERMCAP;\n");
+X			fprintf(stdout, "TERM='%s';\n", term);
+X			if (datatype == 1) {
+X				compress_buf(buf);
+X				fprintf(stdout, "TERMCAP='%s';\n", buf);
+X			}
+X		}
+X		break;
+X	}
+X	
+X	return 0;
+X}
+END_OF_FILE
+if test 15371 -ne `wc -c <'tset.c'`; then
+    echo shar: \"'tset.c'\" unpacked with wrong size!
+fi
+# end of 'tset.c'
+fi
+echo shar: End of archive 3 \(of 3\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

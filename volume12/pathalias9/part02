@@ -1,0 +1,2689 @@
+Subject:  v12i002:  Pathalias, version 9, Part02/02
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rs@uunet.UU.NET
+
+Submitted-by: honey@CITI.UMICH.EDU (Peter Honeyman)
+Posting-number: Volume 12, Issue 2
+Archive-name: pathalias9/part02
+
+[  This is the latest and greatest pathalias, and other tools.  It may
+   well be the last one peter ever works on, judging from his off-line
+   remarks... :-)  This version has had several bugs fixed, and has
+   been tested on BSD, Sun, 3B, SysV, Mac, etc.  MOST IMPORTANTLY:
+   it has several new features, and additions to the input syntax, that
+   you will need for all future UUCP maps.  Finally, had I an
+   irrelevant axe to grind, I'd point out that this code has no
+   copyright and is in the public domain.  --r$  ]
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 2)."
+# Contents:  addnode.c arpatxt.c mapit.c parse.y pathalias.1
+# Wrapped by rsalz@uunet on Mon Oct  5 22:45:12 1987
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f addnode.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"addnode.c\"
+else
+echo shar: Extracting \"addnode.c\" \(8514 characters\)
+sed "s/^X//" >addnode.c <<'END_OF_addnode.c'
+X/* pathalias -- by steve bellovin, as told to peter honeyman */
+X#ifndef lint
+Xstatic char	*sccsid = "@(#)addnode.c	9.1 87/10/04";
+X#endif
+X
+X#include "def.h"
+X
+X/* exports */
+Xnode *addnode(), *addprivate();
+Xvoid alias(), hashanalyze(), fixprivate(), penalize();
+Xnode **Table;				/* hash table ^ priority queue */
+Xlong Tabsize;				/* size of Table */	
+X
+X/* imports */
+Xextern link *addlink();
+Xextern node *newnode(), **newtable();
+Xextern char *strsave();
+Xextern int Iflag, Tflag, Vflag;
+Xextern node **Table;
+Xextern long Ncount, Tabsize;
+Xextern char **Argv;
+Xextern void atrace(), die();
+X
+X/* privates */
+XSTATIC void crcinit(), rehash(), lowercase();
+XSTATIC long fold();
+XSTATIC long hash();
+XSTATIC node *isprivate();
+Xstatic node *Private;	/* list of private nodes in current input file */
+X/*
+X * these numbers are chosen because:
+X *	-> they are prime,
+X *	-> they are monotonic increasing,
+X *	-> each is a tad smaller than a multiple of 1024,
+X *	-> they form a fibonacci sequence (almost).
+X * the first point yields good hash functions, the second is used for the
+X * standard re-hashing implementation of open addressing, the third
+X * optimizes for quirks in some mallocs i have seen, and the fourth simply
+X * appeals to me.
+X */
+Xstatic long Primes[] = {
+X	1021, 2039, 3067, 5113, 8179, 13309, 21499, 34807, 56311, 0
+X};
+X
+Xstatic int	Tabindex;
+Xstatic long	Tab128;		/* Tabsize * 128 */
+X
+Xnode	*
+Xaddnode(name)
+X	register char *name;
+X{	register long i;
+X	register node *n;
+X
+X	if (Iflag)
+X		lowercase(name);
+X
+X	/* is it a private host? */
+X	n = isprivate(name);
+X	if (n)
+X		return n;
+X
+X	i = hash(name, 0);
+X	if (Table[i]) 
+X		return Table[i];
+X
+X	n = newnode();
+X	n->n_name = strsave(name);
+X	Table[i] = n;
+X	n->n_tloc = i;	/* essentially a back link to the table */
+X
+X	return n;
+X}
+X
+Xvoid
+Xalias(n1, n2)
+X	node *n1, *n2;
+X{
+X	link	*l;
+X
+X	if (ISADOMAIN(n1) && ISADOMAIN(n2)) {
+X		fprintf(stderr, "%s: domain alias %s = %s is illegal\n", Argv[0], n1->n_name, n2->n_name);
+X		return;
+X	}
+X	l = addlink(n1, n2, (Cost) 0, DEFNET, DEFDIR);
+X	l->l_flag |= LALIAS;
+X	l = addlink(n2, n1, (Cost) 0, DEFNET, DEFDIR);
+X	l->l_flag |= LALIAS;
+X	if (Tflag)
+X		atrace(n1, n2);
+X}
+X
+X/*
+X * fold a string into a long int.  31 bit crc (from andrew appel).
+X * the crc table is computed at run time by crcinit() -- we could
+X * precompute, but it takes 1 clock tick on a 750.
+X *
+X * This fast table calculation works only if POLY is a prime polynomial
+X * in the field of integers modulo 2.  Since the coefficients of a
+X * 32-bit polynomail won't fit in a 32-bit word, the high-order bit is
+X * implicit.  IT MUST ALSO BE THE CASE that the coefficients of orders
+X * 31 down to 25 are zero.  Happily, we have candidates, from
+X * E. J.  Watson, "Primitive Polynomials (Mod 2)", Math. Comp. 16 (1962):
+X *	x^32 + x^7 + x^5 + x^3 + x^2 + x^1 + x^0
+X *	x^31 + x^3 + x^0
+X *
+X * We reverse the bits to get:
+X *	111101010000000000000000000000001 but drop the last 1
+X *         f   5   0   0   0   0   0   0
+X *	010010000000000000000000000000001 ditto, for 31-bit crc
+X *	   4   8   0   0   0   0   0   0
+X */
+X
+X#define POLY32 0xf5000000	/* 32-bit polynomial */
+X#define POLY31 0x48000000	/* 31-bit polynomial */
+X#define POLY POLY31	/* use 31-bit to avoid sign problems */
+X
+Xstatic long CrcTable[128];
+X
+XSTATIC void
+Xcrcinit()
+X{	register int i,j;
+X	register long sum;
+X
+X	for (i = 0; i < 128; i++) {
+X		sum = 0;
+X		for (j = 7-1; j >= 0; --j)
+X			if (i & (1 << j))
+X				sum ^= POLY >> j;
+X		CrcTable[i] = sum;
+X	}
+X}
+X
+XSTATIC long
+Xfold(s)
+X	register char *s;
+X{	register long sum = 0;
+X	register int c;
+X
+X	while (c = *s++)
+X		sum = (sum >> 7) ^ CrcTable[(sum ^ c) & 0x7f];
+X	return sum;
+X}
+X
+X
+X#define HASH1(n) ((n) % Tabsize);
+X#define HASH2(n) (Tabsize - 2 - ((n) % (Tabsize-2)))	/* sedgewick */
+X
+X/*
+X * when alpha is 0.79, there should be 2 probes per access (gonnet).
+X * use long constant to force promotion.  Tab128 biases HIGHWATER by
+X * 128/100 for reduction in strength in isfull().
+X */
+X#define HIGHWATER	79L
+X#define isfull(n)	((n) * 128 >= Tab128)
+X	
+XSTATIC long
+Xhash(name, unique)
+X	char *name;
+X{	register long probe;
+X	register long hash2;
+X	register node *n;
+X
+X	if (isfull(Ncount)) {
+X		if (Tabsize == 0) {		/* first time */
+X			crcinit();
+X			Tabindex = 0;
+X			Tabsize = Primes[0];
+X			Table = newtable(Tabsize);
+X			Tab128 = (HIGHWATER * Tabsize * 128L)/100L;
+X		} else
+X			rehash();		/* more, more! */
+X	}
+X
+X	probe = fold(name);
+X	hash2 = HASH2(probe);
+X	probe = HASH1(probe);
+X
+X	/*
+X	 * probe the hash table.
+X	 * if unique is set, we require a fresh slot.
+X	 * otherwise, use double hashing to find either
+X	 *  (1) an empty slot, or
+X	 *  (2) a non-private copy of this host name
+X	 */
+X	while ((n = Table[probe]) != 0) {
+X		if (unique)
+X			goto skip;
+X		if (n->n_flag & ISPRIVATE)
+X			goto skip;
+X		if (strcmp(n->n_name, name) == 0)
+X			break;			/* this is it! */
+Xskip:
+X		probe -= hash2;
+X		if (probe < 0)
+X			probe += Tabsize;
+X	}
+X	return probe;
+X}
+X
+XSTATIC void
+Xrehash()
+X{	register node **otable, **optr;
+X	register long probe;
+X	long osize;
+X
+X#ifdef DEBUG
+X	hashanalyze();
+X#endif
+X	optr = Table + Tabsize - 1;	/* ptr to last */
+X	otable = Table;
+X	osize = Tabsize;
+X	Tabsize = Primes[++Tabindex];
+X	if (Tabsize == 0)
+X		die("too many hosts");	/* need more prime numbers */
+X	vprintf(stderr, "rehash into %d\n", Tabsize);
+X	Table = newtable(Tabsize);
+X	Tab128 = (HIGHWATER * Tabsize * 128L)/100L;
+X
+X	do {
+X		if (*optr == 0)
+X			continue;	/* empty slot in old table */
+X		probe = hash((*optr)->n_name, (int) ((*optr)->n_flag & ISPRIVATE));
+X		if (Table[probe] != 0)
+X			die("rehash error");
+X		Table[probe] = *optr;
+X		(*optr)->n_tloc = probe;
+X	} while (optr-- > otable);
+X	freetable(otable, osize);
+X}
+X
+Xvoid
+Xhashanalyze()
+X{ 	long	probe, hash2;
+X	int	count, i, collision[8];
+X	int	longest = 0, total = 0, slots = 0, longprobe = 0;
+X	int	nslots = sizeof(collision)/sizeof(collision[0]);
+X
+X	if (!Vflag)
+X		return;
+X
+X	strclear((char *) collision, sizeof(collision));
+X	for (i = 0; i < Tabsize; i++) {
+X		if (Table[i] == 0)
+X			continue;
+X		/* private hosts too hard to account for ... */
+X		if (Table[i]->n_flag & ISPRIVATE)
+X			continue;
+X		count = 1;
+X		probe = fold(Table[i]->n_name);
+X		/* don't change the order of the next two lines */
+X		hash2 = HASH2(probe);
+X		probe = HASH1(probe);
+X		/* thank you! */
+X		while (Table[probe] != 0
+X		    && strcmp(Table[probe]->n_name, Table[i]->n_name) != 0) {
+X			count++;
+X			probe -= hash2;
+X			if (probe < 0)
+X				probe += Tabsize;
+X		}
+X		if (Table[probe] == 0)
+X			die("impossible hash error");
+X		
+X		total += count;
+X		slots++;
+X		if (count > longest) {
+X			longest = count;
+X			longprobe = i;
+X		}
+X		if (count >= nslots)
+X			count = 0;
+X		collision[count]++;
+X	}
+X	for (i = 1; i < nslots; i++)
+X		if (collision[i])
+X			fprintf(stderr, "%d chains: %d (%ld%%)\n",
+X				i, collision[i], (collision[i] * 100L)/ slots);
+X		if (collision[0])
+X			fprintf(stderr, "> %d chains: %d (%ld%%)\n",
+X				nslots - 1, collision[0],
+X				(collision[0] * 100L)/ slots);
+X	fprintf(stderr, "%2.2f probes per access, longest chain: %d, %s\n",
+X		(double) total / slots, longest, Table[longprobe]->n_name);
+X	if (Vflag < 2)
+X		return;
+X	probe = fold(Table[longprobe]->n_name);
+X	hash2 = HASH2(probe);
+X	probe = HASH1(probe);
+X	while (Table[probe] != 0
+X	    && strcmp(Table[probe]->n_name, Table[longprobe]->n_name) != 0) {
+X		fprintf(stderr, "%5d %s\n", probe, Table[probe]->n_name);
+X		probe -= hash2;
+X		if (probe < 0)
+X			probe += Tabsize;
+X	}
+X	fprintf(stderr, "%5d %s\n", probe, Table[probe]->n_name);
+X	
+X}
+X
+X/* convert to lower case in place */
+XSTATIC void
+Xlowercase(s)
+X	register char *s;
+X{
+X	do {
+X		if (isupper(*s))
+X			*s -= 'A' - 'a';	/* ASCII */
+X	} while (*s++);
+X}
+X
+X/*
+X * this might need change if privates catch on
+X */
+XSTATIC node *
+Xisprivate(name)
+X	register char *name;
+X{	register node *n;
+X
+X	for (n = Private; n != 0; n = n->n_private)
+X		if (strcmp(name, n->n_name) == 0)
+X			return n;
+X	return 0;
+X}
+X
+Xvoid
+Xfixprivate()
+X{	register node *n, *next;
+X	register long i;
+X
+X	for (n = Private; n != 0; n = next) {
+X		n->n_flag |= ISPRIVATE;		/* overkill, but safe */
+X		i = hash(n->n_name, 1);
+X		if (Table[i] != 0)
+X			die("impossible private node error");
+X	
+X		Table[i] = n;
+X		n->n_tloc = i;	/* essentially a back link to the table */
+X		next = n->n_private;
+X		n->n_private = 0;	/* clear for later use */
+X	}
+X	Private = 0;
+X}
+X
+Xnode *
+Xaddprivate(name)
+X	register char *name;
+X{	register node *n;
+X
+X	if (Iflag)
+X		lowercase(name);
+X	if ((n = isprivate(name)) != 0)
+X		return n;
+X
+X	n = newnode();
+X	n->n_name = strsave(name);
+X	n->n_private = Private;
+X	Private = n;
+X	return n;
+X}
+X
+Xvoid
+Xpenalize(name, cost)
+X	char *name;
+X	Cost cost;
+X{	node *n;
+X
+X	if (Iflag)
+X		lowercase(name);
+X	n = addnode(name);
+X	n->n_cost += cost;	/* cumulative */
+X}
+END_OF_addnode.c
+if test 8514 -ne `wc -c <addnode.c`; then
+    echo shar: \"addnode.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f arpatxt.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"arpatxt.c\"
+else
+echo shar: Extracting \"arpatxt.c\" \(12317 characters\)
+sed "s/^X//" >arpatxt.c <<'END_OF_arpatxt.c'
+X#ifndef lint
+Xstatic char *sccsid = "@(#)arpatxt.c	9.1 87/10/04";
+X#endif
+X
+X/*
+X * convert hosts.txt into pathalias format.
+X *
+X * alias rule: "host.dom.ain,nickname.arpa,..." -> host = nickname, ...
+X */
+X
+X/* remove the next line for standard or research unix */
+X#define BSD
+X
+X#ifdef BSD
+X#define strchr index
+X#endif /* BSD */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X
+Xtypedef struct node node;
+X
+Xstruct node {
+X	node *child;	/* subdomain or member host */
+X	node *parent;	/* parent domain */
+X	node *next;	/* sibling in domain tree or host list */
+X	char *name;
+X	node *alias;
+X	node *bucket;
+X	node *gateway;
+X	int  flag;
+X};
+X
+Xnode *Top;
+Xint Atflag;
+Xint Fflag, Iflag;
+Xchar *DotArpa = ".ARPA";
+Xchar Fname[256], *Fstart;
+X
+Xnode *newnode(), *find();
+Xchar *strsave(), *lowercase();
+Xvoid crcinit();
+Xlong fold();
+XFILE *mkfile();
+X
+Xextern char *malloc(), *strchr(), *calloc(), *gets(), *strcpy(), *fgets();
+Xextern FILE *fopen();
+X
+X#define ISADOMAIN(n) ((n) && *((n)->name) == '.')
+X
+X/* for node.flag */
+X#define COLLISION 1
+X
+X/* for formatprint() */
+X#define PRIVATE		0
+X#define HOSTS		1
+X#define SUBDOMAINS	2
+X
+X/* for usage() */
+X#define USAGE "usage: %s [-i@] [-g gateway] [-p privatefile] [-f | -d directory] [file ...]\n"
+X
+Xmain(argc, argv)
+X	char **argv;
+X{	int c;
+X	char *progname;
+X	extern char *optarg;
+X	extern int optind;
+X
+X	if ((progname = strchr(argv[0], '/')) != 0)
+X		progname++;
+X	else
+X		progname = argv[0];
+X	crcinit();
+X
+X	Top = newnode();	/* needed for adding gateways */
+X	while ((c = getopt(argc, argv, "d:fg:ip:@")) != EOF)
+X		switch(c) {
+X		case 'd':
+X			strcpy(Fname, optarg);
+X			break;
+X		case 'f':	/* filter mode -- write on stdout */
+X			Fflag++;
+X			break;
+X		case 'g':
+X			gateway(optarg);
+X			break;
+X		case 'i':
+X			Iflag++;
+X			break;
+X		case 'p':
+X			readprivates(optarg);
+X			break;
+X		case '@':
+X			Atflag++;
+X			break;
+X		default:
+X			usage(progname);
+X		}
+X
+X	if (Fflag && *Fname)
+X		usage(progname);
+X	if (Iflag)
+X		(void) lowercase(DotArpa);
+X	if (Top->gateway == 0)
+X		fprintf(stderr, "%s: warning: no gateway to top level domains\n", progname);
+X
+X	Fstart = Fname + strlen(Fname);
+X	if (Fstart != Fname) {
+X		*Fstart++ = '/';
+X		*Fstart = 0;
+X	}
+X	/* should do the mkdir here instead of the shell script ...*/
+X		
+X	Top->name = "internet";
+X	if (optind == argc)
+X		scan();
+X	else for ( ; optind < argc; optind++) {
+X		if (freopen(argv[optind], "r", stdin) == 0) {
+X			perror(argv[optind]);
+X			continue;
+X		}
+X		scan();
+X	}
+X	merge();
+X	dump(Top);
+X	return 0;
+X}
+X
+Xscan()
+X{	static first;
+X	char buf0[BUFSIZ], buf1[BUFSIZ], buf2[BUFSIZ];
+X
+X	if (first++ == 0)
+X		(void) re_comp("^HOST.*SMTP");
+X	while (gets(buf0) != 0) {
+X		if (re_exec(buf0) == 0)
+X			continue;
+X		if (sscanf(buf0, "HOST : %[^:] : %[^: ]", buf1, buf2) != 2)
+X			continue;
+X		if (Iflag)
+X			(void) lowercase(buf2);
+X		insert(buf2);
+X	}
+X}
+X/*
+X * format of private file:
+X *	one per line, optionally followed by white space and comments
+X *	line starting with # is comment
+X */
+Xreadprivates(pfile)
+X	char *pfile;
+X{	FILE *f;
+X	node *n;
+X	char buf[BUFSIZ], *bptr;
+X
+X	if ((f = fopen(pfile, "r")) == 0) {
+X		perror(pfile);
+X		return;
+X	}
+X	while (fgets(buf, BUFSIZ, f) != 0) {
+X		if (*buf == '#')
+X			continue;
+X		if ((bptr = strchr(buf, ' ')) != 0)
+X			*bptr = 0;
+X		if ((bptr = strchr(buf, '\t')) != 0)
+X			*bptr = 0;
+X		if (*buf == 0)
+X			continue;
+X		n = newnode();
+X		n->name = strsave(buf);
+X		hash(n);
+X	}
+X	(void) fclose(f);
+X}
+Xusage(progname)
+X	char *progname;
+X{
+X	fprintf(stderr, USAGE, progname);
+X	exit(1);
+X}
+Xdumpgateways(ndom, f)
+X	node *ndom;
+X	FILE *f;
+X{	node *n;
+X
+X	for (n = ndom->gateway; n; n = n->next) {
+X		fprintf(f, "%s ", n->name);
+X		if (Atflag)
+X			putc('@', f);
+X		fprintf(f, "%s(%s)\t# gateway\n", ndom->name,
+X				ndom == Top ? "DEDICATED" : "LOCAL");
+X	}
+X}
+X
+Xgateway(buf)
+X	char *buf;
+X{	node *n, *dom;
+X	char *dot;
+X
+X	dot = strchr(buf, '.');
+X	if (dot) {
+X		dom = find(dot);
+X		*dot = 0;
+X	} else
+X		dom = Top;
+X
+X	n = newnode();
+X	n->name = strsave(buf);
+X	n->next = dom->gateway;
+X	dom->gateway = n;
+X}
+X	
+Xinsert(buf)
+X	char *buf;
+X{	char host[BUFSIZ], *hptr, *dot;
+X	node *n;
+X
+X	for (hptr = host; *hptr = *buf++; hptr++)
+X		if (*hptr == ',')
+X			break;
+X
+X	if (*hptr == ',')
+X		*hptr = 0;
+X	else
+X		buf = 0;	/* no aliases */
+X
+X	if ((dot = strchr(host, '.')) == 0)
+X		abort();	/* can't happen */
+X	
+X	if (strcmp(dot, DotArpa) == 0)
+X		buf = 0;		/* no aliases */
+X
+X	n = find(dot);
+X	*dot = 0;
+X
+X	addchild(n, host, buf);
+X}
+X
+Xnode *
+Xfind(domain)
+X	char *domain;
+X{	char *dot;
+X	node *parent, *child;
+X
+X	if (domain == 0)
+X		return Top;
+X	if ((dot = strchr(domain+1, '.')) != 0) {
+X		parent = find(dot);
+X		*dot = 0;
+X	} else
+X		parent = Top;
+X
+X	for (child = parent->child; child; child = child->next)
+X		if (strcmp(domain, child->name) == 0)
+X			break;
+X	if (child == 0) {
+X		child = newnode();
+X		child->next = parent->child;
+X		parent->child = child;
+X		child->parent = parent;
+X		child->name = strsave(domain);
+X	}
+X	return child;
+X}
+X
+Xnode *
+Xnewnode()
+X{
+X	node *n;
+X
+X	if ((n = (node *) calloc(1, sizeof(node))) == 0)
+X		abort();
+X	return n;
+X}
+X
+Xchar *
+Xstrsave(buf)
+X	char *buf;
+X{	char *mstr;
+X
+X	if ((mstr = malloc(strlen(buf)+1)) == 0)
+X		abort();
+X	strcpy(mstr, buf);
+X	return mstr;
+X}
+X
+Xaddchild(n, host, aliases)
+X	node *n;
+X	char *host, *aliases;
+X{	node *child;
+X
+X	/* check for dups?  nah! */
+X	child = newnode();
+X	child->name = strsave(host);
+X	child->parent = n;
+X	child->next = n->child;
+X	makealiases(child, aliases);
+X	n->child = child;
+X}
+X
+X/* yer basic tree walk */
+Xdump(n)
+X	node *n;
+X{	node *child;
+X	FILE *f;
+X	int hadprivates = 0;
+X
+X	if (n->child == 0)
+X		return;
+X
+X	f = mkfile(n);
+X
+X	if (n != Top && ! ISADOMAIN(n))
+X		abort();
+X
+X	hadprivates = domprint(n, f);
+X	dumpgateways(n, f);
+X	if (hadprivates || n == Top)
+X		fputs("private {}\n", f);	/* end scope of privates */
+X	if (!Fflag)
+X		(void) fclose(f);
+X	else
+X		putc('\n', f);
+X	for (child = n->child; child; child = child->next)
+X		dump(child);
+X}
+X
+Xqcmp(a, b)
+X	node **a, **b;
+X{
+X	return strcmp((*a)->name, (*b)->name);
+X}
+X
+Xdomprint(n, f)
+X	node *n;
+X	FILE *f;
+X{	node *table[10240], *child, *alias;
+X	char *cost = 0;
+X	int nelem, i, rval = 0;
+X
+X	/* dump private definitions */
+X	/* sort hosts and aliases in table */
+X	i = 0;
+X	for (child = n->child; child; child = child->next) {
+X		table[i++] = child;
+X		for (alias = child->alias; alias; alias = alias->next)
+X			table[i++] = alias;
+X	}
+X
+X	qsort((char *) table, i, sizeof(table[0]), qcmp);
+X	formatprint(f, table, i, PRIVATE, "private", cost);
+X
+X	/* rval == 0 IFF no privates */
+X	while (i-- > 0)
+X		if (table[i]->flag & COLLISION) {
+X			rval = 1;
+X			break;
+X		}
+X
+X	/* dump domains and aliases */
+X	/* sort hosts (only) in table */
+X	i = 0;
+X	for (child = n->child; child; child = child->next)
+X		table[i++] = child;
+X	qsort((char *) table, i, sizeof(table[0]), qcmp);
+X
+X	/* cost is DEDICATED for hosts in top-level domains, LOCAL o.w. */
+X	if (n->parent == Top && strchr(n->name + 1, '.') == 0)
+X		cost = "DEDICATED";
+X	else
+X		cost = "LOCAL";
+X	formatprint(f, table, i, HOSTS, n->name, cost);
+X
+X	formatprint(f, table, i, SUBDOMAINS, n->name, "0");
+X
+X	/* dump aliases */
+X	nelem = i;
+X	for (i = 0; i < nelem; i++) {
+X		if ((alias = table[i]->alias) == 0)
+X			continue;
+X		fprintf(f, "%s = %s", table[i]->name, alias->name);
+X		for (alias = alias->next; alias; alias = alias->next)
+X			fprintf(f, ", %s", alias->name);
+X		putc('\n', f);
+X	}
+X
+X	return rval;
+X}
+X
+X/* for debugging */
+Xdtable(comment, table, nelem)
+X	char *comment;
+X	node **table;
+X{	int	i;
+X
+X	fprintf(stderr, "\n%s\n", comment);
+X	for (i = 0; i < nelem; i++)
+X		fprintf(stderr, "%3d\t%s\n", i, table[i]->name);
+X}
+X
+Xformatprint(f, table, nelem, type, lhs, cost)
+X	FILE *f;
+X	node **table;
+X	char *lhs, *cost;
+X{	int i, didprint;
+X	char buf[128], *bptr;
+X
+X	sprintf(buf, "%s%s{" /*}*/, lhs, type == PRIVATE ? " " : " = ");
+X	bptr = buf + strlen(buf);
+X
+X	didprint = 0;
+X	for (i = 0; i < nelem; i++) {
+X		if (type == PRIVATE && ! (table[i]->flag & COLLISION))
+X			continue;
+X		else if (type == HOSTS && ISADOMAIN(table[i]) )
+X			continue;
+X		else if (type == SUBDOMAINS && ! ISADOMAIN(table[i]) )
+X			continue;
+X
+X		if ((bptr - buf) + strlen(table[i]->name) > 69) {
+X			*bptr = 0;
+X			fprintf(f, "%s\n ", buf);	/* continuation */
+X			bptr = buf;
+X		}
+X		sprintf(bptr, "%s, ", table[i]->name);
+X		bptr += strlen(bptr);
+X		didprint++;
+X	}
+X	*bptr = 0;
+X
+X	if ( ! didprint )
+X		return;
+X
+X	fprintf(f, /*{*/ "%s}", buf);
+X	if (type != PRIVATE)
+X		fprintf(f, "(%s)", cost);
+X	putc('\n', f);
+X}
+X
+XFILE *				
+Xmkfile(n)
+X	node *n;
+X{	node *parent;
+X	char *bptr;
+X	FILE *f;
+X
+X	/* build up the domain name in Fname[] */
+X	bptr = Fstart;
+X	if (n == Top)
+X		strcpy(bptr, n->name);
+X	else {
+X		strcpy(bptr, n->name + 1);	/* skip leading dot */
+X		bptr = bptr + strlen(bptr);
+X		parent = n->parent;
+X		while (ISADOMAIN(parent)) {
+X			strcpy(bptr, parent->name);
+X			bptr += strlen(bptr);
+X			parent = parent->parent;
+X		}
+X		*bptr = 0;
+X	}
+X
+X	/* get a stream descriptor */
+X	if (Fflag) {
+X		printf("# %s\n", Fstart);
+X		f = stdout;
+X	} else {
+X#ifndef BSD
+X		Fstart[14] = 0;
+X#endif
+X		if ((f = fopen(Fname, "w")) == 0) {
+X			perror(Fname);
+X			exit(1);
+X		}
+X	}
+X	if (n == Top)
+X		fprintf(f, "private {%s}\ndead {%s}\n", Top->name, Top->name);
+X	return f;
+X}
+X
+X/* map to lower case in place.  return parameter for convenience */
+Xchar *
+Xlowercase(buf)
+X	char *buf;
+X{	char *str;
+X
+X	for (str = buf ; *str; str++)
+X		if (isupper(*str))
+X			*str -= 'A' - 'a';
+X	return buf;
+X}
+X
+X/* get the interesting aliases, attach to n->alias */
+Xmakealiases(n, line)
+X	node *n;
+X	char *line;
+X{	char *next, *dot;
+X	node *a;
+X
+X	if (line == 0 || *line == 0)
+X		return;
+X
+X	for ( ; line; line = next) {
+X		next = strchr(line, ',');
+X		if (next)
+X			*next++ = 0;
+X		if ((dot = strchr(line, '.')) == 0)
+X			continue;
+X		if (strcmp(dot, DotArpa) != 0)
+X			continue;
+X		*dot = 0;
+X
+X		if (strcmp(n->name, line) == 0)
+X			continue;
+X
+X		a = newnode();
+X		a->name = strsave(line);
+X		a->next = n->alias;
+X		n->alias = a;
+X	}
+X}
+X
+X#define NHASH 13309
+Xnode *htable[NHASH];
+X
+Xmerge()
+X{	node *n;
+X
+X	setuniqflag(Top);
+X	for (n = Top->child; n; n = n->next) {
+X		if (n->flag & COLLISION) {
+X			fprintf(stderr, "illegal subdomain: %s\n", n->name);
+X			abort();
+X		}
+X		promote(n);
+X	}
+X}
+X
+X/*
+X * for domains like cc.umich.edu and cc.berkeley.edu, it's inaccurate
+X * to describe cc as a member of umich.edu or berkeley.edu.  (i.e., the
+X * lousy scoping rules for privates don't permit a clean syntax.)  so.
+X *
+X * to prevent confusion, tack on to any such domain name its parent domain
+X * and promote it in the tree.  e.g., make cc.umich and cc.berkeley
+X * subdomains of edu.
+X */
+X
+Xpromote(parent)
+X	node *parent;
+X{	node *prev, *child, *next;
+X	char buf[BUFSIZ];
+X
+X	prev = 0;
+X	for (child = parent->child; child; child = next) {
+X		next = child->next;
+X		if (!ISADOMAIN(child)) {
+X			prev = child;
+X			continue;
+X		}
+X		if ((child->flag & COLLISION) || child->gateway) {
+X			/*
+X			 * dup domain name or gateway found.  don't bump
+X			 * prev: this node is moving up the tree.
+X			 */
+X
+X			/* qualify child domain name */
+X			sprintf(buf, "%s%s", child->name, parent->name);
+X			cfree(child->name);
+X			child->name = strsave(buf);
+X
+X			/* unlink child out of sibling chain */
+X			if (prev)
+X				prev->next = child->next;
+X			else
+X				parent->child = child->next;
+X
+X			/* link child in as peer of parent */
+X			child->next = parent->next;
+X			parent->next = child;
+X			child->parent = parent->parent;
+X
+X			/*
+X			 * reset collision flag; may promote again on
+X			 * return to caller.
+X			 */
+X			child->flag &= ~COLLISION;
+X			hash(child);
+X		} else {
+X			/* this domain is uninteresting (so bump prev) */
+X			promote(child);
+X			prev = child;
+X		}
+X	}
+X	
+X}
+X
+Xsetuniqflag(n)
+X	node *n;
+X{	node *child, *alias;
+X
+X	/* mark this node in the hash table */
+X	hash(n);
+X	/* mark the aliases of this node */
+X	for (alias = n->alias; alias; alias = alias->next)
+X		hash(alias);
+X	/* recursively mark this node's children */
+X	for (child = n->child; child; child = child->next)
+X		setuniqflag(child);
+X}
+X
+Xhash(n)
+X	node *n;
+X{	node **bucket, *b;
+X
+X	bucket = &htable[fold(n->name) % NHASH];
+X	for (b = *bucket; b; b = b->bucket) {
+X		if (strcmp(n->name, b->name) == 0) {
+X			b->flag |= COLLISION;
+X			n->flag |= COLLISION;
+X			return;
+X		}
+X	}
+X	n->bucket = *bucket;
+X	*bucket = n;
+X}
+X
+X/* stolen from pathalias:addnode.c, q.v. */
+X#define POLY	0x48000000		/* 31-bit polynomial */
+Xlong CrcTable[128];
+X
+Xvoid
+Xcrcinit()
+X{	register int i,j;
+X	register long sum;
+X
+X	for (i = 0; i < 128; i++) {
+X		sum = 0;
+X		for (j = 7-1; j >= 0; --j)
+X			if (i & (1 << j))
+X				sum ^= POLY >> j;
+X		CrcTable[i] = sum;
+X	}
+X}
+X
+Xlong
+Xfold(s)
+X	register char *s;
+X{	register long sum = 0;
+X	register int c;
+X
+X	while (c = *s++)
+X		sum = (sum >> 7) ^ CrcTable[(sum ^ c) & 0x7f];
+X	return sum;
+X}
+END_OF_arpatxt.c
+if test 12317 -ne `wc -c <arpatxt.c`; then
+    echo shar: \"arpatxt.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f mapit.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"mapit.c\"
+else
+echo shar: Extracting \"mapit.c\" \(13861 characters\)
+sed "s/^X//" >mapit.c <<'END_OF_mapit.c'
+X/* pathalias -- by steve bellovin, as told to peter honeyman */
+X#ifndef lint
+Xstatic char	*sccsid = "@(#)mapit.c	9.1 87/10/04";
+X#endif
+X
+X#include "def.h"
+X
+X#define chkheap(i)	/* void */
+X
+X/* exports */
+X/* invariant while mapping: Nheap < Hashpart */
+Xlong Hashpart;		/* start of unreached nodes */
+Xlong Nheap;		/* end of heap */
+X
+Xvoid mapit();
+X
+X/* imports */
+Xextern long Nheap, Hashpart, Tabsize;
+Xextern int Tflag, Vflag;
+Xextern node **Table, *Home;
+Xextern char *Linkout, *Graphout;
+X
+Xextern void freelink(), resetnodes(), printit(), dumpgraph();
+Xextern void showlinks(), die();
+Xextern long pack(), allocation();
+Xextern link *newlink(), *addlink();
+Xextern int maptrace();
+Xextern node *ncopy();
+X
+X
+X/* privates */
+Xstatic long	Heaphighwater;
+Xstatic link	**Heap;
+X
+XSTATIC void insert(), heapup(), heapdown(), heapswap(), backlinks();
+XSTATIC void setheapbits(), mtracereport(), heapchildren();
+XSTATIC link *min_node();
+XSTATIC int dehash(), skiplink(), skipterminalalias();
+XSTATIC Cost costof();
+X
+X/* transform the graph to a shortest-path tree by marking tree edges */
+Xvoid
+Xmapit()
+X{	register node *n;
+X	register link *l;
+X	link *lparent;
+X	static int firsttime = 0;
+X
+X	vprintf(stderr, "*** mapping\n");
+X	Tflag = Tflag && Vflag;		/* tracing here only if verbose */
+X	/* re-use the hash table space for the heap */
+X	Heap = (link **) Table;
+X	Hashpart = pack(0L, Tabsize - 1);
+X
+X	/* expunge penalties from -a option and make circular copy lists */
+X	resetnodes();
+X
+X	if (firsttime++) {
+X		if (Linkout && *Linkout)	/* dump cheapest links */
+X			showlinks();
+X		if (Graphout && *Graphout)	/* dump the edge list */
+X			dumpgraph();
+X	}
+X
+X	/* insert Home to get things started */
+X	l = newlink();		/* link to get things started */
+X	l->l_to = Home;
+X	(void) dehash(Home);
+X	insert(l);
+X
+X	/* main mapping loop */
+Xremap:
+X	Heaphighwater = Nheap;
+X	while ((lparent = min_node()) != 0) {
+X		chkheap(1);
+X		lparent->l_flag |= LTREE;
+X		n = lparent->l_to;
+X		if (Tflag && maptrace(n, n))
+X			fprintf(stderr, "%s -> %s mapped\n", n->n_parent->n_name, n->n_name);
+X		if (n->n_flag & MAPPED)
+X			die("mapped node in heap");
+X		n->n_flag |= MAPPED;
+X
+X		/* add children to heap */
+X		heapchildren(n);
+X	}
+X	vprintf(stderr, "heap high water mark was %d\n", Heaphighwater);
+X
+X	/* sanity check on implementation */
+X	if (Nheap != 0)
+X		die("null entry in heap");
+X
+X	if (Hashpart < Tabsize) {
+X		/*
+X		 * add back links from unreachable hosts to
+X		 * reachable neighbors, then remap.
+X		 *
+X		 * asymptotically, this is quadratic; in
+X		 * practice, this is done once or twice.
+X		 */
+X		backlinks();
+X		if (Nheap)
+X			goto remap;
+X	}
+X	if (Hashpart < Tabsize) {
+X		fputs("You can't get there from here:\n", stderr);
+X		for ( ; Hashpart < Tabsize; Hashpart++) {
+X			fprintf(stderr, "\t%s", Table[Hashpart]->n_name);
+X			if (Table[Hashpart]->n_flag & ISPRIVATE)
+X				fputs(" (private)", stderr);
+X			putc('\n', stderr);
+X		}
+X	}
+X}
+X
+XSTATIC void
+Xheapchildren(n)
+X	register node *n;
+X{	register link *l;
+X	register node *next;
+X	register int mtrace;
+X	register Cost cost;
+X
+X	for (l = n->n_link; l; l = l->l_next) {
+X
+X		next = l->l_to;		/* neighboring node */
+X		mtrace = Tflag && maptrace(n, next);
+X
+X		if (next->n_flag & MAPPED) {
+X			if (mtrace)
+X				mtracereport(n, l, "-\talready mapped");
+X			continue;
+X		}
+X		if (l->l_flag & LTREE)
+X			continue;
+X
+X		if (l->l_flag & LTERMINAL)
+X			next = l->l_to = ncopy(next);
+X
+X		if ((n->n_flag & NTERMINAL) && (l->l_flag & LALIAS))
+X			if (skipterminalalias(n, next))
+X				continue;
+X			else
+X				next = l->l_to = ncopy(next);
+X			
+X
+X		cost = costof(n, l);
+X
+X		if (skiplink(l, n, cost, mtrace))
+X			continue;
+X
+X		/*
+X		 * put this link in the heap and restore the
+X		 * heap property.
+X		 */
+X		if (mtrace) {
+X			if (next->n_parent)
+X				mtracereport(next->n_parent, l, "*\tdrop");
+X			mtracereport(n, l, "+\tadd");
+X		}
+X		next->n_parent = n;
+X		if (dehash(next) == 0) {  /* first time */
+X			next->n_cost = cost;
+X			insert(l);	  /* insert at end */
+X			heapup(l);
+X		} else {
+X			/* replace inferior path */
+X			Heap[next->n_tloc] = l;
+X			if (cost > next->n_cost) {
+X				/* increase cost (gateway) */
+X				next->n_cost = cost;
+X				heapdown(l);
+X			} else if (cost < next->n_cost) {
+X				/* cheaper route */
+X				next->n_cost = cost;
+X
+X				heapup(l);
+X			}
+X		}
+X		setheapbits(l);
+X		chkheap(1);
+X
+X	}
+X}
+X
+X/* bizarro special case */
+XSTATIC
+Xskipterminalalias(n, next)
+X	node *n, *next;
+X{	node *ncp;
+X
+X	while (n->n_flag & NALIAS) {
+X		n = n->n_parent;
+X		for (ncp = n->n_copy; ncp != n; ncp = ncp->n_copy)
+X			if (next == ncp)
+X				return 1;
+X	}
+X	return 0;
+X}
+X
+X/*
+X * return 1 if we definitely don't want want this link in the
+X * shortest path tree, 0 if we might want it, i.e., best so far.
+X *
+X * if tracing is turned on, report only if this node is being skipped.
+X */
+XSTATIC int
+Xskiplink(l, parent, cost, trace)
+X	link *l;		/* new link to this node */
+X	node *parent;		/* (potential) new parent of this node */
+X	register Cost cost;	/* new cost to this node */
+X	int trace;		/* trace this link? */
+X{	register node *n;	/* this node */
+X	register link *lheap;		/* old link to this node */
+X
+X	n = l->l_to;
+X
+X	/* first time we've reached this node? */
+X	if (n->n_tloc >= Hashpart)
+X		return 0;
+X
+X	lheap = Heap[n->n_tloc];
+X
+X	/* examine links to nets that require gateways */
+X	if (GATEWAYED(n)) {
+X		/* if exactly one is a gateway, use it */
+X		if ((lheap->l_flag & LGATEWAY) && !(l->l_flag & LGATEWAY)) {
+X			if (trace)
+X				mtracereport(parent, l, "-\told gateway");
+X			return 1;	/* old is gateway */
+X		}
+X		if (!(lheap->l_flag & LGATEWAY) && (l->l_flag & LGATEWAY))
+X			return 0;	/* new is gateway */
+X
+X		/* no gateway or both gateways;  resolve in standard way ... */
+X	}
+X
+X	/* examine dup link (sanity check) */
+X	if (n->n_parent == parent && ((lheap->l_flag & LDEAD) || (l->l_flag & LDEAD)))
+X		die("dup dead link");
+X
+X	/*  examine cost */
+X	if (cost < n->n_cost)
+X		return 0;
+X	if (cost > n->n_cost) {
+X		if (trace)
+X			mtracereport(parent, l, "-\tcheaper");
+X		return 1;
+X	}
+X
+X	/* all other things being equal, ask the oracle */
+X	if (tiebreaker(n, parent)) {
+X		if (trace)
+X			mtracereport(parent, l, "-\ttiebreaker");
+X		return 1;
+X	}
+X	return 0;
+X}
+X
+XSTATIC Cost
+Xcostof(prev, l)
+X	register node *prev;
+X	register link *l;
+X{	register node *next;
+X	register Cost cost;
+X
+X	if (l->l_flag & LALIAS)
+X		return prev->n_cost;	/* by definition */
+X
+X	next = l->l_to;
+X	cost = prev->n_cost + l->l_cost;	/* basic cost */
+X
+X	/*
+X	 * heuristics:
+X	 *    charge for a dead link.
+X	 *    charge for getting past a terminal edge.
+X	 *    charge for getting out of a dead host.
+X	 *    charge for getting into a gatewayed net (except at a gateway).
+X	 *    discourage mixing of left and right syntax when prev is a host.
+X	 *
+X	 * life was simpler when pathalias computed true shortest paths.
+X	 */
+X	if (l->l_flag & LDEAD)				/* dead link */
+X		cost += INF;
+X	if (prev->n_flag & NTERMINAL)			/* terminal parent */
+X		cost += INF;
+X	if (DEADHOST(prev))				/* dead host */
+X		cost += INF;
+X	if (GATEWAYED(next) && !(l->l_flag & LGATEWAY))	/* not gateway */
+X		cost += INF;
+X	if (!ISANET(prev)) {				/* mixed syntax? */
+X		if ((NETDIR(l) == LLEFT && (prev->n_flag & HASRIGHT))
+X		 || (NETDIR(l) == LRIGHT && (prev->n_flag & HASLEFT)))
+X			cost += INF;
+X	}
+X
+X	return cost;
+X}
+X
+X/* binary heap implementation of priority queue */
+X
+XSTATIC void
+Xinsert(l)
+X	link *l;
+X{	register node *n;
+X
+X	n = l->l_to;
+X	if (n->n_flag & MAPPED)
+X		die("insert mapped node");
+X
+X	Heap[n->n_tloc] = 0;
+X	if (Heap[Nheap+1] != 0)
+X		die("heap error in insert");
+X	if (Nheap++ == 0) {
+X		Heap[1] = l;
+X		n->n_tloc = 1;
+X		return;
+X	}
+X	if (Vflag && Nheap > Heaphighwater)
+X		Heaphighwater = Nheap;	/* diagnostics */
+X
+X	/* insert at the end.  caller must heapup(l). */
+X	Heap[Nheap] = l;
+X	n->n_tloc = Nheap;
+X}
+X
+X/*
+X * "percolate" up the heap by exchanging with the parent.  as in
+X * min_node(), give tiebreaker() a chance to produce better, stable
+X * routes by moving nets and domains close to the root, nets closer
+X * than domains.
+X *
+X * i know this seems obscure, but it's harmless and cheap.  trust me.
+X */
+XSTATIC void
+Xheapup(l)
+X	link *l;
+X{	register long cindx, pindx;	/* child, parent indices */
+X	register Cost cost;
+X	register node *child, *parent;
+X
+X	child = l->l_to;
+X
+X	cost = child->n_cost;
+X	for (cindx = child->n_tloc; cindx > 1; cindx = pindx) {
+X		pindx = cindx / 2;
+X		if (Heap[pindx] == 0)	/* sanity check */
+X			die("impossible error in heapup");
+X		parent = Heap[pindx]->l_to;
+X		if (cost > parent->n_cost)
+X			return;
+X
+X		/* net/domain heuristic */
+X		if (cost == parent->n_cost) {
+X			if (!ISANET(child))
+X				return;
+X			if (!ISADOMAIN(parent))
+X				return;
+X			if (ISADOMAIN(child))
+X				return;
+X		}
+X		heapswap(cindx, pindx);
+X	}
+X}
+X
+X/* extract min (== Heap[1]) from heap */
+XSTATIC link	*
+Xmin_node()
+X{	link *rval, *lastlink;
+X	register link **rheap;
+X
+X	if (Nheap == 0)
+X		return 0;
+X
+X	rheap = Heap;		/* in register -- heavily used */
+X	rval = rheap[1];	/* return this one */
+X
+X	/* move last entry into root and reheap */
+X	lastlink = rheap[Nheap];
+X	rheap[Nheap] = 0;
+X
+X	if (--Nheap) {
+X		rheap[1] = lastlink;
+X		lastlink->l_to->n_tloc = 1;
+X		heapdown(lastlink);	/* restore heap property */
+X	}
+X
+X	return rval;
+X}
+X
+X/*
+X * swap Heap[i] with smaller child, iteratively down the tree.
+X *
+X * given the opportunity, attempt to place nets and domains
+X * near the root.  this helps tiebreaker() shun domain routes.
+X */
+X
+XSTATIC void
+Xheapdown(l)
+X	link *l;
+X{	register long pindx, cindx;
+X	register link **rheap = Heap;	/* in register -- heavily used */
+X	node *child, *rchild, *parent;
+X
+X	pindx = l->l_to->n_tloc;
+X	parent = rheap[pindx]->l_to;	/* invariant */
+X	for ( ; (cindx = pindx * 2) <= Nheap; pindx = cindx) {
+X		/* pick lhs or rhs child */
+X		child = rheap[cindx]->l_to;
+X		if (cindx < Nheap) {
+X			/* compare with rhs child */
+X			rchild = rheap[cindx+1]->l_to;
+X			/*
+X			 * use rhs child if smaller than lhs child.
+X			 * if equal, use rhs if net or domain.
+X			 */
+X			if (child->n_cost > rchild->n_cost) {
+X				child = rchild;
+X				cindx++;
+X			} else if (child->n_cost == rchild->n_cost)
+X				if (ISANET(rchild)) {
+X					child = rchild;
+X					cindx++;
+X				}
+X		}
+X
+X		/* child is the candidate for swapping */
+X		if (parent->n_cost < child->n_cost)
+X			break;
+X
+X		/*
+X		 * heuristics:
+X		 *	move nets/domains up
+X		 *	move nets above domains
+X		 */
+X		if (parent->n_cost == child->n_cost) {
+X			if (!ISANET(child))
+X				break;
+X			if (ISANET(parent) && ISADOMAIN(child))
+X				break;
+X		}
+X
+X		heapswap(pindx, cindx);
+X	}
+X}
+X
+X/* exchange Heap[i] and Heap[j] pointers */
+XSTATIC void
+Xheapswap(i, j)
+X	long i, j;
+X{	register link *temp, **rheap;
+X
+X	rheap = Heap;	/* heavily used -- put in register */
+X	temp = rheap[i];
+X	rheap[i] = rheap[j];
+X	rheap[j] = temp;
+X	rheap[j]->l_to->n_tloc = j;
+X	rheap[i]->l_to->n_tloc = i;
+X}
+X
+X/* return 1 if n is already de-hashed (n_tloc < Hashpart), 0 o.w. */
+XSTATIC int
+Xdehash(n)
+X	register node *n;
+X{
+X	if (n->n_tloc < Hashpart)
+X		return 1;
+X
+X	/* swap with entry in Table[Hashpart] */
+X	Table[Hashpart]->n_tloc = n->n_tloc;
+X	Table[n->n_tloc] = Table[Hashpart];
+X	Table[Hashpart] = n;
+X
+X	n->n_tloc = Hashpart++;
+X	return 0;
+X}
+X
+XSTATIC void
+Xbacklinks()
+X{	register link *l;
+X	register node *n, *parent;
+X	node *nomap, *ncp;
+X	long i;
+X
+X	for (i = Hashpart; i < Tabsize; i++) {
+X		nomap = Table[i];
+X		for (ncp = nomap->n_copy; ncp != nomap; ncp = ncp->n_copy) {
+X			if (ncp->n_flag & MAPPED) {
+X				dehash(nomap);
+X				Table[nomap->n_tloc] = 0;
+X				nomap->n_tloc = 0;
+X				goto nexti;
+X			}
+X		}
+X
+X		/* TODO: simplify this */		
+X		parent = 0;
+X		for (l = nomap->n_link; l; l = l->l_next) {
+X			n = l->l_to;
+X			if (!(n->n_flag & MAPPED))
+X				continue;
+X			if (parent == 0) {
+X				parent = n;
+X				continue;
+X			}
+X			if (n->n_cost > parent->n_cost)
+X				continue;
+X			if (n->n_cost == parent->n_cost) {
+X				nomap->n_parent = parent;
+X				if (tiebreaker(nomap, n))
+X					continue;
+X			}
+X			parent = n;
+X		}
+X		if (parent == 0)
+X			continue;
+X		(void) dehash(nomap);
+X		l = addlink(parent, nomap, INF, DEFNET, DEFDIR);
+X		nomap->n_parent = parent;
+X		nomap->n_cost = costof(parent, l);
+X		insert(l);
+X		heapup(l);
+Xnexti:
+X		;
+X	}
+X	vprintf(stderr, "%d backlinks\n", Nheap);
+X}
+X
+XSTATIC void
+Xsetheapbits(l)
+X	register link *l;
+X{	register node *n;
+X	register node *parent;
+X
+X	n = l->l_to;
+X	parent = n->n_parent;
+X	n->n_flag &= ~(NALIAS|HASLEFT|HASRIGHT);	/* reset */
+X
+X	/* record whether link is an alias */
+X	if (l->l_flag & LALIAS) {
+X		n->n_flag |= NALIAS;
+X		if (parent->n_flag & NTERMINAL)
+X			n->n_flag |= NTERMINAL;
+X	}
+X
+X	/* set left/right bits */
+X	if (NETDIR(l) == LLEFT || (parent->n_flag & HASLEFT))
+X		n->n_flag |= HASLEFT;
+X	if (NETDIR(l) == LRIGHT || (parent->n_flag & HASRIGHT))
+X		n->n_flag |= HASRIGHT;
+X}
+X
+XSTATIC void
+Xmtracereport(from, l, excuse)
+X	node *from;
+X	link *l;
+X	char *excuse;
+X{	node *to = l->l_to;
+X
+X	fprintf(stderr, "%-16s ", excuse);
+X	fputs(from->n_name, stderr);
+X	if (from->n_flag & NTERMINAL)
+X		putc('\'', stderr);
+X	fputs(" -> ", stderr);
+X	fputs(to->n_name, stderr);
+X	if (to->n_flag & NTERMINAL)
+X		putc('\'', stderr);
+X	fprintf(stderr, " (%ld, %ld, %ld) ", from->n_cost, l->l_cost, to->n_cost);
+X	if (to->n_parent) {
+X		fputs(to->n_parent->n_name, stderr);
+X		if (to->n_parent->n_flag & NTERMINAL)
+X			putc('\'', stderr);
+X		fprintf(stderr, " (%ld)", to->n_parent->n_cost);
+X	}
+X	putc('\n', stderr);
+X}
+X	
+X#if 0
+Xchkheap(i)
+X{	int lhs, rhs;
+X
+X	lhs = i * 2;
+X	rhs = lhs + 1;
+X
+X	if (lhs <= Nheap) {
+X		if (Heap[i]->l_to->n_cost > Heap[lhs]->l_to->n_cost)
+X			die("chkheap failure on lhs");
+X		chkheap(lhs);
+X	}
+X	if (rhs <= Nheap) {
+X		if (Heap[i]->l_to->n_cost > Heap[rhs]->l_to->n_cost)
+X			die("chkheap failure on rhs");
+X		chkheap(rhs);
+X	}
+X#if 00
+X	for (i = 1; i < Nheap; i++) {
+X		link *l;
+X
+X		vprintf(stderr, "%5d %-16s", i, Heap[i]->l_to->n_name);
+X		if ((l = Heap[i]->l_to->n_link) != 0) do {
+X			vprintf(stderr, "%-16s", l->l_to->n_name);
+X		} while ((l = l->l_next) != 0);
+X		vprintf(stderr, "\n");
+X	}
+X	for (i = Hashpart; i < Tabsize; i++) {
+X		link *l;
+X		node *n;
+X
+X		vprintf(stderr, "%5d %-16s", i, Table[i]->n_name);
+X		if ((l = Table[i]->n_link) != 0) do {
+X			vprintf(stderr, "%-16s", l->l_to->n_name);
+X		} while ((l = l->l_next) != 0);
+X		vprintf(stderr, "\n");
+X	}
+X#endif /*00*/
+X		
+X}
+X#endif /*0*/
+END_OF_mapit.c
+if test 13861 -ne `wc -c <mapit.c`; then
+    echo shar: \"mapit.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f parse.y -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"parse.y\"
+else
+echo shar: Extracting \"parse.y\" \(8405 characters\)
+sed "s/^X//" >parse.y <<'END_OF_parse.y'
+X%{
+X/* pathalias -- by steve bellovin, as told to peter honeyman */
+X#ifndef lint
+Xstatic char	*sccsid = "@(#)parse.y	9.1 87/10/04";
+X#endif /* lint */
+X
+X#include "def.h"
+X
+X/* exports */
+Xextern void yyerror();
+X
+X/* imports */
+Xextern node *addnode(), *addprivate();
+Xextern void fixprivate(), alias(), deadlink();
+Xextern link *addlink();
+Xextern int optind;
+Xextern char *Cfile, *Netchars, **Argv;
+Xextern int Lineno, Argc;
+X
+X/* privates */
+XSTATIC void fixnet();
+XSTATIC int yylex(), yywrap(), getword();
+Xstatic int Scanstate = NEWLINE;	/* scanner (yylex) state */
+X
+X/* flags for ys_flags */
+X#define TERMINAL 1
+X%}
+X
+X%union {
+X	node	*y_node;
+X	Cost	y_cost;
+X	char	y_net;
+X	char	*y_name;
+X	struct {
+X		node *ys_node;
+X		Cost ys_cost;
+X		short ys_flag;
+X		char ys_net;
+X		char ys_dir;
+X	} y_s;
+X}
+X
+X%type <y_s>	site asite
+X%type <y_node>	links aliases plist network nlist host pelem snode delem dlist
+X%type <y_cost>	cost cexpr
+X
+X%token <y_name>	SITE HOST
+X%token <y_cost>	COST
+X%token <y_net>	NET
+X%token EOL PRIVATE DEAD
+X
+X%left	'+' '-'
+X%left	'*' '/'
+X
+X%%
+Xmap	:	/* empty */
+X	|	map		EOL
+X	|	map links	EOL
+X	|	map aliases	EOL
+X	|	map network	EOL
+X	|	map private	EOL
+X	|	map dead	EOL
+X	|	error		EOL
+X	;
+X
+Xlinks	: host site cost {
+X		struct link *l;
+X
+X		l = addlink($1, $2.ys_node, $3, $2.ys_net, $2.ys_dir);
+X		if (GATEWAYED($2.ys_node))
+X			l->l_flag |= LGATEWAY;
+X		if ($2.ys_flag & TERMINAL)
+X			l->l_flag |= LTERMINAL;
+X	  }			
+X	| links ',' site cost {
+X		struct link *l;
+X
+X		l = addlink($1, $3.ys_node, $4, $3.ys_net, $3.ys_dir);
+X		if (GATEWAYED($3.ys_node))
+X			l->l_flag |= LGATEWAY;
+X		if ($3.ys_flag & TERMINAL)
+X			l->l_flag |= LTERMINAL;
+X	  }
+X	| links ','	/* permit this benign error */
+X	;
+X
+Xaliases	: host '=' SITE	{alias($1, addnode($3));}
+X	| aliases ',' SITE	{alias($1, addnode($3));}
+X	| aliases ','	/* permit this benign error */
+X	;
+X
+Xnetwork	: host '=' '{' nlist '}' cost	{fixnet($1, $4, $6, DEFNET, DEFDIR);}
+X	| host '=' NET '{' nlist '}' cost	{fixnet($1, $5, $7, $3, LRIGHT);}
+X	| host '=' '{' nlist '}' NET cost	{fixnet($1, $4, $7, $6, LLEFT);}
+X	;
+X
+Xprivate	: PRIVATE '{' plist '}'			/* list of privates */
+X	| PRIVATE '{' '}'	{fixprivate();}	/* end scope of privates */
+X	;
+X
+Xdead	: DEAD '{' dlist '}';
+X
+Xhost	: HOST		{$$ = addnode($1);}
+X	| PRIVATE	{$$ = addnode("private");}
+X	| DEAD		{$$ = addnode("dead");}
+X	;
+X
+Xsnode	: SITE	{$$ = addnode($1);} ;
+X
+Xasite	: SITE {
+X		$$.ys_node = addnode($1);
+X		$$.ys_flag = 0;
+X	  }
+X	| '<' SITE '>' {
+X		$$.ys_node = addnode($2);
+X		$$.ys_flag = TERMINAL;
+X	  }
+X	;
+X
+Xsite	: asite {
+X		$$ = $1;
+X		$$.ys_net = DEFNET;
+X		$$.ys_dir = DEFDIR;
+X	  }
+X	| NET asite {
+X		$$ = $2;
+X		$$.ys_net = $1;
+X		$$.ys_dir = LRIGHT;
+X	  }
+X	| asite NET {
+X		$$ = $1;
+X		$$.ys_net = $2;
+X		$$.ys_dir = LLEFT;
+X	  }
+X	;
+X
+Xpelem	: SITE	{$$ = addprivate($1);} ;
+X
+Xplist	: pelem			{$1->n_flag |= ISPRIVATE;}
+X	| plist ',' pelem	{$3->n_flag |= ISPRIVATE;}
+X	| plist ','		/* permit this benign error */
+X	;
+X
+Xdelem	: SITE			{deadlink(addnode($1), (node *) 0);}
+X	| snode NET snode	{deadlink($1, $3);}
+X	;
+X
+Xdlist	: delem
+X	| dlist ',' delem
+X	| dlist ','		/* permit this benign error */
+X	;
+X
+Xnlist	: SITE		{$$ = addnode($1);}
+X	| nlist ',' snode {
+X			if ($3->n_net == 0) {
+X				$3->n_net = $1;
+X				$$ = $3;
+X			}
+X	  }
+X	| nlist ','	/* permit this benign error */
+X	;
+X		
+Xcost	: {$$ = DEFCOST;	/* empty -- cost is always optional */}
+X	| '(' {Scanstate = COSTING;} cexpr {Scanstate = OTHER;} ')'
+X		{$$ = $3;}
+X	;
+X
+Xcexpr	: COST
+X	| '(' cexpr ')'   {$$ = $2;}
+X	| cexpr '+' cexpr {$$ = $1 + $3;}
+X	| cexpr '-' cexpr {$$ = $1 - $3;}
+X	| cexpr '*' cexpr {$$ = $1 * $3;}
+X	| cexpr '/' cexpr {
+X		if ($3 == 0)
+X			yyerror("zero divisor\n");
+X		else
+X			$$ = $1 / $3;
+X	  }
+X	;
+X%%
+X
+Xvoid
+Xyyerror(s)
+X	char *s;
+X{
+X	/* a concession to bsd error(1) */
+X	if (Cfile)
+X		fprintf(stderr, "\"%s\", ", Cfile);
+X	else
+X		fprintf(stderr, "%s: ", Argv[0]);
+X	fprintf(stderr, "line %d: %s\n", Lineno, s);
+X}
+X
+X/*
+X * patch in the costs of getting on/off the network.
+X *
+X * for each network member on netlist, add links:
+X *	network -> member	cost = 0;
+X *	member -> network	cost = parameter.
+X *
+X * if network and member both require gateways, assume network
+X * is a gateway to member (but not v.v., to avoid such travesties
+X * as topaz!seismo.css.gov.edu.rutgers).
+X *
+X * note that members can have varying costs to a network, by suitable
+X * multiple declarations.  this is a feechur, albeit a useless one.
+X */
+XSTATIC void
+Xfixnet(network, nlist, cost, netchar, netdir)
+X	register node *network;
+X	node *nlist;
+X	Cost cost;
+X	char netchar, netdir;
+X{	register node *member, *nextnet;
+X	link *l;
+X
+X	network->n_flag |= NNET;
+X
+X	/* now insert the links */
+X	for (member = nlist ; member; member = nextnet) {
+X		/* network -> member, cost is 0 */
+X		l = addlink(network, member, (Cost) 0, netchar, netdir);
+X		if (GATEWAYED(network) && GATEWAYED(member))
+X			l->l_flag |= LGATEWAY;
+X
+X		/* member -> network, cost is parameter */
+X		(void) addlink(member, network, cost, netchar, netdir);
+X		nextnet = member->n_net;
+X		member->n_net = 0;	/* clear for later use */
+X	}
+X}
+X
+X/* scanner */
+X
+X#define QUOTE '"'
+X#define STR_EQ(s1, s2) (s1[2] == s2[2] && strcmp(s1, s2) == 0)
+X#define NLRETURN() {Scanstate = NEWLINE; return EOL;}
+X
+Xstatic struct ctable {
+X	char *cname;
+X	Cost cval;
+X} ctable[] = {
+X	/* ordered by frequency of appearance in a "typical" dataset */
+X	{"DIRECT", 200},
+X	{"DEMAND", 300},
+X	{"DAILY", 5000},
+X	{"HOURLY", 500},
+X	{"DEDICATED", 95},
+X	{"EVENING", 1800},
+X	{"LOCAL", 25},
+X	{"LOW", 5},	/* baud rate, quality penalty */
+X	{"DEAD", INF/2},
+X	{"POLLED", 5000},
+X	{"WEEKLY", 30000},
+X	{"HIGH", -5},	/* baud rate, quality bonus */
+X	{"FAST", -80},	/* high speed (>= 9.6 kbps) modem */
+X	/* deprecated */
+X	{"ARPA", 100},
+X	{"DIALED", 300},
+X	{0, 0}
+X};
+X
+XSTATIC int
+Xyylex()
+X{	static char retbuf[128];	/* for return to yacc part */
+X	register int c;
+X	register char *buf = retbuf;
+X	register struct ctable *ct;
+X	register Cost cost;
+X	char errbuf[128];
+X
+X	if (feof(stdin) && yywrap())
+X		return EOF;
+X
+X	/* count lines, skip over space and comments */
+X	if ((c = getchar()) == EOF)
+X		NLRETURN();
+X    
+Xcontinuation:
+X	while (c == ' ' || c == '\t')
+X		if ((c = getchar()) == EOF)
+X			NLRETURN();
+X
+X	if (c == '#')
+X		while ((c = getchar()) != '\n')
+X			if (c == EOF)
+X				NLRETURN();
+X
+X	/* scan token */
+X	if (c == '\n') {
+X		Lineno++;
+X		if ((c = getchar()) != EOF) {
+X			if (c == ' ' || c == '\t')
+X				goto continuation;
+X			ungetc(c, stdin);
+X		}
+X		NLRETURN();
+X	}
+X
+X	switch(Scanstate) {
+X	case COSTING:
+X		if (isdigit(c)) {
+X			cost = c - '0';
+X			for (c = getchar(); isdigit(c); c = getchar())
+X				cost = (cost * 10) + c - '0';
+X			ungetc(c, stdin);
+X			yylval.y_cost = cost;
+X			return COST;
+X		}
+X
+X		
+X		if (getword(buf, c) == 0) {
+X			for (ct = ctable; ct->cname; ct++)
+X				if (STR_EQ(buf, ct->cname)) {
+X					yylval.y_cost = ct->cval;
+X					return COST;
+X				}
+X			sprintf(errbuf, "unknown cost (%s), using default", buf);
+X			yyerror(errbuf);
+X			yylval.y_cost = DEFCOST;
+X			return COST;
+X		}
+X
+X		return c;	/* pass the buck */
+X
+X	case NEWLINE:
+X		Scanstate = OTHER;
+X		if (getword(buf, c) != 0)
+X			return c;
+X		/* `private' (but not `"private"')? */
+X		if (c == 'p' && STR_EQ(buf, "private"))
+X			return PRIVATE;
+X		/* `dead' (but not `"dead"')? */
+X		if (c == 'd' && STR_EQ(buf, "dead"))
+X			return DEAD;
+X
+X		yylval.y_name = buf;
+X		return HOST;
+X	}
+X
+X	if (getword(buf, c) == 0) {
+X		yylval.y_name = buf;
+X		return SITE;
+X	}
+X
+X	if (index(Netchars, c)) {
+X		yylval.y_net = c;
+X		return NET;
+X	}
+X
+X	return c;
+X}
+X
+X/*
+X * fill str with the next word in [0-9A-Za-z][-._0-9A-Za-z]+ or a quoted
+X * string that contains no newline.  return -1 on failure or EOF, 0 o.w.
+X */ 
+XSTATIC int
+Xgetword(str, c)
+X	register char *str;
+X	register int c;
+X{
+X	if (c == QUOTE) {
+X		while ((c = getchar()) != QUOTE) {
+X			if (c == '\n') {
+X				yyerror("newline in quoted string\n");
+X				ungetc(c, stdin);
+X				return -1;
+X			}
+X			if (c == EOF) {
+X				yyerror("EOF in quoted string\n");
+X				return -1;
+X			}
+X			*str++ = c;
+X		}
+X		*str = 0;
+X		return 0;
+X	}
+X
+X	/* host name must start with alphanumeric or `.' */
+X	if (!isalnum(c) && c != '.')
+X		return -1;
+X
+Xyymore:
+X	do {
+X		*str++ = c;
+X		c = getchar();
+X	} while (isalnum(c) || c == '.' || c == '_');
+X
+X	if (c == '-' && Scanstate != COSTING)
+X		goto yymore;
+X
+X	ungetc(c, stdin);
+X	*str = 0;
+X	return 0;
+X}
+X
+XSTATIC int
+Xyywrap()
+X{	char errbuf[100];
+X
+X	fixprivate();	/* munge private host definitions */
+X	Lineno = 1;
+X	while (optind < Argc) {
+X		if (freopen((Cfile = Argv[optind++]), "r", stdin) != 0)
+X			return 0;
+X		sprintf(errbuf, "%s: %s", Argv[0], Cfile);
+X		perror(errbuf);
+X	}
+X	freopen("/dev/null", "r", stdin);
+X	return -1;
+X}
+END_OF_parse.y
+if test 8405 -ne `wc -c <parse.y`; then
+    echo shar: \"parse.y\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f pathalias.1 -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"pathalias.1\"
+else
+echo shar: Extracting \"pathalias.1\" \(11998 characters\)
+sed "s/^X//" >pathalias.1 <<'END_OF_pathalias.1'
+X.\" @(#)pathalias.1	9.1 87/10/04
+X.TH PATHALIAS 1 "10/4/87" "Public Domain"
+X.SH NAME
+Xpathalias, makedb, arpatxt \- mail routing tools
+X.SH SYNOPSIS
+X.B pathalias
+X[
+X.B \-ivcDf
+X] [
+X.BI \-t \0link
+X] [
+X.BI \-l \0host
+X] [
+X.BI \-a \0host
+X] [
+X.BI \-d \0link
+X] [
+X.ig
+X.\" for pathparse.
+X.BI \-g \0file
+X] [
+X..
+X.I files ...
+X]
+X.PP
+X.B makedb
+X[
+X.B \-a
+X] [
+X.BI \-o \0dbmfile
+X] [
+X.I files ...
+X]
+X.PP
+X.B arpatxt
+X[
+X.B \-@fi
+X] [
+X.BI \-g \0gateway
+X] [
+X.BI \-p \0privatefile
+X] [
+X.BI \-d \0directory
+X] [
+X.I files ...
+X]
+X.ad b
+X.SH DESCRIPTION
+X.I Pathalias
+Xcomputes the shortest paths and corresponding routes from one host
+X(computer system) to all other known, reachable hosts.
+X.I Pathalias
+Xreads host-to-host connectivity
+Xinformation on standard input or in the named
+X.IR files ,
+Xand writes a list of
+Xhost-route pairs on the standard output.
+X.PP
+XHere are the
+X.I pathalias
+Xoptions:
+X.TP 6
+X.B \-i
+XIgnore case:  map all host names to lower case.
+XBy default, case is significant.
+X.TP
+X.B \-c
+XPrint costs: print the path cost before each host-route pair.
+X.TP
+X.B \-v
+XVerbose: report some statistics on the standard error output.
+X.TP
+X.B \-D
+XTerminal domains: domain members are terminal.
+X.TP
+X.B \-f
+XFirst hop cost: the printed cost is the cost to the first relay in a path,
+Xinstead of the cost of the path itself; implies (and overrides) the
+X.B \-c
+Xoption.
+X.ig
+X.\" the -g option is for pathparse and is not for public consumption (yet!).
+X.TP
+X.BI \-g \0file
+XDump the edges of the graph into the named file.
+X..
+X.TP
+X.BI \-l \0host
+XSet local host name to
+X.IR host .
+XBy default,
+X.I pathalias
+Xdiscovers the local host name in a system-dependent way.
+X.TP
+X.BI \-a \0host
+XAvoid
+X.IR host ;
+Xpenalize all links out of
+X.I host
+Xby a small amount.  The
+X.B \-a
+Xoption is cumulative.
+X.TP
+X.BI \-d \0arg
+XDeclare a dead link, host, or network.
+XIf
+X.I arg
+Xis of the form ``host-1!host-2,'' the link from host-1 to host-2
+Xis treated as an extremely high cost (\fIi.e.\fP, \s-1DEAD\s0) link.
+XIf
+X.I arg
+Xis a single host name,
+Xthat host is treated as dead
+Xand is used as a relay host of last resort on any path.
+XIf
+X.I arg
+Xis a network name, the network requires a gateway.
+X.TP
+X.BI \-t \0arg
+XTrace input for link, host or network on the standard error output.
+XThe form of
+X.I arg
+Xis as above.
+X.PP
+X.I Makedb
+Xtakes
+X.I pathalias
+Xoutput and creates or appends to a
+X.IR dbm (3)
+Xdatabase.
+X.PP
+XHere are the
+X.I makedb
+Xoptions:
+X.TP 6
+X.B \-a
+XAppend to an existing database;
+Xby default,
+X.I makedb
+Xtruncates the database.
+X.TP
+X.BI \-o \0dbmfile
+XIdentify the output file base name.
+X.PP
+X.I Arpatxt
+Xconverts the Internet hosts table
+X.I hosts.txt
+Xinto
+X.I pathalias
+Xinput.
+X.PP
+XHere are the
+X.I arpatxt
+Xoptions:
+X.TP 6
+X.B \-@
+XGenerate
+X.I pathalias
+Xinput that specifies `@' style addressing.  The default
+Xis to produce
+X.I pathalias
+Xinput that specifies `!' style addressing.
+X.TP
+X.B \-f
+X\&``Filter mode'' \(em write output on stdout.  Normally,
+X.I arpatxt
+Xwrites the description of each domain into a separate file.
+X.TP
+X.B \-i
+XMap output to lower case.
+X.TP
+X.BI \-g \0arg
+XDeclare a gateway to the Internet or one of its subdomains.  If
+X.I arg
+Xcontains one or more dots, the left-hand side component that contains
+Xno dots is declared a gateway to the domain to the right of the dot.
+XOtherwise,
+X.I arg
+Xis declared a gateway to the Internet as a whole.
+X.TP
+X.BI \-p \0privatefile
+X.I Privatefile
+Xcontains a list of host names that conflict with other names.
+X.TP
+X.BI \-d \0directory
+XWrite output files in
+X.IR directory .
+X.SS \fIPathalias\fP Input Format
+XA line beginning with white space continues the preceding line.
+XAnything following `#' on an input line is ignored.
+X.PP
+XA list of host-to-host connections consists of a ``from'' host in column 1,
+Xfollowed by white space,
+Xfollowed by a comma-separated list of ``to' hosts, called
+X.IR links .
+XA link may be preceded or followed by a network character to use
+Xin the route.
+XValid network characters are `!' (default), `@', `:', and `%'.
+XA link (and network character, if present) may be
+Xfollowed by a ``cost'' enclosed in parentheses.
+XCosts may be arbitrary
+Xarithmetic expressions involving numbers, parentheses, `+', `\-', `*',
+Xand `/'.
+XThe following symbolic costs are
+Xrecognized:
+X.PP
+X.RS
+X.nf
+X.ta 14mR 17m
+X\s-1LOCAL\s0	25	(local-area network connection)
+X\s-1DEDICATED\s0	95	(high speed dedicated link)
+X\s-1DIRECT\s0	200	(toll-free call)
+X\s-1DEMAND\s0	300	(long-distance call)
+X\s-1HOURLY\s0	500	(hourly poll)
+X\s-1EVENING\s0	1800	(time restricted call)
+X\s-1DAILY\s0	5000	(daily poll, also called \s-1POLLED\s0)
+X\s-1WEEKLY\s0	30000	(irregular poll)
+X.fi
+X.RE
+X.PP
+XIn addition,
+X.SM DEAD
+Xis a very large number (effectively infinite),
+X.SM HIGH
+Xand
+X.SM LOW
+Xare \-5 and +5 respectively,
+Xfor baud-rate or quality bonuses/penalties,
+Xand
+X.SM FAST
+Xis \-80, for adjusting costs of links that use high-speed (9.6 Kbaud or more) modems.
+XThese symbolic costs represent an imperfect measure of bandwidth,
+Xmonetary cost, and frequency of connections.
+XFor most mail traffic, it is important to minimize the number
+Xof hosts in a route,
+Xthus,
+X.IR e.g. ,
+X.SM HOURLY
+X\&* 24
+Xis much larger than
+X.SM DAILY.
+XIf no cost is given,
+Xa default of 4000 is used.
+X.PP
+XFor the most part, arithmetic expressions that mix symbolic constants
+Xother than
+X.SM HIGH,
+X.SM LOW,
+Xand
+X.SM FAST
+Xmake no sense.
+X.IR E.g. ,
+Xif a host calls a local neighbor whenever there is work,
+Xand additionally polls every evening,
+Xthe cost is
+X.SM DIRECT,
+X.B not
+X.SM DIRECT+EVENING.
+X.PP
+XSome examples:
+X.PP
+X.RS
+X.nf
+X.ta 10m 15m
+Xdown	princeton!(\s-1DEDICATED\s0), tilt,
+X	%thrash(\s-1LOCAL\s0)
+Xprinceton	topaz!(\s-1DEMAND\s0+\s-1LOW\s0)
+Xtopaz	@rutgers(\s-1LOCAL\s0+1)
+X.fi
+X.RE
+X.PP
+XIf a link is encountered more than once,
+Xthe least-cost occurrence dictates the cost and network character.
+XLinks are treated as bidirectional but asymmetric:
+Xfor each link declared in the input, a
+X.SM DEAD
+Xreverse link is assumed.
+X.PP
+XIf the ``to'' host in a link is surrounded by angle brackets,
+Xthe link is considered
+X.IR terminal ,
+Xand
+Xfurther links beyond this one are heavily penalized.
+X.IR E.g. ,
+Xwith input
+X.PP
+X.RS
+X.nf
+X.ta 10m 15m
+Xseismo	<research>(10), research(100), ihnp4(10)
+Xresearch	allegra(10)
+Xihnp4	allegra(50)
+X.fi
+X.RE
+X.PP
+Xthe path from seismo to research is direct, but the path from seismo
+Xto allegra
+Xuses ihnp4 as a relay, not research.
+XThe way to think of this is to imagine two copies of research, one that's
+Xcheap to get to, but has no neighbors, and one that's expensive to get to,
+Xbut has neighbors.
+X(This is an exception to the ``least-cost link'' rule above.)
+X.PP
+XThe set of names by which a host is known to its neighbors is
+Xcalled its
+X.IR aliases .
+XAliases are declared as follows:
+X.PP
+X.RS
+Xname = alias, alias ...
+X.RE
+X.PP
+XThe name used in the route to or through aliased hosts
+Xis the name by which the host is known
+Xto its predecessor in the route.
+X.PP
+XFully connected networks, such as the
+X.SM ARPANET
+Xor a local-area network,
+Xare declared as follows:
+X.PP
+X.RS
+Xnet = {host, host, ...}
+X.RE
+X.PP
+XThe host-list may be preceded or followed by a routing
+Xcharacter, and may be followed by a cost:
+X.PP
+X.RS
+X.nf
+Xprinceton-ethernet = {down, up, princeton}!(\s-1LOCAL\s0)
+X\s-1ARPA\s0 = @{sri-unix, mit-ai, su-score}(\s-1DEDICATED\s0)
+X.fi
+X.RE
+X.PP
+XThe routing character used in a route to a network member is the one
+Xencountered when ``entering'' the network.
+XSee also the sections on
+X.I gateways
+Xand
+X.I domains .
+X.PP
+XConnection data may be given while hiding host names
+Xby declaring
+X.PP
+X.RS
+Xprivate {host, host, ...}
+X.RE
+X.PP
+X.I Pathalias
+Xwill not generate routes for private hosts, but may produce routes
+Xthrough them.
+XThe scope of a private declaration extends from the declaration to the end of
+Xthe input file in which it appears, or to a private declaration with an empty
+Xhost list, whichever comes first.
+XThe latter scope rule offers a way to retain the
+Xsemantics of private declarations when
+Xreading from the standard input.
+X.PP
+XDead hosts, links, or networks may be presented in the input stream by declaring
+X.PP
+X.RS
+Xdead {arg, ...}
+X.RE
+X.PP
+Xwhere
+X.I arg
+Xhas the same form as the argument to the
+X.B \-d
+Xoption.
+X.SS Output Format
+XA list of host-route pairs is written to the standard output,
+Xwhere route is a string appropriate for use with
+X.IR printf (3),
+X.IR e.g. ,
+X.PP
+X.RS
+X.nf
+X.ta 10m 20m
+Xrutgers	princeton!topaz!%s@rutgers
+X.fi
+X.RE
+X.PP
+XThe ``%s'' in the route string should be replaced by the
+Xuser name at the destination host.
+X(This task is normally performed by a mailer.)
+X.PP
+XExcept for
+X.IR domains ,
+Xthe name of a network is never used in
+Xroutes.
+XThus, in the earlier example, the path from down to
+Xup would be ``up!%s,'' not ``princeton-ethernet!up!%s.''
+X.SS Gateways
+XA network is represented by
+Xa pseudo-host and a set of network members.
+XLinks from the members to the network have the weight given in
+Xthe input, while the cost from the network to the members is zero.
+XIf a network is declared dead,
+Xthe member-to-network links are marked dead,
+Xwhich effectively prohibits access to the network
+Xfrom its members.
+X.PP
+XHowever, if the input also shows an explicit link from any host to the network,
+Xthen that host can be used as a gateway.
+X(In particular, the gateway need not be a network member.)
+X.PP
+X.IR E.g. ,
+Xif
+X.SM CSNET
+Xis declared dead
+Xand the input contains
+X.PP
+X.RS
+X.nf
+X.ta 10m 20m
+X\s-1CSNET\s0 = {...}
+Xcsnet-relay	\s-1CSNET\s0
+X.fi
+X.RE
+X.PP
+Xthen routes to
+X.SM CSNET
+Xhosts will use csnet-relay as a gateway.
+X.SS Domains
+XA network whose name begins with `.' is called
+Xa domain.
+XDomains are presumed to require gateways,
+X.IR i.e. ,
+Xthey are \s-1DEAD\s0.
+XThe route given by a path through a domain is similar to
+Xthat for a network, but here
+Xthe domain name is tacked onto the end of the next host.
+XSubdomains are permitted.
+X.PP
+X.IR E.g. ,
+X.PP
+X.RS
+X.nf
+X.ta 1i
+X.ta 10m 20m 30m
+Xharvard	.\s-1EDU\s0	# harvard is gateway to .EDU domain
+X\&.\s-1EDU\s0	= {.\s-1BERKELEY\s0, .\s-1UMICH\s0}
+X\&.\s-1BERKELEY\s0	= {ernie}
+X.fi
+X.RE
+X.PP
+Xyields
+X.PP
+X.RS
+X.nf
+X.ta 10m 20m
+Xernie	...!harvard!ernie.\s-1BERKELEY\s0.\s-1EDU\s0!%s
+X.fi
+X.RE
+X.PP
+XOutput is given for the nearest gateway
+Xto a domain,
+X.IR e.g. ,
+Xthe example above gives
+X.PP
+X.RS
+X.nf
+X.ta 10m 25m
+X\&.\s-1EDU\s0	...!harvard!%s
+X.fi
+X.RE
+X.PP
+XOutput is given for a subdomain if it has a different
+Xroute than its parent domain, or if all its ancestor domains are private.
+X.PP
+XIf the
+X.B \-D
+Xoption is given on the command line,
+X.I pathalias
+Xtreats a link from a domain to a host member of that domain as terminal.
+XThis discourages the use of
+Xroutes that use a domain member as a relay.
+X.SS Databases
+X.I Makedb
+Xbuilds a
+X.IR dbm (3)
+Xdatabase from the standard input or from the named
+X.IR files .
+XInput is expected to be sequence of
+X.SM ASCII
+Xrecords,
+Xeach consisting of a key field and a data field separated by a single tab.
+XIf the tab is missing, the data field is assumed to be empty.
+X.SH FILES ET AL.
+X.ta \w'/usr/local/lib/palias.{dir,pag}     'u
+X/usr/local/lib/palias.{dir,pag}	default dbm output
+X.br
+Xnewsgroup comp.mail.maps	likely location of some input files
+X.br
+X.IR getopt (3),
+Xavailable from comp.sources.unix archives (if not in the C library).
+X.SH BUGS
+XTerminal nets are not implemented.
+X.PP
+XThe
+X.B \-i
+Xoption should be the default.
+X.PP
+XThe order of arguments is significant.
+XIn particular,
+X.B \-i
+Xand
+X.B \-t
+Xshould appear early.
+X.PP
+X.I Pathalias
+Xcan generate hybrid (\fIi.e.\fP ambiguous) routes, which are
+Xabhorrent and most certainly should not be given as examples
+Xin the manual entry.
+XExperienced mappers largely shun `@' when preparing input; this
+Xis historical, but also reflects \s-1UUCP\s0's
+Xfacile syntax for source routes.
+X.PP
+XMultiple `@'s in routes are loathsome, so
+X.I pathalias
+Xresorts to the ``magic %'' rule when necessary.
+XThis convention is not documented anywhere, including here.
+X.PP
+XThe
+X.B \-D
+Xoption elides insignificant routes to domain members.
+XThis is benign, perhaps even beneficial, but confusing, since the
+Xbehavior is undocumented and somewhat unpredictable.
+X.SH SEE ALSO
+XP. Honeyman and S.M. Bellovin, ``\s-1PATHALIAS\s0 \fIor\fP The Care and Feeding
+Xof Relative Addresses,''
+Xin \fIProc. Summer \s-1USENIX\s0 Conf.\fP, Atlanta, 1986.
+END_OF_pathalias.1
+if test 11998 -ne `wc -c <pathalias.1`; then
+    echo shar: \"pathalias.1\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+echo shar: End of archive 2 \(of 2\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked both archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

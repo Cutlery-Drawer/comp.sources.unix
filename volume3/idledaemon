@@ -1,0 +1,1242 @@
+From: Stephen Crawley <genrad!panda!talcott!ucl-cs.arpa:scc@computer-lab.cambridge.ac.uk>
+Subject: Yet another idledaemon
+Newsgroups: mod.sources
+Approved: jpn@panda.UUCP
+
+Mod.sources:  Volume 3, Issue 17
+Submitted by: Stephen Crawley <ucl-cs.arpa:scc@computer-lab.cambridge.ac.uk>
+
+
+This posting contains the source and manual entry for a daemon for
+managing a pool of terminal ports to try to make sure that there
+will be free one when it is needed.  It does this by checking for
+sessions that have had no input, and that have no active processes.
+When there is a shortage of ports, some or all of these sessions are
+sent warning messages, and if necessary killed off.  
+
+The program is 4.2 specific, since (for example) it grubs around in 
+the process table to determine whether a session has active processes.
+
+To compile the program, feed the stuff below the dotted line into /bin/sh,
+then type
+		cc idledaemon
+
+If you want to see what the program is up to, compile it with the DEBUG
+flag set, and it will tell all on stderr.
+
+Read the manual entry, to find out about the various parameters you can
+tweak, then run the daemon.  I recommend that before you install it for
+real, you run the program with the -d option for a few days to get your 
+users used to the idea.  
+
+We have been running the daemon for a few weeks now, but bugs are still
+jumping out occasionally.  Please send any bug reports, suggestions for 
+changes and so on to me at the address below.
+
+			Stephen C. Crawley
+
+ARPA:	scc%uk.ac.cam.cl@ucl-cs.ARPA  SMail: Cambridge Univ. Computer Lab.,
+JANET:	scc@uk.ac.cam.cl                     Corn Exchange Street,
+UUCP:	{ukc,kcl-cs}!cl-jenny!scc	     Cambridge,
+	scc@cl-jenny.UUCP		     CB2 3QG, 
+PHONE:	+44 223 352 435                      England.
+
+
+------------------Cut-Here-And-Feed-Into-/bin/sh---------------------------
+#!/bin/sh
+echo 'Start of pack.out, part 01 of 01:'
+echo 'x - idledaemon.c'
+sed 's/^X//' > idledaemon.c << '/'
+X#ifndef lint
+Xstatic char rcsid[] = "CUCL:	$Header: idledaemon.c,v 1.5 85/09/23 01:40:32 scc Exp $";
+X#endif lint
+X
+X/*********************************************************************\
+X* 								      *
+X*  								      *
+X* 			    Copyright Notice: 			      *
+X* 								      *
+X* 	    (C) Cambridge University Computer Laboratory 1985	      *
+X* 								      *
+X* 	This program is Public Domain.  Permission is hereby given    *
+X* 	to anyone to redistributed it to anyone they want to, with    *
+X* 	the proviso that this notice is included unaltered.	      *
+X* 								      *
+X*	Neither the author or C.U.C.L accepts legal responsibility    *
+X*	for bugs in this program, or for any trouble it may cause.    *
+X*								      *
+X* 	Please send any comments, suggestions for improvements and    *
+X* 	bug reports/fixes to the author :-			      *
+X* 								      *
+X* 			    Stephen Crawley			      *
+X* 								      *
+X* 		    USENET: scc@cl-jenny.UUCP			      *
+X* 		    ARPA:   scc%cl.cam.ac.uk@ucl-cs.ARPA	      *
+X* 		    JANET:  scc@uk.ac.cam.cl			      *
+X* 								      *
+X\*********************************************************************/
+X
+X
+X/*
+X * idledaemon [-a] [-d] [-f<number>] [-{s,i,g}<minutes>] tty ...
+X *
+X * Kick idle users off the system if there is a shortage of terminals.
+X * 	-a	kick them off anyway (even if there are free lines)
+X *	-f	try to keep this many lines free
+X *	-s 	gives the time idledaemon sleeps between runs
+X *	-i	gives the idle threshold
+X *	-g	gives the grace period
+X *	-d	debug mode ... send messages to users, but don't
+X *		actually kill anything.  I used this to get people
+X *		used to the idea before installing the daemon for real.
+X *
+X * Idledaemon first checks /etc/utmp to see how many of the named terminals
+X * are free.  If enough terminals are free nothing more is done.  Otherwise,
+X * idle terminals for which a warning has been sent and for which the grace
+X * period has expired are SIGHUPed then SIGKILLed.  If the number of free
+X * terminals is still less than the threshold, warnings are sent to any 
+X * other idle terminals.
+X *
+X * Idledaemon's idea of an idle terminal is one for which there has been no
+X * terminal input processed in the time period, and for which there are no
+X * background jobs running or "sleeping".  Detached processes such as 
+X * sysline are excluded from the latter category.
+X *
+X * If you send a SIGINT to the daemon, it will print a summary of the
+X * the state of the world to standard output.
+X */
+X
+X
+X/* #define DEBUG	/* print debugging info on stderr */
+X
+X
+X#define SECSPERMIN 60
+X
+X/*
+X * Tuning parameters and argument defaults.
+X */
+X#define PROC_SLEEPTIME 		10
+X#define WARNING_TIMEOUT		(20 * SECSPERMIN)
+X#define DFLT_IDLETIME 		(30 * SECSPERMIN)
+X#define DFLT_GRACETIME 		(5 * SECSPERMIN)
+X#define DFLT_LOOPTIME 		(5 * SECSPERMIN)
+X#define DFLT_MINTTYSFREE 	1
+X
+X
+X
+X#include <stdio.h>
+X#include <signal.h>
+X#include <ctype.h>
+X#include <nlist.h>
+X#include <setjmp.h>
+X#include <utmp.h>
+X#include <sys/param.h>
+X#include <sys/time.h>
+X#include <sys/ioctl.h>
+X#include <sys/wait.h>
+X#include <sys/tty.h>
+X#include <sys/file.h>
+X#include <sys/proc.h>
+X#include <sys/stat.h>
+X
+Xstruct nlist nl[] = {
+X	{ "_proc" },
+X#define	X_PROC		0
+X	{ "_nproc" },
+X#define	X_NPROC		1
+X	{ "" },
+X};
+X
+Xextern errno;
+Xlong lseek();
+Xchar *malloc();
+Xchar *strncpy();
+X
+Xint gracetime = DFLT_GRACETIME;	/* Minimum time between message and zapping */
+Xint idletime = DFLT_IDLETIME;	/* Time allowed before a terminal is idle */
+Xint looptime = DFLT_LOOPTIME;	/* Sleep this long between looking */
+X
+Xint minttysfree = DFLT_MINTTYSFREE; 
+X				/* If there are less than this many terminals
+X				   free, start invoking sanctions ... */
+X				    
+Xint killanyway = 0;		/* If non-zero, kill 'em irrespective of the
+X				   number of free terminals. */
+X
+Xint debug = 0;			/* Disable killing, and modify messages
+X				   sent to user's terminals */
+X
+Xstruct ttyinfo
+X{
+X    char	tty_line[8];	/* Terminal name */
+X    int		tty_state;
+X    char	tty_name[8];	/* Logged in user's name */
+X    time_t	tty_logintime;
+X    time_t	tty_accesstime;
+X    time_t	tty_warningtime;
+X    struct proc *tty_shellproc;	/* Process table entry for login shell */
+X    short	tty_shellpid;	/* Process id of login shell */
+X    short	tty_notifier;	/* Process which is writing to terminal */
+X};
+X
+X/*
+X * State of terminal.
+X */
+X#define TTY_UNKNOWN	0	/* tty not in utmp (yet) */
+X#define TTY_FREE	1	/* not logged in */
+X#define TTY_ACTIVE	2	/* logged in */
+X#define TTY_NOINPUT	3	/* idle session (last time we checked) */
+X#define TTY_WARNED	4	/* a warning has been sent */
+X#define TTY_KILLED	5	/* session has been killed (transient) */
+X#define TTY_STUCK	6	/* session is unkillable ! */
+X#define NOS_STATES	7
+X
+Xchar *statestrings[NOS_STATES] = {
+X	"UNKNOWN", "FREE", "ACTIVE", "NOINPUT", 
+X	"WARNED", "KILLED", "STUCK"};
+X
+Xint nttys, nttysfree;	/* number of terminals and terminals currently free */
+Xstruct ttyinfo *ttytable;
+X
+Xint utmp = -1;		/* fd for /etc/utmp */
+Xint nutmp = 0;		/* number of utmp entries */
+Xstruct utmp *utmptable = 0;
+X
+X/*
+X * Process table globals.
+X */
+Xint kmem;		/* fd for /dev/kmem */
+X
+Xunsigned long procp;	/* base of process table */
+Xunsigned long nproc;	/* entries in process table */
+Xstruct proc *proctable;
+X
+Xunsigned long kreadvar();
+X
+Xtime_t timenow;
+Xint notifiers;		/* number of outstanding notification processes */
+Xint notifierskilled;	/* the notifiers have been SIGKILLED */
+Xjmp_buf timeout;	/* ... for abandoning the wait when a notifier 
+X			   gets stuck ... */
+X
+X#ifdef DEBUG
+X#define Bomb abort()
+X#define dprintf0(msg) fprintf(stderr,msg)
+X#define dprintf1(msg,a1) fprintf(stderr,msg,a1)
+X#define dprintf2(msg,a1,a2) fprintf(stderr,msg,a1,a2)
+X#else DEBUG
+X#define Bomb exit(1)
+X#define dprintf0(msg) 
+X#define dprintf1(msg,a1) 
+X#define dprintf2(msg,a1,a2) 
+X#endif DEBUG
+X
+X
+Xmain (argc, argv)
+Xint argc;
+Xchar **argv;
+X{
+X    int     argerror = 0;
+X    setlinebuf (stderr);
+X
+X    for (argc--, argv++; *argv && **argv == '-'; argv++, argc--)
+X    {
+X	switch ((*argv)[1])
+X	{
+X	    case 'a': 
+X		killanyway++;
+X		break;
+X	    case 'd':
+X		debug++;
+X		break;
+X	    case 'f': 
+X		minttysfree = atoi (&(*argv)[2]);
+X		break;
+X	    case 'g': 
+X		gracetime = atoi (&(*argv)[2]) * SECSPERMIN;
+X		break;
+X	    case 'i': 
+X		idletime = atoi (&(*argv)[2]) * SECSPERMIN;
+X		break;
+X	    case 'l': 
+X		looptime = atoi (&(*argv)[2]) * SECSPERMIN;
+X		break;
+X	    default: 
+X		argerror = 1;
+X	}
+X    }
+X
+X    if (argerror || argc <= 0)
+X    {
+X	fprintf (stderr,
+X		"usage: idledaemon [-a] [-d] [-f<nos>] [-{s,i,g}<mins>] tty ..\n");
+X	Bomb;
+X    }
+X
+X    if (idletime <= looptime || gracetime <= 0 || looptime <= 0)
+X    {
+X	fprintf (stderr,
+X		"idledaemon: inconsistent idle, grace and loop times\n");
+X	Bomb;
+X    }
+X
+X    if (chdir ("/dev") < 0)
+X    {
+X	perror ("idledaemon: can't cd to \"/dev\": ");
+X	Bomb;
+X    }
+X
+X    init_signals ();
+X    init_ttytable (argc, argv);
+X    init_kmem ();
+X
+X    /*
+X     * All OK ... orphan ourselves.
+X     */
+X    if (fork() != 0)
+X	exit (0);
+X
+X    for (;;)
+X    {
+X	timenow = time ((time_t *) 0);
+X	dprintf1 ("\ntime is %s", ctime(&timenow));
+X	/*
+X         * Count the terminals in use, dealing with changes in user.
+X	 */
+X	scanutmp ();
+X        dprintf1 ("there are %d terminals free\n", nttysfree);
+X
+X	if (nttysfree < minttysfree || killanyway)
+X	{
+X	    /*
+X	     * For each tty in use, see if there has been any input, and
+X	     * clear the WARNED state if there has been.  The value
+X	     * returned is the number of possibly idle terminals.
+X	     */
+X	    if (scanttys () > 0)
+X	    {
+X		struct ttyinfo *tp;
+X
+X		/*
+X		 * Knock sessions off one at a time in order of
+X		 * decreasing idleness.
+X		 */
+X		while (nttysfree < minttysfree || killanyway)
+X		{
+X		    if (!killmostidle())
+X			break;
+X		}
+X		/*
+X		 * Satisfied?
+X		 */
+X		if (nttysfree < minttysfree || killanyway)
+X		{
+X		    /*
+X		     * Nope!  Send out warnings to the next batch.
+X		     */
+X		    read_proctable ();
+X		    for (tp = ttytable; tp < &ttytable[nttys]; tp++)
+X		    {
+X			if (tp -> tty_state == TTY_NOINPUT && ttyidle (tp))
+X			    ttywarning (tp);
+X		    }
+X		}
+X		collectnotifiers ();
+X	    }    
+X	}
+X	sleep ((unsigned) looptime);
+X    }
+X}
+X
+X
+X/*
+X * Initialise tty table from (the rest of) the argument vector.
+X */
+Xinit_ttytable(argc, argv)
+Xint argc;
+Xchar **argv;
+X{
+X    struct ttyinfo *tp;
+X
+X    ttytable = (struct ttyinfo *) malloc((unsigned) argc * sizeof(*ttytable));
+X    if (ttytable == 0)
+X    {
+X	fprintf (stderr, "idledaemon: can't calloc ttytable!");
+X	Bomb;
+X    }
+X    nttys = argc;
+X
+X    for (tp = ttytable; argc > 0; argc--, argv++, tp++)
+X    {
+X	struct stat stbuf;
+X
+X	/*
+X	 * Check we can stat each terminal.
+X	 */
+X	if (stat(*argv, &stbuf) < 0)
+X	{
+X	    fprintf (stderr, "idledaemon: can't stat %s: ", *argv);
+X	    perror ("");
+X	    Bomb;
+X	}
+X	(void) strncpy (tp -> tty_line, *argv, sizeof (tp -> tty_line));
+X	tp -> tty_name[0] = '\000';
+X	tp -> tty_logintime = 0;
+X	tp -> tty_warningtime = 0;
+X	tp -> tty_accesstime = 0;
+X	tp -> tty_shellpid = 0;
+X	tp -> tty_notifier = 0;
+X	tp -> tty_state = TTY_UNKNOWN;
+X    }
+X}
+X
+X
+X/*
+X * Initialise bits and pieces needed to read the proc table
+X */
+Xinit_kmem ()
+X{
+X    if ((kmem = open ("kmem", O_RDONLY, 0)) < 0)
+X    {
+X	perror ("idledaemon: can't open /dev/kmem");
+X	Bomb;
+X    }
+X    nlist ("/vmunix", nl);
+X    if (nl[0].n_type == 0)
+X    {
+X	fprintf (stderr, "idledaemon: can't get namelist for /vmunix\n");
+X	Bomb;
+X    }
+X    procp = kreadvar (X_PROC);
+X    nproc = kreadvar (X_NPROC);
+X    proctable = (struct proc *) malloc((unsigned) nproc * sizeof(*proctable));
+X    if (proctable == 0)
+X    {
+X	fprintf (stderr, "idledaemon: can't calloc proc table buffer!\n");
+X	Bomb;
+X    }
+X}
+X
+X
+X/*
+X * Read complete proc table into the proctable buffer.
+X */
+Xread_proctable ()
+X{
+X    if (lseek (kmem, (long) procp, L_SET) != procp)
+X    {
+X	perror ("idledaemon: lseek to proc table failed: ");
+X	Bomb;
+X    }
+X#define proctabsize (nproc * sizeof (struct proc))
+X    if (read (kmem, (char *) proctable, (int) proctabsize) != proctabsize)
+X    {
+X	perror ("idledaemon: proc table read failed: ");
+X	Bomb;
+X    }
+X}
+X
+X
+X/*
+X * Read a long from the kernel.
+X */
+Xunsigned long kreadvar (name)
+Xint name;
+X{
+X    unsigned long res;
+X    unsigned long addr = nl[name].n_value;
+X
+X    if (lseek (kmem, (long) addr, L_SET) != addr)
+X    {
+X	perror ("idledaemon: lseek on kmem failed: ");
+X	Bomb;
+X    }
+X    if (read (kmem, (char *) &res, sizeof(res)) != sizeof (res))
+X    {
+X	perror ("idledaemon: read on kmem failed: ");
+X	Bomb;
+X    }
+X    dprintf2 ("kreadvar: &%x -> %x\n", addr, res);
+X    return (res);
+X}
+X
+X
+X/*
+X * Relocate a proc table pointer, relative to proctable.
+X */
+Xstruct proc *reloc (pp)
+Xstruct proc *pp;
+X{
+X    return (struct proc *) (
+X	    (unsigned) pp - (unsigned) procp + (unsigned) proctable);
+X}
+X
+X
+X/*
+X * Read utmp file and update the tty table for sessions that have
+X * logged in or out.  Then count free terminals..
+X */
+Xscanutmp ()
+X{
+X    struct stat statbuf;
+X    int size;
+X    struct utmp *up;
+X    struct ttyinfo *tp;
+X
+X    /*  Open utmp file if we haven't already */
+X    if (utmp == -1)
+X    {
+X	utmp = open ("/etc/utmp", O_RDONLY, 0);
+X	if (utmp < 0)
+X	{
+X	    perror ("idledaemon: can't open /etc/utmp: ");
+X	    Bomb;
+X	}
+X    }
+X    else
+X    {
+X	if (lseek (utmp, (long) 0, L_SET) != 0)
+X	{
+X	    perror ("idledaemon: lseek on utmp failed: ");
+X	    Bomb;
+X	}
+X    }
+X
+X    /*
+X     * Find out how big the file is.  If it is bigger than it was before,
+X     * allocate a bigger buffer.
+X     */
+X    if (fstat (utmp, &statbuf) < 0)
+X    {
+X	perror ("idledaemon: utmp stat failed: ");
+X	Bomb;
+X    }
+X    size = statbuf.st_size;
+X    if ((size / sizeof (struct utmp)) != nutmp)
+X    {
+X	nutmp = size / sizeof (struct utmp);
+X	if (utmptable != 0)
+X	    free ((char *) utmptable);
+X	utmptable = (struct utmp *) malloc ((unsigned) size);
+X    }
+X
+X    /*
+X     * Read utmp and update the tty table from it.
+X     */
+X    if (read (utmp, (char *) utmptable, size) != size)
+X    {
+X	fprintf (stderr, "idledaemon: utmp read failed\n");
+X	Bomb;
+X    }
+X    for (up = utmptable; up < &utmptable[nutmp]; up++)
+X    {
+X	for (tp = ttytable; tp < &ttytable[nttys]; tp++)
+X	{
+X	    if (strcmp (tp -> tty_line, up -> ut_line) == 0)
+X	    {
+X	        if (up -> ut_name[0] == '\000')
+X	        {
+X		    tp -> tty_name[0] = '\000';
+X		    if (tp -> tty_state != TTY_FREE)
+X		        ttystate (tp, TTY_FREE);
+X		}
+X		else
+X		{
+X		    if (up -> ut_time != tp -> tty_logintime ||
+X			strcmp (tp -> tty_name, up -> ut_name) != 0)
+X		    {
+X			(void) strncpy (tp -> tty_name, up -> ut_name, 
+X				 sizeof (tp -> tty_name));
+X			tp -> tty_logintime = up -> ut_time;
+X			tp -> tty_accesstime = 0;
+X			tp -> tty_shellpid = 0;
+X			ttystate (tp, TTY_ACTIVE);
+X		    }
+X		}
+X	    }
+X	}
+X    }
+X    /*
+X     * Count the free terminals.
+X     */
+X    nttysfree = 0;
+X    for (tp = ttytable; tp < &ttytable[nttys]; tp++)
+X	if (tp -> tty_state == TTY_FREE || tp -> tty_state == TTY_UNKNOWN)
+X	    nttysfree++;
+X}
+X
+X
+X/*
+X * Look at the atimes for all ttys in the table, and adjust state.
+X * The number of terminals that have had no input is returned.
+X */
+Xscanttys ()
+X{
+X    struct stat statbuf;
+X    struct ttyinfo *tp;
+X    int candidates = 0;
+X
+X    for (tp = ttytable; tp < &ttytable[nttys]; tp++)
+X    {
+X	if (tp -> tty_state != TTY_FREE)
+X	{
+X	    if (stat (tp -> tty_line, &statbuf) < 0)
+X	    {
+X		fprintf (stderr, "stat(%s) failed: ", tp -> tty_line);
+X		perror ("");
+X		continue;
+X	    }
+X
+X	    if (statbuf.st_atime != tp -> tty_accesstime)
+X	    {
+X	        tp -> tty_accesstime = statbuf.st_atime;
+X	        if (tp -> tty_state != TTY_ACTIVE)
+X		{
+X		    /*
+X		     * At some point since the last scan, the terminal
+X		     * has reactivated.  It may not still be active,
+X		     * but that is dealt with below.
+X		     */
+X		    ttystate (tp, TTY_ACTIVE);
+X		}
+X	    }
+X	    
+X	    /*
+X	     * Spot idle terminals, and timeout old warnings.
+X	     */
+X	    if (timenow > tp -> tty_accesstime + idletime)
+X	    {
+X		if (tp -> tty_state == TTY_ACTIVE ||
+X		    (tp -> tty_state == TTY_WARNED &&
+X		     timenow > tp -> tty_warningtime + WARNING_TIMEOUT))
+X		{
+X		    ttystate (tp, TTY_NOINPUT);
+X		}
+X		candidates++;
+X	    }
+X	}
+X    }
+X    dprintf1 ("scantty: %d candidates\n", candidates);
+X    return (candidates);
+X}
+X
+X
+X/*
+X * Decide if a terminal has no active processes.
+X */
+Xttyidle (tp)
+Xstruct ttyinfo *tp;
+X{
+X    if (tp -> tty_shellpid == 0)
+X    {	
+X	/*
+X	 * Cache information about process shell.
+X	 */
+X	if (!findshell (tp))
+X	    return (0);
+X    }
+X    else
+X    {
+X	if (tp -> tty_shellproc -> p_pid != tp -> tty_shellpid)
+X	{
+X	    dprintf0 ("err ... this process table is like wierd man!\n");
+X	    if (!findshell (tp))
+X		return (0);
+X	}
+X    }
+X    return (idleprocs (tp -> tty_shellproc, 0));
+X}
+X
+X
+X/*
+X * Change terminal state and dprint ... it happens a lot
+X */
+Xttystate (tp, state)
+Xstruct ttyinfo *tp;
+Xint state;
+X{
+X    tp -> tty_state = state;
+X    dprintf2 ("%s state -> %s\n", tp -> tty_line, statestrings[state]);
+X}
+X
+X
+X/*
+X * Starting at the shell process, traverse the tree of processes looking for
+X * an active one.  An active process is defined to be any process in states
+X * SWAIT, SRUN or SIDL, or in state SSLEEP with slptime < MAXSLP.
+X */
+Xidleprocs (pp, depth)
+Xstruct proc *pp;
+Xint depth;
+X{
+X    register struct proc *cpp;
+X    register short width = 0;
+X
+X    if (depth > nproc)
+X    {
+X	dprintf0 ("eek!! idleprocs looping vertically!!\n");
+X	return (0);
+X    }
+X
+X    switch (pp -> p_stat)
+X    {
+X        case SSLEEP:
+X	    if (pp -> p_slptime >= PROC_SLEEPTIME)
+X		break;
+X	case SWAIT:
+X	case SRUN:
+X	case SIDL:
+X	    dprintf1 ("process %d is active\n", pp -> p_pid);
+X	    return (0);		/* not idle */
+X    }
+X    dprintf1 ("process %d is idle\n", pp -> p_pid);
+X
+X    /*
+X     * Recursively check all children starting at youngest.
+X     */
+X    cpp = pp -> p_cptr;
+X    while (cpp != NULL)
+X    {
+X	if (width++ > nproc)
+X	{
+X	    dprintf0 ("eek!! idleproc looping horizontally!!\n");
+X	    return (0);
+X	}
+X	cpp = reloc (cpp);
+X	if (!idleprocs(cpp, depth + 1))
+X	    return (0);
+X	cpp = cpp -> p_osptr;
+X    }
+X    dprintf2 ("checked %d children for %d ...\n", width, pp -> p_pid);
+X    return (1);
+X}
+X
+X
+X/*
+X * Find the "shell" process associated with the terminal.  
+X * The algorithm is ...
+X *	Look up the controlling process group for the tty. If the
+X *	    associated process DNE, search for one with the same pgrp.
+X *	Starting with the process, chain back through the parents until a
+X *          process with ppid == 1 is found.  That's the shell.
+X */
+Xfindshell (tp)
+Xstruct ttyinfo *tp;
+X{
+X    int tty = open (tp -> tty_line, O_WRONLY, 0);
+X    short pgrp;
+X    register paranoia = 0;
+X    register struct proc *pp, *altpp;
+X
+X    if (tty < 0)
+X    {
+X	fprintf (stderr, "idledaemon: open /dev/%s failed in findshell: ",
+X		tp -> tty_line);
+X	perror ("");
+X	return (0);
+X    }
+X    /* 4.2 lint library (?) bug ... */
+X    if (ioctl (tty, TIOCGPGRP, (char *) &pgrp) < 0)
+X    {
+X	fprintf (stderr, "idledaemon: ioctl on /dev/%s to get pgrp failed: ",
+X		tp -> tty_line);
+X	perror ("");
+X	close (tty);
+X	return (0);
+X    }
+X    close (tty);
+X    for (pp = proctable; pp < &proctable[nproc] && pp -> p_pid != pgrp; pp++)
+X    {
+X	if (pp -> p_pgrp == pgrp)
+X	    altpp = pp;
+X    }
+X    if (pp -> p_pid != pgrp)
+X	if (altpp -> p_pgrp == pgrp)
+X	{
+X	    pp = altpp;
+X	    dprintf2 ("findshell starting with proc %d in pgrp %d\n", 
+X		      altpp -> p_pid, pgrp);
+X	}
+X	else
+X	{
+X	    fprintf (stderr, 
+X		    "idledaemon: no processes for pgrp %d (/dev/%s)\n",
+X		    pgrp, tp -> tty_line);
+X	    return (0);
+X	}
+X    else
+X	dprintf1 ("findshell starting with pgrp leader %d\n", pgrp);
+X    while (pp -> p_ppid > 1)
+X    {
+X	pp = reloc (pp -> p_pptr);
+X	dprintf1 ("parent is %d\n", pp -> p_pid);
+X	if (paranoia++ > nproc)
+X	{
+X	    dprintf0 ("eek!! findshell looping!!\n");
+X	    return (0);
+X	}
+X    }
+X    dprintf1 ("findshell found process %d\n", pp -> p_pid);
+X    tp -> tty_shellpid = pp -> p_pid;
+X    tp -> tty_shellproc = pp;
+X    return (1);
+X}
+X
+X
+X/*
+X * Send a HUP to all the decendents of the process ... depth first
+X */
+Xhupprocs (pp, depth)
+Xstruct proc *pp;
+Xint depth;
+X{
+X    register struct proc *cpp;
+X    register width = 0;
+X    register i;
+X
+X    if (depth > nproc)
+X    {
+X	dprintf0 ("eek!! killprocs looping vertically!!\n");
+X	return;
+X    }
+X
+X    /*
+X     * See if the process has gone already ...
+X     */
+X    if (kill (pp -> p_pid, 0) < 0)
+X    {
+X	dprintf2 ("hupprocs: process %d has already gone away: errno %d\n", 
+X		pp -> p_pid, errno);
+X	return;
+X    }
+X
+X    dprintf1 ("hupprocs: doing children of process %d\n", pp -> p_pid);
+X
+X    /*
+X     * Recursively HUP all children starting at youngest.
+X     */
+X    cpp = pp -> p_cptr;
+X    while (cpp != NULL)
+X    {
+X	if (width++ > nproc)
+X	{
+X	    dprintf0 ("eek!! killproc looping horizontally!!\n");
+X	    return;
+X	}
+X	cpp = reloc (cpp);
+X	hupprocs(cpp, depth + 1);
+X	cpp = cpp -> p_osptr;
+X    }
+X    dprintf2 ("HUPed %d children for %d ...\n", width, pp -> p_pid);
+X    
+X    if (kill (pp -> p_pid, SIGHUP) < 0)
+X    {
+X	dprintf2 ("HUP to %d failed ... errno %d\n", pp -> p_pid, errno);
+X	return;
+X    }
+X    else
+X	dprintf1 ("HUP sent to %d\n", pp -> p_pid);
+X    if (pp -> p_stat == SSTOP)
+X    {
+X	(void) kill (pp -> p_pid, SIGCONT);
+X	dprintf1 ("CONT sent to %d\n", pp -> p_pid);
+X    }
+X
+X    for (i = 0; i < 5; i++)
+X    {
+X        if (kill (pp -> p_pid, 0) < 0)
+X	{
+X	    dprintf1 ("HUPed process %d has gone\n", pp -> p_pid);
+X	    return;
+X	}
+X	dprintf0 (".");	    
+X	sleep (1);
+X    }
+X    dprintf1 ("HUPed process %d didn't go away\n", pp -> p_pid);
+X}
+X
+X
+X/*
+X * Send an idle warning message.
+X */
+Xttywarning (tp)
+Xstruct ttyinfo *tp;
+X{
+X    ttymsg (tp, "WARNING: you may be auto-logged out in %d mins.\r\n", 
+X	    gracetime / SECSPERMIN);
+X    tp -> tty_warningtime = timenow;	/* (or there abouts) */
+X    ttystate (tp, TTY_WARNED);
+X}
+X
+X
+X/*
+X * Search and destroy the terminal with the most idle time.
+X */
+Xkillmostidle()
+X{
+X    register struct ttyinfo *tp,
+X                           *itp;
+X
+X    read_proctable ();
+X /* Find worst offender.  */
+X    for (tp = ttytable, itp = (struct ttyinfo  *) 0;
+X	    tp < &ttytable[nttys]; tp++)
+X    {
+X	if (tp -> tty_state == TTY_WARNED &&
+X		tp -> tty_accesstime + idletime + gracetime < timenow &&
+X		(!itp || (tp -> tty_accesstime < itp -> tty_accesstime)))
+X	{
+X	    if (!ttyidle (tp))
+X	    {
+X	    /* 
+X	     * Zombified session has revived itself without
+X	     * any input from terminal.  Probably some clock
+X	     * driven process.
+X	     */
+X		dprintf1 ("Urghhh! terminal %s has revived itself\n",
+X			tp -> tty_line);
+X		ttystate (tp, TTY_NOINPUT);
+X	    }
+X	    else
+X		itp = tp;
+X	}
+X    }
+X    if (!itp)
+X	return (0);		/* Ah well ... nothing left to kill */
+X
+X/*
+X * Zap all processes attached to a terminal.  If the shell process goes
+X * away, nttysfree is incremented to stop the mainline killing more
+X * sessions or sending out warnings unnecessarily (unneces-celery).
+X */
+X    ttymsg (itp, "Your session is being auto-logged out\r\n", 0);
+X    sleep (1);
+X
+X    read_proctable ();		/* Hmm ... a little bit of paranoia here */
+X    if (debug == 0 && (itp -> tty_shellproc -> p_pid == itp -> tty_shellpid))
+X    {
+X    /* 
+X     * Send HUPs to all processes attached to terminal.
+X     */
+X	hupprocs (itp -> tty_shellproc, 0);
+X
+X    /* 
+X     * If the shell is still hanging around, stick the knife in.
+X     */
+X	if (kill (itp -> tty_shellpid, 0) == 0)
+X	{
+X	    dprintf1 ("KILLing shell process %d\n", itp -> tty_shellpid);
+X	    (void) kill (itp -> tty_shellpid, SIGKILL);
+X	    sleep (5);
+X	    if (kill (itp -> tty_shellpid, 0) < 0)
+X		nttysfree++;
+X	    else
+X	    {
+X		dprintf1 ("Shell process %d cannot be killed!!\n", 
+X			  itp -> tty_shellpid);
+X		ttystate (itp, TTY_STUCK);
+X		return (1);
+X	    }
+X	}
+X	else
+X	    nttysfree++;
+X    }
+X    else
+X    {
+X	dprintf1 ("skipped kills for process %d\n", itp -> tty_shellpid);
+X	nttysfree++;
+X    }
+X    ttystate (itp, TTY_KILLED);
+X    return (1);
+X}
+X
+X
+X/*
+X * Send a message to a user's terminal from a sub-process
+X */
+Xttymsg (tp, message, arg)
+Xstruct ttyinfo *tp;
+Xchar *message;
+Xint arg;
+X{
+X    tp -> tty_notifier = fork();
+X    if (tp -> tty_notifier < 0)
+X    {
+X	perror ("idledaemon: fork failed: ");
+X	return;
+X    }
+X    /*
+X     * Child process sends message.  It will be collected later.
+X     */
+X    if (tp -> tty_notifier == 0)
+X	notifier (tp -> tty_line, message, arg);	/* does not return */
+X    notifiers++;
+X    (void) alarm (2);
+X}
+X
+X
+X/*
+X * ALARM handler for collectnotifiers() ... give the notifiers a helping hand
+X */
+Xkillnotifiers ()
+X{
+X    struct ttyinfo *tp;
+X
+X    /*
+X     * If we have already sent the kills, something screwy is going on!
+X     */
+X    if (notifierskilled)
+X    {
+X	dprintf0 ("Timeout for collectnotifiers() after sending kills!\n");
+X	/* 4.2 lint library bug ... */
+X	longjmp(timeout, 1);
+X    }
+X
+X    for (tp = ttytable; tp < &ttytable[nttys]; tp++)
+X    {
+X        if (tp -> tty_notifier > 0)
+X	{
+X	    (void) kill (tp -> tty_notifier, SIGKILL);
+X	    dprintf1 ("killing notifier %d\n", tp -> tty_notifier);
+X	}
+X    }
+X    notifierskilled++;
+X    (void) alarm (5);    
+X}
+X
+X
+X/*
+X * Collect all terminal notification processes, sending a kill if
+X * necessary in case someone has left their terminal with output blocked.
+X */
+Xcollectnotifiers ()
+X{
+X    union wait status;
+X    int     child;
+X    struct ttyinfo *tp;
+X
+X    if (notifiers == 0)
+X	return;
+X
+X    dprintf0 ("Collecting notifiers\n");
+X    notifierskilled = 0;
+X
+X    (void) signal (SIGALRM, killnotifiers);
+X    (void) alarm (5);
+X
+X    if (setjmp (timeout) == 0)
+X    {
+X	while (notifiers > 0)
+X	{
+X	    child = wait (&status);
+X	    dprintf2 ("notifier %d status %x\n", child, status);
+X	    for (tp = ttytable; tp < &ttytable[nttys]; tp++)
+X	    {
+X		if (child == tp -> tty_notifier)
+X		{
+X		    tp -> tty_notifier = 0;
+X		    notifiers--;
+X		}
+X	    }
+X	}
+X    }
+X    else
+X	dprintf1 ("Abandoned wait for %d notifiers\n", notifiers);
+X
+X    notifiers = 0;
+X    (void) alarm (0);
+X    (void) signal (SIGALRM, SIG_IGN);
+X}
+X
+X
+X/*
+X * (In a child process ...) Send a message to a terminal, then exit.
+X */
+Xnotifier (line, message, arg)
+Xchar *line, *message;
+Xint arg;
+X{
+X    FILE * tty;
+X    char    hostname[20];
+X
+X    /* 4.2 lint library bug ... */
+X    (void) gethostname (hostname, sizeof (hostname));
+X    tty = fopen (line, "w");
+X
+X    if (tty != NULL)
+X    {
+X	if (debug)
+X	    fprintf (tty, "**** Testing idledaemon: PLEASE IGNORE!\r\n\r\n");
+X	fprintf (tty, "**** \007\007Message from %s.idledaemon at %8.8s\r\n\r\n**** ",
+X		hostname, ctime (&timenow) + 11);
+X	fprintf (tty, message, arg);
+X	fputs ("\r\n", tty);
+X	(void) fclose (tty);
+X    }
+X    else
+X	dprintf2 ("notifier failed to open %s ... errno %d\n", line, errno);
+X    (void) fflush (stderr);
+X    exit (0);
+X}
+X
+X
+Xdisplaysig (sig, x, y)
+X{
+X    time_t sigtime;
+X
+X    time (&sigtime);
+X    dprintf2 ("Signal %d caught at %s", sig, ctime(&sigtime));
+X    fflush (stderr);
+X    exit (1);
+X}
+X
+X
+X/*
+X *  Signal routine to display tty state tables on standard output.
+X */
+Xprintstate (sig, x, y)
+X{
+X    time_t sigtime;
+X    register i;
+X    register struct ttyinfo *tp;
+X
+X    sleep (1);			/* time for the next shell prompt ... */
+X    time (&sigtime);
+X    printf ("\nIdledaemon terminal info: time %25.25s", ctime(&sigtime));
+X    printf ("%d terminals out of %d are free\n", nttysfree, nttys);
+X    printf (
+X"tty     state   user    login time        last access       warning sent\n");
+X    for (i = 0, tp = ttytable; i < nttys; i++, tp++)
+X    {
+X	printf ("%s\t%s", tp -> tty_line, statestrings[tp -> tty_state]);
+X	if (tp -> tty_state == TTY_FREE || tp -> tty_state == TTY_UNKNOWN)
+X	{
+X	    putchar ('\n');
+X	    continue;
+X	}
+X        printf ("\t%s", tp -> tty_name);
+X	printf ("\t%15.15s", ctime (&(tp -> tty_logintime)) + 4);
+X	if (tp -> tty_state != TTY_ACTIVE)
+X	{
+X	    printf ("   %15.15s", ctime (&(tp -> tty_accesstime)) + 4);
+X	    if (tp -> tty_state == TTY_WARNED)
+X	        printf ("   %15.15s", ctime (&(tp -> tty_warningtime)) + 4);
+X	}
+X	putchar ('\n');
+X    }
+X    fflush (stdout);
+X}
+X
+X
+X/*
+X *  Set up signal handlers.
+X */
+Xinit_signals ()
+X{
+X    register i;
+X    for (i = 1; i <= SIGPROF; i++)
+X    {
+X	if (i != SIGCONT && i != SIGCHLD && i != SIGHUP && i != SIGINT)
+X	    (void) signal (i, displaysig);
+X    }
+X    signal (SIGHUP, SIG_IGN);
+X    signal (SIGINT, printstate);
+X}
+/
+echo 'x - idledaemon.8l'
+sed 's/^X//' > idledaemon.8l << '/'
+X.TH IDLEDAEMON 8L "6 September 1985"
+X.UC 4
+X.SH NAME
+Xidledaemon \- auto-logout idle terminals
+X.SH SYNOPSIS
+X.B /etc/idledaemon 
+X[
+X.B \-a
+X] [
+X.BI \-f nosfree
+X] [
+X.BI \-gil minutes
+X]
+X.B tty ...
+X.SH DESCRIPTION
+X.I Idledaemon 
+Xmonitors the use of a group of terminal lines.  When the number
+Xof free terminals in the group falls below a given threshold, it finds those
+Xwhich are idle, sends a warning message, and if necessary logs them out.
+XThe options to 
+X.I idledaemon
+Xare as follows:
+X.TP
+X.B \-a
+Xcauses the daemon to kill idle terminals irrespective of the number that are 
+Xfree.
+X.TP
+X.B \-d
+Xruns the daemon in 
+X.I debug
+Xmode.  The daemon goes through the motions of checking terminals and sending
+Xmessages, but does not kill off sessions.  You might want to use this to get
+Xyour users used to the idea of an idle daemon.
+X.TP
+X.BI \-f nosfree
+Xsets the size of the free terminal pool that the daemon tries to keep.  This
+Xparameter defaults to 1.
+X.TP
+X.BI \-i minutes
+Xchanges the terminal
+X.B idle time
+Xfrom the default of 30 minutes.  If there is no terminal input processed for
+Xthis many minutes, the session may be deemed to be idle (see below).
+X.TP
+X.BI \-g minutes
+Xchanges the minimum
+X.B grace time
+Xbetween the warning message and auto-logout from the default of 5 minutes.
+XNotifications which have not been followed by kills time out after 30 minutes.
+X.TP
+X.BI \-l minutes
+Xchanges the time between idle daemon scans from the default of 5 minutes.
+X.PP
+XThe algorithm for finding and killing idle sessions is complicated and not
+Xfoolproof.  When a terminal has had no input (strictly, no program has
+Xread input from the terminal) for the prescribed number of minutes, the
+Xidledaemon scans the processes 
+X.B attached
+Xto the session to see if any are active.  Attached processes include
+Xstopped or background processes started by the session but exclude
+Xbackground processes started by previous sessions and daemon processes 
+Xlike 
+X.IR sysline (1).  
+XAn 
+X.B active
+Xprocess is any process that is ready to execute or has been in the past
+Xfew seconds; basically anything that
+X.IR ps (1) 
+Xshows with a STAT of R, P, D or S.
+XWhen an idle session has been found, all processes attached to the session
+Xare sent HUP signals to allow them to tidy up, then the shell process is
+Xsent a KILL.
+X.PP
+XWhen the idledaemon receives a SIGINT signal, it prints a summary of the
+Xcurrent state to its output stream.  This could be directed to the console.
+X.SH AUTHOR
+XStephen Crawley
+X.SH FILES
+X/dev/tty*,
+X/etc/utmp
+X.SH "SEE ALSO"
+Xps(1)
+X.SH BUGS
+XThe scheme the daemon uses to find idle sessions is trivially easy to fool.
+X.PP
+XThe daemon doesn't do anything about objectionable people who hog lots of
+Xterminals ports at the same time.
+X.PP
+XProbably lots of bugs in some of the unusual cases (like stuck ttys).
+/
+echo 'Part 01 of pack.out complete.'
+exit
+----------------------------That's-All-Folks-------------------------------
+
+

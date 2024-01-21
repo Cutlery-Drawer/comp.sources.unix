@@ -1,0 +1,2516 @@
+Newsgroups: comp.sources.unix
+From: jeff@forys.cranbury.nj.us (Jeff Forys)
+Subject: v28i089: skill - signal or reprioritize specified processes, V3.6, Part03/03
+References: <1.774325799.5452@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: jeff@forys.cranbury.nj.us (Jeff Forys)
+Posting-Number: Volume 28, Issue 89
+Archive-Name: skill/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 3)."
+# Contents:  machdep/aos-43.c machdep/bsd-43.c machdep/irix-3.c
+#   machdep/irix-4.c machdep/ultrix-4.c
+# Wrapped by vixie@gw.home.vix.com on Fri Jul 15 19:29:13 1994
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'machdep/aos-43.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machdep/aos-43.c'\"
+else
+echo shar: Extracting \"'machdep/aos-43.c'\" \(11465 characters\)
+sed "s/^X//" >'machdep/aos-43.c' <<'END_OF_FILE'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: aos-43.c,v 1.8 1994/06/26 04:15:19 forys Exp $";
+X#endif
+X
+X/*
+X**  This program may be freely redistributed for noncommercial purposes.
+X**  This entire comment MUST remain intact.
+X**
+X**  AOS 4.3 support by Christos Zoulas (christos@deshaw.com)
+X**
+X**  Copyright 1994 by Jeff Forys (jeff@forys.cranbury.nj.us)
+X*/
+X
+X#define	NO_MEXTERN
+X#include "conf.h"
+X#undef	NO_MEXTERN
+X
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X
+X#include <stdio.h>
+X
+X/*
+X * Define SigNames, NSig, and TtyDevDir here; they are used by other
+X * routines and must be global.  Everyone seems to have their own
+X * idea as to what NSIG should be.  Here, `NSig' is the number of
+X * signals available, not counting zero.
+X */
+Xchar *SigMap[] = { "0",
+X	"HUP", "INT", "QUIT", "ILL", "TRAP", "IOT",		/*  1 -  6 */
+X	"EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",		/*  7 - 12 */
+X	"PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP",		/* 13 - 18 */
+X	"CONT", "CHLD", "TTIN", "TTOU", "IO", "XCPU",		/* 19 - 24 */
+X	"XFSZ", "VTALRM", "PROF", "WINCH", "LOST", "USR1",	/* 25 - 30 */
+X	"USR2", "32",						/* 31 - 32 */
+X};
+Xint NSig = NSIG;
+X
+X#define	SETCMD(dst,src,maxlen) {			\
+X	extern char *rindex();				\
+X	if (maxlen > 0) src[maxlen] = '\0';		\
+X	dst = (dst = rindex(src, '/')) ? ++dst: src;	\
+X}
+X
+Xstatic char *TtyDevDir = "/dev";
+X
+Xint	Skill;			/* set 1 if running `skill', 0 if `snice' */
+Xint	PrioMin, PrioMax;	/* min and max process priorities */
+Xint	SigPri;			/* signal to send or priority to set */
+Xpid_T	MyPid;			/* pid of this process */
+Xuid_T	MyUid;			/* uid of this process */
+Xchar	*ProgName;		/* program name */
+X
+X/*
+X * This is the machine-dependent initialization routine.
+X *
+X *   - The following global variables must be initialized:
+X *     MyPid, MyUid, ProgName, Skill, PrioMin, PrioMax, SigPri
+X *   - The working directory will be changed to that which contains the
+X *     tty devices (`TtyDevDir'); this makes argument parsing go faster.
+X *   - If possible, this routine should raise the priority of this process.
+X */
+Xvoid
+XMdepInit(pname)
+X	char *pname;
+X{
+X	extern char *rindex(), *SysErr();
+X
+X	MyPid = (pid_T) getpid();
+X	MyUid = (uid_T) getuid();
+X	SETCMD(ProgName, pname, 0)
+X
+X	/*
+X	 * If we are running as root, raise our priority to better
+X	 * catch runaway processes.
+X	 */
+X	if (MyUid == ROOTUID)
+X		(void) setpriority(PRIO_PROCESS, MyPid, PRIO_MIN);
+X
+X	/*
+X	 * Determine what we are doing to processes we find.  We will
+X	 * either send them a signal (skill), or renice them (snice).
+X	 */
+X	Skill = (strcmp(ProgName, "snice") != 0);
+X
+X	/*
+X	 * chdir to `TtyDevDir' to speed up tty argument parsing.
+X	 */
+X	if (chdir(TtyDevDir) < 0) {
+X		fprintf(stderr, "%s: chdir(%s): %s\n", ProgName, TtyDevDir,
+X		        SysErr());
+X		exit(EX_SERR);
+X	}
+X
+X	/*
+X	 * Set up minimum and maximum process priorities.
+X	 * Initialize SigPri to either default signal (`skill') or
+X	 * default priority (`snice').
+X	 */
+X	PrioMin = PRIO_MIN;
+X	PrioMax = PRIO_MAX;
+X	SigPri = Skill? SIGTERM: 4;
+X}
+X
+X/*
+X * Carry out an action on a particular process.  If this is `skill',
+X * then send the process a signal, otherwise this is `snice' so change
+X * it's priority.
+X *
+X * If 0 is returned, the operation was successful, otherwise -1 is
+X * returned and `errno' set.
+X */
+Xint
+XMdepAction(pid)
+X	pid_T pid;
+X{
+X	if (Skill)
+X		return(kill((int)pid, SigPri));
+X	else
+X		return(setpriority(PRIO_PROCESS, (int)pid, SigPri));
+X}
+X
+X/*
+X * Now, set up everything we need to write a GetProc() routine.
+X */
+X
+X#include <sys/file.h>
+X#include <sys/vm.h>
+X
+X#include <machine/pte.h>
+X
+X#include <nlist.h>
+X
+Xstatic char *kmemf =	"/dev/kmem";	/* window into kernel virtual memory */
+Xstatic char *memf =	"/dev/mem";	/* window into physical memory */
+Xstatic char *swapf =	"/dev/drum";	/* paging device */
+Xstatic char *kernf =	"/vmunix";	/* kernel image */
+Xstatic int kmem = 0, mem = 0, swap = 0;
+X
+Xstatic struct nlist nl[] = {
+X	{ "_nproc" },
+X#define	X_NPROC		0
+X	{ "_proc" },
+X#define	X_PROC		1
+X	{ "_Usrptmap" },
+X#define	X_USRPTMAP	2
+X	{ "_usrpt" },
+X#define	X_USRPT		3
+X	{ "" },
+X#define	X_LAST		4
+X};
+X
+Xstatic	int	nproc = -1;
+Xstatic	struct	proc *procp;
+Xstatic	struct	pte *usrptmap, *usrpt;
+X
+X#define	NPROCS	32			/* number of procs to read at once */
+X
+Xstatic	char	*pidmap[] = { "swapper", "init", "pagedaemon" };
+Xstatic	int	pidmapsiz = sizeof(pidmap) / sizeof(pidmap[0]);
+X
+Xextern	off_t lseek();
+X
+X/*
+X * GetProc()
+X *
+X * Fill in and return a `struct ProcInfo' with information about the
+X * next process.  If no processes are left, return NULL.
+X *
+X * Fflag support:
+X *	If Fflag is set we will try to avoid reading in the user struct.
+X *	We can do this only if Iflag, TtyIndx, and CmdIndx are zero.
+X */
+Xstruct ProcInfo *
+XGetProc()
+X{
+X	extern char *SysErr();
+X	static struct user *GetUser();
+X	static struct proc procs[NPROCS], *procsp;
+X	static struct ProcInfo procinfo;
+X	register struct user *auser;
+X	register struct proc *aproc;
+X	static int thisproc = 0;
+X	static int needuser = 1;		/* Fflag support */
+X
+X	/*
+X	 * If this is our first time here, open various files,
+X	 * and set up the nlist.
+X	 */
+X	if (nproc == -1) {
+X		char *errstr = "%s: %s: %s\n";
+X		int nfound;
+X
+X		if ((kmem=open(kmemf, 0)) < 0) {	/* open kmem */
+X			fprintf(stderr, errstr, ProgName, kmemf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((mem=open(memf, 0)) < 0) {		/* open mem */
+X			fprintf(stderr, errstr, ProgName, memf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((swap=open(swapf, 0)) < 0) {	/* open swap device */
+X			fprintf(stderr, errstr, ProgName, swapf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((nfound=nlist(kernf, nl)) < 0) {	/* kernel name list */
+X			fprintf(stderr, errstr, ProgName, kernf,"no name list");
+X			exit(EX_SERR);
+X		}
+X		if (nfound != 0) {
+X			register int i;
+X
+X			fprintf(stderr, "%s: nlist: unresolved symbols:",
+X			        ProgName);
+X			for (i = 0; i < X_LAST; i++)
+X				if (nl[i].n_type == 0)
+X					fprintf(stderr, " %s", nl[i].n_name);
+X			(void) putc('\n', stderr);
+X			exit(EX_SERR);
+X		}
+X
+X		usrpt = (struct pte *) nl[X_USRPT].n_value;
+X		usrptmap = (struct pte *) nl[X_USRPTMAP].n_value;
+X		procp = (struct proc *)GetWord((off_t)nl[X_PROC].n_value);
+X		nproc = GetWord((off_t)nl[X_NPROC].n_value);
+X		/*
+X		 * We run much faster without reading in the user struct;
+X		 * the price is incomplete information for errors (no cmd).
+X		 */
+X		if (Fflag && Iflag == 0 && TtyIndx == 0 && CmdIndx == 0)
+X			needuser = 0;
+X	}
+X
+X	/*
+X	 * Read in NPROCS proc structures at-a-time.  Decrement `nproc'
+X	 * by the number of proc structures we have read; when it reaches
+X	 * zero, we are finished (return NULL).
+X	 */
+X	do {
+X		while (thisproc == 0) {
+X			int nread;
+X			int psize;
+X
+X			if (nproc == 0)
+X				return((struct ProcInfo *)NULL);
+X
+X			thisproc = MIN(NPROCS, nproc);
+X			psize = thisproc * sizeof(struct proc);
+X			nproc -= thisproc;
+X			if (lseek(kmem, (off_t)procp, L_SET) == -1 ||
+X			    (nread = read(kmem, (char *)procs, psize)) < 0) {
+X				fprintf(stderr, "%s: read proc: %s\n",
+X				        ProgName, SysErr());
+X				return((struct ProcInfo *)NULL);
+X			} else if (nread != psize) {
+X				thisproc = nread / sizeof(struct proc);
+X				nproc = 0;
+X				fprintf(stderr, "%s: read proc: short read\n",
+X				        ProgName);
+X			}
+X			procsp = procs;
+X			procp += thisproc;
+X		}
+X
+X		aproc = procsp++;
+X		thisproc--;
+X
+X		if (aproc->p_stat != 0) {
+X			/*
+X			 * Before we go through the trouble of reading
+X			 * in the user struct, let's make sure this isn't
+X			 * a "zombie" or "exiting" process.  If it is,
+X			 * we have all the information we need; fill in
+X			 * procinfo and return.
+X			 */
+X			procinfo.pi_flags = 0;
+X			procinfo.pi_pid = (pid_T) aproc->p_pid;
+X			procinfo.pi_uid = (uid_T) aproc->p_uid;
+X
+X			if (aproc->p_stat == SZOMB) {		/* zombie */
+X				static char *zombie = "<defunct>";
+X				procinfo.pi_flags |= PI_ZOMBIE;
+X				procinfo.pi_cmd = zombie;
+X			} else if (aproc->p_flag & SWEXIT) {	/* exiting */
+X				static char *exiting = "<exiting>";
+X				procinfo.pi_flags |= PI_SWEXIT;
+X				procinfo.pi_cmd = exiting;
+X			} else if (!needuser) {			/* Fflag */
+X				static char *fflagcmd = "<-f>";
+X				procinfo.pi_cmd = fflagcmd;
+X			}
+X
+X			if (procinfo.pi_flags || !needuser)
+X				return(&procinfo);
+X			else
+X				auser = GetUser(aproc);
+X		}
+X
+X	} while (aproc->p_stat == 0 || auser == NULL);
+X
+X	/*
+X	 * We now have a process (`aproc') and a user (`auser').
+X	 * Fill in the rest of `procinfo'.
+X	 */
+X	if (auser->u_ttyp != 0) {	/* has a controlling tty */
+X		procinfo.pi_flags |= PI_CTLTTY;
+X		procinfo.pi_tty = (tty_T) auser->u_ttyd;
+X	}
+X
+X	if (aproc->p_pid < pidmapsiz) {	/* special */
+X		procinfo.pi_cmd = pidmap[aproc->p_pid];
+X		procinfo.pi_flags |= PI_ASKUSR;
+X	} else				 /* set path-stripped command name */
+X		SETCMD(procinfo.pi_cmd, auser->u_comm, MAXCOMLEN)
+X
+X	return(&procinfo);
+X}
+X
+X#define	SKRD(file, src, dst, size)			\
+X	(lseek(file, (off_t)(src), L_SET) == -1) ||	\
+X	(read(file, (char *)(dst), (size)) != (size))
+X
+X/*
+X * GetWord(loc)
+X *
+X * Read in word at `loc' from kernel virtual memory.
+X * If an error occurs, call exit(2) with EX_SERR.
+X */
+Xstatic int
+XGetWord(loc)
+X	off_t loc;
+X{
+X	int val;
+X
+X	if (SKRD(kmem, loc, &val, sizeof(val))) {
+X		fprintf(stderr, "%s: can't read word at %lx in %s\n",
+X		        ProgName, (u_long)loc, kmemf);
+X		exit(EX_SERR);
+X	}
+X	return (val);
+X}
+X
+X#ifndef	CLBYTES
+X#define	CLBYTES	(CLSIZE*NBPG)
+X#endif
+X
+X/*
+X * GetUser(aproc)
+X *
+X * Read in the user struct for `aproc' and return a pointer to it.
+X * If an error occurs, return NULL.
+X */
+X#define	SW_UADDR	dtob(aproc->p_swaddr)
+X#define	SW_UBYTES	sizeof(struct userx)
+X
+Xstruct userx {
+X	char userfill[UPAGES * NBPG - sizeof(struct user)];
+X	struct user user;
+X};
+X#define REDSIZE (CLSIZE * 2)
+X
+Xstatic struct user *
+XGetUser(aproc)
+X	struct proc *aproc;
+X{
+X	static char *WarnMsg = "Warning: can't read ";
+X	union u {
+X		struct userx user;
+X		char	upgs[UPAGES][NBPG * CLSIZE];
+X	} u;
+X	static struct pte apte, uptes[HIGHPAGES + CLSIZE + REDSIZE];
+X	register int ncl, i;
+X
+X	/*
+X	 * If process is not in core, we simply snarf it's user struct
+X	 * from the swap device.
+X	 */
+X	if ((aproc->p_flag & SLOAD) == 0) {
+X		if (SKRD(swap, SW_UADDR, &u, SW_UBYTES)) {
+X			if (Wflag)
+X				printf("%su for pid %d from %s\n",
+X				       WarnMsg, aproc->p_pid, swapf);
+X			return ((struct user *)NULL);
+X		}
+X		return (&u.user.user);
+X	}
+X
+X	/*
+X	 * Process is in core.  First read from the user page-table
+X	 * map for this process to get the u-area page table entry.
+X	 * Next, read in the page table entries that map the u-area.
+X	 * Finally, read in the physical pages that comprise the u-area.
+X	 *
+X	 * If at any time, an lseek() or read() fails, print a warning
+X	 * message (if `Wflag' is set) and return NULL.
+X	 */
+X	if (SKRD(kmem, &usrptmap[btokmx(aproc->p_p0br) + aproc->p_szpt - 1],
+X	         &apte, sizeof(apte))) {
+X		if (Wflag)
+X			printf("%sindir pte of user pt for pid %d from %s\n",
+X			       WarnMsg, aproc->p_pid, kmemf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	if (SKRD(mem, ctob(apte.pg_pfnum+1) - sizeof(uptes),
+X	         uptes, sizeof(uptes))) {
+X		if (Wflag)
+X			printf("%suser pt for pid %d from %s\n",
+X			       WarnMsg, aproc->p_pid, memf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	/*
+X	 * Set `ncl' to the (rounded up) number of u-area page clusters
+X	 * to read, and then read in this user struct (in reverse).
+X	 */
+X	ncl = (SW_UBYTES + NBPG * CLSIZE - 1) / (NBPG * CLSIZE);
+X	while (--ncl >= 0) {
+X		i = ncl * CLSIZE;
+X		if (SKRD(mem,ctob(uptes[CLSIZE+REDSIZE+i].pg_pfnum),
+X			 u.upgs[i],CLBYTES)){
+X			if (Wflag)
+X				printf("%suser page %u for pid %d from %s\n",
+X				       WarnMsg, 
+X				       uptes[CLSIZE+REDSIZE+i].pg_pfnum,
+X				       aproc->p_pid, memf);
+X			return((struct user *)NULL);
+X		}
+X	}
+X	return (&u.user.user);
+X}
+END_OF_FILE
+if test 11465 -ne `wc -c <'machdep/aos-43.c'`; then
+    echo shar: \"'machdep/aos-43.c'\" unpacked with wrong size!
+fi
+# end of 'machdep/aos-43.c'
+fi
+if test -f 'machdep/bsd-43.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machdep/bsd-43.c'\"
+else
+echo shar: Extracting \"'machdep/bsd-43.c'\" \(12470 characters\)
+sed "s/^X//" >'machdep/bsd-43.c' <<'END_OF_FILE'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: bsd-43.c,v 1.9 1994/06/26 04:15:06 forys Exp $";
+X#endif
+X
+X/*
+X**  This program may be freely redistributed for noncommercial purposes.
+X**  This entire comment MUST remain intact.
+X**
+X**  Copyright 1994 by Jeff Forys (jeff@forys.cranbury.nj.us)
+X*/
+X
+X#define	NO_MEXTERN
+X#include "conf.h"
+X#undef	NO_MEXTERN
+X
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X
+X#include <stdio.h>
+X
+X/*
+X * Define SigNames, NSig, and TtyDevDir here; they are used by other
+X * routines and must be global.  Everyone seems to have their own
+X * idea as to what NSIG should be.  Here, `NSig' is the number of
+X * signals available, not counting zero.
+X */
+Xchar *SigMap[] = { "0",
+X	"HUP", "INT", "QUIT", "ILL", "TRAP", "IOT",		/*  1 -  6 */
+X	"EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",		/*  7 - 12 */
+X	"PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP",		/* 13 - 18 */
+X	"CONT", "CHLD", "TTIN", "TTOU", "IO", "XCPU",		/* 19 - 24 */
+X	"XFSZ", "VTALRM", "PROF", "WINCH", "29", "USR1",	/* 25 - 30 */
+X	"USR2", "32",						/* 31 - 32 */
+X};
+Xint NSig = NSIG;
+X
+X#define	SETCMD(dst,src,maxlen) {			\
+X	extern char *rindex();				\
+X	if (maxlen > 0) src[maxlen] = '\0';		\
+X	dst = (dst = rindex(src, '/')) ? ++dst: src;	\
+X}
+X
+Xstatic char *TtyDevDir = "/dev";
+X
+Xint	Skill;			/* set 1 if running `skill', 0 if `snice' */
+Xint	PrioMin, PrioMax;	/* min and max process priorities */
+Xint	SigPri;			/* signal to send or priority to set */
+Xpid_T	MyPid;			/* pid of this process */
+Xuid_T	MyUid;			/* uid of this process */
+Xchar	*ProgName;		/* program name */
+X
+X/*
+X * This is the machine-dependent initialization routine.
+X *
+X *   - The following global variables must be initialized:
+X *     MyPid, MyUid, ProgName, Skill, PrioMin, PrioMax, SigPri
+X *   - The working directory will be changed to that which contains the
+X *     tty devices (`TtyDevDir'); this makes argument parsing go faster.
+X *   - If possible, this routine should raise the priority of this process.
+X */
+Xvoid
+XMdepInit(pname)
+X	char *pname;
+X{
+X	extern char *rindex(), *SysErr();
+X
+X	MyPid = (pid_T) getpid();
+X	MyUid = (uid_T) getuid();
+X	SETCMD(ProgName, pname, 0)
+X
+X	/*
+X	 * If we are running as root, raise our priority to better
+X	 * catch runaway processes.
+X	 */
+X	if (MyUid == ROOTUID)
+X		(void) setpriority(PRIO_PROCESS, MyPid, PRIO_MIN);
+X
+X	/*
+X	 * Determine what we are doing to processes we find.  We will
+X	 * either send them a signal (skill), or renice them (snice).
+X	 */
+X	Skill = (strcmp(ProgName, "snice") != 0);
+X
+X	/*
+X	 * chdir to `TtyDevDir' to speed up tty argument parsing.
+X	 */
+X	if (chdir(TtyDevDir) < 0) {
+X		fprintf(stderr, "%s: chdir(%s): %s\n", ProgName, TtyDevDir,
+X		        SysErr());
+X		exit(EX_SERR);
+X	}
+X
+X	/*
+X	 * Set up minimum and maximum process priorities.
+X	 * Initialize SigPri to either default signal (`skill') or
+X	 * default priority (`snice').
+X	 */
+X	PrioMin = PRIO_MIN;
+X	PrioMax = PRIO_MAX;
+X	SigPri = Skill? SIGTERM: 4;
+X}
+X
+X/*
+X * Carry out an action on a particular process.  If this is `skill',
+X * then send the process a signal, otherwise this is `snice' so change
+X * it's priority.
+X *
+X * If 0 is returned, the operation was successful, otherwise -1 is
+X * returned and `errno' set.
+X */
+Xint
+XMdepAction(pid)
+X	pid_T pid;
+X{
+X	if (Skill)
+X		return(kill((int)pid, SigPri));
+X	else
+X		return(setpriority(PRIO_PROCESS, (int)pid, SigPri));
+X}
+X
+X/*
+X * Now, set up everything we need to write a GetProc() routine.
+X */
+X
+X#include <sys/file.h>
+X#include <sys/vm.h>
+X
+X#include <machine/pte.h>
+X
+X#include <nlist.h>
+X
+Xstatic char *kmemf =	"/dev/kmem";	/* window into kernel virtual memory */
+Xstatic char *memf =	"/dev/mem";	/* window into physical memory */
+Xstatic char *swapf =	"/dev/drum";	/* paging device */
+Xstatic char *kernf =	"/vmunix";	/* kernel image */
+Xstatic int kmem = 0, mem = 0, swap = 0;
+X
+Xstatic struct nlist nl[] = {
+X	{ "_nproc" },
+X#define	X_NPROC		0
+X	{ "_proc" },
+X#define	X_PROC		1
+X	{ "_Usrptmap" },
+X#define	X_USRPTMAP	2
+X	{ "_usrpt" },
+X#define	X_USRPT		3
+X#ifndef hp800
+X	{ "" },
+X#define	X_LAST		4
+X#else
+X	{ "_ubase" },
+X#define	X_UBASE		4
+X	{ "" },
+X#define	X_LAST		5
+X#endif
+X};
+X
+Xstatic	int	nproc = -1;
+Xstatic	struct	proc *procp;
+Xstatic	struct	pte *usrptmap, *usrpt;
+X#ifdef hp800
+Xstatic	int	ubase;
+X#endif
+X
+X#define	NPROCS	32			/* number of procs to read at once */
+X
+Xstatic	char	*pidmap[] = { "swapper", "init", "pagedaemon" };
+Xstatic	int	pidmapsiz = sizeof(pidmap) / sizeof(pidmap[0]);
+X
+Xextern	off_t lseek();
+X
+X/*
+X * GetProc()
+X *
+X * Fill in and return a `struct ProcInfo' with information about the
+X * next process.  If no processes are left, return NULL.
+X *
+X * Fflag support:
+X *	If Fflag is set we will try to avoid reading in the user struct.
+X *	We can do this only if Iflag, TtyIndx, and CmdIndx are zero.
+X */
+Xstruct ProcInfo *
+XGetProc()
+X{
+X	extern char *SysErr();
+X	static struct user *GetUser();
+X	static struct proc procs[NPROCS], *procsp;
+X	static struct ProcInfo procinfo;
+X	register struct user *auser;
+X	register struct proc *aproc;
+X	static int thisproc = 0;
+X	static int needuser = 1;		/* Fflag support */
+X
+X	/*
+X	 * If this is our first time here, open various files,
+X	 * and set up the nlist.
+X	 */
+X	if (nproc == -1) {
+X		char *errstr = "%s: %s: %s\n";
+X		int nfound;
+X
+X		if ((kmem=open(kmemf, 0)) < 0) {	/* open kmem */
+X			fprintf(stderr, errstr, ProgName, kmemf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((mem=open(memf, 0)) < 0) {		/* open mem */
+X			fprintf(stderr, errstr, ProgName, memf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((swap=open(swapf, 0)) < 0) {	/* open swap device */
+X			fprintf(stderr, errstr, ProgName, swapf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((nfound=nlist(kernf, nl)) < 0) {	/* kernel name list */
+X			fprintf(stderr, errstr, ProgName, kernf,"no name list");
+X			exit(EX_SERR);
+X		}
+X		if (nfound != 0) {
+X			register int i;
+X
+X			fprintf(stderr, "%s: nlist: unresolved symbols:",
+X			        ProgName);
+X			for (i = 0; i < X_LAST; i++)
+X				if (nl[i].n_type == 0)
+X					fprintf(stderr, " %s", nl[i].n_name);
+X			(void) putc('\n', stderr);
+X			exit(EX_SERR);
+X		}
+X
+X		usrpt = (struct pte *) nl[X_USRPT].n_value;
+X		usrptmap = (struct pte *) nl[X_USRPTMAP].n_value;
+X		procp = (struct proc *)GetWord((off_t)nl[X_PROC].n_value);
+X		nproc = GetWord((off_t)nl[X_NPROC].n_value);
+X#ifdef hp800
+X		ubase = nl[X_UBASE].n_value;
+X#endif
+X		/*
+X		 * We run much faster without reading in the user struct;
+X		 * the price is incomplete information for errors (no cmd).
+X		 */
+X		if (Fflag && Iflag == 0 && TtyIndx == 0 && CmdIndx == 0)
+X			needuser = 0;
+X	}
+X
+X	/*
+X	 * Read in NPROCS proc structures at-a-time.  Decrement `nproc'
+X	 * by the number of proc structures we have read; when it reaches
+X	 * zero, we are finished (return NULL).
+X	 */
+X	do {
+X		while (thisproc == 0) {
+X			int nread;
+X			int psize;
+X
+X			if (nproc == 0)
+X				return((struct ProcInfo *)NULL);
+X
+X			thisproc = MIN(NPROCS, nproc);
+X			psize = thisproc * sizeof(struct proc);
+X			nproc -= thisproc;
+X			if (lseek(kmem, (off_t)procp, L_SET) == -1 ||
+X			    (nread = read(kmem, (char *)procs, psize)) < 0) {
+X				fprintf(stderr, "%s: read proc: %s\n",
+X				        ProgName, SysErr());
+X				return((struct ProcInfo *)NULL);
+X			} else if (nread != psize) {
+X				thisproc = nread / sizeof(struct proc);
+X				nproc = 0;
+X				fprintf(stderr, "%s: read proc: short read\n",
+X				        ProgName);
+X			}
+X			procsp = procs;
+X			procp += thisproc;
+X		}
+X
+X		aproc = procsp++;
+X		thisproc--;
+X
+X		if (aproc->p_stat != 0) {
+X			/*
+X			 * Before we go through the trouble of reading
+X			 * in the user struct, let's make sure this isn't
+X			 * a "zombie" or "exiting" process.  If it is,
+X			 * we have all the information we need; fill in
+X			 * procinfo and return.
+X			 */
+X			procinfo.pi_flags = 0;
+X			procinfo.pi_pid = (pid_T) aproc->p_pid;
+X			procinfo.pi_uid = (uid_T) aproc->p_uid;
+X
+X			if (aproc->p_stat == SZOMB) {		/* zombie */
+X				static char *zombie = "<defunct>";
+X				procinfo.pi_flags |= PI_ZOMBIE;
+X				procinfo.pi_cmd = zombie;
+X			} else if (aproc->p_flag & SWEXIT) {	/* exiting */
+X				static char *exiting = "<exiting>";
+X				procinfo.pi_flags |= PI_SWEXIT;
+X				procinfo.pi_cmd = exiting;
+X			} else if (!needuser) {			/* Fflag */
+X				static char *fflagcmd = "<-f>";
+X				procinfo.pi_cmd = fflagcmd;
+X			}
+X
+X			if (procinfo.pi_flags || !needuser)
+X				return(&procinfo);
+X			else
+X				auser = GetUser(aproc);
+X		}
+X
+X	} while (aproc->p_stat == 0 || auser == NULL);
+X
+X	/*
+X	 * We now have a process (`aproc') and a user (`auser').
+X	 * Fill in the rest of `procinfo'.
+X	 */
+X	if (auser->u_ttyp != 0) {	/* has a controlling tty */
+X		procinfo.pi_flags |= PI_CTLTTY;
+X		procinfo.pi_tty = (tty_T) auser->u_ttyd;
+X	}
+X
+X	if (aproc->p_pid < pidmapsiz) {	/* special */
+X		procinfo.pi_cmd = pidmap[aproc->p_pid];
+X		procinfo.pi_flags |= PI_ASKUSR;
+X	} else				 /* set path-stripped command name */
+X		SETCMD(procinfo.pi_cmd, auser->u_comm, MAXCOMLEN)
+X
+X	return(&procinfo);
+X}
+X
+X#define	SKRD(file, src, dst, size)			\
+X	(lseek(file, (off_t)(src), L_SET) == -1) ||	\
+X	(read(file, (char *)(dst), (size)) != (size))
+X
+X/*
+X * GetWord(loc)
+X *
+X * Read in word at `loc' from kernel virtual memory.
+X * If an error occurs, call exit(2) with EX_SERR.
+X */
+Xstatic int
+XGetWord(loc)
+X	off_t loc;
+X{
+X	int val;
+X
+X	if (SKRD(kmem, loc, &val, sizeof(val))) {
+X		fprintf(stderr, "%s: can't read word at %lx in %s\n",
+X		        ProgName, (u_long)loc, kmemf);
+X		exit(EX_SERR);
+X	}
+X	return (val);
+X}
+X
+X#ifndef	CLBYTES
+X#define	CLBYTES	(CLSIZE*NBPG)
+X#endif
+X
+X/*
+X * GetUser(aproc)
+X *
+X * Read in the user struct for `aproc' and return a pointer to it.
+X * If an error occurs, return NULL.
+X */
+X#ifndef hp800
+X
+X#define	SW_UADDR	dtob(aproc->p_swaddr)
+X#define	SW_UBYTES	sizeof(struct user)
+X
+Xstatic struct user *
+XGetUser(aproc)
+X	struct proc *aproc;
+X{
+X	static char *WarnMsg = "Warning: can't read ";
+X	static union {
+X		struct user user;
+X		char upgs[UPAGES][NBPG];
+X	} u;
+X	static struct pte apte, uptes[HIGHPAGES+CLSIZE];
+X	register int ncl, i;
+X
+X	/*
+X	 * If process is not in core, we simply snarf it's user struct
+X	 * from the swap device.
+X	 */
+X	if ((aproc->p_flag & SLOAD) == 0) {
+X		if (SKRD(swap, SW_UADDR, &u.user, SW_UBYTES)) {
+X			if (Wflag)
+X				printf("%su for pid %d from %s\n",
+X				       WarnMsg, aproc->p_pid, swapf);
+X			return ((struct user *)NULL);
+X		}
+X		return (&u.user);
+X	}
+X
+X	/*
+X	 * Process is in core.  First read from the user page-table
+X	 * map for this process to get the u-area page table entry.
+X	 * Next, read in the page table entries that map the u-area.
+X	 * Finally, read in the physical pages that comprise the u-area.
+X	 *
+X	 * If at any time, an lseek() or read() fails, print a warning
+X	 * message (if `Wflag' is set) and return NULL.
+X	 */
+X	if (SKRD(kmem, &usrptmap[btokmx(aproc->p_p0br) + aproc->p_szpt - 1],
+X	         &apte, sizeof(apte))) {
+X		if (Wflag)
+X			printf("%sindir pte of user pt for pid %d from %s\n",
+X			       WarnMsg, aproc->p_pid, kmemf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	if (SKRD(mem, ctob(apte.pg_pfnum+1) - sizeof(uptes),
+X	         uptes, sizeof(uptes))) {
+X		if (Wflag)
+X			printf("%suser pt for pid %d from %s\n",
+X			       WarnMsg, aproc->p_pid, memf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	/*
+X	 * Set `ncl' to the (rounded up) number of u-area page clusters
+X	 * to read, and then read in this user struct (in reverse).
+X	 */
+X	ncl = (sizeof(struct user) + CLBYTES - 1) / CLBYTES;
+X	while (--ncl >= 0) {
+X		i = ncl * CLSIZE;
+X		if (SKRD(mem,ctob(uptes[CLSIZE+i].pg_pfnum),u.upgs[i],CLBYTES)){
+X			if (Wflag)
+X				printf("%suser page %u for pid %d from %s\n",
+X				       WarnMsg, uptes[CLSIZE+i].pg_pfnum,
+X				       aproc->p_pid, memf);
+X			return((struct user *)NULL);
+X		}
+X	}
+X	return (&u.user);
+X}
+X#else	/* hp800 and Inverted Page Tables */
+X
+X#undef	pindx
+X#define	pindx(p)	((p)->p_ndx)
+X
+X#define	SW_UADDR	dtob(aproc->p_swaddr + ctod(btoc(KSTAKSIZE*CLBYTES)))
+X#define	SW_UBYTES	sizeof(struct user)
+X
+Xstatic struct user *
+XGetUser(aproc)
+X	struct proc *aproc;
+X{
+X	static char *WarnMsg = "Warning: can't read ";
+X	static union {
+X		struct user user;
+X		char upgs[UPAGES][NBPG];
+X	} u;
+X
+X	/*
+X	 * If process is not in core, we simply snarf it's user struct
+X	 * from the swap device.
+X	 */
+X	if ((aproc->p_flag & SLOAD) == 0) {
+X		if (SKRD(swap, SW_UADDR, &u.user, SW_UBYTES)) {
+X			if (Wflag)
+X				printf("%su for pid %d from %s\n",
+X				       WarnMsg, aproc->p_pid, swapf);
+X			return ((struct user *)NULL);
+X		}
+X		return (&u.user);
+X	}
+X
+X	/*
+X	 * Process is in core.
+X	 *
+X	 * User struct is not mapped into user space,
+X	 * must be read from kernel VA space.
+X	 */
+X	if (SKRD(kmem, uvadd(aproc), &u.user, sizeof(struct user))) {
+X		if (Wflag)
+X			printf("%su for pid %d from %s\n",
+X			       WarnMsg, aproc->p_pid, kmemf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	return (&u.user);
+X}
+X#endif
+END_OF_FILE
+if test 12470 -ne `wc -c <'machdep/bsd-43.c'`; then
+    echo shar: \"'machdep/bsd-43.c'\" unpacked with wrong size!
+fi
+# end of 'machdep/bsd-43.c'
+fi
+if test -f 'machdep/irix-3.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machdep/irix-3.c'\"
+else
+echo shar: Extracting \"'machdep/irix-3.c'\" \(12967 characters\)
+sed "s/^X//" >'machdep/irix-3.c' <<'END_OF_FILE'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: irix-3.c,v 1.8 1994/06/26 04:16:15 forys Exp $";
+X#endif
+X
+X/*
+X**  This program may be freely redistributed for noncommercial purposes.
+X**  This entire comment MUST remain intact.
+X**
+X**  Copyright 1994 by Jeff Forys (jeff@forys.cranbury.nj.us)
+X*/
+X
+X#define	NO_MEXTERN
+X#include "conf.h"
+X#undef	NO_MEXTERN
+X
+X#include <sys/dir.h>
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X
+X#include <stdio.h>
+X
+X/*
+X * Define SigNames, NSig, and TtyDevDir here; they are used by other
+X * routines and must be global.  Everyone seems to have their own
+X * idea as to what NSIG should be.  Here, `NSig' is the number of
+X * signals available, not counting zero.
+X */
+Xchar *SigMap[] = { "0",
+X	"HUP", "INT", "QUIT", "ILL", "TRAP", "IOT",		/*  1 -  6 */
+X	"EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",		/*  7 - 12 */
+X	"PIPE", "ALRM", "TERM", "USR1", "USR2", "CHLD",		/* 13 - 18 */
+X	"PWR", "STOP", "TSTP", "POLL", "IO", "URG",		/* 19 - 24 */
+X	"WINCH", "VTALRM", "PROF", "CONT", "TTIN", "TTOU",	/* 25 - 30 */
+X	"XCPU", "XFSZ",						/* 31 - 32 */
+X};
+Xint NSig = NUMSIGS;
+X
+X#define	SETCMD(dst,src,maxlen) {			\
+X	extern char *rindex();				\
+X	if (maxlen > 0) src[maxlen] = '\0';		\
+X	dst = (dst = rindex(src, '/')) ? ++dst: src;	\
+X}
+X
+Xstatic char *TtyDevDir = "/dev";
+X
+Xint	Skill;			/* set 1 if running `skill', 0 if `snice' */
+Xint	PrioMin, PrioMax;	/* min and max process priorities */
+Xint	SigPri;			/* signal to send or priority to set */
+Xpid_T	MyPid;			/* pid of this process */
+Xuid_T	MyUid;			/* uid of this process */
+Xchar	*ProgName;		/* program name */
+X
+X/*
+X * This is the machine-dependent initialization routine.
+X *
+X *   - The following global variables must be initialized:
+X *     MyPid, MyUid, ProgName, Skill, PrioMin, PrioMax, SigPri
+X *   - The working directory will be changed to that which contains the
+X *     tty devices (`TtyDevDir'); this makes argument parsing go faster.
+X *   - If possible, this routine should raise the priority of this process.
+X */
+Xvoid
+XMdepInit(pname)
+X	char *pname;
+X{
+X	extern char *rindex(), *SysErr();
+X
+X	MyPid = (pid_T) getpid();
+X	MyUid = (uid_T) getuid();
+X	SETCMD(ProgName, pname, 0)
+X
+X	/*
+X	 * If we are running as root, raise our priority to better
+X	 * catch runaway processes.
+X	 */
+X	if (MyUid == ROOTUID)
+X		(void) setpriority(PRIO_PROCESS, MyPid, PRIO_MIN);
+X
+X	/*
+X	 * Determine what we are doing to processes we find.  We will
+X	 * either send them a signal (skill), or renice them (snice).
+X	 */
+X	Skill = (strcmp(ProgName, "snice") != 0);
+X
+X	/*
+X	 * chdir to `TtyDevDir' to speed up tty argument parsing.
+X	 */
+X	if (chdir(TtyDevDir) < 0) {
+X		fprintf(stderr, "%s: chdir(%s): %s\n", ProgName, TtyDevDir,
+X		        SysErr());
+X		exit(EX_SERR);
+X	}
+X
+X	/*
+X	 * Set up minimum and maximum process priorities.
+X	 * Initialize SigPri to either default signal (`skill') or
+X	 * default priority (`snice').
+X	 */
+X	PrioMin = PRIO_MIN;
+X	PrioMax = PRIO_MAX;
+X	SigPri = Skill? SIGTERM: 4;
+X}
+X
+X/*
+X * Carry out an action on a particular process.  If this is `skill',
+X * then send the process a signal, otherwise this is `snice' so change
+X * it's priority.
+X *
+X * If 0 is returned, the operation was successful, otherwise -1 is
+X * returned and `errno' set.
+X */
+Xint
+XMdepAction(pid)
+X	pid_T pid;
+X{
+X	if (Skill)
+X		return(kill((int)pid, SigPri));
+X	else
+X		return(setpriority(PRIO_PROCESS, (int)pid, SigPri));
+X}
+X
+X/*
+X * Now, set up everything we need to write a GetProc() routine.
+X */
+X
+X#include <sys/immu.h>
+X#include <sys/swap.h>
+X#include <sys/file.h>
+X#include <sys/stat.h>
+X#include <sys/sysmacros.h>
+X
+X#include <nlist.h>
+X
+Xstatic char *kmemf =	"/dev/kmem";	/* window into kernel virtual memory */
+Xstatic char *memf =	"/dev/mem";	/* window into physical memory */
+Xstatic char *kernf =	"/unix";	/* kernel image */
+Xstatic char *devdskf =	"/dev/dsk";	/* where swap devices can be found */
+Xstatic int kmem = 0, mem = 0;
+X
+Xstatic struct nlist nl[] = {
+X	{ "v" },
+X#define	X_VAR		0
+X	{ "proc" },
+X#define	X_PROC		1
+X	{ "swaptab" },
+X#define	X_SWAPTAB	2
+X	{ "" },
+X#define	X_LAST		3
+X};
+X
+Xstatic	int	nproc = -1;
+Xstatic	struct	proc *procp;
+Xstatic	swpt_t	swtab[MSFILES];		/* available swap devices */
+Xstatic	dev_t	swdev[MSFILES];		/* opened swap devices */
+X
+X#define	NPROCS	32			/* number of procs to read at once */
+X
+Xstatic	char	*pidmap[] = { "sched", "init", "vhand", "bdflush" };
+Xstatic	int	pidmapsiz = sizeof(pidmap) / sizeof(pidmap[0]);
+X
+Xextern	off_t lseek();
+X
+X/*
+X * GetProc()
+X *
+X * Fill in and return a `struct ProcInfo' with information about the
+X * next process.  If no processes are left, return NULL.
+X *
+X * Fflag support:
+X *      If Fflag is set we will try to avoid reading in the user struct
+X *	and locating/opening the swap device(s).
+X *      We can do this only if Iflag, TtyIndx, and CmdIndx are zero.
+X */
+Xstruct ProcInfo *
+XGetProc()
+X{
+X	extern char *SysErr();
+X	static struct user *GetUser();
+X	static struct proc procs[NPROCS], *procsp;
+X	static struct ProcInfo procinfo;
+X	static struct var var;
+X	register struct user *auser;
+X	register struct proc *aproc;
+X	static int thisproc = 0;
+X	static int needuser = 1;		/* Fflag support */
+X
+X	/*
+X	 * If this is our first time here, open various files,
+X	 * and set up the nlist.
+X	 */
+X	if (nproc == -1) {
+X		char *errstr = "%s: %s: %s\n";
+X		int nfound;
+X
+X		if ((kmem=open(kmemf, 0)) < 0) {	/* open kmem */
+X			fprintf(stderr, errstr, ProgName, kmemf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((mem=open(memf, 0)) < 0) {		/* open mem */
+X			fprintf(stderr, errstr, ProgName, memf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((nfound=nlist(kernf, nl)) < 0) {	/* kernel name list */
+X			fprintf(stderr, errstr, ProgName, kernf,"no name list");
+X			exit(EX_SERR);
+X		}
+X
+X		if (nfound != 0) {
+X			register int i;
+X
+X			fprintf(stderr, "%s: nlist: unresolved symbols:",
+X			        ProgName);
+X			for (i = 0; i < X_LAST; i++)
+X				if (nl[i].n_type == 0)
+X					fprintf(stderr, " %s", nl[i].n_name);
+X			(void) putc('\n', stderr);
+X			exit(EX_SERR);
+X		}
+X
+X		GetStruct((off_t)svirtophys(nl[X_VAR].n_value), "var",
+X		          (off_t)&var, sizeof(var));
+X		GetStruct((off_t)svirtophys(nl[X_SWAPTAB].n_value), "swaptab",
+X		          (off_t)swtab, sizeof(swtab));
+X		procp = (struct proc *)svirtophys(nl[X_PROC].n_value);
+X		nproc = var.v_proc;
+X
+X		/*
+X		 * We run faster without finding/opening the swap devices
+X		 * and reading in the user struct; the price is incomplete
+X		 * information for errors (no cmd).
+X		 */
+X		if (Fflag && Iflag == 0 && TtyIndx == 0 && CmdIndx == 0)
+X			needuser = 0;
+X		else
+X			OpenSwapDevs();
+X	}
+X
+X	/*
+X	 * Read in NPROCS proc structures at-a-time.  Decrement `nproc'
+X	 * by the number of proc structures we have read; when it reaches
+X	 * zero, we are finished (return NULL).
+X	 */
+X	do {
+X		while (thisproc == 0) {
+X			int nread;
+X			int psize;
+X
+X			if (nproc == 0)
+X				return((struct ProcInfo *)NULL);
+X
+X			thisproc = MIN(NPROCS, nproc);
+X			psize = thisproc * sizeof(struct proc);
+X			nproc -= thisproc;
+X			if (lseek(kmem, (off_t)procp, L_SET) == -1 ||
+X			    (nread = read(kmem, (char *)procs, psize)) < 0) {
+X				fprintf(stderr, "%s: read proc: %s\n",
+X				        ProgName, SysErr());
+X				return((struct ProcInfo *)NULL);
+X			} else if (nread != psize) {
+X				thisproc = nread / sizeof(struct proc);
+X				nproc = 0;
+X				fprintf(stderr, "%s: read proc: short read\n",
+X				        ProgName);
+X			}
+X			procsp = procs;
+X			procp += thisproc;
+X		}
+X
+X		aproc = procsp++;
+X		thisproc--;
+X
+X		if (aproc->p_stat != 0) {
+X			/*
+X			 * Before we go through the trouble of reading
+X			 * in the user struct, let's make sure this isn't
+X			 * a "zombie" or "exiting" process.  If it is,
+X			 * we have all the information we need; fill in
+X			 * procinfo and return.
+X			 */
+X			procinfo.pi_flags = 0;
+X			procinfo.pi_pid = (pid_T) aproc->p_pid;
+X			procinfo.pi_uid = (uid_T) aproc->p_uid;
+X
+X			if (aproc->p_stat == SZOMB) {		/* zombie */
+X				static char *zombie = "<defunct>";
+X				procinfo.pi_flags |= PI_ZOMBIE;
+X				procinfo.pi_cmd = zombie;
+X			} else if (aproc->p_flag & SEXIT) {	/* exiting */
+X				static char *exiting = "<exiting>";
+X				procinfo.pi_flags |= PI_SWEXIT;
+X				procinfo.pi_cmd = exiting;
+X			} else if (!needuser) {			/* Fflag */
+X				static char *fflagcmd = "<-f>";
+X				procinfo.pi_cmd = fflagcmd;
+X			}
+X
+X			if (procinfo.pi_flags || !needuser)
+X				return(&procinfo);
+X			else
+X				auser = GetUser(aproc);
+X		}
+X
+X	} while (aproc->p_stat == 0 || auser == NULL);
+X
+X	/*
+X	 * We now have a process (`aproc') and a user (`auser').
+X	 * Fill in the rest of `procinfo'.
+X	 */
+X	if (auser->u_ttyp != 0) {	/* has a controlling tty */
+X		procinfo.pi_flags |= PI_CTLTTY;
+X		procinfo.pi_tty = (tty_T) auser->u_ttyd;
+X	}
+X
+X	if (aproc->p_pid < pidmapsiz) {	/* special */
+X		procinfo.pi_cmd = pidmap[aproc->p_pid];
+X		procinfo.pi_flags |= PI_ASKUSR;
+X	} else				 /* set path-stripped command name */
+X		SETCMD(procinfo.pi_cmd, auser->u_comm, PSCOMSIZ)
+X
+X	return(&procinfo);
+X}
+X
+X#define	SKRD(file, src, dst, size)			\
+X	(lseek(file, (off_t)(src), L_SET) == -1) ||	\
+X	(read(file, (char *)(dst), (size)) != (size))
+X
+XGetStruct(loc, name, dest, size)
+X	off_t loc;
+X	char *name;
+X	off_t dest;
+X	int size;
+X{
+X	if (SKRD(kmem, loc, dest, size)) {
+X		fprintf(stderr, "%s: can't read %s struct at %lx in %s\n",
+X		        ProgName, name, (u_long)loc, kmemf);
+X		exit(EX_SERR);
+X	}
+X}
+X
+X/*
+X * OpenSwapDevs()
+X *
+X * Locate and open all the swap devices currently configured.
+X * The opened file descriptors are saved in `swdev[i]'.
+X *
+X * Side Effect: this routine does a chdir(devdskf).
+X */
+XOpenSwapDevs()
+X{
+X	extern char *SysErr();
+X	struct stat statb;
+X	register DIR *devdsk;
+X	register struct direct *dp;
+X	register char *flnm;
+X	register int i, keeplooking = 1;
+X
+X	/*
+X	 * Initialize all file descriptors to "unopened".
+X	 */
+X	for (i = 0; i < MSFILES; i++)
+X		swdev[i] = -1;
+X
+X	/*
+X	 * Relocate our current working directory to `devdskf' and open
+X	 * the directory for reading it's contents.
+X	 */
+X	if (chdir(devdskf) < 0) {
+X		fprintf(stderr, "%s: can't change dir to %s: %s\n",
+X		        ProgName, devdskf, SysErr());
+X		return;
+X	}
+X	if ((devdsk = opendir(".")) == NULL) {
+X		fprintf(stderr, "%s: can't open %s: %s\n",
+X			        ProgName, devdskf, SysErr());
+X		return;
+X	}
+X
+X	/*
+X	 * For each directory entry, if it is one of our swap devices,
+X	 * try to open it.
+X	 */
+X	while ((dp = readdir(devdsk)) != NULL && keeplooking) {
+X		flnm = dp->d_name;
+X		if (stat(flnm, &statb) < 0)	/* who knows, who cares... */
+X			continue;
+X		keeplooking = 0;
+X		for (i = 0; i < MSFILES; i++) {
+X			if (swdev[i] < 0 && S_ISBLK(statb.st_mode) &&
+X			    swtab[i].st_dev == statb.st_rdev)
+X				if ((swdev[i] = open(flnm, 0)) < 0)
+X					fprintf(stderr,
+X					        "%s: can't open %s/%s: %s\n",
+X					        ProgName,devdskf,flnm,SysErr());
+X
+X			if (swtab[i].st_dev && swdev[i] < 0)
+X				keeplooking = 1;
+X		}
+X	}
+X
+X	/*
+X	 * Lastly, see if there were any swap devices we could not locate.
+X	 */
+X	if (keeplooking) {
+X		for (i = 0; i < MSFILES; i++)
+X			if (swtab[i].st_dev && swdev[i] < 0)
+X				fprintf(stderr,
+X				"%s: can't open swap device %d,%d\n", ProgName,
+X				major(swtab[i].st_dev), minor(swtab[i].st_dev));
+X	}
+X	closedir(devdsk);
+X}
+X
+X/*
+X * GetUser(aproc)
+X *
+X * Read in the user struct for `aproc' and return a pointer to it.
+X * If an error occurs, return NULL.
+X */
+Xstatic struct user *
+XGetUser(aproc)
+X	struct proc *aproc;
+X{
+X	static char *WarnMsg = "Warning: can't read ";
+X	static union {
+X		struct user user;
+X		char upgs[USIZE][NBPP];
+X	} u;
+X	register int i, pgtype, file, swapi;
+X	register u_int addr;
+X	register char *flnm;
+X
+X	/*
+X	 * aproc->p_upgs has the pdes for the u-area.  Also, encoded into
+X	 * the pde is the key to the location of these pages.  If the disk
+X	 * block descriptor is of type DBD_NONE, then the pages are in
+X	 * core.  If they are of type DBD_SWAP they are out on swap device
+X	 * number `dbd_swpi' at logical block number `dbd_pgno'.  This is
+X	 * actually pretty cool, except that each swap partition must be
+X	 * treated separately (so we had to open all of them).
+X	 *
+X	 * If at any time, an lseek() or read() fails, print a warning
+X	 * message (if `Wflag' is set) and return NULL.
+X	 */
+X	for (i = 0; i < USIZE; i++) {
+X		pgtype = pdetodbd(&aproc->p_upgs[i])->dbd_type;
+X		switch (pgtype) {
+X		    case DBD_NONE:	/* in core */
+X			addr = aproc->p_upgs[i].pgm.pg_pfn*NBPP;
+X			file = mem;
+X			flnm = memf;
+X			break;
+X		    case DBD_SWAP:	/* swapped out */
+X			/*
+X			 * I assume that it's necessary to add in `st_swplo'
+X			 * in case our logical swap partition starts at a
+X			 * block offset other than zero.  The include files
+X			 * werent clear on this, so I guessed.  ..jef
+X			 */
+X			swapi = aproc->p_upgs[i].pgm.dbd.dbd_swpi;
+X			addr = BBTOB(aproc->p_upgs[i].pgm.dbd.dbd_pgno +
+X			             swtab[swapi].st_swplo);
+X			file = swdev[swapi];
+X			flnm = "swap";
+X			break;
+X		    default:		/* other (impossible?) things */
+X			if (Wflag)
+X				printf("%suser page of type %d for pid %d\n",
+X				       WarnMsg, pgtype, aproc->p_pid);
+X			return((struct user *)NULL);
+X		}
+X		if (SKRD(file, addr, u.upgs[i], NBPP)) {
+X			if (Wflag)
+X				printf("%suser page %u for pid %d from %s\n",
+X				       WarnMsg, addr/NBPP, aproc->p_pid, flnm);
+X			return((struct user *)NULL);
+X		}
+X	}
+X	return (&u.user);
+X}
+END_OF_FILE
+if test 12967 -ne `wc -c <'machdep/irix-3.c'`; then
+    echo shar: \"'machdep/irix-3.c'\" unpacked with wrong size!
+fi
+# end of 'machdep/irix-3.c'
+fi
+if test -f 'machdep/irix-4.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machdep/irix-4.c'\"
+else
+echo shar: Extracting \"'machdep/irix-4.c'\" \(12975 characters\)
+sed "s/^X//" >'machdep/irix-4.c' <<'END_OF_FILE'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: irix-4.c,v 1.6 1994/06/26 04:18:31 forys Exp $";
+X#endif
+X
+X/*
+X**  This program may be freely redistributed for noncommercial purposes.
+X**  This entire comment MUST remain intact.
+X**
+X**  Copyright 1994 by Jeff Forys (jeff@forys.cranbury.nj.us)
+X*/
+X
+X#define	NO_MEXTERN
+X#include "conf.h"
+X#undef	NO_MEXTERN
+X
+X#include <sys/dir.h>
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X
+X#include <stdio.h>
+X
+X/*
+X * Define SigNames, NSig, and TtyDevDir here; they are used by other
+X * routines and must be global.  Everyone seems to have their own
+X * idea as to what NSIG should be.  Here, `NSig' is the number of
+X * signals available, not counting zero.
+X */
+Xchar *SigMap[] = { "0",
+X	"HUP", "INT", "QUIT", "ILL", "TRAP", "IOT",		/*  1 -  6 */
+X	"EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",		/*  7 - 12 */
+X	"PIPE", "ALRM", "TERM", "USR1", "USR2", "CHLD",		/* 13 - 18 */
+X	"PWR", "STOP", "TSTP", "POLL", "IO", "URG",		/* 19 - 24 */
+X	"WINCH", "VTALRM", "PROF", "CONT", "TTIN", "TTOU",	/* 25 - 30 */
+X	"XCPU", "XFSZ",						/* 31 - 32 */
+X};
+Xint NSig = NUMSIGS;
+X
+X#define	SETCMD(dst,src,maxlen) {			\
+X	extern char *rindex();				\
+X	if (maxlen > 0) src[maxlen] = '\0';		\
+X	dst = (dst = rindex(src, '/')) ? ++dst: src;	\
+X}
+X
+Xstatic char *TtyDevDir = "/dev";
+X
+Xint	Skill;			/* set 1 if running `skill', 0 if `snice' */
+Xint	PrioMin, PrioMax;	/* min and max process priorities */
+Xint	SigPri;			/* signal to send or priority to set */
+Xpid_T	MyPid;			/* pid of this process */
+Xuid_T	MyUid;			/* uid of this process */
+Xchar	*ProgName;		/* program name */
+X
+X/*
+X * This is the machine-dependent initialization routine.
+X *
+X *   - The following global variables must be initialized:
+X *     MyPid, MyUid, ProgName, Skill, PrioMin, PrioMax, SigPri
+X *   - The working directory will be changed to that which contains the
+X *     tty devices (`TtyDevDir'); this makes argument parsing go faster.
+X *   - If possible, this routine should raise the priority of this process.
+X */
+Xvoid
+XMdepInit(pname)
+X	char *pname;
+X{
+X	extern char *rindex(), *SysErr();
+X
+X	MyPid = (pid_T) getpid();
+X	MyUid = (uid_T) getuid();
+X	SETCMD(ProgName, pname, 0)
+X
+X	/*
+X	 * If we are running as root, raise our priority to better
+X	 * catch runaway processes.
+X	 */
+X	if (MyUid == ROOTUID)
+X		(void) setpriority(PRIO_PROCESS, MyPid, PRIO_MIN);
+X
+X	/*
+X	 * Determine what we are doing to processes we find.  We will
+X	 * either send them a signal (skill), or renice them (snice).
+X	 */
+X	Skill = (strcmp(ProgName, "snice") != 0);
+X
+X	/*
+X	 * chdir to `TtyDevDir' to speed up tty argument parsing.
+X	 */
+X	if (chdir(TtyDevDir) < 0) {
+X		fprintf(stderr, "%s: chdir(%s): %s\n", ProgName, TtyDevDir,
+X		        SysErr());
+X		exit(EX_SERR);
+X	}
+X
+X	/*
+X	 * Set up minimum and maximum process priorities.
+X	 * Initialize SigPri to either default signal (`skill') or
+X	 * default priority (`snice').
+X	 */
+X	PrioMin = PRIO_MIN;
+X	PrioMax = PRIO_MAX;
+X	SigPri = Skill? SIGTERM: 4;
+X}
+X
+X/*
+X * Carry out an action on a particular process.  If this is `skill',
+X * then send the process a signal, otherwise this is `snice' so change
+X * it's priority.
+X *
+X * If 0 is returned, the operation was successful, otherwise -1 is
+X * returned and `errno' set.
+X */
+Xint
+XMdepAction(pid)
+X	pid_T pid;
+X{
+X	if (Skill)
+X		return(kill((int)pid, SigPri));
+X	else
+X		return(setpriority(PRIO_PROCESS, (int)pid, SigPri));
+X}
+X
+X/*
+X * Now, set up everything we need to write a GetProc() routine.
+X */
+X
+X#include <sys/immu.h>
+X#include <sys/swap.h>
+X#include <sys/file.h>
+X#include <sys/stat.h>
+X#include <sys/sysmacros.h>
+X
+X#include <nlist.h>
+X
+Xstatic char *kmemf =	"/dev/kmem";	/* window into kernel virtual memory */
+Xstatic char *memf =	"/dev/mem";	/* window into physical memory */
+Xstatic char *kernf =	"/unix";	/* kernel image */
+Xstatic char *devdskf =	"/dev/dsk";	/* where swap devices can be found */
+Xstatic int kmem = 0, mem = 0;
+X
+Xstatic struct nlist nl[] = {
+X	{ "v" },
+X#define	X_VAR		0
+X	{ "proc" },
+X#define	X_PROC		1
+X	{ "swaptab" },
+X#define	X_SWAPTAB	2
+X	{ "" },
+X#define	X_LAST		3
+X};
+X
+Xstatic	int	nproc = -1;
+Xstatic	struct	proc *procp;
+Xstatic	swpt_t	swtab[MSFILES];		/* available swap devices */
+Xstatic	dev_t	swdev[MSFILES];		/* opened swap devices */
+X
+X#define	NPROCS	32			/* number of procs to read at once */
+X
+Xstatic	char	*pidmap[] = { "sched", "init", "vhand", "bdflush" };
+Xstatic	int	pidmapsiz = sizeof(pidmap) / sizeof(pidmap[0]);
+X
+Xextern	off_t lseek();
+X
+X/*
+X * GetProc()
+X *
+X * Fill in and return a `struct ProcInfo' with information about the
+X * next process.  If no processes are left, return NULL.
+X *
+X * Fflag support:
+X *      If Fflag is set we will try to avoid reading in the user struct
+X *	and locating/opening the swap device(s).
+X *      We can do this only if Iflag, TtyIndx, and CmdIndx are zero.
+X */
+Xstruct ProcInfo *
+XGetProc()
+X{
+X	extern char *SysErr();
+X	static struct user *GetUser();
+X	static struct proc procs[NPROCS], *procsp;
+X	static struct ProcInfo procinfo;
+X	static struct var var;
+X	register struct user *auser;
+X	register struct proc *aproc;
+X	static int thisproc = 0;
+X	static int needuser = 1;		/* Fflag support */
+X
+X	/*
+X	 * If this is our first time here, open various files,
+X	 * and set up the nlist.
+X	 */
+X	if (nproc == -1) {
+X		char *errstr = "%s: %s: %s\n";
+X		int nfound;
+X
+X		if ((kmem=open(kmemf, 0)) < 0) {	/* open kmem */
+X			fprintf(stderr, errstr, ProgName, kmemf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((mem=open(memf, 0)) < 0) {		/* open mem */
+X			fprintf(stderr, errstr, ProgName, memf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((nfound=nlist(kernf, nl)) < 0) {	/* kernel name list */
+X			fprintf(stderr, errstr, ProgName, kernf,"no name list");
+X			exit(EX_SERR);
+X		}
+X
+X		if (nfound != 0) {
+X			register int i;
+X
+X			fprintf(stderr, "%s: nlist: unresolved symbols:",
+X			        ProgName);
+X			for (i = 0; i < X_LAST; i++)
+X				if (nl[i].n_type == 0)
+X					fprintf(stderr, " %s", nl[i].n_name);
+X			(void) putc('\n', stderr);
+X			exit(EX_SERR);
+X		}
+X
+X		GetStruct((off_t)svirtophys(nl[X_VAR].n_value), "var",
+X		          (off_t)&var, sizeof(var));
+X		GetStruct((off_t)svirtophys(nl[X_SWAPTAB].n_value), "swaptab",
+X		          (off_t)swtab, sizeof(swtab));
+X		procp = (struct proc *)svirtophys(nl[X_PROC].n_value);
+X		nproc = var.v_proc;
+X
+X		/*
+X		 * We run faster without finding/opening the swap devices
+X		 * and reading in the user struct; the price is incomplete
+X		 * information for errors (no cmd).
+X		 */
+X		if (Fflag && Iflag == 0 && TtyIndx == 0 && CmdIndx == 0)
+X			needuser = 0;
+X		else
+X			OpenSwapDevs();
+X	}
+X
+X	/*
+X	 * Read in NPROCS proc structures at-a-time.  Decrement `nproc'
+X	 * by the number of proc structures we have read; when it reaches
+X	 * zero, we are finished (return NULL).
+X	 */
+X	do {
+X		while (thisproc == 0) {
+X			int nread;
+X			int psize;
+X
+X			if (nproc == 0)
+X				return((struct ProcInfo *)NULL);
+X
+X			thisproc = MIN(NPROCS, nproc);
+X			psize = thisproc * sizeof(struct proc);
+X			nproc -= thisproc;
+X			if (lseek(kmem, (off_t)procp, L_SET) == -1 ||
+X			    (nread = read(kmem, (char *)procs, psize)) < 0) {
+X				fprintf(stderr, "%s: read proc: %s\n",
+X				        ProgName, SysErr());
+X				return((struct ProcInfo *)NULL);
+X			} else if (nread != psize) {
+X				thisproc = nread / sizeof(struct proc);
+X				nproc = 0;
+X				fprintf(stderr, "%s: read proc: short read\n",
+X				        ProgName);
+X			}
+X			procsp = procs;
+X			procp += thisproc;
+X		}
+X
+X		aproc = procsp++;
+X		thisproc--;
+X
+X		if (aproc->p_stat != 0) {
+X			/*
+X			 * Before we go through the trouble of reading
+X			 * in the user struct, let's make sure this isn't
+X			 * a "zombie" or "exiting" process.  If it is,
+X			 * we have all the information we need; fill in
+X			 * procinfo and return.
+X			 */
+X			procinfo.pi_flags = 0;
+X			procinfo.pi_pid = (pid_T) aproc->p_pid;
+X			procinfo.pi_uid = (uid_T) aproc->p_uid;
+X
+X			if (aproc->p_stat == SZOMB) {		/* zombie */
+X				static char *zombie = "<defunct>";
+X				procinfo.pi_flags |= PI_ZOMBIE;
+X				procinfo.pi_cmd = zombie;
+X			} else if (aproc->p_flag & SEXIT) {	/* exiting */
+X				static char *exiting = "<exiting>";
+X				procinfo.pi_flags |= PI_SWEXIT;
+X				procinfo.pi_cmd = exiting;
+X			} else if (!needuser) {			/* Fflag */
+X				static char *fflagcmd = "<-f>";
+X				procinfo.pi_cmd = fflagcmd;
+X			}
+X
+X			if (procinfo.pi_flags || !needuser)
+X				return(&procinfo);
+X			else
+X				auser = GetUser(aproc);
+X		}
+X
+X	} while (aproc->p_stat == 0 || auser == NULL);
+X
+X	/*
+X	 * We now have a process (`aproc') and a user (`auser').
+X	 * Fill in the rest of `procinfo'.
+X	 */
+X	if (auser->u_ttyd != (dev_t)-1) {	/* has a controlling tty */
+X		procinfo.pi_flags |= PI_CTLTTY;
+X		procinfo.pi_tty = (tty_T) auser->u_ttyd;
+X	}
+X
+X	if (aproc->p_pid < pidmapsiz) {	/* special */
+X		procinfo.pi_cmd = pidmap[aproc->p_pid];
+X		procinfo.pi_flags |= PI_ASKUSR;
+X	} else				 /* set path-stripped command name */
+X		SETCMD(procinfo.pi_cmd, auser->u_comm, PSCOMSIZ)
+X
+X	return(&procinfo);
+X}
+X
+X#define	SKRD(file, src, dst, size)			\
+X	(lseek(file, (off_t)(src), L_SET) == -1) ||	\
+X	(read(file, (char *)(dst), (size)) != (size))
+X
+XGetStruct(loc, name, dest, size)
+X	off_t loc;
+X	char *name;
+X	off_t dest;
+X	int size;
+X{
+X	if (SKRD(kmem, loc, dest, size)) {
+X		fprintf(stderr, "%s: can't read %s struct at %lx in %s\n",
+X		        ProgName, name, (u_long)loc, kmemf);
+X		exit(EX_SERR);
+X	}
+X}
+X
+X/*
+X * OpenSwapDevs()
+X *
+X * Locate and open all the swap devices currently configured.
+X * The opened file descriptors are saved in `swdev[i]'.
+X *
+X * Side Effect: this routine does a chdir(devdskf).
+X */
+XOpenSwapDevs()
+X{
+X	extern char *SysErr();
+X	struct stat statb;
+X	register DIR *devdsk;
+X	register struct direct *dp;
+X	register char *flnm;
+X	register int i, keeplooking = 1;
+X
+X	/*
+X	 * Initialize all file descriptors to "unopened".
+X	 */
+X	for (i = 0; i < MSFILES; i++)
+X		swdev[i] = -1;
+X
+X	/*
+X	 * Relocate our current working directory to `devdskf' and open
+X	 * the directory for reading it's contents.
+X	 */
+X	if (chdir(devdskf) < 0) {
+X		fprintf(stderr, "%s: can't change dir to %s: %s\n",
+X		        ProgName, devdskf, SysErr());
+X		return;
+X	}
+X	if ((devdsk = opendir(".")) == NULL) {
+X		fprintf(stderr, "%s: can't open %s: %s\n",
+X			        ProgName, devdskf, SysErr());
+X		return;
+X	}
+X
+X	/*
+X	 * For each directory entry, if it is one of our swap devices,
+X	 * try to open it.
+X	 */
+X	while ((dp = readdir(devdsk)) != NULL && keeplooking) {
+X		flnm = dp->d_name;
+X		if (stat(flnm, &statb) < 0)	/* who knows, who cares... */
+X			continue;
+X		keeplooking = 0;
+X		for (i = 0; i < MSFILES; i++) {
+X			if (swdev[i] < 0 && S_ISBLK(statb.st_mode) &&
+X			    swtab[i].st_dev == statb.st_rdev)
+X				if ((swdev[i] = open(flnm, 0)) < 0)
+X					fprintf(stderr,
+X					        "%s: can't open %s/%s: %s\n",
+X					        ProgName,devdskf,flnm,SysErr());
+X
+X			if (swtab[i].st_dev && swdev[i] < 0)
+X				keeplooking = 1;
+X		}
+X	}
+X
+X	/*
+X	 * Lastly, see if there were any swap devices we could not locate.
+X	 */
+X	if (keeplooking) {
+X		for (i = 0; i < MSFILES; i++)
+X			if (swtab[i].st_dev && swdev[i] < 0)
+X				fprintf(stderr,
+X				"%s: can't open swap device %d,%d\n", ProgName,
+X				major(swtab[i].st_dev), minor(swtab[i].st_dev));
+X	}
+X	closedir(devdsk);
+X}
+X
+X/*
+X * GetUser(aproc)
+X *
+X * Read in the user struct for `aproc' and return a pointer to it.
+X * If an error occurs, return NULL.
+X */
+Xstatic struct user *
+XGetUser(aproc)
+X	struct proc *aproc;
+X{
+X	static char *WarnMsg = "Warning: can't read ";
+X	static union {
+X		struct user user;
+X		char upgs[USIZE][NBPP];
+X	} u;
+X	register int i, pgtype, file, swapi;
+X	register u_int addr;
+X	register char *flnm;
+X
+X	/*
+X	 * aproc->p_upgs has the pdes for the u-area.  Also, encoded into
+X	 * the pde is the key to the location of these pages.  If the disk
+X	 * block descriptor is of type DBD_NONE, then the pages are in
+X	 * core.  If they are of type DBD_SWAP they are out on swap device
+X	 * number `dbd_swpi' at logical block number `dbd_pgno'.  This is
+X	 * actually pretty cool, except that each swap partition must be
+X	 * treated separately (so we had to open all of them).
+X	 *
+X	 * If at any time, an lseek() or read() fails, print a warning
+X	 * message (if `Wflag' is set) and return NULL.
+X	 */
+X	for (i = 0; i < USIZE; i++) {
+X		pgtype = pdetodbd(&aproc->p_upgs[i])->dbd_type;
+X		switch (pgtype) {
+X		    case DBD_NONE:	/* in core */
+X			addr = aproc->p_upgs[i].pgm.pg_pfn*NBPP;
+X			file = mem;
+X			flnm = memf;
+X			break;
+X		    case DBD_SWAP:	/* swapped out */
+X			/*
+X			 * I assume that it's necessary to add in `st_swplo'
+X			 * in case our logical swap partition starts at a
+X			 * block offset other than zero.  The include files
+X			 * werent clear on this, so I guessed.  ..jef
+X			 */
+X			swapi = aproc->p_upgs[i].pgm.dbd.dbd_swpi;
+X			addr = BBTOB(aproc->p_upgs[i].pgm.dbd.dbd_pgno +
+X			             swtab[swapi].st_swplo);
+X			file = swdev[swapi];
+X			flnm = "swap";
+X			break;
+X		    default:		/* other (impossible?) things */
+X			if (Wflag)
+X				printf("%suser page of type %d for pid %d\n",
+X				       WarnMsg, pgtype, aproc->p_pid);
+X			return((struct user *)NULL);
+X		}
+X		if (SKRD(file, addr, u.upgs[i], NBPP)) {
+X			if (Wflag)
+X				printf("%suser page %u for pid %d from %s\n",
+X				       WarnMsg, addr/NBPP, aproc->p_pid, flnm);
+X			return((struct user *)NULL);
+X		}
+X	}
+X	return (&u.user);
+X}
+END_OF_FILE
+if test 12975 -ne `wc -c <'machdep/irix-4.c'`; then
+    echo shar: \"'machdep/irix-4.c'\" unpacked with wrong size!
+fi
+# end of 'machdep/irix-4.c'
+fi
+if test -f 'machdep/ultrix-4.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machdep/ultrix-4.c'\"
+else
+echo shar: Extracting \"'machdep/ultrix-4.c'\" \(13985 characters\)
+sed "s/^X//" >'machdep/ultrix-4.c' <<'END_OF_FILE'
+X#ifndef lint
+Xstatic char rcsid[] = "$Header: ultrix-4.c,v 1.6 1994/06/26 04:16:59 forys Exp $";
+X#endif
+X
+X/*
+X**  This program may be freely redistributed for noncommercial purposes.
+X**  This entire comment MUST remain intact.
+X**
+X**  Ultrix 4 support by Ric Anderson (ric@cs.arizona.edu)
+X**
+X**  Copyright 1994 by Jeff Forys (jeff@forys.cranbury.nj.us)
+X*/
+X
+X#define	NO_MEXTERN
+X#include "conf.h"
+X#undef	NO_MEXTERN
+X
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X
+X#include <stdio.h>
+X
+X#define CRIT_PID	4  /* Query kills for pids .LE. this number */
+X
+X/*
+X * Define SigNames, NSig, and TtyDevDir here; they are used by other
+X * routines and must be global.  Everyone seems to have their own
+X * idea as to what NSIG should be.  Here, `NSig' is the number of
+X * signals available, not counting zero.
+X */
+Xchar *SigMap[] = { "0",
+X	"HUP", "INT", "QUIT", "ILL", "TRAP", "IOT",		/*  1 -  6 */
+X	"EMT", "FPE", "KILL", "BUS", "SEGV", "SYS",		/*  7 - 12 */
+X	"PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP",		/* 13 - 18 */
+X	"CONT", "CHLD", "TTIN", "TTOU", "IO", "XCPU",		/* 19 - 24 */
+X	"XFSZ", "VTALRM", "PROF", "WINCH", "LOST", "USR1",	/* 25 - 30 */
+X	"USR2", "32",						/* 31 - 32 */
+X};
+Xint NSig = NSIG;
+X
+X#define	SETCMD(dst,src,maxlen) {			\
+X	extern char *rindex();				\
+X	if (maxlen > 0) src[maxlen] = '\0';		\
+X	dst = (dst = rindex(src, '/')) ? ++dst: src;	\
+X}
+X
+Xstatic char *TtyDevDir = "/dev";
+X
+Xint	Skill;			/* set 1 if running `skill', 0 if `snice' */
+Xint	PrioMin, PrioMax;	/* min and max process priorities */
+Xint	SigPri;			/* signal to send or priority to set */
+Xpid_T	MyPid;			/* pid of this process */
+Xuid_T	MyUid;			/* uid of this process */
+Xchar	*ProgName;		/* program name */
+X
+X/*
+X * This is the machine-dependent initialization routine.
+X *
+X *   - The following global variables must be initialized:
+X *     MyPid, MyUid, ProgName, Skill, PrioMin, PrioMax, SigPri
+X *   - The working directory will be changed to that which contains the
+X *     tty devices (`TtyDevDir'); this makes argument parsing go faster.
+X *   - If possible, this routine should raise the priority of this process.
+X */
+Xvoid
+XMdepInit(pname)
+X	char *pname;
+X{
+X	extern char *rindex(), *SysErr();
+X
+X	MyPid = (pid_T) getpid();
+X	MyUid = (uid_T) getuid();
+X	SETCMD(ProgName, pname, 0)
+X
+X	/*
+X	 * If we are running as root, raise our priority to better
+X	 * catch runaway processes.
+X	 */
+X	if (MyUid == ROOTUID)
+X		(void) setpriority(PRIO_PROCESS, MyPid, PRIO_MIN);
+X
+X	/*
+X	 * Determine what we are doing to processes we find.  We will
+X	 * either send them a signal (skill), or renice them (snice).
+X	 */
+X	Skill = (strcmp(ProgName, "snice") != 0);
+X
+X	/*
+X	 * chdir to `TtyDevDir' to speed up tty argument parsing.
+X	 */
+X	if (chdir(TtyDevDir) < 0) {
+X		fprintf(stderr, "%s: chdir(%s): %s\n", ProgName, TtyDevDir,
+X		        SysErr());
+X		exit(EX_SERR);
+X	}
+X
+X	/*
+X	 * Set up minimum and maximum process priorities.
+X	 * Initialize SigPri to either default signal (`skill') or
+X	 * default priority (`snice').
+X	 */
+X	PrioMin = PRIO_MIN;
+X	PrioMax = PRIO_MAX;
+X	SigPri = Skill? SIGTERM: 4;
+X}
+X
+X/*
+X * Carry out an action on a particular process.  If this is `skill',
+X * then send the process a signal, otherwise this is `snice' so change
+X * it's priority.
+X *
+X * If 0 is returned, the operation was successful, otherwise -1 is
+X * returned and `errno' set.
+X */
+Xint
+XMdepAction(pid)
+X	pid_T pid;
+X{
+X	if (Skill)
+X		return(kill((int)pid, SigPri));
+X	else
+X		return(setpriority(PRIO_PROCESS, (int)pid, SigPri));
+X}
+X
+X/*
+X * Now, set up everything we need to write a GetProc() routine.
+X */
+X
+X#include <sys/tty.h>
+X#include <sys/file.h>
+X#include <sys/vm.h>
+X
+X#include <machine/pte.h>
+X
+X#include <nlist.h>
+X
+Xstatic char *kmemf =	"/dev/kmem";	/* window into kernel virtual memory */
+Xstatic char *memf =	"/dev/mem";	/* window into physical memory */
+Xstatic char *swapf =	"/dev/drum";	/* paging device */
+Xstatic char *kernf =	"/vmunix";	/* kernel image */
+Xstatic int kmem = 0, mem = 0, swap = 0;
+X
+Xstatic struct nlist nl[] = {
+X	{ "_nproc" },
+X#define	X_NPROC		0
+X	{ "_proc" },
+X#define	X_PROC		1
+X	{ "_proc_bitmap" },
+X#define	X_PROC_BITMAP	2
+X#ifdef vax
+X	{ "_Usrptmap" },
+X#define	X_USRPTMAP	3
+X	{ "_usrpt" },
+X#define	X_USRPT		4
+X	{ "" },
+X#define	X_LAST		5
+X#else
+X	{ "" },
+X#define	X_LAST		3
+X#endif
+X};
+X
+Xstatic	int	nproc = -1;
+Xstatic	int	absolute_proc_number = -1;
+Xstatic	struct	proc *procp;
+X#ifdef vax
+Xstatic	struct	pte *usrptmap, *usrpt;
+X#endif
+X
+X#define	NPROCS	32			/* number of procs to read at once */
+X
+Xextern	off_t lseek();
+X
+X/*
+X * GetProc()
+X *
+X * Fill in and return a `struct ProcInfo' with information about the
+X * next process.  If no processes are left, return NULL.
+X */
+Xstruct ProcInfo *
+XGetProc()
+X{
+X	int proc_active;
+X	extern char *SysErr();
+X	static struct user *GetUser();
+X	static unsigned bitmap;
+X	static struct proc procs[NPROCS], *procsp;
+X	static struct ProcInfo procinfo;
+X	static struct tty tty;
+X	register struct user *auser;
+X	register struct proc *aproc;
+X	static int thisproc = 0;
+X
+X	/*
+X	 * If this is our first time here, open various files,
+X	 * and set up the nlist.
+X	 */
+X	if (nproc == -1) {
+X		char *errstr = "%s: %s: %s\n";
+X		int nfound;
+X
+X		if ((kmem=open(kmemf, 0)) < 0) {	/* open kmem */
+X			fprintf(stderr, errstr, ProgName, kmemf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((mem=open(memf, 0)) < 0) {		/* open mem */
+X			fprintf(stderr, errstr, ProgName, memf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((swap=open(swapf, 0)) < 0) {	/* open swap device */
+X			fprintf(stderr, errstr, ProgName, swapf, SysErr());
+X			exit(EX_SERR);
+X		}
+X
+X		if ((nfound=nlist(kernf, nl)) < 0) {	/* kernel name list */
+X			fprintf(stderr, errstr, ProgName, kernf,"no name list");
+X			exit(EX_SERR);
+X		}
+X		if (nfound != 0) {
+X			register int i;
+X
+X			fprintf(stderr, "%s: nlist: unresolved symbols:",
+X			        ProgName);
+X			for (i = 0; i < X_LAST; i++)
+X				if (nl[i].n_type == 0)
+X					fprintf(stderr, " %s", nl[i].n_name);
+X			(void) putc('\n', stderr);
+X			exit(EX_SERR);
+X		}
+X
+X#ifdef vax
+X		usrpt = (struct pte *) nl[X_USRPT].n_value;
+X		usrptmap = (struct pte *) nl[X_USRPTMAP].n_value;
+X#endif
+X		procp = (struct proc *)GetWord((off_t)nl[X_PROC].n_value);
+X		nproc = GetWord((off_t)nl[X_NPROC].n_value);
+X	}
+X
+X	/*
+X	 * Read in NPROCS proc structures at-a-time.  Decrement `nproc'
+X	 * by the number of proc structures we have read; when it reaches
+X	 * zero, we are finished (return NULL).
+X	 */
+X	do {
+X		while (thisproc == 0) {
+X			int nread;
+X			int psize;
+X
+X			if (nproc == 0)
+X				return((struct ProcInfo *)NULL);
+X
+X			thisproc = MIN(NPROCS, nproc);
+X			psize = thisproc * sizeof(struct proc);
+X			nproc -= thisproc;
+X			if (lseek(kmem, (off_t)procp, L_SET) == -1 ||
+X			    (nread = read(kmem, (char *)procs, psize)) < 0) {
+X				fprintf(stderr, "%s: read proc: %s\n",
+X				        ProgName, SysErr());
+X				return((struct ProcInfo *)NULL);
+X			} else if (nread != psize) {
+X				thisproc = nread / sizeof(struct proc);
+X				nproc = 0;
+X				fprintf(stderr, "%s: read proc: short read\n",
+X				        ProgName);
+X			}
+X			procsp = procs;
+X			procp += thisproc;
+X		}
+X
+X		aproc = procsp++;
+X		thisproc--;
+X
+X/*  Ultrix 4.x uses a bitmap to tell if a proc structure is	*/
+X/*  valid.  We read and check the bitmap.  The code here is	*/
+X/*  structured around 32 bits/entry, and 4 bytes/entry.		*/
+X
+X		absolute_proc_number++;
+X		if((absolute_proc_number % 32) == 0)
+X			bitmap = GetWord((unsigned int)nl[X_PROC_BITMAP].n_value
+X			  + ((absolute_proc_number / 32) * 4));
+X		proc_active = (bitmap & (1 << (absolute_proc_number % 32))) != 0;
+X		if (proc_active) {
+X			/*
+X			 * Before we go through the trouble of reading
+X			 * in the user struct, let's make sure this isn't
+X			 * a "zombie" or "exiting" process.  If it is,
+X			 * we have all the information we need; fill in
+X			 * procinfo and return.
+X			 */
+X			procinfo.pi_flags = 0;
+X			procinfo.pi_pid = (pid_T) aproc->p_pid;
+X			procinfo.pi_uid = (uid_T) aproc->p_uid;
+X
+X			if (aproc->p_stat == SZOMB) {		/* zombie */
+X				static char *zombie = "<defunct>";
+X				procinfo.pi_flags |= PI_ZOMBIE;
+X				procinfo.pi_cmd = zombie;
+X			} else if (aproc->p_type & SWEXIT) {	/* exiting */
+X				static char *exiting = "<exiting>";
+X				procinfo.pi_flags |= PI_SWEXIT;
+X				procinfo.pi_cmd = exiting;
+X			}
+X
+X			if (procinfo.pi_flags)
+X				return(&procinfo);
+X			else
+X				auser = GetUser(aproc);
+X		}
+X
+X	} while (!proc_active || auser == NULL);
+X
+X	/*
+X	 * We now have a process (`aproc') and a user (`auser').
+X	 * Fill in the rest of `procinfo'.
+X	 */
+X	if (aproc->p_ttyp != 0 &&	/* has a controlling terminal? */
+X	    lseek(kmem, (off_t)aproc->p_ttyp, L_SET) != -1 &&
+X	    read(kmem, (char *)&tty, sizeof(tty)) == sizeof(tty)) {
+X		procinfo.pi_flags |= PI_CTLTTY;
+X		procinfo.pi_tty = (tty_T) tty.t_dev;
+X	}
+X
+X	if (aproc->p_pid <= CRIT_PID)	/* special */
+X		procinfo.pi_flags |= PI_ASKUSR;
+X	SETCMD(procinfo.pi_cmd, auser->u_comm, MAXCOMLEN)
+X
+X	return(&procinfo);
+X}
+X
+X#define	SKRD(file, src, dst, size)			\
+X	(lseek(file, (off_t)(src), L_SET) == -1) ||	\
+X	(read(file, (char *)(dst), (size)) != (size))
+X
+X/*
+X * GetStruct(loc,name,dest,size)
+X *
+X * Read in structure at `loc' from kernel virtual memory.
+X * If an error occurs, return non-zero.
+X */
+X
+Xstatic int
+XGetStruct(loc,name,dest,size)
+Xchar *name;
+Xint size;
+Xoff_t dest, loc;
+X{
+X	if(SKRD(kmem,loc,dest,size))
+X		return(0);
+X	return(1);
+X}
+X
+X/*
+X * GetWord(loc)
+X *
+X * Read in word at `loc' from kernel virtual memory.
+X * If an error occurs, call exit(2) with EX_SERR.
+X */
+Xstatic int
+XGetWord(loc)
+X	off_t loc;
+X{
+X	int val;
+X
+X	if (SKRD(kmem, loc, &val, sizeof(val))) {
+X		fprintf(stderr, "%s: can't read word at %lx in %s\n",
+X		        ProgName, (u_long)loc, kmemf);
+X		exit(EX_SERR);
+X	}
+X	return (val);
+X}
+X
+X#ifdef mips
+X#define	SW_UADDR	dtob(GetWord(dmap.dm_ptdaddr))
+X#define	SW_UBYTES	sizeof(struct user)
+X
+X/*
+X * GetUser(aproc)
+X *
+X * Read in the user struct for `aproc' and return a pointer to it.
+X * If an error occurs, return NULL.
+X */
+Xstatic struct user *
+XGetUser(aproc)
+X	struct proc *aproc;
+X{
+X	static char *WarnMsg = "Warning: can't read ";
+X	static union {
+X		struct user user;
+X		char upgs[UPAGES][NBPG];
+X	} u;
+X	static struct pte uptes[UPAGES];
+X	static struct dmap dmap;
+X	register int i, nbytes;
+X
+X	/*
+X	 * If process is not in core, we simply snarf it's user struct
+X	 * from the swap device.
+X	 */
+X	if ((aproc->p_sched & SLOAD) == 0) {
+X		if(!GetStruct((off_t)aproc->p_smap,"aproc->p_smap",
+X		  &dmap,sizeof(dmap))) {
+X			if (Wflag)
+X				printf("%s dmap for pid %d from %s\n",
+X				       WarnMsg, aproc->p_pid, swapf);
+X			return ((struct user *)NULL);
+X		}
+X		if (SKRD(swap, SW_UADDR, &u.user, SW_UBYTES)) {
+X			if (Wflag)
+X				printf("%su for pid %d from %s\n",
+X				       WarnMsg, aproc->p_pid, swapf);
+X			return ((struct user *)NULL);
+X		}
+X		return (&u.user);
+X	}
+X
+X	/*
+X	 * Process is in core.  Follow p_addr to read in the page
+X	 * table entries that map the u-area and then read in the
+X	 * physical pages that comprise the u-area.
+X	 *
+X	 * If at any time, an lseek() or read() fails, print a warning
+X	 * message (if `Wflag' is set) and return NULL.
+X	 */
+X	if (SKRD(kmem, aproc->p_addr, uptes, sizeof(uptes))) {
+X		if (Wflag)
+X			printf("%suser pt for pid %d from %s\n",
+X			       WarnMsg, aproc->p_pid, kmemf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	nbytes = sizeof(struct user);
+X	for (i = 0; i < UPAGES && nbytes > 0; i++) {
+X		if (SKRD(mem, ptob(uptes[i].pg_pfnum), u.upgs[i], NBPG)) {
+X			if (Wflag)
+X				printf("%suser page %u for pid %d from %s\n",
+X				       WarnMsg, uptes[i].pg_pfnum,
+X				       aproc->p_pid, memf);
+X			return((struct user *)NULL);
+X		}
+X		nbytes -= NBPG;
+X	}
+X	return (&u.user);
+X}
+X#endif /* mips */
+X
+X#ifdef vax
+X/****	The following code is uncompiled, and untested.  if you have
+X *	an Ultrix 4.x vax to compile it on, please do so and send
+X *	mods to jeff forys.
+X */
+X
+X#define	SW_UADDR	dtob(GetWord(dmap.dm_ptdaddr))
+X#define	SW_UBYTES	sizeof(struct user)
+X
+X/*
+X * GetUser(aproc)
+X *
+X * Read in the user struct for `aproc' and return a pointer to it.
+X * If an error occurs, return NULL.
+X */
+Xstatic struct user *
+XGetUser(aproc)
+X	struct proc *aproc;
+X{
+X	static char *WarnMsg = "Warning: can't read ";
+X	static union {
+X		struct user user;
+X		char upgs[UPAGES][NBPG];
+X	} u;
+X	static struct pte apte, uptes[CLSIZE+HIGHPAGES];
+X	static struct dmap dmap;
+X	register int ncl, i, nbytes;
+X
+X	/*
+X	 * If process is not in core, we simply snarf it's user struct
+X	 * from the swap device.
+X	 */
+X	if ((aproc->p_sched & SLOAD) == 0) {
+X		if(!GetStruct((off_t)aproc->p_smap,"aproc->p_smap",
+X		  &dmap,sizeof(dmap))) {
+X			if (Wflag)
+X				printf("%s dmap for pid %d from %s\n",
+X				       WarnMsg, aproc->p_pid, swapf);
+X			return ((struct user *)NULL);
+X		}
+X		if (SKRD(swap, SW_UADDR, &u.user, SW_UBYTES)) {
+X			if (Wflag)
+X				printf("%su for pid %d from %s\n",
+X				       WarnMsg, aproc->p_pid, swapf);
+X			return ((struct user *)NULL);
+X		}
+X		return (&u.user);
+X	}
+X
+X/* Process is in core.  First read from the user page-table	*/
+X/* map for this process to get the u-area page table entry.	*/
+X/* Next, read in the page table entries that map the u-area.	*/
+X/* Finally, read in the physical pages that comprise the	*/
+X/* u-area.							*/
+X/*								*/
+X/* If at any time, an lseek() or read() fails, print a warning	*/
+X/* message (if `Wflag' is set) and return NULL.			*/
+X
+X	if (SKRD(kmem, &usrptmap[btokmx(aproc->p_p0br) + aproc->p_szpt - 1],
+X	         &apte, sizeof(apte))) {
+X		if (Wflag)
+X			printf("%sindir pte of user pt for pid %d from %s\n",
+X			  WarnMsg, aproc->p_pid, kmemf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	if (SKRD(mem, ctob(apte.pg_pfnum+1) - sizeof(uptes),
+X	         uptes, sizeof(uptes))) {
+X		if (Wflag)
+X			printf("%suser pt for pid %d from %s\n",
+X			       WarnMsg, aproc->p_pid, memf);
+X		return ((struct user *)NULL);
+X	}
+X
+X	/*
+X	 * Set `ncl' to the (rounded up) number of u-area page clusters
+X	 * to read, and then read in this user struct (in reverse).
+X	 */
+X	ncl = (sizeof(struct user) + CLBYTES - 1) / CLBYTES;
+X	while (--ncl >= 0) {
+X		i = ncl * CLSIZE;
+X		if (SKRD(mem,ctob(uptes[CLSIZE+i].pg_pfnum),u.upgs[i],CLBYTES)){
+X			if (Wflag)
+X				printf("%suser page %u for pid %d from %s\n",
+X				       WarnMsg, uptes[CLSIZE+i].pg_pfnum,
+X				       aproc->p_pid, memf);
+X			return((struct user *)NULL);
+X		}
+X	}
+X	return (&u.user);
+X}
+X#endif /* vax */
+END_OF_FILE
+if test 13985 -ne `wc -c <'machdep/ultrix-4.c'`; then
+    echo shar: \"'machdep/ultrix-4.c'\" unpacked with wrong size!
+fi
+# end of 'machdep/ultrix-4.c'
+fi
+echo shar: End of archive 3 \(of 3\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

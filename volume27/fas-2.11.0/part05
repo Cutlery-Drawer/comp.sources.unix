@@ -1,0 +1,2334 @@
+Newsgroups: comp.sources.unix
+From: fas@geminix.in-berlin.de (FAS Support Account)
+Subject: v27i071: FAS-2.11.0 - asynch serial driver for System V, Part05/08
+References: <1.750471074.20539@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: fas@geminix.in-berlin.de (FAS Support Account)
+Posting-Number: Volume 27, Issue 71
+Archive-Name: fas-2.11.0/part05
+
+#!/bin/sh
+# this is fas211pl0.05 (part 5 of a multipart archive)
+# do not concatenate these parts, unpack them in order with /bin/sh
+# file fas.c continued
+#
+if test ! -r _shar_seq_.tmp; then
+	echo 'Please unpack part 1 first!'
+	exit 1
+fi
+(read Scheck
+ if test "$Scheck" != 5; then
+	echo Please unpack part "$Scheck" next!
+	exit 1
+ else
+	exit 0
+ fi
+) < _shar_seq_.tmp || exit 1
+if test ! -f _shar_wnt_.tmp; then
+	echo 'x - still skipping fas.c'
+else
+echo 'x - continuing file fas.c'
+sed 's/^X//' << 'SHAR_EOF' >> 'fas.c' &&
+XSTATIC void	fas_xxfer P((struct fas_internals *fipp));
+XSTATIC void	fas_hangup P((struct fas_internals *fip));
+XSTATIC void	fas_timeout P((struct fas_internals *fip));
+XSTATIC void	fas_rdi_enable P((struct fas_internals *fip));
+XSTATIC void	fas_send_xon P((struct fas_internals *fip));
+XSTATIC void	fas_send_xoff P((struct fas_internals *fip));
+XSTATIC uint	fas_make_ctl_val P((struct fas_internals *fip, uint unit,
+X								uint num));
+XSTATIC void	fas_mem_zero P((unchar *ptr, uint size));
+XSTATIC uint	fas_test_device P((struct fas_internals *fip));
+X#if defined (NEED_PUT_GETCHAR)
+Xint		FASPUTCHAR P((unchar arg));
+Xint		FASGETCHAR P((void));
+X#endif
+X#if defined (NEED_INIT8250)
+Xint		init8250 P((ushort port, ushort ier));
+X#endif
+X
+X/* External functions used by this driver. */
+Xextern int	ttinit ();
+Xextern int	ttiocom ();
+Xextern int	ttyflush ();
+Xextern int	SPLINT ();
+Xextern int	SPLWRK ();
+Xextern int	splx ();
+Xextern int	sleep ();
+Xextern int	wakeup ();
+Xextern void	longjmp ();
+X#if !defined (SVR4)
+Xextern int	signal ();
+X#endif
+Xextern int	timeout ();
+Xextern int	untimeout ();
+X#if defined (SCO) || defined (XENIX)
+Xextern int	printcfg ();
+X#else
+Xextern int	printf ();
+X#endif
+X#if defined (HAVE_VPIX)
+Xextern int	copyin ();
+Xextern int	copyout ();
+Xextern int	v86setint ();
+X#endif
+X#if !defined (__GNUC__) || defined (NO_ASM)
+X#define INB(port) inb (port)
+X#define OUTB(port,val) outb (port, val)
+Xextern int	inb ();
+Xextern int	outb ();
+X#endif
+X
+X/* External data objects used by this driver. */
+Xextern int	tthiwat [];
+Xextern int	ttlowat [];
+X#if defined (TUNABLE_TTYHOG)
+Xextern int	ttyhog;
+X#endif
+X
+X/* The following stuff is defined in `space.c'. */
+Xextern uint	fas_port [];
+Xextern int	fas_vec [];
+Xextern uint	fas_modify [];
+Xextern uint	fas_fifo_ctl [];
+Xextern uint	fas_init_seq [];
+Xextern uint	fas_int_ack_seq [];
+Xextern uint	fas_mcb [];
+Xextern ulong	fas_modem [];
+Xextern ulong	fas_flow [];
+Xextern uint	fas_ctl_port [];
+Xextern uint	fas_ctl_val [];
+Xextern uint	fas_pl_select [];
+Xextern uint	fas_layout [] [NUM_UART_REGS];
+Xextern uint	fas_bt_select [];
+Xextern ulong	fas_baud [] [CBAUD + 1];
+Xextern uint	fas_physical_units;
+Xextern uint	fas_port_layouts;
+Xextern uint	fas_baud_tables;
+Xextern struct fas_internals	fas_internals [];
+Xextern struct tty		fas_tty [];
+Xextern struct fas_speed		fas_speed [] [CBAUD + 1];
+Xextern struct fas_internals	*fas_internals_ptr [];
+Xextern struct tty		*fas_tty_ptr [];
+Xextern struct fas_speed		*fas_speed_ptr [];
+Xextern ulong			*fas_baud_ptr [];
+X/* End of `space.c' references. */
+X
+X#if defined (NEED_PUT_GETCHAR)
+X/* Flag to indicate that we have been through fasinit. */
+Xstatic bool	fas_is_initted = FALSE;
+X#endif
+X
+X/* Flag to indicate that the event handler has been scheduled
+X   via the timeout () function.
+X*/
+Xstatic bool	event_scheduled = FALSE;
+X
+X/* Pointers to the first and last fas_internals structure of the
+X   interrupt users chain.
+X*/
+Xstatic struct fas_internals	*fas_first_int_user = NULL;
+Xstatic struct fas_internals	*fas_last_int_user = NULL;
+X
+X/* Threshold for the character transfer to the CLIST buffers. */
+Xstatic uint	max_rawq_count;
+X
+X/* Counters for receiver overruns. Each UART type has its own counter
+X   indexed by the device type.
+X*/
+Xuint	fas_overrun [NUMBER_OF_TYPES];
+X
+X/* Counter for temporarily disabled modem status interrupts due
+X   to noise on the modem status lines.
+X*/
+Xuint	fas_msi_noise = 0;
+X
+X/* Lookup table for minor device number -> open mode flags translation. */
+Xstatic uint	fas_open_modes [16] =
+X{
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON | OS_CLOCAL,
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON | OS_CLOCAL | OS_HWO_HANDSHAKE
+X							| OS_HWI_HANDSHAKE,
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON | OS_CLOCAL | OS_HWO_HANDSHAKE,
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON | OS_CLOCAL | OS_HWO_HANDSHAKE
+X							| OS_HDX_HANDSHAKE,
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON,
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON | OS_HWO_HANDSHAKE
+X						| OS_HWI_HANDSHAKE,
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON | OS_HWO_HANDSHAKE,
+X	OS_OPEN_FOR_DIALOUT | OS_FAKE_CARRIER_ON | OS_HWO_HANDSHAKE
+X						| OS_HDX_HANDSHAKE,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN | OS_NO_DIALOUT,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN | OS_NO_DIALOUT | OS_HWO_HANDSHAKE
+X							| OS_HWI_HANDSHAKE,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN | OS_NO_DIALOUT | OS_HWO_HANDSHAKE,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN | OS_NO_DIALOUT | OS_HWO_HANDSHAKE
+X							| OS_HDX_HANDSHAKE,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN | OS_HWO_HANDSHAKE
+X						| OS_HWI_HANDSHAKE,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN | OS_HWO_HANDSHAKE,
+X	OS_OPEN_FOR_DIALIN | OS_WAIT_OPEN | OS_HWO_HANDSHAKE
+X						| OS_HDX_HANDSHAKE
+X};
+X
+X/* Check for the presence of the devices in the fas_port array and if
+X   the respective device is present, test and initialize it. During the
+X   initialization the device type is automatically determined and the UART
+X   is handled according to its requirements.
+X*/
+Xvoid
+Xfasinit ()
+X{
+X	register struct fas_internals	*fip REG_SI;
+X	register uint	unit REG_DI;
+X	uint	logical_units;
+X	int	max_tthiwat, max_ttlowat;
+X	long	xbuf_size, min_xbuf_size;
+X	struct fas_speed	*speed_ptr;
+X	ulong	*baud_ptr;
+X	uint	*offset_ptr;
+X	char	port_stat [MAX_UNITS + 1];
+X
+X#if defined (NEED_PUT_GETCHAR)
+X	if (fas_is_initted)
+X		return;
+X
+X	fas_is_initted = TRUE;
+X#endif
+X
+X	{
+X	    register uint	baud_rate REG_BX;
+X
+X#if defined (FIX_TTHILOWAT)
+X	    /* kludge to make sure that the tty buffer high water levels
+X	       for fast baud rates are high enough to ensure max. throughput
+X	    */
+X	    for (baud_rate = B0 + 1, max_tthiwat = 0; baud_rate <= CBAUD;
+X								++baud_rate)
+X	    {
+X		if (tthiwat [baud_rate] >= max_tthiwat)
+X		{
+X			max_tthiwat = tthiwat [baud_rate];
+X			max_ttlowat = ttlowat [baud_rate];
+X		}
+X		else
+X		{
+X			tthiwat [baud_rate] = max_tthiwat;
+X			ttlowat [baud_rate] = max_ttlowat;
+X		}
+X	    }
+X#endif
+X
+X	    /* calculate baud rate related values */
+X	    for (unit = 0; unit < fas_baud_tables; ++unit)
+X	    {
+X		baud_ptr = fas_baud_ptr [unit] = fas_baud [unit];
+X		speed_ptr = fas_speed_ptr [unit] = fas_speed [unit];
+X		if (baud_ptr [B0])
+X			speed_ptr [B0].i.valid = TRUE;
+X		else
+X		{
+X			speed_ptr [B0].i.valid = FALSE;
+X			continue;
+X		}
+X		for (baud_rate = B0 + 1; baud_rate <= CBAUD; ++baud_rate)
+X		{
+X			if (!baud_ptr [baud_rate])
+X			{
+X				speed_ptr [B0].i.valid = FALSE;
+X				break;
+X			}
+X
+X			speed_ptr [baud_rate].i.ctime
+X				= ((HZ) * 150L + (baud_ptr [baud_rate] / 2L))
+X					/ baud_ptr [baud_rate];
+X			if (speed_ptr [baud_rate].i.ctime < 2)
+X				speed_ptr [baud_rate].i.ctime = 2;
+X			/* ideal xbuf size */
+X			xbuf_size = (baud_ptr [baud_rate] + 25L) / 50L
+X					- tthiwat [baud_rate];
+X			/* lower boundary to prevent bottle-neck */
+X			min_xbuf_size = (baud_ptr [baud_rate] * (EVENT_TIME)
+X						+ 25000L) / 50000L;
+X			if (xbuf_size < min_xbuf_size)
+X				xbuf_size = min_xbuf_size;
+X			if (xbuf_size < MAX_OUTPUT_FIFO_SIZE * 2L)
+X				xbuf_size = MAX_OUTPUT_FIFO_SIZE * 2L;
+X			speed_ptr [baud_rate].xbuf_size
+X				= (xbuf_size > (long) XMIT_BUFF_SIZE)
+X					? (long) XMIT_BUFF_SIZE
+X					: xbuf_size;
+X			speed_ptr [baud_rate].div.val
+X				= (baud_ptr [B0] + (baud_ptr [baud_rate] / 2L))
+X					/ baud_ptr [baud_rate];
+X			if (!speed_ptr [baud_rate].div.val)
+X				speed_ptr [baud_rate].div.val = 1;
+X		}
+X	    }
+X	}
+X
+X	/* initialize threshold for the character transfer to
+X	   the CLIST buffers
+X	*/
+X#if defined (TUNABLE_TTYHOG)
+X	max_rawq_count = ttyhog;
+X#else
+X	max_rawq_count = TTYHOG;
+X#endif
+X
+X	/* execute the init sequence for the serial cards */
+X	{
+X	    register uint	*seq_ptr REG_BX;
+X
+X	    for (seq_ptr = &fas_init_seq [0]; *seq_ptr; seq_ptr += 2)
+X	    {
+X		if (*(seq_ptr + 1) & READ_PORT)
+X			(void) INB (*seq_ptr);
+X		else
+X			(void) OUTB (*seq_ptr, *(seq_ptr + 1));
+X	    }
+X	}
+X
+X	/* set overrun counters to zero */
+X	for (unit = 0; unit < NUMBER_OF_TYPES; ++unit)
+X		fas_overrun [unit] = 0;
+X
+X	/* setup the list of pointers to the tty structures */
+X	for (unit = 0, logical_units = fas_physical_units * 2;
+X			unit < logical_units; ++unit)
+X		fas_mem_zero ((unchar *) (fas_tty_ptr [unit] = &fas_tty [unit]),
+X				sizeof fas_tty [0]);
+X
+X	/* setup and initialize all serial ports */
+X	for (unit = 0; unit < fas_physical_units; ++unit)
+X	{
+X		fas_internals_ptr [unit] = fip = &fas_internals [unit];
+X		fas_mem_zero ((unchar *) fip, (unchar *) &fip->recv_buffer [0]
+X						- (unchar *) fip);
+X		port_stat [unit] = '-';
+X		if (fas_port [unit])
+X		{
+X			if (fas_bt_select [unit] >= fas_baud_tables)
+X			{
+X				port_stat [unit] = '!';
+X				continue;	/* a configuration error */
+X			}
+X			BT_SELECT = fas_bt_select [unit];
+X
+X			if (!fas_speed_ptr [BT_SELECT] [B0].i.valid)
+X			{
+X				port_stat [unit] = '!';
+X				continue;	/* a configuration error */
+X			}
+X
+X			/* init all of its ports */
+X			if (fas_ctl_port [unit])
+X			{
+X				CTL_PORT.p.addr = fas_ctl_port [unit];
+X
+X				if (fas_ctl_val [unit] & 0xff00)
+X					fip->device_flags |= DF_CTL_EVERY;
+X				else
+X					fip->device_flags |= DF_CTL_FIRST;
+X			}
+X
+X			if (fas_pl_select [unit] >= fas_port_layouts)
+X			{
+X				port_stat [unit] = '!';
+X				continue;	/* a configuration error */
+X			}
+X
+X			{
+X			    register uint	regno REG_BX;
+X
+X			    offset_ptr = fas_layout [fas_pl_select [unit]];
+X
+X			    for (regno = 0; regno < NUM_UART_REGS; ++regno)
+X			    {
+X				fip->port [regno].p.addr
+X					= (fip->device_flags & DF_CTL_EVERY)
+X						? fas_port [unit]
+X						: fas_port [unit]
+X							+ offset_ptr [regno];
+X				fip->port [regno].p.ctl
+X					= fas_make_ctl_val (fip, unit,
+X							offset_ptr [regno]);
+X			    }
+X			}
+X
+X			fip->modem.l = fas_modem [unit];
+X			fip->flow.l = fas_flow [unit];
+X			fip->po_state = fip->o_state = OS_DEVICE_CLOSED;
+X
+X			/* mask off invalid bits */
+X			fip->modem.m.di &= MC_ANY_CONTROL;
+X			fip->modem.m.eo &= MC_ANY_CONTROL;
+X			fip->modem.m.ei &= MC_ANY_CONTROL;
+X			fip->modem.m.ca &= MS_ANY_PRESENT;
+X			fip->flow.m.ic &= MC_ANY_CONTROL;
+X			fip->flow.m.oc &= MS_ANY_PRESENT;
+X			fip->flow.m.oe &= MS_ANY_PRESENT;
+X			fip->flow.m.hc &= MC_ANY_CONTROL;
+X
+X			fip->recv_ring_put_ptr = fip->recv_ring_take_ptr
+X						= &fip->recv_buffer [0];
+X			fip->xmit_ring_put_ptr = fip->xmit_ring_take_ptr
+X						= &fip->xmit_buffer [0];
+X
+X			/* disable all ints */
+X			FAS_FIRST_OUTB (fip, INT_ENABLE_PORT, IER = IE_NONE);
+X
+X			/* is there a serial chip ? */
+X			if (FAS_SAME_INB (fip, INT_ENABLE_PORT) != IER)
+X			{
+X				port_stat [unit] = '?';
+X				continue;	/* a hardware error */
+X			}
+X
+X			/* test the chip thoroughly */
+X			if (!(fas_modify [unit] & NO_TEST)
+X				&& (port_stat [unit]
+X						= (fas_test_device (fip) + '0'))
+X					!= '0')
+X				continue;	/* a hardware error */
+X
+X			FAS_OUTB (fip, LINE_CTL_PORT, LCR = 0);
+X			FAS_OUTB (fip, MDM_CTL_PORT, MCR
+X					= fas_mcb [unit] | fip->modem.m.di);
+X
+X			DEVICE_TYPE = TYPE_NS16450;
+X			fip->xmit_fifo_size = 1;
+X			port_stat [unit] = '*';
+X
+X			/* let's see if it's an NS16550A */
+X			FAS_OUTB (fip, NS_FIFO_CTL_PORT, NS_FIFO_INIT_CMD);
+X			if (!(~FAS_INB (fip, INT_ID_PORT) & II_NS_FIFO_ENABLED))
+X			{
+X				DEVICE_TYPE = TYPE_NS16550A;
+X				fip->xmit_fifo_size = OUTPUT_NS_FIFO_SIZE;
+X				port_stat [unit] = 'F';
+X				FAS_OUTB (fip, NS_FIFO_CTL_PORT, NS_FIFO_CLEAR_CMD);
+X			}
+X			else
+X			{
+X				FAS_OUTB (fip, NS_FIFO_CTL_PORT, NS_FIFO_CLEAR_CMD);
+X				/* or is it an i82510 ? */
+X				FAS_OUTB (fip, I_BANK_PORT, I_BANK_2);
+X				if (!(~FAS_INB (fip, I_BANK_PORT) & I_BANK_2))
+X				{
+X					DEVICE_TYPE = TYPE_I82510;
+X					fip->xmit_fifo_size = OUTPUT_I_FIFO_SIZE;
+X					port_stat [unit] = 'f';
+X					FAS_OUTB (fip, I_BANK_PORT, I_BANK_1);
+X					FAS_OUTB (fip, I_TCM_PORT, I_FIFO_CLR_XMIT);
+X					FAS_OUTB (fip, I_RCM_PORT, I_FIFO_CLR_RECV);
+X				}
+X				FAS_OUTB (fip, I_BANK_PORT, I_BANK_0);
+X			}
+X
+X			/* select FIFO mode */
+X			if (DEVICE_TYPE != TYPE_NS16450)
+X			{
+X				if (fas_fifo_ctl [unit] == FIFO_DEFAULT)
+X				{
+X					if (DEVICE_TYPE == TYPE_NS16550A)
+X					{
+X#if defined (LOW_INT_LAT)
+X						FCR = NS_FIFO_SIZE_8
+X							    | NS_FIFO_ENABLE;
+X#else
+X						FCR = NS_FIFO_SIZE_4
+X							    | NS_FIFO_ENABLE;
+X#endif
+X					}
+X				}
+X				else if (fas_fifo_ctl [unit]
+X						== FIFO_EMUL_NS16450)
+X				{
+X					fip->xmit_fifo_size = 1;
+X					if (DEVICE_TYPE == TYPE_NS16550A)
+X					{
+X						FCR = NS_FIFO_SIZE_1
+X							    | NS_FIFO_ENABLE;
+X					}
+X				}
+X				else if (fas_fifo_ctl [unit] == FIFO_OFF
+X					   || DEVICE_TYPE != TYPE_NS16550A)
+X				{
+X					DEVICE_TYPE = TYPE_NS16450;
+X					fip->xmit_fifo_size = 1;
+X					port_stat [unit] = '+';
+X				}
+X				else switch (fas_fifo_ctl [unit])
+X				{
+X					case FIFO_POINTER_DEV:
+X					case FIFO_TRIGGER_1:
+X						FCR = NS_FIFO_SIZE_1
+X							    | NS_FIFO_ENABLE;
+X						break;
+X					case FIFO_TRIGGER_4:
+X						FCR = NS_FIFO_SIZE_4
+X							    | NS_FIFO_ENABLE;
+X						break;
+X					case FIFO_TRIGGER_8:
+X						FCR = NS_FIFO_SIZE_8
+X							    | NS_FIFO_ENABLE;
+X						break;
+X					case FIFO_TRIGGER_14:
+X						FCR = NS_FIFO_SIZE_14
+X							    | NS_FIFO_ENABLE;
+X						break;
+X					default:
+X						DEVICE_TYPE = TYPE_NS16450;
+X						fip->xmit_fifo_size = 1;
+X						port_stat [unit] = '+';
+X						break;
+X				}
+X			}
+X
+X			/* clear potential interrupts */
+X			(void) FAS_INB (fip, MDM_STATUS_PORT);
+X			(void) FAS_INB (fip, RCV_DATA_PORT);
+X			if (FAS_INB (fip, LINE_STATUS_PORT) & LS_RCV_AVAIL)
+X				(void) FAS_INB (fip, RCV_DATA_PORT);
+X			(void) FAS_INB (fip, INT_ID_PORT);
+X
+X			/* do we want the fdx meaning of CTSFLOW/RTSFLOW ? */
+X			if (fas_modify [unit] & NEW_CTSRTS)
+X				fip->flow_flags |= FF_NEW_CTSRTS;
+X
+X			/* do we want hangup protection ? */
+X			if (!(fas_modify [unit] & NO_HUP_PROTECT))
+X				fip->device_flags |= DF_HUP_PROTECT;
+X
+X			/* is the device overrun protected ? */
+X			if (fas_modify [unit] & NO_OVERRUN)
+X				fip->device_flags |= DF_NO_OVERRUN;
+X
+X			/* show that it is present and configured */
+X			fip->device_flags |= DF_DEVICE_CONFIGURED;
+X		}
+X	}
+X
+X	/* execute the interrupt acknowledge sequence for the serial cards */
+X	{
+X	    register uint	*seq_ptr REG_BX;
+X
+X	    for (seq_ptr = &fas_int_ack_seq [0]; *seq_ptr; seq_ptr += 2)
+X	    {
+X		if (*(seq_ptr + 1) & READ_PORT)
+X			(void) INB (*seq_ptr);
+X		else
+X			(void) OUTB (*seq_ptr, *(seq_ptr + 1));
+X	    }
+X	}
+X
+X#if defined (NEED_PUT_GETCHAR)
+X	fip = &fas_internals [0];
+X	MCR &= ~fip->modem.m.di;
+X	FAS_FIRST_OUTB (fip, MDM_CTL_PORT, MCR |= INITIAL_MDM_CONTROL);
+X
+X	LCR = INITIAL_LINE_CONTROL;
+X	FAS_OUTB (fip, LINE_CTL_PORT, LCR | LC_ENABLE_DIVISOR);
+X	FAS_OUTB (fip, DIVISOR_LSB_PORT, fas_speed_ptr [BT_SELECT]
+X							[INITIAL_BAUD_RATE]
+X							.div.b.low);
+X	FAS_OUTB (fip, DIVISOR_MSB_PORT, fas_speed_ptr [BT_SELECT]
+X							[INITIAL_BAUD_RATE]
+X							.div.b.high);
+X	FAS_OUTB (fip, LINE_CTL_PORT, LCR);
+X#endif
+X
+X#if defined (SCO) || defined (XENIX)
+X	for (unit = 0; unit < fas_physical_units; ++unit)
+X		(void) printcfg ("fas", fas_port [unit], 7,
+X					fas_vec [unit], -1,
+X					"unit=%d type=%c release=2.11.0",
+X					unit, port_stat [unit]);
+X#else
+X	port_stat [unit] = '\0';
+X	(void) printf ("\nFAS 2.11.0 async driver: Unit 0-%d init state is [%s]\n\n",
+X			unit - 1,
+X			port_stat);
+X#endif
+X}
+X
+X/* Open a tty line. This function is called for every open, as opposed
+X   to the fasclose function which is called only with the last close.
+X   (called at SPL0)
+X*/
+Xvoid
+Xfasopen (dev, flag, otyp)
+Xdev_t	dev;
+Xint	flag;
+Xint	otyp;
+X{
+X	register struct fas_internals	*fip REG_SI;
+X	register struct tty	*ttyp REG_DI;
+X	register uint	open_mode REG_BX;
+X	uint	unit;
+X	bool	have_lock;
+X	int	old_level;
+X
+X	/* check for valid port number */
+X	if ((unit = GET_UNIT (dev)) >= fas_physical_units)
+X	{
+X		u.u_error = ENXIO;
+X		return;
+X	}
+X
+X	fip = fas_internals_ptr [unit];
+X
+X	/* was the port present at init time ? */
+X	if (!(fip->device_flags & DF_DEVICE_CONFIGURED))
+X	{
+X		u.u_error = ENXIO;
+X		return;
+X	}
+X
+X	open_mode = GET_OPEN_MODE (dev);
+X	have_lock = FALSE;
+X	old_level = SPLINT ();
+X
+X	/* loop until we've got the device lock and, owning the lock, we've
+X	   checked whether the current open mode permits us to open the
+X	   device
+X	*/
+X	for (;;)
+X	{
+X		/* If this is a dialin open, but the device is already
+X		   open for dialout and the FNDELAY flag is not set,
+X		   wait until the device is closed.
+X		*/
+X		if ((open_mode & OS_OPEN_FOR_DIALIN)
+X				&& (fip->o_state & OS_OPEN_FOR_DIALOUT)
+X#if defined (FNONBLOCK)
+X				&& !(flag & (FNDELAY | FNONBLOCK)))
+X#else
+X				&& !(flag & FNDELAY))
+X#endif
+X		{
+X			if (have_lock)
+X			{
+X				RELEASE_DEVICE_LOCK (fip);
+X				have_lock = FALSE;
+X			}
+X			do
+X			{
+X				(void) sleep ((caddr_t) &fip->o_state, TTIPRI);
+X			} while (fip->o_state & OS_OPEN_FOR_DIALOUT);
+X		}
+X		
+X		/* If the device is already open and another open uses a
+X		   different open mode or if a dialin process waits for
+X		   carrier and doesn't allow parallel dialout opens, return
+X		   with EBUSY error.
+X		*/
+X		if ((fip->o_state & ((open_mode & OS_OPEN_FOR_DIALIN)
+X					? (OS_OPEN_STATES | OS_WAIT_OPEN)
+X					: (OS_OPEN_STATES | OS_NO_DIALOUT)))
+X			&& ((flag & FEXCL)
+X				|| ((open_mode ^ fip->o_state) & (u.u_uid
+X							? OS_TEST_MASK
+X							: OS_SU_TEST_MASK))))
+X		{
+X			if (have_lock)
+X				RELEASE_DEVICE_LOCK (fip);
+X			(void) splx (old_level);
+X			u.u_error = EBUSY;
+X			return;
+X		}
+X
+X		/* If device is already open and the FAPPEND flag is set,
+X		   flush the output buffers. This may be used to release
+X		   processes that got stuck in fasclose () during an
+X		   exit () call.
+X		*/
+X		if ((fip->o_state & OS_OPEN_STATES) && (flag & FAPPEND))
+X		{
+X			flag &= ~FAPPEND;	/* flush only once */
+X			(void) SPLWRK ();
+X			(void) ttyflush (fip->tty, FWRITE);
+X			(void) SPLINT ();
+X		}
+X
+X		/* if we don't have the device lock, yet, try to get it */
+X		if (!have_lock)
+X		{
+X			if (fip->device_flags & DF_DEVICE_LOCKED)
+X			{
+X				GET_DEVICE_LOCK (fip, TTIPRI);
+X				have_lock = TRUE;
+X				/* we had to sleep for some time to get the
+X				   lock, therefore, re-check whether the
+X				   current open mode still permits us to
+X				   open the device
+X				*/
+X				continue;
+X			}
+X			else
+X				GET_DEVICE_LOCK (fip, TTIPRI);
+X		}
+X
+X		break;
+X	}
+X
+X	/* disable subsequent opens */
+X	if (flag & FEXCL)
+X		open_mode |= OS_EXCLUSIVE_OPEN_1;
+X
+X	/* set up pointer to tty structure */
+X	ttyp = (open_mode & OS_OPEN_FOR_DIALIN)
+X		? fas_tty_ptr [unit + fas_physical_units]
+X		: fas_tty_ptr [unit];
+X
+X	/* things to do on first open only */
+X	if (!(fip->o_state & ((open_mode & OS_OPEN_FOR_DIALIN)
+X				? (OS_OPEN_STATES | OS_WAIT_OPEN)
+X				: OS_OPEN_STATES)))
+X	{
+X		/* close dialin device before opening dialout device */
+X		if (fip->o_state & OS_WAIT_OPEN)
+X		{
+X			fip->flow_flags &= ~(FF_CD_ENABLED | FF_CARRIER_ON);
+X			fip->tty->t_state &= ~CARR_ON;
+X			/* disable receiver data interrupts */
+X			if (fip->device_flags & DF_RDI_ENABLED)
+X			{
+X				FAS_FIRST_OUTB (fip, INT_ENABLE_PORT,
+X						IER &= ~IE_RECV_DATA_AVAILABLE);
+X				fip->device_flags &= ~DF_RDI_ENABLED;
+X			}
+X			/* re-link fas_internals structure */
+X			fas_pos_by_speed (fip);
+X			/* block transmitter */
+X			fip->device_flags |= DF_XMIT_LOCKED;
+X			(void) SPLWRK ();
+X			(void) ttyflush (fip->tty, FREAD | FWRITE);
+X			(void) SPLINT ();
+X			fas_close_device (fip);
+X		}
+X
+X		/* init data structures */
+X		fip->tty = ttyp;
+X		(void) ttinit (ttyp);
+X		ttyp->t_proc = (int (*)()) fasproc;
+X		fip->po_state = fip->o_state;
+X		fip->o_state = open_mode & ~OS_OPEN_STATES;
+X		fas_open_device (fip);		/* open physical device */
+X
+X		/* allow pending tty interrupts */
+X		(void) SPLWRK ();
+X		(void) SPLINT ();
+X	}
+X
+X	/* If dialin open and the FNDELAY flag is not set,
+X	   block and wait for carrier if device not yet open.
+X	*/
+X	if ((open_mode & OS_OPEN_FOR_DIALIN)
+X#if defined (FNONBLOCK)
+X			&& !(flag & (FNDELAY | FNONBLOCK)))
+X#else
+X			&& !(flag & FNDELAY))
+X#endif
+X	{
+X		/* sleep while open for dialout or no carrier */
+X		while ((fip->o_state & OS_OPEN_FOR_DIALOUT)
+X			|| (!(fip->flow_flags & FF_CARRIER_ON)
+X				&& !(fip->o_state & OS_OPEN_FOR_DIALIN)))
+X		{
+X			ttyp->t_state |= WOPEN;
+X			RELEASE_DEVICE_LOCK (fip);
+X			(void) sleep ((caddr_t) &ttyp->t_canq, TTIPRI);
+X			GET_DEVICE_LOCK (fip, TTIPRI);
+X			ttyp->t_state &= ~WOPEN;
+X		}
+X	}
+X
+X	/* we can't have concurrent ISOPEN and WOPEN states, so
+X	   wake up waiting dialin processes as we are about to set
+X	   the ISOPEN flag
+X	*/
+X	if (ttyp->t_state & WOPEN)
+X		(void) wakeup ((caddr_t) &ttyp->t_canq);
+X
+X	(void) (*linesw [(unchar) ttyp->t_line].l_open) (ttyp);
+X
+X	/* set open type flags */
+X	fip->o_state = open_mode;
+X
+X	RELEASE_DEVICE_LOCK (fip);
+X	(void) splx (old_level);
+X}
+X
+X/* Close a tty line. This is only called if there is no other
+X   concurrent open left. A blocked dialin open is not counted as
+X   a concurrent open because in this state it isn't really open.
+X   (called at SPL0)
+X*/
+Xvoid
+Xfasclose (dev, flag, otyp)
+Xdev_t	dev;
+Xint	flag;
+Xint	otyp;
+X{
+X	register struct fas_internals	*fip REG_SI;
+X	register struct tty	*ttyp REG_DI;
+X	register uint	open_mode REG_BX;
+X	uint	unit;
+X	bool	was_signal = FALSE;
+X	bool	ignore_signal = FALSE;
+X	int	old_level;
+X
+X	fip = fas_internals_ptr [unit = GET_UNIT (dev)];
+X
+X	/* set up pointer to tty structure */
+X	ttyp = ((open_mode = GET_OPEN_MODE (dev)) & OS_OPEN_FOR_DIALIN)
+X		? fas_tty_ptr [unit + fas_physical_units]
+X		: fas_tty_ptr [unit];
+X	
+X	old_level = SPLINT ();
+X	GET_DEVICE_LOCK (fip, PZERO - 1);
+X
+X	if ((fip->o_state == OS_DEVICE_CLOSED)
+X			|| ((open_mode & OS_OPEN_FOR_DIALIN)
+X				? (fip->o_state & OS_OPEN_FOR_DIALOUT)
+X					&& (fip->po_state == OS_DEVICE_CLOSED)
+X				: fip->o_state & OS_WAIT_OPEN))
+X	{
+X		/* device is not open on the driver level */
+X		RELEASE_DEVICE_LOCK (fip);
+X		(void) splx (old_level);
+X		return;
+X	}
+X
+X	if (!((open_mode & OS_OPEN_FOR_DIALIN)
+X				&& (fip->o_state & OS_OPEN_FOR_DIALOUT)))
+X	{
+X		/* wait for buffer drain and catch interrupts */
+X		while ((fip->flow_flags & FF_CARRIER_ON)
+X				&& ((fip->flow_flags & FF_OUTPUT_BUSY)
+X					|| ttyp->t_outq.c_cc
+X					|| (ttyp->t_state & TIMEOUT)))
+X		{
+X			/* if FNDELAY/FNONBLOCK is set, flush output buffers */
+X#if defined (FNONBLOCK)
+X			if (flag & (FNDELAY | FNONBLOCK))
+X			{
+X				flag &= ~(FNDELAY | FNONBLOCK);
+X#else
+X			if (flag & FNDELAY)
+X			{
+X				flag &= ~FNDELAY;
+X#endif
+X				ignore_signal = TRUE;
+X				(void) SPLWRK ();
+X				(void) ttyflush (ttyp, FWRITE);
+X				(void) SPLINT ();
+X				continue;
+X			}
+X			/* on receipt of a signal, flush output buffers */
+X			ttyp->t_state |= TTIOW;
+X			if (sleep ((caddr_t) &ttyp->t_oflag,
+X						ignore_signal
+X							? PZERO - 1
+X							: TTOPRI | PCATCH))
+X			{
+X				/* caught signal */
+X				was_signal = TRUE;
+X				ignore_signal = TRUE;
+X				ttyp->t_state &= ~TTIOW;
+X				(void) SPLWRK ();
+X				(void) ttyflush (ttyp, FWRITE);
+X				(void) SPLINT ();
+X			}
+X		}
+X
+X		/* block transmitter and wait until it is
+X		   empty
+X		*/
+X		fip->device_flags |= DF_XMIT_LOCKED;
+X		while (fip->device_flags & (DF_XMIT_BUSY
+X						| DF_XMIT_BREAK
+X						| DF_GUARD_TIMEOUT))
+X			(void) sleep ((caddr_t) &fip->device_flags,
+X								PZERO - 1);
+X
+X		fip->flow_flags &= ~(FF_CD_ENABLED | FF_CARRIER_ON);
+X		ttyp->t_state &= ~(WOPEN | CARR_ON);
+X		/* disable receiver data interrupts */
+X		if (fip->device_flags & DF_RDI_ENABLED)
+X		{
+X			FAS_FIRST_OUTB (fip, INT_ENABLE_PORT,
+X					IER &= ~IE_RECV_DATA_AVAILABLE);
+X			fip->device_flags &= ~DF_RDI_ENABLED;
+X		}
+X		/* re-link fas_internals structure */
+X		fas_pos_by_speed (fip);
+X		(void) SPLWRK ();
+X		(void) ttyflush (ttyp, FREAD | FWRITE);
+X		(void) SPLINT ();
+X	}
+X	else
+X	{
+X		fip->flow_flags &= ~(FF_CD_ENABLED | FF_CARRIER_ON);
+X		ttyp->t_state &= ~(WOPEN | CARR_ON);
+X	}
+X
+X	(void) (*linesw [(unchar) ttyp->t_line].l_close) (ttyp);
+X
+X	if (open_mode & OS_OPEN_FOR_DIALIN)
+X	{
+X		if (!(fip->o_state & OS_OPEN_FOR_DIALOUT))
+X		{
+X			fas_close_device (fip);
+X			fip->o_state = OS_DEVICE_CLOSED;
+X			if (fip->cflag & HUPCL)
+X			{
+X				/* request hangup */
+X				fip->device_flags |= DF_DO_HANGUP;
+X				(void) timeout (fas_hangup, (caddr_t) fip,
+X						(HANGUP_DELAY) * (HZ) / 1000);
+X			}
+X		}
+X		else	/* a parallel dialout open is active */
+X			fip->po_state = OS_DEVICE_CLOSED;
+X	}
+X	else
+X	{
+X		fas_close_device (fip);
+X		fip->o_state = OS_DEVICE_CLOSED;
+X		if (fip->cflag & HUPCL)
+X		{
+X			/* request hangup */
+X			fip->device_flags |= DF_DO_HANGUP;
+X			(void) timeout (fas_hangup, (caddr_t) fip,
+X						(HANGUP_DELAY) * (HZ) / 1000);
+X		}
+X		/* If there is a waiting dialin process on
+X		   this port, reopen the physical device.
+X		*/
+X		if (fip->po_state & OS_WAIT_OPEN)
+X		{
+X			/* get the dialin version of the
+X			   tty structure
+X			*/
+X			fip->tty = fas_tty_ptr [unit + fas_physical_units];
+X			fip->o_state = fip->po_state;
+X			fip->po_state = OS_DEVICE_CLOSED;
+X			if (!(fip->device_flags & DF_DO_HANGUP))
+X			{
+X				/* allow pending tty interrupts */
+X				(void) SPLWRK ();
+X				(void) SPLINT ();
+X				fas_open_device (fip);
+X			}
+X		}
+X
+X		/* wake up dialin process (if any) */
+X		(void) wakeup ((caddr_t) &fip->o_state);
+X	}
+X
+X	if (!(fip->device_flags & DF_DO_HANGUP))
+X		RELEASE_DEVICE_LOCK (fip);
+X
+X	(void) splx (old_level);
+X
+X	if (was_signal)
+X#if defined (SVR4)
+X		longjmp (&u.u_qsav);
+X#else
+X		longjmp (u.u_qsav);
+X#endif
+X}
+X
+X/* Read characters from the input buffer.
+X   (called at SPL0)
+X*/
+Xvoid
+Xfasread (dev)
+Xdev_t	dev;
+X{
+X	register struct tty	*ttyp REG_CX;
+X
+X	ttyp = fas_internals_ptr [GET_UNIT (dev)]->tty;
+X
+X	(void) (*linesw [(unchar) ttyp->t_line].l_read) (ttyp);
+X}
+X
+X/* Write characters to the output buffer.
+X   (called at SPL0)
+X*/
+Xvoid
+Xfaswrite (dev)
+Xdev_t	dev;
+X{
+X	register struct tty	*ttyp REG_CX;
+X
+X	ttyp = fas_internals_ptr [GET_UNIT (dev)]->tty;
+X
+X	(void) (*linesw [(unchar) ttyp->t_line].l_write) (ttyp);
+X}
+X
+X/* Called by the TTY subsystem (not by FAS itself !) to process various
+X   device-dependent operations.
+X   (called at SPL0)
+X*/
+Xvoid
+Xfasproc (ttyp, cmd)
+Xregister struct tty	*ttyp REG_SI;
+Xint	cmd;
+X{
+X	register struct fas_internals	*fip REG_DI;
+X	uint	unit;
+X	int	old_level;
+X
+X	fip = ((unit = ttyp - &fas_tty [0]) >= fas_physical_units)
+X		? fas_internals_ptr [unit - fas_physical_units]
+X		: fas_internals_ptr [unit];
+X
+X	old_level = SPLINT ();
+X
+X	switch (cmd)
+X	{
+X	    case T_TIME:	/* timeout */
+X		ttyp->t_state &= ~TIMEOUT;
+X		EVENT_SCHED (fip, EF_DO_XXFER);
+X		break;
+X
+X	    case T_OUTPUT:	/* output characters to the transmitter */
+X		if (fip->xmit_ring_size > fip->xmit_ring_cnt)
+X			EVENT_SCHED (fip, EF_DO_XXFER);
+X		break;
+X
+X	    case T_SUSPEND:	/* suspend character output */
+X		fip->flow_flags |= FF_SWO_STOPPED;
+X		ttyp->t_state |= TTSTOP;
+X		break;
+X
+X	    case T_RESUME:	/* restart character output */
+X		fip->flow_flags &= ~FF_SWO_STOPPED;
+X		ttyp->t_state &= ~TTSTOP;
+X		fas_xproc (fip);
+X		break;
+X
+X	    case T_BLOCK:	/* stop character input, request XOFF */
+X		ttyp->t_state |= TBLOCK;
+X		break;	/* note: we do our own XON/XOFF */
+X
+X	    case T_UNBLOCK:	/* restart character input, request XON */
+X		ttyp->t_state &= ~TBLOCK;
+X		break;	/* note: we do our own XON/XOFF */
+X
+X	    case T_RFLUSH:	/* flush input buffers and restart input */
+X		if (DEVICE_TYPE == TYPE_NS16550A)
+X			FAS_FIRST_OUTB (fip, NS_FIFO_CTL_PORT, FCR
+X						| NS_FIFO_CLR_RECV);
+X		else if (DEVICE_TYPE == TYPE_I82510)
+X		{
+X			FAS_FIRST_OUTB (fip, I_BANK_PORT, I_BANK_1);
+X			FAS_OUTB (fip, I_RCM_PORT, I_FIFO_CLR_RECV);
+X			FAS_OUTB (fip, I_BANK_PORT, I_BANK_0);
+X		}
+X		(void) FAS_FIRST_INB (fip, RCV_DATA_PORT);
+X		if (FAS_INB (fip, LINE_STATUS_PORT) & LS_RCV_AVAIL)
+X			(void) FAS_INB (fip, RCV_DATA_PORT);
+X
+X		fip->recv_ring_put_ptr = fip->recv_ring_take_ptr
+X					= &fip->recv_buffer [0];
+X		fip->recv_ring_cnt = 0;
+X		ttyp->t_state &= ~TBLOCK;
+X
+X		/* restart input */
+X		if ((fip->flow_flags & (FF_HWI_HANDSHAKE | FF_HWI_STARTED))
+X				== FF_HWI_HANDSHAKE)
+X		{
+X			FAS_OUTB (fip, MDM_CTL_PORT,
+X						MCR |= fip->flow.m.ic);
+X			fip->flow_flags |= FF_HWI_STARTED;
+X		}
+X		if ((fip->iflag & IXOFF)
+X				&& (fip->flow_flags & FF_SWI_STOPPED))
+X			fas_send_xon (fip);
+X		break;
+X
+X	    case T_WFLUSH:	/* flush output buffer and restart output */
+X		if (DEVICE_TYPE == TYPE_NS16550A)
+X			FAS_FIRST_OUTB (fip, NS_FIFO_CTL_PORT, FCR
+X						| NS_FIFO_CLR_XMIT);
+X		else if (DEVICE_TYPE == TYPE_I82510)
+X		{
+X			FAS_FIRST_OUTB (fip, I_BANK_PORT, I_BANK_1);
+X			FAS_OUTB (fip, I_TCM_PORT, I_FIFO_CLR_XMIT);
+X			FAS_OUTB (fip, I_BANK_PORT, I_BANK_0);
+X		}
+X
+X		fip->xmit_ring_put_ptr = fip->xmit_ring_take_ptr
+X					= &fip->xmit_buffer [0];
+X		fip->xmit_ring_cnt = 0;
+X
+X		ttyp->t_tbuf.c_size -= ttyp->t_tbuf.c_count;
+X		ttyp->t_tbuf.c_count = 0;
+X
+X		fip->flow_flags &= ~(FF_SWO_STOPPED | FF_SW_FC_REQ);
+X		ttyp->t_state &= ~(TTSTOP | TTXON | TTXOFF);
+X
+X		if ((fip->flow_flags & FF_OUTPUT_BUSY)
+X			&& !(fip->device_flags & (DF_XMIT_BUSY
+X							| DF_GUARD_TIMEOUT
+X							| DF_XMIT_BREAK)))
+X		{
+X			fip->flow_flags &= ~FF_OUTPUT_BUSY;
+X			ttyp->t_state &= ~BUSY;
+X			/* check half duplex output flow control */
+X			if ((fip->flow_flags & (FF_HDX_HANDSHAKE
+X							| FF_HDX_STARTED))
+X				== (FF_HDX_HANDSHAKE | FF_HDX_STARTED))
+X			{
+X				FAS_FIRST_OUTB (fip, MDM_CTL_PORT,
+X						MCR &= ~fip->flow.m.hc);
+X				fip->flow_flags &= ~FF_HDX_STARTED;
+X			}
+X			EVENT_SCHED (fip, EF_DO_XXFER);
+X		}
+X		break;
+X
+X	    case T_BREAK:	/* do a break on the transmitter line */
+X		fip->device_flags |= DF_XMIT_BREAK;
+X		fip->flow_flags |= FF_OUTPUT_BUSY;
+X		ttyp->t_state |= BUSY;
+X		/* check half duplex output flow control */
+X		if ((fip->flow_flags & (FF_HDX_HANDSHAKE | FF_HDX_STARTED))
+X			== FF_HDX_HANDSHAKE)
+X		{
+X			FAS_FIRST_OUTB (fip, MDM_CTL_PORT,
+X						MCR |= fip->flow.m.hc);
+X			fip->flow_flags |= FF_HDX_STARTED;
+X		}
+X		if (fip->device_flags & (DF_XMIT_BUSY | DF_GUARD_TIMEOUT))
+X		{
+X			fip->device_flags |= DF_DO_BREAK;
+X		}
+X		else
+X		{
+X			/* set up break request flags */
+X			FAS_FIRST_OUTB (fip, LINE_CTL_PORT,
+X						LCR |= LC_SET_BREAK_LEVEL);
+X			(void) timeout (fas_timeout, (caddr_t) fip,
+X						(BREAK_TIME) * (HZ) / 1000);
+X		}
+X		break;
+X
+X	    case T_PARM:	/* set up port according to termio structure */
+X		fas_param (fip, SOFT_INIT);
+X		break;
+X	}
+X
+X	(void) splx (old_level);
+X}
+X
+X/* Process ioctl calls.
+X   (called at SPL0)
+X*/
+Xvoid
+Xfasioctl (dev, cmd, arg, mode)
+Xdev_t	dev;
+Xint	cmd;
+Xunion ioctl_arg	arg;
+Xint	mode;
+X{
+X	register struct fas_internals	*fip REG_SI;
+X	register struct tty	*ttyp REG_DI;
+X#if defined (HAVE_VPIX)
+X	register int	v86_cmd REG_BX;
+X	int	v86_data;
+X#if defined (SCO) || defined (XENIX)
+X	struct termss	termss;
+X#endif
+X	n_unchar	vpix_status;
+X	unchar	cpbyte;
+X#endif
+X	int	old_level;
+X
+X	fip = fas_internals_ptr [GET_UNIT (dev)];
+X	ttyp = fip->tty;
+X
+X	/* process ioctl commands */
+X	switch (cmd)
+X	{
+X#if defined (HAVE_VPIX)
+X		case AIOCINTTYPE:	/* set pseudorupt type */
+X			switch (arg.iarg)
+X			{
+X				case V86VI_KBD:
+X				case V86VI_SERIAL0:
+X				case V86VI_SERIAL1:
+X					old_level = SPLINT ();
+X					fip->v86_intmask = arg.iarg;
+X					(void) splx (old_level);
+X					break;
+X
+X				default:
+X					old_level = SPLINT ();
+X					fip->v86_intmask = V86VI_SERIAL0;
+X					(void) splx (old_level);
+X					break;
+X			}
+X			break;
+X
+X		case AIOCDOSMODE:	/* enable dos mode */
+X			if (!(fip->iflag & DOSMODE))
+X			{
+X				old_level = SPLINT ();
+X				fip->v86_proc = u.u_procp->p_v86;
+X				if (!(fip->v86_intmask))
+X					fip->v86_intmask = V86VI_SERIAL0;
+X				ttyp->t_iflag |= DOSMODE;
+X				if (fip->v86_intmask != V86VI_KBD)
+X					ttyp->t_cflag |= CLOCAL;
+X				fas_param (fip, SOFT_INIT);
+X				(void) splx (old_level);
+X			}
+X			u.u_rval1 = 0;
+X			break;
+X
+X		case AIOCNONDOSMODE:	/* disable dos mode */
+X			if (fip->iflag & DOSMODE)
+X			{
+X				old_level = SPLINT ();
+X				fip->v86_proc = (v86_t *) NULL;
+X				fip->v86_intmask = 0;
+X				ttyp->t_iflag &= ~DOSMODE;
+X				if (fip->flow_flags & FF_RXFER_STOPPED)
+X				{
+X					fip->flow_flags &= ~FF_RXFER_STOPPED;
+X					/* schedule character transfer
+X					   to CLIST buffer
+X					*/
+X					if (fip->recv_ring_cnt)
+X						EVENT_SCHED (fip, EF_DO_RXFER);
+X				}
+X				LCR = 0;
+X				fas_param (fip, HARD_INIT);
+X				(void) splx (old_level);
+X			}
+X			u.u_rval1 = 0;
+X			break;
+X
+X		case AIOCSERIALOUT:	/* setup port registers for dos */
+X			if (fip->iflag & DOSMODE)
+X			{
+X				/* wait until output is done */
+X				old_level = SPLINT ();
+X				while ((fip->flow_flags & FF_OUTPUT_BUSY)
+X					|| ttyp->t_outq.c_cc
+X					|| (ttyp->t_state & TIMEOUT))
+X				{
+X					ttyp->t_state |= TTIOW;
+X					(void) sleep ((caddr_t) &ttyp->t_oflag,
+X									TTOPRI);
+X				}
+X
+X				/* block transmitter and wait until it is
+X				   empty
+X				*/
+X				fip->device_flags |= DF_XMIT_LOCKED;
+X				while (fip->device_flags & (DF_XMIT_BUSY
+X							| DF_XMIT_BREAK
+X							| DF_GUARD_TIMEOUT))
+X					(void) sleep ((caddr_t) &fip->
+X								device_flags,
+X							PZERO - 1);
+X				(void) splx (old_level);
+X
+X				/* get port write command */
+X				if (copyin (arg.cparg, &cpbyte, sizeof cpbyte)
+X						== -1)
+X				{
+X					u.u_error = EFAULT;
+X					goto restart_output;
+X				}
+X				v86_cmd = cpbyte;
+X				/* set divisor lsb requested */
+X				if (v86_cmd & SIO_MASK (SO_DIVLLSB))
+X				{
+X					if (copyin (arg.cparg + SO_DIVLLSB,
+X							&cpbyte, sizeof cpbyte)
+X						== -1)
+X					{
+X						u.u_error = EFAULT;
+X						goto restart_output;
+X					}
+X					v86_data = cpbyte;
+X					old_level = SPLINT ();
+X					FAS_FIRST_OUTB (fip, LINE_CTL_PORT, LCR
+X							| LC_ENABLE_DIVISOR);
+X					FAS_OUTB (fip, DIVISOR_LSB_PORT, v86_data);
+X					FAS_OUTB (fip, LINE_CTL_PORT, LCR);
+X					(void) splx (old_level);
+X				}
+X				/* set divisor msb requested */
+X				if (v86_cmd & SIO_MASK (SO_DIVLMSB))
+X				{
+X					if (copyin (arg.cparg + SO_DIVLMSB,
+X							&cpbyte, sizeof cpbyte)
+X						== -1)
+X					{
+X						u.u_error = EFAULT;
+X						goto restart_output;
+X					}
+X					v86_data = cpbyte;
+X					old_level = SPLINT ();
+X					FAS_FIRST_OUTB (fip, LINE_CTL_PORT, LCR
+X							| LC_ENABLE_DIVISOR);
+X					FAS_OUTB (fip, DIVISOR_MSB_PORT, v86_data);
+X					FAS_OUTB (fip, LINE_CTL_PORT, LCR);
+X					(void) splx (old_level);
+X				}
+X				/* set lcr requested */
+X				if (v86_cmd & SIO_MASK (SO_LCR))
+X				{
+X					if (copyin (arg.cparg + SO_LCR,
+X							&cpbyte, sizeof cpbyte)
+X						== -1)
+X					{
+X						u.u_error = EFAULT;
+X						goto restart_output;
+X					}
+X					v86_data = cpbyte;
+X					old_level = SPLINT ();
+X					FAS_FIRST_OUTB (fip, LINE_CTL_PORT,
+X							LCR = v86_data
+X							  & ~LC_ENABLE_DIVISOR);
+X					(void) splx (old_level);
+X				}
+X				/* set mcr requested */
+X				if (v86_cmd & SIO_MASK (SO_MCR))
+X				{
+X					if (copyin (arg.cparg + SO_MCR,
+X							&cpbyte, sizeof cpbyte)
+X						== -1)
+X					{
+X						u.u_error = EFAULT;
+X						goto restart_output;
+X					}
+X					v86_data = cpbyte;
+X					old_level = SPLINT ();
+X					/* virtual dtr processing */
+X					if ((v86_data & MC_SET_DTR)
+X						&& (fip->flow_flags
+X							& FF_CD_ENABLED))
+X					{
+X						MCR |= (fip->o_state
+X								& OS_WAIT_OPEN)
+X							? fip->modem.m.ei
+X							: fip->modem.m.eo;
+X					}
+X					else
+X					{
+X						MCR &= (fip->o_state
+X								& OS_WAIT_OPEN)
+X							? ~fip->modem.m.ei
+X							: ~fip->modem.m.eo;
+X					}
+X					/* virtual rts processing */
+X					if (fip->flow_flags
+X							& FF_HWI_HANDSHAKE)
+X					{
+X					  if (v86_data & MC_SET_RTS)
+X					  {
+X						if (fip->flow_flags
+X							& FF_RXFER_STOPPED)
+X						{
+X						  fip->flow_flags
+X							&= ~FF_RXFER_STOPPED;
+X						  /* schedule character transfer
+X						     to CLIST buffer
+X						  */
+X						  if (fip->recv_ring_cnt)
+X							EVENT_SCHED (fip,
+X								EF_DO_RXFER);
+X						}
+X					  }
+X					  else
+X						fip->flow_flags
+X							|= FF_RXFER_STOPPED;
+X					}
+X					else if (!(fip->flow_flags
+X							& FF_HDX_HANDSHAKE))
+X					{
+X						if (v86_data & MC_SET_RTS)
+X							MCR |= fip->flow.m.hc;
+X						else
+X							MCR &= ~fip->flow.m.hc;
+X					}
+X					FAS_FIRST_OUTB (fip, MDM_CTL_PORT, MCR);
+X					(void) splx (old_level);
+X				}
+X
+Xrestart_output:
+X				old_level = SPLINT ();
+X				/* enable transmitter and restart output */
+X				fip->device_flags &= ~DF_XMIT_LOCKED;
+X				fas_xproc (fip);
+X				(void) splx (old_level);
+X			}
+X			break;
+X
+X		case AIOCSERIALIN:	/* read port registers for dos */
+X			if (fip->iflag & DOSMODE)
+X			{
+X				if (copyin (arg.cparg, &cpbyte, sizeof cpbyte)
+X					== -1)
+X				{
+X					u.u_error = EFAULT;
+X					break;
+X				}
+X				v86_cmd = cpbyte;
+X				if (v86_cmd & SIO_MASK (SI_MSR))
+X				{
+X					vpix_status = MSR & MS_ANY_PRESENT;
+X					if (fip->flow_flags
+X						& FF_HWO_HANDSHAKE)
+X					    vpix_status |= fip->flow.m.oc
+X							    | fip->flow.m.oe;
+X					if (!(fip->cflag & CLOCAL))
+X					    vpix_status |= fip->modem.m.ca;
+X					cpbyte = vpix_status;
+X					if (copyout (&cpbyte,
+X							arg.cparg + SI_MSR,
+X							sizeof cpbyte)
+X						== -1)
+X					{
+X						u.u_error = EFAULT;
+X						break;
+X					}
+X				}
+X			}
+X			break;
+X
+X		case AIOCSETSS:	/* set start/stop characters */
+X#if defined (SCO) || defined (XENIX)
+X			/* SCO UNIX and Xenix pass a pointer to struct termss */
+X			if (copyin (arg.cparg, &termss, sizeof termss)
+X					== -1)
+X			{
+X				u.u_error = EFAULT;
+X				break;
+X			}
+X#define GET_TERMSS(member)	(termss.member)
+X#else
+X			/* The rest of the world passes struct termss */
+X#define GET_TERMSS(member)	(((struct termss *) &arg.iarg)->member)
+X#endif
+X			old_level = SPLINT ();
+X			fip->start_char = GET_TERMSS (ss_start);
+X			fip->stop_char = GET_TERMSS (ss_stop);
+X			(void) splx (old_level);
+X			break;
+X
+X		case AIOCINFO:	/* show what type of device we are */
+X			u.u_rval1 = ('a' << 8) | GET_UNIT (dev);
+X			break;
+X#endif
+X#if defined (RTS_TOG)
+X		case RTS_TOG:	/* set hardware handshake output */
+X			if (arg.iarg == 0)
+X			{
+X			    /* low level */
+X			    old_level = SPLINT ();
+X			    /* set hardware handshake output only if unused
+X			       otherwise
+X			    */
+X			    if (!(fip->flow_flags & (FF_HWI_HANDSHAKE
+X							| FF_HDX_HANDSHAKE
+X							| FF_DEF_HHO_LOW))
+X#if defined (HAVE_VPIX)
+X					&& !(fip->iflag & DOSMODE)
+X#endif
+X					)
+X			    {
+X				/* block transmitter and wait until it is
+X				   empty
+X				*/
+X				fip->device_flags |= DF_XMIT_LOCKED;
+X				while (fip->device_flags & (DF_XMIT_BUSY
+X							| DF_XMIT_BREAK
+X							| DF_GUARD_TIMEOUT))
+X					(void) sleep ((caddr_t) &fip->
+X								device_flags,
+X							PZERO - 1);
+X	    			/* suspend character output */
+X				fip->flow_flags |= FF_SWO_STOPPED;
+X				ttyp->t_state |= TTSTOP;
+X				FAS_FIRST_OUTB (fip, MDM_CTL_PORT,
+X						MCR &= ~fip->flow.m.hc);
+X				/* enable transmitter and restart output */
+X				fip->device_flags &= ~DF_XMIT_LOCKED;
+X				fas_xproc (fip);
+X			    }
+X			    fip->flow_flags |= FF_DEF_HHO_LOW;
+X			    (void) splx (old_level);
+X			}
+X			else if (arg.iarg == 1)
+X			{
+X			    /* high level */
+X			    old_level = SPLINT ();
+X			    /* set hardware handshake output only if unused
+X			       otherwise
+X			    */
+X			    if ((fip->flow_flags & (FF_HWI_HANDSHAKE
+X							| FF_HDX_HANDSHAKE
+X							| FF_DEF_HHO_LOW))
+X					== FF_DEF_HHO_LOW
+X#if defined (HAVE_VPIX)
+X					&& !(fip->iflag & DOSMODE)
+X#endif
+X					)
+X			    {
+X	    			/* restart character output */
+X				fip->flow_flags &= ~FF_SWO_STOPPED;
+X				ttyp->t_state &= ~TTSTOP;
+X				FAS_FIRST_OUTB (fip, MDM_CTL_PORT,
+X						MCR |= fip->flow.m.hc);
+X				fas_xproc (fip);
+X			    }
+X			    fip->flow_flags &= ~FF_DEF_HHO_LOW;
+X			    (void) splx (old_level);
+X			}
+X			break;
+X#endif
+X		default:	/* default ioctl processing */
+X			/* If it is a TCSETA* command, call fas_param ().
+X			   There is a bug in ttiocom with TCSELE. It
+X			   always tells the tty driver to reprogram the
+X			   port. This will cause lost input characters.
+X			   So we don't do it. SCO UNIX and Xenix use
+X			   IOC_SELECT instead of TCSELE!
+X			*/
+X			old_level = SPLWRK ();
+X#if defined (TCSELE)
+X			if (ttiocom (ttyp, cmd, arg, mode) && cmd != TCSELE)
+X#else
+X#if defined (IOC_SELECT)
+X			if (ttiocom (ttyp, cmd, arg, mode)
+X						&& cmd != IOC_SELECT)
+X#else
+X			if (ttiocom (ttyp, cmd, arg, mode))
+X#endif
+X#endif
+X			{
+X				/* reprogram the port */
+X				(void) SPLINT ();
+X				fas_param (fip, SOFT_INIT);
+X			}
+X			(void) splx (old_level);
+X			break;
+X	}
+X}
+X
+X/* Main FAS interrupt handler. Actual character processing is splitted
+X   into sub-functions.
+X   (called at SPLINT)
+X*/
+Xvoid
+Xfasintr (vect)
+Xint	vect;
+X{
+X	register struct fas_internals	*fip REG_SI;
+X	uint	num_polls;
+X	bool	was_rint, was_xint, was_mint, do_xproc;
+X
+X	fip = fas_first_int_user;
+X	if (!fip)
+X		return;	/* false alarm: must be a spurious int */
+X
+X	was_rint = FALSE;
+X	was_xint = FALSE;
+X	was_mint = FALSE;
+X
+X	{
+X	    register uint	poll_cnt REG_DI;
+X
+X	    poll_cnt = 1;
+X
+X	    /* Loop through all users of the interrupt users chain
+X	       and look for characters in the receiver buffer.
+X	       We poll the line status register regardless of
+X	       whether the UART has interrupted or not. This
+X	       synchronizes concurrently running receiver FIFOs
+X	       and dramatically reduces the overall interrupt
+X	       frequency.
+X	    */
+X	    do
+X	    {
+X		register n_unchar	lstatus REG_BX;
+Xfastloop1:
+X		/* read in all characters from all UARTs */
+X		if (!(fip->device_flags & DF_RDI_ENABLED)
+X			|| !((lstatus = FAS_FIRST_INB (fip, LINE_STATUS_PORT))
+X					& LS_RCV_AVAIL))
+X		{
+X			/* speed beats beauty */
+X			fip = fip->next_int_user;
+X			++poll_cnt;
+X			if (fip)
+X				goto fastloop1;
+X			break;
+X		}
+X
+X		/* do the character processing */
+X		(void) fas_rproc (fip, lstatus);
+X		was_rint = TRUE;
+X		fip = fip->next_int_user;
+X		++poll_cnt;
+X	    } while (fip);
+X
+X	    /* Save the number of UARTs we have to poll to be sure that
+X	       there are no further pending interrupts.
+X	    */
+X	    num_polls = poll_cnt;
+X
+X	    /* The 8259 interrupt controller is set up for edge trigger.
+X	       Therefore, we must loop until we make a complete pass without
+X	       getting any UARTs that are interrupting.
+X	    */
+X	    for (;;)
+X	    {
+Xfastloop2:
+X		if (!fip)
+X			fip = fas_first_int_user;	/* wrap around */
+X
+X		/* process only ports that have an interrupt
+X		   pending
+X		*/
+X		if (FAS_FIRST_INB (fip, INT_ID_PORT) & II_NO_INTS_PENDING)
+X		{
+X			/* speed beats beauty */
+X			fip = fip->next_int_user;
+X			if (--poll_cnt)
+X				goto fastloop2;
+X			break;
+X		}
+X
+X		{
+X		    register n_unchar	mstatus REG_BX;
+X
+X		    /* Has there been a polarity change on
+X		       some of the modem lines ?
+X		    */
+X		    if ((fip->device_flags & DF_MSI_ENABLED)
+X			&& ((mstatus = FAS_INB (fip, MDM_STATUS_PORT))
+X					& MS_ANY_DELTA))
+X		    {
+X			/* if the same modem status line
+X			   is responsible for a modem status
+X			   interrupt twice during two
+X			   event scheduler runs, we disable
+X			   modem status interrupts until we
+X			   process this interrupt in the event
+X			   scheduler
+X			*/
+X			if (mstatus & NEW_MSR & MS_ANY_DELTA)
+X			{
+X				FAS_OUTB (fip, INT_ENABLE_PORT,
+X					  IER &= ~IE_MODEM_STATUS);
+X				fip->device_flags &= ~DF_MSI_ENABLED;
+X				fip->device_flags |= DF_MSI_NOISE;
+X				++fas_msi_noise;
+X			}
+X			/* Do special RING line handling.
+X			   RING generates an int only on the
+X			   trailing edge.
+X			*/
+X			mstatus = (mstatus & ~MS_RING_PRESENT)
+X					| (NEW_MSR & MS_RING_PRESENT);
+X			if (mstatus & MS_RING_TEDGE)
+X				mstatus |= MS_RING_PRESENT;
+X			if ((mstatus ^ NEW_MSR) & MS_ANY_PRESENT)
+X			{
+X			    do_xproc = FALSE;
+X			    /* check hw flow flags */
+X			    if (!(~mstatus & fip->flow.m.oc)
+X					|| (~mstatus & fip->flow.m.oe)
+X					|| !(fip->flow_flags
+X						& FF_HWO_HANDSHAKE))
+X			    {
+X				if (fip->flow_flags & FF_HWO_STOPPED)
+X				{
+X				    fip->flow_flags &= ~FF_HWO_STOPPED;
+X				    do_xproc = TRUE;
+X				}
+X			    }
+X			    else
+X				fip->flow_flags |= FF_HWO_STOPPED;
+X			    /* check carrier detect
+X			       note: the actual carrier detect
+X			             processing is done in fas_mproc ()
+X			    */
+X	    		    if (!(fip->cflag & CLOCAL)
+X				    && (fip->flow_flags & FF_CARRIER_ON))
+X	    		    {
+X				if (!(~mstatus & fip->modem.m.ca))
+X				{
+X				    if (fip->flow_flags & FF_CARR_STOPPED)
+X				    {
+X					fip->flow_flags &= ~FF_CARR_STOPPED;
+X					do_xproc = TRUE;
+X				    }
+X				}
+X				else if (!(~NEW_MSR & fip->modem.m.ca))
+X				    fip->flow_flags |= FF_CARR_STOPPED;
+X			    }
+X			    if (do_xproc)
+X				fas_xproc (fip);
+X			    EVENT_SCHED (fip, EF_DO_MPROC);
+X			}
+X			else
+X			    EVENT_SCHED (fip, EF_RESET_DELTA_BITS);
+X			/* "or" the delta flags to prevent
+X			   excessive modem status interrupts
+X			*/
+X			NEW_MSR = mstatus | (NEW_MSR & MS_ANY_DELTA);
+X			was_mint = TRUE;
+X		    }
+X		}
+X
+X		{
+X		    register n_unchar	lstatus REG_BX;
+X
+X		    lstatus = FAS_INB (fip, LINE_STATUS_PORT);
+X
+X		    /* Is it a receiver int ? */
+X		    if ((lstatus & LS_RCV_AVAIL)
+X				&& (fip->device_flags & DF_RDI_ENABLED))
+X		    {
+X			/* do the character processing */
+X			lstatus = fas_rproc (fip, lstatus);
+X			was_rint = TRUE;
+X		    }
+X
+X		    /* Is it a transmitter int ? */
+X		    if (lstatus & LS_XMIT_AVAIL)
+X		    {
+X			if (fip->device_flags & DF_XMIT_BUSY)
+X			{
+X			    fip->device_flags &= ~DF_XMIT_BUSY;
+X			    /* do the character processing */
+X			    fas_xproc (fip);
+X			    if (!(fip->device_flags & DF_XMIT_BUSY))
+X			    {
+X				fip->device_flags |= DF_GUARD_TIMEOUT;
+X				fip->timeout_idx
+X				    = timeout (fas_timeout, (caddr_t) fip,
+X						fas_speed_ptr [BT_SELECT]
+X							[fip->cflag & CBAUD]
+X							.i.ctime);
+X			    }
+X			    was_xint = TRUE;
+X			}
+X		    }
+X		}
+X
+X		fip = fip->next_int_user;
+X		poll_cnt = num_polls;	/* reset counter as there was work */
+X	    }
+X	}
+X
+X	{
+X		register uint	*seq_ptr REG_DI;
+X		register uint	port REG_BX;
+X
+X		/* execute the interrupt acknowledge sequence for the
+X		   serial cards
+X		*/
+X		seq_ptr = &fas_int_ack_seq [0];
+X		port = *seq_ptr;
+X		if (port)
+X		{
+X			do
+X			{
+X				if (*(seq_ptr + 1) & READ_PORT)
+X					(void) INB (port);
+X				else
+X					(void) OUTB (port, *(seq_ptr + 1));
+X				port = *(seq_ptr += 2);
+X			} while (port);
+X		}
+X	}
+X		
+X	/* provide statistical infos */
+X	if (was_rint)
+X		++sysinfo.rcvint;
+X	if (was_xint)
+X		++sysinfo.xmtint;
+X	if (was_mint)
+X		++sysinfo.mdmint;
+X}
+X
+X/* Receiver interrupt handler. Translates input characters to character
+X   sequences as described in TERMIO(7) man page.
+X   (called at SPLINT)
+X*/
+XSTATIC n_unchar
+Xfas_rproc (fip, line_status)
+Xregister struct fas_internals	*fip REG_SI;
+Xn_unchar	line_status;
+X{
+X	register unchar	*ring_ptr REG_DI;
+X	register n_unchar	charac REG_BX;
+X
+X	/* Was there a receiver overrun ? Count them in a
+X	   separate counter for each UART type.
+X	*/
+X	if (line_status & LS_OVERRUN)
+X		++fas_overrun [DEVICE_TYPE];
+X
+X	ring_ptr = fip->recv_ring_put_ptr;
+X
+X	/* Translate characters from FIFO according to the TERMIO(7)
+X	   man page.
+X	*/
+X	do
+X	{
+X		/* ignore parity errors ? */
+X		if (!(fip->iflag & INPCK))
+X			line_status &= ~LS_PARITY_ERROR;
+X
+X		charac = FAS_INB (fip, RCV_DATA_PORT);
+X
+X		if (fip->iflag & ISTRIP)	/* strip off 8th bit ? */
+X			charac &= 0x7f;
+X
+X		/* do we have some kind of character error ? */
+X		if (line_status & (LS_PARITY_ERROR
+X					| LS_FRAMING_ERROR
+X					| LS_BREAK_DETECTED))
+X		{
+X#if defined (HAVE_VPIX)
+X			if (fip->iflag & DOSMODE)
+X			{
+X			    if (fip->iflag & PARMRK)
+X			    {
+X				/* send status bits to VP/ix */
+X				if (fip->recv_ring_cnt < RECV_BUFF_SIZE - 2)
+X				{
+X				    fip->recv_ring_cnt += 3;
+X				    PUT_RECV_BUFFER (fip, ring_ptr, 0xff);
+X				    PUT_RECV_BUFFER (fip, ring_ptr, 1);
+X				    PUT_RECV_BUFFER (fip, ring_ptr,
+X					(line_status & (LS_PARITY_ERROR
+X							| LS_FRAMING_ERROR
+X							| LS_BREAK_DETECTED))
+X						| LS_RCV_AVAIL
+X						| LS_XMIT_AVAIL
+X						| LS_XMIT_COMPLETE);
+X				}
+X			    }
+X			    goto valid_char;
+X			}
+X			else
+X#endif
+X			/* is it a BREAK ? */
+X			if (line_status & LS_BREAK_DETECTED)
+X			{
+X				if (!(fip->iflag & IGNBRK))
+X				{
+X					if (fip->iflag & BRKINT)
+X					{
+X						/* do BREAK interrupt */
+X						EVENT_SCHED (fip, EF_DO_BRKINT);
+X					}
+X					else if (fip->iflag & PARMRK)
+X					{
+X						if (fip->recv_ring_cnt
+X							< RECV_BUFF_SIZE - 2)
+X						{
+X						    fip->recv_ring_cnt += 3;
+X						    PUT_RECV_BUFFER (fip,
+X								     ring_ptr,
+X								     0xff);
+X						    PUT_RECV_BUFFER (fip,
+X								     ring_ptr,
+X								     0);
+X						    PUT_RECV_BUFFER (fip,
+X								     ring_ptr,
+X								     0);
+X						}
+X					}
+X					else
+X					{
+X						if (fip->recv_ring_cnt
+X							< RECV_BUFF_SIZE)
+X						{
+X						    ++fip->recv_ring_cnt;
+X						    PUT_RECV_BUFFER (fip,
+X								     ring_ptr,
+X								     0);
+X						}
+X					}
+X				}
+X			}
+X			else if (!(fip->iflag & IGNPAR))
+X				if (fip->iflag & PARMRK)
+X				{
+X					if (fip->recv_ring_cnt
+X						< RECV_BUFF_SIZE - 2)
+X					{
+X						fip->recv_ring_cnt += 3;
+X						PUT_RECV_BUFFER (fip, ring_ptr,
+X								    0xff);
+X						PUT_RECV_BUFFER (fip, ring_ptr,
+X								    0);
+X						PUT_RECV_BUFFER (fip, ring_ptr,
+X								    charac);
+X					}
+X				}
+X				else
+X				{
+X					if (fip->recv_ring_cnt
+X						< RECV_BUFF_SIZE)
+X					{
+X						++fip->recv_ring_cnt;
+X						PUT_RECV_BUFFER (fip, ring_ptr,
+X								    0);
+X					}
+X				}
+X		}
+X		else
+X		{
+X			if (fip->iflag & IXON)
+X			{
+X				/* do output start/stop handling */
+X				if (fip->flow_flags & FF_SWO_STOPPED)
+X				{
+X					if ((charac == fip->start_char)
+X						|| (fip->iflag & IXANY))
+X					{
+X						fip->flow_flags &=
+X							~FF_SWO_STOPPED;
+X						fip->tty->t_state &= ~TTSTOP;
+X						/* restart output */
+X						fas_xproc (fip);
+X					}
+X				}
+X				else
+X				{
+X					if (charac == fip->stop_char)
+X					{
+X						fip->flow_flags |=
+X							FF_SWO_STOPPED;
+X						fip->tty->t_state |= TTSTOP;
+X					}
+X				}
+X				/* we don't put start/stop characters
+X				   into the receiver buffer
+X				*/
+X				if ((charac == fip->start_char)
+X					|| (charac == fip->stop_char))
+X					continue;
+X			}
+Xvalid_char:
+X			if ((charac == 0xff) && (fip->iflag & PARMRK))
+X			{
+X				if (fip->recv_ring_cnt < RECV_BUFF_SIZE - 1)
+X				{
+X					fip->recv_ring_cnt += 2;
+X					PUT_RECV_BUFFER (fip, ring_ptr, 0xff);
+X					PUT_RECV_BUFFER (fip, ring_ptr, 0xff);
+X				}
+X			}
+X			else
+X			{
+X				if (fip->recv_ring_cnt < RECV_BUFF_SIZE)
+X				{
+X					++fip->recv_ring_cnt;
+X					PUT_RECV_BUFFER (fip, ring_ptr, charac);
+X				}
+X			}
+X		}
+X	} while ((line_status = FAS_INB (fip, LINE_STATUS_PORT))
+X							& LS_RCV_AVAIL);
+X
+X	fip->recv_ring_put_ptr = ring_ptr;
+X
+X	/* schedule character transfer to CLIST buffer */
+X	if (!(fip->event_flags & EF_DO_RXFER)
+X		&& !(fip->flow_flags & FF_RXFER_STOPPED))
+X	{
+X		EVENT_SCHED (fip, EF_DO_RXFER);
+X	}
+X
+X	/* check input buffer high water marks */
+X	if ((fip->recv_ring_cnt > HW_HIGH_WATER)
+X		&& (fip->flow_flags & (FF_HWI_HANDSHAKE | FF_HWI_STARTED))
+X				== (FF_HWI_HANDSHAKE | FF_HWI_STARTED))
+X	{
+X		FAS_OUTB (fip, MDM_CTL_PORT, MCR &= ~fip->flow.m.ic);
+X		fip->flow_flags &= ~FF_HWI_STARTED;
+X	}
+X	if ((fip->recv_ring_cnt > SW_HIGH_WATER)
+X			&& (fip->iflag & IXOFF)
+X			&& !(fip->flow_flags & FF_SWI_STOPPED))
+X		fas_send_xoff (fip);
+X
+X	return (line_status);
+X}
+X
+X/* Output characters to the transmitter register.
+X   (called at SPLINT)
+X*/
+XSTATIC void
+Xfas_xproc (fip)
+Xregister struct fas_internals	*fip REG_SI;
+X{
+X	/* proceed only if transmitter is available */
+X	if (fip->device_flags & (DF_XMIT_BUSY | DF_XMIT_BREAK
+X							| DF_XMIT_LOCKED))
+X		goto sched;
+X	if (fip->flow_flags & (FF_HWO_STOPPED | FF_CARR_STOPPED))
+X		goto sched;
+X	
+X	{
+X		register unchar	*ring_ptr REG_DI;
+X		register uint	num_to_output REG_BX;
+X
+X		num_to_output = fip->xmit_fifo_size;
+X	
+X		/* handle XON/XOFF input flow control requests */
+X		if (fip->flow_flags & FF_SW_FC_REQ)
+X		{
+X			FAS_FIRST_OUTB (fip, XMT_DATA_PORT,
+X					(fip->flow_flags & FF_SWI_STOPPED)
+X						? fip->stop_char
+X						: fip->start_char);
+X			--num_to_output;
+X			fip->device_flags |= DF_XMIT_BUSY;
+X			fip->flow_flags &= ~FF_SW_FC_REQ;
+X			fip->tty->t_state &= ~(TTXON | TTXOFF);
+X			/* disable guard timeout */
+X			if (fip->device_flags & DF_GUARD_TIMEOUT)
+X			{
+X				fip->device_flags &= ~DF_GUARD_TIMEOUT;
+X				(void) untimeout (fip->timeout_idx);
+X			}
+X		}
+X	
+X		/* bail out if output is suspended by XOFF */
+X		if (fip->flow_flags & FF_SWO_STOPPED)
+X			goto sched;
+X	
+X		/* Determine how many chars to put into the transmitter
+X		   register.
+X		*/
+X		if (fip->xmit_ring_cnt < num_to_output)
+X			num_to_output = fip->xmit_ring_cnt;
+X	
+X		/* no characters available ? */
+X		if (!num_to_output)
+X			goto sched;
+X	
+X		/* output characters */
+X		fip->xmit_ring_cnt -= num_to_output;
+X	
+X		FAS_CTL (fip, XMT_DATA_PORT);
+X	
+X		ring_ptr = fip->xmit_ring_take_ptr;
+X
+X		do
+X		{
+X			do
+X			{
+X				FAS_SAME_OUTB (fip, XMT_DATA_PORT, *ring_ptr);
+X				if (++ring_ptr
+X					== &fip->xmit_buffer [XMIT_BUFF_SIZE])
+X					break;
+X			} while (--num_to_output);
+X			if (!num_to_output)
+X				break;
+X			ring_ptr = &fip->xmit_buffer [0];
+X		} while (--num_to_output);
+X	
+X		fip->xmit_ring_take_ptr = ring_ptr;
+X
+X		/* signal that transmitter is busy now */
+X		fip->device_flags |= DF_XMIT_BUSY;
+X		/* disable guard timeout */
+X		if (fip->device_flags & DF_GUARD_TIMEOUT)
+X		{
+X			fip->device_flags &= ~DF_GUARD_TIMEOUT;
+X			(void) untimeout (fip->timeout_idx);
+X		}
+X	}
+X
+X	/* schedule fas_xxfer () if there are more characters to transfer
+X	   into the transmitter ring buffer
+X	*/
+Xsched:
+X	{
+X		register struct tty	*ttyp REG_DI;
+X
+X		if (!(fip->event_flags & EF_DO_XXFER)
+X			&& (fip->xmit_ring_size > fip->xmit_ring_cnt)
+X			&& ((ttyp = fip->tty)->t_outq.c_cc
+X				|| (ttyp->t_tbuf.c_ptr
+X					&& ttyp->t_tbuf.c_count)))
+X		{
+X			EVENT_SCHED (fip, EF_DO_XXFER);
+X		}
+X	}
+X}
+X
+X/* Open device physically.
+X   (called at SPLINT)
+X*/
+XSTATIC void
+Xfas_open_device (fip)
+Xregister struct fas_internals	*fip REG_SI;
+X{
+X	/* init some variables */
+X	fip->device_flags &= DF_DEVICE_CONFIGURED | DF_DEVICE_LOCKED
+X				| DF_CTL_FIRST | DF_CTL_EVERY | DF_HUP_PROTECT
+X				| DF_NO_OVERRUN;
+X	fip->device_flags |= DF_DEVICE_OPEN;
+X	fip->flow_flags &= FF_NEW_CTSRTS;
+X	fip->flow_flags |= FF_CD_ENABLED;
+X	fip->event_flags = 0;
+X	fip->recv_ring_put_ptr = fip->recv_ring_take_ptr
+X				= &fip->recv_buffer [0];
+X	fip->recv_ring_cnt = 0;
+X	fip->xmit_ring_put_ptr = fip->xmit_ring_take_ptr
+X				= &fip->xmit_buffer [0];
+X	fip->xmit_ring_cnt = 0;
+X	fip->rxfer_timeout = MAX_RXFER_DELAY / EVENT_TIME;
+X	LCR = 0;
+X	MCR &= ~(fip->modem.m.di | fip->modem.m.ei | fip->modem.m.eo);
+X	fip->start_char = CSTART;
+X	fip->stop_char = CSTOP;
+X#if defined (HAVE_VPIX)
+X	/* initialize VP/ix related variables */
+X	fip->v86_proc = (v86_t *) NULL;
+X	fip->v86_intmask = 0;
+X#endif
+X
+X	/* hook into the interrupt users chain */
+X	if ((fip->next_int_user = fas_first_int_user))
+X		fip->next_int_user->prev_int_user = fip;
+X	else
+X		fas_last_int_user = fip;
+X	fas_first_int_user = fip;
+X	fip->prev_int_user = (struct fas_internals *) NULL;
+X
+X	/* enable FIFOs */
+X	if (DEVICE_TYPE == TYPE_NS16550A)
+X		FAS_FIRST_OUTB (fip, NS_FIFO_CTL_PORT, FCR | NS_FIFO_CLR_XMIT);
+X	else if (DEVICE_TYPE == TYPE_I82510)
+X	{
+X		FAS_FIRST_OUTB (fip, I_BANK_PORT, I_BANK_2);
+X		FAS_OUTB (fip, I_IDM_PORT, I_FIFO_SETUP_CMD);
+X		FAS_OUTB (fip, I_BANK_PORT, I_BANK_1);
+X		FAS_OUTB (fip, I_TCM_PORT, I_FIFO_CLR_XMIT);
+X		FAS_OUTB (fip, I_BANK_PORT, I_BANK_0);
+X	}
+X
+X	/* enable and clear transmitter interrupts */
+X	FAS_FIRST_OUTB (fip, INT_ENABLE_PORT,
+X				IER = IE_XMIT_HOLDING_BUFFER_EMPTY);
+X	(void) FAS_INB (fip, INT_ID_PORT);
+X
+X	fas_param (fip, HARD_INIT);	/* set up port regs */
+X}
+X
+X/* Close device physically.
+X   (called at SPLINT)
+X*/
+XSTATIC void
+Xfas_close_device (fip)
+Xregister struct fas_internals	*fip REG_SI;
+X{
+X	/* disable UART interrupts */
+X	FAS_FIRST_OUTB (fip, INT_ENABLE_PORT, IER = IE_NONE);
+X
+X	/* drop flow control lines */
+X	FAS_OUTB (fip, MDM_CTL_PORT,
+X			MCR &= (fip->o_state & OS_HWI_HANDSHAKE)
+X					? ~fip->flow.m.ic
+X					: ~fip->flow.m.hc);
+X
+X	/* reset break level */
+X	FAS_OUTB (fip, LINE_CTL_PORT, LCR = 0);
+X
+X	/* clear some variables */
+X	fip->device_flags &= ~DF_DEVICE_OPEN;
+X	fip->event_flags = 0;
+X
+X	/* unhook from interrupt users chain */
+X	if (fip->prev_int_user)
+X		fip->prev_int_user->next_int_user = fip->next_int_user;
+X	else
+X		fas_first_int_user = fip->next_int_user;
+X	if (fip->next_int_user)
+X		fip->next_int_user->prev_int_user = fip->prev_int_user;
+X	else
+X		fas_last_int_user = fip->prev_int_user;
+X}
+X
+X/* Set up a port according to the given termio structure.
+X   (called at SPLINT)
+X*/
+XSTATIC void
+Xfas_param (fip, init_type)
+Xregister struct	fas_internals	*fip REG_SI;
+Xint	init_type;
+X{
+X	register struct tty	*ttyp REG_DI;
+X	bool	do_flush;
+X	int	old_level;
+X
+X	ttyp = fip->tty;
+X
+X	{
+X	    register uint	cflag REG_BX;
+X
+X	    cflag = ttyp->t_cflag;
+X	    fip->iflag = ttyp->t_iflag;
+X	    do_flush = FALSE;
+X
+X#if defined (HAVE_VPIX)
+X	    /* we don't set port registers if we are in dos mode */
+X	    if (fip->iflag & DOSMODE)
+X	    {
+X		/* This is a kludge. We don't know what baud rate
+X		   DOS will use. Therefore, we assume a rather low
+X		   one to be on the safe side.
+X		*/
+X		cflag = (cflag & ~CBAUD) | B300;
+X		goto setflags;
+X	    }
+X#endif
+X	    /* Make sure that we have a valid baud rate. If we don't
+X	       get one, take the previous baud rate.
+X	    */
+X	    if ((cflag & CBAUD) == B0)
+X		cflag = (cflag & ~CBAUD) | (fip->cflag & CBAUD);
+X
+X	    /* if soft init mode: don't set port registers if cflag
+X	       didn't change
+X	    */
+X	    if ((init_type == SOFT_INIT)
+X			&& !((cflag ^ fip->cflag)
+X				& (CBAUD | CSIZE | CSTOPB | PARENB | PARODD)))
+X		goto setflags;
+X
+X	    /* don't change break flag */
+X	    LCR &= LC_SET_BREAK_LEVEL;
+X
+X	    /* set character size */
+X	    switch (cflag & CSIZE)
+X	    {
+X		case CS5:
+X			LCR |= LC_WORDLEN_5;
+X			break;
+X
+X		case CS6:
+X			LCR |= LC_WORDLEN_6;
+X			break;
+X
+X		case CS7:
+X			LCR |= LC_WORDLEN_7;
+X			break;
+X
+X		default:
+X			LCR |= LC_WORDLEN_8;
+X			break;
+X	    }
+X
+X	    /* set # of stop bits */
+X	    if (cflag & CSTOPB)
+X		LCR |= LC_STOPBITS_LONG;
+X
+X	    /* set parity */
+X	    if (cflag & PARENB)
+X	    {
+X		LCR |= LC_ENABLE_PARITY;
+X
+X		if (!(cflag & PARODD))
+X			LCR |= LC_EVEN_PARITY;
+X	    }
+X
+X	    /* set LCR and baud rate */
+X	    FAS_FIRST_OUTB (fip, LINE_CTL_PORT, LCR | LC_ENABLE_DIVISOR);
+X	    FAS_OUTB (fip, DIVISOR_LSB_PORT, fas_speed_ptr [BT_SELECT]
+X								[cflag & CBAUD]
+X								.div.b.low);
+X	    FAS_OUTB (fip, DIVISOR_MSB_PORT, fas_speed_ptr [BT_SELECT]
+X								[cflag & CBAUD]
+X								.div.b.high);
+X	    FAS_OUTB (fip, LINE_CTL_PORT, LCR);
+X
+Xsetflags:
+X	    /* set dynamic xmit ring buffer size */
+X	    fip->xmit_ring_size = fas_speed_ptr [BT_SELECT] [cflag & CBAUD]
+X							.xbuf_size;
+X
+X	    /* disable modem control signals if required by open mode */
+X	    if (fip->o_state & OS_CLOCAL)
+X		cflag |= CLOCAL;
+X
+X	    /* Select hardware handshake depending on the minor device
+X	       number and various termio flags (if they are available).
+X	    */
+X	    fip->flow_flags &= ~(FF_HWO_HANDSHAKE
+X					| FF_HWI_HANDSHAKE
+X					| FF_HDX_HANDSHAKE);
+X	    if (fip->o_state & (OS_HWO_HANDSHAKE | OS_HWI_HANDSHAKE
+X					| OS_HDX_HANDSHAKE))
+X	    {
+X		if (fip->o_state & OS_HWO_HANDSHAKE)
+X			fip->flow_flags |= FF_HWO_HANDSHAKE;
+X		if (fip->o_state & OS_HWI_HANDSHAKE)
+X			fip->flow_flags |= FF_HWI_HANDSHAKE;
+X		if (fip->o_state & OS_HDX_HANDSHAKE)
+X			fip->flow_flags |= FF_HDX_HANDSHAKE;
+X	    }
+X	    else
+X	    {
+X#if defined (CTSXON) && defined (RTSXOFF)	/* SVR4 compatibility */
+X		if (fip->iflag & CTSXON)
+X			fip->flow_flags |= FF_HWO_HANDSHAKE;
+X		if (fip->iflag & RTSXOFF)
+X			fip->flow_flags |= FF_HWI_HANDSHAKE;
+X#else
+X#if defined (CTSFLOW) && defined (RTSFLOW)	/* SCO Xenix compatibility */
+X		if (!(cflag & CLOCAL) || (fip->flow_flags & FF_NEW_CTSRTS))
+X		{
+X#if defined (ORTSFL)	/* SCO UNIX 3.2.4.2 compatibility */
+X			if ((cflag & (ORTSFL | CTSFLOW | RTSFLOW)) == ORTSFL)
+X				fip->flow_flags |= FF_HWO_HANDSHAKE
+X							| FF_HWI_HANDSHAKE;
+X			else
+X			{
+X				if (cflag & CTSFLOW)
+X					fip->flow_flags |= FF_HWO_HANDSHAKE;
+X				if (cflag & RTSFLOW)
+X					fip->flow_flags |= ((fip->flow_flags
+X								& FF_NEW_CTSRTS)
+X							   || !(cflag & ORTSFL))
+X							    ? FF_HWI_HANDSHAKE
+X							    : FF_HDX_HANDSHAKE;
+X			}
+X#else
+X#if defined (CRTSFL)	/* SCO UNIX 3.2.4 compatibility */
+X			if ((cflag & (CRTSFL | CTSFLOW | RTSFLOW)) == CRTSFL)
+X				fip->flow_flags |= FF_HWO_HANDSHAKE
+X							| FF_HWI_HANDSHAKE;
+SHAR_EOF
+true || echo 'restore of fas.c failed'
+fi
+echo 'End of  part 5'
+echo 'File fas.c is continued in part 6'
+echo 6 > _shar_seq_.tmp
+exit 0

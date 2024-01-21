@@ -1,0 +1,1331 @@
+Subject:  v23i030:  A cron/crontab replacement, Part03/03
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: b389277b 0cbb344a 8f68432b 0ea68de7
+
+Submitted-by: Paul A Vixie <vixie@vixie.sf.ca.us>
+Posting-number: Volume 23, Issue 30
+Archive-name: vixie-cron/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 3)."
+# Contents:  do_command.c misc.c
+# Wrapped by vixie@volition.pa.dec.com on Wed Jul 18 00:32:49 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'do_command.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'do_command.c'\"
+else
+echo shar: Extracting \"'do_command.c'\" \(14961 characters\)
+sed "s/^X//" >'do_command.c' <<'END_OF_FILE'
+X#if !defined(lint) && !defined(LINT)
+static char rcsid[] = "$Header: do_command.c,v 2.1 90/07/18 00:23:38 vixie Exp $";
+X#endif
+X
+X/* $Source: /jove_u3/vixie/src/cron/RCS/do_command.c,v $
+X * $Revision: 2.1 $
+X * $Log:	do_command.c,v $
+X * Revision 2.1  90/07/18  00:23:38  vixie
+X * Baseline for 4.4BSD release
+X * 
+X * Revision 2.0  88/12/10  04:57:44  vixie
+X * V2 Beta
+X * 
+X * Revision 1.5  88/11/29  13:06:06  vixie
+X * seems to work on Ultrix 3.0 FT1
+X * 
+X * Revision 1.4  87/05/02  17:33:35  paul
+X * baseline for mod.sources release
+X * 
+X * Revision 1.3  87/04/09  00:03:58  paul
+X * improved data hiding, locality of declaration/references
+X * fixed a rs@mirror bug by redesigning the mailto stuff completely
+X * 
+X * Revision 1.2  87/03/19  12:46:24  paul
+X * implemented suggestions from rs@mirror (Rich $alz):
+X *    MAILTO="" means no mail should be sent
+X *    various fixes of bugs or lint complaints
+X *    put a To: line in the mail message
+X * 
+X * Revision 1.1  87/01/26  23:47:00  paul
+X * Initial revision
+X */
+X
+X/* Copyright 1988,1990 by Paul Vixie
+X * All rights reserved
+X *
+X * Distribute freely, except: don't remove my name from the source or
+X * documentation (don't take credit for my work), mark your changes (don't
+X * get me blamed for your possible bugs), don't alter or remove this
+X * notice.  May be sold if buildable source is provided to buyer.  No
+X * warrantee of any kind, express or implied, is included with this
+X * software; use at your own risk, responsibility for damages (if any) to
+X * anyone resulting from the use of this software rests entirely with the
+X * user.
+X *
+X * Send bug reports, bug fixes, enhancements, requests, flames, etc., and
+X * I'll try to keep a version up to date.  I can be reached as follows:
+X * Paul Vixie, 329 Noe Street, San Francisco, CA, 94114, (415) 864-7013,
+X * paul@vixie.sf.ca.us || {hoptoad,pacbell,decwrl,crash}!vixie!paul
+X */
+X
+X
+X#include "cron.h"
+X#include <signal.h>
+X#include <pwd.h>
+X#if defined(BSD)
+X# include <sys/wait.h>
+X#endif /*BSD*/
+X#if defined(sequent)
+X# include <strings.h>
+X# include <sys/universe.h>
+X#endif
+X
+X
+void
+do_command(cmd, u)
+X	char	*cmd;
+X	user	*u;
+X{
+X	extern int	fork(), _exit();
+X	extern void	child_process(), log_it();
+X	extern char	*env_get();
+X
+X	Debug(DPROC, ("[%d] do_command(%s, (%s,%d,%d))\n",
+X		getpid(), cmd, env_get(USERENV, u->envp), u->uid, u->gid))
+X
+X	/* fork to become asynchronous -- parent process is done immediately,
+X	 * and continues to run the normal cron code, which means return to
+X	 * tick().  the child and grandchild don't leave this function, alive.
+X	 *
+X	 * vfork() is unsuitable, since we have much to do, and the parent
+X	 * needs to be able to run off and fork other processes.
+X	 */
+X	switch (fork())
+X	{
+X	case -1:
+X		log_it("CROND",getpid(),"error","can't fork");
+X		break;
+X	case 0:
+X		/* child process */
+X		child_process(cmd, u);
+X		Debug(DPROC, ("[%d] child process done, exiting\n", getpid()))
+X		_exit(OK_EXIT);
+X		break;
+X	}
+X	Debug(DPROC, ("[%d] main process returning to work\n", getpid()))
+X}
+X
+X
+static void
+child_process(cmd, u)
+X	char	*cmd;
+X	user	*u;
+X{
+X	extern struct passwd	*getpwnam();
+X	extern void	sigpipe_func(), be_different(), log_it();
+X	extern int	VFORK();
+X	extern char	*index(), *env_get();
+X
+X	auto int	stdin_pipe[2], stdout_pipe[2];
+X	register char	*input_data, *usernm, *mailto;
+X	auto int	children = 0;
+X#if defined(sequent)
+X	extern void	do_univ();
+X#endif
+X
+X	Debug(DPROC, ("[%d] child_process('%s')\n", getpid(), cmd))
+X
+X	/* mark ourselves as different to PS command watchers by upshifting
+X	 * our program name.  This has no effect on some kernels.
+X	 */
+X	{
+X		register char	*pch;
+X
+X		for (pch = ProgramName;  *pch;  pch++)
+X			*pch = MkUpper(*pch);
+X	}
+X
+X	/* discover some useful and important environment settings
+X	 */
+X	usernm = env_get(USERENV, u->envp);
+X	mailto = env_get("MAILTO", u->envp);
+X
+X#if defined(BSD)
+X	/* our parent is watching for our death by catching SIGCHLD.  we
+X	 * do not care to watch for our children's deaths this way -- we
+X	 * use wait() explictly.  so we have to disable the signal (which
+X	 * was inherited from the parent).
+X	 *
+X	 * this isn't needed for system V, since our parent is already
+X	 * SIG_IGN on SIGCLD -- which, hopefully, will cause children to
+X	 * simply vanish when they die.
+X	 */
+X	(void) signal(SIGCHLD, SIG_IGN);
+X#endif /*BSD*/
+X
+X	/* create some pipes to talk to our future child
+X	 */
+X	pipe(stdin_pipe);	/* child's stdin */
+X	pipe(stdout_pipe);	/* child's stdout */
+X	
+X	/* since we are a forked process, we can diddle the command string
+X	 * we were passed -- nobody else is going to use it again, right?
+X	 *
+X	 * if a % is present in the command, previous characters are the
+X	 * command, and subsequent characters are the additional input to
+X	 * the command.  Subsequent %'s will be transformed into newlines,
+X	 * but that happens later.
+X	 */
+X	if (NULL == (input_data = index(cmd, '%')))
+X	{
+X		/* no %.  point input_data at a null string.
+X		 */
+X		input_data = "";
+X	}
+X	else
+X	{
+X		/* % found.  replace with a null (remember, we're a forked
+X		 * process and the string won't be reused), and increment
+X		 * input_data to point at the following character.
+X		 */
+X		*input_data++ = '\0';
+X	}
+X
+X	/* fork again, this time so we can exec the user's command.  Vfork()
+X	 * is okay this time, since we are going to exec() pretty quickly.
+X	 * I'm assuming that closing pipe ends &whatnot will not affect our
+X	 * suspended pseudo-parent/alter-ego.
+X	 */
+X	if (VFORK() == 0)
+X	{
+X		Debug(DPROC, ("[%d] grandchild process VFORK()'ed\n", getpid()))
+X
+X		/* write a log message.  we've waited this long to do it
+X		 * because it was not until now that we knew the PID that
+X		 * the actual user command shell was going to get and the
+X		 * PID is part of the log message.
+X		 */
+X#ifdef LOG_FILE
+X		{
+X			extern char *mkprints();
+X			char *x = mkprints(cmd, strlen(cmd));
+X
+X			log_it(usernm, getpid(), "CMD", x);
+X			free(x);
+X		}
+X#endif
+X
+X		/* get new pgrp, void tty, etc.
+X		 */
+X		be_different();
+X
+X		/* close the pipe ends that we won't use.  this doesn't affect
+X		 * the parent, who has to read and write them; it keeps the
+X		 * kernel from recording us as a potential client TWICE --
+X		 * which would keep it from sending SIGPIPE in otherwise
+X		 * appropriate circumstances.
+X		 */
+X		close(stdin_pipe[WRITE_PIPE]);
+X		close(stdout_pipe[READ_PIPE]);
+X
+X		/* grandchild process.  make std{in,out} be the ends of
+X		 * pipes opened by our daddy; make stderr go to stdout.
+X		 */
+X		close(STDIN);	dup2(stdin_pipe[READ_PIPE], STDIN);
+X		close(STDOUT);	dup2(stdout_pipe[WRITE_PIPE], STDOUT);
+X		close(STDERR);	dup2(STDOUT, STDERR);
+X
+X		/* close the pipes we just dup'ed.  The resources will remain,
+X		 * since they've been dup'ed... :-)...
+X		 */
+X		close(stdin_pipe[READ_PIPE]);
+X		close(stdout_pipe[WRITE_PIPE]);
+X
+X# if defined(sequent)
+X		/* set our login universe.  Do this in the grandchild
+X		 * so that the child can invoke /usr/lib/sendmail
+X		 * without surprises.
+X		 */
+X		do_univ(u);
+X# endif
+X
+X		/* set our directory, uid and gid.  Set gid first, since once
+X		 * we set uid, we've lost root privledges.  (oops!)
+X		 */
+X		setgid(u->gid);
+X# if defined(BSD)
+X		initgroups(env_get(USERENV, u->envp), u->gid);
+X# endif
+X		setuid(u->uid);		/* you aren't root after this... */
+X		chdir(env_get("HOME", u->envp));
+X
+X		/* exec the command.
+X		 */
+X		{
+X			char	*shell = env_get("SHELL", u->envp);
+X
+X# if DEBUGGING
+X			if (DebugFlags & DTEST) {
+X				fprintf(stderr,
+X				"debug DTEST is on, not exec'ing command.\n");
+X				fprintf(stderr,
+X				"\tcmd='%s' shell='%s'\n", cmd, shell);
+X				_exit(OK_EXIT);
+X			}
+X# endif /*DEBUGGING*/
+X			/* normally you can't put debugging stuff here because
+X			 * it gets mailed with the command output.
+X			 */
+X			/*
+X			Debug(DPROC, ("[%d] execle('%s', '%s', -c, '%s')\n",
+X					getpid(), shell, shell, cmd))
+X			 */
+X
+X# ifdef bad_idea
+X			/* files writable by non-owner are a no-no
+X			 */
+X			{
+X				struct stat sb;
+X
+X				if (0 != stat(cmd, &sb)) {
+X					fputs("crond: stat(2): ", stderr);
+X					perror(cmd);
+X					_exit(ERROR_EXIT);
+X				} else if (sb.st_mode & 022) {
+X					fprintf(stderr,
+X					"crond: %s writable by nonowner\n",
+X						cmd);
+X					_exit(ERROR_EXIT);
+X				} else if (sb.st_uid & 022) {
+X					fprintf(stderr,
+X					"crond: %s owned by uid %d\n",
+X						cmd, sb.st_uid);
+X					_exit(ERROR_EXIT);
+X				}
+X			}
+X# endif /*bad_idea*/
+X
+X			execle(shell, shell, "-c", cmd, (char *)0, u->envp);
+X			fprintf(stderr, "execl: couldn't exec `%s'\n", shell);
+X			perror("execl");
+X			_exit(ERROR_EXIT);
+X		}
+X	}
+X
+X	children++;
+X
+X	/* middle process, child of original cron, parent of process running
+X	 * the user's command.
+X	 */
+X
+X	Debug(DPROC, ("[%d] child continues, closing pipes\n", getpid()))
+X
+X	/* close the ends of the pipe that will only be referenced in the
+X	 * grandchild process...
+X	 */
+X	close(stdin_pipe[READ_PIPE]);
+X	close(stdout_pipe[WRITE_PIPE]);
+X
+X	/*
+X	 * write, to the pipe connected to child's stdin, any input specified
+X	 * after a % in the crontab entry.  while we copy, convert any
+X	 * additional %'s to newlines.  when done, if some characters were
+X	 * written and the last one wasn't a newline, write a newline.
+X	 *
+X	 * Note that if the input data won't fit into one pipe buffer (2K
+X	 * or 4K on most BSD systems), and the child doesn't read its stdin,
+X	 * we would block here.  the solution, of course, is to fork again.
+X	 */
+X
+X	if (*input_data && fork() == 0) {
+X		register FILE	*out = fdopen(stdin_pipe[WRITE_PIPE], "w");
+X		register int	need_newline = FALSE;
+X		register int	escaped = FALSE;
+X		register int	ch;
+X
+X		Debug(DPROC, ("[%d] child2 sending data to grandchild\n", getpid()))
+X
+X		/* close the pipe we don't use, since we inherited it and
+X		 * are part of its reference count now.
+X		 */
+X		close(stdout_pipe[READ_PIPE]);
+X
+X		/* translation:
+X		 *	\% -> %
+X		 *	%  -> \n
+X		 *	\x -> \x	for all x != %
+X		 */
+X		while (ch = *input_data++)
+X		{
+X			if (escaped) {
+X				if (ch != '%')
+X					putc('\\', out);
+X			} else {
+X				if (ch == '%')
+X					ch = '\n';
+X			}
+X
+X			if (!(escaped = (ch == '\\'))) {
+X				putc(ch, out);
+X				need_newline = (ch != '\n');
+X			}
+X		}
+X		if (escaped)
+X			putc('\\', out);
+X		if (need_newline)
+X			putc('\n', out);
+X
+X		/* close the pipe, causing an EOF condition.  fclose causes
+X		 * stdin_pipe[WRITE_PIPE] to be closed, too.
+X		 */
+X		fclose(out);
+X
+X		Debug(DPROC, ("[%d] child2 done sending to grandchild\n", getpid()))
+X		exit(0);
+X	}
+X
+X	/* close the pipe to the grandkiddie's stdin, since its wicked uncle
+X	 * ernie back there has it open and will close it when he's done.
+X	 */
+X	close(stdin_pipe[WRITE_PIPE]);
+X
+X	children++;
+X
+X	/*
+X	 * read output from the grandchild.  it's stderr has been redirected to
+X	 * it's stdout, which has been redirected to our pipe.  if there is any
+X	 * output, we'll be mailing it to the user whose crontab this is...
+X	 * when the grandchild exits, we'll get EOF.
+X	 */
+X
+X	Debug(DPROC, ("[%d] child reading output from grandchild\n", getpid()))
+X
+X	{
+X		register FILE	*in = fdopen(stdout_pipe[READ_PIPE], "r");
+X		register int	ch = getc(in);
+X
+X		if (ch != EOF)
+X		{
+X			register FILE	*mail;
+X			register int	bytes = 1;
+X			union wait	status;
+X
+X			Debug(DPROC|DEXT,
+X				("[%d] got data (%x:%c) from grandchild\n",
+X					getpid(), ch, ch))
+X
+X			/* get name of recipient.  this is MAILTO if set to a
+X			 * valid local username; USER otherwise.
+X			 */
+X			if (mailto)
+X			{
+X				/* MAILTO was present in the environment
+X				 */
+X				if (!*mailto)
+X				{
+X					/* ... but it's empty. set to NULL
+X					 */
+X					mailto = NULL;
+X				}
+X			}
+X			else
+X			{
+X				/* MAILTO not present, set to USER.
+X				 */
+X				mailto = usernm;
+X			}
+X		
+X			/* if we are supposed to be mailing, MAILTO will
+X			 * be non-NULL.  only in this case should we set
+X			 * up the mail command and subjects and stuff...
+X			 */
+X
+X			if (mailto)
+X			{
+X				extern FILE	*popen();
+X				extern char	*sprintf(), *print_cmd();
+X				register char	**env;
+X				auto char	mailcmd[MAX_COMMAND];
+X				auto char	hostname[MAXHOSTNAMELEN];
+X
+X				(void) gethostname(hostname, MAXHOSTNAMELEN);
+X				(void) sprintf(mailcmd, MAILCMD, mailto);
+X				if (!(mail = popen(mailcmd, "w")))
+X				{
+X					perror(MAILCMD);
+X					(void) _exit(ERROR_EXIT);
+X				}
+X				fprintf(mail, "From: root (Cron Daemon)\n");
+X				fprintf(mail, "To: %s\n", mailto);
+X				fprintf(mail,
+X				"Subject: cron for %s@%s said this\n",
+X					usernm, first_word(hostname, ".")
+X				);
+X				fprintf(mail, "Date: %s", ctime(&TargetTime));
+X				fprintf(mail, "X-Cron-Cmd: <%s>\n", cmd);
+X				for (env = u->envp;  *env;  env++)
+X					fprintf(mail, "X-Cron-Env: <%s>\n",
+X						*env);
+X				fprintf(mail, "\n");
+X
+X				/* this was the first char from the pipe
+X				 */
+X				putc(ch, mail);
+X			}
+X
+X			/* we have to read the input pipe no matter whether
+X			 * we mail or not, but obviously we only write to
+X			 * mail pipe if we ARE mailing.
+X			 */
+X
+X			while (EOF != (ch = getc(in)))
+X			{
+X				bytes++;
+X				if (mailto)
+X					putc(ch, mail);
+X			}
+X
+X			/* only close pipe if we opened it -- i.e., we're
+X			 * mailing...
+X			 */
+X
+X			if (mailto) {
+X				Debug(DPROC, ("[%d] closing pipe to mail\n",
+X					getpid()))
+X				/* Note: the pclose will probably see
+X				 * the termination of the grandchild
+X				 * in addition to the mail process, since
+X				 * it (the grandchild) is likely to exit
+X				 * after closing its stdout.
+X				 */
+X				status.w_status = pclose(mail);
+X			}
+X
+X			/* if there was output and we could not mail it,
+X			 * log the facts so the poor user can figure out
+X			 * what's going on.
+X			 */
+X			if (mailto && status.w_status) {
+X				char buf[MAX_TEMPSTR];
+X
+X				sprintf(buf,
+X			"mailed %d byte%s of output but got status 0x%04x\n",
+X					bytes, (bytes==1)?"":"s",
+X					status.w_status);
+X				log_it(usernm, getpid(), "MAIL", buf);
+X			}
+X
+X		} /*if data from grandchild*/
+X
+X		Debug(DPROC, ("[%d] got EOF from grandchild\n", getpid()))
+X
+X		fclose(in);	/* also closes stdout_pipe[READ_PIPE] */
+X	}
+X
+X#if defined(BSD)
+X	/* wait for children to die.
+X	 */
+X	for (;  children > 0;  children--)
+X	{
+X		int		pid;
+X		union wait	waiter;
+X
+X		Debug(DPROC, ("[%d] waiting for grandchild #%d to finish\n",
+X			getpid(), children))
+X		pid = wait(&waiter);
+X		if (pid < OK) {
+X			Debug(DPROC, ("[%d] no more grandchildren--mail written?\n",
+X				getpid()))
+X			break;
+X		}
+X		Debug(DPROC, ("[%d] grandchild #%d finished, status=%04x",
+X			getpid(), pid, waiter.w_status))
+X		if (waiter.w_coredump)
+X			Debug(DPROC, (", dumped core"))
+X		Debug(DPROC, ("\n"))
+X	}
+X#endif /*BSD*/
+X}
+X
+X
+X#if defined(sequent)
+X/* Dynix (Sequent) hack to put the user associated with
+X * the passed user structure into the ATT universe if
+X * necessary.  We have to dig the gecos info out of
+X * the user's password entry to see if the magic
+X * "universe(att)" string is present.  If we do change
+X * the universe, also set "LOGNAME".
+X */
+X
+void
+do_univ(u)
+X	user	*u;
+X{
+X	struct	passwd	*p;
+X	char	*s;
+X	int	i;
+X	char	envstr[MAX_ENVSTR], **env_set();
+X
+X	p = getpwuid(u->uid);
+X	(void) endpwent();
+X
+X	if (p == NULL)
+X		return;
+X
+X	s = p->pw_gecos;
+X
+X	for (i = 0; i < 4; i++)
+X	{
+X		if ((s = index(s, ',')) == NULL)
+X			return;
+X		s++;
+X	}
+X	if (strcmp(s, "universe(att)"))
+X		return;
+X
+X	(void) sprintf(envstr, "LOGNAME=%s", p->pw_name);
+X	u->envp = env_set(u->envp, envstr);
+X
+X	(void) universe(U_ATT);
+X}
+X#endif
+END_OF_FILE
+if test 14961 -ne `wc -c <'do_command.c'`; then
+    echo shar: \"'do_command.c'\" unpacked with wrong size!
+fi
+# end of 'do_command.c'
+fi
+if test -f 'misc.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'misc.c'\"
+else
+echo shar: Extracting \"'misc.c'\" \(13932 characters\)
+sed "s/^X//" >'misc.c' <<'END_OF_FILE'
+X#if !defined(lint) && !defined(LINT)
+static char rcsid[] = "$Header: misc.c,v 2.1 90/07/18 00:24:33 vixie Exp $";
+X#endif
+X
+X/* vix 26jan87 [RCS has the rest of the log]
+X * vix 15jan87 [added TIOCNOTTY, thanks csg@pyramid]
+X * vix 30dec86 [written]
+X */
+X
+X/* Copyright 1988,1990 by Paul Vixie
+X * All rights reserved
+X *
+X * Distribute freely, except: don't remove my name from the source or
+X * documentation (don't take credit for my work), mark your changes (don't
+X * get me blamed for your possible bugs), don't alter or remove this
+X * notice.  May be sold if buildable source is provided to buyer.  No
+X * warrantee of any kind, express or implied, is included with this
+X * software; use at your own risk, responsibility for damages (if any) to
+X * anyone resulting from the use of this software rests entirely with the
+X * user.
+X *
+X * Send bug reports, bug fixes, enhancements, requests, flames, etc., and
+X * I'll try to keep a version up to date.  I can be reached as follows:
+X * Paul Vixie, 329 Noe Street, San Francisco, CA, 94114, (415) 864-7013,
+X * paul@vixie.sf.ca.us || {hoptoad,pacbell,decwrl,crash}!vixie!paul
+X */
+X
+X
+X#include "cron.h"
+X#include <sys/time.h>
+X#include <sys/resource.h>
+X#include <sys/ioctl.h>
+X#include <sys/file.h>
+X#include <errno.h>
+X#if defined(ATT)
+X# include <fcntl.h>
+X#endif
+X
+X
+void log_it(), be_different(), acquire_daemonlock();
+X
+X
+char *
+savestr(str)
+X	char	*str;
+X{
+X	extern	int	strlen();
+X	extern	char	*malloc(), *strcpy();
+X	/**/	char	*temp;
+X
+X	temp = malloc((unsigned) (strlen(str) + 1));
+X	(void) strcpy(temp, str);
+X	return temp;
+X}
+X
+X
+int
+nocase_strcmp(left, right)
+X	char	*left;
+X	char	*right;
+X{
+X	while (*left && (MkLower(*left) == MkLower(*right)))
+X	{
+X		left++;
+X		right++;
+X	}
+X	return MkLower(*left) - MkLower(*right);
+X}
+X
+X
+int
+strcmp_until(left, right, until)
+X	char	*left;
+X	char	*right;
+X	char	until;
+X{
+X	register int	diff;
+X
+X	Debug(DPARS|DEXT, ("strcmp_until(%s,%s,%c) ... ", left, right, until))
+X
+X	while (*left && *left != until && *left == *right)
+X	{
+X		left++;
+X		right++;
+X	}
+X
+X	if (	(*left=='\0' || *left == until) 
+X	    &&	(*right=='\0' || *right == until)
+X	   )
+X		diff = 0;
+X	else
+X		diff = *left - *right;
+X
+X	Debug(DPARS|DEXT, ("%d\n", diff))
+X
+X	return diff;
+X}
+X
+X
+X/* strdtb(s) - delete trailing blanks in string 's' and return new length
+X */
+int
+strdtb(s)
+X	register char	*s;
+X{
+X	register char	*x = s;
+X
+X	/* scan forward to the null
+X	 */
+X	while (*x)
+X		x++;
+X
+X	/* scan backward to either the first character before the string,
+X	 * or the last non-blank in the string, whichever comes first.
+X	 */
+X	do	{x--;}
+X	while (x >= s && isspace(*x));
+X
+X	/* one character beyond where we stopped above is where the null
+X	 * goes.
+X	 */
+X	*++x = '\0';
+X
+X	/* the difference between the position of the null character and
+X	 * the position of the first character of the string is the length.
+X	 */
+X	return x - s;
+X}
+X
+X
+int
+set_debug_flags(flags)
+X	char	*flags;
+X{
+X	/* debug flags are of the form    flag[,flag ...]
+X	 *
+X	 * if an error occurs, print a message to stdout and return FALSE.
+X	 * otherwise return TRUE after setting ERROR_FLAGS.
+X	 */
+X
+X#if !DEBUGGING
+X
+X	printf("this program was compiled without debugging enabled\n");
+X	return FALSE;
+X
+X#else /* DEBUGGING */
+X
+X	char	*pc = flags;
+X
+X	DebugFlags = 0;
+X
+X	while (*pc)
+X	{
+X		char	**test;
+X		int	mask;
+X
+X		/* try to find debug flag name in our list.
+X		 */
+X		for (	test = DebugFlagNames, mask = 1;
+X			*test && strcmp_until(*test, pc, ',');
+X			test++, mask <<= 1
+X		    )
+X			;
+X
+X		if (!*test)
+X		{
+X			fprintf(stderr,
+X				"unrecognized debug flag <%s> <%s>\n",
+X				flags, pc);
+X			return FALSE;
+X		}
+X
+X		DebugFlags |= mask;
+X
+X		/* skip to the next flag
+X		 */
+X		while (*pc && *pc != ',')
+X			pc++;
+X		if (*pc == ',')
+X			pc++;
+X	}
+X
+X	if (DebugFlags)
+X	{
+X		int	flag;
+X
+X		fprintf(stderr, "debug flags enabled:");
+X
+X		for (flag = 0;  DebugFlagNames[flag];  flag++)
+X			if (DebugFlags & (1 << flag))
+X				fprintf(stderr, " %s", DebugFlagNames[flag]);
+X		fprintf(stderr, "\n");
+X	}
+X
+X	return TRUE;
+X
+X#endif /* DEBUGGING */
+X}
+X
+X
+X#if defined(BSD)
+void
+set_cron_uid()
+X{
+X	int	seteuid();
+X
+X	if (seteuid(ROOT_UID) < OK)
+X	{
+X		perror("seteuid");
+X		exit(ERROR_EXIT);
+X	}
+X}
+X#endif
+X
+X#if defined(ATT)
+void
+set_cron_uid()
+X{
+X	int	setuid();
+X
+X	if (setuid(ROOT_UID) < OK)
+X	{
+X		perror("setuid");
+X		exit(ERROR_EXIT);
+X	}
+X}
+X#endif
+X
+void
+set_cron_cwd()
+X{
+X	extern int	errno;
+X	struct stat	sb;
+X
+X	/* first check for CRONDIR ("/var/cron" or some such)
+X	 */
+X	if (stat(CRONDIR, &sb) < OK && errno == ENOENT) {
+X		perror(CRONDIR);
+X		if (OK == mkdir(CRONDIR, 0700)) {
+X			fprintf(stderr, "%s: created\n", CRONDIR);
+X			stat(CRONDIR, &sb);
+X		} else {
+X			fprintf(stderr, "%s: ", CRONDIR);
+X			perror("mkdir");
+X			exit(ERROR_EXIT);
+X		}
+X	}
+X	if (!(sb.st_mode & S_IFDIR)) {
+X		fprintf(stderr, "'%s' is not a directory, bailing out.\n",
+X			CRONDIR);
+X		exit(ERROR_EXIT);
+X	}
+X	if (chdir(CRONDIR) < OK) {
+X		fprintf(stderr, "cannot chdir(%s), bailing out.\n", CRONDIR);
+X		perror(CRONDIR);
+X		exit(ERROR_EXIT);
+X	}
+X
+X	/* CRONDIR okay (now==CWD), now look at SPOOL_DIR ("tabs" or some such)
+X	 */
+X	if (stat(SPOOL_DIR, &sb) < OK && errno == ENOENT) {
+X		perror(SPOOL_DIR);
+X		if (OK == mkdir(SPOOL_DIR, 0700)) {
+X			fprintf(stderr, "%s: created\n", SPOOL_DIR);
+X			stat(SPOOL_DIR, &sb);
+X		} else {
+X			fprintf(stderr, "%s: ", SPOOL_DIR);
+X			perror("mkdir");
+X			exit(ERROR_EXIT);
+X		}
+X	}
+X	if (!(sb.st_mode & S_IFDIR)) {
+X		fprintf(stderr, "'%s' is not a directory, bailing out.\n",
+X			SPOOL_DIR);
+X		exit(ERROR_EXIT);
+X	}
+X}
+X
+X
+X#if defined(BSD)
+void
+be_different()
+X{
+X	/* release the control terminal:
+X	 *  get new pgrp (name after our PID)
+X	 *  do an IOCTL to void tty association
+X	 */
+X
+X	extern int	getpid(), setpgrp(), open(), ioctl(), close();
+X	auto int	fd;
+X
+X	(void) setpgrp(0, getpid());
+X
+X	if ((fd = open("/dev/tty", 2)) >= 0)
+X	{
+X		(void) ioctl(fd, TIOCNOTTY, (char*)0);
+X		(void) close(fd);
+X	}
+X}
+X#endif /*BSD*/
+X
+X#if defined(ATT)
+void
+be_different()
+X{
+X	/* not being a system V wiz, I don't know if this is what you have
+X	 * to do to release your control terminal.  what I want to accomplish
+X	 * is to keep this process from getting any signals from the tty.
+X	 *
+X	 * some system V person should let me know if this works... (vixie)
+X	 */
+X	int	setpgrp(), close(), open();
+X
+X	(void) setpgrp();
+X
+X	(void) close(STDIN);	(void) open("/dev/null", 0);
+X	(void) close(STDOUT);	(void) open("/dev/null", 1);
+X	(void) close(STDERR);	(void) open("/dev/null", 2);
+X}
+X#endif /*ATT*/
+X
+X
+X/* acquire_daemonlock() - write our PID into /etc/crond.pid, unless
+X *	another daemon is already running, which we detect here.
+X */
+void
+acquire_daemonlock()
+X{
+X	int	fd = open(PIDFILE, O_RDWR|O_CREAT, 0644);
+X	FILE	*fp = fdopen(fd, "r+");
+X	int	pid = getpid(), otherpid;
+X	char	buf[MAX_TEMPSTR];
+X
+X	if (fd < 0 || fp == NULL) {
+X		sprintf(buf, "can't open or create %s, errno %d", PIDFILE, errno);
+X		log_it("CROND", pid, "DEATH", buf);
+X		exit(ERROR_EXIT);
+X	}
+X
+X	if (flock(fd, LOCK_EX|LOCK_NB) < OK) {
+X		int save_errno = errno;
+X
+X		fscanf(fp, "%d", &otherpid);
+X		sprintf(buf, "can't lock %s, otherpid may be %d, errno %d",
+X			PIDFILE, otherpid, save_errno);
+X		log_it("CROND", pid, "DEATH", buf);
+X		exit(ERROR_EXIT);
+X	}
+X
+X	rewind(fp);
+X	fprintf(fp, "%d\n", pid);
+X	fflush(fp);
+X	ftruncate(fd, ftell(fp));
+X
+X	/* abandon fd and fp even though the file is open. we need to
+X	 * keep it open and locked, but we don't need the handles elsewhere.
+X	 */
+X}
+X
+X/* get_char(file) : like getc() but increment LineNumber on newlines
+X */
+int
+get_char(file)
+X	FILE	*file;
+X{
+X	int	ch;
+X
+X	ch = getc(file);
+X	if (ch == '\n')
+X		Set_LineNum(LineNumber + 1)
+X	return ch;
+X}
+X
+X
+X/* unget_char(ch, file) : like ungetc but do LineNumber processing
+X */
+void
+unget_char(ch, file)
+X	int	ch;
+X	FILE	*file;
+X{
+X	ungetc(ch, file);
+X	if (ch == '\n')
+X		Set_LineNum(LineNumber - 1)
+X}
+X
+X
+X/* get_string(str, max, file, termstr) : like fgets() but
+X *		(1) has terminator string which should include \n
+X *		(2) will always leave room for the null
+X *		(3) uses get_char() so LineNumber will be accurate
+X *		(4) returns EOF or terminating character, whichever
+X */
+int
+get_string(string, size, file, terms)
+X	char	*string;
+X	int	size;
+X	FILE	*file;
+X	char	*terms;
+X{
+X	int	ch;
+X	char	*index();
+X
+X	while (EOF != (ch = get_char(file)) && !index(terms, ch))
+X		if (size > 1)
+X		{
+X			*string++ = (char) ch;
+X			size--;
+X		}
+X
+X	if (size > 0)
+X		*string = '\0';
+X
+X	return ch;
+X}
+X
+X
+X/* skip_comments(file) : read past comment (if any)
+X */
+void
+skip_comments(file)
+X	FILE	*file;
+X{
+X	int	ch;
+X
+X	while (EOF != (ch = get_char(file)))
+X	{
+X		/* ch is now the first character of a line.
+X		 */
+X
+X		while (ch == ' ' || ch == '\t')
+X			ch = get_char(file);
+X
+X		if (ch == EOF)
+X			break;
+X
+X		/* ch is now the first non-blank character of a line.
+X		 */
+X
+X		if (ch != '\n' && ch != '#')
+X			break;
+X
+X		/* ch must be a newline or comment as first non-blank
+X		 * character on a line.
+X		 */
+X
+X		while (ch != '\n' && ch != EOF)
+X			ch = get_char(file);
+X
+X		/* ch is now the newline of a line which we're going to
+X		 * ignore.
+X		 */
+X	}
+X	unget_char(ch, file);
+X}
+X
+X/* int in_file(char *string, FILE *file)
+X *	return TRUE if one of the lines in file matches string exactly,
+X *	FALSE otherwise.
+X */
+int
+in_file(string, file)
+X	char *string;
+X	FILE *file;
+X{
+X	char line[MAX_TEMPSTR];
+X
+X	/* let's be persnickety today.
+X	 */
+X	if (!file) {
+X		if (!string)
+X			string = "0x0";
+X		fprintf(stderr,
+X			"in_file(\"%s\", 0x%x): called with NULL file--botch",
+X			string, file);
+X		exit(ERROR_EXIT);
+X	}
+X
+X	rewind(file);
+X	while (fgets(line, MAX_TEMPSTR, file)) {
+X		if (line[0] != '\0')
+X			line[strlen(line)-1] = '\0';
+X		if (0 == strcmp(line, string))
+X			return TRUE;
+X	}
+X	return FALSE;
+X}
+X
+X
+X/* int allowed(char *username)
+X *	returns TRUE if (ALLOW_FILE exists and user is listed)
+X *	or (DENY_FILE exists and user is NOT listed)
+X *	or (neither file exists but user=="root" so it's okay)
+X */
+int
+allowed(username)
+X	char *username;
+X{
+X	static int	init = FALSE;
+X	static FILE	*allow, *deny;
+X
+X	if (!init) {
+X		init = TRUE;
+X#if defined(ALLOW_FILE) && defined(DENY_FILE)
+X		allow = fopen(ALLOW_FILE, "r");
+X		deny = fopen(DENY_FILE, "r");
+X		Debug(DMISC, ("allow/deny enabled, %d/%d\n", !!allow, !!deny))
+X#else
+X		allow = NULL;
+X		deny = NULL;
+X#endif
+X	}
+X
+X	if (allow)
+X		return (in_file(username, allow));
+X	if (deny)
+X		return (!in_file(username, deny));
+X
+X#if defined(ALLOW_ONLY_ROOT)
+X	return (strcmp(username, ROOT_USER) == 0);
+X#else
+X	return TRUE;
+X#endif
+X}
+X
+X
+X#if defined(LOG_FILE) || defined(SYSLOG)
+void
+log_it(username, pid, event, detail)
+X	char	*username;
+X	int	pid;
+X	char	*event;
+X	char	*detail;
+X{
+X#if defined(LOG_FILE)
+X	extern struct tm	*localtime();
+X	extern long		time();
+X	extern char		*malloc();
+X	auto char		*msg;
+X	auto long		now = time((long *) 0);
+X	register struct tm	*t = localtime(&now);
+X	static int		log_fd = -1;
+X#endif /*LOG_FILE*/
+X
+X#if defined(SYSLOG)
+X	static int		syslog_open = 0;
+X#endif
+X
+X
+X#if defined(LOG_FILE)
+X	/* we assume that MAX_TEMPSTR will hold the date, time, &punctuation.
+X	 */
+X	msg = malloc(strlen(username)
+X	      + strlen(event)
+X	      + strlen(detail)
+X	      + MAX_TEMPSTR);
+X
+X	if (log_fd < OK) {
+X		log_fd = open(LOG_FILE, O_WRONLY|O_APPEND|O_CREAT, 0600);
+X		if (log_fd < OK) {
+X			fprintf(stderr, "%s: can't open log file\n", ProgramName);
+X			perror(LOG_FILE);
+X		}
+X	}
+X
+X	/* we have to sprintf() it because fprintf() doesn't always write
+X	 * everything out in one chunk and this has to be atomically appended
+X	 * to the log file.
+X	 */
+X	sprintf(msg, "%s (%02d/%02d-%02d:%02d:%02d-%d) %s (%s)\n",
+X		username,
+X		t->tm_mon+1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, pid,
+X		event, detail);
+X
+X	/* we have to run strlen() because sprintf() returns (char*) on BSD
+X	 */
+X	if (log_fd < OK || write(log_fd, msg, strlen(msg)) < OK) {
+X		fprintf(stderr, "%s: can't write to log file\n", ProgramName);
+X		if (log_fd >= OK)
+X			perror(LOG_FILE);
+X		write(STDERR, msg, strlen(msg));
+X	}
+X
+X	/* I suppose we could use alloca()...
+X	 */
+X	free(msg);
+X#endif /*LOG_FILE*/
+X
+X#if defined(SYSLOG)
+X	if (!syslog_open) {
+X		/* we don't use LOG_PID since the pid passed to us by
+X		 * our client may not be our own.  therefore we want to
+X		 * print the pid ourselves.
+X		 */
+X# ifdef LOG_CRON
+X		openlog(ProgramName, 0, LOG_CRON);
+X# else
+X# ifdef LOG_DAEMON
+X		openlog(ProgramName, 0, LOG_DAEMON);
+X# else
+X		openlog(ProgramName, 0);
+X# endif /*LOG_DAEMON*/
+X# endif /*LOG_CRON*/
+X		syslog_open = TRUE;		/* assume openlog success */
+X	}
+X
+X	syslog(LOG_INFO, "(%s %d) %s (%s)\n",
+X		username, pid, event, detail);
+X
+X#endif /*SYSLOG*/
+X
+X	if (DebugFlags) {
+X		fprintf(stderr, "log_it: (%s %d) %s (%s)",
+X			username, pid, event, detail);
+X	}
+X}
+X#endif /*LOG_FILE || SYSLOG */
+X
+X
+X/* two warnings:
+X *	(1) this routine is fairly slow
+X *	(2) it returns a pointer to static storage
+X */
+char *
+first_word(s, t)
+X	local char *s;	/* string we want the first word of */
+X	local char *t;	/* terminators, implicitly including \0 */
+X{
+X	static char retbuf[2][MAX_TEMPSTR + 1];	/* sure wish I had GC */
+X	static int retsel = 0;
+X	local char *rb, *rp;
+X	extern char *index();
+X
+X	/* select a return buffer */
+X	retsel = 1-retsel;
+X	rb = &retbuf[retsel][0];
+X	rp = rb;
+X
+X	/* skip any leading terminators */
+X	while (*s && (NULL != index(t, *s))) {s++;}
+X
+X	/* copy until next terminator or full buffer */
+X	while (*s && (NULL == index(t, *s)) && (rp < &rb[MAX_TEMPSTR])) {
+X		*rp++ = *s++;
+X	}
+X
+X	/* finish the return-string and return it */
+X	*rp = '\0';
+X	return rb;
+X}
+X
+X
+X/* warning:
+X *	heavily ascii-dependent.
+X */
+X
+void
+mkprint(dst, src, len)
+X	register char *dst;
+X	register unsigned char *src;
+X	register int len;
+X{
+X	while (len-- > 0)
+X	{
+X		register unsigned char ch = *src++;
+X
+X		if (ch < ' ') {			/* control character */
+X			*dst++ = '^';
+X			*dst++ = ch + '@';
+X		} else if (ch < 0177) {		/* printable */
+X			*dst++ = ch;
+X		} else if (ch == 0177) {	/* delete/rubout */
+X			*dst++ = '^';
+X			*dst++ = '?';
+X		} else {			/* parity character */
+X			sprintf(dst, "\\%03o", ch);
+X			dst += 4;
+X		}
+X	}
+X	*dst = NULL;
+X}
+X
+X
+X/* warning:
+X *	returns a pointer to malloc'd storage, you must call free yourself.
+X */
+X
+char *
+mkprints(src, len)
+X	register unsigned char *src;
+X	register unsigned int len;
+X{
+X	extern char *malloc();
+X	register char *dst = malloc(len*4 + 1);
+X
+X	mkprint(dst, src, len);
+X
+X	return dst;
+X}
+END_OF_FILE
+if test 13932 -ne `wc -c <'misc.c'`; then
+    echo shar: \"'misc.c'\" unpacked with wrong size!
+fi
+# end of 'misc.c'
+fi
+echo shar: End of archive 3 \(of 3\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+
+exit 0 # Just in case...

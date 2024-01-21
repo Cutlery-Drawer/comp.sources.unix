@@ -1,0 +1,2143 @@
+Subject:  v19i004:  A reimplementation of the System V shell, Part04/08
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: ka@june.cs.washington.edu (Kenneth Almquist)
+Posting-number: Volume 19, Issue 4
+Archive-name: ash/part04
+
+# This is part 4 of ash.  To unpack, feed it into the shell (not csh).
+# The ash distribution consists of eight pieces.  Be sure you get them all.
+# After you unpack everything, read the file README.
+
+echo extracting jobs.h
+cat > jobs.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/* Mode argument to forkshell.  Don't change FORK_FG or FORK_BG. */
+#define FORK_FG 0
+#define FORK_BG 1
+#define FORK_NOJOB 2
+
+
+/*
+ * A job structure contains information about a job.  A job is either a
+ * single process or a set of processes contained in a pipeline.  In the
+ * latter case, pidlist will be non-NULL, and will point to a -1 terminated
+ * array of pids.
+ */
+
+struct procstat {
+      short pid;		/* process id */
+      short status;		/* status flags (defined above) */
+      char *cmd;		/* text of command being run */
+};
+
+
+/* states */
+#define JOBSTOPPED 1		/* all procs are stopped */
+#define JOBDONE 2		/* all procs are completed */
+
+
+struct job {
+      struct procstat ps0;	/* status of process */
+      struct procstat *ps;	/* status or processes when more than one */
+      short nprocs;		/* number of processes */
+      short pgrp;		/* process group of this job */
+      char state;		/* true if job is finished */
+      char used;		/* true if this entry is in used */
+      char changed;		/* true if status has changed */
+#if JOBS
+      char jobctl;		/* job running under job control */
+#endif
+};
+
+extern short backgndpid;	/* pid of last background process */
+
+
+#ifdef __STDC__
+void setjobctl(int);
+void showjobs(int);
+struct job *makejob(union node *, int);
+int forkshell(struct job *, union node *, int);
+int waitforjob(struct job *);
+#else
+void setjobctl();
+void showjobs();
+struct job *makejob();
+int forkshell();
+int waitforjob();
+#endif
+
+#if ! JOBS
+#define setjobctl(on)	/* do nothing */
+#endif
+EOF
+if test `wc -c < jobs.h` -ne 1738
+then	echo 'jobs.h is the wrong size'
+fi
+echo extracting jobs.c
+cat > jobs.c <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+#include "shell.h"
+#if JOBS
+#include "sgtty.h"
+#undef CEOF			/* syntax.h redefines this */
+#endif
+#include "main.h"
+#include "parser.h"
+#include "nodes.h"
+#include "jobs.h"
+#include "options.h"
+#include "trap.h"
+#include "signames.h"
+#include "syntax.h"
+#include "input.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include "mystring.h"
+#include <fcntl.h>
+#include <signal.h>
+#include "myerrno.h"
+#ifdef BSD
+#include <sys/wait.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#endif
+
+
+
+struct job *jobtab;		/* array of jobs */
+int njobs;			/* size of array */
+MKINIT short backgndpid = -1;	/* pid of last background process */
+#if JOBS
+int initialpgrp;		/* pgrp of shell on invocation */
+short curjob;			/* current job */
+#endif
+
+#ifdef __STDC__
+STATIC void restartjob(struct job *);
+STATIC struct job *getjob(char *);
+STATIC void freejob(struct job *);
+STATIC int procrunning(int);
+STATIC int dowait(int, struct job *);
+STATIC int waitproc(int, int *);
+STATIC char *commandtext(union node *);
+#else
+STATIC void restartjob();
+STATIC struct job *getjob();
+STATIC void freejob();
+STATIC int procrunning();
+STATIC int dowait();
+STATIC int waitproc();
+STATIC char *commandtext();
+#endif
+
+
+ 
+#if JOBS
+/*
+ * Turn job control on and off.
+ *
+ * Note:  This code assumes that the third arg to ioctl is a character
+ * pointer, which is true on Berkeley systems but not System V.  Since
+ * System V doesn't have job control yet, this isn't a problem now.
+ */
+
+MKINIT int jobctl;
+
+void
+setjobctl(on) {
+      int ldisc;
+
+      if (on == jobctl || rootshell == 0)
+            return;
+      if (on) {
+            do { /* while we are in the background */
+                  if (ioctl(2, TIOCGPGRP, (char *)&initialpgrp) < 0) {
+                        out2str("ash: can't access tty; job control turned off\n");
+                        jflag = 0;
+                        return;
+                  }
+                  if (initialpgrp == -1)
+                        initialpgrp = getpgrp(0);
+                  else if (initialpgrp != getpgrp(0)) {
+                        killpg(initialpgrp, SIGTTIN);
+                        continue;
+                  }
+            } while (0);
+            if (ioctl(2, TIOCGETD, (char *)&ldisc) < 0 || ldisc != NTTYDISC) {
+                  out2str("ash: need new tty driver to run job control; job control turned off\n");
+                  jflag = 0;
+                  return;
+            }
+            setsignal(SIGTSTP);
+            setsignal(SIGTTOU);
+            ioctl(2, TIOCSPGRP, (char *)&rootpid);
+            setpgrp(0, rootpid);
+      } else { /* turning job control off */
+            ioctl(2, TIOCSPGRP, (char *)&initialpgrp);
+            setpgrp(0, initialpgrp);
+            setsignal(SIGTSTP);
+            setsignal(SIGTTOU);
+      }
+      jobctl = on;
+}
+#endif
+
+
+#ifdef mkinit
+
+SHELLPROC {
+      backgndpid = -1;
+#if JOBS
+      jobctl = 0;
+#endif
+}
+
+#endif
+
+
+
+#if JOBS
+fgcmd(argc, argv)  char **argv; {
+      struct job *jp;
+      int pgrp;
+      int status;
+
+      jp = getjob(argv[1]);
+      if (jp->jobctl == 0)
+            error("job not created under job control");
+      pgrp = jp->ps[0].pid;
+      ioctl(2, TIOCSPGRP, (char *)&pgrp);
+      restartjob(jp);
+      INTOFF;
+      status = waitforjob(jp);
+      INTON;
+      return status;
+}
+
+
+bgcmd(argc, argv)  char **argv; {
+      struct job *jp;
+
+      do {
+	    jp = getjob(*++argv);
+	    if (jp->jobctl == 0)
+		  error("job not created under job control");
+	    restartjob(jp);
+      } while (--argc > 1);
+      return 0;
+}
+
+
+STATIC void
+restartjob(jp)
+      struct job *jp;
+      {
+      struct procstat *ps;
+      int i;
+
+      if (jp->state == JOBDONE)
+            return;
+      INTOFF;
+      killpg(jp->ps[0].pid, SIGCONT);
+      for (ps = jp->ps, i = jp->nprocs ; --i >= 0 ; ps++) {
+            if ((ps->status & 0377) == 0177) {
+                  ps->status = -1;
+                  jp->state = 0;
+            }
+      }
+      INTON;
+}
+#endif
+
+
+int
+jobscmd(argc, argv)  char **argv; {
+      showjobs(0);
+      return 0;
+}
+
+
+/*
+ * Print a list of jobs.  If "change" is nonzero, only print jobs whose
+ * statuses have changed since the last call to showjobs.
+ *
+ * If the shell is interrupted in the process of creating a job, the
+ * result may be a job structure containing zero processes.  Such structures
+ * will be freed here.
+ */
+
+void
+showjobs(change) {
+      int jobno;
+      int procno;
+      int i;
+      struct job *jp;
+      struct procstat *ps;
+      int col;
+      char s[64];
+
+      TRACE(("showjobs(%d) called\n", change));
+      while (dowait(0, (struct job *)NULL) > 0);
+      for (jobno = 1, jp = jobtab ; jobno <= njobs ; jobno++, jp++) {
+	    if (! jp->used)
+		  continue;
+	    if (jp->nprocs == 0) {
+                  freejob(jp);
+		  continue;
+	    }
+	    if (change && ! jp->changed)
+		  continue;
+	    procno = jp->nprocs;
+	    for (ps = jp->ps ; ; ps++) {	/* for each process */
+		  if (ps == jp->ps)
+			fmtstr(s, 64, "[%d] %d ", jobno, ps->pid);
+		  else
+			fmtstr(s, 64, "    %d ", ps->pid);
+		  out1str(s);
+		  col = strlen(s);
+		  s[0] = '\0';
+		  if (ps->status == -1) {
+			/* don't print anything */
+		  } else if ((ps->status & 0xFF) == 0) {
+			fmtstr(s, 64, "Exit %d", ps->status >> 8);
+		  } else {
+			i = ps->status;
+#if JOBS
+			if ((i & 0xFF) == 0177)
+			      i >>= 8;
+#endif
+			if ((i & 0x7F) <= MAXSIG && sigmesg[i & 0x7F])
+			      scopy(sigmesg[i & 0x7F], s);
+			else
+			      fmtstr(s, 64, "Signal %d", i & 0x7F);
+			if (i & 0x80)
+			      strcat(s, " (core dumped)");
+		  }
+		  out1str(s);
+		  col += strlen(s);
+		  do {
+			out1c(' ');
+			col++;
+		  } while (col < 30);
+		  out1str(ps->cmd);
+		  out1c('\n');
+		  if (--procno <= 0)
+			break;
+	    }
+	    jp->changed = 0;
+	    if (jp->state == JOBDONE) {
+		  freejob(jp);
+	    }
+      }
+}
+
+
+/*
+ * Mark a job structure as unused.
+ */
+
+STATIC void
+freejob(jp)
+      struct job *jp;
+      {
+      struct procstat *ps;
+      int i;
+
+      INTOFF;
+      for (i = jp->nprocs, ps = jp->ps ; --i >= 0 ; ps++) {
+	    if (ps->cmd != nullstr)
+		  ckfree(ps->cmd);
+      }
+      if (jp->ps != &jp->ps0)
+	    ckfree(jp->ps);
+      jp->used = 0;
+#if JOBS
+      if (curjob == jp - jobtab + 1)
+	    curjob = 0;
+#endif
+      INTON;
+}
+
+
+
+int
+waitcmd(argc, argv)  char **argv; {
+      struct job *job;
+      int status;
+      struct job *jp;
+
+      if (argc > 1) {
+            job = getjob(argv[1]);
+      } else {
+	    job = NULL;
+      }
+      for (;;) {	/* loop until process terminated or stopped */
+            if (job != NULL) {
+                  if (job->state) {
+			status = job->ps[job->nprocs - 1].status;
+			if ((status & 0xFF) == 0)
+			      status = status >> 8 & 0xFF;
+#if JOBS
+			else if ((status & 0xFF) == 0177)
+			      status = (status >> 8 & 0x7F) + 128;
+#endif
+			else
+			      status = (status & 0x7F) + 128;
+			if (! iflag)
+			      freejob(job);
+                        return status;
+		  }
+	    } else {
+		  for (jp = jobtab ; ; jp++) {
+			if (jp >= jobtab + njobs) {	/* no running procs */
+			      return 0;
+			}
+			if (jp->used && jp->state == 0)
+			      break;
+		  }
+            }
+            dowait(1, (struct job *)NULL);
+      }
+}
+
+
+
+jobidcmd(argc, argv)  char **argv; {
+      struct job *jp;
+      int i;
+
+      jp = getjob(argv[1]);
+      for (i = 0 ; i < jp->nprocs ; ) {
+	    out1fmt("%d", jp->ps[i].pid);
+	    out1c(++i < jp->nprocs? ' ' : '\n');
+      }
+      return 0;
+}
+
+
+
+/*
+ * Convert a job name to a job structure.
+ */
+
+STATIC struct job *
+getjob(name)
+      char *name;
+      {
+      int jobno;
+      register struct job *jp;
+      int pid;
+      int i;
+
+      if (name == NULL) {
+#if JOBS
+currentjob:
+	    if ((jobno = curjob) == 0 || jobtab[jobno - 1].used == 0)
+		  error("No current job");
+	    return &jobtab[jobno - 1];
+#else
+	    error("No current job");
+#endif
+      } else if (name[0] == '%') {
+	    if (is_digit(name[1])) {
+		  jobno = number(name + 1);
+		  if (jobno > 0 && jobno <= njobs
+		   && jobtab[jobno - 1].used != 0)
+			return &jobtab[jobno - 1];
+#if JOBS
+	    } else if (name[1] == '%' && name[2] == '\0') {
+		  goto currentjob;
+#endif
+	    } else {
+		  register struct job *found = NULL;
+		  for (jp = jobtab, i = njobs ; --i >= 0 ; jp++) {
+			if (jp->used && jp->nprocs > 0
+			 && prefix(name + 1, jp->ps[0].cmd)) {
+			      if (found)
+				    error("%s: ambiguous", name);
+			      found = jp;
+			}
+		  }
+		  if (found)
+			return found;
+	    }
+      } else if (is_number(name)) {
+	    pid = number(name);
+	    for (jp = jobtab, i = njobs ; --i >= 0 ; jp++) {
+		  if (jp->used && jp->nprocs > 0
+		   && jp->ps[jp->nprocs - 1].pid == pid)
+			return jp;
+	    }
+      }
+      error("No such job: %s", name);
+}
+
+
+
+/*
+ * Return a new job structure,
+ */
+
+struct job *
+makejob(node, nprocs)
+      union node *node;
+      {
+      int i;
+      struct job *jp;
+
+      for (i = njobs, jp = jobtab ; ; jp++) {
+            if (--i < 0) {
+		  INTOFF;
+                  if (njobs == 0) {
+                        jobtab = ckmalloc(4 * sizeof jobtab[0]);
+                  } else {
+                        jp = ckmalloc((njobs + 4) * sizeof jobtab[0]);
+                        bcopy(jobtab, jp, njobs * sizeof jp[0]);
+                        ckfree(jobtab);
+                        jobtab = jp;
+                  }
+                  jp = jobtab + njobs;
+                  for (i = 4 ; --i >= 0 ; jobtab[njobs++].used = 0);
+		  INTON;
+                  break;
+            }
+            if (jp->used == 0)
+                  break;
+      }
+      INTOFF;
+      jp->state = 0;
+      jp->used = 1;
+      jp->changed = 0;
+      jp->nprocs = 0;
+#if JOBS
+      jp->jobctl = jobctl;
+#endif
+      if (nprocs > 1) {
+            jp->ps = ckmalloc(nprocs * sizeof (struct procstat));
+      } else {
+            jp->ps = &jp->ps0;
+      }
+      INTON;
+      TRACE(("makejob(0x%x, %d) returns %%%d\n", (int)node, nprocs, jp - jobtab + 1));
+      return jp;
+}	
+
+
+/*
+ * Fork of a subshell.  If we are doing job control, give the subshell its
+ * own process group.  Jp is a job structure that the job is to be added to.
+ * N is the command that will be evaluated by the child.  Both jp and n may
+ * be NULL.  The mode parameter can be one of the following:
+ *	FORK_FG - Fork off a foreground process.
+ *	FORK_BG - Fork off a background process.
+ *	FORK_NOJOB - Like FORK_FG, but don't give the process its own
+ *		     process group even if job control is on.
+ *
+ * When job control is turned off, background processes have their standard
+ * input redirected to /dev/null (except for the second and later processes
+ * in a pipeline).
+ */
+
+int
+forkshell(jp, n, mode)
+      union node *n;
+      struct job *jp;
+      {
+      int pid;
+      int pgrp;
+
+      TRACE(("forkshell(%%%d, 0x%x, %d) called\n", jp - jobtab, (int)n, mode));
+      INTOFF;
+      pid = fork();
+      if (pid == -1) {
+            TRACE(("Fork failed, errno=%d\n", errno));
+            INTON;
+            error("Cannot fork");
+      }
+      if (pid == 0) {
+	    struct job *p;
+            int wasroot;
+	    int i;
+
+            TRACE(("Child shell %d\n", getpid()));
+	    wasroot = rootshell;
+            rootshell = 0;
+	    for (i = njobs, p = jobtab ; --i >= 0 ; p++)
+		  if (p->used)
+			freejob(p);
+	    closescript();
+            INTON;
+	    clear_traps();
+#if JOBS
+	    jobctl = 0;		/* do job control only in root shell */
+            if (wasroot && mode != FORK_NOJOB && jflag) {
+                  if (jp == NULL || jp->nprocs == 0)
+                        pgrp = getpid();
+                  else
+                        pgrp = jp->ps[0].pid;
+                  if (mode == FORK_FG) {
+                        if (ioctl(2, TIOCSPGRP, (char *)&pgrp) < 0)
+                              error("TIOCSPGRP failed, errno=%d\n", errno);
+                  }
+                  setpgrp(0, pgrp);
+                  setsignal(SIGTSTP);
+                  setsignal(SIGTTOU);
+            } else if (mode == FORK_BG) {
+		  ignoresig(SIGINT);
+		  ignoresig(SIGQUIT);
+		  if (jp == NULL || jp->nprocs == 0) {
+			close(0);
+			if (open("/dev/null", O_RDONLY) != 0)
+			      error("Can't open /dev/null");
+		  }
+	    }
+#else
+	    if (mode == FORK_BG) {
+		  ignoresig(SIGINT);
+		  ignoresig(SIGQUIT);
+		  if (jp == NULL || jp->nprocs == 0) {
+			close(0);
+			if (open("/dev/null", O_RDONLY) != 0)
+			      error("Can't open /dev/null");
+		  }
+	    }
+#endif
+            if (wasroot && iflag) {
+                  setsignal(SIGINT);
+                  setsignal(SIGQUIT);
+                  setsignal(SIGTERM);
+            }
+            return pid;
+      }
+      if (mode == FORK_BG)
+            backgndpid = pid;		/* set $! */
+      if (jp) {
+	    struct procstat *ps = &jp->ps[jp->nprocs++];
+            ps->pid = pid;
+	    ps->status = -1;
+	    ps->cmd = nullstr;
+	    if (iflag && rootshell && n)
+		  ps->cmd = commandtext(n);
+      }
+      INTON;
+      TRACE(("In parent shell:  child = %d\n", pid));
+      return pid;
+}
+
+
+
+/*
+ * Wait for job to finish.
+ *
+ * Under job control we have the problem that while a child process is
+ * running interrupts generated by the user are sent to the child but not
+ * to the shell.  This means that an infinite loop started by an inter-
+ * active user may be hard to kill.  With job control turned off, an
+ * interactive user may place an interactive program inside a loop.  If
+ * the interactive program catches interrupts, the user doesn't want
+ * these interrupts to also abort the loop.  The approach we take here
+ * is to have the shell ignore interrupt signals while waiting for a
+ * forground process to terminate, and then send itself an interrupt
+ * signal if the child process was terminated by an interrupt signal.
+ * Unfortunately, some programs want to do a bit of cleanup and then
+ * exit on interrupt; unless these processes terminate themselves by
+ * sending a signal to themselves (instead of calling exit) they will
+ * confuse this approach.
+ */
+
+int
+waitforjob(jp)
+      register struct job *jp;
+      {
+#if JOBS
+      int mypgrp = getpgrp(0);
+#endif
+      int status;
+      int st;
+
+      INTOFF;
+      TRACE(("waitforjob(%%%d) called\n", jp - jobtab + 1));
+      while (jp->state == 0) {
+            dowait(1, jp);
+      }
+#if JOBS
+      if (jp->jobctl) {
+            if (ioctl(2, TIOCSPGRP, (char *)&mypgrp) < 0)
+                  error("TIOCSPGRP failed, errno=%d\n", errno);
+      }
+      if (jp->state == JOBSTOPPED)
+	    curjob = jp - jobtab + 1;
+#endif
+      status = jp->ps[jp->nprocs - 1].status;
+      /* convert to 8 bits */
+      if ((status & 0xFF) == 0)
+            st = status >> 8 & 0xFF;
+#if JOBS
+      else if ((status & 0xFF) == 0177)
+            st = (status >> 8 & 0x7F) + 128;
+#endif
+      else
+            st = (status & 0x7F) + 128;
+      if (! JOBS || jp->state == JOBDONE)
+	    freejob(jp);
+      CLEAR_PENDING_INT;
+      if ((status & 0x7F) == SIGINT)
+	    kill(getpid(), SIGINT);
+      INTON;
+      return st;
+}
+
+
+
+/*
+ * Wait for a process to terminate.
+ */
+
+STATIC int
+dowait(block, job)
+      struct job *job;
+      {
+      int pid;
+      int status;
+      struct procstat *sp;
+      struct job *jp;
+      struct job *thisjob;
+      int done;
+      int stopped;
+      int core;
+
+      TRACE(("dowait(%d) called\n", block));
+      do {
+            pid = waitproc(block, &status);
+            TRACE(("wait returns %d, status=%d\n", pid, status));
+      } while (pid == -1 && errno == EINTR);
+      if (pid <= 0)
+            return pid;
+      INTOFF;
+      thisjob = NULL;
+      for (jp = jobtab ; jp < jobtab + njobs ; jp++) {
+            if (jp->used) {
+                  done = 1;
+                  stopped = 1;
+                  for (sp = jp->ps ; sp < jp->ps + jp->nprocs ; sp++) {
+                        if (sp->pid == -1)
+                              continue;
+                        if (sp->pid == pid) {
+                              TRACE(("Changin status of proc %d from 0x%x to 0x%x\n", pid, sp->status, status));
+                              sp->status = status;
+                              thisjob = jp;
+                        }
+                        if (sp->status == -1)
+                              stopped = 0;
+                        else if ((sp->status & 0377) == 0177)
+                              done = 0;
+                  }
+                  if (stopped) {		/* stopped or done */
+                        int state = done? JOBDONE : JOBSTOPPED;
+                        if (jp->state != state) {
+                              TRACE(("Job %d: changing state from %d to %d\n", jp - jobtab + 1, jp->state, state));
+                              jp->state = state;
+#if JOBS
+			      if (done && curjob == jp - jobtab + 1)
+				    curjob = 0;		/* no current job */
+#endif
+                        }
+                  }
+            }
+      }
+      INTON;
+      if (! rootshell || ! iflag || (job && thisjob == job)) {
+#if JOBS
+	    if ((status & 0xFF) == 0177)
+		  status >>= 8;
+#endif
+            core = status & 0x80;
+            status &= 0x7F;
+            if (status != 0 && status != SIGINT && status != SIGPIPE) {
+		  if (thisjob != job)
+			outfmt(out2, "%d: ", pid);
+#if JOBS
+		  if (status == SIGTSTP && rootshell && iflag)
+			outfmt(out2, "%%%d ", job - jobtab + 1);
+#endif
+		  if (status <= MAXSIG && sigmesg[status])
+			out2str(sigmesg[status]);
+		  else
+			outfmt(out2, "Signal %d", status);
+		  if (core)
+			out2str(" - core dumped");
+                  out2c('\n');
+                  flushout(&errout);
+            } else {
+                  TRACE(("Not printing status: status=%d\n", status));
+            }
+      } else {
+	    TRACE(("Not printing status, rootshell=%d, job=0x%x\n", rootshell, job));
+	    if (thisjob)
+		  thisjob->changed = 1;
+      }
+      return pid;
+}
+
+
+
+/*
+ * Do a wait system call.  If job control is compiled in, we accept
+ * stopped processes.  If block is zero, we return a value of zero
+ * rather than blocking.
+ *
+ * System V doesn't have a non-blocking wait system call.  It does
+ * have a SIGCLD signal that is sent to a process when one of it's
+ * children dies.  The obvious way to use SIGCLD would be to install
+ * a handler for SIGCLD which simply bumped a counter when a SIGCLD
+ * was received, and have waitproc bump another counter when it got
+ * the status of a process.  Waitproc would then know that a wait
+ * system call would not block if the two counters were different.
+ * This approach doesn't work because if a process has children that
+ * have not been waited for, System V will send it a SIGCLD when it
+ * installs a signal handler for SIGCLD.  What this means is that when
+ * a child exits, the shell will be sent SIGCLD signals continuously
+ * until is runs out of stack space, unless it does a wait call before
+ * restoring the signal handler.  The code below takes advantage of
+ * this (mis)feature by installing a signal handler for SIGCLD and
+ * then checking to see whether it was called.  If there are any
+ * children to be waited for, it will be.
+ *
+ * If neither SYSV nor BSD is defined, we don't implement nonblocking
+ * waits at all.  In this case, the user will not be informed when
+ * a background process until the next time she runs a real program
+ * (as opposed to running a builtin command or just typing return),
+ * and the jobs command may give out of date information.
+ */
+
+#ifdef SYSV
+STATIC int gotsigchild;
+
+STATIC int onsigchild() {
+      gotsigchild = 1;
+}
+#endif
+
+
+STATIC int
+waitproc(block, status)
+      int *status;
+      {
+#ifdef BSD
+      int flags;
+
+#if JOBS
+      flags = WUNTRACED;
+#else
+      flags = 0;
+#endif
+      if (block == 0)
+            flags |= WNOHANG;
+      return wait3((union wait *)status, flags, (struct rusage *)NULL);
+#else
+#ifdef SYSV
+      int (*save)();
+
+      if (block == 0) {
+            gotsigchild = 0;
+            save = signal(SIGCLD, onsigchild);
+            signal(SIGCLD, save);
+            if (gotsigchild == 0)
+                  return 0;
+      }
+      return wait(status);
+#else
+      if (block == 0)
+            return 0;
+      return wait(status);
+#endif
+#endif
+}
+
+
+
+/*
+ * Return a string identifying a command (to be printed by the
+ * jobs command.
+ */
+
+STATIC char *cmdnextc;
+STATIC int cmdnleft;
+STATIC void cmdtxt(), cmdputs();
+
+STATIC char *
+commandtext(n)
+      union node *n;
+      {
+      char *name;
+
+      cmdnextc = name = ckmalloc(50);
+      cmdnleft = 50 - 4;
+      cmdtxt(n);
+      *cmdnextc = '\0';
+      return name;
+}
+
+
+STATIC void
+cmdtxt(n)
+      union node *n;
+      {
+      union node *np;
+      struct nodelist *lp;
+      char *p;
+      int i;
+      char s[2];
+
+      switch (n->type) {
+      case NSEMI:
+            cmdtxt(n->nbinary.ch1);
+            cmdputs("; ");
+            cmdtxt(n->nbinary.ch2);
+            break;
+      case NAND:
+            cmdtxt(n->nbinary.ch1);
+            cmdputs(" && ");
+            cmdtxt(n->nbinary.ch2);
+            break;
+      case NOR:
+            cmdtxt(n->nbinary.ch1);
+            cmdputs(" || ");
+            cmdtxt(n->nbinary.ch2);
+            break;
+      case NPIPE:
+            for (lp = n->npipe.cmdlist ; lp ; lp = lp->next) {
+                  cmdtxt(lp->n);
+                  if (lp->next)
+                        cmdputs(" | ");
+            }
+            break;
+      case NSUBSHELL:
+	    cmdputs("(");
+	    cmdtxt(n->nredir.n);
+	    cmdputs(")");
+	    break;
+      case NREDIR:
+      case NBACKGND:
+	    cmdtxt(n->nredir.n);
+	    break;
+      case NIF:
+            cmdputs("if ");
+            cmdtxt(n->nif.test);
+            cmdputs("; then ");
+            cmdtxt(n->nif.ifpart);
+            cmdputs("...");
+            break;
+      case NWHILE:
+            cmdputs("while ");
+            goto until;
+      case NUNTIL:
+            cmdputs("until ");
+until:
+            cmdtxt(n->nbinary.ch1);
+            cmdputs("; do ");
+            cmdtxt(n->nbinary.ch2);
+            cmdputs("; done");
+            break;
+      case NFOR:
+            cmdputs("for ");
+            cmdputs(n->nfor.var);
+            cmdputs(" in ...");
+            break;
+      case NCASE:
+            cmdputs("case ");
+            cmdputs(n->ncase.expr->narg.text);
+            cmdputs(" in ...");
+            break;
+      case NDEFUN:
+            cmdputs(n->narg.text);
+            cmdputs("() ...");
+            break;
+      case NCMD:
+            for (np = n->ncmd.args ; np ; np = np->narg.next) {
+                  cmdtxt(np);
+                  if (np->narg.next)
+                        cmdputs(" ");
+            }
+            for (np = n->ncmd.redirect ; np ; np = np->nfile.next) {
+                  cmdputs(" ");
+                  cmdtxt(np);
+            }
+            break;
+      case NARG:
+            cmdputs(n->narg.text);
+            break;
+      case NTO:
+            p = ">";  i = 1;  goto redir;
+      case NAPPEND:
+            p = ">>";  i = 1;  goto redir;
+      case NTOFD:
+            p = ">&";  i = 1;  goto redir;
+      case NFROM:
+            p = "<";  i = 0;  goto redir;
+      case NFROMFD:
+            p = "<&";  i = 0;  goto redir;
+redir:
+            if (n->nfile.fd != i) {
+                  s[0] = n->nfile.fd + '0';
+                  s[1] = '\0';
+                  cmdputs(s);
+            }
+            cmdputs(p);
+            if (n->type == NTOFD || n->type == NFROMFD) {
+                  s[0] = n->ndup.dupfd + '0';
+                  s[1] = '\0';
+                  cmdputs(s);
+            } else {
+                  cmdtxt(n->nfile.fname);
+            }
+            break;
+      case NHERE:
+      case NXHERE:
+            cmdputs("<<...");
+	    break;
+      default:
+            cmdputs("???");
+            break;
+      }
+}
+
+
+
+STATIC void
+cmdputs(s)
+      char *s;
+      {
+      register char *p, *q;
+      register char c;
+      int subtype = 0;
+
+      if (cmdnleft <= 0)
+            return;
+      p = s;
+      q = cmdnextc;
+      while ((c = *p++) != '\0') {
+            if (c == CTLESC)
+                  *q++ = *p++;
+            else if (c == CTLVAR) {
+                  *q++ = '$';
+		  if (--cmdnleft > 0)
+			*q++ = '{';
+		  subtype = *p++;
+	    } else if (c == '=' && subtype != 0) {
+		  *q++ = "}-+?="[(subtype & VSTYPE) - VSNORMAL];
+		  subtype = 0;
+	    } else if (c == CTLENDVAR) {
+		  *q++ = '}';
+            } else if (c == CTLBACKQ | c == CTLBACKQ+CTLQUOTE)
+                  cmdnleft++;		/* ignore it */
+            else
+                  *q++ = c;
+            if (--cmdnleft <= 0) {
+                  *q++ = '.';
+                  *q++ = '.';
+                  *q++ = '.';
+                  break;
+            }
+      }
+      cmdnextc = q;
+}
+EOF
+if test `wc -c < jobs.c` -ne 24668
+then	echo 'jobs.c is the wrong size'
+fi
+echo extracting machdep.h
+cat > machdep.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/*
+ * Most machines require the value returned from malloc to be aligned
+ * in some way.  The following macro will get this right on many machines.
+ */
+
+#ifndef ALIGN
+union align {
+      int i;
+      char *cp;
+};
+
+#define ALIGN(nbytes)	((nbytes) + sizeof(union align) - 1 &~ (sizeof(union align) - 1))
+#endif
+EOF
+if test `wc -c < machdep.h` -ne 525
+then	echo 'machdep.h is the wrong size'
+fi
+echo extracting mail.h
+cat > mail.h <<\EOF
+#ifdef __STDC__
+void chkmail(int);
+#else
+void chkmail();
+#endif
+EOF
+if test `wc -c < mail.h` -ne 64
+then	echo 'mail.h is the wrong size'
+fi
+echo extracting mail.c
+cat > mail.c <<\EOF
+/*
+ * Routines to check for mail.  (Perhaps make part of main.c?)
+ */
+
+#include "shell.h"
+#include "exec.h"	/* defines padvance() */
+#include "var.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include <sys/types.h>
+#include <sys/stat.h>
+
+
+#define MAXMBOXES 10
+
+
+STATIC int nmboxes;			/* number of mailboxes */
+STATIC time_t mailtime[MAXMBOXES];	/* times of mailboxes */
+
+
+
+/*
+ * Print appropriate message(s) if mail has arrived.  If the argument is
+ * nozero, then the value of MAIL has changed, so we just update the
+ * values.
+ */
+
+void
+chkmail(silent) {
+      register int i;
+      char *mpath;
+      char *p;
+      register char *q;
+      struct stackmark smark;
+      struct stat statb;
+
+      if (silent)
+	    nmboxes = 10;
+      if (nmboxes == 0)
+	    return;
+      setstackmark(&smark);
+      mpath = mpathset()? mpathval() : mailval();
+      for (i = 0 ; i < nmboxes ; i++) {
+	    p = padvance(&mpath, nullstr);
+	    if (p == NULL)
+		  break;
+	    if (*p == '\0')
+		  continue;
+	    for (q = p ; *q ; q++);
+	    if (q[-1] != '/')
+		  abort();
+	    q[-1] = '\0';			/* delete trailing '/' */
+#ifdef notdef /* this is what the System V shell claims to do (it lies) */
+	    if (stat(p, &statb) < 0)
+		  statb.st_mtime = 0;
+	    if (statb.st_mtime > mailtime[i] && ! silent) {
+		  out2str(pathopt? pathopt : "you have mail");
+		  out2c('\n');
+	    }
+	    mailtime[i] = statb.st_mtime;
+#else /* this is what it should do */
+	    if (stat(p, &statb) < 0)
+		  statb.st_size = 0;
+	    if (statb.st_size > mailtime[i] && ! silent) {
+		  out2str(pathopt? pathopt : "you have mail");
+		  out2c('\n');
+	    }
+	    mailtime[i] = statb.st_size;
+#endif
+      }
+      nmboxes = i;
+      popstackmark(&smark);
+}
+EOF
+if test `wc -c < mail.c` -ne 1722
+then	echo 'mail.c is the wrong size'
+fi
+echo extracting main.h
+cat > main.h <<\EOF
+extern int rootpid;		/* pid of main shell */
+extern int rootshell;		/* true if we aren't a child of the main shell */
+
+#ifdef __STDC__
+void readcmdfile(char *);
+void cmdloop(int);
+#else
+void readcmdfile();
+void cmdloop();
+#endif
+EOF
+if test `wc -c < main.h` -ne 229
+then	echo 'main.h is the wrong size'
+fi
+echo extracting main.c
+cat > main.c <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+
+#include <signal.h>
+#include <fcntl.h>
+#include "shell.h"
+#include "main.h"
+#include "mail.h"
+#include "options.h"
+#include "output.h"
+#include "parser.h"
+#include "nodes.h"
+#include "eval.h"
+#include "jobs.h"
+#include "input.h"
+#include "trap.h"
+#if ATTY
+#include "var.h"
+#endif
+#include "memalloc.h"
+#include "error.h"
+#include "init.h"
+#include "mystring.h"
+
+#define PROFILE 0
+
+const char copyright[] = "@(#)Copyright 1989 by Kenneth Almquist";
+int rootpid;
+int rootshell;
+STATIC union node *curcmd;
+STATIC union node *prevcmd;
+extern int errno;
+#if PROFILE
+short profile_buf[16384];
+extern int etext();
+#endif
+
+#ifdef __STDC__
+STATIC void read_profile(char *);
+char *getenv(char *);
+#else
+STATIC void read_profile();
+char *getenv();
+#endif
+
+
+/*
+ * Main routine.  We initialize things, parse the arguments, execute
+ * profiles if we're a login shell, and then call cmdloop to execute
+ * commands.  The setjmp call sets up the location to jump to when an
+ * exception occurs.  When an exception occurs the variable "state"
+ * is used to figure out how far we had gotten.
+ */
+
+main(argc, argv)  char **argv; {
+      struct jmploc jmploc;
+      struct stackmark smark;
+      volatile int state;
+      char *shinit;
+
+#if PROFILE
+      monitor(4, etext, profile_buf, sizeof profile_buf, 50);
+#endif
+      state = 0;
+      if (setjmp(jmploc.loc)) {
+	    /*
+	     * When a shell procedure is executed, we raise the
+	     * exception EXSHELLPROC to clean up before executing
+	     * the shell procedure.
+	     */
+	    if (exception == EXSHELLPROC) {
+		  rootpid = getpid();
+		  rootshell = 1;
+		  minusc = NULL;
+		  state = 3;
+	    } else if (state == 0 || iflag == 0 || ! rootshell)
+		  exitshell(2);
+	    reset();
+#if ATTY
+	    if (exception == EXINT
+	     && (! attyset() || equal(termval(), "emacs"))) {
+#else
+	    if (exception == EXINT) {
+#endif
+		  out2c('\n');
+		  flushout(&errout);
+	    }
+	    popstackmark(&smark);
+	    FORCEINTON;				/* enable interrupts */
+	    if (state == 1)
+		  goto state1;
+	    else if (state == 2)
+		  goto state2;
+	    else
+		  goto state3;
+      }
+      handler = &jmploc;
+#ifdef DEBUG
+      opentrace();
+      trputs("Shell args:  ");  trargs(argv);
+#endif
+      rootpid = getpid();
+      rootshell = 1;
+      init();
+      setstackmark(&smark);
+      procargs(argc, argv);
+      if (argv[0] && argv[0][0] == '-') {
+	    state = 1;
+	    read_profile("/etc/profile");
+state1:
+	    state = 2;
+	    read_profile(".profile");
+      } else if ((sflag || minusc) && (shinit = getenv("SHINIT")) != NULL) {
+	    state = 2;
+	    evalstring(shinit);
+      }
+state2:
+      state = 3;
+      if (minusc) {
+	    evalstring(minusc);
+      }
+      if (sflag || minusc == NULL) {
+state3:
+	    cmdloop(1);
+      }
+#if PROFILE
+      monitor(0);
+#endif
+      exitshell(exitstatus);
+}
+
+
+/*
+ * Read and execute commands.  "Top" is nonzero for the top level command
+ * loop; it turns on prompting if the shell is interactive.
+ */
+
+void
+cmdloop(top) {
+      union node *n;
+      struct stackmark smark;
+      int inter;
+      int numeof;
+
+      TRACE(("cmdloop(%d) called\n", top));
+      setstackmark(&smark);
+      numeof = 0;
+      for (;;) {
+	    if (sigpending)
+		  dotrap();
+	    inter = 0;
+	    if (iflag && top) {
+		  inter++;
+		  showjobs(1);
+		  chkmail(0);
+		  flushout(&output);
+	    }
+	    n = parsecmd(inter);
+	    if (n == NEOF) {
+		  if (Iflag == 0 || numeof >= 50)
+			break;
+		  out2str("\nUse \"exit\" to leave ash.\n");
+		  numeof++;
+	    } else if (n != NULL && nflag == 0) {
+		  if (inter) {
+			INTOFF;
+			if (prevcmd)
+			      freefunc(prevcmd);
+			prevcmd = curcmd;
+			curcmd = copyfunc(n);
+			INTON;
+		  }
+		  evaltree(n, 0);
+#ifdef notdef
+		  if (exitstatus)				      /*DEBUG*/
+			outfmt(&errout, "Exit status 0x%X\n", exitstatus);
+#endif
+	    }
+	    popstackmark(&smark);
+      }
+      popstackmark(&smark);		/* unnecessary */
+}
+
+
+
+/*
+ * Read /etc/profile or .profile.  Return on error.
+ */
+
+STATIC void
+read_profile(name)
+      char *name;
+      {
+      int fd;
+
+      INTOFF;
+      if ((fd = open(name, O_RDONLY)) >= 0)
+	    setinputfd(fd, 1);
+      INTON;
+      if (fd < 0)
+	    return;
+      cmdloop(0);
+      popfile();
+}
+
+
+
+/*
+ * Read a file containing shell functions.
+ */
+
+void
+readcmdfile(name)
+      char *name;
+      {
+      int fd;
+
+      INTOFF;
+      if ((fd = open(name, O_RDONLY)) >= 0)
+	    setinputfd(fd, 1);
+      else
+	    error("Can't open %s", name);
+      INTON;
+      cmdloop(0);
+      popfile();
+}
+
+
+
+/*
+ * Take commands from a file.  To be compatable we should do a path
+ * search for the file, but a path search doesn't make any sense.
+ */
+
+dotcmd(argc, argv)  char **argv; {
+      exitstatus = 0;
+      if (argc >= 2) {		/* That's what SVR2 does */
+	    setinputfile(argv[1], 1);
+	    commandname = argv[1];
+	    cmdloop(0);
+	    popfile();
+      }
+      return exitstatus;
+}
+
+
+exitcmd(argc, argv)  char **argv; {
+      if (argc > 1)
+	    exitstatus = number(argv[1]);
+      exitshell(exitstatus);
+}
+
+
+lccmd(argc, argv)  char **argv; {
+      if (argc > 1) {
+	    defun(argv[1], prevcmd);
+	    return 0;
+      } else {
+	    INTOFF;
+	    freefunc(curcmd);
+	    curcmd = prevcmd;
+	    prevcmd = NULL;
+	    INTON;
+	    evaltree(curcmd, 0);
+	    return exitstatus;
+      }
+}
+
+
+
+#ifdef notdef
+/*
+ * Should never be called.
+ */
+
+void
+exit(exitstatus) {
+      _exit(exitstatus);
+}
+#endif
+EOF
+if test `wc -c < main.c` -ne 5561
+then	echo 'main.c is the wrong size'
+fi
+echo extracting makefile
+cat > makefile <<\EOF
+# Makefile for ash.
+#
+# Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+# This file is part of ash, which is distributed under the terms specified
+# by the Ash General Public License.  See the file named LICENSE.
+
+FILES=main.o options.o parser.o eval.o expand.o jobs.o redir.o exec.o\
+ builtins.o cd.o miscbltin.o mail.o var.o input.o output.o nodes.o syntax.o\
+ signames.o memalloc.o error.o trap.o show.o dirent.o mystring.o\
+ init.o
+
+CFILES=main.c options.c parser.c eval.c expand.c jobs.c redir.c exec.c\
+ builtins.c cd.c miscbltin.c mail.c var.c input.c output.c nodes.c syntax.c\
+ signames.c memalloc.c error.c trap.c show.c dirent.c mystring.c
+
+GENERATEDFILES=syntax.h syntax.c signames.h signames.c nodes.c nodes.c\
+ builtin.h builtin.c init.c token.def
+
+#MALLOC=mymalloc.o
+
+
+#CC=gcc
+DEBUG=-g
+CFLAGS=$(DEBUG)
+LDFLAGS=
+BLTIN=bltin
+
+
+all: make_bltin ash
+
+make_bltin:
+	cd bltin; make 'CC=$(CC)' 'DEBUG=$(DEBUG)'
+
+
+clean:
+	rm -f $(FILES)
+	rm -f $(GENERATEDFILES) mksyntax mksignames mknodes mkinit
+	rm -f bltin/bltinlib.a bltin/*.o bltin/operators.h bltin/operators.c
+
+clobber: clean
+	rm -f ash bltin/catf bltin/expr bltin/test 'bltin/[' bltin/echo bltin/line bltin/nlecho bltin/true bltin/: bltin/umask
+
+
+ash:$P $(FILES) $(BLTIN)/bltinlib.a $(MALLOC)
+	$(CC) -o temp $(LDFLAGS) $(DEBUG) $(FILES) $(BLTIN)/bltinlib.a $(MALLOC)
+#	ld -o temp crt0.o $(FILES) $(BLTIN)/bltinlib.a $(MALLOC) -lc
+	mv -f temp $@
+
+lint:
+	lint $(CFILES) init.c
+
+syntax.c syntax.h: mksyntax
+	./mksyntax
+
+mksyntax: mksyntax.c parser.h
+	$(CC) -o mksyntax mksyntax.c
+
+signames.c signames.h: mksignames
+	./mksignames
+
+mksignames: mksignames.c
+	$(CC) -o mksignames mksignames.c
+
+nodes.c nodes.h: mknodes nodetypes nodes.c.pat
+	./mknodes
+
+mknodes: mknodes.c
+	$(CC) -o mknodes -g mknodes.c
+
+token.def: mktokens
+	sh mktokens
+
+builtins.h builtins.c: mkbuiltins builtins
+	sh mkbuiltins
+	rm -f builtins.o
+
+.c:
+	echo make is confused, it but should recover
+
+init.o: mkinit $(CFILES)
+	./mkinit '$(CC) -c $(CFLAGS) init.c' $(CFILES)
+
+mkinit: mkinit.c
+	$(CC) -o mkinit mkinit.c
+
+
+cd.o: shell.h var.h nodes.h jobs.h options.h output.h memalloc.h error.h\
+	mystring.h
+dirent.o: shell.h mydirent.h
+eval.o: shell.h nodes.h syntax.h expand.h parser.h jobs.h eval.h builtins.h\
+	options.h exec.h redir.h input.h output.h trap.h var.h memalloc.h\
+	error.h mystring.h
+error.o: shell.h main.h options.h output.h error.h
+exec.o: shell.h main.h nodes.h parser.h redir.h eval.h exec.h builtins.h var.h\
+	options.h input.h output.h memalloc.h error.h init.h\
+	mystring.h
+expand.o: shell.h main.h nodes.h eval.h expand.h syntax.h parser.h jobs.h\
+	options.h var.h input.h output.h memalloc.h error.h\
+	mystring.h mydirent.h
+input.c: shell.h syntax.h input.h output.h memalloc.h error.h
+jobs.o: shell.h main.h parser.h nodes.h jobs.h options.h trap.h signames.h\
+	syntax.h input.h output.h memalloc.h error.h mystring.h
+mail.o: shell.h exec.h var.h output.h memalloc.h error.h
+main.o: shell.h mail.h options.h var.h output.h parser.h nodes.h eval.h jobs.h\
+	input.h trap.h error.h memalloc.h init.h
+memalloc.o: shell.h output.h memalloc.h error.h machdep.h mystring.h
+miscbltin.o: shell.h options.h var.h output.h memalloc.h error.h mystring.h
+mystring.o: shell.h syntax.h error.h mystring.h
+nodes.o: shell.h nodes.h memalloc.h machdep.h mystring.h
+options.o: shell.h options.h nodes.h eval.h jobs.h input.h output.h trap.h\
+	var.h memalloc.h error.h mystring.h
+output.o: shell.h syntax.h output.h memalloc.h error.h
+parser.o: shell.h parser.h nodes.h expand.h redir.h syntax.h options.h input.h\
+	output.h var.h error.h memalloc.h mystring.h token.def
+redir.o: shell.h nodes.h jobs.h expand.h redir.h output.h memalloc.h error.h
+show.o: shell.h parser.h nodes.h mystring.h
+syntax.o: shell.h syntax.h
+trap.o: shell.h main.h nodes.h eval.h jobs.h options.h syntax.h signames.h\
+	output.h memalloc.h error.h trap.h
+var.o: shell.h output.h expand.h nodes.h eval.h exec.h syntax.h mail.h\
+	options.h var.h memalloc.h error.h mystring.h
+EOF
+if test `wc -c < makefile` -ne 3992
+then	echo 'makefile is the wrong size'
+fi
+echo extracting memalloc.h
+cat > memalloc.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+struct stackmark {
+      struct stack_block *stackp;
+      char *stacknxt;
+      int stacknleft;
+};
+
+
+extern char *stacknxt;
+extern int stacknleft;
+extern int sstrnleft;
+extern int herefd;
+
+#ifdef __STDC__
+pointer ckmalloc(int);
+pointer ckrealloc(pointer, int);
+void free(pointer);		/* defined in C library */
+char *savestr(char *);
+pointer stalloc(int);
+void stunalloc(pointer);
+void setstackmark(struct stackmark *);
+void popstackmark(struct stackmark *);
+void growstackblock(void);
+void grabstackblock(int);
+char *growstackstr(void);
+char *makestrspace(void);
+void ungrabstackstr(char *, char *);
+#else
+pointer ckmalloc();
+pointer ckrealloc();
+void free();		/* defined in C library */
+char *savestr();
+pointer stalloc();
+void stunalloc();
+void setstackmark();
+void popstackmark();
+void growstackblock();
+void grabstackblock();
+char *growstackstr();
+char *makestrspace();
+void ungrabstackstr();
+#endif
+
+
+
+#define stackblock() stacknxt
+#define stackblocksize() stacknleft
+#define STARTSTACKSTR(p)	p = stackblock(), sstrnleft = stackblocksize()
+#define STPUTC(c, p)	(--sstrnleft >= 0? (*p++ = (c)) : (p = growstackstr(), *p++ = (c)))
+#define CHECKSTRSPACE(n, p)	if (sstrnleft < n) p = makestrspace(); else
+#define USTPUTC(c, p)	(--sstrnleft, *p++ = (c))
+#define STACKSTRNUL(p)	(sstrnleft == 0? (p = growstackstr(), *p = '\0') : (*p = '\0'))
+#define STUNPUTC(p)	(++sstrnleft, --p)
+#define STTOPC(p)	p[-1]
+#define STADJUST(amount, p)	(p += (amount), sstrnleft -= (amount))
+#define grabstackstr(p)	stalloc(stackblocksize() - sstrnleft)
+
+#define ckfree(p)	free((pointer)(p))
+EOF
+if test `wc -c < memalloc.h` -ne 1787
+then	echo 'memalloc.h is the wrong size'
+fi
+echo extracting memalloc.c
+cat > memalloc.c <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+#include "shell.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include "machdep.h"
+#include "mystring.h"
+
+
+
+/*
+ * Like malloc, but returns an error when out of space.
+ */
+
+pointer
+ckmalloc(nbytes) {
+      register pointer p;
+      pointer malloc();
+
+      if ((p = malloc(nbytes)) == NULL)
+	    error("Out of space");
+      return p;
+}
+
+
+/*
+ * Same for realloc.
+ */
+
+pointer
+ckrealloc(p, nbytes)
+      register pointer p;
+      {
+      pointer realloc();
+
+      if ((p = realloc(p, nbytes)) == NULL)
+	    error("Out of space");
+      return p;
+}
+
+
+/*
+ * Make a copy of a string in safe storage.
+ */
+
+char *
+savestr(s)
+      char *s;
+      {
+      register char *p;
+
+      p = ckmalloc(strlen(s) + 1);
+      scopy(s, p);
+      return p;
+}
+
+
+/*
+ * Parse trees for commands are allocated in lifo order, so we use a stack
+ * to make this more efficient, and also to avoid all sorts of exception
+ * handling code to handle interrupts in the middle of a parse.
+ *
+ * The size 504 was chosen because the Ultrix malloc handles that size
+ * well.
+ */
+
+#define MINSIZE 504		/* minimum size of a block */
+
+
+struct stack_block {
+      struct stack_block *prev;
+      char space[MINSIZE];
+};
+
+struct stack_block stackbase;
+struct stack_block *stackp = &stackbase;
+char *stacknxt = stackbase.space;
+int stacknleft = MINSIZE;
+int sstrnleft;
+int herefd = -1;
+
+
+
+pointer
+stalloc(nbytes) {
+      register char *p;
+
+      nbytes = ALIGN(nbytes);
+      if (nbytes > stacknleft) {
+	    int blocksize;
+	    struct stack_block *sp;
+
+	    blocksize = nbytes;
+	    if (blocksize < MINSIZE)
+		  blocksize = MINSIZE;
+	    INTOFF;
+	    sp = ckmalloc(sizeof(struct stack_block) - MINSIZE + blocksize);
+	    sp->prev = stackp;
+	    stacknxt = sp->space;
+	    stacknleft = blocksize;
+	    stackp = sp;
+	    INTON;
+      }
+      p = stacknxt;
+      stacknxt += nbytes;
+      stacknleft -= nbytes;
+      return p;
+}
+
+
+void
+stunalloc(p)
+      pointer p;
+      {
+      if (p == NULL) {		/*DEBUG */
+	    write(2, "stunalloc\n", 10);
+	    abort();
+      }
+      stacknleft += stacknxt - (char *)p;
+      stacknxt = p;
+}
+
+
+
+void
+setstackmark(mark)
+      struct stackmark *mark;
+      {
+      mark->stackp = stackp;
+      mark->stacknxt = stacknxt;
+      mark->stacknleft = stacknleft;
+}
+
+
+void
+popstackmark(mark)
+      struct stackmark *mark;
+      {
+      struct stack_block *sp;
+
+      INTOFF;
+      while (stackp != mark->stackp) {
+	    sp = stackp;
+	    stackp = sp->prev;
+	    ckfree(sp);
+      }
+      stacknxt = mark->stacknxt;
+      stacknleft = mark->stacknleft;
+      INTON;
+}
+
+
+/*
+ * When the parser reads in a string, it wants to stick the string on the
+ * stack and only adjust the stack pointer when it knows how big the
+ * string is.  Stackblock (defined in stack.h) returns a pointer to a block
+ * of space on top of the stack and stackblocklen returns the length of
+ * this block.  Growstackblock will grow this space by at least one byte,
+ * possibly moving it (like realloc).  Grabstackblock actually allocates the
+ * part of the block that has been used.
+ */
+
+void
+growstackblock() {
+      char *p;
+      int newlen = stacknleft * 2 + 100;
+      char *oldspace = stacknxt;
+      int oldlen = stacknleft;
+      struct stack_block *sp;
+
+      if (stacknxt == stackp->space && stackp != &stackbase) {
+	    INTOFF;
+	    sp = stackp;
+	    stackp = sp->prev;
+	    sp = ckrealloc((pointer)sp, sizeof(struct stack_block) - MINSIZE + newlen);
+	    sp->prev = stackp;
+	    stackp = sp;
+	    stacknxt = sp->space;
+	    stacknleft = newlen;
+	    INTON;
+      } else {
+	    p = stalloc(newlen);
+	    bcopy(oldspace, p, oldlen);
+	    stacknxt = p;			/* free the space */
+	    stacknleft += newlen;		/* we just allocated */
+      }
+}
+
+
+
+void
+grabstackblock(len) {
+      len = ALIGN(len);
+      stacknxt += len;
+      stacknleft -= len;
+}
+
+
+
+/*
+ * The following routines are somewhat easier to use that the above.
+ * The user declares a variable of type STACKSTR, which may be declared
+ * to be a register.  The macro STARTSTACKSTR initializes things.  Then
+ * the user uses the macro STPUTC to add characters to the string.  In
+ * effect, STPUTC(c, p) is the same as *p++ = c except that the stack is
+ * grown as necessary.  When the user is done, she can just leave the
+ * string there and refer to it using stackblock().  Or she can allocate
+ * the space for it using grabstackstr().  If it is necessary to allow
+ * someone else to use the stack temporarily and then continue to grow
+ * the string, the user should use grabstack to allocate the space, and
+ * then call ungrabstr(p) to return to the previous mode of operation.
+ *
+ * USTPUTC is like STPUTC except that it doesn't check for overflow.
+ * CHECKSTACKSPACE can be called before USTPUTC to ensure that there
+ * is space for at least one character.
+ */
+
+
+char *
+growstackstr() {
+      int len = stackblocksize();
+      if (herefd >= 0 && len >= 1024) {
+	    xwrite(herefd, stackblock(), len);
+	    sstrnleft = len - 1;
+	    return stackblock();
+      }
+      growstackblock();
+      sstrnleft = stackblocksize() - len - 1;
+      return stackblock() + len;
+}
+
+
+/*
+ * Called from CHECKSTRSPACE.
+ */
+
+char *
+makestrspace() {
+      int len = stackblocksize() - sstrnleft;
+      growstackblock();
+      sstrnleft = stackblocksize() - len;
+      return stackblock() + len;
+}
+
+
+
+void
+ungrabstackstr(s, p)
+      char *s;
+      char *p;
+      {
+      stacknleft += stacknxt - s;
+      stacknxt = s;
+      sstrnleft = stacknleft - (p - s);
+}
+EOF
+if test `wc -c < memalloc.c` -ne 5694
+then	echo 'memalloc.c is the wrong size'
+fi
+echo extracting miscbltin.c
+cat > miscbltin.c <<\EOF
+/*
+ * Miscelaneous builtins.
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+#include "shell.h"
+#include "options.h"
+#include "var.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include "mystring.h"
+
+#undef eflag
+
+extern char **argptr;		/* argument list for builtin command */
+
+
+/*
+ * The read builtin.  The -e option causes backslashes to escape the
+ * following character.
+ *
+ * This uses unbuffered input, which may be avoidable in some cases.
+ */
+
+readcmd(argc, argv)  char **argv; {
+      char **ap;
+      int backslash;
+      char c;
+      int eflag;
+      char *prompt;
+      char *ifs;
+      char *p;
+      int startword;
+      int status;
+      int i;
+
+      eflag = 0;
+      prompt = NULL;
+      while ((i = nextopt("ep:")) != '\0') {
+	    if (i == 'p')
+		  prompt = optarg;
+	    else
+		  eflag = 1;
+      }
+      if (prompt && isatty(0)) {
+	    out2str(prompt);
+	    flushall();
+      }
+      if ((ap = argptr) == NULL)
+	    error("arg count");
+      if ((ifs = bltinlookup("IFS", 1)) == NULL)
+	    ifs = nullstr;
+      status = 0;
+      startword = 1;
+      backslash = 0;
+      STARTSTACKSTR(p);
+      for (;;) {
+	    if (read(0, &c, 1) != 1) {
+		  status = 1;
+		  break;
+	    }
+	    if (c == '\0')
+		  continue;
+	    if (backslash) {
+		  backslash = 0;
+		  if (c != '\n')
+			STPUTC(c, p);
+		  continue;
+	    }
+	    if (eflag && c == '\\') {
+		  backslash++;
+		  continue;
+	    }
+	    if (c == '\n')
+		  break;
+	    if (startword && *ifs == ' ' && strchr(ifs, c)) {
+		  continue;
+	    }
+	    startword = 0;
+	    if (backslash && c == '\\') {
+		  if (read(0, &c, 1) != 1) {
+			status = 1;
+			break;
+		  }
+		  STPUTC(c, p);
+	    } else if (ap[1] != NULL && strchr(ifs, c) != NULL) {
+		  STACKSTRNUL(p);
+		  setvar(*ap, stackblock(), 0);
+		  ap++;
+		  startword = 1;
+		  STARTSTACKSTR(p);
+	    } else {
+		  STPUTC(c, p);
+	    }
+      }
+      STACKSTRNUL(p);
+      setvar(*ap, stackblock(), 0);
+      while (*++ap != NULL)
+	    setvar(*ap, nullstr, 0);
+      return status;
+}
+
+
+
+umaskcmd(argc, argv)  char **argv; {
+      int mask;
+      char *p;
+      int i;
+
+      if ((p = argv[1]) == NULL) {
+	    INTOFF;
+	    mask = umask(0);
+	    umask(mask);
+	    INTON;
+	    out1fmt("%.4o\n", mask);	/* %#o might be better */
+      } else {
+	    mask = 0;
+	    do {
+		  if ((unsigned)(i = *p - '0') >= 8)
+			error("Illegal number: %s", argv[1]);
+		  mask = (mask << 3) + i;
+	    } while (*++p != '\0');
+	    umask(mask);
+      }
+      return 0;
+}
+EOF
+if test `wc -c < miscbltin.c` -ne 2633
+then	echo 'miscbltin.c is the wrong size'
+fi
+echo extracting mkbuiltins
+cat > mkbuiltins <<\EOF
+# Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+# This file is part of ash, which is distributed under the terms specified
+# by the Ash General Public License.  See the file named LICENSE.
+
+temp=/tmp/ka$$
+havejobs=0
+if grep '^#define JOBS[	 ]*1' shell.h > /dev/null
+then	havejobs=1
+fi
+exec > builtins.c
+cat <<\!
+/*
+ * This file was generated by the mkbuiltins program.
+ */
+
+#include "shell.h"
+#include "builtins.h"
+
+!
+awk '/^[^#]/ {if('$havejobs' || $2 != "-j") print $0}' builtins |
+	sed 's/-j//' > $temp
+awk '{	printf "int %s();\n", $1}' $temp
+echo '
+int (*const builtinfunc[])() = {'
+awk '/^[^#]/ {	printf "\t%s,\n", $1}' $temp
+echo '};
+
+const struct builtincmd builtincmd[] = {'
+awk '{	for (i = 2 ; i <= NF ; i++) {
+		printf "\t\"%s\", %d,\n",  $i, NR-1
+	}}' $temp
+echo '	NULL, 0
+};'
+
+exec > builtins.h
+cat <<\!
+/*
+ * This file was generated by the mkbuiltins program.
+ */
+
+!
+tr abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ < $temp |
+	awk '{	printf "#define %s %d\n", $1, NR-1}'
+echo '
+struct builtincmd {
+      char *name;
+      int code;
+};
+
+extern int (*const builtinfunc[])();
+extern const struct builtincmd builtincmd[];'
+rm -f $temp
+EOF
+if test `wc -c < mkbuiltins` -ne 1168
+then	echo 'mkbuiltins is the wrong size'
+fi
+echo Archive 4 unpacked
+exit
+

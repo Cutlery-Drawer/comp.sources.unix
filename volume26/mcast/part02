@@ -1,0 +1,3125 @@
+Newsgroups: comp.sources.unix
+From: casey@gauss.llnl.gov (Casey Leedom)
+Subject: v26i106: mcast - LLNL IP multicast implementation, V1.2.3, Part02/04
+Sender: unix-sources-moderator@vix.com
+Approved: paul@vix.com
+
+Submitted-By: casey@gauss.llnl.gov (Casey Leedom)
+Posting-Number: Volume 26, Issue 106
+Archive-Name: mcast/part02
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 4)."
+# Contents:  libmcast/_mc_write.c libmcast/mc_bind.c
+#   libmcast/mc_connect.c libmcast/mc_fcntl.c libmcast/mc_lib.h
+#   libmcast/mc_sendto.c libmcast/mc_socket.c
+#   libmcast/mcast_getgroupbyname.c libmcast/mcast_newaddr.c
+#   libmcast/mcast_sopen.c man/mc_bind.2 man/mc_connect.2
+#   man/mc_fcntl.2 man/mc_getpeername.2 man/mc_getsockname.2
+#   man/mc_ioctl.2 man/mc_write.2 man/mcast_getgroupbyname.3
+#   test/mc_clock.c test/mc_listen.c test/mc_send.c
+# Wrapped by vixie@gw.home.vix.com on Tue Apr  6 12:49:47 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'libmcast/_mc_write.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/_mc_write.c'\"
+else
+echo shar: Extracting \"'libmcast/_mc_write.c'\" \(4437 characters\)
+sed "s/^X//" >'libmcast/_mc_write.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/_mc_write.c,v 1.4 93/01/16 19:37:43 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/_mc_write.c,v 1.4 93/01/16 19:37:43 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST SYSLIB PRIVATE: _mc_write helper routine.
+X */
+X
+X
+X#include "mc_lib.h"
+X
+X
+static void	SigPipe(int);		/* dead server signal */
+static jmp_buf	deadserver;		/* where to go if the server dies */
+X
+int
+X_mc_write(int s, const void *buf, size_t len, int flags, const mc_addr *to)
+X    /*
+X     * Write len bytes from buf to multicast group attached to socket s.
+X     * If to is non-NULL, set multicast message destination address to *to,
+X     * otherwise use default remote address.
+X     */
+X{
+X	mc_state *sp = &_mc_state[s];
+X	mc_header header;
+X	struct sigaction sig, osig;
+X	int nwrite, n;
+X	struct iovec wv[2];
+X	extern writev(int, struct iovec *, int);
+X
+X	/* we don't support any flags yet ... */
+X	if (flags) {
+X		errno = ENOPROTOOPT;
+X		return(-1);
+X	}
+X
+X	/* construct a transport header */
+X	(void)memset(&header, 0, sizeof(header));
+X	header.version = MCVERSION;
+X	header.hlength = sizeof(header);
+X	header.length = htonl(sizeof(header) + len);
+X	header.group = sp->group;
+X	header.source = sp->local;
+X	if (to != NULL)
+X		header.destination = *to;
+X	else
+X		header.destination = sp->remote;
+X
+X	/*
+X	 * Send the header and user data to the server.  We have to protect
+X	 * ourselves from a potential SIGPIPE generated by talking to a
+X	 * dead server.
+X	 */
+X	wv[0].iov_base = (caddr_t)&header;
+X	wv[0].iov_len = sizeof(header);
+X	wv[1].iov_base = (caddr_t)buf;
+X	wv[1].iov_len = len;
+X	n = wv[0].iov_len + wv[1].iov_len;
+X	sig.sa_handler = SigPipe;
+X	(void)sigemptyset(&sig.sa_mask);
+X	sig.sa_flags = 0;
+X	(void)sigaction(SIGPIPE, &sig, &osig);
+X	if (sigsetjmp(deadserver, 1) != 0) {
+X		(void) sigaction(SIGPIPE, &osig, (struct sigaction *)0);
+X		(void)fprintf(stderr, "_mc_write: connection to server reset\n");
+X		sp->state |= MC_CORRUPTED;
+X		errno = EIO;
+X		return(-1);
+X	}
+X	nwrite = writev(s, wv, 2);
+X	(void)sigaction(SIGPIPE, &osig, (struct sigaction *)0);
+X	if (nwrite < n) {
+X		if (nwrite < 0)
+X			perror("_mc_write");
+X		else
+X			(void)fprintf(stderr, "_mc_write: WRITE ONLY WROTE %d of %d"
+X				" requested!\n", nwrite, n);
+X		sp->state |= MC_CORRUPTED;
+X		errno = EIO;
+X		return(-1);
+X	}
+X	return(len);
+X}
+X
+X/*ARGSUSED*/
+static void
+SigPipe(int sig)
+X{
+X	siglongjmp(deadserver, 1);
+X	/*NOTREACHED*/
+X}
+END_OF_FILE
+if test 4437 -ne `wc -c <'libmcast/_mc_write.c'`; then
+    echo shar: \"'libmcast/_mc_write.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/_mc_write.c'
+fi
+if test -f 'libmcast/mc_bind.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mc_bind.c'\"
+else
+echo shar: Extracting \"'libmcast/mc_bind.c'\" \(4249 characters\)
+sed "s/^X//" >'libmcast/mc_bind.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mc_bind.c,v 1.3 93/01/16 19:40:30 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mc_bind.c,v 1.3 93/01/16 19:40:30 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST SYSLIB PUBLIC: mc_bind: bind(2) system call emulation routine.
+X */
+X
+X
+X#include "mc_lib.h"
+X
+X
+int
+mc_bind(int s, const struct sockaddr *name, int namelen)
+X    /*
+X     * Bind multicast group and member addresses to local side of socket.
+X     * If specified member address is MCADDR_ANY, create a new unique
+X     * member address and use that.
+X     *
+X     * NOTE: We don't allow multiple binds on a socket.
+X     */
+X{
+X	mc_state *sp = &_mc_state[s];
+X	struct sockaddr_mcast *np = (struct sockaddr_mcast *)name;
+X	mcd_message command;
+X	int nwrite;
+X
+X	if (s < 0 || s >= MC_MAX_CONNECTIONS
+X	    || !(sp->state & MC_VALID)) {
+X		/* return(bind(s, name, namelen)); */
+X		errno = EBADF;
+X		return(-1);
+X	}
+X	if (sp->state & MC_CORRUPTED) {
+X		errno = EIO;
+X		return(-1);
+X	}
+X	if (namelen < sizeof(struct sockaddr_mcast)) {
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X	if (np->family != sp->family) {
+X		errno = EAFNOSUPPORT;
+X		return(-1);
+X	}
+X	if (sp->state & MC_BOUND) {
+X		/*
+X		 * The server actually offers the capability of rebinding
+X		 * addresses to the connection any number of times, but
+X		 * we don't resell that capability through the socket API.
+X		 * This restriction is mostly for compatibility with the
+X		 * other already existing Berkeley socket-interfaced
+X		 * communication domains.
+X		 */
+X		errno = EISCONN;
+X		return(-1);
+X	}
+X
+X	/* bind name to socket */
+X	if (MCADDR_EQ(np->member, MCADDR_BROADCAST)
+X	    || MCADDR_EQ(np->group, MCADDR_ANY)
+X	    || MCADDR_EQ(np->group, MCADDR_BROADCAST)) {
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X	sp->group = np->group;
+X	if (MCADDR_EQ(np->member, MCADDR_ANY))
+X		mcast_newaddr(&sp->local);
+X	else
+X		sp->local = np->member;
+X	sp->state |= MC_BOUND;
+X
+X	/* send MCD_BIND to server */
+X	(void)memset(&command, 0, sizeof(command));
+X	command.request = htonl(MCD_BIND);
+X	command.group = sp->group;
+X	command.local = sp->local;
+X	command.remote = sp->remote;
+X	nwrite = _mc_write(s, &command, sizeof(command), 0, &MCD_MCADDR);
+X	if (nwrite < 0)
+X		return(-1);
+X	return(0);
+X}
+END_OF_FILE
+if test 4249 -ne `wc -c <'libmcast/mc_bind.c'`; then
+    echo shar: \"'libmcast/mc_bind.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mc_bind.c'
+fi
+if test -f 'libmcast/mc_connect.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mc_connect.c'\"
+else
+echo shar: Extracting \"'libmcast/mc_connect.c'\" \(4262 characters\)
+sed "s/^X//" >'libmcast/mc_connect.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mc_connect.c,v 1.3 93/01/16 19:42:16 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mc_connect.c,v 1.3 93/01/16 19:42:16 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST SYSLIB PUBLIC: mc_connect: connect(2) system call emulation routine.
+X */
+X
+X
+X#include "mc_lib.h"
+X
+X
+int
+mc_connect(int s, const struct sockaddr *name, int namelen)
+X    /*
+X     * ``Connect'' to multicast group (and possibly a specific member).  If
+X     * a local group and member address have already been bound to the
+X     * socket, the group address in the connect request must match the
+X     * group address used in the previous bind request.
+X     */
+X{
+X	mc_state *sp = &_mc_state[s];
+X	struct sockaddr_mcast *np = (struct sockaddr_mcast *)name;
+X	mcd_message command;
+X
+X	if (s < 0 || s >= MC_MAX_CONNECTIONS
+X	    || !(sp->state & MC_VALID)) {
+X		/* return(connect(s, name, namelen)); */
+X		errno = EBADF;
+X		return(-1);
+X	}
+X	if (sp->state & MC_CORRUPTED) {
+X		errno = EIO;
+X		return(-1);
+X	}
+X	if (namelen >= sizeof(struct sockaddr)
+X	    && name->sa_family == AF_UNSPEC) {
+X		if (!(sp->state & MC_BOUND)) {
+X			errno = EINVAL;
+X			return(-1);
+X		}
+X		sp->remote = MCADDR_BROADCAST;
+X		sp->state &= ~MC_CONNECTED;
+X		goto send_bind;
+X	}
+X	if (namelen < sizeof(struct sockaddr_mcast)) {
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X	if (np->family != sp->family) {
+X		errno = EAFNOSUPPORT;
+X		return(-1);
+X	}
+X	if (MCADDR_EQ(np->group, MCADDR_BROADCAST)
+X	    || MCADDR_EQ(np->group, MCADDR_ANY)) {
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X
+X	/* bind name to socket */
+X	if (sp->state & MC_BOUND) {
+X		if (!MCADDR_EQ(np->group, sp->group)) {
+X			errno = EISCONN;
+X			return(-1);
+X		}
+X	} else {
+X		sp->group = np->group;
+X		mcast_newaddr(&sp->local);
+X		sp->state |= MC_BOUND;
+X	}
+X	sp->remote = np->member;
+X	if (MCADDR_EQ(sp->remote, MCADDR_BROADCAST))
+X		sp->state &= ~MC_CONNECTED;
+X	else
+X		sp->state |= MC_CONNECTED;
+X
+X    send_bind:
+X	/* send MCD_BIND to server */
+X	(void)memset(&command, 0, sizeof(command));
+X	command.request = htonl(MCD_BIND);
+X	command.group = sp->group;
+X	command.local = sp->local;
+X	command.remote = sp->remote;
+X	if (_mc_write(s, &command, sizeof(command), 0, &MCD_MCADDR) < 0)
+X		return(-1);
+X	return(0);
+X}
+END_OF_FILE
+if test 4262 -ne `wc -c <'libmcast/mc_connect.c'`; then
+    echo shar: \"'libmcast/mc_connect.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mc_connect.c'
+fi
+if test -f 'libmcast/mc_fcntl.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mc_fcntl.c'\"
+else
+echo shar: Extracting \"'libmcast/mc_fcntl.c'\" \(3889 characters\)
+sed "s/^X//" >'libmcast/mc_fcntl.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mc_fcntl.c,v 1.2 92/11/17 16:56:13 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mc_fcntl.c,v 1.2 92/11/17 16:56:13 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST SYSLIB PUBLIC: mc_fcntl: fcntl(2) system call emulation routine.
+X */
+X
+X
+X#include "mc_lib.h"
+X
+X
+X/*VARARGS2*/
+int
+mc_fcntl(int s, int request, ...)
+X    /*
+X     * Perform file control operation on multicast socket.  Basically only
+X     * F_SETFL and F_GETFL are supported, and the only flag controls
+X     * supported are O_NONBLOCK and MCO_LOOPBACK.  O_NONBLOCK does the
+X     * usual.  MCO_LOOPBACK controls whether we see our own out-bound
+X     * messages in our input.
+X     */
+X{
+X	mc_state *sp = &_mc_state[s];
+X	va_list va;
+X	int arg;
+X
+X	va_start(va, request);
+X	if (s < 0 || s >= MC_MAX_CONNECTIONS
+X	    || !(sp->state & MC_VALID)) {
+X		/* return(fcntl(s, request, va_arg(va, int))); */
+X		errno = EBADF;
+X		return(-1);
+X	}
+X	if (sp->state & MC_CORRUPTED) {
+X		errno = EIO;
+X		return(-1);
+X	}
+X
+X	switch (request) {
+X	    default:
+X		errno = EINVAL;
+X		return(-1);
+X
+X	    case F_SETFL:
+X		arg = va_arg(va, int);
+X		if (arg & ~(O_APPEND|O_NDELAY|O_NONBLOCK|O_SYNC|FASYNC|O_DEV)) {
+X			errno = EINVAL;
+X			return(-1);
+X		}
+X		if (arg & ~(O_NONBLOCK|MCO_LOOPBACK)) {
+X			/* we only support a few flags ... */
+X			errno = EOPNOTSUPP;
+X			return(-1);
+X		}
+X		/* if LOOPBACK changing state, send server LOOPBACK command */
+X		if ((arg ^ sp->flags) & MCO_LOOPBACK) {
+X			mcd_message command;
+X
+X			(void)memset(&command, 0, sizeof(command));
+X			command.request = htonl(MCD_LOOPBACK);
+X			command.option = htonl((long)(arg & MCO_LOOPBACK));
+X			if (_mc_write(s, &command, sizeof(command), 0,
+X				      &MCD_MCADDR) < 0)
+X				return(-1);
+X		}
+X		sp->flags = arg;
+X		return(0);
+X
+X	    case F_GETFL:
+X		return(sp->flags);
+X	}
+X	/*NOTREACHED*/
+X	va_end(va);
+X}
+END_OF_FILE
+if test 3889 -ne `wc -c <'libmcast/mc_fcntl.c'`; then
+    echo shar: \"'libmcast/mc_fcntl.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mc_fcntl.c'
+fi
+if test -f 'libmcast/mc_lib.h' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mc_lib.h'\"
+else
+echo shar: Extracting \"'libmcast/mc_lib.h'\" \(3787 characters\)
+sed "s/^X//" >'libmcast/mc_lib.h' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mc_lib.h,v 1.2 93/01/16 19:45:47 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef _MC_LIB_H_
+X#define	_MC_LIB_H_
+X
+X
+X/*
+X * ANSI C and POSIX includes
+X */
+X#include <errno.h>
+X#include <fcntl.h>
+X#include <setjmp.h>
+X#include <signal.h>
+X#include <stdarg.h>
+X#include <stddef.h>
+X#include <stdio.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <unistd.h>
+X#include <sys/ioctl.h>
+X#include <sys/types.h>
+X
+X/*
+X * BSD networking includes
+X */
+X#include <netdb.h>
+X#include <sys/uio.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X
+X/*
+X * Multicast transport includes
+X */
+X#include <netmcast/mcast.h>
+X#include <netmcast/mcastd.h>
+X
+X
+typedef struct {
+X	/* socket/connection names */
+X	int		family;		/* PF_* protocol family */
+X	int		type;		/* SOCK_* socket type */
+X	int		protocol;	/* protocol */
+X	mc_addr		group;		/* bind/connect: multicast group */
+X	mc_addr		local;		/* bind: local member address */
+X	mc_addr		remote;		/* connect: remote member address */
+X	/* socket state */
+X	int		state;		/* socket state */
+X	int		flags;		/* socket options (see fcntl) */
+X	mc_addr		source;		/* source of current message */
+X	unsigned int	resid;		/* bytes left to read in current message */
+X} mc_state;
+X
+X/* bits for "state" */
+X#define	MC_VALID		0x0001	/* assigned and connected to server */
+X#define	MC_CORRUPTED		0x0002	/* connection to server corrupted */
+X#define	MC_BOUND		0x0004	/* bound to multicast group */
+X#define	MC_CONNECTED		0x0008	/* connected to remote peer */
+X#define	MC_SHUTDOWNRECV		0x0010	/* receiving shutdown */
+X#define	MC_SHUTDOWNSEND		0x0020	/* sending shutdown */
+X
+X#define	MC_MAX_CONNECTIONS	FD_SETSIZE
+extern mc_state _mc_state[MC_MAX_CONNECTIONS];
+X
+int _mc_pullup(int s, int flags);
+int _mc_read(int s, void *buf, size_t len, int flags, mc_addr *from);
+int _mc_write(int s, const void *buf, size_t len, int flags, const mc_addr *to);
+X
+X#ifndef min
+X#define	min(a, b)	((a) < (b) ? (a) : (b))
+X#endif
+X
+X#endif /* _MC_LIB_H_ */
+END_OF_FILE
+if test 3787 -ne `wc -c <'libmcast/mc_lib.h'`; then
+    echo shar: \"'libmcast/mc_lib.h'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mc_lib.h'
+fi
+if test -f 'libmcast/mc_sendto.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mc_sendto.c'\"
+else
+echo shar: Extracting \"'libmcast/mc_sendto.c'\" \(3833 characters\)
+sed "s/^X//" >'libmcast/mc_sendto.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mc_sendto.c,v 1.2 93/01/16 19:50:20 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mc_sendto.c,v 1.2 93/01/16 19:50:20 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST SYSLIB PUBLIC: mc_sendto: sendto(2) system call emulation routine.
+X */
+X
+X
+X#include "mc_lib.h"
+X
+X
+int
+mc_sendto(int s, const void *buf, int len, int flags,
+X	  struct sockaddr *to, int tolen)
+X{
+X	mc_state *sp = &_mc_state[s];
+X	struct sockaddr_mcast *np = (struct sockaddr_mcast *)to;
+X
+X	if (s < 0 || s >= MC_MAX_CONNECTIONS
+X	    || !(sp->state & MC_VALID)) {
+X		/* return(sendto(s, buf, len, flags)); */
+X		errno = EBADF;
+X		return(-1);
+X	}
+X	if (sp->state & MC_CORRUPTED) {
+X		errno = EIO;
+X		return(-1);
+X	}
+X	if (len < 0) {
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X	if (sp->state & MC_SHUTDOWNSEND) {
+X		errno = EPIPE;
+X		return(-1);
+X	}
+X	if (to == NULL) {
+X		if (!(sp->state & MC_BOUND)) {
+X			errno = EPIPE;
+X			return(-1);
+X		}
+X		return(_mc_write(s, buf, len, flags, NULL));
+X	}
+X	if (tolen < sizeof(struct sockaddr_mcast)) {
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X	if (np->family != sp->family) {
+X		errno = EAFNOSUPPORT;
+X		return(-1);
+X	}
+X	if (MCADDR_EQ(np->member, MCD_MCADDR)) {
+X		/* don't want to let them confuse the server ... */
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X	if (sp->state & MC_BOUND) {
+X		if (!MCADDR_EQ(np->group, sp->group)) {
+X			/* can't send to other groups -- this is a mis-feature
+X			   according to Birman circa early '92 */
+X			errno = EISCONN;
+X			return(-1);
+X		}
+X	} else {
+X		/* implied bind ... */
+X		struct sockaddr_mcast local;
+X
+X		local.family = sp->family;
+X		local.group = np->group;
+X		local.member = MCADDR_ANY;
+X		if (mc_bind(s, (struct sockaddr *)&local, sizeof(local)) < 0)
+X			return(-1);
+X	}
+X	return(_mc_write(s, buf, len, flags, &np->member));
+X}
+END_OF_FILE
+if test 3833 -ne `wc -c <'libmcast/mc_sendto.c'`; then
+    echo shar: \"'libmcast/mc_sendto.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mc_sendto.c'
+fi
+if test -f 'libmcast/mc_socket.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mc_socket.c'\"
+else
+echo shar: Extracting \"'libmcast/mc_socket.c'\" \(4363 characters\)
+sed "s/^X//" >'libmcast/mc_socket.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mc_socket.c,v 1.3 93/03/17 09:22:38 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mc_socket.c,v 1.3 93/03/17 09:22:38 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST SYSLIB PUBLIC: mc_socket: socket(2) system call emulation routine.
+X */
+X
+X
+X#include "mc_lib.h"
+X
+X
+int
+mc_socket(int domain, int type, int protocol)
+X{
+X	int s;
+X	struct sockaddr_in server;
+X
+X	/* qualify arguments */
+X	if (domain != PF_MCAST && domain != PF_AMCAST) {
+X		errno = EPFNOSUPPORT;
+X		return(-1);
+X	}
+X	if (type != SOCK_SEQPACKET && type != SOCK_STREAM
+X	    && (domain == PF_AMCAST
+X		|| (type != SOCK_DGRAM && type != SOCK_RDM))) {
+X		/* note that SOCK_RAW isn't supported -- need to think about
+X		   what SOCK_RAW would mean ... */
+X		errno = EPROTONOSUPPORT;
+X		return(-1);
+X	}
+X	if (protocol != 0) {
+X		errno = EPROTONOSUPPORT;
+X		return(-1);
+X	}
+X	s = socket(PF_INET, SOCK_STREAM, 0);
+X	if (s < 0)
+X		return(-1);
+X	if (s >= MC_MAX_CONNECTIONS) {
+X		(void)close(s);
+X		errno = EMFILE;
+X		return(-1);
+X	}
+X
+X	(void)memset(&server, 0, sizeof(server));
+X	server.sin_family = PF_INET;
+X
+X	/* get multicast server information */
+X	{
+X		char *server_name;
+X		struct hostent *hp;
+X
+X		server_name = getenv(MCD_SERVER_ENV);
+X		if (server_name == NULL)
+X			server_name = MCD_SERVER_NAME;
+X		hp = gethostbyname(server_name);
+X		if (hp != NULL)
+X			(void)memcpy(&server.sin_addr, hp->h_addr, hp->h_length);
+X		else
+X			server.sin_addr.s_addr = MCD_SERVER_HOST;
+X	}
+X
+X	/* get multicast server port information */
+X	{
+X		char *env;
+X		struct servent *sp;
+X		extern struct servent *getservbyname(const char *, const char *);
+X
+X		env = getenv(MCD_SERVICE_ENV);
+X		if (env != NULL)
+X			server.sin_port = htons(atoi(env));
+X		else {
+X			sp = getservbyname(MCD_SERVICE_NAME, "tcp");
+X			if (sp != NULL)
+X				server.sin_port = sp->s_port;
+X			else
+X				server.sin_port = htons(MCD_SERVICE_PORT);
+X		}
+X	}
+X
+X	/* try to establish connection with the server */
+X	if (connect(s, &server, sizeof(server)) < 0) {
+X		int e = errno;
+X
+X		(void)close(s);
+X		errno = e;
+X		return(-1);
+X	}
+X
+X	{
+X		mc_state *sp = &_mc_state[s];
+X
+X		sp->type = type;
+X		sp->family = domain;
+X		sp->protocol = protocol;
+X		sp->group = MCADDR_ANY;
+X		sp->local = MCADDR_ANY;
+X		sp->remote = MCADDR_BROADCAST;
+X		sp->state = MC_VALID;
+X		sp->flags = O_RDWR;
+X		sp->resid = 0;
+X	}
+X	return(s);
+X}
+END_OF_FILE
+if test 4363 -ne `wc -c <'libmcast/mc_socket.c'`; then
+    echo shar: \"'libmcast/mc_socket.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mc_socket.c'
+fi
+if test -f 'libmcast/mcast_getgroupbyname.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mcast_getgroupbyname.c'\"
+else
+echo shar: Extracting \"'libmcast/mcast_getgroupbyname.c'\" \(3805 characters\)
+sed "s/^X//" >'libmcast/mcast_getgroupbyname.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mcast_getgroupbyname.c,v 1.4 93/03/17 11:36:11 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mcast_getgroupbyname.c,v 1.4 93/03/17 11:36:11 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST STDLIB PUBLIC: mcast_getgroupbyname standard library routine.
+X */
+X
+X
+X#include <errno.h>
+X#include <stddef.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <unistd.h>
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+X
+struct ret { /* structure of malloced return */
+X	struct mcastent	ent;		/* MUST BE FIRST! */
+X	char		*aliases[1];	/* alias list */
+X	char		name[1];	/* canonical name */
+X};
+X
+struct mcastent *
+mcast_getgroupbyname(const char *name, int domain)
+X    /*
+X     * Look up multicast group by name in the indicated multicast protocol
+X     * domain and return pointer to a struct mcastent in malloced memory.
+X     * On error return NULL and leave an error in errno.
+X     *
+X     * NOTE: The name lookup is *completely* fake at this point.  All that
+X     *       we do is copy the group name opaquely into the address entry of
+X     *       the mcastent structure ...
+X     *
+X     * NOTE: All these application specific name service thingies are really
+X     *       a pain.  We really should have a completely general name server.
+X     */
+X{
+X	struct ret *rp = (struct ret *)malloc(sizeof(struct ret) + strlen(name));
+X
+X	if (rp == NULL) {
+X		errno = ENOMEM;
+X		return(NULL);
+X	}
+X	rp->ent.name = rp->name;
+X	(void)strcpy(rp->name, name);
+X	rp->ent.aliases = rp->aliases;
+X	rp->aliases[0] = NULL;
+X	rp->ent.family = domain;
+X	(void)memset(&rp->ent.address, 0, sizeof(rp->ent.address));
+X	(void)strncpy((char *)&rp->ent.address, name, sizeof(rp->ent.address));
+X	return(&rp->ent);
+X}
+END_OF_FILE
+if test 3805 -ne `wc -c <'libmcast/mcast_getgroupbyname.c'`; then
+    echo shar: \"'libmcast/mcast_getgroupbyname.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mcast_getgroupbyname.c'
+fi
+if test -f 'libmcast/mcast_newaddr.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mcast_newaddr.c'\"
+else
+echo shar: Extracting \"'libmcast/mcast_newaddr.c'\" \(4649 characters\)
+sed "s/^X//" >'libmcast/mcast_newaddr.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mcast_newaddr.c,v 1.2 92/11/17 16:56:17 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mcast_newaddr.c,v 1.2 92/11/17 16:56:17 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST STDLIB PUBLIC: mcast_sopen standard library routine.
+X */
+X
+X
+X#include <errno.h>
+X#include <stddef.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <unistd.h>
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+X
+int
+mcast_newaddr(mc_addr *addr)
+X    /*
+X     * Create a new unique multicast address.
+X     *
+X     * Multicast addresses are opaque, so it doesn't matter what makes them
+X     * unique, and in fact, a multicast address created by a process on one
+X     * host can be used by a process on another machine.  This allows for
+X     * the possibility of process migration.
+X     *
+X     * This version of mcast_newaddr uses a combination of the creating
+X     * host and process' IDs, the current time, and a sequence number to
+X     * insure uniqueness.  This allows us to create unique multicast
+X     * addresses in a totally distributed manner.
+X     *
+X     * NOTE: This really needs to be a system call since bind(2) uses it
+X     *       to generate new multicast member addresses when MCADDR_ANY is
+X     *       passed * to bind as a member address.  However, the idea of a
+X     *       system call * unique to the multicast protocol is disgusting.
+X     *       two ideas for candidate system calls are:
+X     *
+X     *           int newaddr(int domain, int level, void *name, int *namelen)
+X     *
+X     *       and
+X     *
+X     *           int newdistid(distid *id)
+X     *
+X     *       The problem with the first is that it assumes that the
+X     *       concept of generating new unique addresses has meaning for
+X     *       anything other than the multicast protocol (i.e. we're guilty
+X     *       of over generalization) and the problem with the second is
+X     *       that it assumes that there will only ever be one form of
+X     *       distributed id that we'll ever need (i.e. we're guilty of
+X     *       naivete).  The answer probably lays somewhere in between.
+X     */
+X{
+X	static time_t lasttime = 0;
+X	static unsigned long lastsequence = 0;
+X	extern long gethostid(void);
+X
+X	(void)memset(addr, 0, sizeof(*addr));
+X	addr->host = gethostid();
+X	addr->process = getpid();
+X	addr->time = time(0);
+X	if (addr->time == lasttime) {
+X		if (lastsequence+1 < lastsequence) {
+X			errno = EAGAIN;
+X			return(-1);
+X		}
+X		lastsequence++;
+X	} else {
+X		lasttime = addr->time;
+X		lastsequence = 0;
+X	}
+X	addr->sequence = lastsequence;
+X	return(0);
+X}
+END_OF_FILE
+if test 4649 -ne `wc -c <'libmcast/mcast_newaddr.c'`; then
+    echo shar: \"'libmcast/mcast_newaddr.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mcast_newaddr.c'
+fi
+if test -f 'libmcast/mcast_sopen.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libmcast/mcast_sopen.c'\"
+else
+echo shar: Extracting \"'libmcast/mcast_sopen.c'\" \(4387 characters\)
+sed "s/^X//" >'libmcast/mcast_sopen.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/libmcast/RCS/mcast_sopen.c,v 1.4 93/03/17 11:36:08 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/libmcast/RCS/mcast_sopen.c,v 1.4 93/03/17 11:36:08 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X
+X/*
+X * MCAST STDLIB PUBLIC: mcast_sopen standard library routine.
+X */
+X
+X
+X#include <errno.h>
+X#include <stddef.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <unistd.h>
+X
+X#include <fcntl.h>
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+X
+int
+mcast_sopen(const char *group, int domain, int type, int mode)
+X    /*
+X     * Open a connection to the indicated group and return an open file
+X     * descriptor.
+X     *
+X     * NOTE: This turns out to be a nice little routine.  It allows us to
+X     *       write totally trivial multicast applications of only a few
+X     *       lines.  But it would be nice to generalize it somewhat so it
+X     *       could be used for nicely opening up general socket
+X     *       connections.  Thus, one could do s = sopen(...) and either
+X     *       get a failure or a completely set up, connected, etc. socket.
+X     *       Haven't quite figured out what something like "sopen"
+X     *       should look like though, so for now we have this special
+X     *       purpose routine.
+X     */
+X{
+X 	int s, accmode, flags;
+X 	struct sockaddr_mcast addr;
+X 	struct mcastent *mp;
+X
+X	accmode = mode & O_ACCMODE;
+X	flags = mode & ~O_ACCMODE;
+X	if (accmode != O_RDWR && accmode != O_RDONLY && accmode != O_WRONLY) {
+X		errno = EINVAL;
+X		return(-1);
+X	}
+X	s = mc_socket(domain, type, 0);
+X	if (s < 0)
+X		return(-1);
+X	if (accmode != O_RDWR) {
+X		int how;
+X
+X		if (accmode == O_WRONLY)
+X			how = 0;
+X		else if (accmode == O_RDONLY)
+X			how = 1;
+X		if (mc_shutdown(s, how) < 0) {
+X			int e = errno;
+X
+X			(void)mc_close(s);
+X			errno = e;
+X			return(-1);
+X		}
+X	}
+X	if (flags && mc_fcntl(s, F_SETFL, flags) < 0) {
+X		int e = errno;
+X
+X		(void)mc_close(s);
+X		errno = e;
+X		return(-1);
+X	}
+X	mp = mcast_getgroupbyname(group, domain);
+X	if (mp == NULL) {
+X		int e = errno;
+X
+X		(void)mc_close(s);
+X		errno = e;
+X		return(-1);
+X	}
+X	(void)memset(&addr, 0, sizeof(addr));
+X	addr.family = mp->family;
+X	addr.group = mp->address;
+X	addr.member = MCADDR_ANY;
+X	free(mp);
+X	if (mc_bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+X		int e = errno;
+X
+X		(void)mc_close(s);
+X		errno = e;
+X		return(-1);
+X	}
+X	return(s);
+X}
+END_OF_FILE
+if test 4387 -ne `wc -c <'libmcast/mcast_sopen.c'`; then
+    echo shar: \"'libmcast/mcast_sopen.c'\" unpacked with wrong size!
+fi
+# end of 'libmcast/mcast_sopen.c'
+fi
+if test -f 'man/mc_bind.2' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mc_bind.2'\"
+else
+echo shar: Extracting \"'man/mc_bind.2'\" \(4223 characters\)
+sed "s/^X//" >'man/mc_bind.2' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mc_bind.2,v 1.2 93/01/16 20:00:27 casey Exp $
+X.TH MC_BIND 2 \*(Dt
+X.SH NAME
+mc_bind \- bind a name to a multicast socket
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+int
+mc_bind(int s, const struct sockaddr *name, int namelen)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+X.I Mc_bind
+assigns a name to an unnamed multicast socket.
+When a multicast socket is created 
+with
+X.IR mc_socket (2)
+it exists in the multicast name space (address family)
+but has no name assigned.
+X.I Mc_bind
+requests that
+X.I name
+be assigned to the multicast socket.
+X.PP
+X.I Mc_bind
+may only be called once on any multicast socket.  If the multicast
+member address specified in
+X.I name
+is
+MCADDR_ANY,
+X.I mc_bind
+will use a new, unique group member address (see
+X.IR mcast_newaddr (3)).
+See the manual page
+X.IR mcast (4)
+for detailed information on the rules for binding names in the
+multicast communication domain.
+X.SH COMPATIBILITY
+The
+X.I mc_bind
+call emulates the
+X.IR bind (2)
+system call for multicast socket descriptors created with the
+X.IR mc_socket (2)
+call.
+See the manual page for
+X.IR bind (2)
+for a description of the emulated semantics.
+X.I Mc_bind
+does not provide any different semantics from
+X.IR bind (2).
+X.SH "RETURN VALUES"
+If the
+X.I mc_bind
+is successful, a 0 value is returned.
+A return value of -1 indicates an error, which is
+further specified in the global variable
+X.IR errno .
+X.SH ERRORS
+See the manual page for
+X.IR bind (2)
+for a detailed list of errors associated with the general
+X.IR bind (2)
+system call.
+X.I Mc_bind
+itself will fail if:
+X.TP 20
+X[EBADF]
+X.I S
+is not a valid multicast socket descriptor as returned by
+X.IR mc_socket (2).
+X.TP 20
+X[EIO]
+The socket state has become corrupted.  This is an artifact of a
+client/server implementation of the multicast communication system.
+X.TP 20
+X[EINVAL]
+X.I Namelen
+is less than
+X.IR sizeof ( mc_addr ).
+X.TP 20
+X[EISCONN]
+The socket already has a local name bound to it.
+X.TP 20
+X[EAFNOSUPPORT]
+The address family specified by
+X.I name
+is not
+AF_MCAST
+X(See
+X.IR mcast (4)).
+X.SH SEE ALSO
+X.IR bind (2),
+X.IR mc_socket (2),
+X.IR mcast (4)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 4223 -ne `wc -c <'man/mc_bind.2'`; then
+    echo shar: \"'man/mc_bind.2'\" unpacked with wrong size!
+fi
+# end of 'man/mc_bind.2'
+fi
+if test -f 'man/mc_connect.2' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mc_connect.2'\"
+else
+echo shar: Extracting \"'man/mc_connect.2'\" \(4807 characters\)
+sed "s/^X//" >'man/mc_connect.2' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mc_connect.2,v 1.2 93/01/16 20:01:13 casey Exp $
+X.TH MC_CONNECT 2 \*(Dt
+X.SH NAME
+mc_connect \- create an association between a multicast socket and a remote name
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+int
+mc_connect(int s, const struct sockaddr *name, int namelen)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+The parameter
+X.I s
+is a multicast socket as returned by
+X.IR mc_socket (2).
+This call specifies the multicast group peer member with which the
+socket is to be associated; messages sent with
+X.I mc_write
+and
+X.I mc_send
+will be sent to the indicated remote address.
+X.PP
+If
+X.I s
+has not had a name bound to it previously,
+X.I mc_connect
+will automatically bind a name to the socket using the multicast group
+specified in
+X.I name
+and a new, local unique group member address (see
+X.IR mcast_newaddr (3)).
+If
+X.I s
+already has a name bound to it,
+X.I name
+must specify the same multicast group as that already bound to
+the socket; only the multicast group peer member may be changed.
+X.PP
+Multicast sockets may use
+X.I mc_connect
+multiple times to change their remote peer association
+regardless of socket type.  Connecting to MCADDR_BROADCAST or to
+any address in the AF_UNSPEC address family causes future
+messages to be sent to the entire multicast group.
+X.SH COMPATIBILITY
+The
+X.I mc_connect
+call emulates the
+X.IR connect (2)
+system call for multicast socket descriptors created with the
+X.IR mc_socket (2)
+call.
+See the manual page for
+X.IR connect (2)
+for a description of the emulated semantics.
+X.I Mc_connect
+does not provide any different semantics from
+X.IR connect (2).
+X.SH "RETURN VALUES"
+If the connection or binding succeeds, 0 is returned.
+Otherwise a -1 is returned, and a more specific error
+code is stored in
+X.IR errno .
+X.SH ERRORS
+See the manual page for
+X.IR connect (2)
+for a detailed list of errors associated with the general
+X.IR connect (2)
+system call.
+X.I Mc_connect
+itself will fail if:
+X.TP 20
+X[EBADF]
+X.I S
+is not a valid multicast socket descriptor as returned by
+X.IR mc_socket (2).
+X.TP 20
+X[EIO]
+The socket state has become corrupted.  This is an artifact of a
+client/server implementation of the multicast communication system.
+X.TP 20
+X[EINVAL]
+X.I Namelen
+is less than
+X.IR sizeof ( mc_addr ).
+X.TP 20
+X[EINVAL]
+The multicast group selected is one of the reserved group addresses
+MCADDR_BROADCAST
+or
+MCADDR_ANY.
+X.TP 20
+X[EISCONN]
+The multicast group selected is not the same as the one already bound to
+the socket.
+X.TP 20
+X[EAFNOSUPPORT]
+The address family specified by
+X.I name
+is neither
+X.I AF_MCAST
+nor
+X.IR AF_UNSPEC .
+X.SH "SEE ALSO"
+X.IR connect (2),
+X.IR mc_bind (2),
+X.IR mc_getpeername (2),
+X.IR mc_socket (2),
+X.IR mcast (4)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 4807 -ne `wc -c <'man/mc_connect.2'`; then
+    echo shar: \"'man/mc_connect.2'\" unpacked with wrong size!
+fi
+# end of 'man/mc_connect.2'
+fi
+if test -f 'man/mc_fcntl.2' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mc_fcntl.2'\"
+else
+echo shar: Extracting \"'man/mc_fcntl.2'\" \(4466 characters\)
+sed "s/^X//" >'man/mc_fcntl.2' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mc_fcntl.2,v 1.1 92/10/16 18:23:00 casey Exp $
+X.TH MC_FCNTL 2 \*(Dt
+X.SH NAME
+mc_fcntl \- multicast socket control
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <fcntl.h>
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mast.h>
+X
+int
+mc_fcntl(int s, int request, ...)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+X.I Mc_fcntl
+provides for control over multicast socket descriptors.
+The argument
+X.I s
+is a multicast descriptor.
+X.I Request
+specifies the control operation to be performed on
+X.IR s .
+X.PP
+Some requests require a third argument
+X.BR arg .
+The type of
+X.I arg
+is interpreted differently for different operations.
+XEach
+X.I request
+described below specifies whether
+X.I arg
+is required and, if so, what type it is.
+X.PP
+X.I Requests
+are as follows:
+X.TP 10
+XF_GETFL
+Get descriptor status flags, as described below.
+X.TP 10
+XF_SETFL
+Set descriptor status flags to
+X.IR arg .
+X.PP
+The flags for the
+XF_GETFL
+and
+XF_SETFL
+flags are as follows:
+X.TP 10
+O_NONBLOCK
+Non-blocking I/O; if no data is available to a
+X.I read
+call, or if a
+X.I write
+operation would block,
+the read or write call returns -1 with the error
+XEAGAIN.
+X.TP 10
+MCO_LOOPBACK
+Loop back mode; messages sent on the multicast descriptor
+X.I s
+will be looped back and received on a later read.
+X.SH COMPATIBILITY
+The
+X.I mc_fcntl
+call emulates the
+X.IR fcntl (2)
+system call for multicast socket descriptors created with the
+X.IR mc_socket (2)
+call.
+See the manual page for
+X.IR fcntl (2)
+for a description of the emulated semantics.
+X.I Mc_fcntl
+does not provide any different semantics from
+X.IR fcntl (2).
+X.SH "RETURN VALUES"
+Upon successful completion, the value returned depends on
+X.I request
+as follows:
+X.TP 10
+XF_GETFL
+The value of the descriptor flags.
+X.TP 10
+other
+Value other than -1.
+X.PP
+Otherwise, a value of -1 is returned and
+X.I errno
+is set to indicate the error.
+X.SH ERRORS
+See the manual page for
+X.IR fcntl (2)
+for a detailed list of errors associated with the general
+X.IR fcntl (2)
+system call.
+X.I Mc_fcntl
+itself will fail if:
+X.TP 20
+X[EBADF]
+X.I S
+is not a valid multicast socket descriptor as returned by
+X.IR mc_socket (2).
+X.TP 20
+X[EIO]
+The socket state has become corrupted.  This is an artifact of a
+client/server implementation of the multicast communication system.
+X.TP 20
+X[EINVAL]
+X.I Request
+is not a legal value.
+X.SH SEE ALSO
+X.IR fcntl (2),
+X.IR mc_ioctl (2),
+X.IR mc_socket (2),
+X.IR mcast (4)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 4466 -ne `wc -c <'man/mc_fcntl.2'`; then
+    echo shar: \"'man/mc_fcntl.2'\" unpacked with wrong size!
+fi
+# end of 'man/mc_fcntl.2'
+fi
+if test -f 'man/mc_getpeername.2' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mc_getpeername.2'\"
+else
+echo shar: Extracting \"'man/mc_getpeername.2'\" \(4059 characters\)
+sed "s/^X//" >'man/mc_getpeername.2' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mc_getpeername.2,v 1.1 92/10/16 18:23:01 casey Exp $
+X.TH MC_GETPEERNAME 2 \*(Dt
+X.SH NAME
+mc_getpeername \- get remote peer name of multicast socket
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+int
+mc_getpeername(int s, struct sockaddr *name, int *namelen)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+X.I Mc_getpeername
+returns the name of the remote peer connected to
+multicast socket
+X.IR s .
+The
+X.I namelen
+parameter should be initialized to indicate
+the amount of space pointed to by
+X.IR name .
+On return it contains the actual size of the name
+returned (in bytes).
+The name is truncated if the buffer provided is too small.
+X.PP
+XFor multicast sockets,
+X.I namelen
+should always be equal to
+X.IR "sizeof(struct sockaddr_mcast)" .
+The default remote peer name is
+MCADDR_BROADCAST
+but can be changed via
+X.IR mc_connect (2).
+X.SH COMPATIBILITY
+The
+X.I mc_getpeername
+call emulates the
+X.IR getpeername (2)
+system call for multicast socket descriptors created with the
+X.IR mc_socket (2)
+call.
+See the manual page for
+X.IR getpeername (2)
+for a description of the emulated semantics.
+X.I Mc_getpeername
+does not provide any different semantics from
+X.IR getpeername (2).
+X.SH "RETURN VALUES"
+Upon successful completion, a value of 0 is returned.
+Otherwise, a value of -1 is returned and the global integer variable
+X.I errno
+is set to indicate the error.
+X.SH ERRORS
+See the manual page for
+X.IR getpeername (2)
+for a detailed list of errors associated with the general
+X.IR getpeername (2)
+system call.
+X.I Mc_getpeername
+itself will fail if:
+X.TP 20
+X[EBADF]
+X.I S
+is not a valid multicast socket descriptor as returned by
+X.IR mc_socket (2).
+X.TP 20
+X[EIO]
+The socket state has become corrupted.  This is an artifact of a
+client/server implementation of the multicast communication system.
+X.SH "SEE ALSO"
+X.IR getpeername (2),
+X.IR mc_bind (2),
+X.IR mc_connect (2),
+X.IR mc_getsockname (2),
+X.IR mc_socket (2),
+X.IR mcast (4)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 4059 -ne `wc -c <'man/mc_getpeername.2'`; then
+    echo shar: \"'man/mc_getpeername.2'\" unpacked with wrong size!
+fi
+# end of 'man/mc_getpeername.2'
+fi
+if test -f 'man/mc_getsockname.2' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mc_getsockname.2'\"
+else
+echo shar: Extracting \"'man/mc_getsockname.2'\" \(4166 characters\)
+sed "s/^X//" >'man/mc_getsockname.2' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.\"     @(#)getsockname.2	6.4 (Berkeley) 3/10/91
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mc_getsockname.2,v 1.1 92/10/16 18:23:01 casey Exp $
+X.TH MC_GETSOCKNAME 2 \*(Dt
+X.SH NAME
+mc_getsockname \- get (local) name of multicast socket
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+int
+mc_getsockname(int s, struct sockaddr *name, int *namelen)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+X.I Mc_getsockname
+returns the current 
+X.I name
+for the specified socket.  The
+X.I namelen
+parameter should be initialized to indicate
+the amount of space pointed to by
+X.IR name .
+On return it contains the actual size of the name
+returned (in bytes).
+The name is truncated if the buffer provided is too small.
+X.PP
+XFor multicast sockets,
+X.I namelen
+should always be equal to
+X.IR "sizeof(struct sockaddr_mcast)" .
+The default remote sock name is
+MCADDR_ANY
+but can be changed once \- either explicitly or implicitly \- via
+X.IR mc_bind (2),
+X.IR mc_connect (2),
+or
+X.IR mc_sendto (2).
+X.SH COMPATIBILITY
+The
+X.I mc_getsockname
+call emulates the
+X.IR getsockname (2)
+system call for multicast socket descriptors created with the
+X.IR mc_socket (2)
+call.
+See the manual page for
+X.IR getsockname (2)
+for a description of the emulated semantics.
+X.I Mc_getsockname
+does not provide any different semantics from
+X.IR getsockname (2).
+X.SH "RETURN VALUES"
+Upon successful completion, a value of 0 is returned.
+Otherwise, a value of -1 is returned and the global integer variable
+X.I errno
+is set to indicate the error.
+X.SH ERRORS
+See the manual page for
+X.IR getsockname (2)
+for a detailed list of errors associated with the general
+X.IR getsockname (2)
+system call.
+X.I Mc_getsockname
+itself will fail if:
+X.TP 20
+X[EBADF]
+X.I S
+is not a valid multicast socket descriptor as returned by
+X.IR mc_socket (2).
+X.TP 20
+X[EIO]
+The socket state has become corrupted.  This is an artifact of a
+client/server implementation of the multicast communication system.
+X.SH "SEE ALSO"
+X.IR getsockname (2),
+X.IR mc_bind (2),
+X.IR mc_connect (2),
+X.IR mc_getpeername (2),
+X.IR mc_socket (2),
+X.IR mcast (4)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 4166 -ne `wc -c <'man/mc_getsockname.2'`; then
+    echo shar: \"'man/mc_getsockname.2'\" unpacked with wrong size!
+fi
+# end of 'man/mc_getsockname.2'
+fi
+if test -f 'man/mc_ioctl.2' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mc_ioctl.2'\"
+else
+echo shar: Extracting \"'man/mc_ioctl.2'\" \(4805 characters\)
+sed "s/^X//" >'man/mc_ioctl.2' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mc_ioctl.2,v 1.1 92/10/16 18:23:02 casey Exp $
+X.TH MC_IOCTL 2 \*(Dt
+X.SH NAME
+mc_ioctl \- control multicast socket
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <sys/ioctl.h>
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mast.h>
+X
+int
+mc_ioctl(int s, int request, ...)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+The
+X.I mc_ioctl
+function manipulates the underlying parameters of multicast sockets.
+The argument
+X.I s
+must be an open multicast socket descriptor.
+X.I Request
+specifies the control operation to be performed on
+X.IR s .
+X.PP
+The
+X.I request
+parameter encodes whether the operation requires an
+optional third pointer argument,
+X.BR arg ,
+whether it is an
+X\*(lqin\*(rq
+parameter
+or
+X\*(lqout\*(rq
+parameter, and the size in bytes of the object pointed at by
+X.IR arg .
+Macros and defines used in specifying an ioctl
+X.I request
+are located in the files
+X.I <sys/ioctl.h>
+and
+X.IR <netmcast/mcast.h> .
+X.PP
+The following requests are valid:
+X.TP 10
+MCIOLOOPBACK
+Sets loop back mode on the multicast descriptor
+X.IR s .
+When messages are sent on the multicast descriptor
+X.IR s ,
+they will be looped back and received on a later read.
+This call is identical to specifying MCO_LOOPBACK to
+X.I mc_fcntl
+on an F_SETFL operation.
+X.TP 10
+XFIONBIO
+Sets non-blocking mode on the multicast descriptor
+X.IR s .
+If no data is available for to a read call, or if a write
+operation would block, the read or write call returns -1 with the error
+XEAGAIN.
+This call is identical to specifying O_NONBLOCK to
+X.I mc_fcntl
+on an F_SETFL operation.
+X.TP 10
+XFIONREAD
+Returns the number of bytes available for the next read operation.
+The value is returned in the
+X.I long
+pointed to by
+X.IR arg .
+X.SH COMPATIBILITY
+The
+X.I mc_ioctl
+call emulates the
+X.IR ioctl (2)
+system call for multicast socket descriptors created with the
+X.IR mc_socket (2)
+call.
+See the manual page for
+X.IR ioctl (2)
+for a description of the emulated semantics.
+X.I Mc_ioctl
+does not provide any different semantics from
+X.IR ioctl (2).
+X.SH "RETURN VALUES"
+Upon successful completion, a value of 0 is returned.
+Otherwise, a value of -1 is returned and the global integer variable
+X.I errno
+is set to indicate the error.
+X.SH ERRORS
+See the manual page for
+X.IR ioctl (2)
+for a detailed list of errors associated with the general
+X.IR ioctl (2)
+system call.
+X.I Mc_ioctl
+itself will fail if:
+X.TP 20
+X[EBADF]
+X.I S
+is not a valid multicast socket descriptor as returned by
+X.IR mc_socket (2).
+X.TP 20
+X[EIO]
+The socket state has become corrupted.  This is an artifact of a
+client/server implementation of the multicast communication system.
+X.TP 20
+X[EINVAL]
+X.I Request
+is not a legal value.
+X.SH "SEE ALSO"
+X.IR ioctl (2),
+X.IR mc_fcntl (2),
+X.IR mc_socket (2),
+X.IR mcast (4)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 4805 -ne `wc -c <'man/mc_ioctl.2'`; then
+    echo shar: \"'man/mc_ioctl.2'\" unpacked with wrong size!
+fi
+# end of 'man/mc_ioctl.2'
+fi
+if test -f 'man/mc_write.2' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mc_write.2'\"
+else
+echo shar: Extracting \"'man/mc_write.2'\" \(5022 characters\)
+sed "s/^X//" >'man/mc_write.2' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mc_write.2,v 1.3 93/01/16 20:03:45 casey Exp $
+X.TH MC_WRITE 2 \*(Dt
+X.SH NAME
+mc_write, mc_writev \- write output to a multicast socket
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <unistd.h>
+X#include <sys/types.h>
+X#include <sys/uio.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+ssize_t
+mc_write(int s, const void *buf, size_t len)
+X
+int
+mc_writev(int s, const struct iovec *iov, int iovcnt)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+X.I Mc_write
+attempts to write
+X.I len
+bytes of data to the object referenced by the multicast socket descriptor
+X.I d
+from the buffer pointed to by
+X.IR buf .
+X.I Mc_writev
+performs the same action, but gathers the output data
+from the 
+X.I iovcnt
+buffers specified by the members of the
+X.I iov
+array: iov[0], iov[1], ..., iov[iovcnt\|-\|1].
+The multicast socket
+X.I s
+must be bound before either
+X.I mc_write
+or
+X.I mc_writev
+can be used.
+X.PP
+XFor 
+X.IR mc_writev ,
+the 
+X.I iovec
+structure is defined as:
+X.PP
+X.RS
+X.nf
+X.ta \w'struct'u +\w'caddr_tXXXX'u
+struct iovec {
+X	caddr_t	iov_base;
+X	int	iov_len;
+X};
+X.DT
+X.fi
+X.RE
+X.PP
+XEach 
+X.I iovec
+entry specifies the base address and length of an area
+in memory from which data should be written.
+X.I Mc_writev
+will always write a complete area before proceeding
+to the next.
+X.PP
+When using non-blocking I/O,
+X.I mc_write
+and
+X.I mc_writev
+may write fewer bytes than requested;
+the return value must be noted,
+and the remainder of the operation should be retried when possible.
+X.SH COMPATIBILITY
+The
+X.I mc_write
+and
+X.I mc_writev
+calls emulate the
+X.IR write (2)
+and
+X.IR writev (2)
+system calls for multicast socket descriptors created with the
+X.IR mc_socket (2)
+call.
+See the manual pages for
+X.IR write (2)
+and
+X.IR writev (2)
+for a description of the emulated semantics.
+X.I Mc_write
+and
+X.I mc_writev
+do not provide any different semantics from
+X.IR write (2)
+and
+X.IR writev (2).
+X.SH "RETURN VALUES"
+Upon successful completion the number of bytes which were written
+is returned.  Otherwise a -1 is returned and the global variable
+X.I errno
+is set to indicate the error.
+X.SH ERRORS
+See the manual pages for
+X.IR write (2)
+and
+X.IR writev (2)
+for a detailed list of errors associated with the general
+X.IR write (2)
+and
+X.IR writev (2)
+system calls.
+X.I Mc_write
+and
+X.I mc_writev
+themselves will fail if:
+X.TP 20
+X[EBADF]
+X.I S
+is not a valid multicast socket descriptor as returned by
+X.IR mc_socket (2).
+X.TP 20
+X[EIO]
+The socket state has become corrupted.  This is an artifact of a
+client/server implementation of the multicast communication system.
+X.TP 20
+X[EPIPE]
+No name has been bound to the multicast socket yet.
+X.TP 20
+X[EPIPE]
+X.I Mc_shutdown
+was used to shutdown sending on the multicast socket.  All further attempts
+to write on the multicast socket will return EPIPE.
+X.TP 20
+X[EAGAIN]
+The file was marked for non-blocking I/O,
+and no data could be written immediately.
+X.SH "SEE ALSO"
+X.IR mc_fcntl (2),
+X.IR mc_socket (2),
+X.IR mcast (4),
+X.IR select (2),
+X.IR write (2)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 5022 -ne `wc -c <'man/mc_write.2'`; then
+    echo shar: \"'man/mc_write.2'\" unpacked with wrong size!
+fi
+# end of 'man/mc_write.2'
+fi
+if test -f 'man/mcast_getgroupbyname.3' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/mcast_getgroupbyname.3'\"
+else
+echo shar: Extracting \"'man/mcast_getgroupbyname.3'\" \(4276 characters\)
+sed "s/^X//" >'man/mcast_getgroupbyname.3' <<'END_OF_FILE'
+X.\" Copyright (c) 1992 The Regents of the University of California.
+X.\" All rights reserved.
+X.\"
+X.\" Redistribution and use in source and binary forms, with or without
+X.\" modification, are permitted provided that the following conditions
+X.\" are met:
+X.\" 1. Redistributions of source code must retain the above copyright
+X.\"    notice, this list of conditions and the following disclaimer.
+X.\" 2. Redistributions in binary form must reproduce the above copyright
+X.\"    notice, this list of conditions and the following disclaimer in the
+X.\"    documentation and/or other materials provided with the distribution.
+X.\" 3. All advertising materials mentioning features or use of this software
+X.\"    must display the following acknowledgement:
+X.\"	This product includes software developed by the University of
+X.\"	California, Lawrence Livermore National Laboratory and its
+X.\"	contributors.
+X.\" 4. Neither the name of the University nor the names of its contributors
+X.\"    may be used to endorse or promote products derived from this software
+X.\"    without specific prior written permission.
+X.\"
+X.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X.\" SUCH DAMAGE.
+X.\"
+X.de Hd
+X.ds Dt \\$4
+X..
+X.Hd $Header: /u0/casey/src/mcast/man/RCS/mcast_getgroupbyname.3,v 1.4 93/03/17 11:35:02 casey Exp $
+X.TH MCAST_GETGROUPBYNAME 3 \*(Dt
+X.SH NAME
+mcast_getgroupbyname \- get multicast address information
+X.SH SYNOPSIS
+X.nf
+X.ft B
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+struct mcastent *
+mcast_getgroupbyname(const char *name, int domain)
+X.ft P
+X.fi
+X.SH DESCRIPTION
+X.I Mcast_getgroupbyname
+returns information about multicast group
+X.I name
+in the multicast address family
+X.I domain
+X(either AF_MCAST or AF_AMCAST).
+The information
+is returned in the form of a pointer to a
+X.IR malloc 'ed
+X.I mcastent
+structure.  If no information can be returned, NULL is returned.
+X.PP
+X.RS
+X.nf
+X.ta \w'struct'u +\w'struct mc_addrXXXX'u +\w'**aliases;XXXX'u
+X0.5in 2.0in 3.5in
+struct mcastent {
+X	char	*name;	/* official name of group */
+X	char	**aliases;	/* alias list */
+X	int	family;	/* address family */
+X	struct mc_addr	address;	/* address bound to group */
+X};
+X.fi
+X.RE
+X.PP
+It is the responsibility of the caller to free the returned memory with the
+X.IR free (3)
+call.
+X.SH COMPATIBILITY
+X.I Mcast_getgroupbyname
+is unique to the experimental multicast implementation.
+X.I Mcast_getgroupbyname
+is yet another GetFooByBarEnt style routine.  Just what we need.  It's
+especially annoying that we have to pass in the
+X.I domain
+qualifier attribute in such an ad hoc manner.  It
+would be really nice if there was a general name/value server.
+However, since we wanted to get on with our work, we decided not to
+lose time working on a more general scheme.  It's probably attitudes
+like ours that are responsible for the proliferation of special
+purpose name servers and why a general name server still isn't
+available ...
+X.SH "RETURN VALUES"
+Upon successful completion, a pointer to an
+X.I mcastent
+structure in
+X.IR malloc 'ed
+memory is returned.
+Otherwise, a value of NULL is returned and the global integer variable
+X.I errno
+is set to indicate the error.
+X.SH ERRORS
+X.TP 20
+X[ENOENT]
+No information on
+X.I name
+could be found.
+X.TP 20
+X[ENOMEM]
+The attempt to
+X.I malloc
+storage for the return information failed.
+X.SH "SEE ALSO"
+X.IR malloc (3),
+X.IR mcast (4),
+X.IR mcast_newaddr (3),
+X.IR mc_socket (2)
+X.SH STANDARDS
+There are no current standards that address multicast communication.
+The software described in this manual page is experimental and subject
+to change at any time.
+END_OF_FILE
+if test 4276 -ne `wc -c <'man/mcast_getgroupbyname.3'`; then
+    echo shar: \"'man/mcast_getgroupbyname.3'\" unpacked with wrong size!
+fi
+# end of 'man/mcast_getgroupbyname.3'
+fi
+if test -f 'test/mc_clock.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'test/mc_clock.c'\"
+else
+echo shar: Extracting \"'test/mc_clock.c'\" \(4044 characters\)
+sed "s/^X//" >'test/mc_clock.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/test/RCS/mc_clock.c,v 1.4 93/01/16 20:18:23 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/test/RCS/mc_clock.c,v 1.4 93/01/16 20:18:23 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X/*
+X * Emit clock ticks to multicast group.
+X */
+X
+X
+X#include <errno.h>
+X#include <fcntl.h>
+X#include <stddef.h>
+X#include <stdio.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <time.h>
+X#include <unistd.h>
+X
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+X
+X/*
+X * Arguments.
+X */
+char	*myname;			/* name we were invoked by */
+int	header = 0;			/* print a header for every message */
+int	debug = 0;			/* print lots of debug information */
+int	interval = 5;			/* tick interval in seconds */
+char	*group;				/* multicast group to listen to */
+X
+X/*
+X * Local routines.
+X */
+void usage();				/* issue usage and exit with error */
+X
+X
+main(int argc, char *argv[])
+X{
+X	int s;
+X	int opt;
+X	extern int getopt(int, char **, char *);
+X	extern char *optarg;
+X	extern int optind;
+X
+X	/*
+X	 * Parse any arguments ...
+X	 */
+X	myname = argv[0];
+X	while ((opt = getopt(argc, argv, "dhi:")) != EOF)
+X		switch ((char)opt) {
+X		    case '?':
+X			usage();
+X			/*NOTREACHED*/
+X		    case 'd':
+X			debug = 1;
+X			break;
+X		    case 'h':
+X			header = 1;
+X			break;
+X		    case 'i':
+X			interval = atoi(optarg);
+X			break;
+X		}
+X	if (argc != optind+1) {
+X		usage();
+X		/*NOTREACHED*/
+X	}
+X	group = argv[optind];
+X
+X	s = mcast_sopen(group, PF_MCAST, SOCK_STREAM, O_WRONLY);
+X	if (s < 0) {
+X		perror("mcast_sopen");
+X		exit(1);
+X	}
+X	for (;;) {
+X		time_t t = time(NULL);
+X		char *buf = ctime(&t);
+X		int len = strlen(buf);
+X		int nwrite;
+X
+X		nwrite = mc_write(s, buf, len);
+X		if (nwrite < 0) {
+X			perror("mc_write");
+X			exit(1);
+X		}
+X		if (nwrite < len) {
+X			fprintf(stderr, "%s: write only wrote %d of %d!\n",
+X				myname, nwrite, len);
+X		}
+X		(void)sleep(interval);
+X	}
+X	/*NOTREACHED*/
+X}
+X
+X
+void
+usage()
+X    /*
+X     * Issue usage message and exit with an error.
+X     */
+X{
+X	fprintf(stderr, "usage: %s [-h] [-d] [-i interval] group\n", myname);
+X	exit(1);
+X}
+END_OF_FILE
+if test 4044 -ne `wc -c <'test/mc_clock.c'`; then
+    echo shar: \"'test/mc_clock.c'\" unpacked with wrong size!
+fi
+# end of 'test/mc_clock.c'
+fi
+if test -f 'test/mc_listen.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'test/mc_listen.c'\"
+else
+echo shar: Extracting \"'test/mc_listen.c'\" \(4047 characters\)
+sed "s/^X//" >'test/mc_listen.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/test/RCS/mc_listen.c,v 1.3 93/01/16 20:18:38 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/test/RCS/mc_listen.c,v 1.3 93/01/16 20:18:38 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X/*
+X * Listen to messages on a specified multicast group and print them on
+X * standard output.
+X */
+X
+X
+X#include <errno.h>
+X#include <fcntl.h>
+X#include <stddef.h>
+X#include <stdio.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <unistd.h>
+X
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+X
+X/*
+X * Arguments.
+X */
+char	*myname;			/* name we were invoked by */
+int	header = 0;			/* print a header for every message */
+int	debug = 0;			/* print lots of debug information */
+char	*group;				/* multicast group to listen to */
+X
+X/*
+X * Local routines.
+X */
+void usage();				/* issue usage and exit with error */
+X
+X
+main(int argc, char *argv[])
+X{
+X	int s;
+X	int opt;
+X	extern int getopt(int, char **, char *);
+X	extern char *optarg;
+X	extern int optind;
+X
+X	/*
+X	 * Parse any arguments ...
+X	 */
+X	myname = argv[0];
+X	while ((opt = getopt(argc, argv, "dh")) != EOF)
+X		switch ((char)opt) {
+X		    case '?':
+X			usage();
+X			/*NOTREACHED*/
+X		    case 'd':
+X			debug = 1;
+X			break;
+X		    case 'h':
+X			header = 1;
+X			break;
+X		}
+X	if (argc != optind+1) {
+X		usage();
+X		/*NOTREACHED*/
+X	}
+X	group = argv[optind];
+X
+X	s = mcast_sopen(group, PF_MCAST, SOCK_STREAM, O_RDONLY);
+X	if (s < 0) {
+X		perror("mcast_sopen");
+X		exit(1);
+X	}
+X	for (;;) {
+X		char buf[1024];
+X		int nread, nwrite;
+X
+X		nread = mc_read(s, buf, sizeof(buf));
+X		if (nread == 0)
+X			break;
+X		if (nread < 0) {
+X			perror("read");
+X			exit(1);
+X		}
+X		nwrite = write(STDOUT_FILENO, buf, nread);
+X		if (nwrite < 0) {
+X			perror("write");
+X			exit(1);
+X		}
+X		if (nwrite < nread) {
+X			fprintf(stderr, "%s: write only wrote %d of %d!\n",
+X				myname, nwrite, nread);
+X		}
+X	}
+X	(void)mc_close(s);
+X	exit(0);
+X	/*NOTREACHED*/
+X}
+X
+X
+void
+usage()
+X    /*
+X     * Issue usage message and exit with an error.
+X     */
+X{
+X	fprintf(stderr, "usage: %s [-h] [-d] group\n", myname);
+X	exit(1);
+X}
+END_OF_FILE
+if test 4047 -ne `wc -c <'test/mc_listen.c'`; then
+    echo shar: \"'test/mc_listen.c'\" unpacked with wrong size!
+fi
+# end of 'test/mc_listen.c'
+fi
+if test -f 'test/mc_send.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'test/mc_send.c'\"
+else
+echo shar: Extracting \"'test/mc_send.c'\" \(3986 characters\)
+sed "s/^X//" >'test/mc_send.c' <<'END_OF_FILE'
+X/*
+X * $Header: /u0/casey/src/mcast/test/RCS/mc_send.c,v 1.3 93/01/16 20:18:40 casey Exp $
+X */
+X
+X/*
+X * Copyright (c) 1992 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Lawrence Livermore National Laboratory and its
+X *	contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#ifndef lint
+static char rcsid[] = "$Header: /u0/casey/src/mcast/test/RCS/mc_send.c,v 1.3 93/01/16 20:18:40 casey Exp $";
+static char copyright[] =
+X    "Copyright (c) 1992 The Regents of the University of California.\n"
+X    "All rights reserved.\n";
+static char classification[] =
+X    "Unclassified\n";
+X#endif
+X
+X/*
+X * Copy standard input to a specified multicast group.
+X */
+X
+X
+X#include <errno.h>
+X#include <fcntl.h>
+X#include <stddef.h>
+X#include <stdio.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include <unistd.h>
+X
+X#include <sys/socket.h>
+X#include <netmcast/mcast.h>
+X
+X
+X/*
+X * Arguments.
+X */
+char	*myname;			/* name we were invoked by */
+int	header = 0;			/* print a header for every message */
+int	debug = 0;			/* print lots of debug information */
+char	*group;				/* multicast group to listen to */
+X
+X/*
+X * Local routines.
+X */
+void usage();				/* issue usage and exit with error */
+X
+X
+main(int argc, char *argv[])
+X{
+X	int s;
+X	int opt;
+X	extern int getopt(int, char **, char *);
+X	extern char *optarg;
+X	extern int optind;
+X
+X	/*
+X	 * Parse any arguments ...
+X	 */
+X	myname = argv[0];
+X	while ((opt = getopt(argc, argv, "dh")) != EOF)
+X		switch ((char)opt) {
+X		    case '?':
+X			usage();
+X			/*NOTREACHED*/
+X		    case 'd':
+X			debug = 1;
+X			break;
+X		    case 'h':
+X			header = 1;
+X			break;
+X		}
+X	if (argc != optind+1) {
+X		usage();
+X		/*NOTREACHED*/
+X	}
+X	group = argv[optind];
+X
+X	s = mcast_sopen(group, PF_MCAST, SOCK_STREAM, O_WRONLY);
+X	if (s < 0) {
+X		perror("mcast_sopen");
+X		exit(1);
+X	}
+X	for (;;) {
+X		char buf[8192];
+X		int nread, nwrite;
+X
+X		nread = read(STDIN_FILENO, buf, sizeof(buf));
+X		if (nread == 0)
+X			break;
+X		if (nread < 0) {
+X			perror("read");
+X			exit(1);
+X		}
+X		nwrite = mc_write(s, buf, nread);
+X		if (nwrite < 0) {
+X			perror("write");
+X			exit(1);
+X		}
+X		if (nwrite < nread) {
+X			fprintf(stderr, "%s: write only wrote %d of %d!\n",
+X				myname, nwrite, nread);
+X		}
+X	}
+X	exit(0);
+X	/*NOTREACHED*/
+X}
+X
+X
+void
+usage()
+X    /*
+X     * Issue usage message and exit with an error.
+X     */
+X{
+X	fprintf(stderr, "usage: %s [-h] [-d] group\n", myname);
+X	exit(1);
+X}
+END_OF_FILE
+if test 3986 -ne `wc -c <'test/mc_send.c'`; then
+    echo shar: \"'test/mc_send.c'\" unpacked with wrong size!
+fi
+# end of 'test/mc_send.c'
+fi
+echo shar: End of archive 2 \(of 4\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 4 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 4 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

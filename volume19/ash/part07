@@ -1,0 +1,2320 @@
+Subject:  v19i007:  A reimplementation of the System V shell, Part07/08
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: ka@june.cs.washington.edu (Kenneth Almquist)
+Posting-number: Volume 19, Issue 7
+Archive-name: ash/part07
+
+# This is part 7 of ash.  To unpack, feed it into the shell (not csh).
+# The ash distribution consists of eight pieces.  Be sure you get them all.
+# After you unpack everything, read the file README.
+
+echo extracting redir.h
+cat > redir.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/* flags passed to redirect */
+#define REDIR_PUSH 01		/* save previous values of file descriptors */
+#define REDIR_BACKQ 02		/* save the command output in memory */
+
+#ifdef __STDC__
+void redirect(union node *, int);
+void popredir(void);
+void clearredir(void);
+int copyfd(int, int);
+#else
+void redirect();
+void popredir();
+void clearredir();
+int copyfd();
+#endif
+EOF
+if test `wc -c < redir.h` -ne 578
+then	echo 'redir.h is the wrong size'
+fi
+echo extracting redir.c
+cat > redir.c <<\EOF
+/*
+ * Code for dealing with input/output redirection.
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+#include "shell.h"
+#include "nodes.h"
+#include "jobs.h"
+#include "expand.h"
+#include "redir.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include <signal.h>
+#include <fcntl.h>
+#include "myerrno.h"
+
+
+#define EMPTY -2		/* marks an unused slot in redirtab */
+#define PIPESIZE 4096		/* amount of buffering in a pipe */
+
+
+MKINIT
+struct redirtab {
+      struct redirtab *next;
+      short renamed[10];
+};
+
+
+MKINIT struct redirtab *redirlist;
+
+
+#ifdef __STDC__
+STATIC void openredirect(union node *, char *);
+STATIC int openhere(union node *);
+#else
+STATIC void openredirect();
+STATIC int openhere();
+#endif
+
+
+
+/*
+ * Process a list of redirection commands.  If the REDIR_PUSH flag is set,
+ * old file descriptors are stashed away so that the redirection can be
+ * undone by calling popredir.  If the REDIR_BACKQ flag is set, then the
+ * standard output, and the standard error if it becomes a duplicate of
+ * stdout, is saved in memory.
+ */
+
+void
+redirect(redir, flags)
+      union node *redir;
+      int flags;
+      {
+      union node *n;
+      struct redirtab *sv;
+      int i;
+      int fd;
+      char memory[10];		/* file descriptors to write to memory */
+
+      for (i = 10 ; --i >= 0 ; )
+	    memory[i] = 0;
+      memory[1] = flags & REDIR_BACKQ;
+      if (flags & REDIR_PUSH) {
+	    sv = ckmalloc(sizeof (struct redirtab));
+	    for (i = 0 ; i < 10 ; i++)
+		  sv->renamed[i] = EMPTY;
+	    sv->next = redirlist;
+	    redirlist = sv;
+      }
+      for (n = redir ; n ; n = n->nfile.next) {
+	    fd = n->nfile.fd;
+	    if ((flags & REDIR_PUSH) && sv->renamed[fd] == EMPTY) {
+		  INTOFF;
+		  if ((i = copyfd(fd, 10)) != EMPTY) {
+			sv->renamed[fd] = i;
+			close(fd);
+		  }
+		  INTON;
+		  if (i == EMPTY)
+			error("Out of file descriptors");
+	    } else {
+		  close(fd);
+	    }
+	    openredirect(n, memory);
+      }
+      if (memory[1])
+	    out1 = &memout;
+      if (memory[2])
+	    out2 = &memout;
+}
+
+
+STATIC void
+openredirect(redir, memory)
+      union node *redir;
+      char memory[10];
+      {
+      int fd = redir->nfile.fd;
+      char *fname;
+      int f;
+
+      /*
+       * We suppress interrupts so that we won't leave open file
+       * descriptors around.  This may not be such a good idea because
+       * an open of a device or a fifo can block indefinitely.
+       */
+      INTOFF;
+      memory[fd] = 0;
+      switch (redir->nfile.type) {
+      case NFROM:
+	    fname = redir->nfile.expfname;
+	    if ((f = open(fname, O_RDONLY)) < 0)
+		  error("cannot open %s: %s", fname, errmsg(errno, E_OPEN));
+movefd:
+	    if (f != fd) {
+		  copyfd(f, fd);
+		  close(f);
+	    }
+	    break;
+      case NTO:
+	    fname = redir->nfile.expfname;
+#ifdef O_CREAT
+	    if ((f = open(fname, O_WRONLY|O_CREAT|O_TRUNC, 0666)) < 0)
+		  error("cannot create %s: %s", fname, errmsg(errno, E_CREAT));
+#else
+	    if ((f = creat(fname, 0666)) < 0)
+		  error("cannot create %s: %s", fname, errmsg(errno, E_CREAT));
+#endif
+	    goto movefd;
+      case NAPPEND:
+	    fname = redir->nfile.expfname;
+#ifdef O_APPEND
+	    if ((f = open(fname, O_WRONLY|O_CREAT|O_APPEND, 0666)) < 0)
+		  error("cannot create %s: %s", fname, errmsg(errno, E_CREAT));
+#else
+	    if ((f = open(fname, O_WRONLY)) < 0
+	     && (f = creat(fname, 0666)) < 0)
+		  error("cannot create %s: %s", fname, errmsg(errno, E_CREAT));
+	    lseek(f, 0L, 2);
+#endif
+	    goto movefd;
+      case NTOFD:
+      case NFROMFD:
+	    if (redir->ndup.dupfd >= 0) {	/* if not ">&-" */
+		  if (memory[redir->ndup.dupfd])
+			memory[fd] = 1;
+		  else
+			copyfd(redir->ndup.dupfd, fd);
+	    }
+	    break;
+      case NHERE:
+      case NXHERE:
+	    f = openhere(redir);
+	    goto movefd;
+      default:
+	    abort();
+      }
+      INTON;
+}
+
+
+/*
+ * Handle here documents.  Normally we fork off a process to write the
+ * data to a pipe.  If the document is short, we can stuff the data in
+ * the pipe without forking.
+ */
+
+STATIC int
+openhere(redir)
+      union node *redir;
+      {
+      int pip[2];
+      int len;
+
+      if (pipe(pip) < 0)
+	    error("Pipe call failed");
+      if (redir->type == NHERE) {
+	    len = strlen(redir->nhere.doc->narg.text);
+	    if (len <= PIPESIZE) {
+		  xwrite(pip[1], redir->nhere.doc->narg.text, len);
+		  goto out;
+	    }
+      }
+      if (forkshell((struct job *)NULL, (union node *)NULL, FORK_NOJOB) == 0) {
+	    close(pip[0]);
+	    signal(SIGINT, SIG_IGN);
+	    signal(SIGQUIT, SIG_IGN);
+	    signal(SIGHUP, SIG_IGN);
+#ifdef SIGTSTP
+	    signal(SIGTSTP, SIG_IGN);
+#endif
+	    signal(SIGPIPE, SIG_DFL);
+	    if (redir->type == NHERE)
+		  xwrite(pip[1], redir->nhere.doc->narg.text, len);
+	    else
+		  expandhere(redir->nhere.doc, pip[1]);
+	    _exit(0);
+      }
+out:
+      close(pip[1]);
+      return pip[0];
+}
+
+
+
+/*
+ * Undo the effects of the last redirection.
+ */
+
+void
+popredir() {
+      register struct redirtab *rp = redirlist;
+      int i;
+
+      for (i = 0 ; i < 10 ; i++) {
+	    if (rp->renamed[i] != EMPTY) {
+		  close(i);
+		  if (rp->renamed[i] >= 0) {
+			copyfd(rp->renamed[i], i);
+			close(rp->renamed[i]);
+		  }
+	    }
+      }
+      INTOFF;
+      redirlist = rp->next;
+      ckfree(rp);
+      INTON;
+}
+
+
+
+/*
+ * Undo all redirections.  Called on error or interrupt.
+ */
+
+#ifdef mkinit
+
+INCLUDE "redir.h"
+
+RESET {
+      while (redirlist)
+	    popredir();
+}
+
+SHELLPROC {
+      clearredir();
+}
+
+#endif
+
+
+/*
+ * Discard all saved file descriptors.
+ */
+
+void
+clearredir() {
+      register struct redirtab *rp;
+      int i;
+
+      for (rp = redirlist ; rp ; rp = rp->next) {
+	    for (i = 0 ; i < 10 ; i++) {
+		  if (rp->renamed[i] >= 0) {
+			close(rp->renamed[i]);
+		  }
+		  rp->renamed[i] = EMPTY;
+	    }
+      }
+}
+
+
+
+/*
+ * Copy a file descriptor, like the F_DUPFD option of fcntl.  Returns -1
+ * if the source file descriptor is closed, EMPTY if there are no unused
+ * file descriptors left.
+ */
+
+int
+copyfd(from, to) {
+#ifdef F_DUPFD
+      int newfd;
+
+      newfd = fcntl(from, F_DUPFD, to);
+      if (newfd < 0 && errno == EMFILE)
+	    return EMPTY;
+      return newfd;
+#else
+      char toclose[32];
+      int i;
+      int newfd;
+      int e;
+
+      for (i = 0 ; i < to ; i++)
+	    toclose[i] = 0;
+      INTOFF;
+      while ((newfd = dup(from)) >= 0 && newfd < to)
+	    toclose[newfd] = 1;
+      e = errno;
+      for (i = 0 ; i < to ; i++) {
+	    if (toclose[i])
+		  close(i);
+      }
+      INTON;
+      if (newfd < 0 && e == EMFILE)
+	    return EMPTY;
+      return newfd;
+#endif
+}
+EOF
+if test `wc -c < redir.c` -ne 6644
+then	echo 'redir.c is the wrong size'
+fi
+echo extracting shell.h.bsd
+cat > shell.h.bsd <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/*
+ * The follow should be set to reflect the type of system you have:
+ *	JOBS -> 1 if you have Berkeley job control, 0 otherwise.
+ *	SYMLINKS -> 1 if your system includes symbolic links, 0 otherwise.
+ *	DIRENT -> 1 if your system has the SVR3 directory(3X) routines.
+ *	UDIR -> 1 if you want the shell to simulate the /u directory.
+ *	ATTY -> 1 to include code for atty(1).
+ *	SHORTNAMES -> 1 if your linker cannot handle long names.
+ *	define BSD if you are running 4.2 BSD or later.
+ *	define SYSV if you are running under System V.
+ *	define DEBUG to turn on debugging.
+ *
+ * When debugging is on, debugging info will be written to $HOME/trace and
+ * a quit signal will generate a core dump.
+ */
+
+
+#define JOBS 1
+#define SYMLINKS 1
+#define DIRENT 0
+#define UDIR 1
+#define ATTY 1
+#define SHORTNAMES 0
+#define BSD
+/* #define SYSV */
+/* #define DEBUG */
+
+
+
+#if SHORTNAMES
+#include "shortnames.h"
+#endif
+
+
+#ifdef __STDC__
+typedef void *pointer;
+#ifndef NULL
+#define NULL (void *)0
+#endif
+#else /* not __STDC__ */
+#define const
+#define volatile
+typedef char *pointer;
+#ifndef NULL
+#define NULL 0
+#endif
+#endif /* __STDC__ */
+#define STATIC	/* empty */
+#define MKINIT	/* empty */
+
+extern char nullstr[1];		/* null string */
+
+
+#ifdef DEBUG
+#define TRACE(param)	trace param
+#else
+#define TRACE(param)
+#endif
+EOF
+if test `wc -c < shell.h.bsd` -ne 1520
+then	echo 'shell.h.bsd is the wrong size'
+fi
+echo extracting shell.h.s5r2
+cat > shell.h.s5r2 <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/*
+ * The follow should be set to reflect the type of system you have:
+ *	JOBS -> 1 if you have Berkeley job control, 0 otherwise.
+ *	SYMLINKS -> 1 if your system includes symbolic links, 0 otherwise.
+ *	DIRENT -> 1 if your system has the SVR3 directory(3X) routines.
+ *	UDIR -> 1 if you want the shell to simulate the /u directory.
+ *	ATTY -> 1 to include code for atty(1).
+ *	SHORTNAMES -> 1 if your linker cannot handle long names.
+ *	define BSD if you are running 4.2 BSD or later.
+ *	define SYSV if you are running under System V.
+ *	define DEBUG to turn on debugging.
+ *
+ * When debugging is on, debugging info will be written to $HOME/trace and
+ * a quit signal will generate a core dump.
+ */
+
+
+#define JOBS 0
+#define SYMLINKS 0
+#define DIRENT 0
+#define UDIR 1
+#define ATTY 0
+#define SHORTNAMES 0
+/* #define BSD */
+#define SYSV
+/* #define DEBUG */
+
+
+
+#if SHORTNAMES
+#include "shortnames.h"
+#endif
+
+
+#ifdef __STDC__
+typedef void *pointer;
+#ifndef NULL
+#define NULL (void *)0
+#endif
+#else /* not __STDC__ */
+#define const
+#define volatile
+typedef char *pointer;
+#ifndef NULL
+#define NULL 0
+#endif
+#endif /* __STDC__ */
+#define STATIC	/* empty */
+#define MKINIT	/* empty */
+
+extern char nullstr[1];		/* null string */
+
+
+#ifdef DEBUG
+#define TRACE(param)	trace param
+#else
+#define TRACE(param)
+#endif
+EOF
+if test `wc -c < shell.h.s5r2` -ne 1520
+then	echo 'shell.h.s5r2 is the wrong size'
+fi
+echo extracting shell.h.s5r3
+cat > shell.h.s5r3 <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/*
+ * The follow should be set to reflect the type of system you have:
+ *	JOBS -> 1 if you have Berkeley job control, 0 otherwise.
+ *	SYMLINKS -> 1 if your system includes symbolic links, 0 otherwise.
+ *	DIRENT -> 1 if your system has the SVR3 directory(3X) routines.
+ *	UDIR -> 1 if you want the shell to simulate the /u directory.
+ *	ATTY -> 1 to include code for atty(1).
+ *	SHORTNAMES -> 1 if your linker cannot handle long names.
+ *	define BSD if you are running 4.2 BSD or later.
+ *	define SYSV if you are running under System V.
+ *	define DEBUG to turn on debugging.
+ *
+ * When debugging is on, debugging info will be written to $HOME/trace and
+ * a quit signal will generate a core dump.
+ */
+
+
+#define JOBS 0
+#define SYMLINKS 0
+#define DIRENT 1
+#define UDIR 1
+#define ATTY 0
+#define SHORTNAMES 0
+/* #define BSD */
+#define SYSV
+/* #define DEBUG */
+
+
+
+#if SHORTNAMES
+#include "shortnames.h"
+#endif
+
+
+#ifdef __STDC__
+typedef void *pointer;
+#ifndef NULL
+#define NULL (void *)0
+#endif
+#else /* not __STDC__ */
+#define const
+#define volatile
+typedef char *pointer;
+#ifndef NULL
+#define NULL 0
+#endif
+#endif /* __STDC__ */
+#define STATIC	/* empty */
+#define MKINIT	/* empty */
+
+extern char nullstr[1];		/* null string */
+
+
+#ifdef DEBUG
+#define TRACE(param)	trace param
+#else
+#define TRACE(param)
+#endif
+EOF
+if test `wc -c < shell.h.s5r3` -ne 1520
+then	echo 'shell.h.s5r3 is the wrong size'
+fi
+echo extracting shortnames.h
+cat > shortnames.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ *
+ * The following defines avoid global name conflicts for linkers that
+ * only look at the first six characters.
+ */
+
+#define builtinfunc bltfu
+#define builtinloc bltlo
+#define cmdlookup cmdlk
+#define command cmd_
+#define commandtext cmdtx
+#define delete_cmd_entry delce
+#define environment envmt
+#define expandarg exarg
+#define expandhere exher
+#define expandmeta exmet
+#define growstackblock grosb
+#define heredoclist herdl
+#define lookupvar lookv
+#define match_begin matcb
+#define number_parens numpa
+#define parsebackquote parbq
+#define parsefile parfi
+#define parsenextc parnx
+#define parsenleft parnl
+#define pushednleft pusnl
+#define pushedstring pusst
+#define readtoken1 rtok1
+#define setinputfd stifd
+#define setinputfile stifi
+#define setinteractive stint
+#define setvareq stveq
+#define stacknleft stknl
+EOF
+if test `wc -c < shortnames.h` -ne 1027
+then	echo 'shortnames.h is the wrong size'
+fi
+echo extracting show.c
+cat > show.c <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+#include <stdio.h>
+#include "shell.h"
+#include "parser.h"
+#include "nodes.h"
+#include "mystring.h"
+
+
+#ifdef notdef
+static shtree(), shcmd(), sharg(), indent();
+
+
+showtree(n)
+      union node *n;
+      {
+      trputs("showtree called\n");
+      shtree(n, 1, NULL, stdout);
+}
+
+
+static
+shtree(n, ind, pfx, fp)
+      union node *n;
+      char *pfx;
+      FILE *fp;
+      {
+      struct nodelist *lp;
+      char *s;
+
+      indent(ind, pfx, fp);
+      switch(n->type) {
+      case NSEMI:
+	    s = "; ";
+	    goto binop;
+      case NAND:
+	    s = " && ";
+	    goto binop;
+      case NOR:
+	    s = " || ";
+binop:
+	    shtree(n->nbinary.ch1, ind, NULL, fp);
+	    if (ind < 0)
+		  fputs(s, fp);
+	    shtree(n->nbinary.ch2, ind, NULL, fp);
+	    break;
+      case NCMD:
+	    shcmd(n, fp);
+	    if (ind >= 0)
+		  putc('\n', fp);
+	    break;
+      case NPIPE:
+	    for (lp = n->npipe.cmdlist ; lp ; lp = lp->next) {
+		  shcmd(lp->n, fp);
+		  if (lp->next)
+			fputs(" | ", fp);
+	    }
+	    if (n->npipe.backgnd)
+		  fputs(" &", fp);
+	    if (ind >= 0)
+		  putc('\n', fp);
+	    break;
+      default:
+	    fprintf(fp, "<node type %d>", n->type);
+	    if (ind >= 0)
+		  putc('\n', fp);
+	    break;
+      }
+}
+
+
+
+static
+shcmd(cmd, fp)
+      union node *cmd;
+      FILE *fp;
+      {
+      union node *np;
+      int first;
+      char *s;
+      int dftfd;
+
+      first = 1;
+      for (np = cmd->ncmd.args ; np ; np = np->narg.next) {
+	    if (! first)
+		  putchar(' ');
+	    sharg(np, fp);
+	    first = 0;
+      }
+      for (np = cmd->ncmd.redirect ; np ; np = np->nfile.next) {
+	    if (! first)
+		  putchar(' ');
+	    switch (np->nfile.type) {
+		  case NTO:	s = ">";  dftfd = 1; break;
+		  case NAPPEND:	s = ">>"; dftfd = 1; break;
+		  case NTOFD:	s = ">&"; dftfd = 1; break;
+		  case NFROM:	s = "<";  dftfd = 0; break;
+		  case NFROMFD:	s = "<&"; dftfd = 0; break;
+	    }
+	    if (np->nfile.fd != dftfd)
+		  fprintf(fp, "%d", np->nfile.fd);
+	    fputs(s, fp);
+	    if (np->nfile.type == NTOFD || np->nfile.type == NFROMFD) {
+		  fprintf(fp, "%d", np->nfile.dupfd);
+	    } else {
+		  sharg(np->nfile.fname, fp);
+	    }
+	    first = 0;
+      }
+}
+
+
+
+static
+sharg(arg, fp)
+      union node *arg;
+      FILE *fp;
+      {
+      char *p;
+      struct nodelist *bqlist;
+
+      if (arg->type != NARG) {
+	    printf("<node type %d>\n", arg->type);
+	    fflush(stdout);
+	    abort();
+      }
+      bqlist = arg->narg.backquote;
+      for (p = arg->narg.text ; *p ; p++) {
+	    switch (*p) {
+	    case CTLESC:
+		  putc(*++p, fp);
+		  break;
+	    case CTLVAR:
+	    case CTLVAR|CTLQUOTE:
+		  putc('$', fp);
+		  break;
+	    case CTLBACKQ:
+	    case CTLBACKQ|CTLQUOTE:
+		  putc('`', fp);
+		  shtree(bqlist->n, -1, NULL, fp);
+		  putc('`', fp);
+		  break;
+	    default:
+		  putc(*p, fp);
+		  break;
+	    }
+      }
+}
+
+
+static
+indent(amount, pfx, fp)
+      char *pfx;
+      FILE *fp;
+      {
+      int i;
+
+      for (i = 0 ; i < amount ; i++) {
+	    if (pfx && i == amount - 1)
+		  fputs(pfx, fp);
+	    putc('\t', fp);
+      }
+}
+#endif
+
+
+
+/*
+ * Debugging stuff.
+ */
+
+
+FILE *tracefile;
+
+
+
+trputc(c) {
+#ifdef DEBUG
+      if (tracefile == NULL)
+	    return;
+      putc(c, tracefile);
+      if (c == '\n')
+	    fflush(tracefile);
+#endif
+}
+
+
+trace(fmt, a1, a2, a3, a4, a5, a6, a7, a8)
+      char *fmt;
+      {
+#ifdef DEBUG
+      if (tracefile == NULL)
+	    return;
+      fprintf(tracefile, fmt, a1, a2, a3, a4, a5, a6, a7, a8);
+      if (strchr(fmt, '\n'))
+	    fflush(tracefile);
+#endif
+}
+
+
+trputs(s)
+      char *s;
+      {
+#ifdef DEBUG
+      if (tracefile == NULL)
+	    return;
+      fputs(s, tracefile);
+      if (strchr(s, '\n'))
+	    fflush(tracefile);
+#endif
+}
+
+
+trstring(s)
+      char *s;
+      {
+      register char *p;
+      char c;
+
+#ifdef DEBUG
+      if (tracefile == NULL)
+	    return;
+      putc('"', tracefile);
+      for (p = s ; *p ; p++) {
+	    switch (*p) {
+	    case '\n':  c = 'n';  goto backslash;
+	    case '\t':  c = 't';  goto backslash;
+	    case '\r':  c = 'r';  goto backslash;
+	    case '"':  c = '"';  goto backslash;
+	    case '\\':  c = '\\';  goto backslash;
+	    case CTLESC:  c = 'e';  goto backslash;
+	    case CTLVAR:  c = 'v';  goto backslash;
+	    case CTLVAR+CTLQUOTE:  c = 'V';  goto backslash;
+	    case CTLBACKQ:  c = 'q';  goto backslash;
+	    case CTLBACKQ+CTLQUOTE:  c = 'Q';  goto backslash;
+backslash:	  putc('\\', tracefile);
+		  putc(c, tracefile);
+		  break;
+	    default:
+		  if (*p >= ' ' && *p <= '~')
+			putc(*p, tracefile);
+		  else {
+			putc('\\', tracefile);
+			putc(*p >> 6 & 03, tracefile);
+			putc(*p >> 3 & 07, tracefile);
+			putc(*p & 07, tracefile);
+		  }
+		  break;
+	    }
+      }
+      putc('"', tracefile);
+#endif
+}
+
+
+trargs(ap)
+      char **ap;
+      {
+#ifdef DEBUG
+      if (tracefile == NULL)
+	    return;
+      while (*ap) {
+	    trstring(*ap++);
+	    if (*ap)
+		  putc(' ', tracefile);
+	    else
+		  putc('\n', tracefile);
+      }
+      fflush(tracefile);
+#endif
+}
+
+
+opentrace() {
+      char s[100];
+      char *p;
+      char *getenv();
+      int flags;
+
+#ifdef DEBUG
+      if ((p = getenv("HOME")) == NULL)
+	    p = "/tmp";
+      scopy(p, s);
+      strcat(s, "/trace");
+      if ((tracefile = fopen(s, "a")) == NULL) {
+	    fprintf(stderr, "Can't open %s\n", s);
+	    exit(2);
+      }
+#ifdef O_APPEND
+      if ((flags = fcntl(fileno(tracefile), F_GETFL, 0)) >= 0)
+	    fcntl(fileno(tracefile), F_SETFL, flags | O_APPEND);
+#endif
+      fputs("\nTracing started.\n", tracefile);
+      fflush(tracefile);
+#endif
+}
+EOF
+if test `wc -c < show.c` -ne 5655
+then	echo 'show.c is the wrong size'
+fi
+echo extracting trap.h
+cat > trap.h <<\EOF
+/*
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+extern int sigpending;
+
+#ifdef __STDC__
+void clear_traps(void);
+int setsignal(int);
+void ignoresig(int);
+void dotrap(void);
+void setinteractive(int);
+void exitshell(int);
+#else
+void clear_traps();
+int setsignal();
+void ignoresig();
+void dotrap();
+void setinteractive();
+void exitshell();
+#endif
+EOF
+if test `wc -c < trap.h` -ne 511
+then	echo 'trap.h is the wrong size'
+fi
+echo extracting trap.c
+cat > trap.c <<\EOF
+/*
+ * Routines for dealing with signals.
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+#include "shell.h"
+#include "main.h"
+#include "nodes.h"	/* for other headers */
+#include "eval.h"
+#include "jobs.h"
+#include "options.h"
+#include "syntax.h"
+#include "signames.h"
+#include "output.h"
+#include "memalloc.h"
+#include "error.h"
+#include "trap.h"
+#include "mystring.h"
+#include <signal.h>
+
+
+/*
+ * Sigmode records the current value of the signal handlers for the various
+ * modes.  A value of zero means that the current handler is not known.
+ * S_HARD_IGN indicates that the signal was ignored on entry to the shell,
+ */
+
+#define S_DFL 1			/* default signal handling (SIG_DFL) */
+#define S_CATCH 2		/* signal is caught */
+#define S_IGN 3			/* signal is ignored (SIG_IGN) */
+#define S_HARD_IGN 4		/* signal is ignored permenantly */
+
+
+extern char nullstr[1];		/* null string */
+
+char *trap[MAXSIG+1];		/* trap handler commands */
+MKINIT char sigmode[MAXSIG];	/* current value of signal */
+char gotsig[MAXSIG];		/* indicates specified signal received */
+int sigpending;			/* indicates some signal received */
+
+
+#ifdef SYSV
+typedef void (*sigaction)();	/* type returned by signal(2) */
+#else
+typedef int (*sigaction)();	/* type returned by signal(2) */
+#endif
+
+
+
+/*
+ * The trap builtin.
+ */
+
+trapcmd(argc, argv)  char **argv; {
+      char *action;
+      char **ap;
+      int signo;
+
+      if (argc <= 1) {
+	    for (signo = 0 ; signo <= MAXSIG ; signo++) {
+		  if (trap[signo] != NULL)
+			out1fmt("%d: %s\n", signo, trap[signo]);
+	    }
+	    return 0;
+      }
+      ap = argv + 1;
+      if (is_number(*ap))
+	    action = NULL;
+      else
+	    action = *ap++;
+      while (*ap) {
+	    if ((signo = number(*ap)) < 0 || signo > MAXSIG)
+		  error("%s: bad trap", *ap);
+	    INTOFF;
+	    if (action)
+		  action = savestr(action);
+	    if (trap[signo])
+		  ckfree(trap[signo]);
+	    trap[signo] = action;
+	    if (signo != 0)
+		  setsignal(signo);
+	    INTON;
+	    ap++;
+      }
+      return 0;
+}
+
+
+
+/*
+ * Clear traps on a fork.
+ */
+
+void
+clear_traps() {
+      char **tp;
+
+      for (tp = trap ; tp <= &trap[MAXSIG] ; tp++) {
+	    if (*tp && **tp) {	/* trap not NULL or SIG_IGN */
+		  INTOFF;
+		  ckfree(*tp);
+		  *tp = NULL;
+		  if (tp != &trap[0])
+			setsignal(tp - trap);
+		  INTON;
+	    }
+      }
+}
+
+
+
+/*
+ * Set the signal handler for the specified signal.  The routine figures
+ * out what it should be set to.
+ */
+
+int
+setsignal(signo) {
+      int action;
+      sigaction sigact;
+      char *t;
+      extern void onsig();
+
+      if ((t = trap[signo]) == NULL)
+            action = S_DFL;
+      else if (*t != '\0')
+            action = S_CATCH;
+      else
+            action = S_IGN;
+      if (rootshell && action == S_DFL) {
+            switch (signo) {
+            case SIGINT:
+                  if (iflag)
+                        action = S_CATCH;
+                  break;
+#ifndef DEBUG
+            case SIGQUIT:
+#endif
+            case SIGTERM:
+                  if (iflag)
+                        action = S_IGN;
+                  break;
+#if JOBS
+            case SIGTSTP:
+            case SIGTTOU:
+                  if (jflag)
+                        action = S_IGN;
+                  break;
+#endif
+            }
+      }
+      t = &sigmode[signo - 1];
+      if (*t == 0) {	/* current setting unknown */
+            /*
+             * There is a race condition here if action is not S_IGN.
+             * A signal can be ignored that shouldn't be.
+             */
+            if ((int)(sigact = signal(signo, SIG_IGN)) == -1)
+                  error("Signal system call failed");
+            if (sigact == SIG_IGN) {
+                  *t = S_HARD_IGN;
+            } else {
+                  *t = S_IGN;
+            }
+      }
+      if (*t == S_HARD_IGN || *t == action)
+            return 0;
+      switch (action) {
+	    case S_DFL:	   sigact = SIG_DFL;		break;
+	    case S_CATCH:  sigact = (sigaction)onsig;	break;
+	    case S_IGN:	   sigact = SIG_IGN;		break;
+      }
+      *t = action;
+      return (int)signal(signo, sigact);
+}
+
+
+
+/*
+ * Ignore a signal.
+ */
+
+void
+ignoresig(signo) {
+      if (sigmode[signo - 1] != S_IGN && sigmode[signo - 1] != S_HARD_IGN) {
+	    signal(signo, SIG_IGN);
+      }
+      sigmode[signo - 1] = S_HARD_IGN;
+}
+
+
+#ifdef mkinit
+INCLUDE "signames.h"
+INCLUDE "trap.h"
+
+SHELLPROC {
+      char *sm;
+
+      clear_traps();
+      for (sm = sigmode ; sm < sigmode + MAXSIG ; sm++) {
+	    if (*sm == S_IGN)
+		  *sm = S_HARD_IGN;
+      }
+}
+#endif
+
+
+
+/*
+ * Signal handler.
+ */
+
+void
+onsig(signo) {
+      signal(signo, (sigaction)onsig);
+      if (signo == SIGINT && trap[SIGINT] == NULL) {
+            onint();
+            return;
+      }
+      gotsig[signo - 1] = 1;
+      sigpending++;
+}
+
+
+
+/*
+ * Called to execute a trap.  Perhaps we should avoid entering new trap
+ * handlers while we are executing a trap handler.
+ */
+
+void
+dotrap() {
+      int i;
+
+      for (;;) {
+	    for (i = 1 ; ; i++) {
+		  if (gotsig[i - 1])
+			break;
+		  if (i >= MAXSIG)
+			goto done;
+	    }
+	    gotsig[i - 1] = 0;
+	    evalstring(trap[i]);
+      }
+done:
+      sigpending = 0;
+}
+
+
+
+/*
+ * Controls whether the shell is interactive or not.
+ */
+
+int is_interactive;
+
+void
+setinteractive(on) {
+      if (on == is_interactive)
+            return;
+      setsignal(SIGINT);
+      setsignal(SIGQUIT);
+      setsignal(SIGTERM);
+      is_interactive = on;
+}
+
+
+
+/*
+ * Called to exit the shell.
+ */
+
+void
+exitshell(status) {
+      struct jmploc loc1, loc2;
+      char *p;
+
+      TRACE(("exitshell(%d) pid=%d\n", status, getpid()));
+      if (setjmp(loc1.loc))  goto l1;
+      if (setjmp(loc2.loc))  goto l2;
+      handler = &loc1;
+      if ((p = trap[0]) != NULL && *p != '\0') {
+	    trap[0] = NULL;
+	    evalstring(p);
+      }
+l1:   handler = &loc2;			/* probably unnecessary */
+      flushall();
+#if JOBS
+      setjobctl(0);
+#endif
+l2:   _exit(status);
+}
+EOF
+if test `wc -c < trap.c` -ne 6014
+then	echo 'trap.c is the wrong size'
+fi
+echo extracting var.h
+cat > var.h <<\EOF
+/*
+ * Shell variables.
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+/* flags */
+#define VEXPORT		01	/* variable is exported */
+#define VREADONLY	02	/* variable cannot be modified */
+#define VSTRFIXED	04	/* variable struct is staticly allocated */
+#define VTEXTFIXED	010	/* text is staticly allocated */
+#define VSTACK		020	/* text is allocated on the stack */
+#define VUNSET		040	/* the variable is not set */
+
+
+struct var {
+      struct var *next;		/* next entry in hash list */
+      int flags;		/* flags are defined above */
+      char *text;		/* name=value */
+};
+
+
+struct localvar {
+      struct localvar *next;	/* next local variable in list */
+      struct var *vp;		/* the variable that was made local */
+      int flags;		/* saved flags */
+      char *text;		/* saved text */
+};
+
+
+struct localvar *localvars;
+
+#if ATTY
+extern struct var vatty;
+#endif
+extern struct var vifs;
+extern struct var vmail;
+extern struct var vmpath;
+extern struct var vpath;
+extern struct var vps1;
+extern struct var vps2;
+#if ATTY
+extern struct var vterm;
+#endif
+
+/*
+ * The following macros access the values of the above variables.
+ * They have to skip over the name.  They return the null string
+ * for unset variables.
+ */
+
+#define ifsval()	(vifs.text + 4)
+#define mailval()	(vmail.text + 5)
+#define mpathval()	(vmpath.text + 9)
+#define pathval()	(vpath.text + 5)
+#define ps1val()	(vps1.text + 4)
+#define ps2val()	(vps2.text + 4)
+#if ATTY
+#define termval()	(vterm.text + 5)
+#endif
+
+#if ATTY
+#define attyset()	((vatty.flags & VUNSET) == 0)
+#endif
+#define mpathset()	((vmpath.flags & VUNSET) == 0)
+
+
+#ifdef __STDC__
+void initvar();
+void setvar(char *, char *, int);
+void setvareq(char *, int);
+void listsetvar(struct strlist *);
+char *lookupvar(char *);
+char *bltinlookup(char *, int);
+char **environment();
+int showvarscmd(int, char **);
+void mklocal(char *);
+void poplocalvars(void);
+#else
+void initvar();
+void setvar();
+void setvareq();
+void listsetvar();
+char *lookupvar();
+char *bltinlookup();
+char **environment();
+int showvarscmd();
+void mklocal();
+void poplocalvars();
+#endif
+EOF
+if test `wc -c < var.h` -ne 2241
+then	echo 'var.h is the wrong size'
+fi
+echo extracting var.c
+cat > var.c <<\EOF
+/*
+ * Shell variables.
+ *
+ * Copyright (C) 1989 by Kenneth Almquist.  All rights reserved.
+ * This file is part of ash, which is distributed under the terms specified
+ * by the Ash General Public License.  See the file named LICENSE.
+ */
+
+
+#include "shell.h"
+#include "output.h"
+#include "expand.h"
+#include "nodes.h"	/* for other headers */
+#include "eval.h"	/* defines cmdenviron */
+#include "exec.h"
+#include "syntax.h"
+#include "options.h"
+#include "mail.h"
+#include "var.h"
+#include "memalloc.h"
+#include "error.h"
+#include "mystring.h"
+
+
+#define VTABSIZE 39
+
+
+struct varinit {
+      struct var *var;
+      int flags;
+      char *text;
+};
+
+
+#if ATTY
+struct var vatty;
+#endif
+struct var vifs;
+struct var vmail;
+struct var vmpath;
+struct var vpath;
+struct var vps1;
+struct var vps2;
+struct var vvers;
+#if ATTY
+struct var vterm;
+#endif
+
+const struct varinit varinit[] = {
+#if ATTY
+      {&vatty,	VSTRFIXED|VTEXTFIXED|VUNSET,	"ATTY="},
+#endif
+      {&vifs,	VSTRFIXED|VTEXTFIXED,		"IFS= \t\n"},
+      {&vmail,	VSTRFIXED|VTEXTFIXED|VUNSET,	"MAIL="},
+      {&vmpath,	VSTRFIXED|VTEXTFIXED|VUNSET,	"MAILPATH="},
+      {&vpath,	VSTRFIXED|VTEXTFIXED,		"PATH=:/bin:/usr/bin"},
+      {&vps1,	VSTRFIXED|VTEXTFIXED,		"PS1=@ "},
+      {&vps2,	VSTRFIXED|VTEXTFIXED,		"PS2=> "},
+      {&vvers,	VSTRFIXED|VTEXTFIXED,		"SHELLVERS=ash 0.2"},
+#if ATTY
+      {&vterm,	VSTRFIXED|VTEXTFIXED|VUNSET,	"TERM="},
+#endif
+      {NULL,	0,				NULL}
+};
+
+struct var *vartab[VTABSIZE];
+
+#ifdef __STDC__
+STATIC void unsetvar(char *);
+STATIC struct var **hashvar(char *);
+STATIC int varequal(char *, char *);
+#else
+STATIC void unsetvar();
+STATIC struct var **hashvar();
+STATIC int varequal();
+#endif
+
+
+
+/*
+ * Initialize the varable symbol tables and import the environment
+ */
+
+#ifdef mkinit
+INCLUDE "var.h"
+INIT {
+      char **envp;
+      extern char **environ;
+
+      initvar();
+      for (envp = environ ; *envp ; envp++) {
+	    if (strchr(*envp, '=')) {
+		  setvareq(*envp, VEXPORT|VTEXTFIXED);
+	    }
+      }
+}
+#endif
+
+
+/*
+ * This routine initializes the builtin variables.  It is called when the
+ * shell is initialized and again when a shell procedure is spawned.
+ */
+
+void
+initvar() {
+      const struct varinit *ip;
+      struct var *vp;
+      struct var **vpp;
+
+      for (ip = varinit ; (vp = ip->var) != NULL ; ip++) {
+	    if ((vp->flags & VEXPORT) == 0) {
+		  vpp = hashvar(ip->text);
+		  vp->next = *vpp;
+		  *vpp = vp;
+		  vp->text = ip->text;
+		  vp->flags = ip->flags;
+	    }
+      }
+}
+
+
+
+/*
+ * Set the value of a variable.  The flags argument is ored with the
+ * flags of the variable.  If val is NULL, the variable is unset.
+ */
+
+void
+setvar(name, val, flags)
+      char *name, *val;
+      {
+      char *p, *q;
+      int len;
+      int namelen;
+      char *nameeq;
+      int isbad;
+
+      isbad = 0;
+      p = name;
+      if (! is_name(*p++))
+	    isbad = 1;
+      for (;;) {
+	    if (! is_in_name(*p)) {
+		  if (*p == '\0' || *p == '=')
+			break;
+		  isbad = 1;
+	    }
+	    p++;
+      }
+      namelen = p - name;
+      if (isbad)
+	    error("%.*s: is read only", namelen, name);
+      len = namelen + 2;		/* 2 is space for '=' and '\0' */
+      if (val == NULL) {
+	    flags |= VUNSET;
+      } else {
+	    len += strlen(val);
+      }
+      p = nameeq = ckmalloc(len);
+      q = name;
+      while (--namelen >= 0)
+	    *p++ = *q++;
+      *p++ = '=';
+      *p = '\0';
+      if (val)
+	    scopy(val, p);
+      setvareq(nameeq, flags);
+}
+
+
+
+/*
+ * Same as setvar except that the variable and value are passed in
+ * the first argument as name=value.  Since the first argument will
+ * be actually stored in the table, it should not be a string that
+ * will go away.
+ */
+
+void
+setvareq(s, flags)
+      char *s;
+      {
+      struct var *vp, **vpp;
+
+      vpp = hashvar(s);
+      for (vp = *vpp ; vp ; vp = vp->next) {
+	    if (varequal(s, vp->text)) {
+		  if (vp->flags & VREADONLY) {
+			int len = strchr(s, '=') - s;
+			error("%.*s: is read only", len, s);
+		  }
+		  INTOFF;
+		  if (vp == &vpath)
+			changepath(s + 5);	/* 5 = strlen("PATH=") */
+		  if ((vp->flags & (VTEXTFIXED|VSTACK)) == 0)
+			ckfree(vp->text);
+		  vp->flags &=~ (VTEXTFIXED|VSTACK|VUNSET);
+		  vp->flags |= flags;
+		  vp->text = s;
+		  if (vp == &vmpath || (vp == &vmail && ! mpathset()))
+			chkmail(1);
+		  INTON;
+		  return;
+	    }
+      }
+      /* not found */
+      vp = ckmalloc(sizeof (*vp));
+      vp->flags = flags;
+      vp->text = s;
+      vp->next = *vpp;
+      *vpp = vp;
+}
+
+
+
+/*
+ * Process a linked list of variable assignments.
+ */
+
+void
+listsetvar(list)
+      struct strlist *list;
+      {
+      struct strlist *lp;
+
+      INTOFF;
+      for (lp = list ; lp ; lp = lp->next) {
+	    setvareq(savestr(lp->text), 0);
+      }
+      INTON;
+}
+
+
+
+/*
+ * Find the value of a variable.  Returns NULL if not set.
+ */
+
+char *
+lookupvar(name)
+      char *name;
+      {
+      struct var *v;
+
+      for (v = *hashvar(name) ; v ; v = v->next) {
+	    if (varequal(v->text, name)) {
+		  if (v->flags & VUNSET)
+			return NULL;
+		  return strchr(v->text, '=') + 1;
+	    }
+      }
+      return NULL;
+}
+
+
+
+/*
+ * Search the environment of a builtin command.  If the second argument
+ * is nonzero, return the value of a variable even if it hasn't been
+ * exported.
+ */
+
+char *
+bltinlookup(name, doall)
+      char *name;
+      {
+      struct strlist *sp;
+      struct var *v;
+
+      for (sp = cmdenviron ; sp ; sp = sp->next) {
+	    if (varequal(sp->text, name))
+		  return strchr(sp->text, '=') + 1;
+      }
+      for (v = *hashvar(name) ; v ; v = v->next) {
+	    if (varequal(v->text, name)) {
+		  if (v->flags & VUNSET
+		   || ! doall && (v->flags & VEXPORT) == 0)
+			return NULL;
+		  return strchr(v->text, '=') + 1;
+	    }
+      }
+      return NULL;
+}
+
+
+
+/*
+ * Generate a list of exported variables.  This routine is used to construct
+ * the third argument to execve when executing a program.
+ */
+
+char **
+environment() {
+      int nenv;
+      struct var **vpp;
+      struct var *vp;
+      char **env, **ep;
+
+      nenv = 0;
+      for (vpp = vartab ; vpp < vartab + VTABSIZE ; vpp++) {
+	    for (vp = *vpp ; vp ; vp = vp->next)
+		  if (vp->flags & VEXPORT)
+			nenv++;
+      }
+      ep = env = stalloc((nenv + 1) * sizeof *env);
+      for (vpp = vartab ; vpp < vartab + VTABSIZE ; vpp++) {
+	    for (vp = *vpp ; vp ; vp = vp->next)
+		  if (vp->flags & VEXPORT)
+			*ep++ = vp->text;
+      }
+      *ep = NULL;
+      return env;
+}
+
+
+/*
+ * Called when a shell procedure is invoked to clear out nonexported
+ * variables.  It is also necessary to reallocate variables of with
+ * VSTACK set since these are currently allocated on the stack.
+ */
+
+#ifdef mkinit
+MKINIT void shprocvar();
+
+SHELLPROC {
+      shprocvar();
+}
+#endif
+
+void
+shprocvar() {
+      struct var **vpp;
+      struct var *vp, **prev;
+
+      for (vpp = vartab ; vpp < vartab + VTABSIZE ; vpp++) {
+	    for (prev = vpp ; (vp = *prev) != NULL ; ) {
+		  if ((vp->flags & VEXPORT) == 0) {
+			*prev = vp->next;
+			if ((vp->flags & VTEXTFIXED) == 0)
+			      ckfree(vp->text);
+			if ((vp->flags & VSTRFIXED) == 0)
+			      ckfree(vp);
+		  } else {
+			if (vp->flags & VSTACK) {
+			      vp->text = savestr(vp->text);
+			      vp->flags &=~ VSTACK;
+			}
+			prev = &vp->next;
+		  }
+	    }
+      }
+      initvar();
+}
+
+
+
+/*
+ * Command to list all variables which are set.  Currently this command
+ * is invoked from the set command when the set command is called without
+ * any variables.
+ */
+
+int
+showvarscmd(argc, argv)  char **argv; {
+      struct var **vpp;
+      struct var *vp;
+
+      for (vpp = vartab ; vpp < vartab + VTABSIZE ; vpp++) {
+	    for (vp = *vpp ; vp ; vp = vp->next) {
+		  if ((vp->flags & VUNSET) == 0)
+			out1fmt("%s\n", vp->text);
+	    }
+      }
+      return 0;
+}
+
+
+
+/*
+ * The export and readonly commands.
+ */
+
+int
+exportcmd(argc, argv)  char **argv; {
+      struct var **vpp;
+      struct var *vp;
+      char *name;
+      char *p;
+      int flag = argv[0][0] == 'r'? VREADONLY : VEXPORT;
+
+      listsetvar(cmdenviron);
+      if (argc > 1) {
+	    while ((name = *argptr++) != NULL) {
+		  if ((p = strchr(name, '=')) != NULL) {
+			p++;
+		  } else {
+			vpp = hashvar(name);
+			for (vp = *vpp ; vp ; vp = vp->next) {
+			      if (varequal(vp->text, name)) {
+				    vp->flags |= flag;
+				    goto found;
+			      }
+			}
+		  }
+		  setvar(name, p, flag);
+found:;
+	    }
+      } else {
+	    for (vpp = vartab ; vpp < vartab + VTABSIZE ; vpp++) {
+		  for (vp = *vpp ; vp ; vp = vp->next) {
+			if (vp->flags & flag) {
+			      for (p = vp->text ; *p != '=' ; p++)
+				    out1c(*p);
+			      out1c('\n');
+			}
+		  }
+	    }
+      }
+      return 0;
+}
+
+
+/*
+ * The "local" command.
+ */
+
+localcmd(argc, argv)  char **argv; {
+      char *name;
+
+      if (! in_function())
+	    error("Not in a function");
+      while ((name = *argptr++) != NULL) {
+	    mklocal(name);
+      }
+      return 0;
+}
+
+
+/*
+ * Make a variable a local variable.  When a variable is made local, it's
+ * value and flags are saved in a localvar structure.  The saved values
+ * will be restored when the shell function returns.  We handle the name
+ * "-" as a special case.
+ */
+
+void
+mklocal(name)
+      char *name;
+      {
+      struct localvar *lvp;
+      struct var **vpp;
+      struct var *vp;
+
+      INTOFF;
+      lvp = ckmalloc(sizeof (struct localvar));
+      if (name[0] == '-' && name[1] == '\0') {
+	    lvp->text = ckmalloc(sizeof optval);
+	    bcopy(optval, lvp->text, sizeof optval);
+	    vp = NULL;
+      } else {
+	    vpp = hashvar(name);
+	    for (vp = *vpp ; vp && ! varequal(vp->text, name) ; vp = vp->next);
+	    if (vp == NULL) {
+		  if (strchr(name, '='))
+			setvareq(savestr(name), VSTRFIXED);
+		  else
+			setvar(name, NULL, VSTRFIXED);
+		  vp = *vpp;	/* the new variable */
+		  lvp->text = NULL;
+		  lvp->flags = VUNSET;
+	    } else {
+		  lvp->text = vp->text;
+		  lvp->flags = vp->flags;
+		  vp->flags |= VSTRFIXED|VTEXTFIXED;
+		  if (strchr(name, '='))
+			setvareq(savestr(name), 0);
+	    }
+      }
+      lvp->vp = vp;
+      lvp->next = localvars;
+      localvars = lvp;
+      INTON;
+}
+
+
+/*
+ * Called after a function returns.
+ */
+
+void
+poplocalvars() {
+      struct localvar *lvp;
+      struct var *vp;
+
+      while ((lvp = localvars) != NULL) {
+	    localvars = lvp->next;
+	    vp = lvp->vp;
+	    if (vp == NULL) {	/* $- saved */
+		  bcopy(lvp->text, optval, sizeof optval);
+		  ckfree(lvp->text);
+	    } else if ((lvp->flags & (VUNSET|VSTRFIXED)) == VUNSET) {
+		  unsetvar(vp->text);
+	    } else {
+		  if ((vp->flags & VTEXTFIXED) == 0)
+			ckfree(vp->text);
+		  vp->flags = lvp->flags;
+		  vp->text = lvp->text;
+	    }
+	    ckfree(lvp);
+      }
+}
+
+
+setvarcmd(argc, argv)  char **argv; {
+      if (argc <= 2)
+	    return unsetcmd(argc, argv);
+      else if (argc == 3)
+	    setvar(argv[1], argv[2], 0);
+      else
+	    error("List assignment not implemented");
+      return 0;
+}
+
+
+/*
+ * The unset builtin command.  We unset the function before we unset the
+ * variable to allow a function to be unset when there is a readonly variable
+ * with the same name.
+ */
+
+unsetcmd(argc, argv)  char **argv; {
+      char **ap;
+
+      for (ap = argv + 1 ; *ap ; ap++) {
+	    unsetfunc(*ap);
+	    unsetvar(*ap);
+      }
+      return 0;
+}
+
+
+/*
+ * Unset the specified variable.
+ */
+
+STATIC void
+unsetvar(s)
+      char *s;
+      {
+      struct var **vpp;
+      struct var *vp;
+
+      vpp = hashvar(s);
+      for (vp = *vpp ; vp ; vpp = &vp->next, vp = *vpp) {
+	    if (varequal(vp->text, s)) {
+		  INTOFF;
+		  if (*(strchr(vp->text, '=') + 1) != '\0'
+		   || vp->flags & VREADONLY) {
+			setvar(s, nullstr, 0);
+		  }
+		  vp->flags &=~ VEXPORT;
+		  vp->flags |= VUNSET;
+		  if ((vp->flags & VSTRFIXED) == 0) {
+			if ((vp->flags & VTEXTFIXED) == 0)
+			      ckfree(vp->text);
+			*vpp = vp->next;
+			ckfree(vp);
+		  }
+		  INTON;
+		  return;
+	    }
+      }
+}
+
+
+
+/*
+ * Find the appropriate entry in the hash table from the name.
+ */
+
+STATIC struct var **
+hashvar(p)
+      register char *p;
+      {
+      unsigned int hashval;
+
+      hashval = *p << 4;
+      while (*p && *p != '=')
+	    hashval += *p++;
+      return &vartab[hashval % VTABSIZE];
+}
+
+
+
+/*
+ * Returns true if the two strings specify the same varable.  The first
+ * variable name is terminated by '='; the second may be terminated by
+ * either '=' or '\0'.
+ */
+
+STATIC int
+varequal(p, q)
+      register char *p, *q;
+      {
+      while (*p == *q++) {
+	    if (*p++ == '=')
+		  return 1;
+      }
+      if (*p == '=' && *(q - 1) == '\0')
+	    return 1;
+      return 0;
+}
+EOF
+if test `wc -c < var.c` -ne 12409
+then	echo 'var.c is the wrong size'
+fi
+echo extracting TOUR
+cat > TOUR <<\EOF
+                       A Tour through Ash
+
+               Copyright 1989 by Kenneth Almquist.
+
+
+DIRECTORIES:  The subdirectory bltin contains commands which can
+be compiled stand-alone.  The rest of the source is in the main
+ash directory.
+
+SOURCE CODE GENERATORS:  Files whose names begin with "mk" are
+programs that generate source code.  A complete list of these
+programs is:
+
+        program         intput files        generates
+        -------         ------------        ---------
+        mkbuiltins      builtins            builtins.h builtins.c
+        mkinit          *.c                 init.c
+        mknodes         nodetypes           nodes.h nodes.c
+        mksignames          -               signames.h signames.c
+        mksyntax            -               syntax.h syntax.c
+        mktokens            -               token.def
+        bltin/mkexpr    unary_op binary_op  operators.h operators.c
+
+There are undoubtedly too many of these.  Mkinit searches all the
+C source files for entries looking like:
+
+        INIT {
+              x = 1;    /* executed during initialization */
+        }
+
+        RESET {
+              x = 2;    /* executed when the shell does a longjmp
+                           back to the main command loop */
+        }
+
+        SHELLPROC {
+              x = 3;    /* executed when the shell runs a shell procedure */
+        }
+
+It pulls this code out into routines which are when particular
+events occur.  The intent is to improve modularity by isolating
+the information about which modules need to be explicitly
+initialized/reset within the modules themselves.
+
+Mkinit recognizes several constructs for placing declarations in
+the init.c file.
+        INCLUDE "file.h"
+includes a file.  The storage class MKINIT makes a declaration
+available in the init.c file, for example:
+        MKINIT int funcnest;    /* depth of function calls */
+MKINIT alone on a line introduces a structure or union declara-
+tion:
+        MKINIT
+        struct redirtab {
+              short renamed[10];
+        };
+Preprocessor #define statements are copied to init.c without any
+special action to request this.
+
+INDENTATION:  The ash source is indented in multiples of six
+spaces.  The only study that I have heard of on the subject con-
+cluded that the optimal amount to indent is in the range of four
+to six spaces.  I use six spaces since it is not too big a jump
+from the widely used eight spaces.  If you really hate six space
+indentation, use the adjind (source included) program to change
+it to something else.
+
+EXCEPTIONS:  Code for dealing with exceptions appears in
+exceptions.c.  The C language doesn't include exception handling,
+so I implement it using setjmp and longjmp.  The global variable
+exception contains the type of exception.  EXERROR is raised by
+calling error.  EXINT is an interrupt.  EXSHELLPROC is an excep-
+tion which is raised when a shell procedure is invoked.  The pur-
+pose of EXSHELLPROC is to perform the cleanup actions associated
+with other exceptions.  After these cleanup actions, the shell
+can interpret a shell procedure itself without exec'ing a new
+copy of the shell.
+
+INTERRUPTS:  In an interactive shell, an interrupt will cause an
+EXINT exception to return to the main command loop.  (Exception:
+EXINT is not raised if the user traps interrupts using the trap
+command.)  The INTOFF and INTON macros (defined in exception.h)
+provide uninterruptable critical sections.  Between the execution
+of INTOFF and the execution of INTON, interrupt signals will be
+held for later delivery.  INTOFF and INTON can be nested.
+
+MEMALLOC.C:  Memalloc.c defines versions of malloc and realloc
+which call error when there is no memory left.  It also defines a
+stack oriented memory allocation scheme.  Allocating off a stack
+is probably more efficient than allocation using malloc, but the
+big advantage is that when an exception occurs all we have to do
+to free up the memory in use at the time of the exception is to
+restore the stack pointer.  The stack is implemented using a
+linked list of blocks.
+
+STPUTC:  If the stack were contiguous, it would be easy to store
+strings on the stack without knowing in advance how long the
+string was going to be:
+        p = stackptr;
+        *p++ = c;       /* repeated as many times as needed */
+        stackptr = p;
+The folloing three macros (defined in memalloc.h) perform these
+operations, but grow the stack if you run off the end:
+        STARTSTACKSTR(p);
+        STPUTC(c, p);   /* repeated as many times as needed */
+        grabstackstr(p);
+
+We now start a top-down look at the code:
+
+MAIN.C:  The main routine performs some initialization, executes
+the user's profile if necessary, and calls cmdloop.  Cmdloop is
+repeatedly parses and executes commands.
+
+OPTIONS.C:  This file contains the option processing code.  It is
+called from main to parse the shell arguments when the shell is
+invoked, and it also contains the set builtin.  The -i and -j op-
+tions (the latter turns on job control) require changes in signal
+handling.  The routines setjobctl (in jobs.c) and setinteractive
+(in trap.c) are called to handle changes to these options.
+
+PARSING:  The parser code is all in parser.c.  A recursive des-
+cent parser is used.  Syntax tables (generated by mksyntax) are
+used to classify characters during lexical analysis.  There are
+three tables:  one for normal use, one for use when inside single
+quotes, and one for use when inside double quotes.  The tables
+are machine dependent because they are indexed by character vari-
+ables and the range of a char varies from machine to machine.
+
+PARSE OUTPUT:  The output of the parser consists of a tree of
+nodes.  The various types of nodes are defined in the file node-
+types.
+
+Nodes of type NARG are used to represent both words and the con-
+tents of here documents.  An early version of ash kept the con-
+tents of here documents in temporary files, but keeping here do-
+cuments in memory typically results in significantly better per-
+formance.  It would have been nice to make it an option to use
+temporary files for here documents, for the benefit of small
+machines, but the code to keep track of when to delete the tem-
+porary files was complex and I never fixed all the bugs in it.
+(AT&T has been maintaining the Bourne shell for more than ten
+years, and to the best of my knowledge they still haven't gotten
+it to handle temporary files correctly in obscure cases.)
+
+The text field of a NARG structure points to the text of the
+word.  The text consists of ordinary characters and a number of
+special codes defined in parser.h.  The special codes are:
+
+        CTLVAR              Variable substitution
+        CTLENDVAR           End of variable substitution
+        CTLBACKQ            Command substitution
+        CTLBACKQ|CTLQUOTE   Command substitution inside double quotes
+        CTLESC              Escape next character
+
+A variable substitution contains the following elements:
+
+        CTLVAR type name '=' [ alternative-text CTLENDVAR ]
+
+The type field is a single character specifying the type of sub-
+stitution.  The possible types are:
+
+        VSNORMAL            $var
+        VSMINUS             ${var-text}
+        VSMINUS|VSNUL       ${var:-text}
+        VSPLUS              ${var+text}
+        VSPLUS|VSNUL        ${var:+text}
+        VSQUESTION          ${var?text}
+        VSQUESTION|VSNUL    ${var:?text}
+        VSASSIGN            ${var=text}
+        VSASSIGN|VSNUL      ${var=text}
+
+In addition, the type field will have the VSQUOTE flag set if the
+variable is enclosed in double quotes.  The name of the variable
+comes next, terminated by an equals sign.  If the type is not
+VSNORMAL, then the text field in the substitution follows, ter-
+minated by a CTLENDVAR byte.
+
+Commands in back quotes are parsed and stored in a linked list.
+The locations of these commands in the string are indicated by
+CTLBACKQ and CTLBACKQ+CTLQUOTE characters, depending upon whether
+the back quotes were enclosed in double quotes.
+
+The character CTLESC escapes the next character, so that in case
+any of the CTL characters mentioned above appear in the input,
+they can be passed through transparently.  CTLESC is also used to
+escape '*', '?', '[', and '!' characters which were quoted by the
+user and thus should not be used for file name generation.
+
+CTLESC characters have proved to be particularly tricky to get
+right.  In the case of here documents which are not subject to
+variable and command substitution, the parser doesn't insert any
+CTLESC characters to begin with (so the contents of the text
+field can be written without any processing).  Other here docu-
+ments, and words which are not subject to splitting and file name
+generation, have the CTLESC characters removed during the vari-
+able and command substitution phase.  Words which are subject
+splitting and file name generation have the CTLESC characters re-
+moved as part of the file name phase.
+
+EXECUTION:  Command execution is handled by the following files:
+        eval.c     The top level routines.
+        redir.c    Code to handle redirection of input and output.
+        jobs.c     Code to handle forking, waiting, and job control.
+        exec.c     Code to to path searches and the actual exec sys call.
+        expand.c   Code to evaluate arguments.
+        var.c      Maintains the variable symbol table.  Called from expand.c.
+
+EVAL.C:  Evaltree recursively executes a parse tree.  The exit
+status is returned in the global variable exitstatus.  The alter-
+native entry evalbackcmd is called to evaluate commands in back
+quotes.  It saves the result in memory if the command is a buil-
+tin; otherwise it forks off a child to execute the command and
+connects the standard output of the child to a pipe.
+
+JOBS.C:  To create a process, you call makejob to return a job
+structure, and then call forkshell (passing the job structure as
+an argument) to create the process.  Waitforjob waits for a job
+to complete.  These routines take care of process groups if job
+control is defined.
+
+REDIR.C:  Ash allows file descriptors to be redirected and then
+restored without forking off a child process.  This is accom-
+plished by duplicating the original file descriptors.  The redir-
+tab structure records where the file descriptors have be dupli-
+cated to.
+
+EXEC.C:  The routine find_command locates a command, and enters
+the command in the hash table if it is not already there.  The
+third argument specifies whether it is to print an error message
+if the command is not found.  (When a pipeline is set up,
+find_command is called for all the commands in the pipeline be-
+fore any forking is done, so to get the commands into the hash
+table of the parent process.  But to make command hashing as
+transparent as possible, we silently ignore errors at that point
+and only print error messages if the command cannot be found
+later.)
+
+The routine shellexec is the interface to the exec system call.
+
+EXPAND.C:  Arguments are processed in three passes.  The first
+(performed by the routine argstr) performs variable and command
+substitution.  The second (ifsbreakup) performs word splitting
+and the third (expandmeta) performs file name generation.  If the
+"/u" directory is simulated, then when "/u/username" is replaced
+by the user's home directory, the flag "didudir" is set.  This
+tells the cd command that it should print out the directory name,
+just as it would if the "/u" directory were implemented using
+symbolic links.
+
+VAR.C:  Variables are stored in a hash table.  Probably we should
+switch to extensible hashing.  The variable name is stored in the
+same string as the value (using the format "name=value") so that
+no string copying is needed to create the environment of a com-
+mand.  Variables which the shell references internally are preal-
+located so that the shell can reference the values of these vari-
+ables without doing a lookup.
+
+When a program is run, the code in eval.c sticks any environment
+variables which precede the command (as in "PATH=xxx command") in
+the variable table as the simplest way to strip duplicates, and
+then calls "environment" to get the value of the environment.
+There are two consequences of this.  First, if an assignment to
+PATH precedes the command, the value of PATH before the assign-
+ment must be remembered and passed to shellexec.  Second, if the
+program turns out to be a shell procedure, the strings from the
+environment variables which preceded the command must be pulled
+out of the table and replaced with strings obtained from malloc,
+since the former will automatically be freed when the stack (see
+the entry on memalloc.c) is emptied.
+
+BUILTIN COMMANDS:  The procedures for handling these are scat-
+tered throughout the code, depending on which location appears
+most appropriate.  They can be recognized because their names al-
+ways end in "cmd".  The mapping from names to procedures is
+specified in the file builtins, which is processed by the mkbuil-
+tins command.
+
+A builtin command is invoked with argc and argv set up like a
+normal program.  A builtin command is allowed to overwrite its
+arguments.  Builtin routines can call nextopt to do option pars-
+ing.  This is kind of like getopt, but you don't pass argc and
+argv to it.  Builtin routines can also call error.  This routine
+normally terminates the shell (or returns to the main command
+loop if the shell is interactive), but when called from a builtin
+command it causes the builtin command to terminate with an exit
+status of 2.
+
+The directory bltins contains commands which can be compiled in-
+dependently but can also be built into the shell for efficiency
+reasons.  The makefile in this directory compiles these programs
+in the normal fashion (so that they can be run regardless of
+whether the invoker is ash), but also creates a library named
+bltinlib.a which can be linked with ash.  The header file bltin.h
+takes care of most of the differences between the ash and the
+stand-alone environment.  The user should call the main routine
+"main", and #define main to be the name of the routine to use
+when the program is linked into ash.  This #define should appear
+before bltin.h is included; bltin.h will #undef main if the pro-
+gram is to be compiled stand-alone.
+
+CD.C:  This file defines the cd and pwd builtins.  The pwd com-
+mand runs /bin/pwd the first time it is invoked (unless the user
+has already done a cd to an absolute pathname), but then
+remembers the current directory and updates it when the cd com-
+mand is run, so subsequent pwd commands run very fast.  The main
+complication in the cd command is in the docd command, which
+resolves symbolic links into actual names and informs the user
+where the user ended up if he crossed a symbolic link.
+
+SIGNALS:  Trap.c implements the trap command.  The routine set-
+signal figures out what action should be taken when a signal is
+received and invokes the signal system call to set the signal ac-
+tion appropriately.  When a signal that a user has set a trap for
+is caught, the routine "onsig" sets a flag.  The routine dotrap
+is called at appropriate points to actually handle the signal.
+When an interrupt is caught and no trap has been set for that
+signal, the routine "onint" in error.c is called.
+
+OUTPUT:  Ash uses it's own output routines.  There are three out-
+put structures allocated.  "Output" represents the standard out-
+put, "errout" the standard error, and "memout" contains output
+which is to be stored in memory.  This last is used when a buil-
+tin command appears in backquotes, to allow its output to be col-
+lected without doing any I/O through the UNIX operating system.
+The variables out1 and out2 normally point to output and errout,
+respectively, but they are set to point to memout when appropri-
+ate inside backquotes.
+
+INPUT:  The basic input routine is pgetc, which reads from the
+current input file.  There is a stack of input files; the current
+input file is the top file on this stack.  The code allows the
+input to come from a string rather than a file.  (This is for the
+-c option and the "." and eval builtin commands.)  The global
+variable plinno is saved and restored when files are pushed and
+popped from the stack.  The parser routines store the number of
+the current line in this variable.
+
+DEBUGGING:  If DEBUG is defined in shell.h, then the shell will
+write debugging information to the file $HOME/trace.  Most of
+this is done using the TRACE macro, which takes a set of printf
+arguments inside two sets of parenthesis.  Example:
+"TRACE(("n=%d0, n))".  The double parenthesis are necessary be-
+cause the preprocessor can't handle functions with a variable
+number of arguments.  Defining DEBUG also causes the shell to
+generate a core dump if it is sent a quit signal.  The tracing
+code is in show.c.
+EOF
+if test `wc -c < TOUR` -ne 16760
+then	echo 'TOUR is the wrong size'
+fi
+echo Archive 7 unpacked
+exit
+

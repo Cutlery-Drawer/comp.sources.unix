@@ -1,0 +1,1332 @@
+Newsgroups: comp.sources.unix
+From: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Subject: v29i024: mvstape - suite of utilities for handling IBM MVS tapes, Part05/09
+References: <1.807573809.16947@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Posting-Number: Volume 29, Issue 24
+Archive-Name: mvstape/part05
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 5 (of 9)."
+# Contents:  loadtape.c recover.c tlspds.c
+# Wrapped by nmm1@ursa.cus.cam.ac.uk on Fri Aug  4 15:43:58 1995
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'loadtape.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'loadtape.c'\"
+else
+echo shar: Extracting \"'loadtape.c'\" \(15030 characters\)
+sed "s/^X//" >'loadtape.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xloadtape.c  -  The only module for the tape 'diskizing' utility except for
+Xtapeio.c.  Note that it has not been tested on MS-DOS etc. */
+X
+X
+X
+X/* WARNING:  the whole program assumes that CHAR_BIT == 8, sizeof(short) >= 2
+Xand sizeof(int) >= 4.  There is no point in putting the effort into dealing
+Xwith this, given the expected lifetime of this program and the foulness of the
+Xjob. */
+X
+X
+X
+X#include "version.h"
+X#include "loadtape.h"
+X#include "ebcdic.h"
+X#include "labels.h"
+X#include "tlsdict.h"
+X
+X
+X
+X/* Global workspace. */
+X
+Xchar *command_name = NULL;
+X
+Xint return_code = EXIT_SUCCESS, debug = 0, verification = 0,
+X    tape_fileno = -1, disk_fileno = -1, file_count = 0, IO_error_count = 0;
+X
+X
+X
+XSTATIC void get_string (char *target, const char *data, int length) {
+X
+X/* Convert a piece of EBCDIC text to an ASCII C string, removing trailing
+Xspaces.  target must be longer than data. */
+X
+X    int i;
+X    char *ptr;
+X
+X    for (i = 0; i < length; ++i) target[i] = EBCDIC_to_ASCII(data[i]);
+X    target[length] = '\0';
+X    if ((ptr = strchr(target,' ')) != NULL) *ptr = '\0';
+X}
+X
+X
+X
+XSTATIC void diagnose_tape (int fileno) {
+X
+X/* Issue some diagnostics after an I/O error or unexpected EOF on tape.  Note
+Xthat this can be called from other diagnostic routines, and that failure is
+Xdefinitely catastrophic! */
+X
+X    const char *status;
+X
+X    if ((status = basic_tape_status(fileno)) != NULL)
+X        fprintf(stderr,"%s\n",status);
+X    else {
+X        fprintf(stderr,"unable to find status of tape device\n");
+X        exit(EXIT_FAILURE);
+X    }
+X}
+X
+X
+X
+XSTATIC void stop (int code) {
+X
+X/* This closes the tape, issues final diagnostics, closes the output file,
+Xand exits. It does not seem worth the bother of freeing store etc. */
+X
+X    int fileno;
+X
+X/* Issue final diagnostics and close the disk file. */
+X
+X    if (code != EXIT_SUCCESS)
+X        fprintf(stderr,"%s: further processing has been abandoned\n",
+X            command_name);
+X    if (IO_error_count > 0)
+X        fprintf(stderr,"%s: there were %d I/O errors detected\n",
+X            command_name,IO_error_count);
+X    if (verification && file_count >= 0)
+X        printf("%d files were read from the tape\n",file_count);
+X    if (disk_fileno >= 0) {
+X        fileno = disk_fileno;
+X        disk_fileno = -1;
+X        if (Close(fileno)) {
+X            fprintf(stderr,"%s: unable to close disk file\n",command_name);
+X            Perror(command_name);
+X            return_code = EXIT_FAILURE;
+X        }
+X    }
+X
+X/* Close the tape, being careful to avoid recursion. */
+X
+X    if (tape_fileno >= 0) {
+X        fileno = tape_fileno;
+X        tape_fileno = -1;
+X        if (basic_tape_rewind(fileno) < 0) {
+X            fprintf(stderr,"%s: unable to rewind tape\n",command_name);
+X            diagnose_tape(fileno);
+X            exit(EXIT_FAILURE);
+X        } else if (basic_tape_close(fileno) < 0) {
+X            fprintf(stderr,"%s: unable to close tape\n",command_name);
+X            diagnose_tape(fileno);
+X            exit(EXIT_FAILURE);
+X        }
+X    }
+X
+X/* And this is where we usually stop! */
+X
+X    exit(code == EXIT_SUCCESS ? return_code : code);
+X}
+X
+X
+X
+XSTATIC void write_message (const char *message, va_list args) {
+X
+X/* Add the command name onto the front of the message. */
+X
+X    char text[100];
+X
+X    strcpy(text,command_name);
+X    strcat(text,": ");
+X    strncat(text,message,90);
+X    strcat(text,"\n");
+X    vfprintf(stderr,text,args);
+X    if (ferror(stderr)) abort();    /* Yeah, well, what else can I do? */
+X}
+X
+X
+X
+Xvoid comment (const char *message, ...) {
+X
+X/* Write a comment to stderr and carry on. */
+X
+X    va_list args;
+X
+X    va_start(args,message);
+X    write_message(message,args);
+X    va_end(args);
+X}
+X
+X
+X
+XSTATIC void system_messages (int error, int errtype) {
+X
+X/* Handle the system messages for functions warn and fatal. */
+X
+X    errno = error;
+X    if ((errtype == ERR_system || errtype == ERR_tapeio) && errno != 0)
+X        Perror(command_name);
+X    if (errtype == ERR_tapeio && tape_fileno >= 0) diagnose_tape(tape_fileno);
+X}
+X
+X
+X
+Xvoid warn (const char *message, int errtype, ...) {
+X
+X/* Write an error message to stderr and carry on. */
+X
+X    va_list args;
+X    int error;
+X
+X    error = errno;
+X    va_start(args,errtype);
+X    write_message(message,args);
+X    va_end(args);
+X    system_messages(error,errtype);
+X    return_code = EXIT_FAILURE;
+X}
+X
+X
+X
+Xvoid fatal (const char *message, int errtype, ...) {
+X
+X/* Write an error message to stderr and stop. */
+X
+X    va_list args;
+X    int error;
+X
+X    error = errno;
+X    va_start(args,errtype);
+X    write_message(message,args);
+X    va_end(args);
+X    system_messages(error,errtype);
+X    stop(EXIT_FAILURE);
+X}
+X
+X
+X
+XSTATIC int read_block (int fileno, char *buffer, int length, int block_number) {
+X
+X/* Read a block, print some or all of it out if necessary and return its
+Xlength. */
+X
+X    int i, k;
+X    char mess[80];
+X
+X    length = basic_tape_read(fileno,buffer,length);
+X    if (debug) {
+X        comment("%d,%d:  (%d)",file_count,block_number,length);
+X        k = 0;
+X        for (i = 0; i < (length < 32 ? length : 32); ++i) {
+X            if (i != 0 && i%4 == 0) mess[k++] = ' ';
+X            sprintf(&mess[k],"%.2x",(unsigned char)buffer[i]);
+X            k += 2;
+X        }
+X        mess[k] = '\0';
+X        comment(buffer);
+X    }
+X    return length;
+X}
+X
+X
+X
+XSTATIC void save_tape_block (const char *buffer, int length) {
+X
+X/* Save a tape block in 'diskized' form. */
+X
+X    BE_int temp;
+X
+X    put_BE_int(temp,(length < 0 ? -1 : length));
+X    errno = 0;
+X    if (Write(disk_fileno,&temp,sizeof(temp)) != sizeof(temp) ||
+X            (length > 0 && Write(disk_fileno,buffer,length) != length))
+X        fatal("I/O error while writing 'diskized' file",ERR_system);
+X}
+X
+X
+X
+XSTATIC void syntax (void) {
+X
+X/* Diagnose an argument error, in the typical user-hostile UNIX manner. */
+X
+X    fprintf(stderr,"\
+XSyntax:  %s -t tape file -d disk copy [ -m tape marks ] [ -v ] [ -D ]\n\
+X             [ -X I/O errors ]\n",
+X        command_name);
+X    stop(EXIT_FAILURE);
+X}
+X
+X
+X
+XSTATIC const char *arg_value (char *argv[], int *p_i, const char *text) {
+X
+X/* Get the value if an argument flag matches, separating the value if it is
+Xattached and using the next one if not.   Note that checking for the end of the
+Xarguments is done on return. */
+X
+X    int len = strlen(text);
+X
+X    if (strncmp(argv[*p_i],text,len) != 0)
+X        return NULL;
+X    else if (argv[*p_i][len] != '\0')
+X        return &argv[*p_i][len];
+X    else if (argv[++*p_i] == NULL)
+X        return "";
+X    else
+X        return argv[*p_i];
+X}
+X
+X
+X
+XSTATIC int get_int (const char *string) {
+X
+X/* Convert a string to an integer, checking that the string is nothing but
+Xdigits.  It returns -1 for failure. */
+X
+X    int n;
+X    char c;
+X
+X    if (! isdigit(string[0]) || sscanf(string,"%d%c",&n,&c) != 1)
+X        return -1;
+X    return n;
+X}
+X
+X
+X
+XSTATIC void signal_received (const char *message) {
+X
+X/* This is called when the program catches a fatal signal. */
+X
+X    fatal("%s signal received",ERR_private,message);
+X}
+X
+X
+X
+Xint main (int argc, char *argv[]) {
+X
+X/* Decode the options, open and close the main files and do the real work. */
+X
+X    int tape_marks = 0, tape_mark_count, IO_error_limit = 0, check_label = 0,
+X        labelled = 0, TLS_tape = 0, block_number, block_length, IO_errors,
+X        byte_count, max_block, min_block, last_only;
+X    char str1[label_fieldsize], str2[label_fieldsize], *block_buffer;
+X    const char *arg;
+X    int i;
+X
+X    setvbuf(stdout,NULL,_IOLBF,BUFSIZ);
+X    setvbuf(stdout,NULL,_IOLBF,BUFSIZ);
+X    if ((command_name = strrchr(argv[0],'/')) == NULL) command_name = argv[0];
+X    initialize_code_pages();
+X
+X/* I have never understood why getargs() is any use, because it isn't any
+Xclearer and is often bug-ridden. */
+X
+X    errno = 0;
+X    for (i = 1; i < argc; ++i) {
+X        if ((arg = arg_value(argv,&i,"-d")) != NULL) {
+X            if (i >= argc || disk_fileno != -1) syntax();
+X            if ((disk_fileno = Open(arg,O_WRITE,O_WRMODE)) < 0)
+X                fatal("unable to open disk file for writing",ERR_system);
+X        } else if ((arg = arg_value(argv,&i,"-m")) != NULL) {
+X            if (i >= argc || tape_marks != 0 ||
+X                    (tape_marks = get_int(arg)) <= 0 ||
+X                    tape_marks > max_tape_marks)
+X                syntax();
+X        } else if ((arg = arg_value(argv,&i,"-t")) != NULL) {
+X            if (i >= argc || tape_fileno != -1) syntax();
+X            if ((tape_fileno = basic_tape_open(arg)) < 0) {
+X                if (tape_fileno == -2)
+X                    fatal("-t does not specify a tape device",ERR_private);
+X                else if (tape_fileno == -3)
+X                    fatal("the tape device is in a strange state",ERR_tapeio);
+X                else if (tape_fileno == -4)
+X                    fatal("unable to position the tape device at the start",
+X                        ERR_tapeio);
+X                else
+X                    fatal("unable to open tape for reading",ERR_system);
+X            }
+X        } else if (strcmp(argv[i],"-v") == 0) {
+X            if (i >= argc || verification != 0) syntax();
+X            verification = 1;
+X        } else if (strcmp(argv[i],"-D") == 0) {
+X            if (i >= argc || debug != 0) syntax();
+X            debug = 1;
+X        } else if ((arg = arg_value(argv,&i,"-X")) != NULL) {
+X            if (i >= argc || IO_error_limit != 0 ||
+X                    (IO_error_limit = get_int(arg)) <= 0 ||
+X                    IO_error_limit > max_IO_errors)
+X                syntax();
+X        } else
+X            syntax();
+X    }
+X
+X/* Check that both a tape and disk file have been specified, and set the I/O
+Xerror default. */
+X
+X    if (tape_fileno < 0)
+X        fatal("a tape device must be specified with the -t argument",
+X            ERR_private);
+X    if (disk_fileno < 0)
+X        fatal("a disk file must be specified with the -d argument",
+X            ERR_private);
+X    if (IO_error_limit == 0) IO_error_limit = 10;
+X
+X/* Display the relevant global variables if debugging. */
+X
+X    if (debug) {
+X        comment("global variables after argument decoding:");
+X        comment("tape_fileno = %d,    disk_fileno = %d,    tape_marks = %d",
+X            tape_fileno,disk_fileno,tape_marks);
+X        comment("verification = %s,    IO_error_limit = %d",
+X            (verification ? "on" : "off"),IO_error_limit);
+X    }
+X
+X/* Get an I/O buffer, large enough for a full TLS dictionary, and set up the
+Xsignal handler. */
+X
+X    errno = 0;
+X    if ((block_buffer = malloc(constant_64K)) == NULL)
+X        fatal("unable to get space for main I/O buffer",ERR_system);
+X    basic_tape_signal(signal_received);
+X
+X/* Start up the loops by file and then by block. */
+X
+X    tape_mark_count = 0;
+X    while (1) {
+X        ++file_count;
+X        block_number = 0;
+X        IO_errors = byte_count = max_block = min_block = last_only = 0;
+X        while (1) {
+X            block_length =
+X                read_block(tape_fileno,block_buffer,constant_64K,
+X                    ++block_number);
+X
+X/* See if it is a VOL1 label, and handle it if so. */
+X
+X            if (file_count == 1 && block_number == 1) {
+X                get_string(str1,((VOL1_LABEL *)block_buffer)->labelid,
+X                    sizeof(((VOL1_LABEL *)block_buffer)->labelid));
+X                if (block_length == TAPE_LABEL_SIZE &&
+X                        strcmp(str1,"VOL1") == 0) {
+X                    labelled = 1;
+X                    if (tape_marks <= 0) check_label = 1;
+X                    get_string(str1,((VOL1_LABEL *)block_buffer)->tapename,
+X                        sizeof(((VOL1_LABEL *)block_buffer)->tapename));
+X                    if (verification) printf("The tape name is %s",str1);
+X                } else
+X                    if (verification) printf("The tape is unlabelled");
+X                putchar('\n');
+X            }
+X
+X/* See if it is a HDR1 label for a TLS tape. */
+X
+X            if (labelled && file_count == 1 && block_number == 2) {
+X                get_string(str1,((HDR1_LABEL *)block_buffer)->labelid,
+X                    sizeof(((HDR1_LABEL *)block_buffer)->labelid));
+X                get_string(str2,((HDR1_LABEL *)block_buffer)->dataset_name,
+X                    sizeof(((HDR1_LABEL *)block_buffer)->dataset_name));
+X                if (block_length == TAPE_LABEL_SIZE &&
+X                        strcmp(str1,"HDR1") == 0 &&
+X                        strcmp(str2,TLS_dictionary_name) == 0) {
+X                    if (verification) printf("It is a TLS tape\n");
+X                    TLS_tape = 1;
+X                }
+X            }
+X
+X/* If it is a TLS tape, the dictionary may fail to read correctly.  If so,
+Xkludge it!  This is, naturally, pukeworthy. */
+X
+X            if (TLS_tape && file_count == 2 && block_number == 1 &&
+X                    block_length < 0) {
+X                memset(block_buffer,0,constant_64K);
+X                strcpy(block_buffer,TLS_dict_marker);
+X                block_length = constant_64K;
+X                warn("unable to read TLS dictionary - recovery is needed",
+X                    ERR_private);
+X            }
+X
+X/* Save the block on disk and handle EOF and I/O errors. */
+X
+X            save_tape_block(block_buffer,block_length);
+X            if (block_length == 0) {
+X                --block_number;
+X                if (file_count > 1 && block_number == 0 &&
+X                        (check_label ? file_count%3 == 1 :
+X                            ++tape_mark_count >= tape_marks)) {
+X                    --file_count;
+X                    stop(EXIT_SUCCESS);
+X                } else
+X                    break;
+X            } else if (block_length < 0) {
+X                warn("IO_error on file %d block %d",ERR_tapeio,
+X                    file_count,block_number);
+X                ++IO_errors;
+X                if (++IO_error_count >= IO_error_limit) stop(EXIT_FAILURE);
+X
+X/* Handle normal blocks. */
+X
+X            } else {
+X                byte_count += block_length;
+X                if (block_length > max_block) max_block = block_length;
+X                last_only = 0;
+X                if (block_length < min_block || min_block == 0) {
+X                    last_only = (max_block == min_block);
+X                    min_block = block_length;
+X                }
+X            }
+X        }
+X
+X/* Verify some information about the file if requested. */
+X
+X        if (verification) {
+X            if (block_number == 0)
+X                printf("File %d:  empty file\n",file_count);
+X            else if (byte_count == 0)
+X                printf("File %d:  no good blocks,  %d I/O errors\n",
+X                    file_count,IO_errors);
+X            else {
+X                printf("File %d:  %d blocks,  ",file_count,block_number);
+X                if (IO_errors > 0) printf("%d I/O errors,  ",IO_errors);
+X                if (min_block == max_block)
+X                    printf("%d bytes,  all blocks %d\n",byte_count,min_block);
+X                else
+X                    printf("%d bytes,  max. block %d,  min. block %d%s\n",
+X                        byte_count,max_block,min_block,
+X                        (last_only ? " (last only)" : ""));
+X            }
+X        }
+X    }
+X    return EXIT_SUCCESS;    /* Silencing various compilers */
+X}
+END_OF_FILE
+if test 15030 -ne `wc -c <'loadtape.c'`; then
+    echo shar: \"'loadtape.c'\" unpacked with wrong size!
+fi
+# end of 'loadtape.c'
+fi
+if test -f 'recover.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'recover.c'\"
+else
+echo shar: Extracting \"'recover.c'\" \(14559 characters\)
+sed "s/^X//" >'recover.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xrecover.c  -  handle various label recovery problems, such as checking a
+XTLS dictionary, recovering one from the trailer labels, printing the TLS
+Xdictionary (!) and finding a good header label after we have got lost. */
+X
+X
+X
+X#include "mvstape.h"
+X#include "labels.h"
+X#include "tlsdict.h"
+X#include "control.h"
+X
+X
+X
+X/* Constants used only in this module. */
+X
+X#define label_field_size    20        /* Enough for all but TLS dataset names */
+X
+X
+X
+Xvoid check_TLS_dictionary (int in_buffer) {
+X
+X/* Check a TLS dictionary in buffer_block or TLS_dictionary for consistency, at
+Xleast with its version number and the entry pointers.  Also set the version
+Xnumber globally and mark all versions except the newest non-deleted one as
+Xdeleted.  Note that the size when it is in buffer_block is not necessarily
+Xcorrect. */
+X
+X    int last, i, m, n;
+X
+X/* Define a macro to reduce duplicate coding.  This is truly repellent, but
+Xthere seems to be no better way to do it. */
+X
+X#define TLS_CHECK_GROBBLE(TLS_DICT_TYPE,TLS_DICT_SIZE,version)           \
+X                                                                         \
+X    TLS_DICT_TYPE *dict =                                                \
+X        (TLS_DICT_TYPE *)(in_buffer ? block_buffer : TLS_dictionary);    \
+X                                                                         \
+X    TLS_version = version;                                               \
+X    last = get_BE_short(tls_dict_last_entry(&dict[0]));                  \
+X    if (EBCDIC_to_ASCII(tls_dict_version(&dict[0])) != '0'+version ||    \
+X                limit%TLS_DICT_SIZE != 0 ||                              \
+X                last >= limit/TLS_DICT_SIZE)                             \
+X        TLS_version = 0;                                                 \
+X    for (i = 1; i <= last && TLS_version != 0; ++i)                      \
+X        if (get_BE_short(dict[i].fwd_ptr) > last ||                      \
+X                get_BE_short(dict[i].back_ptr) > last)                   \
+X            TLS_version = 0;                                             \
+X    if (TLS_version != 0) {                                              \
+X        n = get_BE_short(dict[0].fwd_ptr);                               \
+X        while (n > 0) {                                                  \
+X            m = n;                                                       \
+X            i = ! (dict[n].flags&tls_flags_deleted);                     \
+X            while ((n = get_BE_short(dict[n].fwd_ptr)) > 0) {            \
+X                if (memcmp(dict[m].dataset_name,dict[n].dataset_name,    \
+X                        sizeof(dict[n].dataset_name)) != 0)              \
+X                    break;                                               \
+X                if (i)                                                   \
+X                    dict[n].flags |= tls_flags_deleted;                  \
+X                else                                                     \
+X                    i = ! (dict[n].flags&tls_flags_deleted);             \
+X            }                                                            \
+X        }                                                                \
+X    }
+X
+X/* See if it matches either version. */
+X
+X    {
+X        int limit = (in_buffer ? block_length-block_length%TLS_V3_DICT_SIZE :
+X                TLS_dict_length);
+X        TLS_CHECK_GROBBLE(TLS_V3_DICT,TLS_V3_DICT_SIZE,3)
+X        if (TLS_version != 0) return;
+X    } {
+X        int limit = (in_buffer ? block_length-block_length%TLS_V4_DICT_SIZE :
+X                TLS_dict_length);
+X        TLS_CHECK_GROBBLE(TLS_V4_DICT,TLS_V4_DICT_SIZE,4)
+X        if (TLS_version != 0) return;
+X    }
+X    fatal("the TLS dictionary appears corrupted",ERR_private);
+X}
+X
+X
+X
+XSTATIC void bad_label (int seqno) {
+X
+X/* Give a diagnostic for failure to read a trailer label. */
+X
+X    fatal("unable to read user trailer labels for file %d",
+X        (block_length < 0 ? ERR_tapeio : ERR_private),seqno);
+X}
+X
+X
+X
+XSTATIC int get_data (char *target, int length, const char *labelid) {
+X
+X/* Read a user trailer label and copy its data.  This returns 0 for success and
+X1 for failure. */
+X
+X    char str[label_field_size];
+X    UTL_LABEL *utl;
+X
+X    if (read_actual_block() != TAPE_LABEL_SIZE) return 1;
+X    utl = (UTL_LABEL *)block_buffer;
+X    get_string(str,utl->labelid,sizeof(utl->labelid));
+X    if (strcmp(str,labelid) != 0) return 1;
+X    memcpy(target,utl->TLS_dict_entry,length);
+X    return 0;
+X}
+X
+X
+X
+XSTATIC int read_trailer (int seqno) {
+X
+X/* This reads the trailer labels and copies the TLS dictionary entry into the
+Xappropriate place.  Note that it ignores I/O errors quietly where possible,
+Xbecause the whole recovery operation is supposed to be transparent.  It returns
+X0 for success and 1 for end of tape. */
+X
+X    int temp, OK1, OK2;
+X    char str1[label_field_size], str2[label_field_size], c, *ptr1, *ptr2;
+X    HDR1_LABEL *hdr1;
+X    UTL_LABEL *utl;
+X
+X/* Check that the sequence number is correct, and skip the next block.  Ignore
+Xerrors (including EOF, which may be spurious) in the second trailer label. */
+X
+X    read_actual_block();
+X    hdr1 = (HDR1_LABEL *)block_buffer;
+X    get_string(str1,hdr1->labelid,sizeof(hdr1->labelid));
+X    get_string(str2,hdr1->sequence_number,sizeof(hdr1->sequence_number));
+X    if (block_length != TAPE_LABEL_SIZE || strcmp(str1,"EOF1") != 0 ||
+X            sscanf(str2,"%d%1c",&temp,&c) != 1 || seqno != temp)
+X        bad_label(seqno);
+X    read_actual_block();
+X
+X/* See if we can read the V3 dictionary entry from the user trailer labels. */
+X
+X    if (TLS_version == 3) {
+X        ptr1 = (char *)(&((TLS_V3_DICT *)TLS_dictionary)[seqno-1]);
+X        if (get_data(ptr1,TLS_V3_DICT_SIZE,"UTL1") &&
+X                get_data(ptr1,TLS_V3_DICT_SIZE,"UTL2"))
+X            bad_label(seqno);
+X        else
+X            return 0;
+X
+X/* V4 dictionary entries are split across two trailer labels. */
+X
+X    } else {
+X        OK1 = OK2 = 0;
+X        ptr1 = (char *)(&((TLS_V4_DICT *)TLS_dictionary)[seqno-1]);
+X        ptr2 = ptr1+sizeof(utl->TLS_dict_entry);
+X        if (! get_data(ptr1,sizeof(utl->TLS_dict_entry),"UTL1")) OK1 = 1;
+X        if (! get_data(ptr2,sizeof(utl->TLS_dict_entry),"UTL2")) OK2 = 1;
+X        if (OK1) {
+X            if (OK2) return 0;
+X            read_actual_block();
+X        } else if (get_data(ptr1,sizeof(utl->TLS_dict_entry),"UTL3"))
+X            bad_label(seqno);
+X        if (OK2 || ! get_data(ptr2,sizeof(utl->TLS_dict_entry),"UTL4"))
+X            return 0;
+X        else
+X            bad_label(seqno);
+X    }
+X    return 1;
+X}
+X
+X
+X
+XSTATIC int compare (const void *left, const void *right) {
+X
+X/* Compare two names in a TLS dictionary, using EBCDIC order. */
+X
+X    char name_l[MVSnamesize], name_r[MVSnamesize];
+X    int l = *(const int *)left, r = *(const int *)right, n;
+X
+X    if (TLS_version == 3) {
+X        TLS_V3_DICT *dict = (TLS_V3_DICT *)TLS_dictionary;
+X        n = sizeof(dict[l].dataset_name);
+X        get_string(name_l,dict[l].dataset_name,n);
+X        get_string(name_r,dict[r].dataset_name,n);
+X    } else {
+X        TLS_V4_DICT *dict = (TLS_V4_DICT *)TLS_dictionary;
+X        n = sizeof(dict[l].dataset_name);
+X        get_string(name_l,dict[l].dataset_name,n);
+X        get_string(name_r,dict[r].dataset_name,n);
+X    }
+X    if ((n = strcmp(name_l,name_r)) != 0)
+X        return n;
+X    else
+X        return r-l;
+X}
+X
+X
+X
+Xvoid recover_TLS_dictionary (void) {
+X
+X/* Recover the TLS dictionary from the trailer labels.  It is called
+Ximmediately after the TLS dictionary has not been read. */
+X
+X    int index[constant_64K/TLS_V3_DICT_SIZE+2], size, limit, seqno, i;
+X    char str1[label_field_size];
+X    UTL_LABEL *utl;
+X    TLS_V4_DICT *dict;
+X
+X/* Read the trailer labels for the TLS dictionary to find out the version. */
+X
+X    if (! following_EOF) skip_file(0);
+X    read_actual_block();
+X    read_actual_block();
+X    read_actual_block();
+X    utl = (UTL_LABEL *)block_buffer;
+X    dict = (TLS_V4_DICT *)utl->TLS_dict_entry;
+X    get_string(str1,utl->labelid,sizeof(utl->labelid));
+X    if (block_length != TAPE_LABEL_SIZE || strcmp(str1,"UTL1") != 0)
+X        fatal("unable to read TLS dictionary trailer labels",
+X            (block_length <= 0 ? ERR_tapeio : ERR_private));
+X    i = dict->version-EBCDIC_ZERO;
+X    TLS_version = (i == 4 ? 4 : 3);
+X
+X/* Read the TLS dictionary data off the trailer labels and set up an index. */
+X
+X    size = (TLS_version == 3 ? TLS_V3_DICT_SIZE : TLS_V4_DICT_SIZE);
+X    limit = constant_64K/size;
+X    for (seqno = 2; seqno <= limit; ++seqno) {
+X        if (! following_EOF) skip_file(1);
+X        if (read_actual_block() == 0) break;
+X        skip_file(1);
+X        skip_file(0);
+X        if (read_trailer(seqno)) break;
+X    }
+X    --seqno;
+X    TLS_dict_length = size*seqno;
+X    index[0] = index[seqno] = 0;
+X    for (i = 1; i < seqno; ++i) index[i] = i;
+X
+X/* Define a macro to reduce duplicate coding.  This is truly repellent, but
+Xthere seems no better way to do it! */
+X
+X#define TLS_DICT_GROBBLE(DICT_TYPE,version)                  \
+X                                                             \
+X    DICT_TYPE *t_dict = (DICT_TYPE *)TLS_dictionary;         \
+X                                                             \
+X    memset(&t_dict[0],0,size);                               \
+X    tls_dict_version(&t_dict[0]) = EBCDIC_ZERO+version;      \
+X    put_BE_short(tls_dict_last_entry(&t_dict[0]),seqno-1);   \
+X    qsort(index,seqno,sizeof(int),compare);                  \
+X    put_BE_short(t_dict[0].fwd_ptr,index[1]);                \
+X    put_BE_short(t_dict[0].back_ptr,index[seqno-1]);         \
+X    for (i = 1; i < seqno; ++i) {                            \
+X        put_BE_short(t_dict[index[i]].fwd_ptr,index[i+1]);   \
+X        put_BE_short(t_dict[index[i]].back_ptr,index[i-1]);  \
+X    }
+X
+X/* Set up the first entry, fix up the entry chain and we are done. */
+X
+X    if (TLS_version == 3) {
+X        TLS_DICT_GROBBLE(TLS_V3_DICT,3)
+X    } else {
+X        TLS_DICT_GROBBLE(TLS_V4_DICT,4)
+X    }
+X    check_TLS_dictionary(0);
+X}
+X
+X
+X
+Xvoid display_TLS_dictionary (void) {
+X
+X/* This prints out the dictionary for diagnostic purposes. */
+X
+X    int i, j, n;
+X    char str[MVSnamesize];
+X
+X/* Define two macros to reduce duplicate coding.  This is truly repellent, but
+Xthere seems no better way to do it! */
+X
+X#define TLS_PRINT_GROBBLE_1(DICT_TYPE)                                    \
+X                                                                          \
+X    DICT_TYPE *dict = (DICT_TYPE *)TLS_dictionary;                        \
+X    int limit = get_BE_short(tls_dict_last_entry(&dict[0]));              \
+X                                                                          \
+X    comment("TLS dictionary  '%c'  %d (%d/%d)",                           \
+X        EBCDIC_to_ASCII(tls_dict_version(&dict[0])),limit,                \
+X        get_BE_short(dict[0].back_ptr),get_BE_short(dict[0].fwd_ptr));
+X
+X#define TLS_PRINT_GROBBLE_2(GET_DATE)                                     \
+X                                                                          \
+X    get_string(str,dict[n].dataset_name,sizeof(dict[n].dataset_name));    \
+X    comment("%d (%d/%d):  %s (%.2x,%.2x,%d,%d,%d)",                       \
+X        get_BE_short(dict[n].entry_num),                                  \
+X        get_BE_short(dict[n].back_ptr),get_BE_short(dict[n].fwd_ptr),     \
+X        str,dict[n].dsorg,dict[n].recfm,get_BE_short(dict[n].lrecl),      \
+X        get_BE_short(dict[n].blksize),dict[n].keylen);                    \
+X    i = GET_DATE(dict[n].tape_date);                                      \
+X    j = GET_DATE(dict[n].disk_date);                                      \
+X    get_comments(str,dict[n].comments,sizeof(dict[n].comments));
+X
+X/* Print out a version 3 dictionary. */
+X
+X    if (TLS_version == 3) {
+X        TLS_PRINT_GROBBLE_1(TLS_V3_DICT)
+X
+X        for (n = 1; n <= limit; ++n) {
+X            TLS_PRINT_GROBBLE_2(get_BE_short)
+X            comment("          (%.2x)  %dK/%d  %d,%d  %d,%d  %s",
+X                dict[n].flags,get_BE_short(dict[n].tracks)*tracksize_3330,
+X                get_BE_short(dict[n].dir_blks),i>>9,i&0x1ff,j>>9,j&0x1ff,
+X                str);
+X        }
+X        comment("");
+X
+X/* Print out a version 4 dictionary. */
+X
+X    } else {
+X        TLS_PRINT_GROBBLE_1(TLS_V4_DICT)
+X
+X        for (n = 1; n <= limit; ++n) {
+X            TLS_PRINT_GROBBLE_2(get_BE_int)
+X            comment("          (%c,%.2x)  %dK/%d  %x  %x  %s",
+X                EBCDIC_to_ASCII(dict[n].version),dict[n].flags,
+X                get_BE_int(dict[n].size_KB)/1000,get_BE_short(dict[n].dir_blks),
+X                i,j,str);
+X        }
+X        comment("");
+X    }
+X}
+X
+X
+X
+Xint find_good_header (void) {
+X
+X/* This finds a good HDR1 label immediately following a file mark and returns
+Xthe sequence number or 0 if it reaches the end of tape.  It interacts horribly
+Xwith the code in control.c and scanning.c.  Note that we don't even know
+Xwhether a block is part of the labels or the data. */
+X
+X    int EOF_flag, TM_flag, seqno;
+X    char str1[label_field_size], str2[label_field_size], c;
+X    HDR1_LABEL *hdr1;
+X
+X/* Skip everything quietly until a block matches our requirements.  This is
+Xpretty horrible, but producing a stream of I/O errors on a section of bad tape
+Xis not helpful either. */
+X
+X    EOF_flag = 0;
+X    while (1) {
+X        TM_flag = following_EOF;
+X        if (read_actual_block() == 0) {
+X            if (TM_flag && EOF_flag) return 0;
+X
+X/* Be paranoid about this block, partly because we are in no state to call
+XIO_error() until we know where we are. */
+X
+X        } else if (block_length == TAPE_LABEL_SIZE && TM_flag) {
+X            hdr1 = (HDR1_LABEL *)block_buffer;
+X            get_string(str1,hdr1->labelid,sizeof(hdr1->labelid));
+X            get_string(str2,hdr1->sequence_number,
+X                sizeof(hdr1->sequence_number));
+X            seqno = 0;
+X            if (strcmp(str1,"HDR1") == 0 &&
+X                    sscanf(str2,"%d%1c",&seqno,&c) == 1)
+X                return seqno;
+X            EOF_flag = (strcmp(str1,"EOF1") == 0 || strcmp(str1,"EOV1") == 0);
+X
+X/* Consider only double take marks following a vaguely plausible EOF block for
+Xend-of-file, or else we will stop on the first null file. */
+X
+X        } else if (block_length == TAPE_LABEL_SIZE) {
+X            hdr1 = (HDR1_LABEL *)block_buffer;
+X            get_string(str1,hdr1->labelid,sizeof(hdr1->labelid));
+X            EOF_flag = (strncmp(str1,"EOF",3) == 0 ||
+X                    strncmp(str1,"EOV",3) == 0 || strncmp(str1,"UTL",3) == 0);
+X        } else
+X            EOF_flag = 0;
+X    }
+X}
+END_OF_FILE
+if test 14559 -ne `wc -c <'recover.c'`; then
+    echo shar: \"'recover.c'\" unpacked with wrong size!
+fi
+# end of 'recover.c'
+fi
+if test -f 'tlspds.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'tlspds.c'\"
+else
+echo shar: Extracting \"'tlspds.c'\" \(15237 characters\)
+sed "s/^X//" >'tlspds.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xtlspds.c  -  skip to a PDS member, unpick PDS directories into an in-store
+Xlist and so on.  It is very TLS-specific.  Note that it does not check
+Xallow_errors, because TLS tapes are assumed to be correctlt formatted! */
+X
+X
+X
+X#include <stddef.h>
+X
+X#include "mvstape.h"
+X#include "control.h"
+X#include "tlspds.h"
+X
+X
+X
+X/* Constants and global variables that are used only in this module;
+XTLS_next_segment is reset in control.c. */
+X
+X
+Xchar *TLS_next_segment = NULL;
+Xstatic int total_block_length = 0;
+X
+X#define PDS_end_name      "\xff\xff\xff\xff\xff\xff\xff\xff" /* Yes, well */
+X#define PDS_member_min    100    /* Get space for at least this many */
+X
+Xstatic char current_member[PDSnamesize] = ""; /* The current member name */
+X
+X
+X
+Xint read_TLS_block (void) {
+X
+X/* Read the next block from a TLS PDS or DA file.  This unpicks tape blocks,
+Xso that TLS's weird format is transparent to the caller.  Remember that DA
+Xblocks may start with a capacity record. */
+X
+X    if (TLS_next_segment == NULL) {
+X        if ((total_block_length = read_actual_block()) <= 0)
+X            return total_block_length;
+X        TLS_next_segment = actual_block_buffer;
+X    }
+X    block_buffer = TLS_next_segment+TLS_PREFIX_LENGTH;
+X    block_length = get_BE_short(((TLS_BLOCK_HDR *)TLS_next_segment)->datalen);
+X    if (dataset_dsorg == dsorg_DA && block_length == 8 &&
+X            ((TLS_BLOCK_HDR *)TLS_next_segment)->ttr[2] == 0) {
+X        if (((TLS_BLOCK_HDR *)TLS_next_segment)->flags&tls_last_block) {
+X            TLS_next_segment = NULL;
+X            block_length = 0;
+X            return block_length;
+X        }
+X        TLS_next_segment = block_buffer+block_length;
+X        block_buffer = TLS_next_segment+TLS_PREFIX_LENGTH;
+X        block_length =
+X            get_BE_short(((TLS_BLOCK_HDR *)TLS_next_segment)->datalen);
+X    }
+X
+X/* Do what checking we can and skip over this segment, for next time.  There
+Xappears to be a bug to do with the setting of the last block flag, so assume
+Xthat it is set when we meet a 'file mark'. */
+X
+X    if (((TLS_BLOCK_HDR *)TLS_next_segment)->keylen != 0 ||
+X            block_buffer-actual_block_buffer > total_block_length-block_length)
+X        IO_error("invalid format of TLS disk-image block",ERR_skip,ERR_private);
+X    if (((TLS_BLOCK_HDR *)TLS_next_segment)->flags&tls_last_block ||
+X            block_length == 0)
+X        TLS_next_segment = NULL;
+X    else
+X        TLS_next_segment = block_buffer+block_length;
+X    return block_length;
+X}
+X
+X
+X
+XSTATIC int compare_offsets (const void *key, const void *element) {
+X
+X/* This is an auxiliary for bsearch() in read_PDS_directory. */
+X
+X    return ((const PDS_STRUCT *)key)->next_offset-
+X            ((const PDS_WORK_STRUCT *)element)->this_offset;
+X}
+X
+X
+X
+XSTATIC int compare_names (const void *key, const void *element) {
+X
+X/* This is an auxiliary for qsort() in read_PDS_directory and bsearch() in
+Xnext_PDS_member. */
+X
+X    return strcmp(((const PDS_STRUCT *)key)->name,
+X            ((const PDS_STRUCT *)element)->name);
+X}
+X
+X
+X
+Xvoid read_TLS_directory (void) {
+X
+X/* Read a PDS directory and turn it into a convenient array.  This is
+Ximmoderately disgusting, because of TLS's peculiar directory format, the need
+Xto convert from EBCDIC to ASCII and the CS's bizarre politics (sic). */
+X
+X    int previous_junk = 0, more_to_come = 1, i, n,
+X        first_segment = 0, bytes_used = 0, m = 0;    /* Silencing 'gcc -Wall' */
+X    char *pds_dir_ptr, *pds_entry_ptr;
+X    PDS_DIRECTORY *PDS_dir_ptr;
+X    PDS_ENTRY pds_entry;
+X    PDS_WORK_STRUCT *pds_work_ptr;
+X    PDS_STRUCT *pds_struct_ptr;
+X
+X    current_member[0] = '\0';
+X
+X/* Get enough store, even if there are 21 members per directory block. */
+X
+X    if ((n = dataset_dir_blks*(256/12)) < PDS_member_min) n = PDS_member_min;
+X    if (PDS_member_list == NULL || n > PDS_member_max) {
+X        if (PDS_member_list != NULL) {
+X            free(PDS_member_list);
+X            free(PDS_work_list);
+X        }
+X        errno = 0;
+X        PDS_member_list = malloc(n*sizeof(PDS_STRUCT));
+X        PDS_work_list = malloc(n*sizeof(PDS_WORK_STRUCT));
+X        if (PDS_member_list == NULL || PDS_work_list == NULL)
+X            fatal("unable to get store for PDS directory",ERR_system);
+X        PDS_member_max = n;
+X    }
+X    PDS_member_count = 0;
+X
+X/* Read the next tape block, using the second copy if necessary. */
+X
+X    while (more_to_come) {
+X        if (read_actual_block() == 0)
+X            IO_error("end of file while reading TLS PDS directory",
+X                ERR_skip,ERR_private);
+X        else if (block_length < 0) {
+X            IO_error("I/O error while reading TLS PDS directory",
+X                ERR_ignore,ERR_tapeio);
+X            if (read_actual_block() <= 0)
+X                IO_error("unable to read TLS PDS directory",
+X                    ERR_skip,ERR_tapeio);
+X            first_segment = 0;
+X        } else
+X            first_segment = 1;
+X
+X/* Start unpicking the segment.  Note that PDSs with a single directory block
+Xdo not have the last block flag set correctly. */
+X
+X        if (debug >= 2)
+X            display_buffer(stderr,block_buffer,block_length,block_length);
+X        PDS_dir_ptr = (PDS_DIRECTORY *)(pds_dir_ptr = block_buffer);
+X        more_to_come = 0;
+X        while (pds_dir_ptr-block_buffer != block_length) {
+X            if (pds_dir_ptr-block_buffer+PDS_data_length > block_length ||
+X                    PDS_dir_ptr->keylen != PDS_key_length ||
+X                    get_BE_short(PDS_dir_ptr->datalen) != PDS_data_length ||
+X                    (bytes_used = get_BE_short(PDS_dir_ptr->bytes_used)-2) >
+X                        PDS_data_length-2)
+X                IO_error("invalid format of PDS directory block",
+X                    ERR_skip,ERR_private);
+X            pds_entry_ptr = PDS_dir_ptr->data;
+X
+X/* Unpick the entries and add them to the list.  This is not difficult - just
+Xdistasteful. */
+X
+X            while (bytes_used != 0) {
+X                if (bytes_used < offsetof(PDS_ENTRY,user_data))
+X                    IO_error("invalid PDS directory block",
+X                        ERR_skip,ERR_private);
+X                memcpy(&pds_entry,pds_entry_ptr,sizeof(pds_entry));
+X                if (memcmp(pds_entry.name,PDS_end_name,
+X                            sizeof(pds_entry.name)) == 0)
+X                    break;
+X                if (PDS_member_count >= PDS_member_max)
+X                    IO_error("more PDS directory blocks than in TLS dictionary",
+X                        ERR_skip,ERR_private);
+X                get_string(PDS_member_list[PDS_member_count].name,
+X                    pds_entry.name,sizeof(pds_entry.name));
+X                strcpy(PDS_work_list[PDS_member_count].name,
+X                    PDS_member_list[PDS_member_count].name);
+X
+X/* The flags are needed for handling aliases and whether this is a load module,
+Xand the offsets to find the main names! */
+X
+X                PDS_member_list[PDS_member_count].flags = PDS_flags_head|
+X                        (pds_entry.flags&pds_ttr_bits ? PDS_flags_ttrs : 0);
+X                PDS_member_list[PDS_member_count].next_entry = -1;
+X                PDS_work_list[PDS_member_count].this_offset =
+X                    previous_junk+pds_entry_ptr-block_buffer;    /* Ugh! */
+X                n = (pds_entry.ttr[0]<<16)+(pds_entry.ttr[1]<<8)+
+X                     pds_entry.ttr[2];
+X                PDS_member_list[PDS_member_count].next_offset =
+X                    (n&pds_end_of_chain ? 0 : n);
+X                n = 2*(pds_entry.flags&pds_length_bits)+12;
+X                bytes_used -= n;
+X                pds_entry_ptr += n;
+X                ++PDS_member_count;
+X            }
+X
+X/* Now see if there are more directory blocks in this tape block, and whether
+Xthere is more directory.  I do not know in which block this is flagged, but it
+Xdoes not matter with this code. */
+X
+X            if (PDS_dir_ptr->flags&tls_last_block) {
+X                if (block_buffer+block_length-pds_dir_ptr !=
+X                        sizeof(PDS_DIRECTORY))
+X                    IO_error("invalid packing of TLS PDS directory blocks",
+X                        ERR_skip,ERR_private);
+X                break;
+X            }
+X            more_to_come |= PDS_dir_ptr->flags&tls_more_dirs;
+X            PDS_dir_ptr =
+X                (PDS_DIRECTORY *)(pds_dir_ptr += sizeof(PDS_DIRECTORY));
+X        }
+X        previous_junk += block_length;
+X
+X/* Out of purest paranoia, check the copy of the directory segment for
+Xequality. */
+X
+X        if (first_segment) {
+X            m = block_length;
+X            for (i = 0; i < block_length; ++i) m = 5*m+block_buffer[i];
+X            if (read_actual_block() <= 0) {
+X                IO_error("unable to read second TLS PDS segment",
+X                    (block_length == 0 ? ERR_skip : ERR_ignore),ERR_private);
+X            } else {
+X                n = block_length;
+X                for (i = 0; i < block_length; ++i) n = 5*n+block_buffer[i];
+X                if (m != n)
+X                    IO_error("mismatching copies of PDS directory segments",
+X                        ERR_ignore,ERR_private);
+X            }
+X        }
+X    }
+X
+X/* Sort into ASCII order and turn TLS's horrible offsets into something that we
+Xcan use.  Luckily, store is not an issue .... */
+X
+X    qsort(PDS_member_list,PDS_member_count,sizeof(PDS_STRUCT),compare_names);
+X    for (i = 0; i < PDS_member_count; ++i) {
+X        if (PDS_member_list[i].next_offset == 0) continue;
+X        pds_work_ptr = (PDS_WORK_STRUCT *)bsearch(&PDS_member_list[i],
+X                PDS_work_list,PDS_member_count,sizeof(PDS_WORK_STRUCT),
+X                compare_offsets);
+X        if (pds_work_ptr == NULL) {
+X            IO_error("invalid alias chain in PDS directory",
+X                ERR_ignore,ERR_private);
+X            continue;
+X        }
+X        pds_struct_ptr = (PDS_STRUCT *)bsearch(pds_work_ptr->name,
+X                PDS_member_list,PDS_member_count,sizeof(PDS_STRUCT),
+X                compare_names);
+X        if (pds_struct_ptr == NULL)
+X            fatal("internal error in PDS shuffling",ERR_private);
+X        PDS_member_list[i].next_entry = m = pds_struct_ptr-PDS_member_list;
+X        PDS_member_list[m].flags &= ~PDS_flags_head;
+X    }
+X
+X/* Now all we have to do is to set the last pointer to the first entry in each
+Xchain and set the head of chain pointer. */
+X
+X    for (i = 0; i < PDS_member_count; ++i)
+X        if (PDS_member_list[i].flags&PDS_flags_head) {
+X            n = i;
+X            while (n >= 0) {
+X                m = n;
+X                n = PDS_member_list[n].next_entry;
+X            }
+X            PDS_member_list[m].next_entry = i;
+X        }
+X}
+X
+X
+X
+XSTATIC void skip_error (const char *message, int errflag, int errtype) {
+X
+X/* This prints an extra line of diagnostics, to give the PDS member that
+Xpreceded the problem. */
+X
+X    comment((current_member[0] == '\0' ?
+X            "error immediately after the PDS directory" :
+X            "error following the good PDS member '%s'"),
+X        current_member);
+X    IO_error(message,errflag,errtype);
+X}
+X
+X
+X
+XSTATIC const char *next_TLS_marker (int skip) {
+X
+X/* This reads the next PDS marker, skipping the previous member if necessary and
+Xreturns the member name or NULL for EOF. */
+X
+X    int operation = (skip ? 1 : 2);
+X    char marker[pds_marker_size], member[PDSnamesize];
+X
+X/* Skip to the PDS member markers, checking that TLS's layout is what I
+Xunderstand it to be.  operation is one of:
+X    1    skip blocks, but there may be none
+X    2    read a marker 1 record
+X    3    read a marker 2 record
+X*/
+X
+X    for ( ; ; ) {
+X        if (read_actual_block() == 0) {
+X            if (operation <= 2) {
+X                current_member[0] = '\0';
+X                return NULL;
+X            } else
+X                skip_error("unexpected end of file in TLS PDS",
+X                    ERR_skip,ERR_tapeio);
+X
+X/* Deal with real I/O errors.  Recovery here is by guess and by golly. */
+X
+X        } else if (block_length < 0) {
+X            if (operation == 2)
+X                skip_error("PDS members may be lost due to I/O error",
+X                    ERR_ignore,ERR_tapeio);
+X            else if (operation == 3) {
+X                skip_error("some initial data may be lost due to I/O error",
+X                    ERR_ignore,ERR_tapeio);
+X                return current_member;
+X            } else
+X                skip_error("I/O error ignored while skipping to next member",
+X                    ERR_ignore,ERR_tapeio);
+X            operation = 1;
+X
+X/* Now we have a real block.  Extract the marker key and check for a first
+XPDS member marker. */
+X
+X        } else {
+X            get_string(marker,((PDS_MARKER *)block_buffer)->marker,
+X                sizeof(((PDS_MARKER *)block_buffer)->marker));
+X            get_string(member,((PDS_MARKER *)block_buffer)->member,
+X                sizeof(((PDS_MARKER *)block_buffer)->member));
+X            if (block_length >= sizeof(PDS_MARKER) &&
+X                    strcmp(marker,tls_member_marker_1) == 0) {
+X                if (debug >= 2)
+X                    display_buffer(stderr,block_buffer,
+X                        block_length,block_length);
+X                if (operation == 3)
+X                    skip_error("too many consecutive PDS member markers",
+X                        ERR_ignore,ERR_private);
+X                strcpy(current_member,member);
+X                operation = 3;
+X
+X/* Do much the same for the second PDS member marker, but use it for last-ditch
+Xrecovery. */
+X
+X            } else if (block_length > sizeof(PDS_MARKER) &&
+X                    strcmp(marker,tls_member_marker_2) == 0) {
+X                if (debug >= 2)
+X                    display_buffer(stderr,block_buffer,
+X                        block_length,block_length);
+X                if (operation == 2)
+X                    skip_error("first PDS member marker seems to be missing",
+X                        ERR_ignore,ERR_private);
+X                if (operation != 3) {
+X                    comment("recovering member %s from second PDS marker",
+X                        member);
+X                    strcpy(current_member,member);
+X                }
+X                return current_member;
+X            } else {
+X
+X/* This does not appear to be a marker record. */
+X
+X                if (operation == 2)
+X                    skip_error("unexpected text following PDS member file mark",
+X                        ERR_ignore,ERR_private);
+X                else if (operation == 3)
+X                    skip_error("the second PDS member marker is missing",
+X                        ERR_skip,ERR_private);
+X                operation = 1;
+X            }
+X        }
+X    }
+X}
+X
+X
+X
+Xint next_TLS_member (int skip) {
+X
+X/* This returns the index into PDS_member_list of the name in the next PDS
+Xmember marker, or -1 for EOF.  It is not actually TLS specific, but seems
+Xlogical here.  I suppose that we could carry on, using the name actually found,
+Xbut that seems like asking for trouble. */
+X
+X    const char *member;
+X    const PDS_STRUCT *pds_struct_ptr;
+X
+X    if ((member = next_TLS_marker(skip)) == NULL) return -1;
+X    pds_struct_ptr = (const PDS_STRUCT *)bsearch(member,PDS_member_list,
+X                PDS_member_count,sizeof(PDS_STRUCT),compare_names);
+X    if (pds_struct_ptr == NULL)
+X        IO_error("PDS member name in marker not in PDS directory",
+X            ERR_skip,ERR_private);
+X    return pds_struct_ptr-PDS_member_list;
+X}
+END_OF_FILE
+if test 15237 -ne `wc -c <'tlspds.c'`; then
+    echo shar: \"'tlspds.c'\" unpacked with wrong size!
+fi
+# end of 'tlspds.c'
+fi
+echo shar: End of archive 5 \(of 9\).
+cp /dev/null ark5isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 9 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

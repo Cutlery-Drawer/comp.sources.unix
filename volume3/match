@@ -1,0 +1,701 @@
+From: Peter Bain <genrad!ihnp4!watmath!wateng!pdbain>
+Subject: match - faster than bm
+Newsgroups: mod.sources
+Approved: jpn@panda.UUCP
+
+Mod.sources:  Volume 3, Issue 2
+Submitted by: Peter Bain <ihnp4!watmath!wateng!pdbain>
+
+
+Match is functionally identical to bm, but uses the Vax MATCHC instruction
+to do the pattern matcher. On 780s, 785s, probably Microvax 2s, 730s
+and 750s (but NOT microvax 1s) it runs considerably faster. Here is
+a run on our 780 under 4.2 BSD:
+
+	/bin/time grep foobar /usr/dict/words
+	       16.7 real         4.6 user         0.6 sys  
+	/bin/time bm foobar /usr/dict/words 
+	        3.0 real         0.9 user         0.5 sys  
+	/bin/time match foobar /usr/dict/words 
+	        3.5 real         0.3 user         0.5 sys  
+
+Note that it runs ONLY on Vaxen, and possibly only under 4.2.
+
+------------------ tear here ----------------------------------
+: This is a shar archive.	Extract with sh, not csh.
+: The rest of this file will extract:
+: Execute.c Extern.h GetPatFile.c Global.c MakeDesc.c match.h match.c MatchFound.c MkDescVec.c MoveResidue.c PrintLine.c PutUsage.c Search.s Makefile README match.p
+echo Extracting Execute.c
+sed 's/^X//' > Execute.c << 'e-o-f'
+X#include <stdio.h>
+X#include "match.h"
+X#include "Extern.h"
+XExecute(DescVec, NPats, TextFile, Buffer)
+Xregister struct PattDesc *DescVec[];
+X/* pointers to status vectors for the different
+X	* patterns, including skip tables, position in buffer, etc. */
+Xint NPats; /* number of patterns */
+Xregister char Buffer[]; /* holds text from file */
+Xint TextFile; /* file to search */
+X{
+X	int NRead, /* number of chars read from file */
+X		NWanted, /* number of chars wanted */
+X		NAvail, /* number of chars actually read */
+X		BuffSize, /* number of chars in buffer */
+X		BuffPos, /* offset of first char in Buffer in TextFile */
+X		BuffEx, /* flag to indicate that buffer has been searched */
+X		ResSize,
+X		/* number of characters in the last, incomplete line */
+X		Found, /* flag indicates whether pattern found
+X		* completely and all matches printed */
+X		Valid; /* was the match "valid", i.e. if -x used,
+X		* did the whole line match? */
+X	register char *BuffEnd;
+X	/* pointer to last char of last complete line */
+X
+X	/* misc working variables */
+X	register int i;
+X
+X	/* initialize */
+X	ResSize = 0;
+X	Found = 0;
+X	BuffPos = 0;
+X	for (i=0; i < NPats; i++) {
+X		DescVec[i] -> Success = 0;
+X		DescVec[i] -> Start = Buffer;
+X	} /* for */
+X	/* now do the searching */
+X	do {
+X		/* first, read a bufferfull and set up the variables */
+X		NWanted = MAXBUFF - ResSize; NRead = 0;
+X		do {
+X			NAvail =
+X			   read(TextFile,Buffer + ResSize + NRead, NWanted);
+X			if (NAvail == -1) {
+X				fprintf(stderr,
+X				  "bm: error reading from input file\n");
+X				exit(2);
+X			} /* if */
+X			NRead += NAvail; NWanted -= NAvail;
+X		} while (NAvail && NWanted);
+X		BuffEx = 0;
+X		BuffSize = ResSize + NRead;
+X		BuffEnd = Buffer + BuffSize - 1;
+X		/* locate the end of the last complete line */
+X		while (*BuffEnd != '\n' && BuffEnd >= Buffer)
+X			--BuffEnd;
+X		if (BuffEnd < Buffer)
+X			BuffEnd = Buffer + BuffSize - 1;
+X		while (!BuffEx) { /* work through one buffer full */
+X			BuffEx = 1; /* set it provisionally, then clear
+X			* it if we find the buffer non-empty */
+X			for (i=0; i< NPats; i++) {
+X				if (!DescVec[i]->Success)
+X				/* if the pattern  has not been found */
+X					DescVec[i]-> Success =
+X					Search(DescVec[i]->Pattern,
+X					DescVec[i]->PatLen, DescVec[i]->Start,
+X					BuffEnd - DescVec[i]->Start + 1,
+X					DescVec[i]);
+X				if (DescVec[i]->Success){
+X				/* if a match occurred */
+X					BuffEx = 0;
+X					Valid = MatchFound(DescVec[i],BuffPos,
+X					Buffer, BuffEnd);
+X					Found |= Valid;
+X					if ((sFlag || lFlag) && Found)
+X						return(0);
+X				} /* if */
+X			} /* for */
+X		} /* while */
+X		if(NRead) {
+X			ResSize = MoveResidue(DescVec,NPats,Buffer,
+X				Buffer + BuffSize -1);
+X			BuffPos += BuffSize - ResSize;
+X		} /* if */
+X	} while (NRead);
+X	return(!Found);
+X} /* Execute */
+e-o-f
+echo Extracting Extern.h
+sed 's/^X//' > Extern.h << 'e-o-f'
+X/* global flags for bm */
+Xextern int	cFlag, /* true if we want only a count of matching lines */
+X	eFlag, /* indicates that next argument is the pattern */
+X	fFlag, /* true if the patterns arew to come from a file */
+X	lFlag, /* true if we want a list of files containing the pattern */
+X	nFlag, /* true if we want the character offset of the pattern */
+X	sFlag, /* true if we want silent mode */
+X	xFlag, /* true if we want only lines which match entirely */
+X	hFlag, /* true if we want no filenames in output */
+X
+X	MatchCount; /* count of number of times a search string was found
+X	* in the text */
+Xextern char *FileName;
+e-o-f
+echo Extracting GetPatFile.c
+sed 's/^X//' > GetPatFile.c << 'e-o-f'
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include "match.h"
+Xint
+XGetPatFile(PatFile, DescVec)
+Xchar *PatFile;
+Xstruct PattDesc *DescVec[];
+X/* read patterns from a file and set up a pattern descriptor vector */
+X{
+X	extern char *malloc();
+X	FILE *PFile;
+X	struct stat StatBuff;
+X	int PatSize; /* the number of chars in all the patterns */
+X	char *PatBuff; /* hold the patterns */
+X	if (!(PFile = fopen(PatFile,"r"))) {
+X		fprintf(stderr,"match: can't open pattern file %s\n",PatFile);
+X		exit(2);
+X	} /* if */
+X	/* find out how big the patterns are */
+X	if (fstat(fileno(PFile),&StatBuff) == -1) {
+X		fprintf(stderr,"match: can't fstat %s\n",PatFile);
+X		exit(2);
+X	} /* if */
+X	PatSize = StatBuff.st_size;
+X	if (!PatSize) {
+X		fprintf(stderr,"match: pattern file is empty\n");
+X		exit(2);
+X	} /* if */
+X	if (!(PatBuff = malloc(PatSize))) {
+X	       fprintf(stderr,"match: insufficient memory to store patterns\n");
+X		exit(2);
+X	} /* if */
+X	fread(PatBuff,1,PatSize,PFile); /* get the patterns */
+X	/* make sure the patterns are null-terminated. We can't have
+X	* nulls in the patterns */
+X	if (PatBuff[PatSize-1] == '\n')
+X		PatBuff[PatSize-1] = '\0';
+X	else
+X		PatBuff[PatSize] = '\0';
+X	return(MkDescVec(DescVec,PatBuff));
+X} /* GetPatFile */
+e-o-f
+echo Extracting Global.c
+sed 's/^X//' > Global.c << 'e-o-f'
+X/* global flags for match */
+Xint	cFlag=0, /* true if we want only a count of matching lines */
+X	eFlag=0, /* indicates that next argument is the pattern */
+X	fFlag=0, /* true if the patterns are to come from a file */
+X	lFlag=0, /* true if we want a list of files containing the pattern */
+X	nFlag=0, /* true if we want the character offset of the pattern */
+X	sFlag=0, /* true if we want silent mode */
+X	xFlag=0, /* true if we want only lines which match entirely */
+X	hFlag=0, /* true if we want no filenames in output */
+X
+X	MatchCount=0; /* count of number of times a search string was found
+X	* in the text */
+Xchar *FileName = 0;
+e-o-f
+echo Extracting MakeDesc.c
+sed 's/^X//' > MakeDesc.c << 'e-o-f'
+X#include <stdio.h>
+X#include "match.h"
+X#include "Extern.h"
+Xextern char * malloc();
+X/* makes a pattern descriptor */
+Xstruct PattDesc *MakeDesc(Pattern)
+Xchar *Pattern;
+X{
+X	struct PattDesc *Desc;
+X	Desc = (struct PattDesc *) malloc(sizeof(struct PattDesc));
+X	Desc->Pattern=Pattern;
+X	Desc->PatLen = strlen(Desc->Pattern);
+X	return(Desc);
+X} /* main */
+e-o-f
+echo Extracting match.h
+sed 's/^X//' > match.h << 'e-o-f'
+X#define FIRSTCHAR ' '
+X#define MAXCHAR 0377
+X#define MAXBUFF 8192
+X#define MAXSIZE 100
+X#define MAXPATS 100 /* max number of patterns */
+X#define min(x,y) (x) < (y) ? (x) : (y)
+X#define max(x,y) (x) > (y) ? (x) : (y)
+Xstruct PattDesc {
+X	char *Pattern;
+X	int PatLen; /* pattern length */
+X	char *Start; /* starting position of search (at beginning of pattern) */
+X	int Success; /* true when pattern found */
+X};
+e-o-f
+echo Extracting match.c
+sed 's/^X//' > match.c << 'e-o-f'
+X#include <stdio.h>
+X#include <sys/file.h>
+X#include <strings.h>
+X#include "match.h"
+X#include "Extern.h"
+Xmain(argc,argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	/* test driver for grep based on Boyer-Moore algorithm */
+X	char BigBuff[MAXBUFF + 2];
+X	/*
+X	* We leave one extra character at the beginning and end of the buffer,
+X	* but don't tell Execute about it. This is so when someone is
+X	* scanning the buffer and scans past the end (or beginning)
+X	* we are still technically in the buffer (picky, but there ARE
+X	* machines which would complain)
+X	*/
+X	int ret = 1, /* return code from Execute */
+X		NotFound = 0, /* non-zero if file not readable */
+X		NFiles,
+X		NPats; /* number of patterns to search for */
+X	char i,
+X		*FlagPtr,
+X		**OptPtr; /* used to scan command line */
+X	int TextFile /* file to search */;
+X	struct PattDesc *DescVec[MAXPATS];
+X
+X	--argc;
+X	OptPtr = argv + 1;
+X	while ( argc && **OptPtr == '-') {
+X		FlagPtr = *OptPtr + 1;
+X		while (*FlagPtr) {
+X			switch (*FlagPtr) {
+X				case 'c': cFlag = 1; break;
+X				case 'e': eFlag = 1;
+X					/* get the patterns from next arg */
+X					NPats = MkDescVec(DescVec,*++OptPtr);
+X					--argc;
+X					break;
+X				case 'f': fFlag = 1; 
+X					/* read the patterns from a file */
+X					NPats = GetPatFile(*++OptPtr,DescVec);
+X					--argc;
+X					break;
+X				case 'l': lFlag = 1; break;
+X				case 'n': nFlag = 1; break;
+X				case 's': sFlag = 1; break;
+X				case 'x': xFlag = 1; break;
+X				case 'h': hFlag = 1; break;
+X				default:
+X					fprintf(stderr,
+X					"match: invalid option: -%c \n",
+X					*FlagPtr);
+X					PutUsage();
+X					exit(2);
+X			} /* switch */
+X			++FlagPtr;
+X		} /* while */
+X		++OptPtr; --argc;
+X	} /* while */
+X	/* OptPtr now points to patterns */
+X	if (!fFlag && !eFlag) {
+X		if (!argc) {
+X			fprintf(stderr,"match: no pattern specified\n");
+X			PutUsage();
+X			exit(2);
+X		} else
+X			NPats = MkDescVec(DescVec,*OptPtr);
+X		++OptPtr; --argc;
+X	}
+X	/* OptPtr now points to first file */
+X	NFiles = argc;
+X	if (!NFiles)
+X		ret &= Execute(DescVec,NPats,0,BigBuff+1);
+X	else while (argc--) {
+X		if ((NFiles > 1) || lFlag) FileName = *OptPtr;
+X		if ((TextFile = open(*OptPtr,O_RDONLY,0)) < 0) {
+X			fprintf(stderr,"match: can't open %s\n",*OptPtr);
+X			NotFound++;
+X		} else {
+X			ret &= Execute(DescVec,NPats,TextFile,BigBuff+1);
+X			if (sFlag && !ret)
+X				exit(0);
+X			close(TextFile);
+X		} /* if */
+X		++OptPtr;
+X	} /* while */
+X	if (cFlag) printf("%d\n",MatchCount);
+X	exit(NotFound ? 2 : ret);
+X} /* main */
+e-o-f
+echo Extracting MatchFound.c
+sed 's/^X//' > MatchFound.c << 'e-o-f'
+X#include <stdio.h>
+X#include "match.h"
+X#include "Extern.h"
+XMatchFound(Desc, BuffPos, Buffer, BuffEnd)
+Xstruct PattDesc *Desc; /* state info about search for one string */
+Xint BuffPos; /* offset of first char of buffer into the file being searched */
+Xchar *Buffer, /* pointer to the first character in the buffer */
+X	*BuffEnd; /* pointer to the last character in the buffer */
+X{
+X	register char *MLineBegin, *MLineEnd;
+X	
+X	Desc->Success = 0;
+X	/* Start points to first character after a successful match */
+X	MLineBegin = MLineEnd = Desc->Start - 1;
+X	while(MLineBegin >=Buffer && *MLineBegin != '\n') --MLineBegin;
+X	++MLineBegin;
+X	while( MLineEnd <= BuffEnd && *MLineEnd != '\n') ++MLineEnd;
+X	if (MLineEnd > BuffEnd) --MLineEnd;
+X	/* fixed 25jun85 pdbain. suppress multiple matches of the same
+X	* pattern on one line */
+X	Desc->Start = MLineEnd + 1;
+X	/* check if exact match */
+X	if (xFlag && !( Desc->PatLen == (*MLineEnd != '\n' ? ((MLineEnd -
+X	MLineBegin) + 1) : (MLineEnd - MLineBegin))))
+X		return(0); /* failure */
+X	if (sFlag) return(1);
+X	if (cFlag) {
+X		++MatchCount;
+X		return(1);
+X	} /* if */
+X	PrintLine(BuffPos+(Desc->Start-Buffer),MLineBegin,MLineEnd);
+X	return(1);
+X} /* MatchFound */
+e-o-f
+echo Extracting MkDescVec.c
+sed 's/^X//' > MkDescVec.c << 'e-o-f'
+X#include "match.h"
+X#include <strings.h>
+X/* scan a newline-separated string of patterns and set up the
+X* vector of descriptors, one pattern descriptor per pattern. 
+X* Return the number of patterns */
+Xint
+XMkDescVec(DescVec, Pats)
+Xstruct PattDesc *DescVec[];
+Xchar *Pats;
+X{
+X	int NPats = 0;
+X	char *EndPat;
+X	extern struct PattDesc *MakeDesc();
+X	while (*Pats && (EndPat = index(Pats,'\n')) && NPats < MAXPATS) {
+X		*EndPat = '\0';
+X		DescVec[NPats] = MakeDesc(Pats);
+X		Pats = EndPat + 1;
+X		++NPats;
+X	} /* while */
+X	if (*Pats && NPats < MAXPATS) {
+X		DescVec[NPats] = MakeDesc(Pats);
+X		++NPats;
+X	} /* if */
+X	return(NPats);
+X} /* MkDescVec */
+e-o-f
+echo Extracting MoveResidue.c
+sed 's/^X//' > MoveResidue.c << 'e-o-f'
+X#include "match.h"
+X/* Moves the text which has not been completely searched at the end of
+X* the buffer to the beginning of the buffer
+X* and returns number of bytes moved */
+Xint MoveResidue(DescVec, NPats,Buffer, BuffEnd)
+Xregister struct PattDesc **DescVec;
+Xint NPats;
+Xchar *Buffer, *BuffEnd;
+X{
+X	char *FirstStart;
+X	register char *Residue;
+X	register int i;
+X	int ResSize;
+X
+X	FirstStart = BuffEnd;
+X	/* find the earliest point which has not been
+X	* completely searched */
+X	for (i=0; i < NPats; i++) {
+X		FirstStart = 
+X			min(FirstStart, DescVec[i]-> Start );
+X	} /* for */
+X	/* now scan to the beginning of the line containing the
+X	* unsearched text */
+X	for (Residue = FirstStart; *Residue != '\n' &&
+X	Residue >= Buffer; Residue--);
+X	if (Residue < Buffer)
+X		Residue = FirstStart;
+X	else ++Residue;
+X	/* now move the residue to the beginning of
+X	* the file */
+X	ResSize = BuffEnd - Residue + 1;
+X	bcopy(Residue, Buffer, ResSize);
+X	/* now fix the status vectors */
+X	for (i=0; i < NPats; i++) {
+X		DescVec[i]->Start -= (Residue - Buffer);
+X	} /* for */
+X	return(ResSize);
+X} /* MoveResidue */
+e-o-f
+echo Extracting PrintLine.c
+sed 's/^X//' > PrintLine.c << 'e-o-f'
+X#include <stdio.h>
+X#include <strings.h>
+X#include "Extern.h"
+XPrintLine(OffSet,LineStart,LineEnd)
+Xint OffSet; /* offset of LineStart from beginning of file */
+Xchar *LineStart,
+X	*LineEnd;
+X{
+X	char OffStr[80];
+X	if (lFlag) {
+X		sprintf(OffStr,"%s\n",FileName);
+X		write(1,OffStr,strlen(OffStr));
+X		return;
+X	} /* if */
+X	if (FileName && !hFlag) {
+X		sprintf(OffStr,"%s: ",FileName);
+X		write(1,OffStr,strlen(OffStr));
+X	} /* if */
+X	if (nFlag) {
+X		sprintf(OffStr,"%d: ",OffSet);
+X		write(1,OffStr,strlen(OffStr));
+X	} /* if */
+X	write(1,LineStart,LineEnd-LineStart+1);
+X	if (*LineEnd != '\n') write (1,"\n",1);
+X} /* PrintLine */
+e-o-f
+echo Extracting PutUsage.c
+sed 's/^X//' > PutUsage.c << 'e-o-f'
+X#include <stdio.h>
+XPutUsage()
+X{
+X	fprintf(stderr,
+X	"match: search for a given string or strings in a file or files\n");
+X	fprintf(stderr,
+X	"synopsis: match [option]* [string(s)] [file]*\n");
+X	fprintf(stderr,
+X	"options:\n");
+X	fprintf(stderr,
+X	"-c print only a count of matching lines \n");
+X	fprintf(stderr,
+X	"-e Take next argument as the pattern\n");
+X	fprintf(stderr,
+X	"-f PFile read patterns from a file PFile\n");
+X	fprintf(stderr,
+X	"-h Do not print file names\n");
+X	fprintf(stderr,
+X	"-l print a list of files containing the pattern(s) \n");
+X	fprintf(stderr,
+X	"-n print the character offset of the pattern(s) \n");
+X	fprintf(stderr,
+X	"-s silent mode. Return only success (0) or failure (1)\n");
+X	fprintf(stderr,
+X	"-x print only lines which match entirely \n");
+X} /*PutUsage */
+e-o-f
+echo Extracting Search.s
+sed 's/^X//' > Search.s << 'e-o-f'
+XLL0:
+X	.data
+X	.text
+X	.align	1
+X	.globl	_Search
+X_Search:
+X	.word	L20
+X	matchc	8(ap),*4(ap),16(ap),*12(ap)
+X	beql	match
+X	movl	20(ap),r0
+X	movl	r3,8(r0)
+X	movl	$0,r0
+X	ret
+Xmatch:
+X	movl	20(ap),r0
+X	movl	r3,8(r0)
+X	movl	$1,r0
+X	ret
+X	.set	L20,0xf00
+X	.data
+e-o-f
+echo Extracting Makefile
+sed 's/^X//' > Makefile << 'e-o-f'
+XCFLAGS =  -O
+XSOURCES =  Execute.c Extern.h\
+X	GetPatFile.c Global.c MakeDesc.c \
+X	match.h match.c MatchFound.c \
+X	MkDescVec.c MoveResidue.c PrintLine.c PutUsage.c Search.s
+XOBJECTS = Execute.o \
+X	GetPatFile.o Global.o MakeDesc.o \
+X	match.o MatchFound.o \
+X	MkDescVec.o MoveResidue.o Search.o PrintLine.o PutUsage.o
+XBASEFILES = $(SOURCES) Makefile README match.p
+Xmatch: $(OBJECTS)
+X	cc -o match $(CFLAGS) $(OBJECTS)
+Xshar:
+X	/usr/public/shar $(BASEFILES) >match.shar
+Xinstall: match
+X	install -c match /usr/public/match
+Xman: /usr/man/manp/match.p
+X/usr/man/manp/match.p: match.p
+X	rm -f /usr/man/manp/match.p
+X	cp match.p /usr/man/manp/match.p
+X	man match > /dev/null
+Xmatch.o: match.c match.h Extern.h
+XPutUsage.o: PutUsage.c match.h 
+XSearch.o: Search.s
+XExecute.o: Execute.c match.h 
+XMoveResidue.o: MoveResidue.c match.h Extern.h
+XMatchFound.o: MatchFound.c match.h Extern.h
+XPrintLine.o: PrintLine.c Extern.h
+XMkDescVec.o: MkDescVec.c match.h
+XGetPatFile.o: GetPatFile.c match.h
+XMakeDesc.o: MakeDesc.c match.h
+XGlobal.o: Global.c
+Xlisting:
+X	print -i $(SOURCES) Makefile
+Xclean:
+X	rm -f *.o match
+e-o-f
+echo Extracting README
+sed 's/^X//' > README << 'e-o-f'
+XMatch is a fast pattern matching utility, intended to be almost
+Xidentical in functionality to fgrep (ugh!) but much faster. It uses
+XMATCHC instruction on VAX computers. Apparently, it is faster than
+XBM only on the VAX 780 - on the Microvax it is much slower than bm.
+X
+XThe files are:
+XExecute.c: search a file for the patterns
+XExtern.h: declarations of externs
+XGetPatFile.c: read in patterns from a file and set up a vector of
+X	pattern descriptors
+XGlobal.c: global variables (complement to Extern.h)
+XMakeDesc.c: create a pattern descriptor for one pattern
+XMakefile: you can figure this one out for yourself
+XMatchFound.c: what to do when you actually FIND a pattern - print it,
+X	update flags, etc.
+XMkDescVec.c: make a vector of pattern descriptors, given a string
+X	of newline-separated patterns
+XMoveResidue.c: when you come to the end of the buffer, move the
+X	unsearched "residue" to the beginning and start again
+XPrintLine.c: print the appropriate stuff after finding a match
+XPutUsage.c: mini-man page.
+XREADME: this file
+XSearch.s: the guts. Calls MATCH
+Xmatch.c: mainline. mostly interpreting the command line and tidying
+X	up at the end. Calls Execute for each file.
+Xmatch.h: constants
+Xmatch.p: man page
+e-o-f
+echo Extracting match.p
+sed 's/^X//' > match.p << 'e-o-f'
+X.TH MATCH PUBLIC "11 July 1985"
+X.UC 4
+X.SH NAME
+Xmatch \- search a file for a string
+X.SH SYNOPSIS
+X.B /usr/public/match
+X[ option ] ...
+X[ strings ]
+X[ file ]
+X.SH DESCRIPTION
+X.I Match
+Xsearches the input
+X.I files
+X(standard input default) for lines matching a string.
+XNormally, each line found is copied to the standard output.
+XIt is blindingly fast.
+X.I Match
+Xstrings are fixed sequences of characters:
+Xthere are no wildcards, repetitions, or other features
+Xof regular expressions.
+XMatch is also case sensitive.
+XThe following options are recognized.
+X.TP
+X.B \-x
+X(Exact) only lines matched in their entirety are printed
+X.TP
+X.B \-l
+XThe names of files with matching lines are listed (once) separated by newlines.
+X.TP
+X.B \-c
+XOnly a count of the number of matches
+Xis printed
+X.TP
+X.B \-e "string"
+XThe string is the next argument after the
+X.B \-e
+Xflag. This allows strings beginning with '-'.
+X.TP
+X.B \-h
+XNo filenames are printed, even if multiple files are searched.
+X.TP
+X.B \-n
+XEach line is preceded by the number
+Xof characters from the beginning of the file
+Xto the match.
+X.TP
+X.B \-s
+XSilent mode.  Nothing is printed (except error messages).
+XThis is useful for checking the error status.
+X.TP
+X.BI \-f " file"
+XThe string list
+Xis taken from the
+X.I file.
+X.LP
+XUnless the
+X.B \-h
+Xoption is specified
+Xthe file name is shown if there is more than one input file.
+XCare should be taken when using the characters $ * [ ^ | ( ) and \\ in the
+X.I strings
+X(listed on the command line)
+Xas they are also meaningful to the Shell.  It is safest to enclose the entire
+X.I expression
+Xargument in single quotes \' \'.
+X.LP
+X.I Match
+Xsearches for lines that contain one of the (newline-separated)
+X.I strings,
+Xusing
+Xthe VAX MATCHC instruction
+XIt is far superior in terms of speed to the grep (egrep, fgrep)
+Xfamily of pattern matchers, as well as bm(p) for fixed-pattern searching
+Xon a VAX 780.
+X.SH "SEE ALSO"
+Xgrep(1), bm(p)
+X.SH DIAGNOSTICS
+XExit status is 0 if any matches are found,
+X1 if none, 2 for syntax errors or inaccessible files.
+X.SH AUTHOR
+XPeter Bain (pdbain@wateng)
+X.SH BUGS
+XWorks slowly on VAXen other than the 780, and doesn't work at all
+Xon other architectures.
+X.LP
+XOnly 100 patterns are allowed.
+X.LP
+XPatterns may not contain newlines.
+X.LP
+XIf a line (delimited by newlines, and the beginning and end of the file)
+Xis longer than 8000 charcters (e.g. in a core dump),
+Xit will not be completely printed.
+X.LP
+XIf multiple patterns are specified, the order of the ouput lines is not
+Xnecessarily the same as the order of the input lines.
+X.LP
+XA line will be printed once for each different string on that line.
+X.LP
+XThe algorithm cannot count lines.
+X.LP
+XThe
+X.B -n
+Xand
+X.B -c
+Xwork differently from fgrep.
+X.LP
+XThe
+X.B -v,
+X.B -i,
+Xand
+X.B -b
+Xare not available.
+e-o-f
+exit 0
+-- 
+   - peter bain
+...!{allegra|decvax|clyde|ihnp4 }!watmath!wateng!pdbain
+hard mail:	CCNG, CPH-2369A, University of Waterloo,
+	Waterloo, Ont. Canada N2M 5G4
+telephone:	(519) 885-1211 x2810
+
+

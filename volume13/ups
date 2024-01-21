@@ -1,0 +1,1112 @@
+Subject:  v13i066:  BSD File delivery programs, Part02/02
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Scooter Morris <scooter@genie.gene.com>
+Posting-number: Volume 13, Issue 66
+Archive-name: ups
+
+[  Great name and concept, even if of unknown utility.  --r$ ]
+
+This program allows users on 4.3bsd systems to pass around files in
+a manner very similar to mail.  It uses the network and the /usr/lib/aliases
+file to handle sending files to users on other machines.
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	README
+#	Makefile
+#	ups.c
+#	upsd.c
+#	ups.l
+export PATH; PATH=/bin:$PATH
+if test -f 'README'
+then
+	echo shar: will not over-write existing file "'README'"
+else
+cat << \SHAR_EOF > 'README'
+README for ups - the package delivery system
+
+ups is a system (actually just two programs) for delivering files between
+users.  It works just like mail, except that accepting delivery implies
+the movement of files.  Basically, a user just types to the shell the
+following:
+	ups user file1 file2 ...
+this will cause the files file1, file2, ... to be copied into a spool area
+and a mail message to be sent to 'user' informing them that there are files
+awaiting them in ups.  To receive the files a user simply types 'ups' to
+the shell and gets a list of files which are awaiting delivery and is
+asked if they wish to accept delivery in the current directory.
+
+What's required
+
+ups was written for a 4.3bsd network of vaxes.  It will probably work on
+a 2.9 or 4.2 system without a lot of work.  Other machines will certainly
+require work.
+
+Installation
+
+	1)  Add ups to the table of known ports in /etc/services as follows:
+
+	ups	600/tcp
+
+	2)  Add ups to the inetd configuration file /etc/inetd.conf:
+
+	ups	stream	tcp	nowait	root	/usr/local/lib/upsd	upsd
+
+	3) Make ups and upsd by just saying "make all"
+	
+	4)  And finally install ups and upsd.  We installed upsd in /usr/local/lib 
+	    (as shown above) and this is where make install will put it.
+	     
+	We also added a line to our standard .login file of the form: ups -q.  This will 
+	inform users at login time if files are awaiting them.
+	
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'Makefile'
+then
+	echo shar: will not over-write existing file "'Makefile'"
+else
+cat << \SHAR_EOF > 'Makefile'
+# $Header: Makefile,v 1.1 85/08/21 22:39:19 scooter Exp $
+
+UPSDIR = "/usr/spool/ups"
+SENDMAIL = "/usr/lib/sendmail"
+BIN = "/usr/local/bin"
+LIB = "/usr/local/lib"
+# CFLAGS = -O -g -D'UPSDIR=$(UPSDIR)' -D'SENDMAIL=$(SENDMAIL)' -DDEBUG -DALIASES
+CFLAGS = -O -D'UPSDIR=$(UPSDIR)' -D'SENDMAIL=$(SENDMAIL)' -DALIASES
+
+VPATH = ./RCS
+.SUFFIXES: .c,v
+
+all:	ups upsd
+
+install: ups upsd
+	cp ups $(BIN)/ups
+	cp upsd $(LIB)/upsd
+
+.c,v.o:
+	co -q $*.c
+	cc $(CFLAGS) -c $*.c
+	mv $*.o OBJS
+	rm -f $*.c
+
+ups:	ups.o
+	cc $(CFLAGS) -o ups ups.o
+
+upsd:	upsd.o
+	cc $(CFLAGS) -o upsd upsd.o
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'ups.c'
+then
+	echo shar: will not over-write existing file "'ups.c'"
+else
+cat << \SHAR_EOF > 'ups.c'
+#ifndef lint
+static char RCSid[] = "$Header: ups.c,v 1.8 86/12/11 15:58:18 scooter Exp $";
+#endif
+
+/*
+ * ups - user interface to the package delivery system
+ *
+ * usage: ups user@host file1 file2 ...
+ *
+ * $Author: scooter $
+ * $Revision: 1.8 $
+ * $Date: 86/12/11 15:58:18 $
+ *
+ * $Log:	ups.c,v $
+ * Revision 1.8  86/12/11  15:58:18  scooter
+ * Added alias expansion code which allows ups to follow /usr/lib/aliases.
+ * 
+ * Revision 1.7  86/09/19  18:53:15  scooter
+ * Added -i option for mail specification
+ * 
+ * Revision 1.6  86/09/18  15:19:45  scooter
+ * More fixes to the '.' problam
+ * 
+ * Revision 1.5  86/09/17  09:43:38  scooter
+ * Added code to do automatic renaming of "." files for delivery to
+ * avoid the "cannot delete" problem
+ * 
+ * Revision 1.4  85/08/21  22:27:45  scooter
+ * Release revision: added more complete RCS headers.
+ * 
+ */
+
+#include <stdio.h>
+#include <pwd.h>
+#include <ndbm.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/file.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <ctype.h>
+
+#define	LS "/bin/ls"
+
+struct	passwd *getpwuid();
+FILE 	*fopen();
+int	rem;
+int	qflg = 0;
+int	iflg = 0;
+int	on   = 1;
+char	buffer[BUFSIZ*5];
+char	mbuffer[BUFSIZ*4];
+
+struct	user_list {
+	char	*u_user;
+	char	*u_host;
+	struct	user_list *u_next;
+};
+
+main(argc, argv)
+char **argv;
+int argc;
+{
+	char	myhost[BUFSIZ];
+	int	file;
+	int	ret;
+	char	*user,*host,*tmp,*rindex(),*index();
+	struct	passwd *mypwent;
+	struct	user_list *u_list,*u_top, *alias_expand();
+
+	gethostname(myhost,BUFSIZ);
+
+	if( (mypwent = getpwuid(getuid())) == NULL )
+	{
+		fprintf(stderr,"ups: who are you?\n");
+		exit(1);
+	}
+
+	while (*argv[1] == '-')
+	{
+		char 	c;
+
+		switch (c = *(++argv[1]))
+		{
+
+		case 'q':
+			qflg++;
+			break;
+
+		case 'i':
+			iflg++;
+			break;
+
+		default:
+			fprintf(stderr,"ups: unknown option %c\n",c);
+
+		}
+		argv++;
+		argc--;
+	}
+
+	if (argc == 1 || qflg)
+		upsread(mypwent);
+	
+	if (argc == 2) {
+		fprintf(stderr,"usage: ups user@host file1 file2 ...\n");
+		exit(0);
+	}
+
+/*
+ * Get the name of the destination user and host
+ */
+
+	user = argv[1];
+	host = rindex(user,'@');
+#ifndef	ALIASES
+	if (host == NULL)
+		host = myhost;
+	else
+		*host++ = '\0';
+#else
+	if (host != NULL)
+		*host++ = '\0';
+	 
+	u_top = alias_expand(user,host,myhost);
+	
+#endif	ALIASES
+
+	if (iflg)
+		upsgetmsg(mbuffer);
+	else
+		mbuffer[0] = '\0';
+
+	while (u_top != NULL)
+	{
+
+#ifdef	DEBUG
+	printf("Connecting to %s for user %s\n",u_top->u_host,u_top->u_user);
+#endif	DEBUG
+		rem = upsconnect(u_top->u_host);	/* Connect to the server */
+
+		/*
+		 * Send the to name, from name, and our name
+		 */
+
+		tmp = index(mypwent->pw_gecos,',');
+		if (tmp)
+			*tmp = '\0';
+
+		sprintf(buffer, "%s\n%s\n%s\n%s", u_top->u_user,
+			mypwent->pw_name, mypwent->pw_gecos,mbuffer);
+
+#ifdef	DEBUG
+	printf("Sending: %s\n",buffer);
+	fflush(stdout);
+#endif	DEBUG
+
+		write(rem, buffer, strlen(buffer)+1);
+		ret = read(rem, buffer, BUFSIZ);
+		if (buffer[0])
+			problem(1);
+	
+		for (file = 2 ; file < argc ; file++)
+		{
+
+#ifdef	DEBUG
+		printf("Sending file: %s",argv[file]);
+#endif	DEBUG
+
+			sendfile(argv[file]);
+		}
+
+		sprintf(buffer, "-Done-");
+		write(rem, buffer, strlen(buffer)+1);
+		read(rem, buffer, BUFSIZ);	/* get result */
+		if (buffer[0])		/* problem? */
+			problem(1);	/* yes, go handle it */
+
+		close(rem);
+		u_top = u_top->u_next;
+	 }
+
+}
+
+
+
+
+upsconnect(host)
+char *host;
+{
+	struct hostent *hp;
+	struct servent *sp;
+	struct	sockaddr_in sin;
+	int s;
+
+	hp = gethostbyname(host);
+	if (hp == NULL) {
+		static struct hostent def;
+		static struct in_addr defaddr;
+		static char namebuf[128];
+		int inet_addr();
+
+		defaddr.s_addr = inet_addr(host);
+		if (defaddr.s_addr == -1) {
+			printf("unknown host: %s\n", host);
+			exit(1);
+		}
+		strcpy(namebuf, host);
+		def.h_name = namebuf;
+		def.h_addr = (char *)&defaddr;
+		def.h_length = sizeof (struct in_addr);
+		def.h_addrtype = AF_INET;
+		def.h_aliases = 0;
+		hp = &def;
+	}
+	sp = getservbyname("ups", "tcp");
+	if (sp == 0) {
+		fprintf(stderr,"tcp/ups: unknown service\n");
+		exit(1);
+	}
+	sin.sin_family = hp->h_addrtype;
+	bcopy(hp->h_addr, (char *)&sin.sin_addr, hp->h_length);
+	sin.sin_port = sp->s_port;
+	s = socket(hp->h_addrtype, SOCK_STREAM, 0);
+	if (s < 0) {
+		fflush(stderr);
+		perror("ups (socket)");
+		exit(1);
+	}
+	setsockopt(s,SOL_SOCKET,SO_KEEPALIVE,&on,sizeof(on));
+#ifdef	DEBUG
+	setsockopt(s,SOL_SOCKET,SO_DEBUG,&on,sizeof(on));
+#endif	DEBUG
+	if (connect(s, (char *)&sin, sizeof (sin)) < 0) {
+		fflush(stderr);
+		perror("ups (connect)");
+		close(s);
+		exit(1);
+	}
+	return(s);
+}
+
+
+
+
+sendfile(file)
+char *file;
+{
+	struct	stat fstatus;
+	int	loc,n;
+	char	*tmp,*fname;
+
+	if ( (loc = open(file,O_RDONLY)) <= 0 ) {
+		perror("ups (open)");
+		return(1);
+	}
+	if (fstat(loc, &fstatus)) {
+		perror("ups (fstat)");
+		return(1);
+	}
+
+	if ((fstatus.st_mode&S_IFMT) != S_IFREG) {
+		switch (fstatus.st_mode&S_IFMT)
+		{
+		case S_IFDIR:
+			tmp = "directory";
+			break;
+		case S_IFCHR:
+			tmp = "character device";
+			break;
+		case S_IFBLK:
+			tmp = "block device";
+			break;
+		case S_IFLNK:
+			tmp = "symbolic link";
+			break;
+		case S_IFSOCK:
+			tmp = "socket";
+			break;
+		}
+
+		fprintf(stderr,
+			"ups: %s is a %s, only regular files may be sent\n",
+			file,tmp);
+		fflush(stderr);
+		return(1);
+	}
+
+	/*
+	 * Send the file name
+	 */
+
+	/*
+	 * First strip off the directory path
+	 */
+	sprintf(buffer,"%s",file);
+	tmp = rindex(buffer,'/');
+	if (tmp) 
+		*tmp++ = '\0';
+	else
+		tmp = buffer;
+
+	fname = tmp;
+
+	if (*tmp == '.')
+	{
+		while ( (*tmp == '.') && (*tmp != '\0') )tmp++;
+
+		fprintf(stdout,
+		  "WARNING: file %s has been renamed to %s for delivery\n",
+		  fname,tmp);
+	}
+
+	write(rem, tmp, strlen(tmp)+1);
+	read(rem, buffer, BUFSIZ);
+	if (buffer[0])		/* problem */
+	{
+		problem(0);
+		return(1);
+	}
+
+	/*
+	 * Send the file size in bytes
+	 */
+
+	sprintf(buffer, "%D",fstatus.st_size);
+	write(rem, buffer, strlen(buffer)+1);
+	read(rem, buffer, BUFSIZ);
+	if (buffer[0])		/* problem */
+	{
+		problem(0);
+		return(1);
+	}
+
+	/*
+	 * Send the file
+	 */
+	while (n = read(loc, buffer, BUFSIZ))
+		write(rem, buffer, n);
+	close(loc);
+	read(rem, buffer, BUFSIZ); /* get result */
+	if (buffer[0])		/* problem */
+	{
+		problem(0);
+		return(1);
+	}
+	sprintf(buffer, "%u", fstatus.st_mode);
+	write(rem, buffer, strlen(buffer)+1);
+	read(rem, buffer, BUFSIZ); /* get result */
+	if (buffer[0])		/* problem */
+	{
+		problem(0);
+		return(1);
+	}
+	return(0);
+}
+
+
+
+upsread(mypwent)
+struct	passwd *mypwent;
+{
+	union	wait status;
+	int	pid;
+	char	c,line[BUFSIZ],*tmp;
+
+	sprintf(buffer,"%s/%s",UPSDIR,mypwent->pw_name);
+	if (qflg)
+	{
+		if (!access(buffer,F_OK)) {
+		fprintf(stderr,
+	"You have ups files awaiting you (type ups to accept delivery)\n");
+		}
+		exit(0);
+	}
+	if (access(buffer,F_OK)) {
+		fprintf(stderr,"Nothing waiting in ups\n");
+		exit(0);
+	}
+	fprintf(stdout,"\nYou have the following files awaiting delivery:\n\n");
+	if (pid = vfork())
+	{
+		wait(&status);
+	} else {
+		execl(LS,"ls","-C",buffer,(char *)0);
+		perror("ups (exec)");
+		return(0);
+	}
+	fprintf(stdout,"\n");
+
+	fprintf(stdout,
+		"Do you wish to accept delivery in your\n");
+	fprintf(stdout,
+		"current directory (%s)? ",
+		getwd(line));
+
+getinp:
+	if (fgets(line,BUFSIZ,stdin) == NULL) {
+		fprintf(stdout,"\n");
+		exit(0);
+	}
+
+	tmp = &line[0];
+	while (isspace(*tmp)) tmp++;
+
+	switch (*tmp) {
+	case 'y':
+	case 'Y':
+		sprintf(line,"mv -i %s/* . ; rmdir %s",buffer,buffer);
+		system(line);
+		exit(0);
+
+	case 'n':
+	case 'N':
+		exit(0);
+
+	default:
+		fprintf(stdout,"Please answer 'yes' or 'no': ");
+		goto getinp;
+	}
+}
+
+
+
+/*
+ * problem() is called when the install demon process return a non-zero reply.
+ * This usually means something recognizable went wrong and we should expect
+ * a reason to follow. Read in the reason, output it on the terminal and die.
+ */
+
+problem(die)
+int die;
+{
+	char buf[BUFSIZ];	/* place to read into */
+
+	if (read(rem, buf, BUFSIZ) > 0)		/* if we have something */
+		fprintf(stderr, "ups: %s", buf);
+	if (die) {
+		close(rem);		/* close network channel */
+		exit(1);
+	}
+}
+
+int
+upsgetmsg(mailbuffer)
+char *mailbuffer;
+{
+	int done = 0;
+
+	fprintf(stdout,
+		"Enter your message followed by '.<RETURN>' or a <CTRL>D:\n");
+	
+	while (!done)
+	{
+		fprintf(stdout,"> ");
+		if (gets(mailbuffer) == NULL)
+		{
+			fprintf(stdout,"\n");
+			done++;
+		} else if ( (*mailbuffer == '.') && (*(mailbuffer+1) == '\0')) 
+		{
+			done++;
+			*mailbuffer = '\0';
+		} else {
+			while(*mailbuffer != '\0')
+				mailbuffer++;
+			*mailbuffer++ = '\n';
+			*mailbuffer = '\0';
+		}
+	}
+	fprintf(stdout,"[EOT]\n");
+}
+
+
+
+struct user_list *
+alias_expand(user,host,myhost)
+char *user,*host,*myhost;
+{
+	char	*malloc();
+	DBM	*dp;
+	datum	key,content;
+	struct	user_list *list,*top,*alloc_list();
+	char	*cp,*tp,*hp;
+	
+	list = top = (struct user_list *)NULL;
+
+	if (host != NULL)
+		return(alloc_list(user,host));
+		
+	dp = dbm_open("/usr/lib/aliases", O_RDONLY, 0644);
+	if (dp == NULL)
+		return(alloc_list(user,host));
+	
+	key.dptr = user;
+	key.dsize = strlen(user) + 1;
+	
+	content = dbm_fetch(dp,key);
+	if (content.dptr == NULL)
+		return(alloc_list(user,myhost));
+	cp = content.dptr;
+	while (cp != NULL)
+	{
+		tp = cp;
+		cp = index(cp,',');
+		if (cp != NULL)
+			*cp++ = '\0';
+		if (index(tp,'!')) {
+		  fprintf(stderr,
+		     "ups: WARNING: cannot alias %s to %s (no ups over uucp)\n",
+		      user,hp);
+		  continue;
+		} else if(index(tp,'|')) {
+		  fprintf(stderr,
+		     "ups: WARNING: cannot alias %s to %s (no shells allowed)\n",
+		      user,hp);
+		  continue;
+		}
+		hp = tp;
+		hp = index(tp,'@');
+		if (hp == NULL)
+			hp = myhost;
+		else
+			*hp++ = '\0';
+		if (top == NULL)
+			top = list = alloc_list(tp,hp);
+		else
+		{
+			list->u_next = alloc_list(tp,hp);
+			list = list->u_next;
+		}
+	}
+	return(top);
+}
+
+struct	user_list *
+alloc_list(user,host)
+char *user,*host;
+{
+	char *malloc();
+	struct	user_list *list;
+
+	list = (struct user_list *)malloc(sizeof(struct user_list));
+	list->u_user = malloc(strlen(user) + 1);
+	list->u_host = malloc(strlen(host) + 1);
+	strcpy(list->u_user,user);
+	strcpy(list->u_host,host);
+	list->u_next = (struct user_list *)NULL;
+	return(list);
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'upsd.c'
+then
+	echo shar: will not over-write existing file "'upsd.c'"
+else
+cat << \SHAR_EOF > 'upsd.c'
+#ifndef lint
+static char RCSid[] = "$Header: upsd.c,v 1.4 86/11/19 15:21:52 scooter Exp $";
+#endif
+
+/*
+ * upsd - package delivery server
+ *
+ * upsd is the program that is called by inetd when a ups
+ * request is issued.  It will read and write to standard input
+ * and standard output.  Here is a description of the ups
+ * protocol:
+ *
+ * 	ups			upsd					type
+ *
+ *  user_name	------>		login name of package receiver		String
+ *  from_name	------>		login name of package sender		String
+ *  full_name	------>		full name of package sender		String
+ *  message	------>		mail message to send			String
+ *		<-----		0 for OK				Byte
+ * For each file:
+ *  file_name	------>		name of file to be delivered		String
+ *  file_size	------>		size of file in bytes			Long
+ *		<-----		0 for OK				Byte
+ *  file	------>		file size bytes
+ *		<-----		0 for OK				Byte
+ *  file_mode	------>		file mode				Int
+ *		<-----		0 for OK				Byte
+ *
+ * When its all done:
+ *  complete	------>		We're done ('-Done-')			String
+ *		<-----		0 for OK				Byte
+ *
+ * $Author: scooter $
+ * $Revision: 1.4 $
+ * $Date: 86/11/19 15:21:52 $
+ *
+ * $Log:	upsd.c,v $
+ * Revision 1.4  86/11/19  15:21:52  scooter
+ * Changed error severity level from ERR to INFO
+ * 
+ * Revision 1.3  86/09/19  18:53:37  scooter
+ * Added -i option for mail specification.
+ * Also added syslog stuff.
+ * 
+ * Revision 1.2  85/08/21  22:28:11  scooter
+ * Release revision: added more complete RCS headers.
+ * 
+ *
+ */
+
+#include	<stdio.h>
+#include	<pwd.h>
+#include	<grp.h>
+#include	<sys/file.h>
+#include	<sys/types.h>
+#include	<netinet/in.h>
+#include	<netdb.h>
+#include	<syslog.h>
+
+long	atol();
+int	atoi();
+
+char	buffer[BUFSIZ*5];	/* character input buffer */
+char	file_name[BUFSIZ];	/* file name */
+char	file_path[BUFSIZ];	/* full path to destination */
+char	user_name[BUFSIZ];	/* Receiver name */
+char	from_name[BUFSIZ];	/* Sender name */
+char	full_name[BUFSIZ];	/* Full name of sender */
+char	file_list[BUFSIZ];	/* List of all files */
+long	file_size;		/* number of bytes in file */
+int	file_mode;		/* mode of the file */
+char	mail_message[BUFSIZ*4];	/* mail message */
+int	mcount;			/* number of characters in mail buffer */
+
+int	fid;			/* File descriptor for destination */
+int	debugflag;		/* Debug flag */
+
+main(argc, argv)
+int argc;
+char **argv;
+{
+	char *ptr,*tptr,*mptr;
+	int f, i, file;
+	struct sockaddr_in sin;
+	struct hostent *peer;
+	struct passwd *pwent;
+	
+	while (*argv[1] == '-')
+	{
+		char 	c;
+
+		switch (c = *(++argv[1]))
+		{
+
+		case 'd':
+			debugflag++;
+			break;
+
+		default:
+			fprintf(stderr,"upsd: unknown option %c\n",c);
+
+		}
+		argv++;
+		argc--;
+	}
+	
+
+	openlog("upsd",LOG_ODELAY,LOG_DAEMON);
+	
+	if (debugflag)
+		syslog(LOG_DEBUG,"started");
+	
+	i = sizeof (sin);
+	if (getpeername(0, &sin, &i) < 0)
+		syslog(LOG_ERR,"getpeername failed: %m");
+
+	if (debugflag)
+		syslog(LOG_DEBUG,"Calling gethostbyaddr");
+	
+	peer = gethostbyaddr((char *)&sin.sin_addr,
+				sizeof(sin.sin_addr),sin.sin_family);
+
+	buffer[0] = '\0';
+	file_list[0] = '\0';
+
+	if (debugflag)
+		syslog(LOG_DEBUG,"Reading first buffer");
+
+	read(0, buffer, BUFSIZ*5);  /* fetch receiver and sender names */
+
+	if (debugflag)
+		syslog(LOG_DEBUG,"receiver/sender/message: %s",buffer);
+
+	ptr = buffer;
+	while (*ptr != '\n')
+		ptr++;
+	*ptr++ = NULL;
+	strcpy(user_name, buffer);	/* save receiver name */
+	tptr = ptr;
+	while (*tptr != '\n')
+		tptr++;
+	*tptr++ = NULL;
+	strcpy(from_name, ptr);		/* save sender name */
+	mptr = tptr;
+	while ((*mptr != '\n') && (*mptr != '\0'))
+		mptr++;
+	*mptr++ = NULL;
+	strcpy (full_name, tptr);	/* save sender's full name */
+	strcpy (mail_message, mptr);	/* save the mail message */
+
+	/*
+	 * Check for a valid user
+	 */
+	if ((pwent = getpwnam(user_name)))
+		ack();
+	else
+	{
+		error("Receiver name","No such person");
+		exit(1);
+	}
+	
+	mcount = strlen (mail_message);
+	if (debugflag)
+		syslog(LOG_DEBUG,"mail message (%d chars):\n %s", mcount, mail_message);
+
+	for (file = 0 ;;)
+	{
+		if (read(0, buffer, BUFSIZ) <= 0) {
+			error("file name","premature EOF or file read error");
+			continue;
+		}
+		strcpy(file_name,buffer);
+
+		if (debugflag)
+			syslog(LOG_DEBUG,"File name:%s",file_name);
+
+
+		/*
+		 * Are we done??
+		 */
+		if (!strncmp(file_name,"-Done-",6)) break;
+
+		if ( (fid = opendest(user_name,file_name,
+				pwent->pw_uid,pwent->pw_gid)) <= 0 ) 
+		{
+			continue;
+		}
+		ack();
+
+		if (read(0, buffer, BUFSIZ) <= 0) {
+			error("file size","premature EOF or file read error");
+			continue;
+		}
+
+		file_size = atol(buffer); /* get number of bytes */
+		ack();
+
+		copyfile(&file);
+
+		if (read(0, buffer, BUFSIZ) <= 0) {
+			error("file mode","premature EOF or file read error");
+			continue;
+		}
+		file_mode = atoi(buffer); 	/* get the file mode */
+		file_mode &= 0700;		/* Strip the low order modes */
+		if (chmod(file_path,file_mode)) {
+			error("file mode","chmod failed");
+			continue;
+		}
+		ack();
+		chown(file_path,pwent->pw_uid,pwent->pw_gid);
+
+	}
+	ack();
+
+	if (file)
+		sendmail(from_name,full_name,peer->h_name,
+			  user_name,file_list,file++,mail_message,mcount);
+}
+
+/*
+copyfile
+copyfile will copy file_size many bytes from stdin to a temporarily created
+file. The filename will be passed back via buffer.
+*/
+
+copyfile(file)
+int *file;
+{
+	long cnt;				/* file size counter */
+	int i;
+
+	cnt = file_size;		/* count down input bytes */
+	while (cnt > 0) {
+		i = read(0, buffer, BUFSIZ);
+		write(fid, buffer, i);
+		cnt -= i;
+	}
+	close(fid);
+
+	ack();
+	sprintf(buffer,"%-15s",file_name);
+	if (*file%4)
+		strcat(file_list," ");
+	else
+		strcat(file_list,"\n\t");
+
+	(*file)++;
+	strcat(file_list,buffer);
+}
+
+/*
+error(option, string)
+char *option, *string;
+This routine is called when some error condition has been encountered.
+option contains an identifier message, while string contains the actual
+error message. Before message is printed, a non-null character is output
+first, then the string error message.
+*/
+
+error(option, string)
+char *option, *string;
+{
+	char buf[BUFSIZ];
+
+
+	buf[0] = 1;
+	write(1, buf, 1);	/* nak */
+	sprintf(buf, "upsd: %s: %s\n", option, string);
+	write(1, buf, strlen(buf)+1);
+
+	syslog(LOG_INFO,"error - %s",buf);
+}
+
+
+
+/*
+ * ack()
+ * This routine is called to return an OK to the remote host.
+ */
+
+ack()
+{
+	buffer[0] = 0;
+	write(1,buffer,1);
+}
+
+
+
+/*
+ * opendest(name,file)
+ * char *name,*file;
+ *
+ * Open the destination file "file" in UPSDIR/user, creating the
+ * file if necessary.
+ */
+
+int
+opendest(name,file,uid,gid)
+char *name,*file;
+int uid,gid;
+{
+	int ret;
+
+	sprintf(file_path,"%s/%s",UPSDIR,name); /* Form path to directory */
+
+	if (access(file_path,F_OK) == (-1))
+	{
+		mkdir(file_path,0700);
+		chown(file_path,uid,gid);
+	}
+
+	sprintf(file_path,"%s/%s/%s",UPSDIR,name,file);
+
+	if (!access(file_path,F_OK))
+	{
+		error("file creation","A file by that name has already been sent to that user.");
+		return(0);
+	} else {
+		ret = open(file_path,O_WRONLY|O_CREAT,0600);
+		if (ret <= 0)
+		{
+			sprintf(buffer,"unable to open destination file: %s",
+				file_path);
+			error("file open",buffer);
+			return(0);
+		}
+		return(ret);
+	}
+}
+
+
+
+/*
+ * sendmail(from,full,from_host,to,list,mess,count)
+ * char *from,*full,*to,*from_host,*list,*mess;
+ * int	count;
+ *
+ * This routine sends mail to the destination user to inform
+ * them that ups files are awaiting them.
+ */
+
+sendmail(from,full,from_host,to,list,file,mess,count)
+char *from,*full,*to,*from_host,*list,*mess;
+int file,count;
+{
+	FILE *send,*popen();
+	static char myhost[BUFSIZ];
+
+	gethostname(myhost,BUFSIZ);
+	sprintf(buffer,"%s -f%s@%s -F\"%s\" -t",SENDMAIL,from,from_host,full);
+
+	if(debugflag)
+		syslog(LOG_DEBUG,"sendmail\n%s",buffer);
+
+	send = popen(buffer,"w");
+
+	fprintf(send,"To: %s@%s\n",to,myhost);
+
+	if(debugflag)
+		syslog(LOG_DEBUG,"To: %s@%s",to,myhost);
+
+	fprintf(send,"Subject: UPS delivery\n");
+	if (file > 1)
+		strcpy(buffer,"files");
+	else
+		strcpy(buffer,"file");
+
+	fprintf(send,"I have sent you the following %s using ups:\n",buffer);
+	fprintf(send,"%s\n\n",list);
+	if (file > 1)
+		strcpy(buffer,"these files");
+	else
+		strcpy(buffer,"this file");
+		
+	fprintf(send,"To retrieve %s, use the ups command.\n\n\n",buffer);
+	if (count)
+		fprintf(send,"%s\n",mess);
+	else
+		fprintf(send,"\n\n\n\n---ups\n");
+	pclose(send);
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'ups.l'
+then
+	echo shar: will not over-write existing file "'ups.l'"
+else
+cat << \SHAR_EOF > 'ups.l'
+.TH UPS LOCAL
+.UC 2
+.SH NAME
+ups \- send files to another user
+.SH SYNOPSIS
+.B ups [\-i]
+user[@host]
+file(s)
+.br
+.B ups
+.br
+.B ups \-q
+.SH DESCRIPTION
+The first form of the command
+sends copies of files to another user.
+The specified files are copied
+into a special spool directory until the receiver
+retrieves them.
+The receiver is notified via \fImail\fR that the files are waiting.
+.PP
+The receiver of the files is specified by typing his/her
+login id.  If you don't know the login id of the receiver,
+type \fIfinger\fR, space, followed by the name of the receiver.
+For example, typing \fIfinger polly\fR would give information,
+including login name, for all users named "polly", and
+\fIfinger polly@genie\fR would give information, including login
+name, for all users named "polly" on the machine "genie".  If the
+user you were interested in sending files to had the login name "pam"
+you could send her files using the command:
+.IP
+\fIups pam@genie file1 ~ckw/file2\fR
+.PP
+This command will send the two files to \fIpam\fR.
+.PP
+The
+.B \-i
+flag is used when the user wishes to interactively specify their own
+message to be appended to the mail sent to the receiver.
+.PP
+The second form of the command is used to receive the files
+awaiting delivery in the spool directory.  The user is shown
+what files are available and asked if he/she wants to accept
+delivery.  If the user accepts delivery, all of the files
+are moved into the current directory.
+.PP
+The third form of the command simply tells the user if there are any
+files waiting.
+.SH SEE ALSO
+ftp(1c), rcp(1), finger(1)
+SHAR_EOF
+fi # end of overwriting check
+#	End of shell archive
+exit 0

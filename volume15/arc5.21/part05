@@ -1,0 +1,2513 @@
+Subject:  v15i081:  ARC (PC compression program), v5.21, Part05/05
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: hyc@math.lsa.umich.edu
+Posting-number: Volume 15, Issue 81
+Archive-name: arc5.21/part05
+
+#--------------------------------CUT HERE-------------------------------------
+#! /bin/sh
+#
+# This is a shell archive.  Save this into a file, edit it
+# and delete all lines above this comment.  Then give this
+# file to sh by executing the command "sh file".  The files
+# will be extracted into the current directory owned by
+# you with default permissions.
+#
+# The files contained herein are:
+#
+# -rw-r--r--  1 hyc         11514 Jun 13 13:54 arcsqs.c
+# -rw-r--r--  1 hyc          4680 Jun 13 00:43 arcsvc.c
+# -rw-r--r--  1 hyc          1284 Apr 19 01:40 arctst.c
+# -rw-r--r--  1 hyc          5347 Jun 18 03:13 arcunp.c
+# -rw-r--r--  1 hyc          2484 Jun  2 16:28 arcusq.c
+# -rw-r--r--  1 hyc          9032 Jun 13 13:56 dtime.c
+# -rw-r--r--  1 hyc          7327 Apr 11 19:11 dtimep.lex
+# -rw-r--r--  1 hyc           356 Apr 11 19:12 lexedit.sed
+# -rw-r--r--  1 hyc          3713 Jun 13 13:59 lexstring.c
+# -rw-r--r--  1 hyc          2241 Apr 11 19:13 libtws.3
+# -rw-r--r--  1 hyc          9053 Jun  6 01:04 marc.c
+#
+echo 'x - arcsqs.c'
+if test -f arcsqs.c; then echo 'shar: not overwriting arcsqs.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcsqs.c
+X/*
+X * $Header: arcsqs.c,v 1.2 88/06/01 16:31:39 hyc Locked $
+X */
+X
+X/*  ARC - Archive utility - SQUASH
+X 
+X(C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+X 
+X This is a quick hack to ARCLZW to make it handle squashed archives.
+X Dan Lanciani (ddl@harvard.*) July 87
+X 
+X*/
+X
+X/*
+X * $Header: arcsqs.c,v 1.2 88/06/01 16:31:39 hyc Locked $
+X */
+X
+X#include <stdio.h>
+X#include "arc.h"
+X
+X#if	MSDOS
+Xchar	*setmem();
+X#else
+Xchar	*memset();
+X#endif
+Xint	getc_unp();
+Xvoid	putc_pak(), putc_unp();
+Xstatic void	putcode();
+X
+X/* definitions for the new dynamic Lempel-Zev crunching */
+X
+X#define BITS   13		/* maximum bits per code */
+X#define HSIZE  10007		/* 80% occupancy */
+X#define INIT_BITS 9		/* initial number of bits/code */
+Xstatic int      n_bits;		/* number of bits/code */
+Xstatic int      maxcode;	/* maximum code, given n_bits */
+X#define MAXCODE(n)      ((1<<(n)) - 1)	/* maximum code calculation */
+Xstatic int      maxcodemax = 1 << BITS;	/* largest possible code (+1) */
+X
+Xstatic unsigned char buf[BITS];	/* input/output buffer */
+X
+Xstatic unsigned char lmask[9] =	/* left side masks */
+X{0xff, 0xfe, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x80, 0x00};
+Xstatic unsigned char rmask[9] =	/* right side masks */
+X{0x00, 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff};
+X
+Xstatic int      offset;		/* byte offset for code output */
+Xstatic long     in_count;	/* length of input */
+Xstatic long     bytes_out;	/* length of compressed output */
+Xstatic unsigned short ent;
+X
+Xlong     htab[HSIZE];	/* hash code table   (crunch) */
+Xunsigned short codetab[HSIZE];	/* string code table (crunch) */
+X
+Xstatic unsigned short *prefix = codetab;  /* prefix code table (uncrunch) */
+Xstatic unsigned char *suffix=(unsigned char *)htab;  /* suffix table (uncrunch) */
+Xstatic int      free_ent;	/* first unused entry */
+Xstatic int      firstcmp;	/* true at start of compression */
+Xunsigned char stack[HSIZE];	/* local push/pop stack */
+X
+X/*
+X * block compression parameters -- after all codes are used up,
+X * and compression rate changes, start over.
+X */
+X
+Xstatic int      clear_flg;
+Xstatic long     ratio;
+X#define CHECK_GAP 10000		/* ratio check interval */
+Xstatic long     checkpoint;
+X
+X/*
+X * the next two codes should not be changed lightly, as they must not
+X * lie within the contiguous general code space.
+X */
+X#define FIRST   257		/* first free entry */
+X#define CLEAR   256		/* table clear output code */
+X
+Xstatic void
+Xcl_block(t)			/* table clear for block compress */
+X	FILE           *t;	/* our output file */
+X{
+X	long            rat;
+X
+X	checkpoint = in_count + CHECK_GAP;
+X
+X	if (in_count > 0x007fffffL) {	/* shift will overflow */
+X		rat = bytes_out >> 8;
+X		if (rat == 0)	/* Don't divide by zero */
+X			rat = 0x7fffffffL;
+X		else
+X			rat = in_count / rat;
+X	} else
+X		rat = (in_count << 8) / bytes_out;	/* 8 fractional bits */
+X
+X	if (rat > ratio)
+X		ratio = rat;
+X	else {
+X		ratio = 0;
+X		setmem(htab, HSIZE * sizeof(long), 0xff);
+X		free_ent = FIRST;
+X		clear_flg = 1;
+X		putcode(CLEAR, t);
+X	}
+X}
+X
+X/*****************************************************************
+X *
+X * Output a given code.
+X * Inputs:
+X *      code:   A n_bits-bit integer.  If == -1, then EOF.  This assumes
+X *              that n_bits =< (long)wordsize - 1.
+X * Outputs:
+X *      Outputs code to the file.
+X * Assumptions:
+X *      Chars are 8 bits long.
+X * Algorithm:
+X *      Maintain a BITS character long buffer (so that 8 codes will
+X * fit in it exactly).  When the buffer fills up empty it and start over.
+X */
+X
+Xstatic void
+Xputcode(code, t)		/* output a code */
+X	int             code;	/* code to output */
+X	FILE           *t;	/* where to put it */
+X{
+X	int             r_off = offset;	/* right offset */
+X	int             bits = n_bits;	/* bits to go */
+X	unsigned char  *bp = buf;	/* buffer pointer */
+X	int             n;	/* index */
+X	register int	ztmp;
+X
+X	if (code >= 0) {	/* if a real code *//* Get to the first byte. */
+X		bp += (r_off >> 3);
+X		r_off &= 7;
+X
+X		/*
+X		 * Since code is always >= 8 bits, only need to mask the
+X		 * first hunk on the left. 
+X		 */
+X		ztmp = (code << r_off) & lmask[r_off];
+X		*bp = (*bp & rmask[r_off]) | ztmp;
+X		bp++;
+X		bits -= (8 - r_off);
+X		code >>= (8 - r_off);
+X
+X		/* Get any 8 bit parts in the middle (<=1 for up to 16 bits). */
+X		if (bits >= 8) {
+X			*bp++ = code;
+X			code >>= 8;
+X			bits -= 8;
+X		}
+X		/* Last bits. */
+X		if (bits)
+X			*bp = code;
+X
+X		offset += n_bits;
+X
+X		if (offset == (n_bits << 3)) {
+X			bp = buf;
+X			bits = n_bits;
+X			bytes_out += bits;
+X			do
+X				putc_pak(*bp++, t);
+X			while (--bits);
+X			offset = 0;
+X		}
+X		/*
+X		 * If the next entry is going to be too big for the code
+X		 * size, then increase it, if possible. 
+X		 */
+X		if (free_ent > maxcode || clear_flg > 0) {	/* Write the whole
+X								 * buffer, because the
+X								 * input side won't
+X								 * discover the size
+X								 * increase until after
+X								 * it has read it. */
+X			if (offset > 0) {
+X				bp = buf;	/* reset pointer for writing */
+X				bytes_out += n = n_bits;
+X				while (n--)
+X					putc_pak(*bp++, t);
+X			}
+X			offset = 0;
+X
+X			if (clear_flg) {	/* reset if clearing */
+X				maxcode = MAXCODE(n_bits = INIT_BITS);
+X				clear_flg = 0;
+X			} else {/* else use more bits */
+X				n_bits++;
+X				if (n_bits == BITS)
+X					maxcode = maxcodemax;
+X				else
+X					maxcode = MAXCODE(n_bits);
+X			}
+X		}
+X	} else {		/* dump the buffer on EOF */
+X		bytes_out += n = (offset + 7) / 8;
+X
+X		if (offset > 0)
+X			while (n--)
+X				putc_pak(*bp++, t);
+X		offset = 0;
+X	}
+X}
+X
+X/*****************************************************************
+X *
+X * Read one code from the standard input.  If EOF, return -1.
+X * Inputs:
+X *      cmpin
+X * Outputs:
+X *      code or -1 is returned.
+X */
+X
+Xstatic int
+Xgetcode(f)			/* get a code */
+X	FILE           *f;	/* file to get from */
+X{
+X	int             code;
+X	static int      offset = 0, size = 0;
+X	int             r_off, bits;
+X	unsigned char  *bp = buf;
+X
+X	if (clear_flg > 0 || offset >= size || free_ent > maxcode) {
+X		/* If the next entry will be too big for the current code
+X		 * size, then we must increase the size. This implies reading
+X		 * a new buffer full, too. */
+X		if (free_ent > maxcode) {
+X			n_bits++;
+X			if (n_bits == BITS)
+X				maxcode = maxcodemax;	/* won't get any bigger
+X							 * now */
+X			else
+X				maxcode = MAXCODE(n_bits);
+X		}
+X		if (clear_flg > 0) {
+X			maxcode = MAXCODE(n_bits = INIT_BITS);
+X			clear_flg = 0;
+X		}
+X		for (size = 0; size < n_bits; size++) {
+X			if ((code = getc_unp(f)) == EOF)
+X				break;
+X			else
+X				buf[size] = code;
+X		}
+X		if (size <= 0)
+X			return -1;	/* end of file */
+X
+X		offset = 0;
+X		/* Round size down to integral number of codes */
+X		size = (size << 3) - (n_bits - 1);
+X	}
+X	r_off = offset;
+X	bits = n_bits;
+X
+X	/*
+X	 * Get to the first byte. 
+X	 */
+X	bp += (r_off >> 3);
+X	r_off &= 7;
+X
+X	/* Get first part (low order bits) */
+X	code = (*bp++ >> r_off);
+X	bits -= 8 - r_off;
+X	r_off = 8 - r_off;	/* now, offset into code word */
+X
+X	/* Get any 8 bit parts in the middle (<=1 for up to 16 bits). */
+X	if (bits >= 8) {
+X		code |= *bp++ << r_off;
+X		r_off += 8;
+X		bits -= 8;
+X	}
+X	/* high order bits. */
+X	code |= (*bp & rmask[bits]) << r_off;
+X	offset += n_bits;
+X
+X	return code;
+X}
+X
+X/*
+X * compress a file
+X *
+X * Algorithm:  use open addressing double hashing (no chaining) on the
+X * prefix code / next character combination.  We do a variant of Knuth's
+X * algorithm D (vol. 3, sec. 6.4) along with G. Knott's relatively-prime
+X * secondary probe.  Here, the modular division first probe is gives way
+X * to a faster exclusive-or manipulation.  Also do block compression with
+X * an adaptive reset, where the code table is cleared when the compression
+X * ratio decreases, but after the table fills.  The variable-length output
+X * codes are re-sized at this point, and a special CLEAR code is generated
+X * for the decompressor.
+X */
+X
+Xvoid
+Xsqinit_cm()			/* initialize for compression */
+X{
+X	offset = 0;
+X	bytes_out = 0;
+X	clear_flg = 0;
+X	ratio = 0;
+X	in_count = 1;
+X	checkpoint = CHECK_GAP;
+X	maxcode = MAXCODE(n_bits = INIT_BITS);
+X	free_ent = FIRST;
+X	setmem(htab, HSIZE * sizeof(long), 0xff);
+X	n_bits = INIT_BITS;	/* set starting code size */
+X
+X	firstcmp = 1;		/* next byte will be first */
+X}
+X
+Xvoid
+Xsqputc_cm(c, t)			/* compress a character */
+X	unsigned char   c;	/* character to compress */
+X	FILE           *t;	/* where to put it */
+X{
+X	static long     fcode;
+X	static int      hshift;
+X	int             i;
+X	int             disp;
+X
+X	if (firstcmp) {		/* special case for first byte */
+X		ent = c;	/* remember first byte */
+X
+X		hshift = 0;
+X		for (fcode = (long) HSIZE; fcode < 65536L; fcode *= 2L)
+X			hshift++;
+X		hshift = 8 - hshift;	/* set hash code range bund */
+X
+X		firstcmp = 0;	/* no longer first */
+X		return;
+X	}
+X	in_count++;
+X	fcode = (long) (((long) c << BITS) + ent);
+X	i = (c << hshift) ^ ent;/* xor hashing */
+X
+X	if (htab[i] == fcode) {
+X		ent = codetab[i];
+X		return;
+X	} else if (htab[i] < 0)	/* empty slot */
+X		goto nomatch;
+X	disp = HSIZE - i;	/* secondary hash (after G.Knott) */
+X	if (i == 0)
+X		disp = 1;
+X
+Xprobe:
+X	if ((i -= disp) < 0)
+X		i += HSIZE;
+X
+X	if (htab[i] == fcode) {
+X		ent = codetab[i];
+X		return;
+X	}
+X	if (htab[i] > 0)
+X		goto probe;
+X
+Xnomatch:
+X	putcode(ent, t);
+X	ent = c;
+X	if (free_ent < maxcodemax) {
+X		codetab[i] = free_ent++;	/* code -> hashtable */
+X		htab[i] = fcode;
+X	} else if ((long) in_count >= checkpoint)
+X		cl_block(t);
+X}
+X
+Xlong 
+Xsqpred_cm(t)			/* finish compressing a file */
+X	FILE           *t;	/* where to put it */
+X{
+X	putcode(ent, t);	/* put out the final code */
+X	putcode(-1, t);		/* tell output we are done */
+X
+X	return bytes_out;	/* say how big it got */
+X}
+X
+X/*
+X * Decompress a file.  This routine adapts to the codes in the file
+X * building the string table on-the-fly; requiring no table to be stored
+X * in the compressed file.  The tables used herein are shared with those of
+X * the compress() routine.  See the definitions above.
+X */
+X
+Xvoid
+Xsqdecomp(f, t)			/* decompress a file */
+X	FILE           *f;	/* file to read codes from */
+X	FILE           *t;	/* file to write text to */
+X{
+X	unsigned char  *stackp;
+X	int             finchar;
+X	int             code, oldcode, incode;
+X
+X	n_bits = INIT_BITS;	/* set starting code size */
+X	clear_flg = 0;
+X
+X	/*
+X	 * As above, initialize the first 256 entries in the table. 
+X	 */
+X	maxcode = MAXCODE(n_bits = INIT_BITS);
+X	for (code = 255; code >= 0; code--) {
+X		prefix[code] = 0;
+X		suffix[code] = (unsigned char) code;
+X	}
+X	free_ent = FIRST;
+X
+X	finchar = oldcode = getcode(f);
+X	if (oldcode == -1)	/* EOF already? */
+X		return;		/* Get out of here */
+X	putc_unp((char) finchar, t);	/* first code must be 8 bits=char */
+X	stackp = stack;
+X
+X	while ((code = getcode(f)) > -1) {
+X		if (code == CLEAR) {
+X			for (code = 255; code >= 0; code--)
+X				prefix[code] = 0;
+X			clear_flg = 1;
+X			free_ent = FIRST - 1;
+X			if ((code = getcode(f)) == -1)	/* O, untimely death! */
+X				break;
+X		}
+X		incode = code;
+X		/*
+X		 * Special case for KwKwK string. 
+X		 */
+X		if (code >= free_ent) {
+X			if (code > free_ent) {
+X				if (warn) {
+X					printf("Corrupted compressed file.\n");
+X					printf("Invalid code %d when max is %d.\n",
+X						code, free_ent);
+X				}
+X				nerrs++;
+X				return;
+X			}
+X			*stackp++ = finchar;
+X			code = oldcode;
+X		}
+X		/*
+X		 * Generate output characters in reverse order 
+X		 */
+X		while (code >= 256) {
+X			*stackp++ = suffix[code];
+X			code = prefix[code];
+X		}
+X		*stackp++ = finchar = suffix[code];
+X
+X		/*
+X		 * And put them out in forward order 
+X		 */
+X		do
+X			putc_unp(*--stackp, t);
+X		while (stackp > stack);
+X
+X		/*
+X		 * Generate the new entry. 
+X		 */
+X		if ((code = free_ent) < maxcodemax) {
+X			prefix[code] = (unsigned short) oldcode;
+X			suffix[code] = finchar;
+X			free_ent = code + 1;
+X		}
+X		/*
+X		 * Remember previous code. 
+X		 */
+X		oldcode = incode;
+X	}
+X}
+________This_Is_The_END________
+if test `wc -c < arcsqs.c` -ne    11514; then
+	echo 'shar: arcsqs.c was damaged during transit (should have been    11514 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcsvc.c'
+if test -f arcsvc.c; then echo 'shar: not overwriting arcsvc.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcsvc.c
+X/*
+X * $Header: arcsvc.c,v 1.8 88/06/13 00:42:59 hyc Locked $
+X */
+X
+X/*  ARC - Archive utility - ARCSVC
+X
+X    Version 2.23, created on 04/22/87 at 13:10:10
+X
+X(C) COPYRIGHT 1985-87 by System Enhancement Associates; ALL RIGHTS RESERVED
+X
+X    By:	 Thom Henderson
+X
+X    Description:
+X	 This file contains service routines needed to maintain an archive.
+X
+X    Language:
+X	 Computer Innovations Optimizing C86
+X*/
+X#include <stdio.h>
+X#include "arc.h"
+X#if	MTS
+X#include <mts.h>
+X#endif
+X
+Xvoid	abort(), setstamp();
+Xint	unlink();
+X
+Xvoid
+Xopenarc(chg)			/* open archive */
+X	int             chg;	/* true to open for changes */
+X{
+X	FILE           *fopen();/* file opener */
+X
+X	if (!(arc = fopen(arcname, "rb"))) {
+X		if (chg) {
+X			if (note)
+X				printf("Creating new archive: %s\n", arcname);
+X		}
+X		else
+X			abort("Archive not found: %s", arcname);
+X	}
+X#if	MTS	/* allow reading archives of max MTS record length */
+X	else {
+X		char *buffer, *malloc();
+X		int inlen;
+X		struct GDDSECT *region;
+X
+X		region=gdinfo(arc->_fd);
+X		inlen=region->GDINLEN;
+X		buffer=malloc(inlen);
+X		setbuf(arc, buffer);
+X		arc->_bufsiz=inlen;
+X	}
+X#endif
+X	if (chg) {		/* if opening for changes */
+X		if (!(new = fopen(newname, "wb")))
+X			abort("Cannot create archive copy: %s", newname);
+X
+X	changing = chg;		/* note if open for changes */
+X	}
+X}
+X
+Xvoid
+Xclosearc(chg)			/* close an archive */
+X	int             chg;	/* true if archive was changed */
+X{
+X	if (arc) {		/* if we had an initial archive */
+X		fclose(arc);
+X		if (kludge)	/* kludge to update timestamp */
+X#if	!MTS
+X			setstamp(arcname, olddate, oldtime);
+X#endif
+X	}
+X	if (chg) {		/* if things have changed */
+X		fclose(new);	/* close the new copy */
+X		if (arc) {	/* if we had an original archive */
+X			if (keepbak) {	/* if a backup is wanted */
+X				unlink(bakname);	/* erase any old copies */
+X				if (move(arcname, bakname))
+X					abort("Cannot rename %s to %s", arcname, bakname);
+X				printf("Keeping backup archive: %s\n", bakname);
+X			} else if (unlink(arcname))
+X				abort("Cannot delete old archive: %s", arcname);
+X		}
+X		if (move(newname, arcname))
+X			abort("Cannot move %s to %s", newname, arcname);
+X#if	!MTS
+X		setstamp(arcname, arcdate, arctime);
+X#endif
+X	}
+X}
+X
+X/*
+X * CRC computation logic
+X * 
+X * The logic for this method of calculating the CRC 16 bit polynomial is taken
+X * from an article by David Schwaderer in the April 1985 issue of PC Tech
+X * Journal.
+X */
+X
+Xstatic short      crctab[] =	/* CRC lookup table */
+X{
+X 0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
+X 0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+X 0xCC01, 0x0CC0, 0x0D80, 0xCD41, 0x0F00, 0xCFC1, 0xCE81, 0x0E40,
+X 0x0A00, 0xCAC1, 0xCB81, 0x0B40, 0xC901, 0x09C0, 0x0880, 0xC841,
+X 0xD801, 0x18C0, 0x1980, 0xD941, 0x1B00, 0xDBC1, 0xDA81, 0x1A40,
+X 0x1E00, 0xDEC1, 0xDF81, 0x1F40, 0xDD01, 0x1DC0, 0x1C80, 0xDC41,
+X 0x1400, 0xD4C1, 0xD581, 0x1540, 0xD701, 0x17C0, 0x1680, 0xD641,
+X 0xD201, 0x12C0, 0x1380, 0xD341, 0x1100, 0xD1C1, 0xD081, 0x1040,
+X 0xF001, 0x30C0, 0x3180, 0xF141, 0x3300, 0xF3C1, 0xF281, 0x3240,
+X 0x3600, 0xF6C1, 0xF781, 0x3740, 0xF501, 0x35C0, 0x3480, 0xF441,
+X 0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
+X 0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
+X 0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
+X 0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+X 0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
+X 0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
+X 0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
+X 0x6600, 0xA6C1, 0xA781, 0x6740, 0xA501, 0x65C0, 0x6480, 0xA441,
+X 0x6C00, 0xACC1, 0xAD81, 0x6D40, 0xAF01, 0x6FC0, 0x6E80, 0xAE41,
+X 0xAA01, 0x6AC0, 0x6B80, 0xAB41, 0x6900, 0xA9C1, 0xA881, 0x6840,
+X 0x7800, 0xB8C1, 0xB981, 0x7940, 0xBB01, 0x7BC0, 0x7A80, 0xBA41,
+X 0xBE01, 0x7EC0, 0x7F80, 0xBF41, 0x7D00, 0xBDC1, 0xBC81, 0x7C40,
+X 0xB401, 0x74C0, 0x7580, 0xB541, 0x7700, 0xB7C1, 0xB681, 0x7640,
+X 0x7200, 0xB2C1, 0xB381, 0x7340, 0xB101, 0x71C0, 0x7080, 0xB041,
+X 0x5000, 0x90C1, 0x9181, 0x5140, 0x9301, 0x53C0, 0x5280, 0x9241,
+X 0x9601, 0x56C0, 0x5780, 0x9741, 0x5500, 0x95C1, 0x9481, 0x5440,
+X 0x9C01, 0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40,
+X 0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841,
+X 0x8801, 0x48C0, 0x4980, 0x8941, 0x4B00, 0x8BC1, 0x8A81, 0x4A40,
+X 0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41,
+X 0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680, 0x8641,
+X 0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040
+X};
+X
+Xint
+Xaddcrc(crc, c)			/* update a CRC check */
+X	int             crc;	/* running CRC value */
+X	unsigned char   c;	/* character to add */
+X{
+X	return ((crc >> 8) & 0x00ff) ^ crctab[(crc ^ c) & 0x00ff];
+X}
+________This_Is_The_END________
+if test `wc -c < arcsvc.c` -ne     4680; then
+	echo 'shar: arcsvc.c was damaged during transit (should have been     4680 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arctst.c'
+if test -f arctst.c; then echo 'shar: not overwriting arctst.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arctst.c
+X/*
+X * $Header: arctst.c,v 1.4 88/04/19 01:40:28 hyc Exp $
+X */
+X
+X/*
+X * ARC - Archive utility - ARCTST
+X * 
+X * Version 2.12, created on 02/03/86 at 23:00:40
+X * 
+X * (C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+X * 
+X * By:  Thom Henderson
+X * 
+X * Description: This file contains the routines used to test archive integrity.
+X * 
+X * Language: Computer Innovations Optimizing C86
+X */
+X#include <stdio.h>
+X#include "arc.h"
+X
+Xvoid	openarc();
+Xint	readhdr(), unpack();
+X
+Xvoid
+Xtstarc()
+X{				/* test integrity of an archive */
+X	struct heads    hdr;	/* file header */
+X	long            arcsize, ftell();	/* archive size */
+X
+X	openarc(0);		/* open archive for reading */
+X	fseek(arc, 0L, 2);	/* move to end of archive */
+X	arcsize = ftell(arc);	/* see how big it is */
+X	fseek(arc, 0L, 0);	/* return to top of archive */
+X
+X	while (readhdr(&hdr, arc)) {
+X		if (ftell(arc) + hdr.size > arcsize) {
+X			printf("Archive truncated in file %s\n", hdr.name);
+X			nerrs++;
+X			break;
+X		} else {
+X			printf("Testing file: %-12s  ", hdr.name);
+X			fflush(stdout);
+X			if (unpack(arc, NULL, &hdr))
+X				nerrs++;
+X			else
+X				printf("okay\n");
+X		}
+X	}
+X
+X	if (nerrs < 1)
+X		printf("No errors detected\n");
+X	else if (nerrs == 1)
+X		printf("One error detected\n");
+X	else
+X		printf("%d errors detected\n", nerrs);
+X}
+________This_Is_The_END________
+if test `wc -c < arctst.c` -ne     1284; then
+	echo 'shar: arctst.c was damaged during transit (should have been     1284 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcunp.c'
+if test -f arcunp.c; then echo 'shar: not overwriting arcunp.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcunp.c
+X/*
+X * $Header: arcunp.c,v 1.7 88/06/18 03:12:36 hyc Locked $
+X */
+X
+X/*
+X * ARC - Archive utility - ARCUNP
+X * 
+X * Version 3.17, created on 02/13/86 at 10:20:08
+X * 
+X * (C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+X * 
+X * By:  Thom Henderson
+X * 
+X * Description: This file contains the routines used to expand a file when
+X * taking it out of an archive.
+X * 
+X * Language: Computer Innovations Optimizing C86
+X */
+X#include <stdio.h>
+X#include "arc.h"
+X#if	MTS
+X#include <ctype.h>
+X#endif
+X
+Xvoid	setcode(), init_usq(), init_ucr(), decomp(), sqdecomp();
+Xvoid	abort(), putc_tst();
+Xint	getc_usq(), getc_ucr(), addcrc();
+X
+X/* stuff for repeat unpacking */
+X
+X#define DLE 0x90		/* repeat byte flag */
+X
+Xstatic int      state;		/* repeat unpacking state */
+X
+X/* repeat unpacking states */
+X
+X#define NOHIST 0		/* no relevant history */
+X#define INREP 1			/* sending a repeated value */
+X
+Xstatic short    crcval;		/* CRC check value */
+Xstatic long     size;		/* bytes to read */
+X#if	!DOS
+Xstatic int	gotcr;		/* got a carriage return? */
+X#endif
+X
+Xint
+Xunpack(f, t, hdr)		/* unpack an archive entry */
+X	FILE           *f, *t;	/* source, destination */
+X	struct heads   *hdr;	/* pointer to file header data */
+X{
+X	int             c;	/* one char of stream */
+X	void            putc_unp();
+X	void            putc_ncr();
+X	int             getc_unp();
+X
+X	/* setups common to all methods */
+X#if	!DOS
+X	gotcr = 0;
+X#endif
+X	crcval = 0;		/* reset CRC check value */
+X	size = hdr->size;	/* set input byte counter */
+X	state = NOHIST;		/* initial repeat unpacking state */
+X	setcode();		/* set up for decoding */
+X
+X	/* use whatever method is appropriate */
+X
+X	switch (hdrver) {	/* choose proper unpack method */
+X	case 1:		/* standard packing */
+X	case 2:
+X		while ((c = getc_unp(f)) != EOF)
+X			putc_unp((char) c, t);
+X		break;
+X
+X	case 3:		/* non-repeat packing */
+X		while ((c = getc_unp(f)) != EOF)
+X			putc_ncr((unsigned char) c, t);
+X		break;
+X
+X	case 4:		/* Huffman squeezing */
+X		init_usq(f);
+X		while ((c = getc_usq(f)) != EOF)
+X			putc_ncr((unsigned char) c, t);
+X		break;
+X
+X	case 5:		/* Lempel-Zev compression */
+X		init_ucr(0);
+X		while ((c = getc_ucr(f)) != EOF)
+X			putc_unp((char) c, t);
+X		break;
+X
+X	case 6:		/* Lempel-Zev plus non-repeat */
+X		init_ucr(0);
+X		while ((c = getc_ucr(f)) != EOF)
+X			putc_ncr((unsigned char) c, t);
+X		break;
+X
+X	case 7:		/* L-Z plus ncr with new hash */
+X		init_ucr(1);
+X		while ((c = getc_ucr(f)) != EOF)
+X			putc_ncr((unsigned char) c, t);
+X		break;
+X
+X	case 8:		/* dynamic Lempel-Zev */
+X		decomp(f, t);
+X		break;
+X
+X	case 9:		/* Squashing */
+X		sqdecomp(f, t);
+X		break;
+X
+X	default:		/* unknown method */
+X		if (warn) {
+X			printf("I don't know how to unpack file %s\n", hdr->name);
+X			printf("I think you need a newer version of ARC\n");
+X			nerrs++;
+X		}
+X		fseek(f, hdr->size, 1);	/* skip over bad file */
+X		return 1;	/* note defective file */
+X	}
+X
+X	/* cleanups common to all methods */
+X
+X	if (crcval != hdr->crc) {
+X		if (warn || kludge) {
+X			printf("WARNING: File %s fails CRC check\n", hdr->name);
+X			nerrs++;
+X		}
+X		return 1;	/* note defective file */
+X	}
+X	return 0;		/* file is okay */
+X}
+X
+X/*
+X * This routine is used to put bytes in the output file.  It also performs
+X * various housekeeping functions, such as maintaining the CRC check value.
+X */
+X
+Xvoid
+Xputc_unp(c, t)			/* output an unpacked byte */
+X	char            c;	/* byte to output */
+X	FILE           *t;	/* file to output to */
+X{
+X	crcval = addcrc(crcval, c);	/* update the CRC check value */
+X#if	MTS
+X	if (!image)
+X		atoe(&c, 1);
+X#endif
+X#if	DOS
+X	putc_tst(c, t);
+X#else
+X	if (image)
+X		putc_tst(c, t);
+X	else {
+X		if (gotcr) {
+X			gotcr = 0;
+X			if (c != '\n')
+X				putc_tst('\r', t);
+X		}
+X		if (c == '\r')
+X			gotcr = 1;
+X		else
+X			putc_tst(c, t);
+X	}
+X#endif
+X}
+X
+X/*
+X * This routine is used to decode non-repeat compression.  Bytes are passed
+X * one at a time in coded format, and are written out uncoded. The data is
+X * stored normally, except that runs of more than two characters are
+X * represented as:
+X * 
+X * <char> <DLE> <count>
+X * 
+X * With a special case that a count of zero indicates a DLE as data, not as a
+X * repeat marker.
+X */
+X
+Xvoid
+Xputc_ncr(c, t)			/* put NCR coded bytes */
+X	unsigned char   c;	/* next byte of stream */
+X	FILE           *t;	/* file to receive data */
+X{
+X	static int      lastc;	/* last character seen */
+X
+X	switch (state) {	/* action depends on our state */
+X	case NOHIST:		/* no previous history */
+X		if (c == DLE)	/* if starting a series */
+X			state = INREP;	/* then remember it next time */
+X		else
+X			putc_unp(lastc = c, t);	/* else nothing unusual */
+X		return;
+X
+X	case INREP:		/* in a repeat */
+X		if (c)		/* if count is nonzero */
+X			while (--c)	/* then repeatedly ... */
+X				putc_unp(lastc, t);	/* ... output the byte */
+X		else
+X			putc_unp(DLE, t);	/* else output DLE as data */
+X		state = NOHIST;	/* back to no history */
+X		return;
+X
+X	default:
+X		abort("Bad NCR unpacking state (%d)", state);
+X	}
+X}
+X
+X/*
+X * This routine provides low-level byte input from an archive.  This routine
+X * MUST be used, as end-of-file is simulated at the end of the archive entry.
+X */
+X
+Xint
+Xgetc_unp(f)			/* get a byte from an archive */
+X	FILE           *f;	/* archive file to read */
+X{
+X	register int    xx;
+X	unsigned char		code();
+X
+X	if (!size)		/* if no data left */
+X		return EOF;	/* then pretend end of file */
+X
+X	size--;			/* deduct from input counter */
+X	xx = getc(f);
+X	return code(xx);	/* and return next decoded byte */
+X}
+________This_Is_The_END________
+if test `wc -c < arcunp.c` -ne     5347; then
+	echo 'shar: arcunp.c was damaged during transit (should have been     5347 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcusq.c'
+if test -f arcusq.c; then echo 'shar: not overwriting arcusq.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcusq.c
+X/*
+X * $Header: arcusq.c,v 1.2 88/06/02 16:27:44 hyc Locked $
+X */
+X
+X/*
+X * ARC - Archive utility - ARCUSQ
+X * 
+X * Version 3.14, created on 07/25/86 at 13:04:19
+X * 
+X * (C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+X * 
+X * By:  Thom Henderson
+X * 
+X * Description: This file contains the routines used to expand a file which was
+X * packed using Huffman squeezing.
+X * 
+X * Most of this code is taken from an USQ program by Richard Greenlaw, which was
+X * adapted to CI-C86 by Robert J. Beilstein.
+X * 
+X * Language: Computer Innovations Optimizing C86
+X */
+X#include <stdio.h>
+X#include "arc.h"
+X
+Xvoid	abort();
+Xint	getc_unp();
+X
+X/* stuff for Huffman unsqueezing */
+X
+X#define ERROR (-1)
+X
+X#define SPEOF 256		/* special endfile token */
+X#define NUMVALS 257		/* 256 data values plus SPEOF */
+X
+Xextern	struct nd {		/* decoding tree */
+X	int	child[2];	/* left, right */
+X}               node[NUMVALS];	/* use large buffer */
+X
+Xstatic int      bpos;		/* last bit position read */
+Xstatic int      curin;		/* last byte value read */
+Xstatic int      numnodes;	/* number of nodes in decode tree */
+X
+Xstatic          short
+Xget_int(f)			/* get a 16bit integer */
+X	FILE           *f;	/* file to get it from */
+X{
+X	int	i,j;
+X	i = getc_unp(f);
+X	j = getc_unp(f) << 8;
+X	return (i | j) & 0xFFFF;
+X}
+X
+Xvoid
+Xinit_usq(f)			/* initialize Huffman unsqueezing */
+X	FILE           *f;	/* file containing squeezed data */
+X{
+X	int             i;	/* node index */
+X
+X	bpos = 99;		/* force initial read */
+X
+X	numnodes = get_int(f);
+X
+X	if (numnodes < 0 || numnodes >= NUMVALS)
+X		abort("File has an invalid decode tree");
+X
+X	/* initialize for possible empty tree (SPEOF only) */
+X
+X	node[0].child[0] = -(SPEOF + 1);
+X	node[0].child[1] = -(SPEOF + 1);
+X
+X	for (i = 0; i < numnodes; ++i) {	/* get decoding tree from
+X						 * file */
+X		node[i].child[0] = get_int(f);
+X		node[i].child[1] = get_int(f);
+X	}
+X}
+X
+Xint
+Xgetc_usq(f)			/* get byte from squeezed file */
+X	FILE           *f;	/* file containing squeezed data */
+X{
+X	int             i;	/* tree index */
+X
+X	/* follow bit stream in tree to a leaf */
+X
+X	for (i = 0; i >= 0;) {	/* work down(up?) from root */
+X		if (++bpos > 7) {
+X			if ((curin = getc_unp(f)) == ERROR)
+X				return (ERROR);
+X			bpos = 0;
+X
+X			/* move a level deeper in tree */
+X			i = node[i].child[1 & curin];
+X		} else
+X			i = node[i].child[1 & (curin >>= 1)];
+X	}
+X
+X	/* decode fake node index to original data value */
+X
+X	i = -(i + 1);
+X
+X	/* decode special endfile token to normal EOF */
+X
+X	i = (i == SPEOF) ? EOF : i;
+X	return i;
+X}
+________This_Is_The_END________
+if test `wc -c < arcusq.c` -ne     2484; then
+	echo 'shar: arcusq.c was damaged during transit (should have been     2484 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - dtime.c'
+if test -f dtime.c; then echo 'shar: not overwriting dtime.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > dtime.c
+X/* dtime.c - routines to do ``ARPA-style'' time structures
+X
+Xver  date   who remarks
+X--- ------- --- -------------------------------------------------------------
+X01B 15nov86 JP  Thouroughly hacked by Jef Poskanzer.
+X01A ??????? MTR Original version from the MH 6.5 distribution, courtesy
+X	          of Marshall Rose.
+X
+X*/
+X
+X
+X#include "tws.h"
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <time.h>
+X#ifdef  SYS5
+X#include <string.h>
+X#else SYS5
+X#include <strings.h>
+X#include <sys/timeb.h>
+X#endif SYS5
+X
+X#ifdef	SYS5
+Xextern int  daylight;
+Xextern long timezone;
+Xextern char *tzname[];
+X#endif	SYS5
+X
+X/*  */
+X
+X#define	abs(a) ( a >= 0 ? a : -a )
+X
+Xchar *tw_moty[] = {
+X    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+X    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", NULL };
+X
+Xchar *tw_dotw[] = {
+X    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", NULL };
+X
+Xchar *tw_ldotw[] = {
+X    "Sunday", "Monday", "Tuesday", "Wednesday",
+X    "Thursday", "Friday", "Saturday", NULL };
+X
+X/*  */
+X
+Xstatic struct zone
+X    {
+X    char *std;
+X    char *dst;
+X    int shift;
+X    }
+X    zones[] = {
+X	"GMT", "BST", 0,
+X	"EST", "EDT", -5,
+X	"CST", "CDT", -6,
+X	"MST", NULL, -7,
+X	"PST", "PDT", -8,
+X	"A", NULL, -1,
+X	"B", NULL, -2,
+X	"C", NULL, -3,
+X	"D", NULL, -4,
+X	"E", NULL, -5,
+X	"F", NULL, -6,
+X	"G", NULL, -7,
+X	"H", NULL, -8,
+X	"I", NULL, -9,
+X	"K", NULL, -10,
+X	"L", NULL, -11,
+X	"M", NULL, -12,
+X	"N", NULL, 1,
+X#ifndef	HUJI
+X	"O", NULL, 2,
+X#else	HUJI
+X	"JST", "JDT", 2,
+X#endif	HUJI
+X	"P", NULL, 3,
+X	"Q", NULL, 4,
+X	"R", NULL, 5,
+X	"S", NULL, 6,
+X	"T", NULL, 7,
+X	"U", NULL, 8,
+X	"V", NULL, 9,
+X	"W", NULL, 10,
+X	"X", NULL, 11,
+X	"Y", NULL, 12,
+X	NULL };
+X
+X#define CENTURY 19
+X
+Xlong time( );
+Xstruct tm *localtime( );
+X
+X/*  */
+X
+Xchar *dtimenow( )
+X    {
+X    long clock;
+X
+X    (void) time( &clock );
+X    return ( dtime( &clock ) );
+X    }
+X
+X
+Xchar *
+Xdctime( tw )
+Xstruct tws *tw;
+X    {
+X    static char buffer[25];
+X
+X    if ( tw == NULL )
+X	return ( NULL );
+X
+X    (void) sprintf( buffer, "%.3s %.3s %02d %02d:%02d:%02d %.4d\n",
+X	    tw_dotw[tw -> tw_wday], tw_moty[tw -> tw_mon], tw -> tw_mday,
+X	    tw -> tw_hour, tw -> tw_min, tw -> tw_sec,
+X	    tw -> tw_year >= 100 ? tw -> tw_year : 1900 + tw -> tw_year );
+X
+X    return ( buffer );
+X    }
+X
+X/*  */
+X
+Xstruct tws *
+Xdtwstime( )
+X    {
+X    long clock;
+X
+X    (void) time( &clock );
+X    return ( dlocaltime( &clock ) );
+X    }
+X
+X
+Xstruct tws *
+Xdlocaltime( clock )
+Xlong *clock;
+X    {
+X    register struct tm *tm;
+X#ifndef SYS5
+X    struct timeb tb;
+X#endif not SYS5
+X    static struct tws tw;
+X
+X    if ( clock == NULL )
+X	return ( NULL );
+X    tw.tw_flags = TW_NULL;
+X
+X    tm = localtime( clock );
+X    tw.tw_sec = tm -> tm_sec;
+X    tw.tw_min = tm -> tm_min;
+X    tw.tw_hour = tm -> tm_hour;
+X    tw.tw_mday = tm -> tm_mday;
+X    tw.tw_mon = tm -> tm_mon;
+X    tw.tw_year = tm -> tm_year;
+X    tw.tw_wday = tm -> tm_wday;
+X    tw.tw_yday = tm -> tm_yday;
+X    if ( tm -> tm_isdst )
+X	tw.tw_flags |= TW_DST;
+X#ifndef  SYS5
+X    ftime( &tb );
+X    tw.tw_zone = -tb.timezone;
+X#else   SYS5
+X    tzset( );
+X    tw.tw_zone = -(timezone / 60);
+X#endif  SYS5
+X    tw.tw_flags &= ~TW_SDAY;
+X    tw.tw_flags |= TW_SEXP;
+X    tw.tw_clock = *clock;
+X
+X    return ( &tw );
+X    }
+X
+X
+Xstruct tws *
+Xdgmtime( clock )
+Xlong *clock;
+X    {
+X    register struct tm *tm;
+X    static struct tws tw;
+X
+X    if ( clock == NULL )
+X	return ( NULL );
+X    tw.tw_flags = TW_NULL;
+X
+X    tm = gmtime( clock );
+X    tw.tw_sec = tm -> tm_sec;
+X    tw.tw_min = tm -> tm_min;
+X    tw.tw_hour = tm -> tm_hour;
+X    tw.tw_mday = tm -> tm_mday;
+X    tw.tw_mon = tm -> tm_mon;
+X    tw.tw_year = tm -> tm_year;
+X    tw.tw_wday = tm -> tm_wday;
+X    tw.tw_yday = tm -> tm_yday;
+X    if ( tm -> tm_isdst )
+X	tw.tw_flags |= TW_DST;
+X    tw.tw_zone = 0;
+X    tw.tw_flags &= ~TW_SDAY;
+X    tw.tw_flags |= TW_SEXP;
+X    tw.tw_clock = *clock;
+X
+X    return( &tw );
+X    }
+X
+X/*  */
+X
+Xchar *
+Xdasctime( tw, flags )
+Xstruct tws *tw;
+Xint flags;
+X    {
+X    static char buffer[80], result[80];
+X
+X    if ( tw == NULL )
+X	return ( NULL );
+X
+X    (void) sprintf( buffer, "%02d %s %02d %02d:%02d:%02d %s",
+X	    tw -> tw_mday, tw_moty[tw -> tw_mon], tw -> tw_year,
+X	    tw -> tw_hour, tw -> tw_min, tw -> tw_sec,
+X	    dtimezone( tw -> tw_zone, tw -> tw_flags | flags ) );
+X
+X    if ( (tw -> tw_flags & TW_SDAY) == TW_SEXP )
+X	(void) sprintf( result, "%s, %s", tw_dotw[tw -> tw_wday], buffer );
+X    else
+X	if ( (tw -> tw_flags & TW_SDAY) == TW_SNIL )
+X	    (void) strcpy( result, buffer );
+X	else
+X	    (void) sprintf( result, "%s (%s)", buffer, tw_dotw[tw -> tw_wday] );
+X
+X    return ( result );
+X    }
+X
+X/*  */
+X
+Xchar *
+Xdtimezone( offset, flags )
+Xint offset, flags;
+X    {
+X    register int hours, mins;
+X    register struct zone *z;
+X    static char buffer[10];
+X
+X    if ( offset < 0 )
+X	{
+X	mins = -((-offset) % 60);
+X	hours = -((-offset) / 60);
+X	}
+X    else
+X	{
+X	mins = offset % 60;
+X	hours = offset / 60;
+X	}
+X
+X    if ( !(flags & TW_ZONE) && mins == 0 )
+X	for ( z = zones; z -> std; z++ )
+X	    if ( z -> shift == hours )
+X		return ( z -> dst && (flags & TW_DST) ? z -> dst : z -> std );
+X
+X#ifdef	DSTXXX
+X    if ( flags & TW_DST )
+X	hours += 1;
+X#endif	DSTXXX
+X    (void) sprintf( buffer, "%s%02d%02d",
+X	    offset < 0 ? "-" : "+", abs( hours ), abs( mins ) );
+X    return ( buffer );
+X    }
+X
+X/*  */
+X
+Xvoid
+Xtwscopy( tb, tw )
+Xstruct tws *tb, *tw;
+X    {
+X#ifdef	notdef
+X    tb -> tw_sec = tw -> tw_sec;
+X    tb -> tw_min = tw -> tw_min;
+X    tb -> tw_hour = tw -> tw_hour;
+X    tb -> tw_mday = tw -> tw_mday;
+X    tb -> tw_mon = tw -> tw_mon;
+X    tb -> tw_year = tw -> tw_year;
+X    tb -> tw_wday = tw -> tw_wday;
+X    tb -> tw_yday = tw -> tw_yday;
+X    tb -> tw_zone = tw -> tw_zone;
+X    tb -> tw_clock = tw -> tw_clock;
+X    tb -> tw_flags = tw -> tw_flags;
+X#else	not notdef
+X    *tb = *tw;
+X#endif	not notdef
+X    }
+X
+X
+Xint
+Xtwsort( tw1, tw2 )
+Xstruct tws *tw1, *tw2;
+X    {
+X    register long c1, c2;
+X
+X    (void) twclock( tw1 );
+X    (void) twclock( tw2 );
+X
+X    return ( (c1 = tw1 -> tw_clock) > (c2 = tw2 -> tw_clock) ? 1
+X	    : c1 == c2 ? 0 : -1 );
+X    }
+X
+X/*  */
+X
+X
+X/* Julian day number of the Unix* clock's origin, 01 Jan 1970. */
+X#define JD1970 2440587L
+X
+X
+Xlong
+Xtwjuliandate( tw )
+Xstruct tws *tw;
+X    {
+X    register int mday, mon, year;
+X    register long a, b;
+X    double jd;
+X
+X    if ( (mday = tw -> tw_mday) < 1 || mday > 31 ||
+X	    (mon = tw -> tw_mon + 1) < 1 || mon > 12 ||
+X	    (year = tw -> tw_year) < 1 || year > 10000 )
+X	return ( -1L );
+X    if ( year < 100 )
+X	year += CENTURY * 100;
+X
+X    if ( mon == 1 || mon == 2 )
+X	{
+X	--year;
+X	mon += 12;
+X	}
+X    if ( year < 1583 )
+X	return ( -1L );
+X    a = year / 100;
+X    b = 2 - a + a / 4;
+X    b += (long) ( (double) year * 365.25 );
+X    b += (long) ( 30.6001 * ( (double) mon + 1.0 ) );
+X    jd = mday + b + 1720994.5;
+X    return ( (long) jd );
+X    }
+X
+X
+Xlong
+Xtwsubdayclock( tw )
+Xstruct tws *tw;
+X    {
+X    register int sec, min, hour;
+X    register long result;
+X
+X    if ( (sec = tw -> tw_sec) < 0 || sec > 59 ||
+X	    (min = tw -> tw_min) < 0 || min > 59 ||
+X	    (hour = tw -> tw_hour) < 0 || hour > 23 )
+X	return ( -1L );
+X
+X    result = ( hour * 60 + min ) * 60 + sec;
+X    result -= 60 * tw -> tw_zone;
+X    if ( tw -> tw_flags & TW_DST )
+X	result -= 60 * 60;
+X
+X    return ( result );
+X    }
+X
+X
+Xlong
+Xtwclock( tw )
+Xstruct tws *tw;
+X    {
+X    register long jd, sdc, result;
+X
+X    if ( tw -> tw_clock != 0L )
+X	return ( tw -> tw_clock );
+X
+X    if ( ( jd = twjuliandate( tw ) ) == -1L )
+X	return ( tw -> tw_clock = -1L );
+X    if ( ( sdc = twsubdayclock( tw ) ) == -1L )
+X	return ( tw -> tw_clock = -1L );
+X
+X    result = ( jd - JD1970 ) * 24 * 60 * 60 + sdc;
+X
+X    return ( tw -> tw_clock = result );
+X    }
+X
+X/*  */
+X
+X/*** twsubtract - subtract tw2 from tw1, returning result in seconds
+X
+XThe point of this routine is that using twclock( tw1 ) - twclock( tw2 )
+Xwould limit you to dates after the Unix* Epoch ( 01 January 1970 ).  This
+Xroutine avoids that limit.  However, because the result is represented
+Xby 32 bits, it is still limited to a span of two billion seconds, which is
+Xabout 66 years.
+X
+X*/
+X
+Xlong
+Xtwsubtract( tw1, tw2 )
+Xstruct tws *tw1, *tw2;
+X    {
+X    register long jd1, jd2, sdc1, sdc2, result;
+X
+X    if ( ( jd1 = twjuliandate( tw1 ) ) == -1L )
+X	return ( 0L );
+X    if ( ( sdc1 = twsubdayclock( tw1 ) ) == -1L )
+X	return ( 0L );
+X
+X    if ( ( jd2 = twjuliandate( tw2 ) ) == -1L )
+X	return ( 0L );
+X    if ( ( sdc2 = twsubdayclock( tw2 ) ) == -1L )
+X	return ( 0L );
+X    
+X    result = ( jd1 - jd2 ) * 24 * 60 * 60 + ( sdc1 - sdc2 );
+X
+X    return ( result );
+X    }
+X
+X/*  */
+X
+X/*
+X *    Simple calculation of day of the week.  Algorithm used is Zeller's
+X *    congruence.  Currently, we assume if tw -> tw_year < 100
+X *    then the century is CENTURY.
+X */
+X
+Xset_dotw( tw )
+Xstruct tws *tw;
+X    {
+X    register int month, day, year, century;
+X
+X    month = tw -> tw_mon - 1;
+X    day = tw -> tw_mday;
+X    year = tw -> tw_year % 100;
+X    century = tw -> tw_year >= 100 ? tw -> tw_year / 100 : CENTURY;
+X
+X    if ( month <= 0 )
+X	{
+X	month += 12;
+X	if ( --year < 0 )
+X	    {
+X	    year += 100;
+X	    century--;
+X	    }
+X	}
+X
+X    tw -> tw_wday =
+X	((26 * month - 2) / 10 + day + year + year / 4
+X	    - 3 * century / 4 + 1) % 7;
+X
+X    tw -> tw_flags &= ~TW_SDAY;
+X    tw -> tw_flags |= TW_SIMP;
+X    }
+X
+X
+X/* * Unix is a virus from outer space. */
+________This_Is_The_END________
+if test `wc -c < dtime.c` -ne     9032; then
+	echo 'shar: dtime.c was damaged during transit (should have been     9032 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - dtimep.lex'
+if test -f dtimep.lex; then echo 'shar: not overwriting dtimep.lex'; else
+sed 's/^X//' << '________This_Is_The_END________' > dtimep.lex
+X%e 2000
+X%p 5000
+X%n 1000
+X%a 4000
+X%START	Z
+Xsun	(sun(day)?)
+Xmon	(mon(day)?)
+Xtue	(tue(sday)?)
+Xwed	(wed(nesday)?)
+Xthu	(thu(rsday)?)
+Xfri	(fri(day)?)
+Xsat	(sat(urday)?)
+X
+XDAY	({sun}|{mon}|{tue}|{wed}|{thu}|{fri}|{sat})
+X
+Xjan	(jan(uary)?)
+Xfeb	(feb(ruary)?)
+Xmar	(mar(ch)?)
+Xapr	(apr(il)?)
+Xmay	(may)
+Xjun	(jun(e)?)
+Xjul	(jul(y)?)
+Xaug	(aug(ust)?)
+Xsep	(sep(tember)?)
+Xoct	(oct(ober)?)
+Xnov	(nov(ember)?)
+Xdec	(dec(ember)?)
+X
+XMONTH	({jan}|{feb}|{mar}|{apr}|{may}|{jun}|{jul}|{aug}|{sep}|{oct}|{nov}|{dec})
+X
+Xw	([ \t]*)
+XW	([ \t]+)
+XD	([0-9]?[0-9])
+Xd	[0-9]
+X%{
+X/* dtimep.lex - routines to do ``ARPA-style'' time parsing
+X
+Xver  date   who remarks
+X--- ------- --- -------------------------------------------------------------
+X01B 15nov86 JP  Thouroughly hacked by Jef Poskanzer.
+X01A ??????? MTR Original version from the MH 6.5 distribution, courtesy
+X	          of Marshall Rose.
+X
+X*/
+X
+X#include "tws.h"
+X#include <ctype.h>
+X#include <sys/types.h>
+X#include <time.h>
+X#ifdef SYS5
+X#include <string.h>
+X#else SYS5
+X#include <strings.h>
+X#include <sys/timeb.h>
+X#endif SYS5
+X
+X#ifdef SYS5
+Xextern int  daylight;
+Xextern long timezone;
+Xextern char *tzname[];
+X#endif SYS5
+X
+X/*
+X * Table to convert month names to numeric month.  We use the
+X * fact that the low order 5 bits of the sum of the 2nd & 3rd
+X * characters of the name is a hash with no collisions for the 12
+X * valid month names.  (The mask to 5 bits maps any combination of
+X * upper and lower case into the same hash value).
+X */
+Xstatic int month_map[] = {
+X	0,
+X	6,	/* 1 - Jul */
+X	3,	/* 2 - Apr */
+X	5,	/* 3 - Jun */
+X	0,
+X	10,	/* 5 - Nov */
+X	0,
+X	1,	/* 7 - Feb */
+X	11,	/* 8 - Dec */
+X	0,
+X	0,
+X	0,
+X	0,
+X	0,
+X	0,
+X	0,	/*15 - Jan */
+X	0,
+X	0,
+X	0,
+X	2,	/*19 - Mar */
+X	0,
+X	8,	/*21 - Sep */
+X	0,
+X	9,	/*23 - Oct */
+X	0,
+X	0,
+X	4,	/*26 - May */
+X	0,
+X	7 };	/*28 - Aug */
+X/*
+X * Same trick for day-of-week using the hash function
+X *  (c1 & 7) + (c2 & 4)
+X */
+Xstatic int day_map[] = {
+X	0,
+X	0,
+X	0,
+X	6,	/* 3 - Sat */
+X	4,	/* 4 - Thu */
+X	0,
+X	5,	/* 6 - Fri */
+X	0,	/* 7 - Sun */
+X	2,	/* 8 - Tue */
+X	1	/* 9 - Mon */,
+X	0,
+X	3 };	/*11 - Wed */
+X#define SETDAY tw.tw_wday= day_map[(cp[0] & 7) + (cp[1] & 4)];\
+X		tw.tw_flags |= TW_SEXP;\
+X		cp += 2;
+X#define SETMONTH tw.tw_mon = month_map[(cp[0] + cp[1]) & 0x1f]; gotdate++;\
+X		 cp += 2;\
+X		 SKIPD;
+X#define CVT1OR2 (i=(*cp++ - '0'), isdigit(*cp)? i*10 + (*cp++ - '0') : i)
+X#define CVT2 ( (*cp++ - '0')*10 + (*cp++ - '0') )
+X#define CVT3 ( ( (*cp++ - '0')*10 + (*cp++ - '0') )*10 + (*cp++ - '0') )
+X#define CVT4 ( ( ( (*cp++ - '0')*10 + (*cp++ - '0') )*10 + (*cp++ - '0') )*10 + (*cp++ - '0') )
+X#define SKIPD while ( ! isdigit( *cp++ ) ) ; --cp;
+X#define ZONE(x) tw.tw_zone=(x);
+X#define ZONED(x) tw.tw_zone=(x); tw.tw_flags |= TW_DST;
+X#define LC(c) (isupper( c ) ? tolower( c ) : ( c ))
+X%}
+X%%
+X%{
+Xstruct tws *
+Xdparsetime( str )
+Xchar *str;
+X    {
+X    register int i;
+X    static struct tws tw;
+X    register char *cp;
+X    register int gotdate = 0;
+X#ifndef SYS5
+X    struct timeb	tb;
+X#endif not SYS5
+X    long clock;
+X
+X    start_cond = 0;
+X
+X    /* Zero out the struct. */
+X    bzero( (char *) &tw, sizeof tw );
+X
+X    /* Set default time zone. */
+X#ifndef SYS5
+X    ftime( &tb );
+X    tw.tw_zone = -tb.timezone;
+X#else SYS5
+X    tzset( );
+X    tw.tw_zone = -(timezone / 60);
+X#endif SYS5
+X
+X    for ( ; ; )
+X	switch ( cp = str, lex_string( &str, start_cond ) )
+X	    {
+X	    case -1:
+X		if ( ! gotdate )
+X			return ( NULL );
+X		tw.tw_flags |= TW_JUNK;
+X		/* fall through */
+X	    case 0:
+X		if ( tw.tw_year == 0 )
+X		    {
+X		    /* Set default year. */
+X		    time( &clock );
+X		    tw.tw_year = localtime( &clock ) -> tm_year;
+X		    }
+X		return ( &tw );
+X
+X%}
+X{DAY}","?{w}				SETDAY;
+X"("{DAY}")"(","?)			cp++, SETDAY;
+X
+X{D}(("-"{D}"-")|("/"{D}"/")){D}?{d}{d}{w}	{
+X#ifdef EUROPE
+X					tw.tw_mday = CVT1OR2; cp++;
+X					tw.tw_mon  = CVT1OR2 - 1; cp++;
+X#else EUROPE
+X					tw.tw_mon = CVT1OR2 - 1; cp++;
+X					tw.tw_mday  = CVT1OR2; cp++;
+X#endif EUROPE
+X					for ( i = 0; isdigit( *cp ); )
+X						i = i * 10 + (*cp++ - '0');
+X					tw.tw_year = i;
+X					gotdate++;
+X					}
+X{D}("/"|"-"){D}{w}			{
+X#ifdef EUROPE
+X					tw.tw_mday = CVT1OR2; cp++;
+X					tw.tw_mon  = CVT1OR2 - 1;
+X#else EUROPE
+X					tw.tw_mon = CVT1OR2 - 1; cp++;
+X					tw.tw_mday  = CVT1OR2;
+X#endif EUROPE
+X					gotdate++;
+X					}
+X{D}(("-"{MONTH}"-")|(" "{MONTH}" ")|({MONTH})){D}?{d}{d}({W}at)?{w}	{
+X					tw.tw_mday = CVT1OR2;
+X					while ( ! isalpha( *cp++ ) )
+X						;
+X					SETMONTH;
+X					for ( i = 0; isdigit( *cp ); )
+X						i = i * 10 + (*cp++ - '0');
+X					tw.tw_year = i;
+X					gotdate++;
+X					}
+X{D}"-"?{MONTH}({W}at)?{w}		{
+X					tw.tw_mday = CVT1OR2;
+X					while ( ! isalpha( *cp++ ) )
+X						;
+X					SETMONTH;
+X					gotdate++;
+X					}
+X{MONTH}{W}{D}","{W}{D}?{d}{d}{w}	{
+X					cp++;
+X					SETMONTH;
+X					tw.tw_mday = CVT1OR2;
+X					SKIPD;
+X					for ( i = 0; isdigit( *cp ); )
+X						i = i * 10 + (*cp++ - '0');
+X					tw.tw_year = i;
+X					gotdate++;
+X					}
+X{MONTH}{W}{D}{w}			{
+X					cp++;
+X					SETMONTH;
+X					tw.tw_mday = CVT1OR2;
+X					gotdate++;
+X					}
+X
+X{D}:{D}:{D}({w}am)?{w}			{
+X					tw.tw_hour = CVT1OR2; cp++;
+X					tw.tw_min  = CVT1OR2; cp++;
+X					tw.tw_sec  = CVT1OR2;
+X					BEGIN Z;
+X					}
+X{D}:{D}:{D}{w}pm{w}			{
+X					tw.tw_hour = CVT1OR2 + 12; cp++;
+X					tw.tw_min  = CVT1OR2; cp++;
+X					tw.tw_sec  = CVT1OR2;
+X					BEGIN Z;
+X					}
+X{D}:{D}({w}am)?{w}			{
+X					tw.tw_hour = CVT1OR2; cp++;
+X					tw.tw_min  = CVT1OR2;
+X					BEGIN Z;
+X					}
+X{D}:{D}{w}pm{w}				{
+X					tw.tw_hour = CVT1OR2 + 12; cp++;
+X					tw.tw_min  = CVT1OR2;
+X					BEGIN Z;
+X					}
+X[0-2]{d}{d}{d}{d}{d}{w}			{
+X					tw.tw_hour = CVT1OR2;
+X					tw.tw_min  = CVT1OR2;
+X					tw.tw_sec  = CVT1OR2;
+X					BEGIN Z;
+X					}
+X[0-2]{d}{d}{d}{w}			{
+X					tw.tw_hour = CVT1OR2;
+X					tw.tw_min  = CVT1OR2;
+X					BEGIN Z;
+X					}
+X<Z>"-"?ut				ZONE(0 * 60);
+X<Z>"-"?gmt				ZONE(0 * 60);
+X<Z>"-"?jst				ZONE(2 * 60);
+X<Z>"-"?jdt				ZONED(2 * 60);
+X<Z>"-"?est				ZONE(-5 * 60);
+X<Z>"-"?edt				ZONED(-5 * 60);
+X<Z>"-"?cst				ZONE(-6 * 60);
+X<Z>"-"?cdt				ZONED(-6 * 60);
+X<Z>"-"?mst				ZONE(-7 * 60);
+X<Z>"-"?mdt				ZONED(-7 * 60);
+X<Z>"-"?pst				ZONE(-8 * 60);
+X<Z>"-"?pdt				ZONED(-8 * 60);
+X<Z>"-"?nst				ZONE(-(3 * 60 + 30));
+X<Z>"-"?ast				ZONE(-4 * 60);
+X<Z>"-"?adt				ZONED(-4 * 60);
+X<Z>"-"?yst				ZONE(-9 * 60);
+X<Z>"-"?ydt				ZONED(-9 * 60);
+X<Z>"-"?hst				ZONE(-10 * 60);
+X<Z>"-"?hdt				ZONED(-10 * 60);
+X<Z>"-"?bst				ZONED(-1 * 60);
+X<Z>[a-i]				tw.tw_zone = 60 * (('a'-1) - LC (*cp));
+X<Z>[k-m]				tw.tw_zone = 60 * ('a' - LC (*cp));
+X<Z>[n-y]				tw.tw_zone = 60 * (LC (*cp) - 'm');
+X<Z>"+"[0-1]{d}{d}{d}			{
+X					cp++;
+X					tw.tw_zone = ((cp[0] * 10 + cp[1])
+X						     -('0' * 10   + '0'))*60
+X						    +((cp[2] * 10 + cp[3])
+X						     -('0' * 10   + '0'));
+X#ifdef DSTXXX
+X					zonehack (&tw);
+X#endif DSTXXX
+X					cp += 4;
+X					}
+X<Z>"-"[0-1]{d}{d}{d}			{
+X					cp++;
+X					tw.tw_zone = (('0' * 10   + '0')
+X						     -(cp[0] * 10 + cp[1]))*60
+X						    +(('0' * 10   + '0')
+X						     -(cp[2] * 10 + cp[3]));
+X#ifdef DSTXXX
+X					zonehack (&tw);
+X#endif DSTXXX
+X					cp += 4;
+X					}
+X
+X<Z>{W}{d}{d}{d}{d}			{
+X					SKIPD;
+X					tw.tw_year = CVT4;
+X					}
+X\n	|
+X{W}	;
+X%%
+X
+X#ifdef DSTXXX
+Xstatic
+Xzonehack( tw )
+Xregister struct tws *tw;
+X    {
+X    register struct tm *tm;
+X
+X    if ( twclock( tw ) == -1L )
+X	return;
+X
+X    tm = localtime( &tw -> tw_clock );
+X    if ( tm -> tm_isdst )
+X	{
+X	tw -> tw_flags |= TW_DST;
+X	tw -> tw_zone -= 60;
+X	}
+X    }
+X#endif DSTXXX
+X
+X
+X#ifdef SYS5
+X/* Not all SYS5's have bzero( ). */
+X
+Xbzero( b, length )
+Xchar *b;
+Xint length;
+X    {
+X    while ( length-- > 0 )
+X	*b++ = 0;
+X    }
+X#endif
+________This_Is_The_END________
+if test `wc -c < dtimep.lex` -ne     7327; then
+	echo 'shar: dtimep.lex was damaged during transit (should have been     7327 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - lexedit.sed'
+if test -f lexedit.sed; then echo 'shar: not overwriting lexedit.sed'; else
+sed 's/^X//' << '________This_Is_The_END________' > lexedit.sed
+X2,/^extern int yylineno;$/c\
+Xstatic int start_cond = 0;\
+X#define BEGIN start_cond =
+X/^struct yysvf \*yyestate;$/,/^extern struct yysvf yysvec/d
+X/^# define YYNEWLINE /,/^int nstr;/d
+X/^while((nstr = yylook()/,/^if(yywrap()) /d
+X/^case -1:$/,/^fprintf(yyout,"bad switch yylook /c\
+X	default: return(0);
+X/^struct yysvf *yybgin = yysvec+1;$/d
+X/^int yylineno /,$d
+________This_Is_The_END________
+if test `wc -c < lexedit.sed` -ne      356; then
+	echo 'shar: lexedit.sed was damaged during transit (should have been      356 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - lexstring.c'
+if test -f lexstring.c; then echo 'shar: not overwriting lexstring.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > lexstring.c
+X#include <stdio.h>
+X#include <ctype.h>
+X
+X#define YYLERR yysvec
+X#define YYTYPE int
+X#define YYLMAX 256
+X
+Xstruct yysvf { 
+X	struct yywork *yystoff;
+X	struct yysvf *yyother;
+X	int *yystops;
+X};
+X
+Xstruct yywork { 
+X	YYTYPE	verify;
+X	YYTYPE	advance; 
+X}; 
+X
+Xextern int yyvstop[];
+Xextern struct yywork yycrank[];
+Xextern struct yysvf yysvec[];
+Xextern struct yywork *yytop;
+Xextern char yymatch[];
+Xextern char yyextra[];
+X
+X#ifdef LEXDEBUG
+Xstatic int debug = 0;
+X#endif
+X
+Xlex_string( strptr, start_cond)
+X	char	**strptr;
+X	int	start_cond;
+X{
+X	register struct yysvf *state, **lsp;
+X	register struct yywork *tran;
+X	register int ch;
+X	register char	*cp = *strptr;
+X	register int	*found;
+X	struct	yysvf *yylstate[YYLMAX];
+X
+X	/* start off machines */
+X	lsp = yylstate;
+X	state = yysvec+1+start_cond;
+X	for (;;){
+X#ifdef LEXDEBUG
+X		if(debug)
+X			fprintf(stderr,"state %d\n",state-yysvec-1);
+X#endif
+X		tran = state->yystoff;
+X		if(tran == yycrank)
+X			/* may not be any transitions */
+X			if (state->yyother == 0 ||
+X			    state->yyother->yystoff == yycrank)
+X				break;
+X
+X		ch = *cp++;
+X#ifdef ONECASE
+X		if (isupper(ch) )
+X			ch = tolower(ch);
+X#endif
+Xtryagain:
+X#ifdef LEXDEBUG
+X		if(debug){
+X			fprintf(stderr,"char ");
+X			allprint(ch);
+X			putchar('\n');
+X		}
+X#endif
+X		if ( tran > yycrank){
+X			tran += ch;
+X			if (tran <= yytop && tran->verify+yysvec == state){
+X				if ((state = tran->advance+yysvec) == YYLERR){
+X					/* error transitions */
+X					--cp;
+X					break;
+X				}
+X				*lsp++ = state;
+X				goto contin;
+X			}
+X
+X		} else if(tran < yycrank) {
+X			/* r < yycrank */
+X			tran = yycrank+(yycrank-tran) + ch;
+X#ifdef LEXDEBUG
+X			if (debug)
+X				fprintf(stderr,"compressed state\n");
+X#endif
+X			if(tran <= yytop && tran->verify+yysvec == state){
+X				if ((state = tran->advance+yysvec) == YYLERR)
+X					/* error transitions */
+X					break;
+X
+X				*lsp++ = state;
+X				goto contin;
+X			}
+X			tran += (yymatch[ch] - ch);
+X#ifdef LEXDEBUG
+X			if(debug){
+X				fprintf(stderr,"try fall back character ");
+X				allprint(yymatch[ch]);
+X				putchar('\n');
+X			}
+X#endif
+X			if(tran <= yytop && tran->verify+yysvec == state){
+X				if(tran->advance+yysvec == YYLERR)
+X					/* error transition */
+X					break;
+X
+X				*lsp++ = state = tran->advance+yysvec;
+X				goto contin;
+X			}
+X		}
+X		if ((state = state->yyother) &&
+X		    (tran = state->yystoff) != yycrank){
+X#ifdef LEXDEBUG
+X			if(debug)
+X				fprintf(stderr,"fall back to state %d\n",
+X					state-yysvec-1);
+X#endif
+X			goto tryagain;
+X		} else
+X			break;
+X
+Xcontin:
+X#ifdef LEXDEBUG
+X		if(debug){
+X			fprintf(stderr,"state %d char ",state-yysvec-1);
+X			allprint(ch);
+X			putchar('\n');
+X		}
+X#endif
+X		;
+X	}
+X#ifdef LEXDEBUG
+X	if(debug){
+X		fprintf(stderr,"stopped at %d with ",*(lsp-1)-yysvec-1);
+X		allprint(ch);
+X		putchar('\n');
+X	}
+X#endif
+X	while (lsp-- > yylstate){
+X		if (*lsp != 0 && (found= (*lsp)->yystops) && *found > 0){
+X			if(yyextra[*found]){
+X				/* must backup */
+X				ch = -*found;
+X				do {
+X					while (*found && *found++ != ch)
+X						;
+X				 } while (lsp > yylstate &&
+X					  (found = (*--lsp)->yystops));
+X			}
+X#ifdef LEXDEBUG
+X			if(debug){
+X				fprintf(stderr,"\nmatch ");
+X				for ( cp = *strptr;
+X				      cp <= ((*strptr)+(lsp-yylstate));
+X				      cp++)
+X					allprint( *cp );
+X				fprintf(stderr," action %d\n",*found);
+X			}
+X#endif
+X			*strptr += (lsp - yylstate + 1);
+X			return(*found);
+X		}
+X	}
+X	/* the string didn't match anything - if we're looking at
+X	 * eos, just return 0.  Otherwise, bump the string pointer
+X	 * and return -1.
+X	 */
+X#ifdef LEXDEBUG
+X	if(debug)
+X		fprintf(stderr,"\nno match\n");
+X#endif
+X	if ( **strptr ) {
+X		(*strptr)++;
+X		return (-1);
+X	}
+X	return (0);
+X}
+X
+X#ifdef LEXDEBUG
+Xallprint(c)
+X	char c;
+X{
+X	if ( c < 32 ) {
+X	    putc( '^', stderr );
+X	    c += 32;
+X	} else if ( c == 127 ) {
+X	    putc( '^', stderr );
+X	    c = '?';
+X	}
+X	putc( c, stderr );
+X}
+X#endif
+________This_Is_The_END________
+if test `wc -c < lexstring.c` -ne     3713; then
+	echo 'shar: lexstring.c was damaged during transit (should have been     3713 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - libtws.3'
+if test -f libtws.3; then echo 'shar: not overwriting libtws.3'; else
+sed 's/^X//' << '________This_Is_The_END________' > libtws.3
+X.TH libtws 3 "08 November 1986"
+X.SH NAME
+Xlibtws \- alternate date and time routines including parsing
+X.SH SYNOPSIS
+X.nf
+X.fc ^ ~
+X.ta \w'char *dtimezone( offset, flags );  'u
+Xinclude "tws.h"
+X.PP
+X^struct tws *dlocaltime( clock );~^/* local clock into tws */
+Xlong *clock;
+X.PP
+X^struct tws *gmtime( clock );~^/* GMT clock into tws */
+Xlong *clock;
+X.PP
+X^char *dtime( clock );~^/* clock into string */
+Xlong *clock;
+X.PP
+X^long twclock( t );~^/* tws into clock */
+Xstruct tws *t;
+X.PP
+X^long twjuliandate( t );~^/* tws into Julian day number */
+Xstruct tws *t;
+X.PP
+X^struct tws *dparsetime( str );~^/* string into tws */
+Xchar *str;
+X.PP
+X^char *dctime( t );~^/* tws into string */
+Xstruct tws *t;
+X.PP
+X^char *dasctime( t, flags );~^/* tws into string */
+Xstruct tws *t;
+Xint flags;
+X.PP
+X^char *dtimezone( offset, flags );~^/* timezone into string */
+Xint offset, flags;
+X.PP
+X^char *dtwszone( t );~^/* tws's timezone into string */
+Xstruct tws *t;
+X.PP
+X^char *dtimemow( );~^/* current time into string */
+X.PP
+X^struct tws *dtwstime( );~^/* current time into tws */
+X.PP
+X^void twscopy( tot, fromt );~^/* copy a tws */
+Xstruct tws *tot, *fromt;
+X.PP
+X^int twsort( t1, t2 );~^/* compare two tws's */
+Xstruct tws *t1, *t2;
+X.PP
+X^long twsubtract( t1, t2 );~^/* seconds between t2 and t1 */
+Xstruct tws *t1, *t2;
+X.fi
+X.SH DESCRIPTION
+X.I Libtws
+Xis a fairly complete date/time library.
+XUnlike the standard Unix* date/time routines,
+X.I libtws
+Xwill parse date/time strings into internal form.
+XThe format for specifying date/time strings is pretty loose - basically
+Xthe same as the format for date/times in network mail.
+X.PP
+XMost of the routines do not use the Unix* "clock" time
+Xformat, and therefore are not limited to dates after 01 January 1970.
+XIn particular, twsubtract() lets you subtract two dates without
+Xconverting them to "clock" form.
+X.SH "SEE\ ALSO"
+X.IR ctime(3),
+X.IR time(3)
+X.SH AUTHOR
+XMost of
+X.I libtws
+Xcame from version 6.5 of the MH message
+Xhandling system, courtesy of Marshall Rose.
+XSome improvements (?) were added by Jef Poskanzer.
+X.SH BUGS
+XThe return values point to static data whose contents are overwritten
+Xby the next call.
+X.PP
+XThe basic Unix* time format (clock) only goes back to 1970, limiting
+Xapplications somewhat.
+X.SH NOTE
+X* Unix is a virus from outer space.
+________This_Is_The_END________
+if test `wc -c < libtws.3` -ne     2241; then
+	echo 'shar: libtws.3 was damaged during transit (should have been     2241 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - marc.c'
+if test -f marc.c; then echo 'shar: not overwriting marc.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > marc.c
+X/*
+X * $Header: marc.c,v 1.2 88/06/06 01:05:02 hyc Locked $
+X */
+X
+X/*  MARC - Archive merge utility
+X
+X    Version 5.21, created on 04/22/87 at 15:05:10
+X
+X(C) COPYRIGHT 1985-87 by System Enhancement Associates; ALL RIGHTS RESERVED
+X
+X    By:	 Thom Henderson
+X
+X    Description:
+X	 This program is used to "merge" archives.  That is, to move
+X	 files from one archive to another with no data conversion.
+X	 Please refer to the ARC source for a description of archives
+X	 and archive formats.
+X
+X    Instructions:
+X	 Run this program with no arguments for complete instructions.
+X
+X    Language:
+X	 Computer Innovations Optimizing C86
+X*/
+X#include <stdio.h>
+X#include "arc.h"
+X
+XFILE *src;			       /* source archive */
+Xchar srcname[STRLEN];		       /* source archive name */
+X
+Xstatic char **lst;		       /* files list */
+Xstatic int lnum;		       /* length of files list */
+X
+X
+Xmain(nargs,arg)			       /* system entry point */
+Xint nargs;			       /* number of arguments */
+Xchar *arg[];			       /* pointers to arguments */
+X{
+X    char *makefnam();		       /* filename fixup routine */
+X    char *calloc();		       /* memory manager */
+X    char *envfind();
+X#if	!MTS
+X    char *arctemp2, *mktemp();		/* temp file stuff */
+X#endif
+X#if	GEMDOS
+X    void exitpause();
+X#endif
+X    int n;			       /* index */
+X
+X    if(nargs<3)
+X    {	 printf("MARC - Archive merger, Version 5.21, created on 04/22/87 at 15:05:10\n");
+X/*	 printf("(C) COPYRIGHT 1985,86,87 by System Enhancement Associates;");
+X	 printf(" ALL RIGHTS RESERVED\n\n");
+X	 printf("Please refer all inquiries to:\n\n");
+X	 printf("	System Enhancement Associates\n");
+X	 printf("	21 New Street, Wayne NJ 07470\n\n");
+X	 printf("You may copy and distribute this program freely,");
+X	 printf(" provided that:\n");
+X	 printf("    1)	  No fee is charged for such copying and");
+X	 printf(" distribution, and\n");
+X	 printf("    2)	  It is distributed ONLY in its original,");
+X	 printf(" unmodified state.\n\n");
+X	 printf("If you like this program, and find it of use, then your");
+X	 printf(" contribution will\n");
+X	 printf("be appreciated.  You may not use this product in a");
+X	 printf(" commercial environment\n");
+X	 printf("or a governmental organization without paying a license");
+X	 printf(" fee of $35.  Site\n");
+X	 printf("licenses and commercial distribution licenses are");
+X	 printf(" available.  A program\n");
+X	 printf("disk and printed documentation are available for $50.\n");
+X	 printf("\nIf you fail to abide by the terms of this license, ");
+X	 printf(" then your conscience\n");
+X	 printf("will haunt you for the rest of your life.\n\n");
+X*/
+X	 printf("Usage: MARC <tgtarc> <srcarc> [<filename> . . .]\n");
+X	 printf("Where: <tgtarc> is the archive to add files to,\n");
+X	 printf("	<srcarc> is the archive to get files from, and\n");
+X	 printf("	<filename> is zero or more file names to get.\n");
+X	 printf("\nAdapted from MSDOS by Howard Chu\n");
+X#if	GEMDOS
+X	 exitpause();
+X#endif
+X	 return 1;
+X    }
+X
+X	/* see where temp files go */
+X#if	!MTS
+X	arctemp = calloc(1, STRLEN);
+X	if (!(arctemp2 = envfind("ARCTEMP")))
+X		arctemp2 = envfind("TMPDIR");
+X	if (arctemp2) {
+X		strcpy(arctemp, arctemp2);
+X		n = strlen(arctemp);
+X		if (arctemp[n - 1] != CUTOFF)
+X			arctemp[n] = CUTOFF;
+X	}
+X#if	!MSDOS
+X	strcat(arctemp, mktemp("AXXXXXX"));
+X#else
+X	strcat(arctemp, "$ARCTEMP");
+X#endif
+X#else
+X	guinfo("SHFSEP	", gotinf);
+X	sepchr[0] = gotinf[0];
+X	guinfo("SCRFCHAR", gotinf);
+X	tmpchr[0] = gotinf[0];
+X	arctemp = "-$$$";
+X	arctemp[0] = tmpchr[0];
+X#endif
+X
+X    makefnam(arg[1],".arc",arcname);   /* fix up archive names */
+X    makefnam(arg[2],".arc",srcname);
+X/*	makefnam(".$$$",arcname,newname);*/
+X	sprintf(newname,"%s.arc",arctemp);
+X
+X#if	!UNIX
+X    upper(arcname); upper(srcname); upper(newname);
+X#endif
+X
+X    arc = fopen(arcname,"rb");	       /* open the archives */
+X    if(!(src=fopen(srcname,"rb")))
+X	 abort("Cannot read source archive %s",srcname);
+X    if(!(new=fopen(newname,"wb")))
+X	 abort("Cannot create new archive %s",newname);
+X
+X    if(!arc)
+X	 printf("Creating new archive %s\n",arcname);
+X
+X    /* get the files list set up */
+X
+X    lnum = nargs-3;		       /* initial length of list */
+X    if(lnum<1)			       /* phoney for default case */
+X    {	 lnum = 1;
+X	 lst = (char **) calloc(1,sizeof(char *));
+X	 lst[0] = "*.*";
+X    }
+X    else			       /* else use filenames given */
+X    {	 lst = (char **) calloc(lnum,sizeof(char *));
+X	 for(n=3; n<nargs; n++)
+X	      lst[n-3] = arg[n];
+X
+X	 for(n=0; n<lnum; )	       /* expand indirect references */
+X	 {    if(*lst[n] == '@')
+X		   expandlst(n);
+X	      else n++;
+X	 }
+X    }
+X
+X    merge(lnum,lst);		       /* merge desired files */
+X
+X    if(arc) fclose(arc);	       /* close the archives */
+X    fclose(src);
+X    fclose(new);
+X
+X    if(arc)			       /* make the switch */
+X	 if(unlink(arcname))
+X	      abort("Unable to delete old copy of %s",arcname);
+X    if(move(newname,arcname))
+X	 abort("Unable to rename %s to %s",newname,arcname);
+X
+X    setstamp(arcname,arcdate,arctime);     /* new arc matches newest file */
+X
+X#if	GEMDOS
+X    exitpause();
+X#endif
+X    return nerrs;
+X}
+X
+Xmerge(nargs,arg)		       /* merge two archives */
+Xint nargs;			       /* number of filename templates */
+Xchar *arg[];			       /* pointers to names */
+X{
+X    struct heads srch;		       /* source archive header */
+X    struct heads arch;		       /* target archive header */
+X    int gotsrc, gotarc;		       /* archive entry versions (0=end) */
+X    int copy;			       /* true to copy file from source */
+X    int n;			       /* index */
+X
+X    gotsrc = gethdr(src,&srch);	       /* get first source file */
+X    gotarc = gethdr(arc,&arch);	       /* get first target file */
+X
+X    while(gotsrc || gotarc)	       /* while more to merge */
+X    {	 if(strcmp(srch.name,arch.name)>0)
+X	 {    copyfile(arc,&arch,gotarc);
+X	      gotarc = gethdr(arc,&arch);
+X	 }
+X
+X	 else if(strcmp(srch.name,arch.name)<0)
+X	 {    copy = 0;
+X	      for(n=0; n<nargs; n++)
+X	      {	   if(match(srch.name,arg[n]))
+X		   {	copy = 1;
+X			break;
+X		   }
+X	      }
+X	      if(copy)		       /* select source or target */
+X	      {	   printf("Adding file:	  %s\n",srch.name);
+X		   copyfile(src,&srch,gotsrc);
+X	      }
+X	      else fseek(src,srch.size,1);
+X	      gotsrc = gethdr(src,&srch);
+X	 }
+X
+X	 else			       /* duplicate names */
+X	 {    copy = 0;
+X	      {	   if((srch.date>arch.date)
+X		   || (srch.date==arch.date && srch.time>arch.time))
+X		   {	for(n=0; n<nargs; n++)
+X			{    if(match(srch.name,arg[n]))
+X			     {	  copy = 1;
+X				  break;
+X			     }
+X			}
+X		   }
+X	      }
+X	      if(copy)		       /* select source or target */
+X	      {	   printf("Updating file: %s\n",srch.name);
+X		   copyfile(src,&srch,gotsrc);
+X		   gotsrc = gethdr(src,&srch);
+X		   if(gotarc)
+X		   {	fseek(arc,arch.size,1);
+X			gotarc = gethdr(arc,&arch);
+X		   }
+X	      }
+X	      else
+X	      {	   copyfile(arc,&arch,gotarc);
+X		   gotarc = gethdr(arc,&arch);
+X		   if(gotsrc)
+X		   {	fseek(src,srch.size,1);
+X			gotsrc = gethdr(src,&srch);
+X		   }
+X	      }
+X	 }
+X    }
+X
+X    hdrver = 0;			       /* end of archive marker */
+X    writehdr(&arch,new);	       /* mark the end of the archive */
+X}
+X
+Xint gethdr(f,hdr)		       /* special read header for merge */
+XFILE *f;			       /* file to read from */
+Xstruct heads *hdr;		       /* storage for header */
+X{
+X    char *i = hdr->name;	       /* string index */
+X    int n;			       /* index */
+X
+X    for(n=0; n<FNLEN; n++)	       /* fill name field */
+X	 *i++ = 0176;		       /* impossible high value */
+X    *--i = '\0';		       /* properly end the name */
+X
+X    hdrver = 0;			       /* reset header version */
+X    if(readhdr(hdr,f))		       /* use normal reading logic */
+X	 return hdrver;		       /* return the version */
+X    else return 0;		       /* or fake end of archive */
+X}
+X
+Xcopyfile(f,hdr,ver)		       /* copy a file from an archive */
+XFILE *f;			       /* archive to copy from */
+Xstruct heads *hdr;		       /* header data for file */
+Xint ver;			       /* header version */
+X{
+X    hdrver = ver;		       /* set header version */
+X    writehdr(hdr,new);		       /* write out the header */
+X    filecopy(f,new,hdr->size);	       /* copy over the data */
+X}
+X
+Xstatic expandlst(n)		       /* expand an indirect reference */
+Xint n;				       /* number of entry to expand */
+X{
+X    FILE *lf, *fopen();		       /* list file, opener */
+X    char *malloc(), *realloc();	       /* memory managers */
+X    char buf[100];		       /* input buffer */
+X    int x;			       /* index */
+X    char *p = lst[n]+1;		       /* filename pointer */
+X
+X    if(*p)			       /* use name if one was given */
+X    {	 makefnam(p,".CMD",buf);
+X	 upper(buf);
+X	 if(!(lf=fopen(buf,"r")))
+X	      abort("Cannot read list of files in %s",buf);
+X    }
+X    else lf = stdin;		       /* else use standard input */
+X
+X    for(x=n+1; x<lnum; x++)	       /* drop reference from the list */
+X	 lst[x-1] = lst[x];
+X    lnum--;
+X
+X    while(fscanf(lf,"%99s",buf)>0)     /* read in the list */
+X    {	 if(!(lst=(char **) realloc(lst,(lnum+1)*sizeof(char *))))
+X	      abort("too many file references");
+X
+X	 lst[lnum] = malloc(strlen(buf)+1);
+X	 strcpy(lst[lnum],buf);	       /* save the name */
+X	 lnum++;
+X    }
+X
+X    if(lf!=stdin)		       /* avoid closing standard input */
+X	 fclose(lf);
+X}
+________This_Is_The_END________
+if test `wc -c < marc.c` -ne     9053; then
+	echo 'shar: marc.c was damaged during transit (should have been     9053 bytes)'
+fi
+fi		; : end of overwriting check
+exit 0
+

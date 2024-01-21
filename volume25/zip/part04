@@ -1,0 +1,2203 @@
+Newsgroups: comp.sources.unix
+From: madler@cco.caltech.edu (Mark Adler)
+Subject: v25i145: zip - file compression/archive tool, Part04/07
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: madler@cco.caltech.edu (Mark Adler)
+Posting-Number: Volume 25, Issue 145
+Archive-Name: zip/part04
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 4 (of 7)."
+# Contents:  im_lmat.c zip.c zip.doc
+# Wrapped by vixie@cognition.pa.dec.com on Sun Mar  1 18:57:38 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'im_lmat.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'im_lmat.c'\"
+else
+echo shar: Extracting \"'im_lmat.c'\" \(27597 characters\)
+sed "s/^X//" >'im_lmat.c' <<'END_OF_FILE'
+X/*
+X
+X Copyright (C) 1990,1991 Mark Adler, Richard B. Wales, and Jean-loup Gailly.
+X Permission is granted to any individual or institution to use, copy, or
+X redistribute this software so long as all of the original files are included
+X unmodified, that it is not sold for profit, and that this copyright notice
+X is retained.
+X
+X*/
+X
+X/*
+X *  im_lmat.c by Jean-loup Gailly.
+X *
+X *  PURPOSE
+X *
+X *      Identify new text as repetitions of old text within a fixed-
+X *      length sliding window trailing behind the new text.
+X *
+X *  DISCUSSION
+X *
+X *      The "implosion" process depends on being able to identify portions
+X *      of the input text which are identical to earlier input (within a
+X *      sliding window trailing behind the input currently being processed).
+X *
+X *      The most straightforward technique turns out to be the fastest for
+X *      most input files: try all possible matches and select the longest.
+X *      The key feature is of this algorithm is that insertion and deletions
+X *      from the string dictionary are very simple and thus fast. Insertions
+X *      and deletions are performed at each input character, whereas string
+X *      matches are performed only when the previous match ends. So it is
+X *      preferable to spend more time in matches to allow very fast string
+X *      insertions and deletions. The matching algorithm for small strings
+X *      is inspired from that of Rabin & Karp. A brute force approach is
+X *      used to find longer strings when a small match has been found.
+X *      A similar algorithm is used in freeze (by Leonid Broukhis) but the
+X *      algorithm used here is faster.
+X *         A previous version of this file used a more sophisticated algorithm
+X *      (by Fiala and Greene) which is guaranteed to run in linear amortized
+X *      time, but has a larger average cost and uses more memory. However
+X *      the F&G algorithm may be faster for some highly redundant files if
+X *      the parameter max_chain_length (described below) is too large.
+X *
+X *  ACKNOWLEDGEMENTS
+X *
+X *      Rich Wales defined the interface, provided the necessary information
+X *      to ensure compatibility with pkunzip 1.0 (not an easy job) and
+X *      suggested the solution (n == 1 + n-1) adopted here.
+X *      The idea of lazy evaluation of matches is due to Jan Mark Wams, and
+X *      I found it in 'freeze' written by Leonid Broukhis.
+X *      Special thanks to Kai-Uwe Rommel for the OS/2 port, to Glenn J.
+X *      Andrews for the VMS port, and to many other info-zippers for testing.
+X *
+X *  REFERENCES
+X *
+X *      A description of the Rabin and Karp algorithm is given in the book
+X *          "Algorithms" by R. Sedgewick, Addison-Wesley, p252.
+X *
+X *      Fiala,E.R., and Greene,D.H.
+X *          Data Compression with Finite Windows, CACM, 32,4 (1989) 490-595.
+X *
+X *  INTERFACE
+X *
+X *      ImpErr lm_init (int pack_level)
+X *          Initialize the "longest match" routines for a new file.
+X *          The global variable fd is an implicit parameter.
+X *
+X *      ImpErr lm_input (U_CHAR *block, U_INT count)
+X *          Process a block of input characters.
+X *
+X *      ImpErr lm_windup (void)
+X *          Flush out the remaining unprocessed input.
+X */
+X
+X#include "implode.h"
+X
+X/***********************************************************************
+X *
+X * Configuration parameters
+X */
+X
+X#define MAX_MATCH_LENGTH  320
+X/* The maximum match length. 320 = 64 + 256. (If the length is greater than
+X * 63, pkzip uses an extra byte.)
+X */
+X
+X#define MAX_WBITS  13
+X#define WSIZE (1 << MAX_WBITS)
+X/* Maximum window size = 8K */
+X
+X/* Constants used to dimension the hash table: */
+X#define HASH_BITS  14
+X/* HASH_BITS must be >= 13, see longest_match() */
+X
+X#define HASH_SIZE (1<<HASH_BITS)
+X#define HASH_MASK (HASH_SIZE-1)
+X
+X#if defined(MSDOS) || defined(i386) || defined(mc68020) || defined(vax)
+X#   define UNALIGNED_OK
+X    /* Define this symbol if your target allows access to unaligned data.
+X     * This is not mandatory, just a speed optimization. The compressed
+X     * output is strictly identical.
+X     */
+X#endif
+X#ifdef __TURBOC__
+X#   define DYN_ALLOC
+X    /* Turbo C 2.0 does not accept far static allocations in small model */
+X#endif
+X
+X/***********************************************************************
+X *
+X * Local data used by the "longest match" routines.
+X */
+X
+X#if HASH_BITS <= 14
+X   typedef unsigned short Hash;
+X#else
+X   /* Defined just for safety, since values > 14 do not speed up implosion */
+X   typedef unsigned long Hash;
+X#endif
+X
+typedef unsigned short Pos;
+typedef unsigned int  IPos;
+X/* A Pos is an index in the character window. We use short instead of int to
+X * save space in the various tables. IPos is used only for parameter passing.
+X */
+X
+int near min_match_length;
+X/* Minimum match length, 2 for binary files, 3 for ascii files.
+X * (bad luck for ebcdic users; not because they may not get optimal
+X * compression, but because they have to use ebcdic machines :-)
+X * A zero value means that the min_match_length is not yet determined.
+X */
+X
+U_CHAR near window[MAX_MATCH_LENGTH + WSIZE + BSZ];
+X/* MAX_MATCH_LENGTH bytes are duplicated at both ends of the window,
+X * to speed up string comparisons. The BSZ extra bytes allow a block copy
+X * of the input buffer into the window instead of a copy one byte at a time.
+X */
+X
+X#define MAX_DIST (WSIZE + BSZ)
+X/* Maximum theoretical distance between two distinct bytes in the window.
+X * Actual distances are limited to bufsize.
+X */
+X
+X#define NIL  MAX_DIST
+X/* Tail of hash chains */
+X
+X#ifdef DYN_ALLOC
+X   Hash far *next = NULL;
+X   Pos  far *prev = NULL;
+X#else
+X   Hash far next[MAX_DIST+1];
+X   Pos  far prev[MAX_DIST+HASH_SIZE+1];
+X#endif
+X/* next is a link to a more recent string with same hash index, or to the head
+X * of a hash table chain if there is no such string. next[NIL] is used to
+X * avoid extra checks. next[s] is NIL if string s is not yet in the dictionary
+X *
+X * prev is a link to an older string with same hash index (first MAX_DIST
+X * values) or head of hash chain (last HASH_SIZE values). prev[NIL] is used
+X * to avoid extra checks.
+X */
+X#define match_head (prev+(MAX_DIST+1))
+X
+Hash near ins_h;  /* hash index of string to be inserted. */
+X
+int near h_shift;
+X/* Number of bits by which ins_h must be shifted at each
+X * input step. It must be such that after min_match_length steps, the oldest
+X * byte no longer takes part in the hash key, that is:
+X *   h_shift * min_match_length >= HASH_BITS
+X */
+X
+MATCH *ma_buf = NULL;
+X/* Buffer used to speed up reading/writing to/from temp file */
+X#define MA_BUFEND (ma_buf+MA_BUFSIZE)
+X
+MATCH *ma;
+X/* Pointer to the most recent match. */
+X
+int near start_length;
+X/* Matches not greater than this are discarded. This is used in the lazy match
+X * evaluation. If start_length > 1, ma is a valid guess of length start_length
+X * and ct_tally has not yet been called.
+X */
+X
+X        int near strstart;      /* start of string to insert */
+X        int near strsize;       /* length of string to insert */
+X        int near match_length;  /* length of current best match */
+X        int near bufsize;       /* # of slots in window */
+X        int near checkpoint;    /* look for new match at this point */
+static  int      insert_point;  /* position of next input buffer */
+X
+static  int      max_lazy_match;
+X/* We try lazy evaluation only for matches of length 2..max_lazy_match, to
+X * speed up the implosion. We use 0 for maximum speed, 0.9*MAX_MATCH_LENGTH
+X * for maximum compression.
+X */
+X
+X        int near max_chain_length;
+X/* To speed up implosion, hash chains are truncated to this length.
+X * A higher limit improves compression ratio but degrades the speed.
+X * We use 40 for maximum speed, 960 for maximum compression. Values
+X * below 20 are not recommended.
+X */
+X
+X/* Values for max_lazy_match and max_chain_length, depending on the desired
+X * pack level (0..9). The values given below have been tuned to exclude
+X * worst case performance for pathological files. Better values may be
+X * found for specific files. Note that the current algorithm requires 
+X * max_lazy >= 2.
+X */
+typedef struct config {
+X   int max_lazy;
+X   int max_chain;
+X} config;
+X
+static config configuration_table[10] = {
+X/* 0 */ {2,                     MAX_MATCH_LENGTH/8}, /* maximum speed */
+X/* 1 */ {4,                     MAX_MATCH_LENGTH/4},
+X/* 2 */ {5,                     MAX_MATCH_LENGTH/2},
+X/* 3 */ {MAX_MATCH_LENGTH/16,   MAX_MATCH_LENGTH/2},
+X/* 4 */ {MAX_MATCH_LENGTH/16,   3*MAX_MATCH_LENGTH/4},
+X/* 5 */ {MAX_MATCH_LENGTH/16,   MAX_MATCH_LENGTH},
+X/* 6 */ {MAX_MATCH_LENGTH/16,   3*MAX_MATCH_LENGTH/2},
+X/* 7 */ {MAX_MATCH_LENGTH/16,   2*MAX_MATCH_LENGTH},
+X/* 8 */ {9*MAX_MATCH_LENGTH/10, 2*MAX_MATCH_LENGTH},
+X/* 9 */ {9*MAX_MATCH_LENGTH/10, 3*MAX_MATCH_LENGTH}}; /* maximum compression */
+X
+X
+X#define MIN(a,b) ((a) <= (b) ? (a) : (b))
+X/* The arguments must not have side effects. */
+X
+X#define EQUAL 0
+X/* result of strncmp for equal strings */
+X
+X/*  Prototypes for local functions */
+X
+static void   set_min_match_length OF ((U_CHAR *block, U_INT count));
+X       ImpErr write_match OF ((IPos ma_start, int ma_length));
+X       IPos   longest_match OF ((IPos cur_match));
+X       ImpErr lm_process OF ((U_INT count));
+X
+X/***********************************************************************
+X *
+X * Initialize the "longest match" routines for a new file.
+X * The global variable fd is an implicit parameter.
+X */
+ImpErr lm_init (pack_level)
+X    int pack_level; /* 0: best speed, 9: best compression, other: default */
+X{
+X    register int i;
+X
+X    /* Validate the arguments */
+X    bufsize = fd.fd_bufsize;
+X    strsize = MIN (fd.fd_strsize, MAX_MATCH_LENGTH);
+X    if (bufsize > WSIZE)          return IM_BADARG;
+X    if (bufsize < 2 * strsize)    return IM_BADARG;
+X    if (pack_level < 0 || pack_level > 9) return IM_BADARG;
+X
+X    /* Make sure "bufsize" is a power of 2 */
+X    if ((bufsize & (bufsize - 1)) != 0) return IM_BADARG;
+X
+X    /* Use dynamic allocation if compiler does not like big static arrays: */
+X#ifdef DYN_ALLOC
+X    if (prev == NULL) {
+X       next = (Hash far*)farmalloc((U_INT)(MAX_DIST+9)*sizeof(Hash));
+X       prev = (Pos far*) farmalloc((U_INT)(MAX_DIST+HASH_SIZE+9)*sizeof(Pos));
+X       /* We allocate 16 extra bytes for the normalization under MSDOS */
+X       if (prev == NULL || next == NULL) return IM_NOMEM;
+X
+X#   if defined(MSDOS) && !defined(OS2)
+X       /* Normalize to pointers with offset 0 (required by asm version).
+X        * For OS/2, we can't of course play such nasty games.
+X        */
+X#define NORMALIZE(ptr) { \
+X   *((int*)&ptr+1) += ((unsigned)(ptr-0) + 15) >> 4; \
+X   *(int*)&ptr = 0; \
+X}
+X       NORMALIZE(prev); NORMALIZE(next);
+X#   endif
+X    }
+X#endif /* DYN_ALLOC */
+X
+X    /* Initialize the hash tables. */
+X    for (i = 0;  i < HASH_SIZE; i++) match_head[i] = NIL;
+X    for (i = 0;  i <= MAX_DIST; i++) next[i] = NIL;
+X    /* prev[0..MAX_DIST] will be initialized on the fly */
+X    ins_h = 0;
+X
+X    /* Assume strsize zeros before the input (bytes beyond strsize
+X     * can be garbage):
+X     */
+X    memset((char*)window, 0, MAX_MATCH_LENGTH);
+X    /* It is not necessary to duplicate this at the end of the window.
+X     * Duplication will start only after the first wrap around.
+X     */
+X    insert_point = MAX_MATCH_LENGTH;
+X
+X    /* Force a check for the file type (ascii/binary) and set the default
+X     * configuration parameters:
+X     */
+X    min_match_length = 0;
+X    max_lazy_match   = configuration_table[pack_level].max_lazy;
+X    max_chain_length = configuration_table[pack_level].max_chain;
+X
+X    /* Do not report matches before the first strsize strings have been
+X     * inserted in the suffix tree:
+X     */
+X    strstart = 0;
+X    checkpoint = strsize;
+X    if (ma_buf == NULL) {
+X        ma_buf = (MATCH *) malloc ((unsigned) (MA_BUFSIZE * sizeof (MATCH)));
+X        if (ma_buf == NULL) return IM_NOMEM;
+X    }
+X    ma = ma_buf - 1;
+X    start_length = 1;
+X
+X    /* All done. */
+X    return IM_OK;
+X}
+X
+X/***********************************************************************
+X *
+X * Output the match info.
+X * IN assertions: The matching strings start at strstart and ma_start
+X *    and have a length of ma_length bytes.
+X *    If ma_length is not greater than start_length, ma_start is garbage.
+X *    strstat == checkpoint. If start_length > 1, ma is the
+X *    previous match which has not yet been output.
+X * OUT assertion: checkpoint is reset according to the match length
+X *    actually chosen.
+X *    ma is set to the current match, with start_length set appropriately.
+X */
+ImpErr write_match(ma_start, ma_length)
+X    IPos ma_start;           /* start of matched string */
+X    int ma_length;           /* length of complete match */
+X{
+X    int ma_dist = 0;         /* distance of current match */
+X
+X    /* ma_length can be too large towards the end of the input: */
+X    if (ma_length > strsize) ma_length = strsize;
+X
+X#ifdef DEBUG
+X    /* check that the match is indeed a match */
+X    if (ma_length > start_length &&
+X        strncmp(window + ma_start, window + strstart, ma_length) != EQUAL) {
+X        fprintf(stderr,
+X            "write_match: ma_start %d, strstart %d, ma_length %d\n",
+X            ma_start, strstart, ma_length);
+X        exit(1);
+X    }
+X#endif
+X    /* PKUNZIP accepts most overlapping matches.  However, when the
+X     * distance has the value 1, versions of PKUNZIP prior to 1.10 don't
+X     * handle the overlap properly -- and version 1.10 handles the
+X     * overlap correctly only if the length is limited to 62 plus the
+X     * minimum match length; i.e., only if there is no supplementary
+X     * length byte.  (From phone conversation with Phil Katz, 23 January
+X     * 1991.) The compression ratio is generally better when we do not
+X     * limit the match length to 64, so we remove distance-one matches
+X     * completely. (But PKUNZIP 1.01 also rejects some distance-two matches.
+X     * This could be fixed but would degrade compression.)
+X     */
+X    if (ma_length > 1) {
+X        ma_dist = strstart - ma_start;
+X        if (ma_dist < 0) ma_dist += MAX_DIST;
+X        if (ma_dist == 1) {
+X            /* keep the previous match if it was delayed */
+X            if (start_length > 1) {
+X                ma_length = 1;
+X            } else {
+X                /* Truncate the match to 1 */
+X                ImpErr retcode = write_match(ma_start, 1);
+X                if (retcode != IM_OK) return retcode;
+X
+X                /* Emit a match with a distance of two and a length reduced by
+X                 * one. This reduced match may be delayed.
+X                 */
+X                checkpoint = ++strstart;
+X                retcode = write_match(ma_start, ma_length-1);
+X                strstart--;
+X                return retcode; /* Leave checkpoint unchanged */
+X            } /* start_length > 1 */
+X        } /* ma_dist == 1 */
+X    } /* ma_length > 1 */
+X
+X    /* If the previous match has been delayed, keep it or prefer the
+X     * current match:
+X     */
+X    if (start_length > 1) {
+X        /* Keep the previous match if it is not shorter than the current one.
+X         * Otherwise, emit only the first byte of the previous match,
+X         * followed by the current match. If we have a delayed match for
+X         * the last bytes of the input file, the next match will necessarily
+X         * be smaller, so ct_tally will correctly be called for the delayed
+X         * match.
+X         */
+X        if (start_length >= ma_length) {
+X            /* Keep the previous match */
+X            if (start_length == 2) {
+X                ma->ma_dist = - ma->ma_dist;
+X                ma->l.ma_litc[1] = window[strstart]; /* litc[0] already set */
+X            } else {
+X                ma->l.ma_length = start_length; /* overwrite ma->l.ma_litc */
+X            }
+X            checkpoint = strstart + start_length - 1;
+X            start_length = 1;
+X            return ct_tally (ma);
+X        }
+X        /* Shorten the previous match to zero */
+X        ma->ma_dist = 0; /* keep ma->l.ma_litc */
+X        start_length = 1;
+X        (void) ct_tally (ma); /* ignore result, ct_tally cannot fail */
+X    }
+X
+X    if (++ma == MA_BUFEND) {
+X        ma = ma_buf;
+X        if (twrite ((char *) ma, sizeof(MATCH), MA_BUFSIZE, fd.fd_temp)
+X            != MA_BUFSIZE) return IM_IOERR;
+X    }
+X
+X    /* Keep the current match as guess only if its length is small,
+X     * trying to find a better match at the next step. If speed is not
+X     * critical, we use this lazy mechanism for all lengths.
+X     */
+X    if (ma_length > 1) {
+X        ma->ma_dist = ma_dist;
+X        if (ma_length <= max_lazy_match) {
+X           /* Set ma_litc[0]: this is the only way to identify the unmatched
+X            * data if the delayed match will be truncated to 1. It is also
+X            * useful if ma_length == 2: it may be more efficient in this case
+X            * to encode the individual characters rather than the match info.
+X            */
+X            ma->l.ma_litc[0] = window[strstart];
+X            start_length = ma_length;
+X            checkpoint = strstart + 1;
+X            return IM_OK;
+X        }
+X        /* At this point, ma_length >= 3, no need for ma_litc */
+X        ma->l.ma_length = ma_length;
+X        checkpoint = strstart + ma_length;
+X    } else {
+X        ma->ma_dist = 0;
+X        ma->l.ma_litc[0] = window[strstart]; /* ma_litc[1] is not required */
+X        checkpoint = strstart + 1;
+X    }
+X    return ct_tally (ma);
+X    /* Keep start_length == 1 */
+X}
+X
+X/***********************************************************************
+X *
+X * Determine the minimum match length, based on the type of data
+X * in the given input buffer: 2 for binary data, 3 otherwise. Set also
+X * h_shift according to the chosen min_match_length, and reduce
+X * max_chain_length for binary files.
+X *    If the guess about data type is wrong, this only affects the
+X * compression ratio and speed but not the correctness of the algorithms.
+X * If there are more than 20% bytes which seem non ascii in the first
+X * 500 bytes, we assume that the data is binary. (We accept data
+X * with a few high bits set as ascii to take into account special
+X * word processor formats.)
+X */
+static void set_min_match_length (block, count)
+X    U_CHAR *block;          /* input data */
+X    U_INT  count;           /* # of input char's */
+X{
+X    int non_ascii = 0;
+X    min_match_length = 3;  /* Default ascii */
+X    if (count >= 500) {
+X        count = 500;
+X        while (--count != 0) {
+X            if (*block <= 6 || *block >= 0x80) non_ascii++;
+X            block++;
+X        }
+X        if (non_ascii > 100) {
+X            min_match_length = 2;
+X            max_chain_length >>= 2;
+X        }
+X    }
+X    h_shift = (HASH_BITS+min_match_length-1)/min_match_length;
+X#ifdef DEBUG
+X    fprintf(stderr," (min_match_length %d) ", min_match_length);
+X#endif
+X}
+X
+X/***********************************************************************
+X *
+X * Insert string s in the dictionary and set last_match to the previous head
+X * of the hash chain (the most recent string with same hash key).
+X * IN  assertion: all calls to to INSERT_STRING are made with consecutive
+X *    input characters, so that a running hash key can be computed from the
+X *    previous key instead of complete recalculation each time.
+X */
+X#define INSERT_STRING(s, last_match) \
+X{ \
+X    ins_h = ((ins_h<<h_shift) ^ window[s + min_match_length-1]) & HASH_MASK; \
+X    prev[s] = last_match = match_head[ins_h]; \
+X    next[last_match] = prev[next[s] = ins_h + MAX_DIST+1] = s; \
+X}
+X    /* next[NIL] is garbage, we can overwrite it if s is a tail */
+X
+X/***********************************************************************
+X *
+X * Remove string s from the dictionary, or do nothing if s is not yet
+X * in the dictionary.
+X * IN assertion: s is the tail of its hash chain (the oldest string).
+X */
+X#define DELETE_STRING(s)  {prev[next[s]] = NIL;}
+X/* No effect if next[s] == NIL (s not in dictionary) */
+X
+X/***********************************************************************
+X *
+X * Find the longest match starting at the given string. Return its position
+X * and set its length in match_length. Matches shorter or equal to
+X * start_length are discarded, in which case match_length is unchanged
+X * and the result position is NIL.
+X * IN assertions: cur_match is the head of the hash chain for the current
+X *   string (strstart) and is not NIL, and start_length >= 1
+X */
+X#if !defined(MSDOS) || defined(NO_ASM)
+X/* For MSDOS, a version of this routine written in assembler is in im_lm.asm.
+X * The algorithms are strictly equivalent, so the C version can be used
+X * instead if you do not have masm or tasm. (Update the makefile in this case.)
+X */
+IPos longest_match(cur_match)
+X    IPos cur_match;
+X{
+X    register U_CHAR *match;                   /* pointer in matched string */
+X    register U_CHAR *scan = window + strstart;/* pointer in current string */
+X    register int len;                         /* length of current match */
+X    IPos cur_best = NIL;                      /* best match so far */
+X    register int ma_length = start_length;    /* best match length so far */
+X    int chain_count = max_chain_length;       /* used to limit hash chains */
+X    typedef unsigned short US;
+X    typedef unsigned long  UL;
+X#ifdef UNALIGNED_OK
+X    register US scan_start = *(US*)scan;
+X    register US scan_end   = *(US*)(scan+ma_length-1);
+X#else
+X    register U_CHAR scan_start = *scan;
+X    register U_CHAR scan_end1  = scan[ma_length-1];
+X    register U_CHAR scan_end   = scan[ma_length];
+X#endif
+X    do {
+X        match = window + cur_match;
+X        /* Skip to next match if the match length cannot increase
+X         * or if the match length is less than 2:
+X         */
+X#ifdef UNALIGNED_OK
+X        /* This code assumes sizeof(unsigned short) == 2 and
+X         * sizeof(unsigned long) == 4. Do not use UNALIGNED_OK if your
+X         * compiler uses different sizes.
+X         */
+X        if (*(US*)(match+ma_length-1) != scan_end ||
+X            *(US*)match != scan_start) continue;
+X
+X        len = min_match_length - 4;
+X        /* If min_match_length == 3, it is not necessary to compare
+X         * scan[2] and match[2] since they are always equal when the other
+X         * bytes match, given that the hash keys are equal and that
+X         * HASH_BITS >= 8.
+X         */
+X#       define ML MAX_MATCH_LENGTH
+X        do {} while ((len+=4) < ML && *(UL*)(scan+len) == *(UL*)(match+len));
+X
+X        if (*(US*)(scan+len) == *(US*)(match+len)) len += 2;
+X        if (scan[len] == match[len]) len++;
+X
+X#else /* UNALIGNED_OK */
+X        if (match[ma_length] != scan_end ||
+X            match[ma_length-1] != scan_end1 || *match != scan_start)
+X           continue;
+X        /* It is not necessary to compare scan[1] and match[1] since they
+X         * are always equal when the other bytes match, given that
+X         * the hash keys are equal and that h_shift+8 <= HASH_BITS,
+X         * that is, when the last byte is entirely included in the hash key.
+X         * The condition is equivalent to
+X         *       (HASH_BITS+2)/3 + 8 <= HASH_BITS
+X         * or: HASH_BITS >= 13 (see set_min_match_length()).
+X         * Also, we check for a match at ma_length-1 to get rid quickly of
+X         * the match with the suffix of the match made at the previous step,
+X         * which is known to fail.
+X         */
+X        len = 1;
+X        do {} while (++len < MAX_MATCH_LENGTH && scan[len] == match[len]);
+X
+X#endif /* UNALIGNED_OK */
+X
+X        if (len > ma_length) {
+X            cur_best = cur_match, ma_length = len;
+X            if (len >= strsize) break;
+X#ifdef UNALIGNED_OK
+X            scan_end = *(US*)(scan+ma_length-1);
+X#else
+X            scan_end1  = scan[ma_length-1];
+X            scan_end   = scan[ma_length];
+X#endif
+X        }
+X    } while (--chain_count != 0 && (cur_match = prev[cur_match]) != NIL);
+X
+X    if (ma_length > start_length) match_length = ma_length;
+X    return cur_best;
+X}
+X#endif /* MSDOS */
+X
+X/***********************************************************************
+X *
+X * Process a block of input characters, generating zero or more match
+X * info records as appropriate.
+X * IN assertion: count <= BSZ
+X */
+ImpErr lm_input (block, count)
+X    U_CHAR *block;          /* input data */
+X    U_INT  count;           /* # of input char's */
+X{
+X    if (count == 0) return IM_OK;
+X
+X    /* Determine the input file type if this is the first call */
+X    if (min_match_length == 0) set_min_match_length (block, count);
+X
+X    if (insert_point + count <= sizeof(window)) {
+X        memcpy((char*)window + insert_point, (char*)block, count);
+X
+X    } else {
+X        int remain = sizeof(window)-insert_point;
+X        memcpy((char*)window + insert_point, (char*)block, remain);
+X
+X        memcpy((char*)window + MAX_MATCH_LENGTH,
+X               (char*)block + remain, count - remain);
+X    }
+X    insert_point += count;
+X    if (insert_point > MAX_DIST) {
+X        /* Duplicate the end of the window */
+X        memcpy((char*)window,
+X               (char*)window + MAX_DIST,
+X               MIN (insert_point - MAX_DIST, MAX_MATCH_LENGTH));
+X    }
+X    if (insert_point >= sizeof(window)) insert_point -= MAX_DIST;
+X
+X    return lm_process(count);
+X}
+X
+X/***********************************************************************
+X *
+X * Process a block of characters already inserted in the window
+X * IN assertion: count > 0
+X */
+X#if !defined(MSDOS) || defined(NO_ASM)
+ImpErr lm_process (count)
+X    U_INT  count;           /* number of bytes to process */
+X{
+X    ImpErr retcode;         /* as usual */
+X    IPos cur_match;         /* starting point for longest match search */
+X    IPos best_match = NIL;  /* longest match found */
+X    int delete_point;       /* position of next string to remove */
+X    
+X    delete_point = strstart - bufsize + MAX_MATCH_LENGTH - 1;
+X    if (delete_point < 0) delete_point += MAX_DIST;
+X
+X    /* Process the input block. */
+X    do {
+X        /* Insert the string window[strstart .. strstart+strsize-1] in the
+X         * dictionary, and set cur_match to the head of the hash chain:
+X         */
+X        INSERT_STRING(strstart, cur_match);
+X
+X        if (strstart == checkpoint) {
+X            /* Find the longest match, discarding those <= start_length */
+X            match_length = 0;
+X            if (cur_match != NIL) {
+X                best_match = longest_match (cur_match);
+X                /* longest_match updates match_length if longer match found */
+X            }
+X            retcode = write_match (best_match, match_length);
+X            if (retcode != IM_OK) return retcode;
+X        }
+X
+X        /* Remove the oldest string from the dictionary, except if we have not
+X         * yet created bufsize dictionary entries. We could avoid this
+X         * deletion and check instead for obsolete pointers in
+X         * longest_match(), but this would be slower.
+X         */
+X#if (MAX_DIST & (MAX_DIST-1)) != 0
+X        if (++delete_point == MAX_DIST) delete_point = 0;
+X#else
+X        delete_point = (delete_point + 1) & (MAX_DIST-1);
+X#endif
+X        DELETE_STRING (delete_point);
+X
+X        if (++strstart == MAX_DIST) {
+X            strstart = 0, checkpoint -= MAX_DIST;
+X        }
+X    } while (--count != 0);
+X    return IM_OK;
+X}
+X#endif /* MSDOS */
+X
+X/***********************************************************************
+X *
+X * Wind up processing by flushing unprocessed input. For normal processing,
+X * this routine is called twice (by imp_size then imp_clear) and the
+X * second call does nothing. In case of error, this routine is called only
+X * by imp_clear().
+X */
+ImpErr lm_windup()
+X{
+X    ImpErr retcode;
+X    int matches;
+X
+X    /* Process the remaining input. */
+X    while (strsize > 0) {
+X       retcode = lm_process (1);
+X       if (retcode != IM_OK) return retcode;
+X       --strsize;
+X    }
+X    /* Flush the match buffer. */
+X    if ((matches = ma-ma_buf+1) != 0 && matches != 
+X        twrite ((char *) ma_buf, sizeof(MATCH), matches, fd.fd_temp)) {
+X        return IM_IOERR;
+X    }
+X    ma = ma_buf - 1;
+X    return IM_OK;
+X}
+END_OF_FILE
+if test 27597 -ne `wc -c <'im_lmat.c'`; then
+    echo shar: \"'im_lmat.c'\" unpacked with wrong size!
+fi
+# end of 'im_lmat.c'
+fi
+if test -f 'zip.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'zip.c'\"
+else
+echo shar: Extracting \"'zip.c'\" \(25825 characters\)
+sed "s/^X//" >'zip.c' <<'END_OF_FILE'
+X/*
+X
+X Copyright (C) 1990,1991 Mark Adler, Richard B. Wales, and Jean-loup Gailly.
+X Permission is granted to any individual or institution to use, copy, or
+X redistribute this software so long as all of the original files are included
+X unmodified, that it is not sold for profit, and that this copyright notice
+X is retained.
+X
+X*/
+X
+X/*
+X *  zip.c by Mark Adler.
+X */
+X
+X#include "revision.h"
+X#include "zip.h"
+X#include <signal.h>
+X
+X#define PWLEN 80        /* Input buffer size for reading encryption key */
+X#define MAXCOM 256      /* Maximum one-line comment size */
+X
+X
+X/* Local option flags */
+X#define DELETE  0
+X#define ADD     1
+X#define UPDATE  2
+X#define FRESHEN 3
+local int action = ADD; /* one of ADD, UPDATE, FRESHEN, or DELETE */
+local int comadd = 0;   /* 1=add comments for new files */
+local int zipedit = 0;  /* 1=edit zip comment and all file comments */
+local int dispose = 0;  /* 1=remove files after put in zip file */
+local int latest = 0;   /* 1=set zip file time to time of latest file */
+local ulg before = 0;   /* 0=ignore, else exclude files before this time */
+X
+X
+X/* Temporary zip file name and file pointer */
+local char *tempzip;
+local FILE *tempzf;
+X
+X
+X/* Local functions */
+X#ifdef PROTO
+X   local void freeup(void);
+X   local void leave(int);
+X   local void err(int, char *);
+X   local void handler(int);
+X   local void license(void);
+X   local void help(void);
+X   void main(int, char **);
+X#endif /* PROTO */
+X
+X
+X
+local void freeup()
+X/* Free all allocations in the found list and the zfiles list */
+X{
+X  struct flist far *f;  /* steps through found list */
+X  struct zlist far *z;  /* pointer to next entry in zfiles list */
+X
+X  for (f = found; f != NULL; f = fexpel(f))
+X    ;
+X  while (zfiles != NULL)
+X  {
+X    z = zfiles->nxt;
+X    free((voidp *)(zfiles->name));
+X    free((voidp *)(zfiles->zname));
+X    if (zfiles->ext)
+X      free((voidp *)(zfiles->extra));
+X    if (zfiles->cext && zfiles->cextra != zfiles->extra)
+X      free((voidp *)(zfiles->cextra));
+X    if (zfiles->com)
+X      free((voidp *)(zfiles->comment));
+X    farfree((voidp far *)zfiles);
+X    zfiles = z;
+X    zcount--;
+X  }
+X}
+X
+X
+local void leave(e)
+int e;                  /* exit code */
+X/* Process -o and -m options (if specified), free up malloc'ed stuff, and
+X   exit with the code e. */
+X{
+X  int r;                /* return value from trash() */
+X  ulg t;                /* latest time in zip file */
+X  struct zlist far *z;  /* pointer into zfile list */
+X
+X  /* If latest, set time to zip file to latest file in zip file */
+X  if (latest)
+X  {
+X    diag("changing time of zip file to time of latest file in it");
+X    /* find latest time in zip file */
+X    t = zfiles->tim;
+X    for (z = zfiles->nxt; z != NULL; z = z->nxt)
+X      if (t < z->tim)
+X        t = z->tim;
+X    /* set modified time of zip file to that time */
+X    stamp(zipfile, t);
+X  }
+X  if (tempath != NULL)
+X  {
+X    free((voidp *)tempath);
+X    tempath = NULL;
+X  }
+X  if (zipfile != NULL)
+X  {
+X    free((voidp *)zipfile);
+X    zipfile = NULL;
+X  }
+X
+X
+X  /* If dispose, delete all files in the zfiles list that are marked */
+X  if (dispose)
+X  {
+X    diag("deleting files that were added to zip file");
+X    if ((r = trash()) != ZE_OK)
+X      err(r, "was deleting moved files and directories");
+X  }
+X
+X
+X  /* Done! */
+X  freeup();
+X#ifdef VMS
+X  exit(0);
+X#else /* !VMS */
+X  exit(e);
+X#endif /* ?VMS */
+X}
+X
+X
+local void err(c, h)
+int c;                  /* error code from the ZE_ class */
+char *h;                /* message about how it happened */
+X/* Issue a message for the error, clean up files and memory, and exit. */
+X{
+X  if (PERR(c))
+X    perror("zip error");
+X  fprintf(stderr, "zip error: %s (%s)\n", errors[c-1], h);
+X  if (shract)
+X  {
+X    shr_clear();
+X    shract = 0;
+X  }
+X#ifndef NOIMPLODE
+X  if (impact)
+X  {
+X    imp_clear();
+X    impact = 0;
+X  }
+X#endif /* !NOIMPLODE */
+X  if (tempzf != NULL)
+X    fclose(tempzf);
+X  if (tempzip != NULL)
+X  {
+X    destroy(tempzip);
+X    if (tempzip != zipfile)
+X      free((voidp *)tempzip);
+X  }
+X  if (key != NULL)
+X    free((voidp *)key);
+X  if (tempath != NULL)
+X    free((voidp *)tempath);
+X  if (zipfile != NULL)
+X    free((voidp *)zipfile);
+X  freeup();
+X#ifdef VMS
+X  exit(0);
+X#else /* !VMS */
+X  exit(c);
+X#endif /* ?VMS */
+X}
+X
+X
+local void handler(s)
+int s;                  /* signal number (ignored) */
+X/* Upon getting a user interrupt, turn echo back on for tty and abort
+X   cleanly using err(). */
+X{
+X#ifndef MSVMS
+X#ifndef EXPORT
+X  echon();
+X#endif /* !EXPORT */
+X  putc('\n', stderr);
+X#endif /* !MSVMS */
+X  err(ZE_ABORT, "aborting");
+X  s++;                                  /* keep some compilers happy */
+X}
+X
+X
+void warn(a, b)
+char *a, *b;            /* message strings juxtaposed in output */
+X/* Print a warning message to stderr and return. */
+X{
+X  fprintf(stderr, "zip warning: %s%s\n", a, b);
+X}
+X
+X
+local void license()
+X/* Print license information to stdout. */
+X{
+X  extent i;             /* counter for copyright array */
+X
+X  for (i = 0; i < sizeof(copyright)/sizeof(char *); i++)
+X    puts(copyright[i]);
+X  for (i = 0; i < sizeof(disclaimer)/sizeof(char *); i++)
+X    puts(disclaimer[i]);
+X}
+X
+X
+local void help()
+X/* Print help (along with license info) to stdout. */
+X{
+X  extent i;             /* counter for help array */
+X
+X  /* help array */
+X  static char *text[] = {
+X"",
+X"Zip %d.%d (%s)",
+X"Usage:  zip [-options] [-b path] [-t mmddyy] zipfile list [-x list]",
+X"  the default action is to add or replace zipfile entries from list, which",
+X"  can include the special name - to read names from stdin.",
+X"  -f   freshen: only changed files  -u   update: only changed or new files",
+X"  -d   delete entries in zipfile    -m   move into zipfile (delete files)",
+X"  -k   simulate PKZIP made zipfile  -g   allow growing existing zipfile",
+X"  -h   show this help               -l   show software license",
+X"  -r   recurse into directories     -j   junk (don't record) directory names",
+X"  -i   implode only                 -s   shrink only",
+X"  -0   compress faster              -9   compress better",
+X"  -q   quiet operation              -n   don't compress special suffixes",
+X"  -c   add one-line comments        -z   add zipfile comment",
+X"  -b   use \"path\" for temp files    -t   only do files after \"mmddyy\"",
+X#ifdef EXPORT
+X"  -o   make zipfile as old as latest entry",
+X#else /* !EXPORT */
+X"  -e   encrypt  (-ee verify key)    -o   make zipfile as old as latest entry",
+X#endif /* ?EXPORT */
+X#ifdef VMS
+X"  -w   append the VMS version number to the name stored in the zip file",
+X#endif /* VMS */
+X#ifdef S_IFLNK
+X"  -y   store symbolic links as the link instead of the referenced file",
+X#endif /* !S_IFLNK */
+X"  -x   exclude the names that follow from those operated on"
+X  };
+X
+X  for (i = 0; i < sizeof(copyright)/sizeof(char *); i++)
+X    puts(copyright[i]);
+X  for (i = 0; i < sizeof(text)/sizeof(char *); i++)
+X  {
+X    printf(text[i], REVISION / 10, REVISION % 10, REVDATE);
+X    putchar('\n');
+X  }
+X}
+X
+X
+X/* Do command line expansion for MSDOS and VMS */
+X#ifdef MSVMS
+X#  define PROCNAME(n) (action==ADD||action==UPDATE?wild(n):procname(n))
+X#else /* !MSVMS */
+X#  define PROCNAME(n) procname(n)
+X#endif /* ?MSVMS */
+X
+X
+void main(argc, argv)
+int argc;               /* number of tokens in command line */
+char **argv;            /* command line tokens */
+X/* Add, update, freshen, or delete zip entries in a zip file.  See the
+X   command help in help() above. */
+X{
+X  int a;                /* attributes of zip file */
+X  ulg c;                /* start of central directory */
+X  int d;                /* true if just adding to a zip file */
+X  char *e;              /* malloc'd comment buffer */
+X  struct flist far *f;  /* steps through found linked list */
+X  int i;                /* arg counter, root directory flag */
+X  int k;                /* next argument type, marked counter,
+X                           comment size, entry count */
+X  ulg n;                /* total of entry len's */
+X  int o;                /* true if there were any ZE_OPEN errors */
+X  char *p;              /* steps through option arguments */
+X  int r;                /* temporary variable */
+X  ulg t;                /* file time, length of central directory */
+X  struct zlist far *v;  /* temporary variable */
+X  struct zlist far * far *w;    /* pointer to last link in zfiles list */
+X  FILE *x, *y;          /* input and output zip files */
+X  struct zlist far *z;  /* steps through zfiles linked list */
+X
+X
+X  /* Process arguments */
+X  diag("processing arguments");
+X  if (argc == 1)
+X  {
+X    help();
+X    exit(0);
+X  }
+X  zipfile = tempzip = NULL;
+X  tempzf = NULL;
+X  d = 0;                        /* disallow adding to a zip file */
+X  signal(SIGINT, handler);
+X  signal(SIGTERM, handler);
+X  k = 0;                        /* Next non-option argument type */
+X  for (i = 1; i < argc; i++)
+X  {
+X    if (argv[i][0] == '-')
+X      if (argv[i][1])
+X        for (p = argv[i]+1; *p; p++)
+X          switch(*p)
+X          {
+X            case '0':  case '1':  case '2':  case '3':  case '4':
+X            case '5':  case '6':  case '7':  case '8':  case '9':
+X                        /* Set the compression efficacy */
+X              level = *p - '0';  break;
+X            case 'b':   /* Specify path for temporary file */
+X              if (k != 0)
+X                err(ZE_PARMS, "use -b before zip file name");
+X              else
+X                k = 1;          /* Next non-option is path */
+X              break;
+X            case 'c':   /* Add comments for new files in zip file */
+X              comadd = 1;  break;
+X            case 'd':   /* Delete files from zip file */
+X              if (action != ADD)
+X                err(ZE_PARMS, "specify just one action");
+X              action = DELETE;
+X              break;
+X#ifndef EXPORT
+X            case 'e':   /* Encrypt */
+X              e = key == NULL ? (char *)NULL : key;
+X              if ((key = malloc(PWLEN+1)) == NULL)
+X                err(ZE_MEM, "was getting encryption password");
+X              if (getp(e == NULL ? "Enter password: " : "Verify password: ",
+X                       key, PWLEN+1) == NULL)
+X                err(ZE_PARMS, "stderr is not a tty");
+X              if (e != NULL)
+X              {
+X                r = strcmp(key, e);
+X                free((voidp *)e);
+X                if (r)
+X                  err(ZE_PARMS, "password not verified");
+X              }
+X              break;
+X#endif /* !EXPORT */
+X            case 'f':   /* Freshen zip file--overwrite only */
+X              if (action != ADD)
+X                err(ZE_PARMS, "specify just one action");
+X              action = FRESHEN;
+X              break;
+X            case 'g':   /* Allow appending to a zip file */
+X              d = 1;  break;
+X            case 'h':   /* Help */
+X              help();  break;
+X            case 'i':   /* Implode only */
+X              method = IMPLODE;  break;
+X            case 'j':   /* Junk directory names */
+X              pathput = 0;  break;
+X            case 'k':   /* Make entries using DOS names (k for Katz) */
+X              dosify = 2;  break;
+X            case 'l':   /* Show license, version */
+X              license();  break;
+X            case 'm':   /* Delete files added or updated in zip file */
+X              dispose = 1;  break;
+X            case 'n':   /* Don't compress files with a special suffix */
+X              if ((special = getenv("NOZIP")) == NULL)
+X                special = ".Z:.zip:.zoo:.arc";
+X#ifndef OS2
+X#ifdef MSDOS
+X              strupr(special);
+X#endif /* MSDOS */
+X#endif /* !OS2 */
+X              break;
+X            case 'o':   /* Set zip file time to time of latest file in it */
+X              latest = 1;  break;
+X            case 'p':   /* Store path with name */
+X              break;            /* (do nothing as annoyance avoidance) */
+X            case 'q':   /* Quiet operation */
+X              noisy = 0;  break;
+X            case 'r':   /* Recurse into subdirectories */
+X              recurse = 1;  break;
+X            case 's':   /* Shrink only */
+X              method = SHRINK;  break;
+X            case 't':   /* Exclude files earlier than specified date */
+X              if (before)
+X                err(ZE_PARMS, "can only have one -t");
+X              k = 2;  break;
+X            case 'u':   /* Update zip file--overwrite only if newer */
+X              if (action != ADD)
+X                err(ZE_PARMS, "specify just one action");
+X              action = UPDATE;
+X              break;
+X            case 'v':   /* Mention oddities in zip file structure */
+X              verbose = 1;
+X              break;
+X#ifdef VMS
+X            case 'w':   /* Append the VMS version number */
+X              vmsver = 1;  break;
+X#endif /* VMS */
+X            case 'x':   /* Exclude following files */
+X              if (k != 4 &&
+X                  (k != 3 || (action != UPDATE && action != FRESHEN)))
+X                err(ZE_PARMS, "nothing to exclude (-x) from");
+X              if (k == 3)       /* must be -u or -f */
+X                for (z = zfiles; z != NULL; z = z->nxt)
+X                  z->mark = 1;  /* mark all of them */
+X              k = 5;
+X              if ((r = exclude()) != ZE_OK)
+X                if (r == ZE_PARMS)
+X                  err(r, "cannot repeat names in zip file");
+X                else
+X                  err(r, "was processing list of files");
+X              break;
+X#ifdef S_IFLNK
+X            case 'y':   /* Store symbolic links as such */
+X              linkput = 1;  break;
+X#endif /* !S_IFLNK */
+X            case 'z':   /* Edit zip file comment */
+X              zipedit = 1;  break;
+X            default:
+X            {
+X              sprintf(errbuf, "no such option: %c", *p);
+X              err(ZE_PARMS, errbuf);
+X            }
+X          }
+X      else              /* just a dash */
+X        if (k < 3)
+X          err(ZE_PARMS, "zip file cannot be stdin");
+X        else            /* read names from stdin */
+X          while ((p = getnam(errbuf)) != NULL)
+X          {
+X            if ((r = PROCNAME(p)) != ZE_OK)
+X              if (r == ZE_MISS)
+X                warn("name not matched: ", p);
+X              else
+X                err(r, p);
+X          }
+X    else                /* not an option */
+X    {
+X      switch (k)
+X      {
+X        case 0:
+X          if ((zipfile = ziptyp(argv[i])) == NULL)
+X            err(ZE_MEM, "was processing arguments");
+X          if ((r = readzipfile()) != ZE_OK)
+X            err(r, zipfile);
+X          found = NULL;
+X          fnxt = &found;
+X          k = 3;
+X          break;
+X        case 1:
+X          if ((tempath = malloc(strlen(argv[i]) + 1)) == NULL)
+X            err(ZE_MEM, "was processing arguments");
+X          strcpy(tempath, argv[i]);
+X          k = 0;
+X          break;
+X        case 2:
+X        {
+X          int yy, mm, dd;       /* results of sscanf() */
+X
+X          if (sscanf(argv[i], "%2d%2d%2d", &mm, &dd, &yy) != 3 ||
+X              mm < 1 || mm > 12 || dd < 1 || dd > 31)
+X            err(ZE_PARMS, "invalid date entered for -t option");
+X          before = dostime(yy + (yy < 80 ? 2000 : 1900), mm, dd, 0, 0, 0);
+X          k = 0;
+X          break;
+X        }
+X        case 3:  case 4:  case 5:
+X          if ((r = PROCNAME(argv[i])) != ZE_OK)
+X            if (r == ZE_MISS)
+X              warn("name not matched: ", argv[i]);
+X            else
+X              err(r, argv[i]);
+X          if (k == 3)
+X            k = 4;
+X      }
+X    }
+X  }
+X  if (k < 3)
+X    exit(0);                    /* No zip file, don't complain */
+X  if (k != 5)                   /* Clean up selections */
+X  {
+X    if (k == 3 && (action == UPDATE || action == FRESHEN))
+X      for (z = zfiles; z != NULL; z = z->nxt)
+X        z->mark = 1;                    /* if -u or -f with no args, do all */
+X    if ((r = exclude()) != ZE_OK)       /* remove duplicates in found list */
+X      if (r == ZE_PARMS)
+X        err(r, "cannot repeat names in zip file");
+X      else
+X        err(r, "was processing list of files");
+X  }
+X  if (zcount)
+X    free((voidp *)zsort);
+X
+X
+X  /* Check option combinations */
+X  if (action == DELETE && (method != BEST || dispose || recurse ||
+X      dosify || key != NULL || comadd || zipedit))
+X    err(ZE_PARMS, "invalid option(s) used with -d");
+X  if (linkput && dosify)
+X    err(ZE_PARMS, "can't use -y with -k");
+X
+X  /* If -b not specified, make temporary path the same as the zip file */
+X#ifdef MSDOS
+X  if (tempath == NULL && ((p = strrchr(zipfile, '/')) != NULL ||
+X                          (p = strrchr(zipfile, '\\')) != NULL ||
+X                          (p = strrchr(zipfile, ':')) != NULL))
+X  {
+X    if (*p == ':')
+X      p++;
+X#else /* !MSDOS */
+X  if (tempath == NULL && (p = strrchr(zipfile, '/')) != NULL)
+X  {
+X#endif /* ?MSDOS */
+X    if ((tempath = malloc((int)(p - zipfile) + 1)) == NULL)
+X      err(ZE_MEM, "was processing arguments");
+X    r = *p;  *p = 0;
+X    strcpy(tempath, zipfile);
+X    *p = (char)r;
+X  }
+X
+X  /* If under MSDOS, force entries to look like made by PKZIP */
+X#ifndef OS2
+X#ifdef MSDOS
+X  dosify = 1;
+X#endif /* MSDOS */
+X#endif /* !OS2 */
+X
+X
+X  /* For each marked entry, if not deleting, check if it exists, and if
+X     updating or freshening, compare date with entry in old zip file.
+X     Unmark if it doesn't exist or is too old, else update marked count. */
+X  diag("stating marked entries");
+X  k = 0;                        /* Initialize marked count */
+X  for (z = zfiles; z != NULL; z = z->nxt)
+X    if (z->mark)
+X      if (action != DELETE &&
+X                ((t = filetime(z->name, (ulg *)NULL, (long *)NULL)) == 0 ||
+X                 t < before ||
+X                 ((action == UPDATE || action == FRESHEN) && t <= z->tim)))
+X      {
+X        z->mark = 0;
+X        z->trash = t && t >= before;    /* delete if -um or -fm */
+X        if (verbose)
+X          printf("zip diagnostic: %s %s\n", z->name,
+X                 z->trash ? "up to date" : "missing or early");
+X      }
+X      else
+X        k++;
+X
+X
+X  /* Remove entries from found list that do not exist or are too old */
+X  diag("stating new entries");
+X  for (f = found; f != NULL;)
+X    if (action == DELETE || action == FRESHEN ||
+X        (t = filetime(f->name, (ulg *)NULL, (long *)NULL)) == 0 ||
+X        t < before || strcmp(f->name, zipfile) == 0)
+X      f = fexpel(f);
+X    else
+X      f = f->nxt;
+X
+X
+X  /* Make sure there's something left to do */
+X  if (k == 0 && found == NULL && !(zfiles != NULL && (latest || zipedit)))
+X    if (action == UPDATE || action == FRESHEN)
+X      leave(ZE_OK);
+X    else
+X      err(ZE_NONE, zipfile);
+X  d = (d && k == 0 && zfiles != NULL);  /* d true if just appending */
+X
+X
+X  /* Before we get carried away, make sure zip file is writeable */
+X  if ((x = fopen(zipfile, zfiles == NULL ? FOPW : FOPM)) == NULL)
+X    err(ZE_CREAT, zipfile);
+X  fclose(x);
+X  a = getfileattr(zipfile);
+X  if (zfiles == NULL)
+X    destroy(zipfile);
+X
+X
+X  /* Open zip file and temporary output file */
+X  diag("opening zip file and creating temporary zip file");
+X  x = NULL;
+X  if (d)
+X  {
+X    if ((y = fopen(zipfile, FOPM)) == NULL)
+X      err(ZE_NAME, zipfile);
+X    tempzip = zipfile;
+X    tempzf = y;
+X#ifdef MSDOS
+X    {
+X      char *zipbuf;
+X
+X      zipbuf = (char *)malloc(BSZ);
+X      if (zipbuf == NULL)
+X        err(ZE_MEM, tempzip);
+X      setbuf(y, zipbuf);
+X    }
+X#endif /* MSDOS */
+X    if (fseek(y, cenbeg, SEEK_SET))
+X      err(ferror(y) ? ZE_READ : ZE_EOF, zipfile);
+X  }
+X  else
+X  {
+X    if (zfiles != NULL && (x = fopen(zipfile, FOPR)) == NULL)
+X      err(ZE_NAME, zipfile);
+X    if ((tempzip = tempname('Z')) == NULL)
+X      err(ZE_MEM, tempzip);
+X    if ((tempzf = y = fopen(tempzip, FOPW)) == NULL)
+X      err(ZE_TEMP, tempzip);
+X    if (zipbeg && (r = fcopy(x, y, zipbeg)) != ZE_OK)
+X      err(r, r == ZE_TEMP ? tempzip : zipfile);
+X  }
+X  o = 0;                                /* no ZE_OPEN errors yet */
+X
+X
+X  /* Process zip file, updating marked files */
+X  if (zfiles != NULL)
+X    diag("going through old zip file");
+X  w = &zfiles;
+X  while ((z = *w) != NULL)
+X    if (z->mark)
+X    {
+X      /* if not deleting, zip it up */
+X      if (action != DELETE)
+X      {
+X        if (noisy)
+X        {
+X          printf("updating %s", z->zname);
+X          fflush(stdout);
+X        }
+X        if ((r = zipup(z, y)) != ZE_OK && r != ZE_OPEN)
+X        {
+X          if (noisy)
+X          {
+X            putchar('\n');
+X            fflush(stdout);
+X          }
+X          sprintf(errbuf, "was zipping %s", z->name);
+X          err(r, errbuf);
+X        }
+X        if (r == ZE_OPEN)
+X        {
+X          o = 1;
+X          if (noisy)
+X          {
+X            putchar('\n');
+X            fflush(stdout);
+X          }
+X          perror("zip warning");
+X          warn("could not open for reading: ", z->name);
+X          warn("will just copy entry over: ", z->zname);
+X          if ((r = zipcopy(z, x, y)) != ZE_OK)
+X          {
+X            sprintf(errbuf, "was copying %s", z->zname);
+X            err(r, errbuf);
+X          }
+X          z->mark = 0;
+X        }
+X        w = &z->nxt;
+X      }
+X      else
+X      {
+X        if (noisy)
+X        {
+X          printf("deleting %s\n", z->zname);
+X          fflush(stdout);
+X        }
+X        v = z->nxt;                     /* delete entry from list */
+X        free((voidp *)(z->name));
+X        free((voidp *)(z->zname));
+X        if (z->ext)
+X          free((voidp *)(z->extra));
+X        if (z->cext && z->cextra != z->extra)
+X          free((voidp *)(z->cextra));
+X        if (z->com)
+X          free((voidp *)(z->comment));
+X        farfree((voidp far *)z);
+X        *w = v;
+X        zcount--;
+X      }
+X    }
+X    else
+X    {
+X      /* copy the original entry verbatim */
+X      if (!d && (r = zipcopy(z, x, y)) != ZE_OK)
+X      {
+X        sprintf(errbuf, "was copying %s", z->zname);
+X        err(r, errbuf);
+X      }
+X      w = &z->nxt;
+X    }
+X  if (x != NULL)
+X    fclose(x);
+X
+X
+X  /* Process the edited found list, adding them to the zip file */
+X  diag("zipping up new entries, if any");
+X  for (f = found; f != NULL; f = fexpel(f))
+X  {
+X    /* add a new zfiles entry and set the name */
+X    if ((z = (struct zlist far *)farmalloc(sizeof(struct zlist))) == NULL)
+X      err(ZE_MEM, "was adding files to zip file");
+X    z->nxt = NULL;
+X    z->name = f->name;
+X    f->name = NULL;
+X    z->zname = f->zname;
+X    f->zname = NULL;
+X    z->ext = z->cext = z->com = 0;
+X    z->mark = 1;
+X    /* zip it up */
+X    if (noisy)
+X    {
+X      printf("adding %s", z->zname);
+X      fflush(stdout);
+X    }
+X    if ((r = zipup(z, y)) != ZE_OK  && r != ZE_OPEN)
+X    {
+X      if (noisy)
+X      {
+X        putchar('\n');
+X        fflush(stdout);
+X      }
+X      sprintf(errbuf, "was zipping %s", z->name);
+X      err(r, errbuf);
+X    }
+X    if (r == ZE_OPEN)
+X    {
+X      o = 1;
+X      if (noisy)
+X      {
+X        putchar('\n');
+X        fflush(stdout);
+X      }
+X      perror("zip warning");
+X      warn("could not open for reading: ", z->name);
+X      free((voidp *)(z->name));
+X      free((voidp *)(z->zname));
+X      farfree((voidp far *)z);
+X    }
+X    else
+X    {
+X      *w = z;
+X      w = &z->nxt;
+X      zcount++;
+X    }
+X  }
+X  if (key != NULL)
+X  {
+X    free((voidp *)key);
+X    key = NULL;
+X  }
+X
+X
+X  /* Get one line comment for each new entry */
+X  if (comadd)
+X  {
+X    if ((e = malloc(MAXCOM + 1)) == NULL)
+X      err(ZE_MEM, "was reading comment lines");
+X    for (z = zfiles; z != NULL; z = z->nxt)
+X      if (z->mark)
+X      {
+X        if (noisy)
+X          printf("Enter comment for %s:\n", z->name);
+X        if (fgets(e, MAXCOM+1, stdin) != NULL)
+X        {
+X          if ((p = malloc((k = strlen(e))+1)) == NULL)
+X          {
+X            free((voidp *)e);
+X            err(ZE_MEM, "was reading comment lines");
+X          }
+X          strcpy(p, e);
+X          if (p[k-1] == '\n')
+X            p[--k] = 0;
+X          z->comment = p;
+X          z->com = k;
+X        }
+X      }
+X    free((voidp *)e);
+X  }
+X
+X  /* Get multi-line comment for the zip file */
+X  if (zipedit)
+X  {
+X    if ((e = malloc(MAXCOM + 1)) == NULL)
+X      err(ZE_MEM, "was reading comment lines");
+X    if (noisy && zcomlen)
+X    {
+X      puts("current zip file comment is:");
+X      fwrite(zcomment, 1, zcomlen, stdout);
+X      if (zcomment[zcomlen-1] != '\n')
+X        putchar('\n');
+X      free((voidp *)zcomment);
+X    }
+X    zcomment = malloc(1);
+X    *zcomment = 0;
+X    if (noisy)
+X      puts("enter new zip file comment (end with .):");
+X    while (fgets(e, MAXCOM+1, stdin) != NULL && strcmp(e, ".\n"))
+X    {
+X      if (e[(r = strlen(e)) - 1] == '\n')
+X        e[--r] = 0;
+X      if ((p = malloc((*zcomment ? strlen(zcomment) + 3 : 1) + r)) == NULL)
+X      {
+X        free((voidp *)e);
+X        err(ZE_MEM, "was reading comment lines");
+X      }
+X      if (*zcomment)
+X        strcat(strcat(strcpy(p, zcomment), "\r\n"), e);
+X      else
+X        strcpy(p, *e ? e : "\r\n");
+X      free((voidp *)zcomment);
+X      zcomment = p;
+X    }
+X    zcomlen = strlen(zcomment);
+X    free((voidp *)e);
+X  }
+X
+X
+X  /* Write central directory and end header to temporary zip */
+X  diag("writing central directory");
+X  k = 0;                        /* keep count for end header */
+X  if ((c = ftell(y)) == -1L)    /* get start of central */
+X    err(d ? ZE_WRITE : ZE_TEMP, tempzip);
+X  n = t = 0;
+X  for (z = zfiles; z != NULL; z = z->nxt)
+X  {
+X    if ((r = putcentral(z, y)) != ZE_OK)
+X      err(r, tempzip);
+X    n += z->len;
+X    t += z->siz;
+X    k++;
+X  }
+X  if (k == 0)
+X    warn("zip file empty", "");
+X  if (verbose)
+X    printf("total bytes=%lu, compressed=%lu -> %d%% savings\n",
+X           n, t, percent(n, t));
+X  if ((t = ftell(y)) == -1L)    /* get end of central */
+X    err(d ? ZE_WRITE : ZE_TEMP, tempzip);
+X  t -= c;                       /* compute length of central */
+X  diag("writing end of central directory");
+X  if ((r = putend(k, t, c, zcomlen, zcomment, y)) != ZE_OK)
+X    err(r, tempzip);
+X  tempzf = NULL;
+X  if (fclose(y))
+X    err(d ? ZE_WRITE : ZE_TEMP, tempzip);
+X
+X
+X  /* Replace old zip file with new zip file, leaving only the new one */
+X  if (!d)
+X  {
+X    diag("replacing old zip file with new zip file");
+X    if ((r = replace(zipfile, tempzip)) != ZE_OK)
+X    {
+X      warn("new zip file left as: ", tempzip);
+X      free((voidp *)tempzip);
+X      tempzip = NULL;
+X      err(r, "was replacing the original zip file");
+X    }
+X    free((voidp *)tempzip);
+X  }
+X  tempzip = NULL;
+X  setfileattr(zipfile, a);
+X
+X  /* Finish up (process -o, -m, clean up).  Exit code depends on o. */
+X  leave(o ? ZE_OPEN : ZE_OK);
+X}
+END_OF_FILE
+if test 25825 -ne `wc -c <'zip.c'`; then
+    echo shar: \"'zip.c'\" unpacked with wrong size!
+fi
+# end of 'zip.c'
+fi
+if test -f 'zip.doc' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'zip.doc'\"
+else
+echo shar: Extracting \"'zip.doc'\" \(22854 characters\)
+sed "s/^X//" >'zip.doc' <<'END_OF_FILE'
+X
+X
+X
+ZIP(1)              UNIX Programmer's Manual               ZIP(1)
+X
+X
+X
+NAME
+X     zip - package and compress (archive) files
+X
+SYNOPSIS
+X     zip [ -cdefghijklmnoqrsuwyz ] [ -b path ] [ -t mmddyy ] zip-
+X     file list [ -x list ]
+X
+DESCRIPTION
+X     Zip is a compression and file packaging utility for Unix,
+X     MSDOS, OS/2, and VMS.  It is analogous to a combination of
+X     tar and compress and is compatible with PKZIP (Phil Katz
+X     ZIP) for MSDOS systems.
+X
+X     There is a companion to Zip called UnZip (of course) which
+X     you should be able to find the same place you got Zip. Zip
+X     and UnZip can work with files produced by PKZIP under MSDOS,
+X     and PKZIP and PKUNZIP can work with files produced by Zip.
+X
+X     Zip puts one or more compressed files into a single "zip
+X     file" along with information about the files, including the
+X     name, path if requested, date and time last modified, pro-
+X     tection, and check information to verify the fidelity of
+X     each entry.  Zip can pack an entire directory structure in a
+X     zip file with a single command.  Compression ratios of 2:1
+X     to 3:1 are common for text files.  Zip has two compression
+X     methods, implosion and shrinking, and automatically chooses
+X     the better of the two for each file to be compressed.
+X
+X     Zip is useful for packaging a set of files to send to some-
+X     one or for distribution; for archiving or backing up files;
+X     and for saving disk space by temporarily compressing unused
+X     files or directories.
+X
+HOW TO INSTALL ZIP
+X     Zip is distributed as C source code that can be compiled on
+X     a wide range of Unix machines, VAXes running VMS, and MSDOS
+X     machines using Microsoft or Borland C++, and OS/2 machines
+X     using Microsoft C.  You will need Unzip (under Unix, MSDOS,
+X     or VMS) or PKUNZIP (under MSDOS) to unpack the distribution
+X     file, zip10.zip.
+X
+X     First, unpack the source as follows, assuming that you have
+X     zip10.zip in the current directory:
+X
+X          mkdir zipsrc
+X          cd zipsrc
+X          unzip ../zip10
+X
+X     This extracts all source files and documentation in the
+X     directory called "zipsrc". You then do:
+X
+X
+X          make system
+X
+X     where "system" is one of: bsd, bsdold, sysv, next, next10,
+X     sun, hpux, dnix, cray, 3b1, zilog, aux, convex, aix, or
+X     minix.  If you are using a NeXT running version 2.0 or
+X     greater, then make next.  If you are using 1.0, then make
+X     next10.  If you are using Sun OS 4.x, then make sun.  If you
+X     are using HPUX, then make hpux.  The other special systems
+X     are DNIX 5.2 or 5.3, Cray Unicos, AT&T 3B1 (also known as
+X     Unix PC or PC 7300), Zilog Zeus, A/UX, Convex, AIX, and
+X     MINIX.  Otherwise, if you are using BSD Unix, try bsd.  If
+X     the linker cannot find _memset or _memcpy, try bsdold.  If
+X     you are using System V Unix or SCO Unix, try sysv.  Also use
+X     sysv on a Silicon Graphics (SGI) machine.  You can also
+X     cross-compile Zip for MSDOS under SCO 386 Unix using "make
+X     scodos".
+X
+X     If none of these compiles, links, and functions properly on
+X     your Unix system, see the section BUGS below for how to get
+X     help.
+X
+X     If the appropriate system was selected, then the executable
+X     "zip" will be created.  You can move the executable "zip" to
+X     an appropriate directory in the search path using a command
+X     like:
+X
+X          mv zip ~/bin
+X
+X     or
+X
+X          mv zip /usr/local/bin
+X
+X     You can use the command "set" to see the current search
+X     path.  If you are using the C-Shell (csh), enter the com-
+X     mand:
+X
+X          rehash
+X
+X     so csh can find the new command in the path.  You are now
+X     ready to use Zip.
+X
+X     You can also move the manual page (the raw form of what
+X     you're reading) to where the Unix man command can find it
+X     (assuming you have the necessary privileges):
+X
+X          mv zip.1 /usr/man/man1
+X
+X     You can get rid of the now unnecessary source and object
+X     files with:
+X
+X          cd ..
+X          rm -r zipsrc
+X
+X     This will remove the directory zip and its contents created
+X     by unzip.  You should keep the zip10.zip file around though,
+X     in case you need to build it again or want to give it to a
+X     colleague.
+X
+X     The steps for installation under MSDOS, OS/2, and VMS are
+X     similar to the above: first unzip the distribution files
+X     into their own directory.  Then under MSDOS do one of:
+X
+X          make makefile.msc
+X          make -fmakefile.bor
+X
+X
+X     for Microsoft or Borland C++, respectively.  Under OS/2:
+X
+X          nmake -f makefile.os2
+X
+X     for Microsoft C 6.00.  Under VAX VMS:
+X
+X
+X          @makevms
+X
+X     The installation process will also compile and link several
+X     other utilities.  They are zipcloak for encrypting and
+X     decrypting zip files, zipnote for editing zip file comments,
+X     zipsplit for splitting a zip file into several zip files,
+X     and ship for sending zip files or any other binary file via
+X     electronic mail.  For command help on any of the zip* utili-
+X     ties, simply enter the name with no arguments.  For help
+X     with ship, enter "ship -h".
+X
+HOW TO USE ZIP
+X     The simplest use of Zip is as follows:
+X
+X          zip stuff *
+X
+X     This will create the file "stuff.zip" (assuming it does not
+X     exist) and put all the files in the current directory in
+X     stuff.zip in a compressed form.  The .zip suffix is added
+X     automatically, unless that file name given contains a dot
+X     already.  This allows specifying suffixes other than ".zip".
+X
+X     Because of the way the shell does filename substitution,
+X     files that start with a "." are not included.  To include
+X     those as well, you can:
+X
+X          zip stuff .* *
+X
+X     Even this will not include any subdirectories that are in
+X     the current directory.  To zip up an entire directory, the
+X     command:
+X
+X          zip -r foo foo
+X
+X     will create the file "foo.zip" containing all the files and
+X     directories in the directory "foo" that is in the current
+X     directory.  The "r" option means recurse through the direc-
+X     tory structure.  In this case, all the files and directories
+X     in foo are zipped, including the ones that start with a ".",
+X     since the recursion does not use the shell's file-name sub-
+X     stitution.  You should not use -r with the name ".*", since
+X     that matches ".." which will attempt to zip up the parent
+X     directory--probably not what was intended.
+X
+X     You may want to make a zip file that contains the files in
+X     foo, but not record the directory name, foo.  You can use
+X     the -j (junk path) option to leave off the path:
+X
+X          zip -j foo foo/*
+X
+X     The -y option (only under Unix) will store symbolic links as
+X     such in the zip file, instead of compressing and storing the
+X     file referred to in the link.
+X
+X     You might be zipping to save disk space, in which case you
+X     could:
+X
+X          zip -rm foo foo
+X
+X     where the "m" option means "move".  This will delete foo and
+X     its contents after making foo.zip.  No deletions will be
+X     done until the zip has completed with no errors.  This
+X     option is obviously more dangerous and should be used with
+X     care.
+X
+X
+X     If the zip file already exists, these commands will replace
+X     existing or add new entries to the zip file.  For example,
+X     if you were really short on disk space, you might not have
+X     enough room simultaneously to hold the directory foo and the
+X     compressed foo.zip.  In this case, you could do it in steps.
+X     If foo contained the subdirectories tom, dick, and harry,
+X     then you could:
+X
+X          zip -rm foo foo/tom
+X          zip -rm foo foo/dick
+X          zip -rm foo foo/harry
+X
+X     where the first command would create foo.zip, and the next
+X     two would add to it.  At the completion of each zip command,
+X     the directory just zipped would be deleted, making room in
+X     which the next Zip command could work.
+X
+MODIFYING EXISTING ZIP FILES
+X     When given the name of an existing zip file with the above
+X     commands, Zip will replace identically named entries in the
+X     Zip file or add entries for new names.  For example, if
+X     foo.zip exists and contains foo/file1 and foo/file2, and the
+X     directory foo contains the files foo/file1 and foo/file3,
+X     then:
+X
+X          zip -r foo foo
+X
+X     will replace foo/file1 in foo.zip and add foo/file3 to
+X     foo.zip.  After this, foo.zip contains foo/file1, foo/file2,
+X     and foo/file3, with foo/file2 unchanged from before.
+X
+X     When changing an existing zip file, Zip will write a tem-
+X     porary file with the new contents, and only replace the old
+X     one when the zip has completed with no errors.  Also, the
+X     two methods, shrink and implode, create temporary files that
+X     are deleted after each file is zipped.  You can use the -b
+X     option to specify a different path (usually a different dev-
+X     ice) to put the temporary files in.  For example:
+X
+X          zip -b /tmp stuff *
+X
+X     will put the temporary zip file and the temporary compres-
+X     sion files in the directory "/tmp", copying over stuff.zip
+X     in the current directory when done.
+X
+X     If you are only adding entries to a zip file, not replacing,
+X     and the -g option is given, then Zip grows (appends to) the
+X     file instead of copying it.  The danger of this is that if
+X     the operation fails, the original zip file is corrupted and
+X     lost.
+X
+X     There are two other ways to change or add entries in a zip
+X     file that are restrictions of simple addition or replace-
+X     ment.  The first is -u (update) which will add new entries
+X     to the zip file as before but will replace existing entries
+X     only if the modified date of the file is more recent than
+X     the date recorded for that name in the zip file.  For exam-
+X     ple:
+X
+X          zip -u stuff *
+X
+X     will add any new files in the current directory, and update
+X     any changed files in the zip file stuff.zip.  Note that Zip
+X     will not try to pack stuff.zip into itself when you do this.
+X     Zip will always exclude the zip file from the files on which
+X     to be operated.
+X
+X     The second restriction is -f (freshen) which, like update,
+X     will only replace entries with newer files; unlike update,
+X     will not add files that are not already in the zip file.
+X     For this option, you may want to simply freshen all of the
+X     files that are in the specified zip file.  To do this you
+X     would simply:
+X
+X          zip -f foo
+X
+X     Note that the -f option with no arguments freshens all the
+X     entries in the zip file.  The same is true of -u, and hence
+X     "zip -u foo" and "zip -f foo" both do the same thing.
+X
+X     This command should be run from the same directory from
+X     which the original zip command was run, since paths stored
+X     in zip files are always relative.
+X
+X     Another restriction that can be used with adding, updating,
+X     or freshening is -t (time), which will not operate on files
+X     modified earlier than the specified date.  For example:
+X
+X          zip -rt 120791 infamy foo
+X
+X     will add all the files in foo and its subdirectories that
+X     were last modified on December 7, 1991, or later to the zip
+X     file infamy.zip.
+X
+X     Also, files can be explicitly excluded using the -x option:
+X
+X          zip -r foo foo -x \*.o
+X
+X     which will zip up the contents of foo into foo.zip but
+X     exclude all the files that end in ".o".  Here the backslash
+X     causes Zip to match file names that were found when foo was
+X     searched.
+X
+X     The last operation is -d (delete) which will remove entries
+X     from a zip file.  An example might be:
+X
+X          zip -d foo foo/tom/junk foo/harry/\* \*.o
+X
+X     which will remove the entry foo/tom/junk, all of the files
+X     that start with "foo/harry/", and all of the files that end
+X     with ".o" (in any path).  Note that once again, the shell
+X     expansion has been inhibited with backslashes, so that Zip
+X     can see the asterisks. Zip can then match on the contents of
+X     the zip file instead of the contents of the current direc-
+X     tory.
+X
+X     Under MSDOS, -d is case sensitive when it matches names in
+X     the zip file.  This allows deleting names that were zipped
+X     on other systems, but requires that the names be entered in
+X     upper case if they were zipped on an MSDOS system, so that
+X     the names can be found in the zip file and deleted.
+X
+MORE OPTIONS
+X     As mentioned before, Zip will use the best of two methods:
+X     shrink or implode.  Usually implode is better, but sometimes
+X     shrink is better, especially for smaller files.  Sometimes
+X     neither method produces a packed version smaller than the
+X     original file, in which case it is stored in the zip file
+X     with no compression (called the "store" method).
+X
+X     The option -s (shrink) will force Zip always to use shrink
+X     or store, and the -i (implode) option forces Zip to use
+X     implode or store.  Shrinking is faster than imploding, and
+X     so -s might be used when speed is more important than
+X     optimal compression.  Implode only (-i) might be used when
+X     the unzipper for which the zip file is destined can only
+X     handle implosion.  An example of this is the PKSFXjr program
+X     that comes with PKZIP.  Also, -i is slightly faster than
+X     imploding and shrinking at the same time.  For example:
+X
+X          zip -rs foo foo
+X
+X     will zip up the directory foo into foo.zip using only shrink
+X     or store.  The speed of implosion can also be controlled
+X     with options -0 (fastest method but less compression) to -9
+X     (best compression but slower). The default value is -5. For
+X     example:
+X
+X          zip -r0 foo foo
+X
+X     In nearly all cases, a file that is already compressed can-
+X     not be compressed further by Zip, or if it can, the effect
+X     is minimal.  The -n option prevents Zip from trying to
+X     compress files that have the suffixes: .Z, .zip, .zoo, or
+X     .arc.  Such files are simply stored (0% compression) in the
+X     output zip file, so that Zip doesn't waste its time trying
+X     to compress them.  If the environment variable NOZIP is set,
+X     then the suffixes listed there are used instead of the
+X     default list.  The suffixes are separated by either colons
+X     or semicolons.  For example, in Unix csh:
+X
+X          setenv NOZIP .Z:.zip:.tiff:.gif:.snd
+X          zip -rn foo foo
+X
+X     will put everything in foo into foo.zip, but will store any
+X     files that end in .Z, .zip, .tiff, .gif, or .snd without
+X     trying to compress them.  (Image and sound files often have
+X     their own specialized compression methods.)  If the environ-
+X     ment variable NOZIP exists but is empty or contains just a
+X     colon or semicolon, then zip -n will store all the entries
+X     and do no compression.
+X
+X     Under Unix and under OS/2 (if files from a HPFS are stored),
+X     Zip will store the full path (relative to the current path)
+X     and name of the file (or just the name if -j is specified)
+X     in the zip file along with the Unix attributes, and it will
+X     mark the entry as made under Unix.  If the zip file is
+X     intended for PKUNZIP under MSDOS, then the -k (Katz) option
+X     should be used to attempt to convert the names and paths to
+X     conform to MSDOS, store only the MSDOS attribute (just the
+X     user write attribute from Unix), and mark the entry as made
+X     under MSDOS (even though it wasn't).
+X
+X     The -o (older) option will set the "last modified" time of
+X     the zip file to the latest "last modified" time of the
+X     entries in the zip file.  This can be used without any other
+X     operations, if desired.  For example:
+X
+X          zip -o foo
+X
+X
+X     will change the last modified time of foo.zip to the latest
+X     time of the entries in foo.zip.
+X
+X     The -e and -c options operate on all files updated or added
+X     to the zip file.  Encryption (-e) will prompt for a password
+X     on the terminal and will not echo the password as it is
+X     typed (if stderr is not a TTY, Zip will exit with an error).
+X     New zip entries will be encrypted using that password.  For
+X     added peace of mind, you can use -ee, which will prompt for
+X     the password twice, checking that the two are the same
+X     before using it.
+X
+X     One-line comments can be added for each file with the -c
+X     option.  The zip file operations (adding or updating) will
+X     be done first, and you will then be prompted for a one-line
+X     comment for each file.  You can then enter the comment fol-
+X     lowed by return, or just return for no comment.
+X
+X     The -z option will prompt you for a multi-line comment for
+X     the entire zip file.  This option can be used by itself, or
+X     in combination with other options.  The comment is ended by
+X     a line containing just a period, or an end of file condition
+X     (^D on Unix, ^Z on MSDOS, OS/2, and VAX/VMS).  Since -z
+X     reads the lines from stdin, you can simply take the comment
+X     from a file:
+X
+X          zip -z foo < foowhat
+X
+X     The -q (quiet) option eliminates the informational messages
+X     and comment prompts while Zip is operating.  This might be
+X     used in shell scripts, for example, or if the zip operation
+X     is being performed as a background task ("zip -q foo *.c
+X     &").
+X
+X     Zip can take a list of file names to operate on from stdin
+X     using the - option.  In Unix, this option can be used with
+X     the find command to extend greatly the functionality of Zip.
+X     For example, to zip up all the C source files in the current
+X     directory and its subdirectories, you can:
+X
+X          find . -type f -name "*.[ch]" -print | zip source -
+X
+X     Note that the pattern must be quoted to keep the shell from
+X     expanding it.
+X
+X     Under VMS only, the -w option will append the version number
+X     of the files to the name and zip up multiple versions of
+X     files.  Without -w, Zip will only use the most recent ver-
+X     sion of the specified file(s).
+X
+X     If Zip is run with no arguments or with the -h option, the
+X     license and the command-argument and option help is shown.
+X     The -l option just shows the license.
+X
+ABOUT PATTERN MATCHING
+X     (Note: this section applies to Unix.  Watch this space for
+X     details on MSDOS and VMS operation.)
+X
+X     The Unix shell (sh or csh) does filename substitution on
+X     command arguments.  The special characters are ?, which
+X     matches any single character; * which matches any number of
+X     characters (including none); and [] which matches any char-
+X     acter in the range inside the brackets (like [a-f] or
+X     [0-9]).  When these characters are encountered (and not
+X     escaped with a backslash or quotes), the shell will look for
+X     files relative to the current path that match the pattern,
+X     and replace the argument with a list of the names that
+X     matched.
+X
+X     Zip can do the same matching on names that are in the zip
+X     file being modified or, in the case of the -x (exclude)
+X     option, on the list of files to be operated on, by using
+X     backslashes or quotes to tell the shell not to do the name
+X     expansion.  In general, when Zip encounters a name in the
+X     list of files to do, it first looks for the name in the file
+X     system.  If it finds it, it then adds it to the list of
+X     files to do.  If it does not find it, it will look for the
+X     name in the zip file being modified (if it exists), using
+X     the pattern matching characters above, if any.  For each
+X     match, it will add that name to the list of files to do.
+X     After -x (exclude), the names are removed from the to-do
+X     list instead of added.
+X
+X     The pattern matching includes the path, and so patterns like
+X     \*.o match names that end in ".o", no matter what the path
+X     prefix is.  Note that the backslash must precede every spe-
+X     cial character (i.e. ?*[]), or the entire argument must be
+X     enclosed in double quotes ("").
+X
+X     In general, using backslash to make Zip do the pattern
+X     matching is used with the -f (freshen) and -d (delete)
+X     options, and sometimes after the -x (exclude) option when
+X     used with any operation (add, -u, -f, or -d).  Zip will
+X     never use pattern matching to search the file system.  If
+X     Zip has recursed into a directory, all files (and all direc-
+X     tories) in there are fair game.
+X
+COPYRIGHT
+X     Copyright (C) 1990,1991 Mark Adler, Richard B. Wales, and
+X     Jean-loup Gailly.  Permission is granted to any individual
+X     or institution to use, copy, or redistribute this software
+X     so long as all of the original files are included unmodi-
+X     fied, that it is not sold for profit, and that this copy-
+X     right notice is retained.
+X
+ACKNOWLEDGEMENTS
+X     Thanks to R. P. Byrne for his Shrink.Pas program which
+X     inspired this project, and from which the shrink algorithm
+X     was stolen; to Phil Katz for making the zip file format,
+X     compression format, and .ZIP filename extension all public
+X     domain; to Keith Petersen for providing a mailing list and
+X     ftp site for the INFO-ZIP group to use; and most impor-
+X     tantly, to the INFO-ZIP group itself (listed in the file
+X     infozip.who) without whose tireless testing and bug-fixing
+X     efforts a portable Zip would not have been possible.
+X     Finally we should thank (blame) the INFO-ZIP moderator,
+X     David Kirschbaum for getting us into this mess in the first
+X     place.
+X
+SEE ALSO
+X     unzip(1), tar(1), compress(1)
+X
+BUGS
+X     Versions of PKUNZIP before 1.1 have a bug that on rare occa-
+X     sions will prevent it from unzipping files produced by Zip
+X     or PKZIP 1.1.  If you experience such problems, we recommend
+X     that you get PKUNZIP 1.1 or the portable Unzip, neither of
+X     which have this problem.
+X
+X     Under MSDOS, Zip will find hidden and system files, but not
+X     set the attributes appropriately in the zip file so that
+X     Unzip can restore them.  This will be fixed in the next
+X     version.
+X
+X     Under VMS, not all of the odd file formats are treated prop-
+X     erly.  Only stream-LF format zip files are expected to work
+X     with Zip.  Others can be converted using Rahul Dhesi's BILF
+X     program.  The next version of Zip will handle some of the
+X     conversion internally.
+X
+X     LIKE ANYTHING ELSE THAT'S FREE, ZIP AND ITS ASSOCIATED UTIL-
+X     ITIES ARE PROVIDED AS IS AND COME WITH NO WARRANTY OF ANY
+X     KIND, EITHER EXPRESSED OR IMPLIED. IN NO EVENT WILL THE
+X     COPYRIGHT HOLDERS BE LIABLE FOR ANY DAMAGES RESULTING FROM
+X     THE USE OF THIS SOFTWARE.
+X
+X     That having been said, please send any problems or comments
+X     via email to the Internet address zip-bugs@cs.ucla.edu.  For
+X     bug reports, please include the version of Zip, the make
+X     options you used to compile it, the machine and operating
+X     system you are using, and as much additional information as
+X     possible.  Thank you for your support.
+X
+END_OF_FILE
+if test 22854 -ne `wc -c <'zip.doc'`; then
+    echo shar: \"'zip.doc'\" unpacked with wrong size!
+fi
+# end of 'zip.doc'
+fi
+echo shar: End of archive 4 \(of 7\).
+cp /dev/null ark4isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 7 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

@@ -1,0 +1,2011 @@
+Subject:  v12i038:  C News alpha release, Part13/14
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rs@uunet.UU.NET
+
+Submitted-by: utzoo!henry (Henry Spencer)
+Posting-number: Volume 12, Issue 38
+Archive-name: cnews/part13
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 13 (of 14)."
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'expire/expire.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'expire/expire.c'\"
+else
+echo shar: Extracting \"'expire/expire.c'\" \(20350 characters\)
+sed "s/^X//" >'expire/expire.c' <<'END_OF_FILE'
+X/*
+X * expire - expire old news
+X *
+X * One modest flaw:  links are not preserved in archived copies, i.e. you
+X * get multiple copies of multiply-posted articles.  Since link preservation
+X * is arbitrarily hard when control files get complex, to hell with it.
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <string.h>
+X#include <errno.h>
+X#include <time.h>
+X#include <sys/types.h>
+X#include <sys/timeb.h>
+X#include <sys/stat.h>
+X#include "news.h"
+X#include "newspaths.h"
+X
+X#ifndef EPOCH
+X#define	EPOCH	((time_t)0)
+X#endif
+X
+X
+X/* structure for dbm */
+Xtypedef struct {
+X	char *dptr;
+X	int dsize;
+X} datum;
+X
+X#define	DAY	(24L*60L*60L)
+X
+X/* structure for expiry-control lists */
+Xstruct ctl {
+X	struct ctl *next;
+X	char *groups;		/* newsgroups */
+X	int ismod;		/* moderated? */
+X#		define	UNMOD	'u'
+X#		define	MOD	'm'
+X#		define	EITHER	'x'
+X	time_t retain;		/* earliest arrival date not expired */
+X	time_t normal;		/* earliest not expired in default case */
+X	time_t purge;		/* latest arrival date always expired */
+X	char *dir;		/* Archive dir or NULL. */
+X};
+X
+X/* header for internal form of control file */
+Xstruct ctl *ctls = NULL;
+Xstruct ctl *lastctl = NULL;
+X
+X/*
+X * Headers for lists by newsgroup, derived (mostly) from active file.
+X * Hashing is by length of newsgroup name; this is quick and works well,
+X * and there is no simple variation that does much better.
+X */
+X#define	NHASH	80
+Xstruct ctl *ngs[NHASH] = { NULL };
+X
+Xint debug = 0;			/* for inews routines */
+Xint expdebug = 0;		/* expire debugging */
+X
+Xint printexpiring = 0;		/* print info line for expiring articles? */
+Xchar *defarch = NULL;		/* default archive dir */
+X
+Xint fourfields = 0;		/* old 4-field C news history file? */
+X
+Xchar dont[] = "don't";		/* magic cookie for checkexpire() return */
+X
+Xtime_t now;
+Xstruct timeb ftnow;		/* ftime() result for getdate() */
+X
+Xchar subject[MAXLINE] = "";	/* buffer for subject line, minus header */
+X
+X/*
+X * Archive-copying buffer.
+X * 8KB buffer is large enough to take most articles at one gulp,
+X * and also large enough for virtual certainty of getting the
+X * Subject: line in the first bufferload.
+X */
+Xchar abuf[8*1024];
+X
+Xchar *progname;
+X
+Xextern int errno;
+Xextern long atol();
+Xextern double atof();
+Xextern char *malloc();
+Xextern struct tm *gmtime();
+Xextern time_t time();
+X
+Xextern time_t getdate();
+X
+X/* forwards */
+XFILE *eufopen();
+Xchar *enstring();
+Xchar *checkexpire();
+Xtime_t back();
+Xvoid checkdir();
+Xvoid errunlock();
+Xvoid control();
+Xvoid prime();
+Xvoid doit();
+Xvoid cd();
+Xvoid process();
+Xvoid warning();
+Xvoid printstuff();
+Xvoid expire();
+Xvoid mkparents();
+Xvoid getsubj();
+Xvoid refill();
+Xvoid printlists();
+Xvoid pctl();
+Xvoid fillin();
+Xvoid ctlline();
+X
+X/*
+X - main - parse arguments and handle options
+X */
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	register int c;
+X	register int errflg = 0;
+X	register struct ctl *ct;
+X	register FILE *cf;
+X	extern int optind;
+X	extern char *optarg;
+X
+X	progname = argv[0];
+X	now = time((time_t *)NULL);
+X	ftime(&ftnow);
+X
+X	while ((c = getopt(argc, argv, "pa:od")) != EOF)
+X		switch (c) {
+X		case 'p':	/* print info line for archived articles */
+X			printexpiring = 1;
+X			break;
+X		case 'a':	/* archive in this directory */
+X			defarch = optarg;
+X			break;
+X		case 'o':	/* old 4-field history file */
+X			fourfields = 1;
+X			break;
+X		case 'd':	/* debug */
+X			expdebug = 1;
+X			break;
+X		case '?':
+X		default:
+X			errflg++;
+X			break;
+X		}
+X	if (errflg || optind < argc-1) {
+X		fprintf(stderr, "Usage: %s [-p] [-a archdir] [ctlfile]\n",
+X								progname);
+X		exit(2);
+X	}
+X
+X	if (optind < argc) {
+X		cf = eufopen(argv[optind], "r");
+X		control(cf);
+X		fclose(cf);
+X	} else
+X		control(stdin);
+X
+X	prime(ctlfile("active"));
+X
+X	if (defarch != NULL)
+X		checkdir(defarch);
+X
+X	if (expdebug)
+X		printlists();
+X
+X	(void) umask(newsumask());
+X	doit();			/* side effect: newslock() */
+X	newsunlock();
+X	exit(0);
+X}
+X
+X/*
+X - control - pick up a control file
+X */
+Xvoid
+Xcontrol(f)
+Xregister FILE *f;
+X{
+X	char ctl[MAXLINE];
+X	void ctlline();
+X
+X	while (fgets(ctl, sizeof(ctl), f) != NULL) {
+X		ctl[strlen(ctl)-1] = '\0';	/* get rid of newline */
+X		ctlline(ctl);
+X	}
+X}
+X
+X/*
+X - ctlline - process one control-file line
+X */
+Xvoid
+Xctlline(ctl)
+Xchar *ctl;
+X{
+X	register struct ctl *ct;
+X	char *field[4];
+X	char datebuf[50];
+X	char *dates[3];
+X	register int nf;
+X	int ndates;
+X
+X	errno = 0;
+X	ct = (struct ctl *)malloc(sizeof(struct ctl));
+X	if (ct == NULL)
+X		errunlock("out of memory for control list", "");
+X
+X	errno = 0;
+X	nf = split(ctl, field, 4, "\t ");
+X	if (nf != 4)
+X		errunlock("bad control line: `%s...'", ctl);
+X
+X	ct->groups = enstring(field[0]);
+X	if (STREQ(field[1], "m"))
+X		ct->ismod = MOD;
+X	else if (STREQ(field[1], "u"))
+X		ct->ismod = UNMOD;
+X	else if (STREQ(field[1], "x"))
+X		ct->ismod = EITHER;
+X	else
+X		errunlock("strange mod field `%s' in control file", field[1]);
+X
+X	if (strlen(field[2]) > sizeof(datebuf)-1)
+X		errunlock("date specification `%s' too long", field[2]);
+X	(void) strcpy(datebuf, field[2]);
+X	ndates = split(datebuf, dates, 3, "-");
+X	switch (ndates) {
+X	case 3:
+X		ct->retain = back(atof(dates[0]));
+X		ct->normal = back(atof(dates[1]));
+X		ct->purge = back(atof(dates[2]));
+X		break;
+X	case 2:
+X		ct->retain = back(0.0);
+X		ct->normal = back(atof(dates[0]));
+X		ct->purge = back(atof(dates[1]));
+X		break;
+X	case 1:
+X		ct->retain = back(0.0);
+X		ct->normal = back(atof(dates[0]));
+X		ct->purge = EPOCH;
+X		break;
+X	default:
+X		errunlock("date processing foulup in `%s'", field[1]);
+X		/* NOTREACHED */
+X		break;
+X	}
+X	if (ct->retain < ct->normal || ct->normal < ct->purge)
+X		errunlock("preposterous dates: `%s'", field[2]);
+X
+X	if (STREQ(field[3], "-"))
+X		ct->dir = NULL;
+X	else if (STREQ(field[3], "@")) {
+X		if (defarch == NULL)
+X			errunlock("@ in control file but no -a", "");
+X		ct->dir = defarch;
+X	} else {
+X		ct->dir = enstring(field[3]);
+X		checkdir(ct->dir);
+X	}
+X
+X	/* put on end of list */
+X	ct->next = NULL;
+X	if (lastctl == NULL)
+X		ctls = ct;
+X	else
+X		lastctl->next = ct;
+X	lastctl = ct;
+X}
+X
+X/*
+X - prime - prime control lists from active file
+X */
+Xvoid
+Xprime(afile)
+Xchar *afile;
+X{
+X	char buf[MAXLINE];
+X	register FILE *af;
+X	register struct ctl *ct;
+X#	define	NFACT	4
+X	char *field[NFACT];
+X	int nf;
+X	register int hash;
+X	void fillin();
+X
+X	af = eufopen(afile, "r");
+X	while (fgets(buf, sizeof(buf), af) != NULL) {
+X		nf = split(buf, field, NFACT, " \t");
+X		if (nf != NFACT)
+X			errunlock("bad active-file line for `%s'", field[0]);
+X		ct = (struct ctl *)malloc(sizeof(struct ctl));
+X		if (ct == NULL)
+X			errunlock("out of memory at newsgroup `%s'", field[0]);
+X		ct->groups = enstring(field[0]);
+X		ct->ismod = (strchr(field[3], 'm') != NULL) ? MOD : UNMOD;
+X		fillin(ct);
+X		hash = strlen(field[0]);
+X		if (hash > NHASH-1)
+X			hash = NHASH-1;
+X		ct->next = ngs[hash];
+X		ngs[hash] = ct;
+X	}
+X	(void) fclose(af);
+X}
+X
+X/*
+X - fillin - fill in a ctl struct for a newsgroup from the control-file list
+X */
+Xvoid
+Xfillin(ct)
+Xregister struct ctl *ct;
+X{
+X	register struct ctl *cscan;
+X
+X	for (cscan = ctls; cscan != NULL; cscan = cscan->next)
+X		if (ngmatch(cscan->groups, ct->groups) &&
+X				(cscan->ismod == ct->ismod ||
+X						cscan->ismod == EITHER)) {
+X			ct->retain = cscan->retain;
+X			ct->normal = cscan->normal;
+X			ct->purge = cscan->purge;
+X			ct->dir = cscan->dir;
+X			return;
+X		}
+X
+X	/* oooooops... */
+X	errunlock("group `%s' not covered by control file", ct->groups);
+X}
+X
+X/*
+X - doit - file manipulation and master control
+X */
+Xvoid
+Xdoit()
+X{
+X	register int old;
+X	register FILE *new;
+X	struct stat stbuf;
+X	char buf[MAXLINE];
+X	char name[MAXLINE];
+X	long here;
+X	register char *nameend;
+X	datum lhs;
+X	datum rhs;
+X	register int ret;
+X
+X	cd(ctlfile((char *)NULL));
+X	old = open("history", 0);
+X	if (old < 0)
+X		errunlock("cannot open `%s'", "history");
+X	errno = 0;
+X	if (stat("history.n", &stbuf) >= 0)
+X		errunlock("disaster -- history.n already exists!", "");
+X	new = eufopen("history.n", "w");
+X	fclose(eufopen("history.n.dir", "w"));
+X	fclose(eufopen("history.n.pag", "w"));
+X	if (dbminit("history.n") < 0)
+X		errunlock("dbminit(history.n) failed", "");
+X
+X	cd(artfile((char *)NULL));
+X	while (readline(buf, sizeof(buf), old) >= 0) {
+X		process(buf);
+X		if (buf[0] != '\0') {
+X			register char *p;
+X
+X			/* extract the message-id, lowercase it */
+X			(void) strcpy(name, buf);
+X			nameend = strchr(name, '\t');
+X			if (nameend == NULL) {
+X				errno = 0;
+X				errunlock("bad return from process(): `%s'",
+X									name);
+X			}
+X			*nameend = '\0';
+X			for (p = name; *p != '\0'; p++)
+X				if (isascii(*p) && isupper(*p))
+X					*p = tolower(*p);
+X
+X			/* make the DBM entry */
+X			lhs.dptr = name;
+X			lhs.dsize = strlen(name)+1;
+X			here = ftell(new);
+X			rhs.dptr = (char *)&here;
+X			rhs.dsize = sizeof(here);
+X			errno = 0;
+X			ret = store(lhs, rhs);
+X			if (ret < 0)
+X				errunlock("dbm failure on `%s'", name);
+X
+X			/* and the history entry */
+X			fputs(buf, new);
+X			putc('\n', new);
+X		}
+X	}
+X	/* side effect of readline() < 0:  newslock() */
+X
+X	close(old);
+X	fclose(new);
+X
+X	cd(ctlfile((char *)NULL));
+X	(void) unlink("history.o");
+X	if (link("history", "history.o") < 0)
+X		errunlock("can't move history", "");
+X	if (unlink("history") < 0)
+X		errunlock("can't finish moving history", "");
+X	if (link("history.n", "history") < 0)
+X		errunlock("disaster -- can't reinstate history!", "");
+X	if (unlink("history.n") < 0)
+X		errunlock("disaster -- can't unlink history.n!", "");
+X	if (unlink("history.dir") < 0)
+X		errunlock("disaster -- can't unlink history.dir!", "");
+X	if (unlink("history.pag") < 0)
+X		errunlock("disaster -- can't unlink history.pag!", "");
+X	if (link("history.n.dir", "history.dir") < 0)
+X		errunlock("disaster -- can't reinstate history.dir!", "");
+X	if (link("history.n.pag", "history.pag") < 0)
+X		errunlock("disaster -- can't reinstate history.pag!", "");
+X	if (unlink("history.n.dir") < 0)
+X		errunlock("disaster -- can't unlink history.n.dir!", "");
+X	if (unlink("history.n.pag") < 0)
+X		errunlock("disaster -- can't unlink history.n.pag!", "");
+X}
+X
+X/*
+X - process - handle one history line, modifying it if appropriate
+X *
+X * The line as supplied is modified if necessary, so that whatever
+X * is in that buffer when process() returns is what should be written
+X * to the new history file.  An empty string ("") means "write nothing".
+X */
+Xvoid
+Xprocess(line)
+Xchar *line;
+X{
+X	char work[MAXLINE];
+X#	define	NF	4	/* number of fields in history line */
+X	char *field[NF];
+X	register int nf;
+X	char keepnames[MAXLINE];
+X#	define	NN	50	/* number of pathnames for article */
+X	char *names[NN];
+X	register int nn;
+X	register char *dir;
+X	time_t recdate;
+X	time_t expdate;
+X	register int i;
+X	register char *scan;
+X	char delim;
+X
+X	if (expdebug)
+X		fprintf(stderr, "\nprocess(%s)\n", line);
+X	(void) strcpy(work, line);
+X	nf = split(work, field, NF, "\t");
+X	if (!fourfields && nf == NF-1) {
+X		field[3] = field[2];
+X		scan = strchr(field[1], '~');
+X		if (scan == NULL)
+X			errunlock("bad date format `%s'", field[1]);
+X		*scan++ = '\0';
+X		field[2] = scan;
+X		nf++;
+X	}
+X	if (nf != NF) {
+X		errno = 0;
+X		warning("invalid history line: `%s'", line);
+X		return;		/* leaving the line in the new history file */
+X	}
+X	if (strspn(field[1], "0123456789") == strlen(field[1]))
+X		recdate = atol(field[1]);
+X	else
+X		recdate = getdate(field[1], &ftnow);
+X	if (strspn(field[2], "0123456789") == strlen(field[2]))
+X		expdate = atol(field[2]);
+X	else if (!STREQ(field[2], "-") && !STREQ(field[2], "X"))
+X		expdate = getdate(field[2], &ftnow);
+X	else
+X		expdate = 0;	/* any old value */
+X	if (expdebug)
+X		fprintf(stderr, "rec %ld, expire %ld\n", recdate, expdate);
+X
+X	nn = split(field[3], names, NN, " ,");
+X	if (nn > NN) {
+X		errno = 0;
+X		warning("too many cross-postings in line `%s'", line);
+X		return;		/* leaving line in history file */
+X	}
+X
+X	keepnames[0] = '\0';
+X	for (i = 0; i < nn; i++) {
+X		if (expdebug)
+X			fprintf(stderr, "link %s\n", names[i]);
+X		dir = checkexpire(field, recdate, expdate, names[i]);
+X		if (dir != dont) {
+X			if (expdebug)
+X				fprintf(stderr, "expire into %s\n",
+X					(dir == NULL) ? "(null)" : dir);
+X			for (scan = strchr(names[i], '.'); scan != NULL;
+X					scan = strchr(scan+1, '.'))
+X				*scan = '/';
+X			expire(names[i], dir);
+X			if (dir != NULL && printexpiring)
+X				printstuff(field, names[i], recdate);
+X		} else {
+X			(void) strcat(keepnames, " ");
+X			(void) strcat(keepnames, names[i]);
+X		}
+X	}
+X
+X	delim = (fourfields) ? '\t' : '~';
+X	if (keepnames[0] != '\0') {
+X		if (STREQ(field[2], "X") || STREQ(field[2], "-"))
+X			sprintf(line, "%s\t%ld%c%s\t%s", field[0], recdate,
+X					delim, field[2], keepnames+1);
+X		else
+X			sprintf(line, "%s\t%ld%c%ld\t%s", field[0], recdate,
+X					delim, expdate, keepnames+1);
+X	} else
+X		line[0] = '\0';
+X
+X	if (expdebug)
+X		fprintf(stderr, "new line `%s'\n", line);
+X}
+X
+X/*
+X - checkexpire - should this article get expired?
+X *
+X * The "dont" variable's address is used as the don't-expire return value,
+X * since NULL is a legitimate archive-directory value internally.
+X *
+X * The check for an expiry date of 'X' is to support a possible future
+X * scheme in which the dbm file is not rebuilt every time.
+X */
+Xchar *				/* archive directory, NULL, or dont */
+Xcheckexpire(field, recdate, expdate, name)
+Xchar *field[];
+Xtime_t recdate;
+Xtime_t expdate;
+Xchar *name;
+X{
+X	char group[MAXFILE];
+X	register char *scan;
+X	register struct ctl *ct;
+X	time_t when;
+X	register int hash;
+X
+X	if (STREQ(field[2], "X"))
+X		return(dont);	/* vestigial entry */
+X
+X	(void) strcpy(group, name);
+X	scan = strchr(group, '/');
+X	if (*scan == NULL) {
+X		errno = 0;
+X		errunlock("bad format in article path `%s'", name);
+X	} else
+X		*scan = '\0';
+X
+X	/* find applicable expiry-control struct (make it if necessary) */
+X	hash = strlen(group);
+X	if (hash > NHASH-1)
+X		hash = NHASH-1;
+X	for (ct = ngs[hash]; ct != NULL && !STREQ(ct->groups, group);
+X								ct = ct->next)
+X		continue;
+X	if (ct == NULL) {	/* oops, there wasn't one */
+X		if (expdebug)
+X			fprintf(stderr, "new group `%s'\n", group);
+X		ct = (struct ctl *)malloc(sizeof(struct ctl));
+X		if (ct == NULL)
+X			errunlock("out of memory for newsgroup `%s'", group);
+X		ct->groups = enstring(group);
+X		ct->ismod = UNMOD;	/* unknown -- treat it as mundane */
+X		fillin(ct);
+X		ct->next = ngs[hash];
+X		ngs[hash] = ct;
+X	}
+X
+X	/* decide whether it ought to expire */
+X	if (recdate >= ct->retain)	/* within retention period */
+X		return(dont);
+X	if (recdate <= ct->purge)	/* past purge date */
+X		return(ct->dir);
+X	if (!STREQ(field[2], "-")) {	/* explicit expiry date */
+X		if (now >= expdate)	/* past its explicit date */
+X			return(ct->dir);
+X		else
+X			return(dont);
+X	} else {
+X		if (recdate < ct->normal)	/* past default date */
+X			return(ct->dir);
+X		else
+X			return(dont);
+X	}
+X}
+X
+X/*
+X - expire - expire an article
+X */
+Xvoid
+Xexpire(name, dir)
+Xchar *name;
+Xchar *dir;
+X{
+X	char old[MAXFILE];
+X	char new[MAXFILE];
+X	struct stat stbuf;
+X
+X	(void) strcpy(old, artfile(name));
+X	if (dir != NULL) {
+X		sprintf(new, "%s/%s", dir, name);
+X		/* cp() usually succeeds, so try it before getting fancy */
+X		if (cp(old, new) < 0) {
+X			if (stat(old, &stbuf) < 0)
+X				return;		/* nonexistent */
+X			mkparents(name, dir);
+X			if (cp(old, new) < 0) {
+X				warning("can't archive `%s'", name);
+X				return;		/* without removing it */
+X			}
+X		}
+X	}
+X	if (unlink(old) < 0 && errno != ENOENT)
+X		warning("can't remove `%s'", name);
+X}
+X
+X/*
+X - cp - try to copy an article
+X */
+Xint				/* 0 success, -1 failure */
+Xcp(src, dst)
+Xchar *src;			/* absolute pathnames */
+Xchar *dst;
+X{
+X	register int ret;
+X	register int count;
+X	register int in, out;
+X	register int first = 1;
+X
+X	in = open(src, 0);
+X	if (in < 0)
+X		return(-1);
+X	out = creat(dst, 0666);
+X	if (out < 0) {
+X		close(in);
+X		return(-1);
+X	}
+X
+X	while ((count = read(in, abuf, sizeof(abuf))) > 0) {
+X		ret = write(out, abuf, count);
+X		if (ret != count)
+X			errunlock("write error in copying `%s'", src);
+X		if (first) {
+X			getsubj(abuf, count);
+X			first = 0;
+X		}
+X	}
+X	if (count < 0)
+X		errunlock("read error in copying `%s'", src);
+X
+X	close(in);
+X	close(out);
+X	return(0);
+X}
+X
+X/*
+X - getsubj - try to find the Subject: line in a buffer
+X *
+X * Result goes in "subject", and is never empty.  Tabs become spaces,
+X * since they are the output delimiters.
+X */
+Xvoid
+Xgetsubj(buf, bsize)
+Xchar *buf;
+Xint bsize;
+X{
+X	register char *scan;
+X	register char *limit;
+X	register int len;
+X	register int clipped;
+X	static char sline[] = "Subject:";
+X
+X	len = strlen(sline);
+X	limit = buf + bsize - len;
+X	for (scan = buf; scan < limit; scan++)
+X		if (STREQN(scan, sline, len) &&
+X				(scan == buf || *(scan-1) == '\n')) {
+X			scan += len;
+X			for (limit = scan; limit < buf+bsize; limit++)
+X				if (*limit == '\n')
+X					break;
+X			while (scan < limit && isspace(*scan))
+X				scan++;
+X			len = limit-scan;
+X			clipped = 0;
+X			if (len > sizeof(subject)-1) {
+X				len = sizeof(subject) - 1 - strlen("...");
+X				clipped = 1;
+X			}
+X			if (len > 0) {
+X				(void) strncpy(subject, scan, len);
+X				subject[len] = '\0';
+X			} else
+X				(void) strcpy(subject, "???");
+X			if (clipped)
+X				(void) strcat(subject, "...");
+X			for (scan = strchr(subject, '\t'); scan != NULL;
+X					scan = strchr(scan+1, '\t'))
+X				*scan = ' ';
+X			return;
+X		} else if (*scan == '\n' && scan+1 < limit && *(scan+1) == '\n')
+X			break;		/* empty line terminates header */
+X
+X	/* didn't find one -- fill in *something* */
+X	(void) strcpy(subject, "???");
+X}
+X
+X/*
+X - mkparents - try to make directories for archiving an article
+X */
+Xvoid
+Xmkparents(art, dir)
+Xchar *art;			/* name relative to dir */
+Xchar *dir;
+X{
+X	char name[MAXFILE];
+X	char cmd[MAXLINE];
+X	register char *p;
+X	register int len;
+X	static char quiet[] = " >/dev/null 2>/dev/null";
+X
+X	(void) strcpy(name, art);
+X	sprintf(cmd, "cd %s; PATH=/bin:/usr/bin mkdir ", dir);
+X	len = strlen(cmd) + sizeof(quiet);
+X	for (p = strchr(name, '/'); p != NULL; p = strchr(p+1, '/')) {
+X		*p = '\0';
+X		if (len + (p - name) + 1 >= sizeof(cmd)-1)
+X			errunlock("line overflow in mkdiring for `%s'", art);
+X		(void) strcat(cmd, name);
+X		(void) strcat(cmd, " ");
+X		*p = '/';
+X	}
+X	(void) strcat(cmd, quiet);
+X	(void) system(cmd);
+X}
+X
+Xchar *months[12] = {
+X	"Jan",
+X	"Feb",
+X	"Mar",
+X	"Apr",
+X	"May",
+X	"Jun",
+X	"Jul",
+X	"Aug",
+X	"Sep",
+X	"Oct",
+X	"Nov",
+X	"Dec",
+X};
+X
+X/*
+X - printstuff - print information about an expiring article
+X */
+Xvoid
+Xprintstuff(field, name, recdate)
+Xchar *field[];
+Xchar *name;
+Xtime_t recdate;
+X{
+X	struct tm *gmt;
+X
+X	gmt = gmtime(&recdate);
+X	printf("%s\t%s\t%d-%s-%d\t%s\n", name, field[1], gmt->tm_mday,
+X			months[gmt->tm_mon], gmt->tm_year+1900, subject);
+X}
+X
+X/*
+X - split - divide a line into fields, like awk split()
+X */
+Xint				/* number of fields */
+Xsplit(line, fields, nfmax, sep)
+Xchar *line;
+Xchar *fields[];
+Xint nfmax;
+Xchar *sep;
+X{
+X	register int i;
+X	register char *p;
+X
+X	i = 0;
+X	for (p = strtok(line, sep); p != NULL; p = strtok((char *)NULL, sep)) {
+X		if (i < nfmax)
+X			fields[i] = p;
+X		i++;
+X	}
+X
+X	return(i);
+X}
+X
+X/*
+X - eufopen - fopen, with errunlock if doesn't succeed
+X */
+XFILE *
+Xeufopen(name, mode)
+Xchar *name;
+Xchar *mode;
+X{
+X	FILE *f;
+X
+X	f = fopen(name, mode);
+X	if (f == NULL)
+X		errunlock("can't open `%s'", name);
+X	return(f);
+X}
+X
+X/*
+X - checkdir - check that a directory is real, writeable, and full pathname
+X */
+Xvoid				/* errunlock() if not */
+Xcheckdir(dir)
+Xchar *dir;
+X{
+X	struct stat stbuf;
+X
+X	if (stat(dir, &stbuf) < 0 || (stbuf.st_mode&S_IFMT) != S_IFDIR)
+X		errunlock("`%s' is not a directory", dir);
+X	if (access(dir, 02) < 0)
+X		errunlock("directory `%s' not writeable", dir);
+X	errno = 0;
+X	if (dir[0] != '/')
+X		errunlock("directory `%s' not an absolute pathname", dir);
+X}
+X
+X/*
+X - enstring - malloc space for a string
+X */
+Xchar *				/* errunlock() if malloc fails */
+Xenstring(s)
+Xchar *s;
+X{
+X	register char *p;
+X
+X	errno = 0;
+X	p = malloc((unsigned)strlen(s)+1);	/* +1 for NUL */
+X	if (p == NULL)
+X		errunlock("cannot malloc for `%s'", s);
+X	(void) strcpy(p, s);
+X	return(p);
+X}
+X
+X/*
+X - back - get a date n days back, with overflow check
+X *
+X * Requires that "now" be set first.
+X */
+Xtime_t
+Xback(ndays)
+Xdouble ndays;
+X{
+X	if (ndays > now / DAY)	/* past beginning of time */
+X		return((time_t)0);
+X	return(now - ndays*DAY);
+X}
+X
+X/*
+X - printlists - print control lists for debugging
+X */
+Xvoid
+Xprintlists()
+X{
+X	register int i;
+X	register struct ctl *ct;
+X
+X	fprintf(stderr, "control file:\n");
+X	for (ct = ctls; ct != NULL; ct = ct->next)
+X		pctl(ct);
+X	fprintf(stderr, "\n");
+X
+X	for (i = 0; i < NHASH; i++)
+X		if (ngs[i] != NULL) {
+X			fprintf(stderr, "list %d:\n", i);
+X			for (ct = ngs[i]; ct != NULL; ct = ct->next)
+X				pctl(ct);
+X		}
+X	fprintf(stderr, "\n");
+X}
+X
+X/*
+X - pctl - print one control-list entry
+X */
+Xvoid
+Xpctl(ct)
+Xregister struct ctl *ct;
+X{
+X#	define	DAYS(x)	((now-(x))/(double)DAY)
+X
+X	fprintf(stderr, "%s(%c) %.1f-%.1f-%.1f %s\n", ct->groups, ct->ismod,
+X			DAYS(ct->retain), DAYS(ct->normal), DAYS(ct->purge),
+X			(ct->dir == NULL) ? "(null)" : ct->dir);
+X}
+X
+X/*
+X - unprivileged - no-op needed to keep the pathname stuff happy
+X */
+Xvoid
+Xunprivileged()
+X{
+X}
+END_OF_FILE
+if test 20350 -ne `wc -c <'expire/expire.c'`; then
+    echo shar: \"'expire/expire.c'\" unpacked with wrong size!
+fi
+# end of 'expire/expire.c'
+fi
+if test -f 'rna/postnews.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'rna/postnews.c'\"
+else
+echo shar: Extracting \"'rna/postnews.c'\" \(20673 characters\)
+sed "s/^X//" >'rna/postnews.c' <<'END_OF_FILE'
+X/*
+X * postnews [-h] [-s subject] [-n newsgroups] [-e expiredate]
+X *		 [-r references] [-i interpfile] [-d distribution]
+X * postnews -c control_command [-n newsgroups] [-d distribution]
+X * postnews -p
+X *
+X *	SETUID to NEWSROOT "news"
+X *
+X *	Michael Rourke (UNSW) April 1984
+X */
+X
+X#include "defs.h"
+X
+Xchar sys[]		 = SYS;
+Xextern char mydomain[];
+Xextern char newsversion[];
+X#ifndef NETID
+Xchar systemid[DIRSIZ];
+X#else
+Xchar systemid[] = NETID;
+X#endif
+X#ifdef UUNAME
+Xchar uuname[] = UUNAME;
+X#endif
+X
+Xchar *sflag;		/* subject */
+Xchar *nflag;		/* newsgroups */
+Xchar *dflag;		/* distribution */
+Xlong eflag;		/* expire date */
+Xchar *cflag;		/* control function */
+Xchar *rflag;		/* references */
+Xchar *iflag;		/* interp file */
+Xbool		hflag;		/* headers in input */
+Xbool		pflag;		/* from other host (su only) */
+Xbool		tty;		/* isatty */
+X
+X#if AUSAM
+Xstruct pwent pe;		/* current user passwd struct */
+Xchar sbuf[SSIZ];	/* strings thereof */
+X#else
+Xstruct passwd *pp;		/* current user passwd struct */
+X#endif
+Xlong now;		/* current time */
+Xint oumask;		/* old umask */
+Xheader		h;		/* current articles header */
+Xbool		su;		/* if news super-user */
+Xchar *tname;		/* name of temp file */
+XFILE		*tmp;		/* file ptr */
+Xchar *newsdir;	/* %news */
+Xuid_t		newsuid;	/* news uid */
+X
+Xint checkng(), linkng();
+Xchar *dfltgrp();
+Xextern FILE	*mailreply(), *mailnewsroot();
+Xextern bool	chkhist(), cancel();
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	register int i;
+X	extern long maketime();
+X
+X	time(&now);
+X	for (argv++, argc--; argc > 0; argc--, argv++) {
+X		if (argv[0][0] != '-' && argv[0][2] != '\0')
+X			break;
+X		switch (argv[0][1]) {
+X		case 'h':
+X			hflag = true;
+X			continue;
+X		case 'p':
+X			pflag = true;
+X			continue;
+X		case 's':
+X			sflag = argv[1];
+X			break;
+X		case 'n':
+X			nflag = argv[1];
+X			break;
+X		case 'r':
+X			rflag = argv[1];
+X			break;
+X		case 'i':
+X			iflag = argv[1];
+X			break;
+X		case 'd':
+X			dflag = argv[1];
+X			break;
+X		case 'e':
+X			for (i = 1; i < argc; i++)
+X				if (argv[i][0] == '-' && argv[i][2] == '\0')
+X					break;
+X			if (i == 1) {
+X				argc = -1;
+X				break;
+X			}
+X			i--;
+X			if ((eflag = maketime(i, &argv[1], TIMES)) == 0L)
+X				exit(1);
+X			argc -= i, argv += i;
+X			continue;
+X		case 'c':
+X			cflag = argv[1];
+X			break;
+X		default:
+X			argc = -1;
+X			break;
+X		}
+X		argv++, argc--;
+X	}
+X	if (argc != 0 || (cflag && pflag) || (pflag && (nflag || dflag)) ||
+X	    ((cflag || pflag) && (hflag || sflag || eflag || rflag || iflag))) {
+X		fprintf(stderr, "Usage: postnews [-h] [-s subject] [-n newsgroups] [-e expiredate ..]\n");
+X		fprintf(stderr, "                [-r references] [-i interpfile] [-d distribution]\n");
+X		fprintf(stderr, "       postnews -c control_command [-n newsgroups] [-d distribution]\n");
+X		fprintf(stderr, "       postnews -p\n");
+X		exit(1);
+X	}
+X	oumask = umask(022);
+X
+X#if AUSAM
+X	pe.pw_strings[LNAME] = NEWSROOT;
+X	if (getpwuid(&pe, sbuf, sizeof(sbuf)) == PWERROR)
+X		error("Password file error.");
+X	newsdir = newstr(pe.pw_strings[DIRPATH]);
+X	newsuid = pe.pw_limits.l_uid;
+X#else
+X	if ((pp = getpwnam(NEWSROOT)) == (struct passwd *) NULL)
+X		error("Password file error.");
+X	newsdir = newstr(pp->pw_dir);
+X	newsuid = pp->pw_uid;
+X#endif
+X
+X#if AUSAM
+X	pe.pw_limits.l_uid = getuid();
+X	if (getpwlog(&pe, sbuf, sizeof(sbuf)) == PWERROR)
+X		error("Password file error.");
+X	pwclose();
+X	su = (bool) (pe.pw_limits.l_uid == 0 || pe.pw_limits.l_uid == newsuid);
+X#else
+X	if ((pp = getpwuid(getuid())) == (struct passwd *) NULL)
+X		error("Password file error.");
+X	endpwent();
+X	su = (bool) ((pp->pw_uid == 0) || (pp->pw_uid = newsuid));
+X#endif
+X
+X#ifndef NETID
+X	getaddr(G_SYSNAME, systemid);
+X#endif
+X	tty = (bool) isatty(fileno(stdin));
+X
+X#if AUSAM
+X	if (!su && (pe.pw_limits.l_flags & USENET) == 0)
+X		error("Net permission is required to post news.");
+X#endif
+X
+X	if (!su && pflag)
+X		error("Permission denied.");
+X
+X	if (pflag || hflag)
+X		gethead(stdin, &h);
+X	if (sflag)
+X		h.h_subject = sflag;
+X	if (cflag) {
+X		h.h_control = cflag;
+X		h.h_subject = "Control";
+X		if (!h.h_replyto)
+X			h.h_replyto = newstr5(
+X#if AUSAM
+X					pe.pw_strings[LNAME],
+X#else
+X					pp->pw_name,
+X#endif
+X				"@", systemid, ".", mydomain);
+X	}
+X	if (nflag)
+X		h.h_newsgroups = nflag;
+X	if (rflag)
+X		h.h_references = rflag;
+X	if (eflag)
+X		if (eflag < now)
+X			error("Time specified has passed.");
+X		else
+X			h.h_expires = newstr(ttoa(eflag));
+X	if (dflag)
+X		h.h_distribution = dflag;
+X	if (tty)
+X		askheads();
+X	if (h.h_newsgroups)
+X		convgrps(h.h_newsgroups);
+X	else
+X		h.h_newsgroups = DFLTGRP;
+X	if (h.h_distribution) {
+X		convgrps(h.h_distribution);
+X		if (CMP(h.h_newsgroups, h.h_distribution) == 0)
+X			h.h_distribution = NIL(char);
+X	}
+X	if (!h.h_subject)
+X		error("No subject specified.");
+X	if (pflag) {
+X		if (chkhist(h.h_messageid))
+X			error("Duplicate article %s rejected.", h.h_messageid);
+X	} else
+X	 {
+X		if (h.h_relayversion || h.h_postversion || h.h_from || h.h_date ||
+X		    h.h_messageid || h.h_path || h.h_sender || h.h_datereceived ||
+X		    h.h_lines)
+X			error("Illegally specified field(s).");
+X
+X		if (!su && ngmatch(h.h_newsgroups, MODGROUPS))
+X			error("Moderated newsgroup:\n\tArticle must be mailed to the newsgroup moderator.");
+X
+X		if (!cflag && applyng(h.h_newsgroups, checkng))
+X			exit(1);
+X		if (!cflag && h.h_distribution && applyng(h.h_distribution,
+X		    checkng))
+X			exit(1);
+X	}
+X	install(&h, stdin);
+X	exit(0);
+X}
+X
+X
+X/*
+X * create all the directories required for a given group
+X */
+Xcreatgroup(grp)
+Xchar *grp;
+X{
+X	register char *dname;
+X	register char *s, *slash;
+X
+X	if (strpbrk(grp, BADGRPCHARS))
+X		error("%s: Illegal char in newsgroup.", grp);
+X	initgrp(grp);		/* make entry in active file */
+X	dname = convg(newstr3(newsdir, "/", grp));
+X	s = dname + strlen(newsdir);
+X	while (*s) {
+X		slash = strchr(s, '/');
+X		if (slash)
+X			*slash = '\0';
+X		if (access(dname, 0) != 0)
+X			mkdir(dname);
+X		if (slash)
+X			*slash = '/', s = slash + 1;
+X		else
+X			break;
+X	}
+X	free(dname);
+X}
+X
+X
+X/*
+X * create dir
+X */
+Xmkdir(s)
+Xchar *s;
+X{
+X	int pid, status, r;
+X	int (*istat)(), (*qstat)();
+X
+X	switch (pid = fork()) {
+X	default:
+X		/* parent */
+X		break;
+X	case 0:
+X		/* child */
+X		execl(MKDIR, "mkdir", s, 0);
+X		error("Can't exec %s", MKDIR);
+X		exit(1);
+X	case -1:
+X		error("Can't fork.");
+X	}
+X
+X	istat = signal(SIGINT, SIG_IGN);
+X	qstat = signal(SIGQUIT, SIG_IGN);
+X
+X	while ((r = wait(&status)) != pid && r != -1)
+X		;
+X	if (r == -1 || status)
+X		error("Couldn't mkdir %s", s);
+X
+X	if (getuid() == 0) {
+X		switch (pid = fork()) {
+X		default:
+X			/* parent */
+X			break;
+X		case 0:
+X			/* child */
+X			setgid(0);
+X			setuid(0);
+X			execl(CHOWN, "chown", NEWSROOT, s, 0);
+X			error("Can't exec %s", CHOWN);
+X			exit(1);
+X		case -1:
+X			error("Can't fork.");
+X		}
+X		while ((r = wait(&status)) != pid && r != -1)
+X			;
+X		if (r == -1 || status)
+X			error("Couldn't chown %s", s);
+X	}
+X
+X	chmod(s, 0755);
+X
+X	signal(SIGINT, istat);
+X	signal(SIGQUIT, qstat);
+X}
+X
+X
+X/*
+X * get unset headers from stdin
+X */
+Xaskheads()
+X{
+X	static char form[]	 = "%s: %s\n";
+X
+X	char *geth();
+X
+X	extern char t_subject[], t_newsgroups[], t_distribution[];
+X	extern char t_references[], t_expires[];
+X
+X	if (h.h_subject)
+X		printf(form, t_subject, h.h_subject);
+X	else
+X		h.h_subject = geth(t_subject, NIL(char));
+X	if (h.h_newsgroups)
+X		printf(form, t_newsgroups, h.h_newsgroups);
+X	else
+X		h.h_newsgroups = geth(t_newsgroups, dfltgrp());
+X	if (h.h_distribution)
+X		printf(form, t_distribution, h.h_distribution);
+X	else
+X		h.h_distribution = geth(t_distribution, h.h_newsgroups);
+X	if (h.h_expires)
+X		printf(form, t_expires, h.h_expires);
+X	if (h.h_references)
+X		printf(form, t_references, h.h_references);
+X}
+X
+X
+X/*
+X * get a header from stdin
+X */
+Xchar *
+Xgeth(fname, def)
+Xchar *fname, *def;
+X{
+X	register char *s;
+X
+X	while (1) {
+X		if (def)
+X			printf("%s (%s): ", fname, def);
+X		else
+X			printf("%s: ", fname);
+X		if ((s = mgets()) && *s)
+X			return newstr(s);
+X		if (def)
+X			return newstr(def);
+X		printf("%s field is mandatory.\n", fname);
+X	}
+X}
+X
+X
+X/*
+X * install the news item
+X */
+Xinstall(hp, f)
+Xregister header *hp;
+XFILE *f;
+X{
+X	register FILE	*sf;
+X	register int c;
+X	register char *mach, *subs, *type, *com, *end;
+X	char buf[BUFLEN];
+X
+X	int cleanup();
+X	FILE		 * getbody(), *trimit();
+X
+X	signal(SIGINT, cleanup);
+X	signal(SIGQUIT, cleanup);
+X
+X	if (tty && !cflag)
+X		f = getbody(f);
+X
+X	if (!hp->h_lines && !cflag)
+X		f = trimit(hp, f);
+X
+X	if ((tname = mtempnam(newsdir, "itmp")) == NIL(char) || (tmp = fopen(tname,
+X	     "w+")) == NIL(FILE))
+X		error("Can't create itmp file.");
+X
+X	chown(tname, (int) newsuid, (int) newsuid);	/* in case we are currently root */
+X
+X	if (pflag)
+X		puthead(hp, tmp, passing);
+X	else
+X	 {
+X		h.h_messageid = newstr5("<", getunique(), "@", systemid, ".");
+X		h.h_messageid = catstr2(h.h_messageid, mydomain, ">");
+X		puthead(hp, tmp, making);
+X	}
+X
+X	putc('\n', tmp);
+X	if (!cflag)
+X		while ((c = getc(f)) != EOF)
+X			putc(c, tmp);
+X
+X	signal(SIGINT, SIG_IGN);
+X	signal(SIGQUIT, SIG_IGN);
+X
+X	sf = fopenf(sys, "r");
+X	while (fgets(buf, sizeof(buf), sf)) {
+X		mach = buf;
+X		if ((subs = strchr(buf, ':')) == NIL(char) || (type = strchr(subs +
+X		    1, ':')) == NIL(char) || (com = strchr(type + 1, ':')) == NIL(char)
+X		    || (end = strchr(com + 1, '\n')) == NIL(char))
+X			error("%s: Bad format.", sys);
+X		*subs++ = *type++ = *com++ = *end = '\0';
+X		if ((hp->h_distribution && ngmatch(hp->h_distribution, subs)
+X		    || !hp->h_distribution) && ngmatch(hp->h_newsgroups, subs))
+X			if (CMP(mach, systemid) == 0)
+X				local(hp, tname, subs);
+X			else if ((pflag && checkpath(hp->h_path, mach) || !pflag)
+X			    && remote(tmp, com))
+X				printf("Couldn't transmit to %s\n", mach);
+X	}
+X	fclose(sf);
+X	fclose(tmp);
+X	unlink(tname);
+X}
+X
+X
+X/*
+X * have to count the number of lines
+X * and trim leading and trailing empty lines
+X */
+XFILE *
+Xtrimit(hp, f)
+Xheader *hp;
+XFILE *f;
+X{
+X	register int ccount, lcount, llcount;
+X	register int c, lastc;
+X
+X	ccount = lcount = llcount = 0;
+X	if ((tmp = tmpfile()) == NIL(FILE))
+X		error("Can't create tempfile.");
+X	while ((c = getc(f)) != EOF && c == '\n')
+X		;
+X	lastc = c;
+X	if (c != EOF)
+X		do
+X		 {
+X			if (c == '\n' && lastc == '\n') {
+X				llcount++;
+X				continue;
+X			}
+X			while (llcount > 0) {
+X				putc('\n', tmp);
+X				lcount++;
+X				llcount--;
+X			}
+X			if (isprint(c))
+X				putc(c, tmp), ccount++;
+X			else if (isspace(c) || c == '\b') {
+X				if (c == '\n')
+X					lcount++;
+X				putc(c, tmp);
+X			} else
+X				putc('?', tmp);
+X			lastc = c;
+X		} while ((c = getc(f)) != EOF);
+X	if (ccount < 5 && !pflag)
+X		error("Article too short.");
+X	hp->h_lines = newstr(itoa(lcount));
+X	rewind(tmp);
+X	fclose(f);
+X	return tmp;
+X}
+X
+X
+X/*
+X * input new article interactivly
+X * and place on standard input
+X */
+XFILE *
+Xgetbody(f)
+XFILE *f;
+X{
+X	register int c;
+X	char buf[BUFSIZ];
+X	bool		quit;
+X
+X	printf("\n");
+X	quit = false;
+X	if ((tname = mtempnam(newsdir, "itmp")) == NIL(char) || (tmp = fopen(tname,
+X	     "w+")) == NIL(FILE))
+X		error("Can't create itmp file.");
+X	/*
+X	 * read article text, interpreting escape commands
+X	 */
+X	while (!quit && (c = getc(f)) != EOF)
+X		if (c == '.' || c == '!') {
+X			switch (c = (c == '!' ? c : getc(f))) {
+X			case 'e':
+X				fclose(tmp);
+X				readln(f);
+X				doed(tname);
+X				if ((tmp = fopen(tname, "a+")) == NIL(FILE))
+X					error("Can't re-open %s", tname);
+X				break;
+X			case 'i':
+X				if (!iflag) {
+X					readln(f);
+X					printf("Can't interpolate.\n");
+X					break;
+X				}
+X				icopy(iflag, tmp);
+X				break;
+X			case '!':
+X				msystem(mgets());
+X				break;
+X			case '\n':
+X				quit = true;
+X				continue;
+X			default:
+X				printf("Unknown escape command: \"%c\"\n", c);
+X				printf("Commands are:\n");
+X				printf("\t.e          - edit article so far\n");
+X				printf("\t.i          - interpolate article\n");
+X				printf("\t.!command   - shell escape\n");
+X				readln(f);
+X			}
+X			printf("(continue)\n");
+X			fflush(stdout);
+X		}
+X		else
+X		 {
+X			if (c == '\\' && (c = getc(f)) != '.')
+X				fprintf(tmp, "\\");
+X			fprintf(tmp, "%c", c);
+X			if (c != '\n' && fgets(buf, sizeof buf, f) != NIL(char))
+X				fputs(buf, tmp);
+X		}
+X	rewind(tmp);
+X	fclose(f);
+X	unlink(tname);
+X	free(tname);
+X	tname = NIL(char);
+X	return tmp;
+X}
+X
+X
+X/*
+X * interpolate fname
+X */
+Xicopy(fname, to)
+Xchar *fname;
+XFILE *to;
+X{
+X	register FILE	*f;
+X	register int c, lastc;
+X
+X	if ((f = fopen(fname, "r")) == NIL(FILE)) {
+X		perror(fname);
+X		return;
+X	}
+X	lastc = '\n';
+X	while ((c = getc(f)) != EOF) {
+X		if (lastc == '\n')
+X			fprintf(to, "    ");
+X		putc(lastc = c, to);
+X	}
+X	fclose(f);
+X}
+X
+X
+X/*
+X * invoke an editor on fname
+X */
+Xdoed(fname)
+Xchar *fname;
+X{
+X	register int i;
+X	register char *editor;
+X	register char *edname;
+X	int pid, stat;
+X	extern char *getenv();
+X	static char ed[] 		 = ED;
+X
+X	chmod(fname, 0660);
+X	if ((pid = fork()) == 0) {
+X		setuid(getuid());
+X		if ((editor = getenv("EDITOR")) == NIL(char))
+X			editor = ed;
+X		edname = strrchr(editor, '/');
+X		edname = (edname ? edname + 1 : editor);
+X		execl(editor, edname, fname, 0);
+X		perror(editor);
+X		exit(1);
+X	}
+X	if (pid == -1) {
+X		error("Can't fork ed.");
+X		return;
+X	}
+X	signal(SIGINT, SIG_IGN);
+X	signal(SIGQUIT, SIG_IGN);
+X
+X	while ((i = wait(&stat)) != pid && i != -1)
+X		;
+X
+X	chmod(fname, 0644);
+X
+X	signal(SIGINT, cleanup);
+X	signal(SIGQUIT, cleanup);
+X}
+X
+X
+X/*
+X * remove temp file, and perhaps save in $HOME/dead.article
+X */
+Xcleanup(sig)
+Xint sig;
+X{
+X	if (sig)
+X		printf("\nInterrupt\n");
+X	signal(SIGINT, SIG_IGN);
+X	signal(SIGQUIT, SIG_IGN);
+X	if (tname && *tname) {
+X		unlink(tname);
+X		tname = NIL(char);
+X		if (tty && tmp)
+X			saveit();
+X	}
+X	exit(1);
+X}
+X
+X
+X/*
+X * save the current temporary file
+X * in $HOME/dead.article
+X */
+Xsaveit()
+X{
+X	register FILE	*f;
+X	register char *nname;
+X	register int c;
+X
+X	extern char *getenv();
+X
+X	rewind(tmp);
+X	if ((nname = getenv("HOME")) == NIL(char))
+X		return;
+X	nname = newstr2(nname, "/dead.article");
+X
+X	umask(oumask);
+X	setgid(getgid());
+X	setuid(getuid());
+X
+X	f = fopenf(nname, "w");
+X	h.h_messageid = NIL(char);
+X	puthead(&h, f, printing);
+X	putc('\n', f);
+X	while ((c = getc(tmp)) != EOF)
+X		putc(c, f);
+X	fclose(f);
+X	printf("Article saved in %s\n", nname);
+X	free(nname);
+X}
+X
+X
+X/*
+X * check that mach is not in path
+X * so we won't send it back again
+X */
+Xcheckpath(path, mach)
+Xchar *path;
+Xchar *mach;
+X{
+X	register char *ex;
+X	register int r;
+X
+X	while (*path && (ex = strchr(path, PSEPCHAR))) {
+X		*ex = '\0';
+X		r = (CMP(path, mach) == 0);
+X		*ex = PSEPCHAR;
+X		if (r)
+X			return 0;
+X		path = ex + 1;
+X	}
+X	return 1;
+X}
+X
+X
+X/* VARARGS1 */
+Xerror(s, a0, a1, a2, a3)
+Xchar *s;
+X{
+X	fprintf(stderr, "postnews: ");
+X	fprintf(stderr, s, a0, a1, a2, a3);
+X	fprintf(stderr, "\n");
+X	cleanup(0);
+X}
+X
+X
+X/*
+X * check that a newsgroup exists
+X */
+Xcheckng(g)
+Xchar *g;
+X{
+X	register char *dname;
+X	register char *s, *com;
+X
+X	dname = convg(newstr3(newsdir, "/", g));
+X	free(dname);
+X	if (access(dname, 0) != 0) {
+X		if (su && tty) {
+X			printf("%s: Nonexistent newgroup. Create? ", g);
+X			if ((s = mgets()) == NIL(char) || !*s || (CMP(s, "y") !=
+X			    0 && CMP(s, "yes") != 0))
+X				return 1;
+X			com = newstr6("exec ", POSTNEWS, " -c 'newgroup ", g,
+X			     				 "' -n ", g);
+X			system(com);
+X			free(com);
+X			return 0;
+X		}
+X		printf("%s: Nonexistent newsgroup.\n", g);
+X		return 1;
+X	}
+X	return 0;
+X}
+X
+X
+X/*
+X * place news locally
+X * by linking tmp file into each newsgroup directory
+X */
+Xlocal(hp, tmpname, subs)
+Xheader *hp;
+Xchar *tmpname;
+Xchar *subs;
+X{
+X	static char junk[] = "junk";
+X
+X	register char *newg;
+X	register FILE	*pp;
+X
+X	if (hp->h_control)
+X		control(hp->h_control);
+X	else if (newg = ngsquash(hp->h_newsgroups, subs)) {
+X		openhist(hp);
+X		if (!applyng(newg, linkng, tmpname)) {
+X			while (!linkng(junk, tmpname))
+X				creatgroup(junk);
+X			pp = mailnewsroot("Postnews: Article placed in \"junk\"");
+X			fprintf(pp, "Article placed in \"junk\" because no groups active from:\n\t%s\n",
+X			     				newg);
+X			mailclose(pp);
+X		}
+X		closehist();
+X		free(newg);
+X	} else
+X		error("Snark: in local");
+X}
+X
+X
+X/*
+X * link news items into local dirs
+X */
+Xlinkng(g, t)
+Xchar *g, *t;
+X{
+X	register char *lname, *dname;
+X	extern char *getseq();
+X
+X	dname = convg(newstr3(newsdir, "/", g));
+X	free(dname);
+X	if (access(dname, 0) != 0)
+X		return 0;		/* don't save - not an active group */
+X	dname = convg(newstr3(g, "/#", getseq(g)));
+X	writehist(dname);
+X	lname = newstr3(newsdir, "/", dname);
+X	if (link(t, lname) != 0)
+X		error("Link from %s to %s failed.", t, lname);
+X	free(lname);
+X	free(dname);
+X	return 1;
+X}
+X
+X
+X/*
+X * execute control messages
+X */
+Xcontrol(com)
+Xchar *com;
+X{
+X	register char *s;
+X	register FILE	*pp;
+X
+X	if (s = strchr(com, ' ')) {
+X		*s++ = '\0';
+X		while (*s && isspace(*s))
+X			s++;
+X	}
+X	if (CMP(com, "cancel") == 0) {
+X		if (!s || !*s)
+X			error("cancel: message-id not specified.");
+X		cancel(s);
+X	} else if (CMP(com, "newgroup") == 0 || CMP(com, "rmgroup") == 0) {
+X		if (!s || !*s)
+X			error("%s: group name not specified.", com);
+X		if (!su)
+X			error("%s: permission denied.", com);
+X		else if (CMP(com, "newgroup") == 0)
+X			creatgroup(s);
+X		else
+X		 {
+X			pp = mailnewsroot("Postnews: rmgroup request");
+X			fprintf(pp, "rmgroup %s, sent from %s\n", s, (h.h_replyto ?
+X			    h.h_replyto : (h.h_from ? h.h_from  : "Unknown?")));
+X			fprintf(pp, "run '/usr/lib/news/rmgroup %s' if sender is authorised.\n",
+X			     s);
+X			mailclose(pp);
+X		}
+X	} else if (CMP(com, "sendsys") == 0)
+X		sendsys();
+X	else if (CMP(com, "version") == 0)
+X		version();
+X	else if (CMP(com, "senduuname") == 0)
+X		senduuname();
+X	else
+X	 {
+X		sorry(com);
+X		error("Unknown control command: %s %s\n(Valid: cancel, newgroup, sendsys, senduuname, version)\nSent from: %s",
+X		     			com, s ? s : "", (h.h_replyto ? h.h_replyto : (h.h_from ?
+X		    h.h_from : "Unknown?")));
+X	}
+X}
+X
+X
+X/*
+X * send sys file to originator
+X */
+Xsendsys()
+X{
+X	register FILE	*pp, *fp;
+X	register int c;
+X
+X	fp = fopenf(sys, "r");
+X	pp = mailreply("News sendsys request");
+X	while ((c = getc(fp)) != EOF)
+X		putc(c, pp);
+X	mailclose(pp);
+X	fclose(fp);
+X}
+X
+X
+X/*
+X * send version name and number to originator
+X */
+Xversion()
+X{
+X	register FILE	*pp;
+X
+X	pp = mailreply("News version request");
+X	fprintf(pp, "Current version: %s\n", newsversion);
+X	mailclose(pp);
+X	fclose(pp);
+X}
+X
+X
+X/*
+X * send uuname data to originator
+X */
+Xsenduuname()
+X{
+X	register FILE	*pp, *f;
+X	register int c;
+X
+X	extern FILE	*tmpfile();
+X
+X#ifndef UUNAME
+X	sorry("uuname");
+X#else
+X	if ((pp = popen(uuname, "r")) == NIL(FILE))
+X		error("Couldn't run \"%s\"", uuname);
+X	if ((f = tmpfile()) == NIL(FILE))
+X		error("Can't open tmp file.");
+X
+X	while ((c = getc(pp)) != EOF)
+X		putc(c, f);
+X
+X	if (pclose(pp) != 0)
+X		error("\"%s\" had bad exit status.", uuname);
+X	rewind(f);
+X
+X	pp = mailreply("News senduuname request");
+X	while ((c = getc(f)) != EOF)
+X		putc(c, pp);
+X
+X	fclose(f);
+X	mailclose(pp);
+X#endif
+X}
+X
+X
+X/*
+X * send message about unimplemented command
+X */
+Xsorry(com)
+Xchar *com;
+X{
+X	register FILE	*pp;
+X
+X	pp = mailreply("Unimplemented news control message");
+X	fprintf(pp, "The control message \"%s\" is not implemented at this site.\n",
+X	     com);
+X	fprintf(pp, "Our current version of news is: %s\n", newsversion);
+X	mailclose(pp);
+X}
+X
+X
+X/*
+X * set up a pipe to a mail program to reply to control requests
+X */
+XFILE *
+Xmailreply(s)
+Xchar *s;
+X{
+X	register FILE	*pp;
+X	register char *com, *ra;
+X
+X	if ((ra = getretaddr(&h)) == NIL(char))
+X		error("Can't form return address for control message");
+X	com = newstr4("exec ", MAIL, " ", ra);
+X	if ((pp = popen(com, "w")) == NIL(FILE))
+X		error("Couldn't run \"%s\"", com);
+X	fprintf(pp, "Subject: %s\n", s);
+X	fprintf(pp, "Responding-system: %s.%s\n\n", systemid, mydomain);
+X	free(com);
+X	free(ra);
+X	return pp;
+X}
+X
+X
+X/*
+X * set up a pipe to mail to NEWSROOT
+X */
+XFILE *
+Xmailnewsroot(s)
+Xchar *s;
+X{
+X	register FILE	*pp;
+X	register char *com;
+X
+X	com = newstr4("exec ", MAIL, " ", NEWSROOT);
+X	if ((pp = popen(com, "w")) == NIL(FILE))
+X		error("Couldn't run \"%s\"", com);
+X	fprintf(pp, "Subject: %s\n", s);
+X	free(com);
+X	return pp;
+X}
+X
+X
+X/*
+X * close the mail pipe
+X */
+Xmailclose(pp)
+XFILE *pp;
+X{
+X	if (pclose(pp) != 0)
+X		error("Mail failed");
+X}
+X
+X
+X/*
+X * send item to remote hosts
+X */
+Xremote(f, com)
+XFILE *f;
+Xchar *com;
+X{
+X	register int c;
+X	FILE		 * out;
+X
+X	if ((out = popen(com, "w")) == NIL(FILE))
+X		return 1;
+X	rewind(f);
+X	while ((c = getc(f)) != EOF)
+X		putc(c, out);
+X	return pclose(out);
+X}
+X
+X
+X/*
+X * shell escape
+X */
+Xmsystem(s)
+Xchar *s;
+X{
+X	int status, pid, w;
+X
+X	if ((pid = fork()) == 0) {
+X		close(fileno(tmp));
+X		/*
+X 		 * remember we are setuid to NEWS so...
+X		 */
+X		umask(oumask);
+X		setgid(getgid());
+X		setuid(getuid());
+X		execl(SHELL, "sh", "-c", s, 0);
+X		_exit(127);
+X	}
+X	signal(SIGINT, SIG_IGN);
+X	signal(SIGQUIT, SIG_IGN);
+X
+X	while ((w = wait(&status)) != pid && w != -1)
+X		;
+X	if (w == -1)
+X		status = -1;
+X
+X	signal(SIGINT, cleanup);
+X	signal(SIGQUIT, cleanup);
+X	return(status);
+X}
+X
+X
+X/*
+X * work out the default group for this user
+X */
+Xchar *
+Xdfltgrp()
+X{
+X#if MANGRPS
+X	register char **sp;
+X	extern char **getclasses();
+X
+X	for (sp = getclasses(pe.pw_cmask); *sp; sp++) {
+X		if (CMP(*sp, "C-Staff") == 0 || CMP(*sp, "System") == 0)
+X			return "system";
+X		if (CMP(*sp, "CLUBS") == 0)
+X			return newstr2("general.club.", pe.pw_strings[LNAME]);
+X		if (CMP(*sp, "Languages") == 0)
+X			return newstr2("general.lang.", pe.pw_strings[LNAME]);
+X		if (CMP(*sp, "Classaccount") == 0)
+X			return newstr2("class.", pe.pw_strings[LNAME]);
+X	}
+X#endif
+X	return DFLTGRP;
+X}
+END_OF_FILE
+if test 20673 -ne `wc -c <'rna/postnews.c'`; then
+    echo shar: \"'rna/postnews.c'\" unpacked with wrong size!
+fi
+# end of 'rna/postnews.c'
+fi
+echo shar: End of archive 13 \(of 14\).
+##  End of shell archive.
+exit 0

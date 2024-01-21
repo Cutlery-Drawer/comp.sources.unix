@@ -1,0 +1,957 @@
+Subject:  v11i059:  Mail user's shell, Part09/12
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rs@uunet.UU.NET
+
+Submitted-by: island!argv@Sun.COM (Dan Heller)
+Posting-number: Volume 11, Issue 59
+Archive-name: mush5.7/Part09
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 9 (of 12)."
+# Contents:  loop.c
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'loop.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'loop.c'\"
+else
+echo shar: Extracting \"'loop.c'\" \(24112 characters\)
+sed "s/^X//" >'loop.c' <<'END_OF_FILE'
+X/* loop.c 	(c) copyright 1986 (Dan Heller) */
+X
+X/*
+X * Here is where the main loop for text mode exists. Also, all the
+X * history is kept here and all the command parsing and execution
+X * and alias expansion in or out of text/graphics mode is done here.
+X */
+X
+X#include "mush.h"
+X
+X#ifdef BSD
+X#include <sys/wait.h>
+X#else
+X#ifndef SYSV
+X#include <wait.h>
+X#endif SYSV
+X#endif BSD
+X
+X#define ever (;;)
+X#define MAXARGS		100
+X#define isdelimeter(c)	(index(" \t;|", c))
+X
+Xchar *alias_expand(), *hist_expand(), *reference_hist(), *hist_from_str();
+Xchar **calloc();
+X
+Xstruct history {
+X    int histno;
+X    char **argv;
+X    struct history *prev;
+X    struct history *next;
+X};
+Xstatic struct history *hist_head, *hist_tail;
+Xstruct history *malloc();
+X#define NULL_HIST	(struct history *)0
+X
+Xstatic char *last_aliased;
+Xstatic int hist_size, print_only;
+X
+Xdo_loop()
+X{
+X    register char *p, **argv;
+X    char	  **last_argv = DUBL_NULL, line[256];
+X    int   	  argc, c = (iscurses - 1);
+X    struct history *new;
+X#ifdef CURSES
+X    int		  save_echo_flg = FALSE;
+X#endif CURSES
+X
+X    /* catch the right signals -- see main.c for other signal catching */
+X    (void) signal(SIGINT, catch);
+X    (void) signal(SIGQUIT, catch);
+X    (void) signal(SIGHUP, catch);
+X    (void) signal(SIGTERM, catch);
+X    (void) signal(SIGCHLD, sigchldcatcher);
+X    (void) signal(SIGPIPE, SIG_IGN); /* if pager is terminated before end */
+X
+X    turnoff(glob_flags, IGN_SIGS);
+X    if (hist_size == 0) /* if user didn't set history in .rc file */
+X	hist_size = 1;
+X
+X    for ever {
+X	if (setjmp(jmpbuf)) {
+X	    Debug("jumped back to main loop (%s: %d)\n", __FILE__,__LINE__);
+X#ifdef CURSES
+X	    if (c > 0) { /* don't pass last command back to curses_command() */
+X		iscurses = TRUE;
+X		c = hit_return();
+X	    }
+X#endif CURSES
+X	}
+X#ifdef CURSES
+X	if (iscurses || c > -1) {
+X	    /* if !iscurses, we know that we returned from a curses-based
+X	     * call and we really ARE still in curses. Reset tty modes!
+X	     */
+X	    if (ison(glob_flags, ECHO_FLAG)) {
+X		turnoff(glob_flags, ECHO_FLAG);
+X		echo_off();
+X		save_echo_flg = TRUE;
+X	    }
+X	    if (!iscurses) {
+X		iscurses = TRUE;
+X		c = hit_return();
+X	    }
+X	    if ((c = curses_command(c)) == -1 && save_echo_flg) {
+X		echo_on();
+X		turnon(glob_flags, ECHO_FLAG);
+X		save_echo_flg = FALSE;
+X	    }
+X	    continue;
+X	}
+X#endif CURSES
+X	clear_msg_list(msg_list);
+X	(void) check_new_mail();
+X
+X	/* print a prompt according to printf like format:
+X	 * (current message, deleted, unread, etc) are found in mail_status.
+X	 */
+X	mail_status(1);
+X	if (Getstr(line, 256, 0) > -1)
+X	    p = line;
+X	else {
+X	    if (p = do_set(set_options, "ignoreeof")) {
+X		if (!*p)
+X		    continue;
+X		else
+X		    p = strcpy(line, p); /* so processing won't destroy var */
+X	    } else {
+X		(void) quit(0, DUBL_NULL);
+X		continue; /* quit may return if new mail arrives */
+X	    }
+X	}
+X
+X	skipspaces(0);
+X	if (!*p && !(p = do_set(set_options, "newline"))) {
+X	    (void) readmsg(0, DUBL_NULL, msg_list);
+X	    continue;
+X	}
+X	if (!*p) /* if newline is set, but no value, then continue */
+X	    continue;
+X
+X	/* upon error, argc = -1 -- still save in history so user can
+X	 * modify syntax error. if !argv, error is too severe.  We pass
+X	 * the last command typed in last_argv for history reference, and
+X	 * get back the current command _as typed_ (unexpanded by aliases
+X	 * or history) in last_argv.
+X	 */
+X	if (!(argv = make_command(p, &last_argv, &argc)))
+X	    continue;
+X	/* now save the new argv in the newly created history structure */
+X	if (!(new = malloc(sizeof (struct history))))
+X	    error("can't increment history");
+X	else {
+X	    new->histno = ++hist_no;
+X	    new->argv = last_argv; /* this is the command _as typed_ */
+X	    new->next = NULL_HIST;
+X	    new->prev = hist_head;
+X	    /* if first command, the tail of the list is "new" because
+X	     * nothing is in the list.  If not the first command, the
+X	     * head of the list's "next" pointer points to the new command.
+X	     */
+X	    if (hist_head)
+X		hist_head->next = new;
+X	    else
+X		hist_tail = new;
+X	    hist_head = new;
+X	}
+X	/*
+X	 * truncate the history list to the size of the history.
+X	 * Free the outdated command (argv) and move the tail closer to front.
+X	 * use a while loop in case the last command reset histsize to "small"
+X	 */
+X	while (hist_head->histno - hist_tail->histno >= hist_size) {
+X	    hist_tail = hist_tail->next;
+X	    free_vec(hist_tail->prev->argv);
+X	    xfree(hist_tail->prev);
+X	    hist_tail->prev = NULL_HIST;
+X	}
+X
+X	if (print_only) {
+X	    print_only = 0;
+X	    free_vec(argv);
+X	} else if (argc > -1)
+X	    (void) do_command(argc, argv, msg_list);
+X    }
+X}
+X
+X/* make a command from "buf".
+X * first, expand history references. make an argv from that and save
+X * in last_argv (to be passed back and stored in history). After that,
+X * THEN expand aliases. return that argv to be executed as a command.
+X */
+Xchar **
+Xmake_command(start, last_argv, argc)
+Xregister char *start, ***last_argv;
+Xint *argc;
+X{
+X    register char *p, **tmp;
+X    char buf[BUFSIZ];
+X
+X    if (!last_argv)
+X	tmp = DUBL_NULL;
+X    else
+X	tmp = *last_argv;
+X    /* first expand history -- (here's where argc gets set)
+X     * pass the buffer, the history list to reference if \!* (or whatever)
+X     * result in static buffer (pointed to by p) -- even if history parsing is
+X     * ignored, do this to remove \'s behind !'s and verifying matching quotes
+X     */
+X    if (!(p = hist_expand(start, tmp, argc)) || Strcpy(buf, p) > BUFSIZ)
+X	return DUBL_NULL;
+X    /* if history was referenced in the command, echo new command */
+X    if (*argc)
+X	puts(buf);
+X
+X    /* argc may == -1; ignore this error for now but catch it later */
+X    if (!(tmp = mk_argv(buf, argc, 0)))
+X	return DUBL_NULL;
+X
+X    /* save this as the command typed */
+X    if (last_argv)
+X	*last_argv = tmp;
+X
+X    /* expand all aliases (recursively)
+X     * pass _this_ command (as typed and without aliases) to let aliases
+X     * with "!*" be able to reference the command line just typed.
+X     */
+X    if (alias_stuff(buf, *argc, tmp) == -1)
+X	return DUBL_NULL;
+X
+X    /* now, expand variable references and make another argv */
+X    if (!variable_expand(buf))
+X	return DUBL_NULL;
+X
+X    if (!last_argv)
+X	free_vec(tmp);
+X
+X    /* with everything expanded, build final argv from new buffer
+X     * Note that backslashes and quotes still exist. Those are removed
+X     * because argument final is 1.
+X     */
+X    tmp = mk_argv(buf, argc, 1);
+X    return tmp;
+X}
+X
+X/*
+X * do the command specified by the argument vector, argv.
+X * First check to see if argc < 0. If so, someone called this
+X * command and they should not have! make_command() will return
+X * an argv but it will set argc to -1 if there's a sytanx error.
+X */
+Xdo_command(argc, argv, list)
+Xchar **argv, list[];
+X{
+X    register char *p;
+X    char **tmp = argv;
+X    int i, status;
+X    long do_pipe = ison(glob_flags, DO_PIPE);
+X
+X    turnoff(glob_flags, IS_PIPE);
+X
+X    if (argc <= 0) {
+X	turnoff(glob_flags, DO_PIPE);
+X	return -1;
+X    }
+X
+X    clear_msg_list(list);
+X
+X    for (i = 0; do_pipe >= 0 && argc; argc--) {
+X	p = argv[i];
+X	if (!strcmp(p, "|") || !strcmp(p, ";")) {
+X	    if (do_pipe = (*p == '|'))
+X		turnon(glob_flags, DO_PIPE);
+X	    argv[i] = NULL;
+X	    /* if piping, then don't call next command if this one fails. */
+X	    if ((status = exec_argv(i, argv, list)) <= -1 && do_pipe) {
+X		print("Broken pipe.\n");
+X		do_pipe = -1, turnoff(glob_flags, DO_PIPE);
+X	    }
+X	    /* if command failed and piping, or command worked and not piping */
+X	    if (do_pipe <= 0)
+X		status = 0, clear_msg_list(list);
+X	    /* else command worked and piping: set is_pipe */
+X	    else if (!status)
+X		turnon(glob_flags, IS_PIPE), turnoff(glob_flags, DO_PIPE);
+X	    argv[i] = p;
+X	    argv += (i+1);
+X	    i = 0;
+X	} else
+X	    i++;
+X    }
+X    if (do_pipe >= 0)
+X	status = exec_argv(i, argv, list);
+X    Debug("freeing: "), print_argv(tmp);
+X    free_vec(tmp);
+X    turnoff(glob_flags, DO_PIPE);
+X    return status;
+X}
+X
+Xexec_argv(argc, argv, list)
+Xregister char **argv, list[];
+X{
+X    register int n;
+X
+X    if (!argv || !*argv || **argv == '\\' && !*++*argv) {
+X	if (ison(glob_flags, IS_PIPE) || ison(glob_flags, DO_PIPE))
+X	    print("Invalid null command.\n");
+X	return -1;
+X    }
+X    Debug("executing: "), print_argv(argv);
+X
+X    /* if interrupted during execution of a command, return -1 */
+X    if (isoff(glob_flags, IGN_SIGS) && setjmp(jmpbuf)) {
+X	Debug("jumped back to exec_argv (%s: %d)\n", __FILE__, __LINE__);
+X	return -1;
+X    }
+X
+X    /* standard commands */
+X    for (n = 0; cmds[n].command; n++)
+X	if (!strcmp(argv[0], cmds[n].command))
+X	    return (*cmds[n].func)(argc, argv, list);
+X
+X    /* ucb-Mail compatible commands */
+X    for (n = 0; ucb_cmds[n].command; n++)
+X	if (!strcmp(argv[0], ucb_cmds[n].command))
+X	    return (*ucb_cmds[n].func)(argc, argv, list);
+X
+X    /* for hidden, undocumented commands */
+X    for (n = 0; hidden_cmds[n].command; n++)
+X	if (!strcmp(argv[0], hidden_cmds[n].command))
+X	    return (*hidden_cmds[n].func)(argc, argv, list);
+X
+X#ifdef SUNTOOL
+X    /* check tool-only commands */
+X    if (istool)
+X	for (n = 0; fkey_cmds[n].command; n++)
+X	    if (!strcmp(argv[0], fkey_cmds[n].command))
+X		return (*fkey_cmds[n].func)(argc, argv);
+X#endif SUNTOOL
+X
+X    if ((isdigit(**argv) || index("^.*$-`{}", **argv))
+X			&& (n = get_msg_list(argv, list)) != 0) {
+X	if (n > 0 && isoff(glob_flags, DO_PIPE))
+X	    for (n = 0; n < msg_cnt; n++)
+X		if (msg_bit(list, n)) {
+X		    display_msg((current_msg = n), (long)0);
+X		    unset_msg_bit(list, n);
+X		}
+X	return 0;
+X    } else if (strlen(*argv) == 1 && index("$^.", **argv)) {
+X	if (!msg_cnt)
+X	    print("No messages.");
+X	else {
+X	    if (**argv != '.')
+X		current_msg = (**argv == '$') ? msg_cnt-1 : 0;
+X	    set_msg_bit(list, current_msg);
+X	    display_msg(current_msg, (long)0);
+X	}
+X	return 0;
+X    }
+X    /* get_msg_list will set the current message bit if nothing parsed */
+X    unset_msg_bit(list, current_msg);
+X
+X    if (!istool && do_set(set_options, "unix")) {
+X	if (ison(glob_flags, IS_PIPE) || ison(glob_flags, DO_PIPE))
+X	    print("There is no piping to or from UNIX commands.\n");
+X	else
+X	    execute(argv);  /* try to execute a unix command */
+X	return -1; /* doesn't affect messages! */
+X    }
+X
+X    print("%s: command not found.\n", *argv);
+X    if (!istool)
+X	print("type '?' for valid commands, or type `help'\n");
+X    return -1;
+X}
+X
+X/* recursively look for aliases on a command line.  aliases may
+X * reference other aliases.
+X */
+Xalias_stuff(b, argc, Argv)
+Xregister char 	*b, **Argv;
+X{
+X    register char 	*p, **argv = DUBL_NULL;
+X    register int 	n = 0, i = 0, Argc;
+X    static int 		loops;
+X    int 		dummy;
+X
+X    if (++loops == 20) {
+X	print("Alias loop.\n");
+X	return -1;
+X    }
+X    for (Argc = 0; Argc < argc; Argc++) {
+X	register char *h = Argv[n + ++i];
+X	register char *p2 = "";
+X
+X	/* we've hit a command separator or the end of the line */
+X	if (h && strcmp(h, ";") && strcmp(h, "|"))
+X	    continue;
+X
+X	/* create a new argv containing this (possible subset) of argv */
+X	if (!(argv = calloc((unsigned)(i+1), sizeof (char *))))
+X	    continue;
+X	while (i--)
+X	    strdup(argv[i], Argv[n+i]);
+X
+X	if ((!last_aliased || strcmp(last_aliased, argv[0]))
+X			&& (p = alias_expand(argv[0]))) {
+X	    /* if history was referenced, ignore the rest of argv
+X	     * else copy all of argv onto the end of the buffer.
+X	     */
+X	    if (!(p2 = hist_expand(p, argv, &dummy)))
+X		break;
+X	    if (!dummy)
+X		(void) argv_to_string(p2+strlen(p2), argv+1);
+X	    if (Strcpy(b, p2) > BUFSIZ) {
+X		print("Not enough buffer space.\n");
+X		break;
+X	    }
+X	    /* release old argv and build a new one based on new string */
+X	    free_vec(argv);
+X	    if (!(argv = mk_argv(b, &dummy, 0)))
+X		break;
+X	    if (alias_stuff(b, dummy, argv) == -1)
+X		break;
+X	} else
+X	    b = argv_to_string(b, argv);
+X	xfree(last_aliased), last_aliased = NULL;
+X	free_vec(argv);
+X	b += strlen(b);
+X	if (h) {
+X	    p2 = h;
+X	    while (++Argc < argc && (h = Argv[Argc]))
+X		if (strcmp(h, ";") && strcmp(h, "|"))
+X		    break;
+X	    b += strlen(sprintf(b, " %s ", p2));
+X	    n = Argc--;
+X	}
+X	i = 0;
+X    }
+X    xfree(last_aliased), last_aliased = NULL;
+X    --loops;
+X    if (Argc < argc) {
+X	free_vec(argv);
+X	return -1;
+X    }
+X    return 0;
+X}
+X
+Xchar *
+Xalias_expand(cmd)
+Xregister char *cmd;
+X{
+X    register char *p;
+X    register int x;
+X
+X    if (!(p = do_set(functions, cmd)))
+X	return NULL;
+X    last_aliased = savestr(cmd); /* to be freed elsewhere; don't strdup! */
+X    if (isoff(glob_flags, WARNING))
+X	return p;
+X    for (x = 0; cmds[x].command; x++)
+X	if (!strcmp(cmd, cmds[x].command)) {
+X	    wprint("(real command: \"%s\" aliased to \"%s\")\n", cmd, p);
+X	    return p;
+X	}
+X    for (x = 0; ucb_cmds[x].command; x++)
+X	if (!strcmp(cmd, ucb_cmds[x].command)) {
+X	    wprint("(ucb-command: \"%s\" aliased to \"%s\")\n", cmd, p);
+X	    return p;
+X	}
+X    return p;
+X}
+X
+X/* expand history references and separate message lists from other tokens */
+Xchar *
+Xhist_expand(str, argv, hist_was_referenced)
+Xregister char *str, **argv;
+Xregister int *hist_was_referenced;
+X{
+X    static char   buf[BUFSIZ];
+X    register int  b = 0, inquotes = 0;
+X    int 	  first_space = 0, ignore_bang;
+X
+X    ignore_bang = (ison(glob_flags, IGN_BANG) ||
+X		   do_set(set_options, "ignore_bang"));
+X
+X    if (hist_was_referenced)
+X	*hist_was_referenced = 0;
+X    while (*str) {
+X	while (!inquotes && isspace(*str))
+X	    str++;
+X	do  {
+X	    if (!*str)
+X		break;
+X	    if (b >= BUFSIZ-1) {
+X		print("argument list too long.\n");
+X		return NULL;
+X	    }
+X	    if ((buf[b] = *str++) == '\'') {
+X		/* make sure there's a match! */
+X		inquotes = !inquotes;
+X	    }
+X	    if (!first_space && !inquotes && index("0123456789{}*$", buf[b])
+X			     && b && !index("0123456789{}- \t", buf[b-1])) {
+X		buf[b+1] = buf[b];
+X		buf[b++] = ' ';
+X		while ((buf[++b] = *str++) && index("0123456789-,${}", buf[b]))
+X		    ;
+X		if (!buf[b])
+X		    str--;
+X		first_space++;
+X	    }
+X	    /* check for (;) (|) or any other delimeter and separate it from
+X	     * other tokens.
+X	     */
+X	    if (!inquotes && buf[b] != '\0' && isdelimeter(buf[b])) {
+X		if (b && !isspace(buf[b-1]))
+X		    buf[b+1] = buf[b], buf[b++] = ' ';
+X		b++;
+X		break;
+X	    }
+X	    /* if double-quotes, just copy byte by byte, char by char ... */
+X	    if (buf[b] == '"') {
+X		int B = b;
+X		while ((buf[++B] = *str++) && buf[B] != '"')
+X		    ;
+X		if (buf[B])
+X		    b = B;
+X		else
+X		    str--;
+X		b++;
+X		continue;
+X	    }
+X	    if (buf[b] == '\\') {
+X		if ((buf[++b] = *str) == '!')
+X		    buf[--b] = '!';
+X		++str;
+X	    } else if (buf[b] == '!' && *str && *str != '\\' && !isspace(*str)
+X			&& !ignore_bang) {
+X		char word[BUFSIZ];
+X		if (!(str = reference_hist(str, word, argv)))
+X		    return NULL;
+X		if (hist_was_referenced)
+X		    *hist_was_referenced = 1;
+X		if (strlen(word) + b >= BUFSIZ) {
+X		    print("argument list too long.\n");
+X		    return NULL;
+X		}
+X		b += Strcpy(&buf[b], word) - 1;
+X	    }
+X	    b++;
+X	} while (*str && !isdelimeter(*str));
+X	if (!inquotes)
+X	    first_space++, buf[b++] = ' ';
+X    }
+X    buf[b] = 0;
+X    return buf;
+X}
+X
+X/*
+X * find mush variable references and expand them to their values.
+X * variables are preceded by a '$' and cannot be within single
+X * quotes.  Only if expansion has been made do we copy buf back into str.
+X * RETURN 0 on failure, 1 on success.
+X */
+Xvariable_expand(str)
+Xregister char *str;
+X{
+X    register int     b = 0;
+X    char             buf[BUFSIZ], *start = str;
+X    int		     expanded = 0;
+X
+X    while (*str) {
+X	if (*str == '~' && (str == start || isspace(*(str-1)))) {
+X	    register char *p = any(str, " \t"), *tmp;
+X	    int x = 1;
+X	    if (p)
+X		*p = 0;
+X	    tmp = getpath(str, &x);
+X	    /* if error, print message and return 0 */
+X	    if (x == -1) {
+X		wprint("%s: %s\n", str, tmp);
+X		return 0;
+X	    }
+X	    b += Strcpy(buf+b, tmp);
+X	    if (p)
+X		*p = ' ', str = p;
+X	    else
+X		str += strlen(str);
+X	    expanded = 1;
+X	}
+X	/* if single-quotes, just copy byte by byte, char by char ... */
+X	if ((buf[b] = *str++) == '\'') {
+X	    while ((buf[++b] = *str++) && buf[b] != '\'')
+X		;
+X	    if (!buf[b])
+X		str--;
+X	}
+X	/* If $ is eoln, continue.  Variables must start with a `$'
+X	 * and continue with {, _, a-z, A-Z or it is not a variable.      }
+X	 */
+X	if (buf[b] == '$' &&
+X	    (isalpha(*str) || *str == '{' || *str == '_'))  /* } */  {
+X	    register char c, *p, *var, *end;
+X
+X	    if (*(end = var = str) == '{')  /* } */   {
+X		if (!isalpha(*++str) && *str != '_') {
+X		    print("Illegal variable name.\n");
+X		    return 0;
+X		}
+X		if (!(end = index(var, '}'))) /* { */   {
+X		    print("Unmatched '{'.\n"); /* } */
+X		    return 0;
+X		}
+X		*end++ = 0;
+X	    } else
+X		while (isalnum(*++end) || *end == '_')
+X		    ;
+X	    /* advance "str" to the next parse-point, replace the end
+X	     * of "var" (end) with a null, and save char in `c'
+X	     */
+X	    c = *(str = end), *end = 0;
+X
+X	    /* get the value of the variable. */
+X	    if (p = do_set(set_options, var))
+X		b += Strcpy(buf+b, p);
+X	    else {
+X		print("%s: undefined variable\n", var);
+X		return 0;
+X	    }
+X	    expanded = 1;
+X	    *str = c; /* replace the null with the old character */
+X	} else
+X	    b++;
+X    }
+X    buf[b] = 0;
+X    if (expanded) /* if any expansions were done, copy back into orig buf */
+X	(void) strcpy(start, buf);
+X    return 1;
+X}
+X
+X/* make an vector of space delimeted character strings out of string "str".
+X * place in "argc" the number of args made. If final is true, then remove
+X * quotes and backslants according to standard.
+X */
+Xchar **
+Xmk_argv(str, argc, final)
+Xregister char *str;
+Xregister int *argc;
+X{
+X    register char	*s, *p;
+X    register int	tmp, err = 0;
+X    char		*newargv[MAXARGS], **argv, *p2, c;
+X
+X    *argc = 0;
+X    while (*str) {
+X	while (isspace(*str))
+X	    ++str;
+X	if (*str) {		/* found beginning of a word */
+X	    s = p = str;
+X	    do  {
+X		if (p - s >= BUFSIZ-1) {
+X		    print("argument list too long.\n");
+X		    return DUBL_NULL;
+X		}
+X		if ((*p = *str++) == '\\') {
+X		    if (final && (*str == ';' || *str == '|'))
+X			/* make ";" look like " ;" */
+X			*p = ' ';
+X		    if (*++p = *str) /* assign and compare to NULL */
+X			str++;
+X		    continue;
+X		}
+X		if (p2 = index("\"'", *p)) {
+X		    register char c2 = *p2;
+X		    /* you can't escape quotes inside quotes of the same type */
+X		    if (!(p2 = index(str, c2))) {
+X			if (final)
+X			    print("Unmatched %c.\n", c2);
+X			err++;
+X			p2 = str;
+X		    }
+X		    tmp = (int)(p2 - str) + 1; /* take upto & include quote */
+X		    (void) strncpy(p + !final, str, tmp);
+X		    p += tmp - 2 * final; /* change final to a boolean */
+X		    if (*(str = p2))
+X			str++;
+X		}
+X	    } while (++p, *str && !isdelimeter(*str));
+X	    if (c = *str) /* set c = *str, check for null */
+X		str++;
+X	    *p = 0;
+X	    if (*s) {
+X		newargv[*argc] = savestr(s);
+X		(*argc)++;
+X	    }
+X	    *p = c;
+X	}
+X    }
+X    if (!*argc)
+X	return DUBL_NULL;
+X    /* newargv[*argc] = NULL; */
+X    if (!(argv = calloc((unsigned)((*argc)+1), sizeof(char *)))) {
+X	perror("mk_argv: calloc");
+X	return DUBL_NULL;
+X    }
+X    for (tmp = 0; tmp < *argc; tmp++)
+X	argv[tmp] = newargv[tmp];
+X    if (err)
+X	*argc = -1;
+X    return argv;
+X}
+X
+X/*
+X * reference previous history from syntax of str and place result into buf
+X * We know we've got a history reference -- we're passed the string starting
+X * the first char AFTER the '!' (which indicates history reference)
+X */
+Xchar *
+Xreference_hist(str, buf, hist_ref)
+Xregister char *str, *buf, **hist_ref;
+X{
+X    int 	   relative = *str == '-'; /* relative from current hist_no */
+X    int 	   old_hist, argstart = 0, lastarg, argend = 0, n = 0;
+X    register char  *p, **argv = hist_ref;
+X    struct history *hist;
+X
+X    buf[0] = 0;
+X    if (index("!:$*", *str)) {
+X	old_hist = hist_no;
+X	if (*str == '!')
+X	    str++;
+X    } else if (isdigit(*(str + relative)))
+X	str = my_atoi(str + relative, &old_hist);
+X    else if (!(p = hist_from_str(str, &old_hist)))
+X	return NULL;
+X    else
+X	str = p;
+X    if (relative)
+X	old_hist = (hist_no-old_hist) + 1;
+X    if (old_hist == hist_no) {
+X	if (!(argv = hist_ref))
+X	    print("You haven't done anything yet!\n");
+X    } else {
+X	if (old_hist <= hist_no-hist_size || old_hist > hist_no ||
+X	    old_hist <= 0) {
+X	    if (old_hist <= 0)
+X		print("You haven't done that many commands, yet.\n");
+X	    else
+X		print("Event %d %s.\n", old_hist,
+X		    (old_hist > hist_no)? "hasn't happened yet": "expired");
+X	    return NULL;
+X	}
+X	hist = hist_head;
+X	while (hist && hist->histno != old_hist)
+X	    hist = hist->prev;
+X	if (hist)
+X	    argv = hist->argv;
+X    }
+X    if (!argv)
+X	return NULL;
+X    while (argv[argend+1])
+X	argend++;
+X    lastarg = argend;
+X    if (*str && index(":$*", *str)) {
+X	int isrange;
+X	if (*str == ':' && isdigit(*++str))
+X	    str = my_atoi(str, &argstart);
+X	if (isrange = (*str == '-'))
+X	    str++;
+X	if (!isdigit(*str)) {
+X	    if (*str == 'p')
+X		str++, print_only = 1;
+X	    else if (!*str || isdelimeter(*str))
+X		argend = argstart;
+X	    else {
+X		if (*str == '*')
+X		    if (argv[0])
+X			argstart = 1, argend = ++lastarg;
+X		    else
+X			argstart = 0;
+X		else if (*str == '$' || !isrange)
+X		    argstart = argend;
+X		else
+X		    print("%c: unknown arguement selector.\n", *str);
+X		str++;
+X	    }
+X	} else
+X	    str = my_atoi(str, &argend);
+X    }
+X    if (argstart > lastarg || argend > lastarg || argstart > argend) {
+X	print("Bad argument selector.\n");
+X	return NULL;
+X    }
+X    while (argstart <= argend) {
+X	n += Strcpy(&buf[n], argv[argstart++]);
+X	buf[n++] = ' ';
+X    }
+X    buf[--n] = 0;
+X    return str;
+X}
+X
+X/* find a history command that contains the string "str"
+X * place that history number in "hist" and return the end of the string
+X * parsed: !?foo (find command with "foo" in it) !?foo?bar (same, but add "bar")
+X * in the second example, return the pointer to "bar"
+X */
+Xchar *
+Xhist_from_str(str, hist_number)
+Xregister char *str;
+Xregister int *hist_number;
+X{
+X    register char *p = NULL, c = 0;
+X    int 	  full_search = 0, len, found;
+X    char 	  buf[BUFSIZ];
+X    struct history *hist;
+X#ifndef SYSV
+X    extern char   *re_comp();
+X#else
+X    extern char   *regcmp();
+X#endif SYSV
+X
+X    if (*str == '?') {
+X	if (p = index(++str, '?'))
+X	    *p++ = 0;
+X	else
+X	    p = str + strlen(str);
+X	full_search = 1;
+X    } else if (*str == '{')
+X	if (!(p = index(str, '}'))) {   /* { */
+X	    print("Unmatched '}'");
+X	    return NULL;
+X	} else
+X	    *p++ = 0, ++str;
+X    else
+X	p = str;
+X    while (*p && *p != ':' && !isspace(*p))
+X	p++;
+X    c = *p, *p = 0;
+X    if (*str) {
+X#ifndef SYSV
+X	if (re_comp(str))
+X#else
+X	if (!regcmp(str, NULL))
+X#endif SYSV
+X	    return NULL;
+X    } else {
+X	*hist_number = hist_no;
+X	return p;
+X    }
+X    len = strlen(str);
+X    /* move thru the history in reverse searching for a string match. */
+X    for (hist = hist_head; hist; hist = hist->prev) {
+X	if (full_search) {
+X	    (void) argv_to_string(buf, hist->argv);
+X	    Debug("Checking for (%s) in (#%d: %s)\n", str, hist->histno, buf);
+X	}
+X	if (!full_search) {
+X	    (void) strcpy(buf, hist->argv[0]);
+X	    Debug("Checking for (%s) in (#%d: %*s)\n",
+X		str, hist->histno, len, buf);
+X	    found = !strncmp(buf, str, len);
+X	} else
+X	    found =
+X#ifndef SYSV
+X		re_exec(buf)
+X#else
+X		!!regex(buf, NULL) /* convert to boolean value */
+X#endif SYSV
+X				== 1;
+X	if (found) {
+X	    *hist_number = hist->histno;
+X	    Debug("Found it in history #%d\n", *hist_number);
+X	    *p = c;
+X	    return p;
+X	}
+X    }
+X    print("%s: event not found\n", str);
+X    return NULL;
+X}
+X
+Xdisp_hist(n, argv)  /* argc not used -- use space for the variable, "n" */
+Xregister int n;
+Xchar **argv;
+X{
+X    register int	list_num = TRUE, num_of_hists = hist_size;
+X    register int	reverse = FALSE;
+X    struct history	*hist = hist_tail;
+X
+X    while (*++argv && *argv[0] == '-') {
+X	n = 1;
+X	do  switch(argv[0][n]) {
+X		case 'h': list_num = FALSE;
+X		when 'r': reverse = TRUE; hist = hist_head;
+X		otherwise: print("usage: history [-h] [-r] [#histories]\n");
+X			   return -1;
+X	    }
+X	while (argv[0][++n]);
+X    }
+X    if (*argv)
+X	if (!isdigit(**argv)) {
+X	    print("history: badly formed number\n");
+X	    return -1;
+X	} else
+X	    num_of_hists = atoi(*argv);
+X
+X    if (num_of_hists > hist_size || num_of_hists > hist_no)
+X	num_of_hists = min(hist_size, hist_no);
+X
+X    if (!reverse)
+X	while (hist_no - hist->histno > num_of_hists) {
+X	    printf("skipping %d\n", hist->histno);
+X	    hist = hist->next;
+X	}
+X
+X    for (n = 0; n < num_of_hists && hist; n++) {
+X	if (list_num)
+X	    wprint("%4.d  ", hist->histno);
+X	print_argv(hist->argv);
+X	hist = (reverse)? hist->prev : hist->next;
+X    }
+X    return -1;
+X}
+X
+Xinit_history(newsize)
+X{
+X    if ((hist_size = newsize) < 1)
+X	hist_size = 1;
+X}
+X
+END_OF_FILE
+if test 24112 -ne `wc -c <'loop.c'`; then
+    echo shar: \"'loop.c'\" unpacked with wrong size!
+fi
+# end of 'loop.c'
+fi
+echo shar: End of archive 9 \(of 12\).
+cp /dev/null ark9isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 12 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

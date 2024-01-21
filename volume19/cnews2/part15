@@ -1,0 +1,1769 @@
+Subject:  v19i092:  Cnews production release, Part15/19
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: utzoo!henry
+Posting-number: Volume 19, Issue 92
+Archive-name: cnews2/part15
+
+: ---CUT HERE---
+echo 'relay/fileart.c':
+sed 's/^X//' >'relay/fileart.c' <<'!'
+X/*
+X * fileart - file an article, given its temporary file name and its headers
+X *
+X * It may be desirable to, some day, prevent cross-postings across
+X * "universes", where a universe might be "alt" or "comp,news".
+X *
+X * There are three classes of newsgroup for the purposes of filing:
+X * "wanted" (in the active file and missing the "x" flag);
+X * "not wanted" ("x"ed in active, or not in active and not matched by sys
+X *	file's subscription list for this machine), so ignore it; or
+X * "don't know it" (not in active and matched by subscription list,
+X *	so file the article in junk once, iff there are no good groups).
+X * junk *must* be in the active file or it's an error (ST_DROPPED),
+X * but junk may have an "x" flag to prevent filing.
+X *
+X * Use the active file 'x' flag to snuff groups quietly, even when your
+X * subscription list permits them, without filing in junk.
+X */
+X
+X#include <stdio.h>
+X#include <errno.h>
+X#include <sys/types.h>
+X
+X#include "libc.h"
+X#include "news.h"
+X#include "config.h"
+X#include "active.h"
+X#include "mkdirs.h"
+X#include "headers.h"
+X#include "article.h"
+X#include "history.h"
+X#include "system.h"
+X
+X#define JUNK "junk"			/* lost+found pseudo-ng. */
+X#define CONTROL "control"		/* control message pseudo-ng. */
+X
+Xstatic long artnum;			/* asgnartnum sets artnum */
+Xstatic int goodngs;			/* asgnartnum reads goodngs */
+X
+Xstatic boolean debug = NO;
+X
+X/* imports from news */
+Xextern void prefuse();
+X
+X/* forwards */
+XFORWARD void asgnartnum(), gotgoodng(), mkjunklink(), mklinks();
+XFORWARD boolean openorlink(), mkonelink(), tryartnum();
+X
+Xvoid
+Xfiledebug(state)		/* set debugging state */
+Xboolean state;
+X{
+X	debug = state;
+X}
+X
+X/*
+X * File in the spool directory the article in art & fill in art->a_files.
+X * Generate Xref: header if needed (successfully cross-posted).
+X *
+X * If a_unlink is true, there is a temp file, so openfirst should
+X * be false, and vice versa.
+X *
+X * If openfirst (!art->a_unlink) is true, fill in a_tmpf with the name of
+X * the first link, fopen it (into art->a_artf), and make any remaining links.
+X * If openfirst is false, just make links to a_tmpf, which is already
+X * open as art->a_artf.  openfirst means "Newsgroups:" was seen in time.
+X */
+Xvoid
+Xfileart(art)
+Xregister struct article *art;
+X{
+X	register boolean openfirst = !art->a_unlink;
+X	int junkgroups = 0;		/* count "junked" groups */
+X	char artnumstr[MAXCOMP];	/* article number in ascii */
+X
+X	if (art->a_filed)
+X		return;			/* don't file twice */
+X	artnum = 0;
+X	goodngs = 0;
+X	mklinks(art, openfirst, artnumstr, &junkgroups);
+X	mkjunklink(art, openfirst, artnumstr, &junkgroups);
+X	if (goodngs > 1 && art->a_artf != NULL)	/* cross-posted? */
+X		emitxref(art);
+X}
+X
+X/*
+X * Store in spooldir.  Link temp file to spooldir/ng/article-number
+X * for each ng.  Control messages go in CONTROL, never in all.all.ctl.
+X */
+XSTATIC void
+Xmklinks(art, openfirst, artnumstr, junkgroupsp)
+Xregister struct article *art;
+Xboolean openfirst;
+Xchar *artnumstr;
+Xint *junkgroupsp;
+X{
+X	register char *ngs, *ng;
+X	register char *comma;
+X
+X	ngs = (art->h.h_ctlcmd != NULL? CONTROL: art->h.h_ngs);
+X	if (art->a_status&ST_REFUSED)
+X		(void) fprintf(stderr,
+X		"%s: mklinks called with ST_REFUSED set (can't happen)\n",
+X			progname);
+X	for (; ngs != NULL; ngs = comma) {
+X		comma = index(ngs, NGSEP);
+X		if (comma != NULL)
+X			*comma = '\0';		/* will be restored below */
+X		ng = realngname(ngs);
+X		if (ng == NULL)
+X			ng = strsave(ngs);
+X		asgnartnum(art, openfirst, ng, artnumstr);
+X		/*
+X		 * If no such group in active or link failed, and the group
+X		 * wasn't 'x'ed in active, but our subscription list permits
+X		 * this group, then set flag to file it under "junk" later.
+X		 */
+X		if ((artnum < 1 || art->a_status != ST_OKAY) &&
+X		    art->a_status != ST_REFUSED &&
+X		    ngmatch(oursys()->sy_ngs, ng))
+X		    	++*junkgroupsp;
+X		/*
+X		 * If article # was assigned & link succeeded,
+X		 * update art->a_files list for history.
+X		 */
+X		if (artnum >= 1 && art->a_status == ST_OKAY)
+X			gotgoodng(art, ng, artnumstr);
+X		free(ng);
+X
+X		if (comma != NULL)
+X			*comma++ = NGSEP;	/* step past comma */
+X
+X		/* asgnartnum refused just this ng */
+X		art->a_status &= ~ST_REFUSED;
+X	}
+X}
+X
+X/*
+X * File once in "junk" iff no ngs were filed due to absence from
+X * active, but some were permitted by sys.  This will make one junk
+X * link, no matter how many bad groups, and only if all are bad
+X * (e.g. rec.drugs,talk.chew-the-fat).
+X */
+XSTATIC void
+Xmkjunklink(art, openfirst, artnumstr, junkgroupsp)
+Xregister struct article *art;
+Xboolean openfirst;
+Xchar *artnumstr;
+Xint *junkgroupsp;
+X{
+X	if (*junkgroupsp > 0 && goodngs == 0) {	/* all groups were "junked"? */
+X		asgnartnum(art, openfirst, JUNK, artnumstr);
+X		if (artnum >= 1 && art->a_status == ST_OKAY) {
+X			gotgoodng(art, JUNK, artnumstr);
+X			art->a_status |= ST_JUNKED;
+X		} else {
+X			/*
+X			 * couldn't file article in junk.
+X			 * was JUNK not 'x'ed (i.e. doesn't exist)?
+X			 */
+X			if (art->a_status != ST_REFUSED) {
+X				static boolean warned = NO;
+X
+X				art->a_status |= ST_REFUSED|ST_DROPPED;
+X				if (!warned) {
+X					warned = YES;
+X					(void) fprintf(stderr, "%s: no %s group\n",
+X						progname, JUNK);
+X				}
+X			}
+X			prefuse(art);
+X			(void) printf("no known groups in `%s' and no %s group\n",
+X				art->h.h_ngs, JUNK);
+X		}
+X	} else if (goodngs == 0) {
+X		extern boolean histreject;
+X
+X		/*
+X		 * Groups were permitted by subscription list, but all
+X		 * were 'x'ed in active, or otherwise refused.
+X		 */
+X		if (histreject)
+X			history(art, NOLOG);
+X		prefuse(art);
+X		(void) printf("all groups `%s' excluded in active\n", art->h.h_ngs);
+X		art->a_status |= ST_REFUSED;
+X	}
+X}
+X
+X/*
+X * Append ng/artnumstr to art's list of files, and bump goodngs.
+X */
+XSTATIC void
+Xgotgoodng(art, ng, artnumstr)
+Xstruct article *art;
+Xchar *ng, *artnumstr;
+X{
+X	++goodngs;
+X	histupdfiles(art, ng, artnumstr);
+X}
+X
+X/*
+X * Assign a permanent name and article number to the temporary name
+X * art->a_tmpf in newsgroup "ng" & store the ascii form of the article
+X * number into "artnumstr", returning the article number in "artnum".
+X *
+X * If openfirst is true and goodngs is zero, set inname to artname,
+X * fopen artname and store the result in art->a_artf.
+X */
+XSTATIC void
+Xasgnartnum(art, openfirst, ng, artnumstr)
+Xstruct article *art;
+Xboolean openfirst;				/* open first link? */
+Xregister char *ng;				/* read-only */
+Xchar *artnumstr;
+X{
+X	register char *slashng;			/* a group, slashed */
+X
+X	/* field active 'x' flag: don't file this group, quietly */
+X	if (unwanted(ng)) {
+X		artnum = -1;
+X		art->a_status |= ST_REFUSED;
+X		return;
+X	}
+X
+X	slashng = strsave(ng);
+X	mkfilenm(slashng);			/* relative to spooldir */
+X	while ((artnum = nxtartnum(ng)) >= 1)
+X		if (tryartnum(art, openfirst, slashng, artnumstr))
+X			break;
+X	free(slashng);
+X}
+X
+X/*
+X * Construct a link name (slashng/artnum) for this article,
+X * and try to link art to it.
+X *
+X * We changed directory to spooldir in main(), so the generated name
+X * is relative to spooldir, therefore artname can be used as is.
+X *
+X * Return value is identical to mkonelink's.
+X */
+XSTATIC boolean
+Xtryartnum(art, openfirst, slashng, artnumstr)
+Xregister struct article *art;
+Xboolean openfirst;
+Xregister char *slashng;
+Xchar *artnumstr;			/* side-effect returned here */
+X{
+X	register char *artname;		/* article file name */
+X	register boolean ret;
+X
+X	(void) sprintf(artnumstr, "%ld", artnum);
+X	artname = nemalloc((unsigned) (strlen(slashng) +
+X		STRLEN(SFNDELIM) + strlen(artnumstr) + 1));
+X	(void) strcpy(artname, slashng);
+X	(void) strcat(artname, SFNDELIM);
+X	(void) strcat(artname, artnumstr);
+X#ifdef notdef
+X	char *tartname = strsave(artfile(artname));
+X	free(artname);
+X	artname = tartname;
+X#endif
+X	ret = mkonelink(art, artname, openfirst);
+X	free(artname);
+X	return ret;
+X}
+X
+X/*
+X * Try to link art to artname.
+X * If the attempt fails, maybe some intermediate directories are missing,
+X * so create any missing directories and try again.  If the second attempt
+X * also fails, look at errno; if it is EEXIST, artname already exists
+X * (presumably because the active file is out of date, or the existing
+X * file is a directory such as net/micro/432), so indicate that higher
+X * levels should keep trying, otherwise we are unable to create the
+X * necessary directories, so complain and set bad status in art.
+X *
+X * Returns YES iff there is no point in trying to file this article again,
+X * usually because it has been successfully filed, but sometimes because
+X * the necessary directories cannot be made.
+X */
+XSTATIC boolean
+Xmkonelink(art, artname, openfirst)
+Xregister struct article *art;
+Xregister char *artname;
+Xboolean openfirst;
+X{
+X	if (openorlink(artname, art, openfirst, goodngs))
+X		return YES;
+X	else {
+X		(void) mkdirs(artname, getuid(), getgid());
+X		if (openorlink(artname, art, openfirst, goodngs))
+X			return YES;
+X		else if (errno != EEXIST) {
+X			warning("can't link to `%s'", artname);
+X			art->a_status |= ST_DROPPED;
+X			return YES;		/* hopeless - give up */
+X		} else
+X			return NO;
+X	}
+X}
+X
+X/*
+X * Try to make a link of art (actually art->a_tmpf) to artname.
+X * If no links have been made yet, record and open artname iff no
+X * link yet exists to that name (by any file, to avoid overwriting
+X * existing articles, e.g. due to an out-of-date active file).
+X * If links already exist, try to make artname a link to the first link
+X * (art->a_tmpf).
+X *
+X * Liberally sprinkled with debugging output, as this is the heart
+X * of article filing.
+X */
+XSTATIC boolean
+Xopenorlink(artname, art, openfirst, goodngcnt)
+Xregister char *artname;
+Xregister struct article *art;
+Xboolean openfirst;			/* open art's first link? */
+Xint goodngcnt;				/* count of good news groups */
+X{
+X	register boolean worked;		/* open or link worked? */
+X
+X	if (openfirst && goodngcnt == 0) {
+X		if (debug)
+X			(void) fprintf(stderr, "opening `%s'... ", artname);
+X		nnfree(&art->a_tmpf);
+X		art->a_tmpf = strsave(artname);
+X		art->a_artf = fopenexcl(art->a_tmpf);
+X		worked = art->a_artf != NULL;
+X	} else {
+X		if (debug)
+X			(void) fprintf(stderr, "linking `%s' to `%s'... ",
+X				art->a_tmpf, artname);
+X		worked = link(art->a_tmpf, artname) == 0;
+X		if (!worked)
+X			/*
+X			 * If art->a_tmpf really *is* a temporary name (because
+X			 * the whole header didn't fit in core), then this will
+X			 * produce a symbolic link to a non-existent name when
+X			 * art->a_tmpf is unlinked, which will be soon.
+X			 * Moral: don't run Eunice on your PDP-11.
+X			 */
+X			worked = symlink(art->a_tmpf, artname) == 0;
+X	}
+X	if (debug)
+X		if (worked)
+X			(void) fprintf(stderr, "success.\n");
+X		else
+X			warning("failed.", "");
+X	return worked;
+X}
+!
+echo 'relay/fileart.h':
+sed 's/^X//' >'relay/fileart.h' <<'!'
+X/* imports from fileart.c */
+Xextern void filedebug();
+Xextern void fileart();
+!
+echo 'relay/altctl/rmgroup.auto':
+sed 's/^X//' >'relay/altctl/rmgroup.auto' <<'!'
+X#! /bin/sh
+X# rmgroup group - snuff group. active file is locked at entry
+X# =()<. ${NEWSCONFIG-@<NEWSCONFIG>@}>()=
+X. ${NEWSCONFIG-/usr/lib/news/bin/config}
+Xexport NEWSCTL NEWSBIN NEWSARTS
+XPATH=$NEWSCTL/bin:$NEWSBIN:$NEWSPATH ; export PATH
+Xumask $NEWSUMASK
+X
+XF=/tmp/nc$$
+X
+Xcat >$F
+Xgrep -s '^Approved:' $F || { rm -f $F; exit 1; }	# unapproved ctl msg? then quit
+XSENDER="`grep '^Sender:' $F | sed 's/^[^:]*: *//'`"
+Xcase "$SENDER" in
+X"")
+X	SENDER="`grep '^From:' $F | sed 's/^[^:]*: *//'`"
+X	;;
+Xesac
+X
+X# remove active entry
+Xsed "/^`echo $1 | sed 's/\./\\\\./g'` /d" $NEWSCTL/active >$F.act
+Xcp $NEWSCTL/active $NEWSCTL/active.old
+Xcp $F.act $NEWSCTL/active
+X
+X# rm -rf $NEWSARTS/`echo $1 | tr . / `	# remove the directory
+Xdir=$NEWSARTS/`echo $1 | tr . / `	# name the directory
+Xexport dir				# for sub-shell below
+X(
+X	if test -x $dir; then
+X		cd $dir				# go there
+X		rm -f *
+X		cd ..
+X		rmdir `basename "$dir" '' `	# remove the empty directory
+X	fi
+X)
+X
+X# tell the local usenet administrator the bad news
+Xecho "rmgrouped $1 cuz $SENDER said to" | mail $NEWSMASTER
+X
+Xrm -f $F*
+!
+echo 'relay/altctl/checkgroups.new':
+sed 's/^X//' >'relay/altctl/checkgroups.new' <<'!'
+X#! /bin/sh
+X# checkgroups - check active file for missing or extra newsgroups.
+X#	stdin must a checkgroups news article, sends mail to $NEWSMASTER
+X#	after updating $nl/newsgroups from $nl/localgroups
+X# v1.4 of 9/4/84, adapted to C news
+X# added handling of changes in moderated for groups.  Dan
+X
+X# =()<. ${NEWSCONFIG-@<NEWSCONFIG>@}>()=
+X. ${NEWSCONFIG-/usr/lib/news/bin/config}
+Xexport NEWSCTL NEWSBIN NEWSARTS
+XPATH=$NEWSCTL/bin:$NEWSBIN:$NEWSPATH ; export PATH
+Xumask $NEWSUMASK
+X
+X# generate newsgroups from localgroups & stdin
+Xcp $NEWSCTL/localgroups $NEWSCTL/newsgroups
+Xsed '1,/^$/d' >>$NEWSCTL/newsgroups	# behead the article (snuff headers)
+X
+X# generate list of approved newsgroups from $nl/newsgroups
+Xecho junk >/tmp/$$a
+Xecho control >>/tmp/$$a
+X# [^.]*\. in next two egreps was net.|mod.|fa., which is inadequate - geoff
+Xsed 's/[ \	].*//' $NEWSCTL/newsgroups |
+X	egrep "^([^.]*\.|general)" >>/tmp/$$a
+Xsort -u /tmp/$$a -o /tmp/$$a
+X
+X# generate list of locally-present newsgroups from $nl/active
+Xegrep "^([^.]*\.|general|junk|control)" $NEWSCTL/active |
+X	sed 's/ .*//' | sort  -u >/tmp/$$b
+X
+Xcomm -13 /tmp/$$a /tmp/$$b >/tmp/$$missing
+Xcomm -23 /tmp/$$a /tmp/$$b >/tmp/$$remove
+X
+Xegrep "^([^.]*\.|general|junk|control)" $NEWSCTL/active | sed -n "/m\$/s/ .*//p" |
+X      sort -u > /tmp/$$amod.all
+Xegrep "^([^.]*\.|general)"  $NEWSCTL/newsgroups |
+Xsed -n "/Moderated/s/[ 	][ 	]*.*//p" | sort -u > /tmp/$$ng.mod
+X
+Xcomm -12 /tmp/$$missing /tmp/$$ng.mod >/tmp/$$add.mod
+Xcomm -23 /tmp/$$missing /tmp/$$ng.mod >/tmp/$$add.unmod
+Xcat /tmp/$$add.mod /tmp/$$add.unmod >>/tmp/$$add
+X
+Xcomm -23 /tmp/$$amod.all /tmp/$$remove >/tmp/$$amod
+Xcomm -13 /tmp/$$ng.mod /tmp/$$amod >/tmp/$$ismod
+Xcomm -23 /tmp/$$ng.mod /tmp/$$amod >/tmp/$$nm.all
+Xcomm -23 /tmp/$$nm.all /tmp/$$add >/tmp/$$notmod
+X
+X
+Xif test -s /tmp/$$remove; then
+X	echo "The following newsgroups are not valid and should be removed."
+X	sed "s/^/	/" /tmp/$$remove
+X	echo ""
+X	echo "You can do this by executing the command:"
+X	echo "	$NEWSCTL/ctl/rmgroup.auto \\"
+X	sed 's;.*;		& \\;' /tmp/$$remove
+X	echo ""
+Xfi 2>&1 >/tmp/$$out
+X
+Xif test -s /tmp/$$add; then
+X	echo "The following newsgroups were missing." # "and were added."
+X	sed "s/^/	/" /tmp/$$add
+X	echo ""
+X	echo "You can add them by executing the command(s):"
+X	for i in `cat /tmp/$$add.unmod`
+X	do
+X		echo "$NEWSBIN/ctl/newgroup $i </dev/null"
+X	done
+X	for i in `cat /tmp/$$add.mod`
+X	do
+X		echo "$NEWSBIN/ctl/newgroup $i moderated </dev/null"
+X	done
+X	echo ""
+X
+X#	for i in `cat /tmp/$$add`
+X#	do
+X# *** "Subject: cmsg " is a hideous botch of a kludge-hack; avoid it!
+X#		inews -h <<!
+X#Control: newgroup $i
+X#Newsgroups: control
+X#Subject: newgroup $i
+X#Distribution: general
+X#
+X#Create $i locally.
+X#!
+X#	done
+X
+Xfi 2>&1 >>/tmp/$$out
+X
+Xif test -s /tmp/$$ismod;then
+X	echo "The following newsgroups are not moderated and are marked moderated."
+X	sed "s/^/	/" /tmp/$$ismod
+X	echo ""
+X	echo "You can correct this by executing the command(s):"
+X	for i in `cat /tmp/$$ismod`
+X	do
+X		echo  "$NEWSBIN/ctl/newgroup $i </dev/null"
+X	done
+X	echo ""
+Xfi 2>&1 >>/tmp/$$out
+X
+X
+Xif test -s /tmp/$$notmod; then
+X	echo "The following newsgroups are moderated and not marked so."
+X	sed "s/^/	/" /tmp/$$notmod
+X	echo ""
+X	echo "You can correct this by executing the command(s):"
+X	for i in `cat /tmp/$$notmod`
+X	do
+X		echo "$NEWSBIN/ctl/newgroup $i moderated </dev/null"
+X	done
+X	echo ""
+Xfi 2>&1 >>/tmp/$$out
+X
+X
+Xif test -s /tmp/$$out; then
+X	(echo "Subject: Problems with your active file"; echo "";
+X	 cat /tmp/$$out) | mail $NEWSMASTER
+Xfi
+X
+Xrm -f /tmp/$$*		# clean up temporaries
+!
+echo 'relay/altctl/README':
+sed 's/^X//' >'relay/altctl/README' <<'!'
+XThis is a rmgroup that will do automatic deletion, and a checkgroups
+Xthat ties into same.  WE DO NOT RECOMMEND INSTALLATION OF THESE.
+!
+echo 'relay/hdrcommon.c':
+sed 's/^X//' >'relay/hdrcommon.c' <<'!'
+X/*
+X * Usenet header common code.
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include "libc.h"
+X#include "news.h"
+X#include "headers.h"
+X#include "hdrint.h"
+X
+Xvoid
+Xhdrdebug(state)
+Xint state;
+X{
+X	headdebug = state;
+X}
+X
+Xvoid
+Xhdrinit(hdrs)			/* zero all elements of hdrs */
+Xregister struct headers *hdrs;
+X{
+X	hdrs->h_subj = NULL;
+X	hdrs->h_ngs = NULL;
+X	hdrs->h_distr = NULL;
+X	hdrs->h_ctlcmd = NULL;
+X	hdrs->h_approved = NULL;
+X	hdrs->h_msgid = NULL;
+X	hdrs->h_artid = NULL;
+X	hdrs->h_expiry = NULL;
+X	hdrs->h_path = NULL;
+X	hdrs->h_sender = NULL;
+X}
+X
+Xboolean
+Xoldctl(hdrs)			/* true iff ngs are OLDCNTRL (cache in hdrs) */
+Xregister struct headers *hdrs;
+X{
+X#ifdef SLOWCTLMATCH
+X	return ngmatch(OLDCNTRL, hdrs->h_ngs);
+X#else
+X	register int ngslen = strlen(hdrs->h_ngs);
+X
+X	if (ngslen < STRLEN(SFXOLDCNTRL))	/* ngs too short */
+X		return NO;
+X	else					/* check for .ctl suffix */
+X		/*
+X		 * This is more general than RFC 850 specifies, but this
+X		 * generality seems harmless.  This doesn't work for e.g.
+X		 * x.y.ctl,z.q, which is a darn shame, but that's a violation
+X		 * of common sense.
+X		 */
+X		return STREQ(&hdrs->h_ngs[ngslen-STRLEN(SFXOLDCNTRL)],
+X			SFXOLDCNTRL);
+X#endif						/* SLOWCTLMATCH */
+X}
+X
+Xvoid
+Xfreeheaders(hdrs)		/* free (assumed) malloced storage */
+Xregister struct headers *hdrs;
+X{
+X	nnfree(&hdrs->h_subj);
+X	nnfree(&hdrs->h_ngs);
+X	nnfree(&hdrs->h_distr);
+X	nnfree(&hdrs->h_ctlcmd);
+X	nnfree(&hdrs->h_approved);
+X	nnfree(&hdrs->h_msgid);
+X	nnfree(&hdrs->h_artid);
+X	nnfree(&hdrs->h_expiry);
+X	nnfree(&hdrs->h_path);
+X	nnfree(&hdrs->h_sender);
+X}
+!
+echo 'relay/hdrdefs.c':
+sed 's/^X//' >'relay/hdrdefs.c' <<'!'
+X/*
+X * Usenet header definitions (see ARPA Internet RFCs 1036 nee 850 & 822;
+X *	for a second opinion, see The Hideous Name by Pike & Weinberger).
+X *
+X * Headers are parsed and modified and copied in one pass.
+X * Nevertheless, the code is in pieces: hdrdefs.c, hdrcommon.c,
+X * hdrparse.c, hdrmunge.c.
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#ifdef REALSTDC
+X#include <stdlib.h>
+X#endif				/* REALSTDC */
+X#include "news.h"
+X#include "headers.h"
+X#include "hdrint.h"		/* may define "const" */
+X
+X#ifndef offsetof
+X#define offsetof(type, mem) ((char *)&((type *)NULL)->mem - (char *)NULL)
+X#endif
+X
+X/* "mandatory" headers (also From:, Date:) */
+Xstatic const char msgnm[] =	"Message-ID:";	/* for rejection */
+Xstatic const char ngsnm[] =	"Newsgroups:";	/* filing, clone for Xref */
+Xstatic const char pathnm[] =	"Path:";	/* rejection, extend (damn) */
+Xstatic const char subjnm[] =	"Subject:";	/* for ctl. msgs. */
+X
+X/* optional headers */
+Xstatic const char appnm[] =	"Approved:";	/* for mod. groups */
+Xstatic const char ctlnm[] =	"Control:";	/* ctl. msg. */
+Xstatic const char expnm[] =	"Expires:";	/* for history */
+Xstatic const char distrnm[] =	"Distribution:";	/* for transmission */
+Xstatic const char sendnm[] =	"Sender:";	/* for mod. groups */
+Xstatic const char xrefnm[] =	"Xref:";	/* to *replace* (damn!)*/
+X
+X/* obsolete "useful" headers */
+Xstatic const char artnm[] =	"Article-I.D.:";	/* obs. Message-ID: */
+X
+X/* obsolete useless headers: delete them all on contact */
+Xstatic const char datercvnm[] = "Date-Received:";
+Xstatic const char rcvnm[] =	"Received:";	/* obsolete Date-Received: */
+Xstatic const char postnm[] =	"Posted:";	/* obsolete Date: */
+Xstatic const char postversnm[] = "Posting-Version:";
+Xstatic const char rlyversnm[] = "Relay-Version:";
+Xstatic const char illobjnm[] = "Illegal-Object:";	/* zmailer bitching */
+X
+Xstatic const struct hdrdef msghdr = {
+X	msgnm, STRLEN(msgnm), offsetof(struct headers, h_msgid) };
+Xstatic const struct hdrdef ngshdr = {
+X	ngsnm, STRLEN(ngsnm), offsetof(struct headers, h_ngs) };
+Xconst struct hdrdef pathhdr = {
+X	pathnm, STRLEN(pathnm), offsetof(struct headers, h_path) };
+Xstatic const struct hdrdef subjhdr = {
+X	subjnm, STRLEN(subjnm), offsetof(struct headers, h_subj) };
+X
+Xstatic const struct hdrdef apphdr = {
+X	appnm, STRLEN(appnm), offsetof(struct headers, h_approved) };
+Xstatic const struct hdrdef ctlhdr = {
+X	ctlnm, STRLEN(ctlnm), offsetof(struct headers, h_ctlcmd) };
+Xstatic const struct hdrdef exphdr = {
+X	expnm, STRLEN(expnm), offsetof(struct headers, h_expiry) };
+Xstatic const struct hdrdef distrhdr = {
+X	distrnm, STRLEN(distrnm), offsetof(struct headers, h_distr) };
+Xstatic const struct hdrdef sendhdr = {
+X	sendnm, STRLEN(sendnm), offsetof(struct headers, h_sender) };
+Xconst struct hdrdef xrefhdr = { xrefnm, STRLEN(xrefnm), -1 };
+X
+Xstatic const struct hdrdef arthdr = {
+X	artnm, STRLEN(artnm), offsetof(struct headers, h_artid) };
+X
+Xstatic const struct hdrdef datrcvhdr = { datercvnm, STRLEN(datercvnm), -1 };
+Xstatic const struct hdrdef rcvhdr = { rcvnm, STRLEN(rcvnm), -1 };
+Xstatic const struct hdrdef psthdr = { postnm, STRLEN(postnm), -1 };
+Xstatic const struct hdrdef pstvrshdr = { postversnm, STRLEN(postversnm), -1 };
+Xstatic const struct hdrdef rlyvrshdr = { rlyversnm, STRLEN(rlyversnm), -1 };
+Xstatic const struct hdrdef illobjhdr = { illobjnm, STRLEN(illobjnm), -1 };
+X
+Xconst hdrlist parsehdrs = {	/* these are parsed into a struct headers */
+X	&msghdr,
+X	&arthdr,		/* obsolete */
+X	&ngshdr,
+X	&pathhdr,		/* modified by hdrmunge.c (emithdr()) */
+X	&subjhdr,
+X	/* start optional headers */
+X	&apphdr,
+X	&ctlhdr,
+X	&distrhdr,
+X	&exphdr,
+X	&sendhdr,
+X	NULL
+X};
+X/*
+X * the following noxious headers are deleted on contact because neighbours
+X * still send them and they are big.  in an ideal world, they wouldn't be
+X * sent and thus we wouldn't need to delete them.
+X * It is tempting to delete Article-I.D.: too, but it may be too soon for that.
+X */
+Xconst hdrlist hdrvilest = {
+X	&xrefhdr,		/* regenerated by fileart() if needed */
+X	&datrcvhdr,
+X	&rcvhdr,
+X	&psthdr,
+X	&pstvrshdr,
+X	&rlyvrshdr,
+X	&illobjhdr,
+X	NULL,
+X};
+X
+Xboolean headdebug = NO;
+!
+echo 'relay/hdrint.h':
+sed 's/^X//' >'relay/hdrint.h' <<'!'
+X/*
+X * definitions internal to the header modules (hdr*.c)
+X */
+X#ifdef REALSTDC
+X#undef REALSTDC
+X#endif
+X#ifdef __STDC__
+X#if __STDC__ >= 1		/* microsoft, etc. brain-damage */
+X#define REALSTDC		/* truth in advertising: really ANSI */
+X#endif				/* __STDC__ < 1 */
+X#endif				/* __STDC__ */
+X
+X#ifndef REALSTDC
+X#define const
+X#endif				/* REALSTDC */
+X
+X#ifndef DEFDIST
+X#define DEFDIST "world"		/* default Distribution: */
+X#endif
+X#ifndef DEFMSGID
+X#define DEFMSGID "<message-id@absent>"
+X#endif
+X
+X#define JUNK "junk"
+X#define ALL "all"
+X
+X#ifdef SLOWCTLMATCH
+X#define OLDCNTRL "all.all.ctl"
+X#endif
+X#define SFXOLDCNTRL ".ctl"
+X
+Xstruct hdrdef {
+X	const char *hdrnm;	/* ascii name */
+X	unsigned hdrlen;	/* STRLEN(hdrnm) */
+X	int hdroff;		/* offset into struct header */
+X};
+Xtypedef const struct hdrdef *hdrlist[];
+X
+Xextern const struct hdrdef pathhdr, xrefhdr;
+Xextern const hdrlist parsehdrs, hdrvilest;
+X
+Xextern boolean headdebug;
+!
+echo 'relay/hdrmunge.c':
+sed 's/^X//' >'relay/hdrmunge.c' <<'!'
+X/*
+X * Usenet header modification & generation
+X *
+X * Ideally, headers should never be modified; message text, including
+X * headers, should be passed untouched.  Path: and Xref: demand that this
+X * rule be violated, and we delete huge obsolete headers to save space.
+X *
+X * Delete obsolete & large headers and Xref (can't be right),
+X * as headers are read.
+X * Recognise Newsgroups: and if more than one group, generate Xref: &
+X * leave holes for the article numbers - fileart will fill them in.
+X * (Make rn look in history instead?)
+X *
+X * Pile up headers into a static buffer until end of buffer (i.e. next
+X * line might not fit) [checked in hdrsave()], end of headers, end of
+X * file, or byte count is exhausted [checked in cparttofp].  Then write
+X * them to disk.  Prepend hostname! to Path: value, during output.
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include "libc.h"
+X#include "news.h"
+X#include "fileart.h"
+X#include "headers.h"
+X#include "article.h"
+X#include "hdrint.h"
+X#include "msgs.h"
+X
+X/*
+X * HDRMEMSIZ is the length of a header-stashing buffer, which is used
+X * only during article-header copying.
+X * HDRMEMSIZ can be too small if memory is tight & will only hurt performance.
+X * Derivation: 630 bytes is a large header (after discarding *-Version:, etc.).
+X */
+X#ifndef HDRMEMSIZ
+X#ifdef SMALLMEM
+X#define HDRMEMSIZ 630
+X#else
+X#define HDRMEMSIZ 8192			/* # bytes for saving headers in core */
+X#endif	/* SMALLMEM */
+X#endif	/* HDRMEMSIZ */
+X
+X/* private */
+Xstatic char **hptrs = NULL;	/* saved-headers-ptrs array; allocated once */
+X
+X/* forwards */
+XFORWARD void emithdr(), hdrsave();
+X
+X/*
+X * Generate an Xref: header from art->a_files.
+X * Turn slashes in art->a_files into colons in Xref:.
+X */
+Xvoid
+Xemitxref(art)
+Xregister struct article *art;
+X{
+X	register char *slashp, *xrefs;
+X
+X	if (!art->a_xref) {
+X		art->a_xref = YES;
+X		xrefs = strsave(art->a_files);
+X		for (slashp = xrefs; (slashp = index(slashp, FNDELIM)) != NULL; )
+X			*slashp++ = ':';
+X		if (fprintf(art->a_artf, "%s %s %s\n",
+X		    xrefhdr.hdrnm, hostname(), xrefs) == EOF)
+X			fulldisk(art, spoolnm(art));
+X		free(xrefs);
+X	}
+X}
+X
+X/*
+X * --- header copying starts here ---
+X */
+X
+X/*
+X * Copy headers and delete or modify a few.  Assumes hdrparse has been called.
+X * Delete obsolete & large headers and Xref.
+X * Pile up other headers for later output (Path: is changed during output).
+X *
+X * art->a_artf may be NULL, and may get set by hdrsave.
+X */
+XSTATIC void
+Xhdrmunge(art, buffer, hdrlen, hdrlst)
+Xregister struct article *art;
+Xregister char *buffer;
+Xint hdrlen;			/* optimisation only */
+Xhdrlist hdrlst;			/* headers of negative utility: snuff 'em */
+X{
+X	register struct hdrdef **vhp;
+X
+X	if (headdebug)
+X		(void) fputs(buffer, stderr);
+X	for (vhp = hdrlst; *vhp != NULL; vhp++)
+X		if (STREQN(buffer, (*vhp)->hdrnm, (int)(*vhp)->hdrlen))
+X			return;			/* don't save this header */
+X	hdrsave(art, buffer, hdrlen);
+X}
+X
+X/*
+X * If headers already dumped, just write to art->a_artf.
+X * Else if there is room, stash "hdr" away until end of headers is seen
+X * (could just wait until Newsgroups: and Control: are seen, if seen)
+X * or there is no room left in the header buffer, then open the first
+X * article link (on art->a_artf) and dump the saved headers and the current
+X * header to it.
+X *
+X * Copy into art->a_haccum (in future, could read in directly,
+X * iff copying is high on the profile).
+X *
+X * hdrstore is static because it is used repeatedly, it only makes sense
+X * to have one active at a time, and there is no memory saving in allocating
+X * and deallocating it, particularly since copyart's (header) buffer must
+X * coexist with hdrstore.
+X */
+XSTATIC void
+Xhdrsave(art, hdr, hdrlen)
+Xregister struct article *art;
+Xchar *hdr;
+Xregister int hdrlen;			/* optimisation only */
+X{
+X	if (art->a_artf != NULL) {
+X		emithdr(art, hdr, hdrlen);
+X		return;
+X	}
+X	if (art->a_haccum == NULL) {
+X		static char hdrstore[HDRMEMSIZ];
+X
+X		art->a_haccum = hdrstore;
+X		art->a_haccum[0] = '\0';
+X		art->a_hnext = art->a_haccum;
+X		art->a_hbytesleft = HDRMEMSIZ;
+X	}
+X	if (art->a_hbytesleft > hdrlen) {
+X		/* add new ptr.-to-this-header to tail of saved-hdr-ptr.-list */
+X		if (art->a_hptrs == NULL) {
+X			art->a_hpused = 0;
+X			art->a_hpalloced = MINSHPTRS;
+X			if (hptrs == NULL)	/* once only */
+X				hptrs = (char **) nemalloc((unsigned)
+X					(art->a_hpalloced * sizeof(char *)));
+X			art->a_hptrs = hptrs;
+X		}
+X		while (art->a_hpused >= art->a_hpalloced) {
+X			art->a_hpalloced += MINSHPTRS;
+X			art->a_hptrs = hptrs = (char **)
+X				realloc((char *)art->a_hptrs, (unsigned)
+X				(art->a_hpalloced * sizeof(char *)));
+X			if (art->a_hptrs == NULL)
+X				errunlock("out of memory (for art->a_hptrs)", "");
+X		}
+X		art->a_hptrs[art->a_hpused++] = art->a_hnext;
+X
+X		/* (void) strcat(art->a_haccum, hdr); */
+X		(void) strcpy(art->a_hnext, hdr);
+X		art->a_hnext += hdrlen;		/* points at NUL byte */
+X		art->a_hbytesleft -= hdrlen;
+X	} else {
+X		hdrdump(art, NOTALLHDRS);	/* don't file */
+X		if (art->a_artf != NULL)
+X			emithdr(art, hdr, hdrlen);
+X	}
+X}
+X
+X/*
+X * Change Path: while writing it out, just dump other headers (hdr) verbatim.
+X */
+XSTATIC void
+Xemithdr(art, hdr, hdrlen)
+Xregister struct article *art;
+Xchar *hdr;
+Xregister int hdrlen;
+X{
+X	if (STREQN(hdr, pathhdr.hdrnm, (int)pathhdr.hdrlen)) {
+X		register char *oldpath, *hostnm = hostname();
+X
+X		oldpath = skipsp(&hdr[pathhdr.hdrlen]);
+X		/*
+X		 * V7 f?printf return 0 or EOF, not a byte count, so it is
+X		 * not portable to use fprintf's return value as a byte count.
+X		 */
+X		if (fprintf(art->a_artf, "%s %s!", pathhdr.hdrnm, hostnm) ==
+X		    EOF || fputs(oldpath, art->a_artf) == EOF)
+X			fulldisk(art, spoolnm(art));
+X		else {
+X			static unsigned hostlen = 0;
+X
+X			if (hostlen == 0)
+X				hostlen = strlen(hostnm);
+X			art->a_charswritten += pathhdr.hdrlen + STRLEN(" ") +
+X			    hostlen + STRLEN("!") + strlen(oldpath);
+X		}
+X	} else {
+X		if (fwrite(hdr, hdrlen, 1, art->a_artf) != 1)
+X			fulldisk(art, spoolnm(art));
+X		else
+X			art->a_charswritten += hdrlen;
+X	}
+X}
+X
+X/*
+X * Write out saved headers after opening on art->a_artf either a temporary
+X * file (using mktemp(3)) or the first article link, based on art->h.h_ngs &
+X * nxtartnum(); set a_tmpf to which ever name is opened.
+X * Modify Path: value on the way.
+X *
+X * If all headers were seen, then open the first link, link to the rest,
+X * and generate Xref:, else open a temporary name and write the article
+X * there (it will get filed later by hdrdump(...,ALLHDRS) or in insart()).
+X */
+Xvoid
+Xhdrdump(art, allhdrsseen)
+Xregister struct article *art;
+Xboolean allhdrsseen;		/* all headers seen & hdrdeflt() called? */
+X{
+X	if (art->a_filed)
+X		return;
+X	if (allhdrsseen)
+X		fileart(art);			/* set a_tmpf */
+X	else if (art->a_artf == NULL) {
+X		nnfree(&art->a_tmpf);
+X		art->a_tmpf = strsave(SPOOLTMP);
+X		(void) mktemp(art->a_tmpf);
+X		art->a_unlink = YES;
+X		art->a_artf = fopenwclex(art->a_tmpf, "w");
+X		if (art->a_artf == NULL)
+X			art->a_status |= ST_DROPPED;
+X	}
+X	if (art->a_artf != NULL &&
+X	    art->a_haccum != NULL && art->a_haccum[0] != '\0') {
+X		register int i;
+X		register char **pp;
+X		register char *nxtln;
+X		register int saved;
+X
+X		for (i = 0, pp = art->a_hptrs; i < art->a_hpused; ++i, ++pp) {
+X			if (i >= art->a_hpused-1)	/* last in-core hdr? */
+X				nxtln = art->a_hnext;
+X			else
+X				nxtln = pp[1];
+X			saved = *nxtln;
+X			*nxtln = '\0';
+X			emithdr(art, *pp, nxtln - *pp);
+X	     		*nxtln = saved;			/* restore */
+X		}
+X		/* art->a_haccum could be freed and zeroed here, if malloced */
+X		art->a_haccum[0] = '\0';	/* paranoia */
+X		art->a_hnext = art->a_haccum;	/* for next article */
+X		art->a_hpused = 0;		/* trash saved-header-ptr-list */
+X		/* reduce saved-header-ptr-list to original size */
+X		if (art->a_hpalloced > MINSHPTRS) {
+X			art->a_hpalloced = MINSHPTRS;
+X			art->a_hptrs = hptrs = (char **)
+X				realloc((char *)art->a_hptrs, (unsigned)
+X				(art->a_hpalloced * sizeof(char *)));
+X			if (hptrs == NULL)
+X				errunlock("can't free a_hptrs memory", "");
+X		}
+X	}
+X}
+X
+X/*
+X * hdrparse remembers this header if it's interesting.
+X * hdrmunge needs art->h.h_ngs to be set, so it is called second.
+X * hdrmunge saves or writes this header, unless it's deemed a waste of bytes.
+X * hdrmunge may call hdrdump(art, NOTALLHDRS).
+X * hdrdump counts art->a_charswritten.
+X */
+Xvoid
+Xhdrdigest(art, line, hdrlen)
+Xregister struct article *art;
+Xregister char *line;
+Xint hdrlen;
+X{
+X    	hdrparse(&art->h, line, parsehdrs);
+X	hdrmunge(art, line, hdrlen, hdrvilest);
+X}
+!
+echo 'relay/hdrparse.c':
+sed 's/^X//' >'relay/hdrparse.c' <<'!'
+X/*
+X * Usenet header parsing and remembering.
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <sys/types.h>
+X#include "libc.h"
+X#include "news.h"
+X#include "headers.h"
+X#include "hdrint.h"
+X
+X/*
+X * Reset internal state of header parser.
+X * (Empty the stomach of partially-digested headers.)
+X */
+Xvoid
+Xhdrwretch()
+X{
+X	/* historical stub */
+X}
+X
+X/*
+X * Parse RFC822/850/1036 header into "hdrs".  Retain significant values.
+X * Assumes ishdr has been called first.
+X *
+X * If a keyword matches one in hdrlst, store the value in *malloc'ed memory*
+X * (N.B.).  freeheader() will free this memory.
+X */
+Xvoid
+Xhdrparse(hdrs, line, hdrlst)
+Xregister struct headers *hdrs;
+Xregister char *line;
+Xhdrlist hdrlst;				/* headers of positive utility */
+X{
+X	register struct hdrdef **hpp;
+X
+X	for (hpp = hdrlst; *hpp != NULL; hpp++)
+X		if (STREQN(line, (*hpp)->hdrnm, (int)(*hpp)->hdrlen) &&
+X		    (*hpp)->hdroff >= 0) {	/* paranoia */
+X			register char **ptrp =
+X				(char **)((char *)hdrs+(*hpp)->hdroff);
+X
+X			nnfree(ptrp);	/* free prev. val. in this art. */
+X			*ptrp = strsave(skipsp(&line[(*hpp)->hdrlen]));
+X			if (*ptrp != NULL)
+X				trim(*ptrp);	/* cut trailing \n */
+X			break;
+X		}
+X}
+X
+X/*
+X * default missing header values
+X *
+X * If strsave ever returns NULL on failure, instead of exiting,
+X * then the strsave calls need to check for failure.
+X *
+X * We support control message *backwards* compatibility: if no Control:
+X * header exists and the newsgroup matches all.all.ctl, use the Subject:
+X * as the control message.  Ugh.
+X */
+Xvoid
+Xhdrdeflt(hdrs)
+Xregister struct headers *hdrs;
+X{
+X	if (hdrs->h_ngs == NULL)
+X		hdrs->h_ngs = strsave(JUNK);
+X	if (hdrs->h_distr == NULL)
+X		hdrs->h_distr = strsave(DEFDIST);
+X	if (hdrs->h_msgid == NULL && hdrs->h_artid != NULL)	/* obs. art.id. */
+X		hdrs->h_msgid = strsave(hdrs->h_artid);
+X	if (hdrs->h_msgid == NULL)
+X		hdrs->h_msgid = strsave(DEFMSGID);
+X	if (hdrs->h_msgid[0] == '\0') {
+X		free(hdrs->h_msgid);
+X		hdrs->h_msgid = strsave(DEFMSGID);
+X	}
+X	if (hdrs->h_expiry == NULL)
+X		hdrs->h_expiry = strsave(DEFEXP);
+X	if (hdrs->h_expiry[0] == '\0') {
+X		free(hdrs->h_expiry);
+X		hdrs->h_expiry = strsave(DEFEXP);
+X	}
+X	if (hdrs->h_subj == NULL)
+X		hdrs->h_subj = strsave("");
+X
+X	if (hdrs->h_ctlcmd == NULL && oldctl(hdrs))
+X		hdrs->h_ctlcmd = strsave(hdrs->h_subj);
+X}
+!
+echo 'relay/headers.h':
+sed 's/^X//' >'relay/headers.h' <<'!'
+X/*
+X * All the article header values worth retaining.
+X * (strictly from headers in input.)
+X *
+X * All members of struct headers must point at malloced memory so that
+X * freeheaders() can free it without having to keep track of what's
+X * malloced and what's static.
+X *
+X * Furthermore, each member of headers must point at its own private copy
+X * of its value string, for the above reason, and no code outside hdr*.c
+X * may copy any member nor a modified copy of any member, though it may
+X * copy the string pointed to by a (possibly modified) member.
+X *
+X * Perhaps C++ will allow this to be enforced by a strings class.
+X * See section 6.9 of The C++ Programming Language for a candidate.
+X */
+Xstruct headers {
+X	char *h_subj;	/* subject: only needed for controls, -> h_ctlcmd */
+X	char *h_ngs;	/* newsgroups: used in filing, sys matching & all.all.ctl matching */
+X	char *h_distr;	/* distribution for transmit */
+X	char *h_ctlcmd;	/* control command */
+X	char *h_approved;	/* needed for acceptance in moderated groups */
+X	char *h_msgid;	/* needed for history & rejection */
+X	char *h_artid;	/* needed for history & rejection (obs.) */
+X	char *h_expiry;	/* needed for history */
+X	char *h_path;	/* needed for transmit - must munge */
+X	char *h_sender;	/* needed for transmit in case of moderation */
+X};
+X
+X/* common */
+Xextern void hdrdebug(), hdrinit(), freeheaders();
+Xextern boolean oldctl();
+X
+X/* munge */
+Xextern void emitxref(), hdrdump(), hdrdigest();
+X
+X/* parse */
+Xextern void hdrwretch(), hdrparse(), hdrdeflt();
+Xextern boolean ishdr(), contin();
+!
+echo 'relay/history.c':
+sed 's/^X//' >'relay/history.c' <<'!'
+X/*
+X * history file bashing
+X *
+X * B 2.10+ news pulls a dirty (and undocumented) trick and converts
+X * message-id's to lower case before using them as keys in the dbm file.
+X * We don't; you'll want to fix your news readers accordingly.
+X *
+X * B 2.10.3+ rnews puts out a leading space before received
+X * time if the article contains an Expires: header; tough.
+X * C news does this right instead of compatibly.
+X *
+X * The second history field is really two: time-received and Expires: value,
+X * separated by a tilde.  This is an attempt at partial compatibility with
+X * B news, in that C expire can cope with B news history files.
+X *
+X * There is no point to storing seek offsets in network byte order in the
+X * dbm file, since dbm files are machine-dependent and so can't be shared
+X * by dissimilar machines anyway.
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include "libc.h"
+X#include "news.h"
+X#include "config.h"
+X#include "fgetmfs.h"
+X#include "headers.h"
+X#include "article.h"
+X#include "history.h"
+X#include "msgs.h"
+X
+X#define HISTNAME "history"	/* name of the history file in $NEWSCTL */
+X#define FIELDSEP '\t'
+X#define SUBFIELDSEP '~'
+X
+X/* give 0 & 2 pretty, SVIDish names */
+X#ifndef SEEK_SET
+X#define SEEK_SET 0
+X#define SEEK_END 2
+X#endif
+X
+Xtypedef struct {
+X	char *dptr;
+X	int dsize;
+X} datum;
+X
+X/* private data */
+Xstatic FILE *fp = NULL;
+Xstatic char *filename;		/* absolute name of the ascii history file */
+Xstatic boolean writable;
+X
+X/* libdbm imports */
+Xextern int dbminit(), store();
+Xextern datum fetch();
+X
+X/* forward decls */
+XFORWARD datum getposhist();
+XFORWARD void mkhistent(), sanitise(), subsanitise();
+X
+XSTATIC void
+Xhistname()
+X{
+X	if (filename == NULL)
+X		filename = strsave(ctlfile(HISTNAME));
+X}
+X
+X/*
+X * open the history files: ascii first, then dbm.
+X * Try a+ mode first, then r mode, as dbm(3) does nowadays,
+X * so that this routine can be used by any user to read history files.
+X */
+XSTATIC boolean
+Xopenhist()
+X{
+X	histname();
+X	if (fp == NULL) {
+X		if ((fp = fopenclex(filename, "a+")) != NULL)
+X			writable = YES;
+X		else if ((fp = fopenwclex(filename, "r")) != NULL)
+X			writable = NO;
+X		/* else fp==NULL and fopenwclex just complained */
+X
+X		if (fp != NULL && dbminit(filename) < 0) {
+X			/* no luck. dbminit will have just honked */
+X			(void) nfclose(fp);	/* close ascii file */
+X			fp = NULL;		/* and mark it */
+X		}
+X	}
+X	return fp != NULL;
+X}
+X
+XSTATIC datum
+Xgetposhist(msgid)		/* return seek offset of history entry */
+Xchar *msgid;
+X{
+X	register char *clnmsgid;
+X	datum msgidkey, keypos;
+X
+X	msgidkey.dptr = NULL;
+X	msgidkey.dsize = 0;
+X	if (!openhist())
+X		return msgidkey;
+X	clnmsgid = strsave(msgid);
+X	sanitise(clnmsgid);
+X	msgidkey.dptr = clnmsgid;
+X	msgidkey.dsize = strlen(clnmsgid) + 1;	/* include NUL */
+X	keypos = fetch(msgidkey);		/* offset into ascii file */
+X	free(clnmsgid);
+X	return keypos;
+X}
+X
+Xboolean
+Xalreadyseen(msgid)		/* return true if found in the data base */
+Xchar *msgid;
+X{
+X	datum posdatum;
+X
+X	posdatum = getposhist(msgid);
+X	return posdatum.dptr != NULL;
+X}
+X
+Xchar *				/* NULL if no history entry */
+Xgethistory(msgid)		/* return existing history entry, if any */
+Xchar *msgid;
+X{
+X	long pos = 0;
+X	datum posdatum;
+X
+X	posdatum = getposhist(msgid);
+X	if (posdatum.dptr != NULL && posdatum.dsize == sizeof pos) {
+X		static char *histent = NULL;
+X
+X		memcpy((char *)&pos, posdatum.dptr, sizeof pos); /* align */
+X		nnfree(&histent);
+X		if (fseek(fp, pos, SEEK_SET) != -1 &&
+X		    (histent = fgetms(fp)) != NULL)
+X			return histent;
+X	}
+X	return NULL;
+X}
+X
+X/*
+X * Return a pointer to the "files" field of a history entry.
+X * Side-effect: trims \n from the history entry.
+X */
+Xchar *
+Xfindfiles(histent)
+Xchar *histent;
+X{
+X	register char *tabp;
+X
+X	trim(histent);
+X	/* find start of 2nd field (arrival~expiry) */
+X	tabp = index(histent, FIELDSEP);
+X	if (tabp == NULL)
+X		return NULL;				/* mangled entry */
+X	/* find start of 3rd field (files list) */
+X	else if ((tabp = index(tabp + 1, FIELDSEP)) == NULL)
+X		return NULL;			/* cancelled or expired art. */
+X	else
+X		return tabp + 1;
+X}
+X
+X/*
+X * Generate a history entry from art.
+X * The history entry will have tabs and newlines deleted from the
+X * interior of fields, to keep the file format sane.
+X * Optionally print the start of an "accepted" log file line (no \n)
+X * (transmit() prints site names).
+X */
+Xvoid
+Xhistory(art, startlog)
+Xregister struct article *art;
+Xboolean startlog;
+X{
+X	register char *msgid, *expiry;
+X	time_t now;
+X
+X	msgid = strsave(nullify(art->h.h_msgid));
+X	sanitise(msgid);	/* RFC 1036 forbids whitespace in msg-ids */
+X	expiry = strsave(nullify(art->h.h_expiry));
+X	sanitise(expiry);
+X	subsanitise(expiry);
+X
+X	if (startlog) {
+X		timestamp(stdout, &now);
+X		if (printf(" %s + %s", sendersite(nullify(art->h.h_path)),
+X		    msgid) == EOF)
+X			fulldisk(art, "stdout");
+X	} else
+X		now = time(&now);
+X	if (!openhist())
+X		art->a_status |= ST_DROPPED;	/* fall through and return */
+X	else if (!writable) {
+X		(void) fprintf(stderr, "%s: no write permission on `%s'\n",
+X			progname, filename);
+X		art->a_status |= ST_DROPPED;
+X	} else if (fseek(fp, 0L, SEEK_END) == -1) {
+X		warning("can't seek to end of `%s'", filename);
+X		art->a_status |= ST_DROPPED;
+X	} else
+X		mkhistent(art, msgid, now, expiry);
+X	free(msgid);
+X	free(expiry);
+X}
+X
+X/*
+X * Internal interface to generate a history file entry,
+X * assuming all sanity checking has been done already.
+X * Record the (msgid, position) pair in the data base.
+X *
+X * The fflush is crash-proofing.
+X */
+XSTATIC void
+Xmkhistent(art, msgid, now, expiry)
+Xregister struct article *art;
+Xchar *msgid, *expiry;
+Xtime_t now;
+X{
+X	long pos;
+X	datum msgidkey, posdatum;
+X										
+X	pos = ftell(fp);			/* get seek ptr for dbm */
+X	if (fprintf(fp, "%s%c%ld%c%s", msgid, FIELDSEP, now, SUBFIELDSEP, expiry)
+X	    == EOF)
+X		fulldisk(art, filename);
+X	/* don't write 3rd field for cancelled but unseen articles */
+X	if (art->a_files != NULL && art->a_files[0] != '\0')
+X		if (fprintf(fp, "%c%s", FIELDSEP, art->a_files) == EOF)
+X			fulldisk(art, filename);
+X	(void) putc('\n', fp);
+X	if (fflush(fp) == EOF)
+X		fulldisk(art, filename);
+X
+X	msgidkey.dptr = msgid;
+X	msgidkey.dsize = strlen(msgid) + 1;	/* include NUL */
+X	posdatum.dptr = (char *)&pos;
+X	posdatum.dsize = sizeof pos;
+X#ifdef NOSTOREVAL
+X	/* original v7 dbm store() returned no value */
+X	(void) store(msgidkey, posdatum);
+X#else
+X	if (store(msgidkey, posdatum) < 0)
+X		fulldisk(art, filename);
+X#endif
+X}
+X
+X/*
+X * Turn \n & FIELDSEP into ' ' in s.
+X */
+XSTATIC void
+Xsanitise(s)
+Xregister char *s;
+X{
+X	for (; *s != '\0'; ++s)
+X		if (*s == FIELDSEP || *s == '\n')
+X			*s = ' ';
+X}
+X
+X/*
+X * Turn SUBFIELDSEP into ' ' in s.
+X */
+XSTATIC void
+Xsubsanitise(s)
+Xregister char *s;
+X{
+X	for (; *s != '\0'; ++s)
+X		if (*s == SUBFIELDSEP)
+X			*s = ' ';
+X}
+X
+X/*
+X * Generate a fake history file entry, given a message-id, an Expires:
+X * value, and a "file" list ("net.foo/123").
+X */
+Xstatust
+Xfakehist(fkmsgid, fkexpiry, fkfiles)
+Xchar *fkmsgid, *fkexpiry, *fkfiles;
+X{
+X	struct article art;
+X
+X	artinit(&art);
+X	art.h.h_msgid = fkmsgid;
+X	art.h.h_expiry = fkexpiry;
+X	art.a_files = fkfiles;
+X	history(&art, STARTLOG);
+X	return art.a_status;
+X}
+X
+X/*
+X * Append "group/artnumstr" to the file list in *art.
+X */
+Xvoid
+Xhistupdfiles(art, group, artnumstr)
+Xregister struct article *art;
+Xregister char *group;
+Xregister char *artnumstr;
+X{
+X	unsigned addlen = strlen(group)+STRLEN(SFNDELIM)+strlen(artnumstr)+1;
+X
+X	art->a_filed = YES;			/* make a note */
+X	if (art->a_files == NULL) {
+X		art->a_files = nemalloc(addlen);
+X		art->a_files[0] = '\0';
+X	} else {
+X		art->a_files = realloc(art->a_files, (unsigned)
+X			strlen(art->a_files) + STRLEN(" ") + addlen);
+X		if (art->a_files == NULL)
+X			errunlock("can't grow a_files", "");
+X		(void) strcat(art->a_files, " ");
+X	}
+X	(void) strcat(art->a_files, group);	/* normal case */
+X	(void) strcat(art->a_files, SFNDELIM);
+X	(void) strcat(art->a_files, artnumstr);
+X}
+!
+echo 'relay/history.h':
+sed 's/^X//' >'relay/history.h' <<'!'
+X/* imports from history.c */
+Xextern char *findfiles(), *gethistory();
+Xextern boolean alreadyseen();
+Xextern statust fakehist();
+Xextern void history(), histupdfiles();
+X
+X#define STARTLOG YES
+X#define NOLOG NO
+!
+echo 'relay/ihave.c':
+sed 's/^X//' >'relay/ihave.c' <<'!'
+X/*
+X * Implement the Usenet ihave/sendme control messages,
+X * as per RFC 1036 (nee 850).
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <sys/types.h>
+X
+X#include "libc.h"
+X#include "news.h"
+X#include "config.h"
+X#include "headers.h"
+X#include "article.h"
+X#include "history.h"
+X#include "fgetmfs.h"
+X#include "msgs.h"
+X#include "transmit.h"
+X
+X#ifndef SENDMEDISTR
+X#define SENDMEDISTR "sendme"	/* kludge: distinguished distribution for sendmes */
+X#endif
+X#ifndef IHAVEDISTR
+X#define IHAVEDISTR "ihave"	/* kludge: distinguished distribution for ihaves */
+X#endif
+X#ifndef AVEARTSIZE
+X#define AVEARTSIZE 3000
+X#endif
+X
+X#define PROTO_IHAVE 0
+X#define PROTO_SENDME 1
+X
+X/* static forwards */
+XFORWARD void doproto(), procmsgids(), procbodymsgids();
+XFORWARD statust faketrans();
+X
+X/*
+X * Read message-IDs from args or control message body,
+X * look them up in history, post a sendme to to.remotesys (via the batcher
+X * to avoid deadlock) consisting of the message-IDs not in history.
+X * The "posting" consists of transmitting to a system matching
+X * "to.remotesys" in sys, which had better have the I flag on.
+X * ihave message-ID-list remotesys	generate a sendme from message-ID-list
+X */
+Xvoid
+Xihave(args, art)
+Xchar *args;
+Xstruct article *art;
+X{
+X	doproto(args, art, IHAVEDISTR, PROTO_IHAVE);
+X}
+X
+X/*
+X * Read message-IDs from args or control message body,
+X * transmit the corresponding articles to a system matching
+X * "to.remotesys/sendme" in sys, which will typically name a batch file.
+X * sendme message-ID-list remotesys	send articles named to remotesys
+X */
+Xvoid
+Xsendme(args, art)
+Xchar *args;
+Xstruct article *art;
+X{
+X	doproto(args, art, SENDMEDISTR, PROTO_SENDME);
+X}
+X
+Xstatic void
+Xdoproto(args, art, distr, proto)
+Xchar *args;
+Xregister struct article *art;
+Xchar *distr;
+Xint proto;
+X{
+X	register char *argscp = skipsp(args), *remotesys;
+X
+X	if (*argscp == '\n' || *argscp == '\0')	/* no args */
+X		return;
+X
+X	argscp = strsave(argscp);
+X
+X	/* dig out the remote system name */
+X	remotesys = rindex(argscp, ' ');	
+X	if (remotesys == NULL)			/* no msg-ids in command */
+X		remotesys = argscp;
+X	else {
+X		remotesys = argscp + strlen(argscp) - 1;	/* last byte */
+X		while (isascii(*remotesys) && isspace(*remotesys))
+X			*remotesys-- = '\0';	/* back up to non-whitespace */
+X		remotesys = rindex(argscp, ' ');
+X		if (remotesys == NULL)		/* no msg-ids in command */
+X			remotesys = argscp;
+X		else
+X			*remotesys++ = '\0';	/* separate msg-ids & sys name */
+X	}
+X	if (strcmp(remotesys, hostname()) != 0)	/* remotesys may not be me */
+X		if (remotesys != argscp)	/* msg-ids in command */
+X			procmsgids(art, argscp, remotesys, distr, proto);
+X		else
+X			procbodymsgids(art, remotesys, distr, proto);
+X	free(argscp);
+X}
+X
+X/*
+X * Process a list of message-ids in msgidln: look them up
+X * and "transmit" the articles to to.remotesys.
+X */
+Xstatic void
+Xprocmsgids(art, msgidln, remotesys, distr, proto)
+Xstruct article *art;
+Xchar *msgidln, *remotesys, *distr;
+Xint proto;
+X{
+X	char *cpmsgid = strsave(skipsp(msgidln));
+X	register char *msgid = cpmsgid, *endmsgid;
+X	register int save, sendit;
+X
+X	for (; *msgid != '\n' && *msgid != '\0'; msgid = skipsp(endmsgid)) {
+X		for (endmsgid = msgid; *endmsgid != '\0' &&
+X		    isascii(*endmsgid) && !isspace(*endmsgid); ++endmsgid)
+X			;			/* skip msgid */
+X
+X		save = *endmsgid;
+X		*endmsgid = '\0';		/* terminate msgid at whitespace */
+X		if (proto == PROTO_IHAVE)
+X			sendit = !alreadyseen(msgid);	/* sendme from remotesys */
+X		else
+X			sendit = alreadyseen(msgid);	/* sendme to remotesys */
+X		if (sendit)
+X			art->a_status |= faketrans(msgid, remotesys, distr, proto);
+X		*endmsgid = save;
+X	}
+X	free(cpmsgid);
+X}
+X
+Xstatic void
+Xprocbodymsgids(art, remotesys, distr, proto)
+Xregister struct article *art;
+Xchar *remotesys, *distr; 
+Xint proto;
+X{
+X	register FILE *arttext;
+X
+X	arttext = fopenwclex(art->a_tmpf, "r");
+X	if (arttext != NULL) {
+X		char *line;
+X
+X		while ((line = fgetms(arttext)) != NULL && *line != '\n')
+X			nnfree(&line);		/* skip header */
+X		if (line != NULL) {		/* article body exists */
+X			nnfree(&line);		/* toss blank separating line */
+X			while ((line = fgetms(arttext)) != NULL) {
+X				procmsgids(art, line, remotesys, distr, proto);
+X				nnfree(&line);
+X			}
+X		}
+X		(void) nfclose(arttext);
+X	}
+X}
+X
+X/*
+X * Fake up a minimal article struct for msgid using group to.remotesys and
+X * distribution distr, then invoke transmit().  If there is a history
+X * entry for msgid, supply the list of file names too.
+X * Generate a log entry for each message-id transmitted.
+X */
+Xstatic statust
+Xfaketrans(msgid, remotesys, distr, proto)
+Xregister char *msgid, *remotesys;
+Xchar *distr;
+Xint proto;
+X{
+X	struct article fakeart;
+X	register char *ng;
+X	register char *histent;
+X	register struct article *fap = &fakeart;
+X	time_t now;
+X	statust status = ST_OKAY;
+X
+X	ng = nemalloc((unsigned)(STRLEN("to.") + strlen(remotesys) + 1));
+X	(void) strcpy(ng, "to.");
+X	(void) strcat(ng, remotesys);
+X
+X	artinit(fap);
+X
+X	fap->h.h_ngs = ng;
+X	fap->h.h_distr = (distr != NULL? distr: ng);
+X	fap->h.h_msgid = msgid;
+X	fap->h.h_path = hostname();
+X	fap->a_charswritten = AVEARTSIZE;
+X	histent = gethistory(msgid);
+X	if (histent == NULL || (fap->a_files = findfiles(histent)) == NULL)
+X		fap->a_files = "no.such.article!";
+X
+X	timestamp(stdout, &now);	/* start log line */
+X	if (printf(" %s %c %s", sendersite(nullify(fap->h.h_path)),
+X	    (proto == PROTO_IHAVE? 'i': 's'), fap->h.h_msgid) == EOF)
+X		fulldisk(fap, "stdout");
+X	transmit(fap, "");	/* write on batch file; write sys name on stdout */
+X	(void) putchar('\n');		/* end log line */
+X	status |= fap->a_status;	/* pass back failure writing batch file */
+X
+X	fap->h.h_ngs = NULL;
+X	fap->h.h_distr = NULL;
+X	fap->h.h_msgid = NULL;
+X	fap->h.h_path = NULL;
+X	fap->a_files = NULL;
+X	artfree(fap);
+X
+X	free(ng);
+X	return status;
+X}
+!
+echo 'relay/io.c':
+sed 's/^X//' >'relay/io.c' <<'!'
+X/*
+X * common i/o operations
+X */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include "news.h"
+X#include "headers.h"
+X#include "article.h"
+X#include "msgs.h"
+X
+X/*
+X * If *fpp is non-null, fclose it and check for errors.
+X * On error, call fulldisk(art, name).
+X */
+Xvoid
+Xnnfclose(art, fpp, name)
+Xstruct article *art;
+Xregister FILE **fpp;
+Xchar *name;
+X{
+X	if (*fpp != NULL) {
+X		if (nfclose(*fpp) == EOF)
+X			fulldisk(art, name);
+X		*fpp = NULL;		/* mark the stream closed */
+X	}
+X}
+!
+echo 'relay/io.h':
+sed 's/^X//' >'relay/io.h' <<'!'
+X/* imports from io.c */
+Xextern void nnfclose();
+!
+echo done
+
+

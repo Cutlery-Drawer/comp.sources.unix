@@ -1,0 +1,481 @@
+Subject:  v15i043:  A users(1)-style rwho
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: pkern <pkern@csri.toronto.edu>
+Posting-number: Volume 15, Issue 43
+Archive-name: ru
+
+[  I haven't tried this; we don't run rwho here...  It reads the
+   data out of the /usr/spool/rwho files, and generates nicely
+   formatted listings of who's logged in where.  -r$ ]
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	makefile ru.1 ru.c
+export PATH; PATH=/bin:$PATH
+echo shar: extracting "'makefile'" '(139 characters)'
+if test -f 'makefile'
+then
+	echo shar: will not over-write existing file "'makefile'"
+else
+cat << \SHAR_EOF > 'makefile'
+#
+CFLAGS=	-O -s
+
+ru:	ru.o
+	$(CC) $(CFLAGS) $*.o -o $@
+
+man:	ru.1
+	nroff -man ru.1 > ru.man
+	more -s ru.man
+
+clean:
+	-rm -f *.o a.out *.man
+SHAR_EOF
+fi # end of overwriting check
+echo shar: extracting "'ru.1'" '(1306 characters)'
+if test -f 'ru.1'
+then
+	echo shar: will not over-write existing file "'ru.1'"
+else
+cat << \SHAR_EOF > 'ru.1'
+.TH RU l local
+.UC
+.SH NAME
+ru, rusers \- compact lists of users on all "visible" systems
+.SH SYNOPSIS
+.B "/usr/local/ru [-acdms] [-D domain] [-h host ...]"
+.br
+.B "/usr/local/rusers [-acdms] [-D domain] [-h host ...]"
+.SH DESCRIPTION
+.I Ru
+lists the login names of the users currently on all visible systems.
+.SH Options
+.IP -a
+list all users, regardless of their login idle time (\fIrwho(1)\fP-inspired).
+.IP -c
+show a count for multiply-logged users.
+.IP -d
+group hosts within their domains (forces -s option).
+.IP -m
+show multiple logins (overrides -c option).
+.IP -s
+list users host-by-host instead of domain-by-domain.
+.IP "-D domain"
+list only users logged on hosts in the given domain.
+.IP "-h host ..."
+list only users logged on to the specified hosts.
+.PP
+Any system for which data can be found in the
+.I rwhod(8c)
+spooling directory is considered to be a "visible system".
+.SH FILES
+/usr/spool/rwho/whod.*
+.SH SEE ALSO
+users(1), rwho(1C), rwhod(8C)
+.SH HISTORY
+Originally created by splicing pieces of
+.I rwho(1)
+source into
+.I users(1)
+source.
+Rewritten to try to clean up the hacked code
+and to try to make it easier to add (or delete) options.
+.SH BUGS
+With the -h option,
+.I ru
+doesn't care if a host's spool file hasn't
+been updated within the last 5 minutes.
+.SH CONTACT
+pkern@utcsri.uucp
+SHAR_EOF
+fi # end of overwriting check
+echo shar: extracting "'ru.c'" '(7817 characters)'
+if test -f 'ru.c'
+then
+	echo shar: will not over-write existing file "'ru.c'"
+else
+cat << \SHAR_EOF > 'ru.c'
+/*
+ * ru - remote users(1)		(version 2)
+ *	list users on all "visible" hosts.
+ *	usage: ru [-acdms] [-D domain] [-h host ...]
+ *
+ * P. Kern (pkern@utcsri)
+ */
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/dir.h>
+#include <sys/file.h>
+#include <netdb.h>
+
+#define MINSTR	8		/* minimum string length */
+#define HNSZ	32		/* hostname length */
+#define RWFSZ	HNSZ+5		/* spool-file name length */
+#define MRGN	12		/* 12 space "tab" */
+#define HOUR	3600		/* seconds in an hour */
+#define RWPERIOD	300	/* 5 minute rwho refresh period */
+#define MAXPORTS	160	/* max tty ports per host */
+
+struct rw_utmp {
+	char tty[MINSTR];	/* user's tty */
+	char name[MINSTR];	/* user's login */
+	long time;		/* login time */
+	long idle;		/* idle time */
+} rut;
+
+struct rw_hdr {
+	char pad[4];		/* ignore first 4 bytes */
+	int sent, rcvd;		/* time sent,  time rec'vd */
+	char host[HNSZ];	/* host's name */
+	int loadav[3];		/* load averages */
+	int boot;		/* boot date */
+} hdr;
+
+int rutsize, hdrsize;
+#define RWHODIR "/usr/spool/rwho"
+
+long now;		/* it won't be ... (long now :-) */
+int n, fd;
+struct stat st;
+char *hnbuf, *hp;	/* hostname buffer & extra pointer */
+char *rubuf, *ep;	/* utmp data buffer & end pointer */
+char *program, *domain;
+int aflag=1;	/* only show users with <1 HR idle time */
+int sflag=1;	/* show output by domains (not by hosts) */
+int mflag=1;	/* ignore multiple logins */
+int cflag=0;	/* (if mflag) don't show login counts */
+int dflag=1;	/* sort hostnames within domains */
+int Dflag=0;	/* show users in a given domain */
+int hflag=0;	/* show users on a given host */
+int errflag=0;
+
+extern char *rindex(), *malloc();
+
+main(argc, argv)
+int argc;
+char *argv[];
+{
+	DIR *dirp;
+	struct direct *dp;
+	int rwfcmp(), rutcmp(), drwcmp();	/* qsort() routines */
+	extern int optind;	/* see getopt(3C) */
+	extern char *optarg;	/* see getopt(3C) */
+
+	program = argv[0];
+	now = time(0);
+	rutsize = sizeof(rut);
+	hdrsize = sizeof(hdr);
+
+	while ((n = getopt(argc, argv, "acdhmsD:")) != EOF)
+		switch(n) {
+		case 'a': aflag=0; break;	/* same as rwho(1) */
+		case 'c': cflag=1; break;	/* show login count */
+		case 'd': dflag=0; break;	/* domain-wise sort */
+		case 'm': mflag=0; break;	/* drop multi-logins */
+		case 's': sflag=0; break;	/* domain-only lists */
+		case 'D': Dflag++; domain = optarg; break;
+		case 'h': hflag++; break;
+		default: errflag++;
+		}
+	if (errflag) {
+		fprintf(stderr,"Usage: %s [-acdms] [-D domain] [-h host ...]\n", program);
+		exit(1);
+	}
+
+	if (!dflag) sflag=0;
+	if (!mflag) cflag=0;	/* not really needed (see burp()) */
+
+	if (chdir(RWHODIR) < 0) {	/* cd RWHODIR */
+		perror(RWHODIR);
+		exit(1);
+	}
+
+	if (hflag) {
+		sflag=0;
+		for ( ;optind < argc; optind++)
+			dohost(argv[optind]);
+		exit(0);
+	}
+
+	/*
+	 * read "." directory (assuming chdir() worked), 
+	 * and get all files with the "whod." prefix.
+	 * if Dflag, only get files ending with "domain".
+	 */
+	if ((dirp = opendir(".")) == NULL
+	    || stat(".", &st) < 0) { 
+		perror(RWHODIR);
+		exit(1);
+	}
+	dp = readdir(dirp);	/* get "." */
+	n = (st.st_size/(DIRSIZ(dp)+8))*RWFSZ;
+	hnbuf = malloc((unsigned)n);
+	n = 0; ep = hnbuf;
+	while (dp = readdir(dirp)) {
+		strncpy(ep, dp->d_name, dp->d_namlen);
+		*(ep+dp->d_namlen) = '\0';
+		if (strncmp(ep, "whod.", 5) == 0 &&
+		   (!Dflag || strcmp(rindex(ep,'.')+1,domain) == 0)) {
+			ep += RWFSZ;
+			n++;
+		}
+	}
+	/* ep should now point to the end of the host name buffer */
+	closedir(dirp);
+
+	if (dflag)	/* sort host names within domains */
+		qsort(hnbuf, n, RWFSZ, drwcmp);
+	else		/* sort full host name */
+		qsort(hnbuf, n, RWFSZ, rwfcmp);
+
+	if (sflag) {	/* process by domains only */
+		dodomains();
+		exit(0);
+	}
+
+	/*
+	 * process each "whod." file in hnbuf list.
+	 * - get <filesize> bytes of mem
+	 * - gobble rutmp data from file
+	 * - sort names alphabetically
+	 * - print names (burp)
+	 * - free up mem
+	 */
+	hp = hnbuf;
+	while (hp < ep) {
+		if ((fd = open(hp, O_RDONLY)) < 0
+		    || fstat(fd, &st) < 0) {
+			perror(hp);
+			exit(1);
+		}
+		if (n = st.st_size-hdrsize) {
+			if ((rubuf = malloc((unsigned)n)) == 0) {
+				perror(program);
+				exit(1);
+			}
+			n = read(fd, (char *)&hdr, hdrsize);
+			if (now-hdr.rcvd <= RWPERIOD &&
+			   (n = ldrut(fd,rubuf,st.st_size-hdrsize))>0 ){
+				qsort(rubuf, n/rutsize, rutsize, rutcmp);
+				burp(hp, rubuf, n);
+			}
+		}
+		free(rubuf);
+		close(fd);
+		hp += RWFSZ;
+	}
+}
+
+/*
+ * compare rwho spool-file names
+ */
+rwfcmp(p, q)
+register char *p, *q;
+{
+	return(strncmp(p, q, RWFSZ));
+}
+
+/*
+ * compare utmp name entries
+ */
+rutcmp(p, q)
+register struct rw_utmp *p, *q;
+{
+	return(strncmp(p->name, q->name, MINSTR));
+} 
+
+/*
+ * compare sub-domain names
+ */
+drwcmp(p, q)
+register char *p, *q;
+{
+	int x;
+	char *s, *t;
+
+	s = rindex(p, '.');
+	t = rindex(q, '.');
+	if (s) s++; else s = p;
+	if (t) t++; else t = q;
+	if(x = strncmp(s, t, RWFSZ))
+		return(x);
+	return(strncmp(p, q, RWFSZ));
+}
+
+/*
+ * print "host:       user1 user2 ... "
+ */
+burp(s, r, n)
+register char *s, *r;
+int n;
+{	
+	register int l;
+	register char *xp;
+
+	if (!sflag)
+		s += 5;		/* skip "whod." prefix */
+	if ((l = strlen(s)) > MRGN) {
+		s[MRGN]= '\0';
+		l = MRGN;
+	}
+	if (sflag) l += 5;
+	printf("%.*s:%*s", MRGN, s, MRGN+1-l, " ");
+
+	if (mflag) {
+		for(l=0, xp="", s=r+MINSTR; s < (r+n); s += rutsize)
+			if (strncmp(s, xp, MINSTR)) {
+				printf( (l)?" %.*s/%d":" %.*s",
+					MINSTR, s, l+1);
+				xp = s; l = 0;
+			}
+			else
+				l += cflag;
+		printf("\n");
+		return;
+	}
+
+	for (s = r+MINSTR; s < (r+n); s += rutsize)
+		printf(" %.*s", MINSTR, s);
+	printf("\n");
+}
+
+/*
+ * show users on a specific host
+ */
+dohost(host)
+char *host;
+{
+	struct hostent *h, *gethostbyname();
+
+	/*
+	 * try to get host's proper name
+	 * and try to find the proper spool file
+	 */
+	if((h = gethostbyname(host)) == NULL) {
+		perror(host);
+		return(1);
+	}
+	hp = malloc(strlen(h->h_name)+6);
+	sprintf(hp, "whod.%s", h->h_name);
+	if ((fd = open(hp, O_RDONLY)) < 0) {
+		char **s;
+		/*
+		 * can't find file related to h_name
+		 * try the aliases instead.
+		 */
+		s = h->h_aliases;
+		while(*s) {
+			free(hp);
+			hp = malloc(strlen(*s)+6);
+			sprintf(hp, "whod.%s", *s);
+			if ((fd = open(hp, O_RDONLY)) > 0)
+				break;
+			s++;
+		}
+		if (*s == NULL) {
+			fprintf(stderr,  "%s: no data\n",  host);
+			return(1);
+		}
+	}
+	if (fstat(fd, &st) < 0) {
+		perror(hp);
+		return(1);
+	}
+	n = st.st_size - hdrsize;
+	if ((rubuf = malloc((unsigned)n)) == 0) {
+		perror(program);
+		exit(1);
+	}
+	n = read(fd, (char *)&hdr, hdrsize);
+	n = ldrut(fd,rubuf,st.st_size-hdrsize);
+	qsort(rubuf, n/rutsize, rutsize, rutcmp);
+	if (now-hdr.rcvd > RWPERIOD)
+		strcat(hp, "*");
+	burp(hp, rubuf, n);
+}
+
+/*
+ * show users by domain
+ */
+dodomains()
+{
+	int z;
+	register int i;
+	char *p0, *p1, *fnp, *rbp;
+
+	fnp = hp = hnbuf;
+
+	if ((rubuf = malloc(n * MAXPORTS * rutsize)) == NULL) {
+		perror(program);
+		exit(1);
+	}
+
+	p0 = rindex(fnp, '.') + 1;
+	if ((int)p0 == 1) p0 = fnp;
+
+	while (fnp < ep) {
+		rbp = rubuf;
+		for (p1=p0, n=i=0; fnp < ep && !strcmp(p1, p0); i++) {
+			if ((fd = open(fnp, O_RDONLY)) < 0
+			    || fstat(fd, &st) < 0) {
+				perror(fnp);
+				exit(1);
+			}
+			read(fd, (char *)&hdr, hdrsize);
+			if (now-hdr.rcvd <= RWPERIOD &&
+			   (z = ldrut(fd,rbp,st.st_size-hdrsize))>0 ) {
+				n += z;
+				rbp += z;
+			}
+			close(fd);
+			fnp += RWFSZ;
+			p1 = p0;
+			p0 = rindex(fnp, '.') + 1;
+			if ((int)p0 == 1) p0 = fnp;
+		}
+		if (!n) continue;
+		*rbp = '\0';
+		qsort(rubuf, n/rutsize, rutsize, rutcmp);
+		burp(p1, rubuf, n);
+	}
+	free(rubuf);
+}
+
+/*
+ * load rutmp data into buffer.
+ */
+ldrut(fd, p, n)
+int fd, n;
+char *p;
+{
+	register int m1, m2, nr;
+	register char *s;
+
+	if (!aflag) return(read(fd, p, n));
+
+	s = p;
+	m1 = m2 = 0;
+
+	while (m2 < n && (nr = read(fd, s, rutsize)) > 0) {
+		m2 += nr;
+		if (((struct rw_utmp *)s)->idle > HOUR)
+			/* ignore entries with >1 hr idle time */
+			continue;
+		m1 += nr;
+		s += nr;
+	}
+	return(m1);
+}
+SHAR_EOF
+fi # end of overwriting check
+#	End of shell archive
+exit 0
+

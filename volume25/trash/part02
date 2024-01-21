@@ -1,0 +1,3675 @@
+Newsgroups: comp.sources.unix
+From: bruce@beta.cs.su.oz.au (Bruce Janson)
+Subject: v25i156: trash - simulate process execution in MIPS RISC/os 4.52, Part02/08
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: bruce@beta.cs.su.oz.au (Bruce Janson)
+Posting-Number: Volume 25, Issue 156
+Archive-Name: trash/part02
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 8)."
+# Contents:  fd.c format.c go.c i_a.c i_b.c i_l.c load.c makefile
+#   trash.1
+# Wrapped by bruce@basser on Tue Mar  3 23:25:21 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'fd.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'fd.c'\"
+else
+echo shar: Extracting \"'fd.c'\" \(5477 characters\)
+sed "s/^X//" >'fd.c' <<'END_OF_FILE'
+X#include	<fcntl.h>
+X#include	<errno.h>
+X#include	<stdio.h>
+X#include	"nels.h"
+X
+X/*
+X * A unix process has a limited, usually small number of
+X * file descriptors available to it.
+X * A simulator for such a process which also uses file
+X * descriptors itself, must stop the simulated process
+X * from interfering with the simulator's file descriptors
+X * but otherwise maintain as normal a set of file descriptors
+X * for use by the process as possible.
+X * The routines in this file attempt to accomplish this.
+X */
+X
+X#define	FD_CLOSED		((fd_t)-1)
+X#define	NFDOHEAD		2
+X
+X#define	fd_valid_fd(fd)		((fd) >= 0 && (fd) < nfiles)
+X
+Xtypedef int			fd_t;
+X
+Xextern int			setobuf();
+X
+Xextern int			errno;
+Xextern FILE			*outfp;
+X
+Xstatic int			nfiles		= -1;
+Xstatic fd_t			*map;	/* map: simfd -> realfd	*/
+Xstatic int			fdoverhead[NFDOHEAD];
+X
+Xint
+Xfd_hold()
+X{
+X	int	i;
+X
+X	for (i = 0; i < nels(fdoverhead); i++)
+X	{
+X		if ((fdoverhead[i] = open("/dev/null", O_RDONLY)) == -1)
+X		{
+X			vcouldnot("open(\"/dev/null\", O_RDONLY)");
+X			return -1;
+X		}
+X
+X		if (fcntl(fdoverhead[i], F_SETFD, 1) == -1)
+X		{
+X			vcouldnot("fcntl(%d, F_SETFD, 1)", fdoverhead[i]);
+X			(void)close(fdoverhead[i]);
+X			return -1;
+X		}
+X	}
+X
+X	return 0;
+X}
+X
+Xint
+Xfd_release()
+X{
+X	int	i;
+X
+X	for (i = 0; i < nels(fdoverhead); i++)
+X	{
+X		if (fdoverhead[i] != -1)
+X		{
+X			(void)close(fdoverhead[i]);
+X			fdoverhead[i] = -1;
+X		}
+X	}
+X
+X	return 0;
+X}
+X
+X#if	0
+Xstatic
+Xvoid
+Xfd_dump()
+X{
+X	int	fd;
+X
+X	fprintf(outfp, "map (%d):", fileno(outfp));
+X	for (fd = 0; fd < nfiles; fd++)
+X	{
+X		if (map[fd] == FD_CLOSED)
+X			continue;
+X
+X		if (map[fd] == fd)
+X			continue;
+X
+X		fprintf(outfp, " %d->%d", fd, map[fd]);
+X	}
+X	fprintf(outfp, "\n");
+X	fflush(outfp);
+X}
+X#endif	/* 0 */
+X
+X/*
+X * Initialise our file descriptor map.
+X * We record all file descriptors that
+X * we have inherited at birth.
+X * fd_init() must be called before the
+X * simulator starts opening any files for its own
+X * internal use.
+X * 'outfd' != -1 iff the output file descriptor
+X * has been explicitly passed to us via a
+X * command line argument.
+X */
+Xint
+Xfd_init(outfd)
+Xint	outfd;
+X{
+X	int	fd;
+X
+X	if ((nfiles = ulimit(4, 0)) == -1)
+X	{
+X		couldnot("get descriptor table size");
+X		return -1;
+X	}
+X
+X	if ((map = (fd_t *)malloc(sizeof(fd_t) * nfiles)) == (fd_t *)0)
+X	{
+X		couldnot("allocate %d bytes for descriptor table map", sizeof(fd_t) * nfiles);
+X		return -1;
+X	}
+X
+X	for (fd = 0; fd < nfiles; fd++)
+X	{
+X		if (fcntl(fd, F_GETFD, 0) == -1)
+X		{
+X			if (errno != EBADF)
+X			{
+X				couldnot("interpret error returned by fcntl(%d, F_GETFD, ..)", fd);
+X				return -1;
+X			}
+X			errno = 0;
+X
+X			map[fd] = FD_CLOSED;
+X		}
+X		else
+X			map[fd] = fd;
+X	}
+X
+X	if (outfd != -1)
+X		map[outfd] = FD_CLOSED;
+X
+X	if (fd_hold() == -1)
+X		return -1;
+X
+X	return 0;
+X}
+X
+Xint
+Xfd_sort()
+X{
+X	int	sim_outfd;
+X	int	real_outfd;
+X	int	fd;
+X	fd_t	*rmap;
+X
+X#if	0
+X	fd_dump();
+X#endif	/* 0 */
+X
+X	if (fd_release() == -1)
+X		return -1;
+X
+X	if ((rmap = (fd_t *)malloc(sizeof(fd_t) * nfiles)) == (fd_t *)0)
+X	{
+X		vcouldnot("allocate %d bytes for reverse descriptor table map", sizeof(fd_t) * nfiles);
+X		return -1;
+X	}
+X
+X	fflush(outfp);
+X	if ((sim_outfd = fd_open(fileno(outfp))) == -1)
+X		return -1;
+X
+X	for (fd = 0; fd < nfiles; fd++)
+X		rmap[fd] = FD_CLOSED;
+X
+X	for (fd = 0; fd < nfiles; fd++)
+X	{
+X		if (map[fd] != FD_CLOSED)
+X			rmap[map[fd]] = fd;
+X	}
+X
+X	for (fd = 0; fd < nfiles; fd++)
+X	{
+X		if (rmap[fd] == fd)
+X			continue;
+X
+X		if (rmap[fd] != FD_CLOSED)
+X		{
+X			int	newfd;
+X
+X			if ((newfd = dup(fd)) == -1)
+X			{
+X				vcouldnot("dup(%d)", fd);
+X				return -1;
+X			}
+X			rmap[newfd] = rmap[fd];
+X			map[rmap[fd]] = newfd;
+X			if (close(fd) == -1)
+X			{
+X				vcouldnot("close(%d)", fd);
+X				return -1;
+X			}
+X			rmap[fd] = FD_CLOSED;
+X		}
+X
+X		if (map[fd] == FD_CLOSED)
+X			continue;
+X
+X		if (dup2(map[fd], fd) == -1)
+X		{
+X			vcouldnot("dup2(%d, %d)", map[fd], fd);
+X			return -1;
+X		}
+X
+X		rmap[fd] = fd;
+X		if (close(map[fd]) == -1)
+X		{
+X			vcouldnot("close(%d)", map[fd]);
+X			return -1;
+X		}
+X		rmap[map[fd]] = FD_CLOSED;
+X		map[fd] = fd;
+X	}
+X
+X	real_outfd = map[sim_outfd];
+X
+X	if (real_outfd != fileno(outfp))
+X	{
+X		FILE	*newoutfp;
+X
+X		if ((newoutfp = fdopen(real_outfd, "a")) == (FILE *)0)
+X		{
+X			vcouldnot("fdopen(%d, \"a\")", real_outfd);
+X			return -1;
+X		}
+X		(void)fclose(outfp);
+X		outfp = newoutfp;
+X
+X		if (setobuf() == -1)
+X			return -1;
+X	}
+X
+X	(void)fd_close(sim_outfd);
+X
+X	(void)free((char *)rmap);
+X
+X	if (fd_hold() == -1)
+X		return -1;
+X
+X#if	0
+X	fd_dump();
+X#endif	/* 0 */
+X
+X	return 0;
+X}
+X
+X/*
+X * Given a good, real file descriptor,
+X * return a simulated file descriptor and
+X * mark it as allocated.
+X */
+Xint
+Xfd_open(real_fd)
+Xint	real_fd;
+X{
+X	int	sim_fd;
+X
+X	for (sim_fd = 0; sim_fd < nfiles; sim_fd++)
+X	{
+X		if (map[sim_fd] == FD_CLOSED)
+X		{
+X			map[sim_fd] = real_fd;
+X			return sim_fd;
+X		}
+X	}
+X
+X	vcouldnot("open real file descriptor %d: internal error: ran out of simulated file descriptors", real_fd);
+X	return -1;
+X}
+X
+X/*
+X * Given a good, real file descriptor,
+X * and an unallocated simulated file descriptor,
+X * mark it as allocated.
+X */
+Xvoid
+Xfd_dopen(real_fd, sim_fd)
+Xint	real_fd;
+Xint	sim_fd;
+X{
+X	map[sim_fd] = real_fd;
+X}
+X
+X/*
+X * Unmap a simulated file descriptor.
+X */
+Xint
+Xfd_close(sim_fd)
+Xint	sim_fd;
+X{
+X	if (fd_valid_fd(sim_fd))
+X		map[sim_fd] = FD_CLOSED;
+X
+X	return 0;
+X}
+X
+X/*
+X * Return the current mapping for a simulated
+X * file descriptor, or -1 if it is not mapped.
+X */
+Xint
+Xfd_lookup(sim_fd)
+Xint	sim_fd;
+X{
+X	if (fd_valid_fd(sim_fd) == 0)
+X		return -1;
+X
+X	if (map[sim_fd] == FD_CLOSED)
+X		return -1;
+X
+X	return map[sim_fd];
+X}
+X
+Xint
+Xfd_invalid(sim_fd)
+Xint	sim_fd;
+X{
+X	if (fd_valid_fd(sim_fd))
+X		return 0;
+X
+X	errno = EBADF;
+X
+X	return 1;
+X}
+X
+Xint
+Xfd_nfiles()
+X{
+X	return nfiles;
+X}
+END_OF_FILE
+if test 5477 -ne `wc -c <'fd.c'`; then
+    echo shar: \"'fd.c'\" unpacked with wrong size!
+fi
+# end of 'fd.c'
+fi
+if test -f 'format.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'format.c'\"
+else
+echo shar: Extracting \"'format.c'\" \(5070 characters\)
+sed "s/^X//" >'format.c' <<'END_OF_FILE'
+X#include	<varargs.h>
+X
+X/*
+X * format converts and formats its args under control of the format.
+X * The format is a character string that contains two types of
+X * objects:  plain characters, which are simply passed one at a time
+X * to putfn, and conversion specifications, each of which results in
+X * fetching of zero or more args.  The results are undefined if
+X * there are insufficient args for the format.  If the format
+X * is exhausted while args remain, the excess args are simply
+X * ignored.
+X * 
+X * Each conversion specification is introduced by the character
+X * %.  After the %, any of the following may appear in sequence:
+X * 
+X * A set of flags, which modify the meaning of the
+X * conversion specification.
+X * 
+X * A zero digit (0) specifying the pad character as 0.
+X * 
+X * A decimal digit string specifying a minimum field width.
+X * 
+X * A period (.) followed by a decimal digit string specifying a precision.
+X * 
+X * An l (ell) specifying that a following conversion character
+X * applies to a long arg.
+X * 
+X * A character that indicates the type of conversion to be
+X * applied.
+X */
+X
+X#define	doit(c, v)	sprintf(&a[0], mkfmt((c)), (v)), outstring(&a[0])
+X
+Xstatic int	(*putfn)();
+Xstatic int	flag_minus;
+Xstatic int	flag_plus;
+Xstatic int	flag_blank;
+Xstatic int	flag_hash;
+Xstatic char	pad_character;
+Xstatic int	have_width;
+Xstatic int	minimum_field_width;
+Xstatic int	have_precision;
+Xstatic int	precision;
+Xstatic int	use_short_form;
+Xstatic int	use_long_form;
+Xstatic char	a[256];
+X
+Xstatic
+Xchar	*
+Xmkfmt(c)
+Xchar	c;
+X{
+X	extern int	strlen();
+X	static char	a[32];
+X
+X	(void)sprintf
+X	(
+X		&a[0],
+X		"%%%s%s%s%s%s",
+X		flag_minus ? "-" : "",
+X		flag_plus ? "+" : "",
+X		flag_blank ? " " : "",
+X		flag_hash ? "#" : "",
+X		(pad_character == '0') ? "0" : ""
+X	);
+X
+X	if (have_width)
+X		(void)sprintf(&a[strlen(&a[0])], "%d", minimum_field_width);
+X
+X	if (have_precision)
+X		(void)sprintf(&a[strlen(&a[0])], ".%d", precision);
+X
+X	(void)sprintf
+X	(
+X		&a[strlen(&a[0])],
+X		"%s%s%c",
+X		use_short_form ? "h" : "",
+X		use_long_form ? "l" : "",
+X		c
+X	);
+X
+X	return &a[0];
+X}
+X
+Xstatic
+Xvoid
+Xoutstring(s)
+Xregister char	*s;
+X{
+X	while (*s != '\0')
+X		(*putfn)(*s++);
+X}
+X
+Xvoid
+Xformat(uputfn, app)
+Xregister int		(*uputfn)();
+Xregister va_list	*app;
+X{
+X	register char	*formatp;	/* Pointer to current	*/
+X					/* format character.	*/
+X	register char	fc;		/* Current format	*/
+X					/* character.		*/
+X
+X	formatp = va_arg(*app, char *);
+X
+X	putfn = uputfn;
+X
+X	while ((fc = *formatp++) != '\0')
+X	{
+X		if (fc != '%')
+X		{
+X			(*uputfn)(fc);
+X			continue;
+X		}
+X
+X		flag_minus = 0;
+X		flag_plus = 0;
+X		flag_blank = 0;
+X		flag_hash = 0;
+X		pad_character = ' ';
+X		have_width = 0;
+X		minimum_field_width = 0;
+X		have_precision = 0;
+X		precision = 1;
+X		use_short_form = 0;
+X		use_long_form = 0;
+X
+X		/*
+X		 * Read some optional flags.
+X		 */
+X		for (;;)
+X		{
+X			switch (fc = *formatp++)
+X			{
+X			case '-':
+X				flag_minus = 1;
+X				continue;
+X
+X			case '+':
+X				flag_plus = 1;
+X				flag_blank = 0;
+X				continue;
+X
+X			case ' ':
+X				if (flag_plus == 0)
+X					flag_blank = 1;
+X				continue;
+X
+X			case '#':
+X				flag_hash = 1;
+X				continue;
+X
+X			default:
+X				break;
+X			}
+X			break;
+X		}
+X
+X		/*
+X		 * Read an optional '0' pad character specification.
+X		 */
+X		if (fc == '0')
+X		{
+X			pad_character = '0';
+X			fc = *formatp++;
+X		}
+X
+X		/*
+X		 * Read an optional minimum field width.
+X		 */
+X		for (;;)
+X		{
+X			if (fc == '*')
+X				minimum_field_width = va_arg(*app, int);
+X			else if (fc >= '0' && fc <= '9')
+X			{
+X				minimum_field_width *= 10;
+X				minimum_field_width += fc - '0';
+X			}
+X			else
+X				break;
+X
+X			have_width = 1;
+X
+X			fc = *formatp++;
+X		}
+X
+X		/*
+X		 * Read an optional precision specifier.
+X		 */
+X		if (fc == '.')
+X		{
+X			fc = *formatp++;
+X
+X			have_precision = 1;
+X
+X			precision = 0;
+X
+X			for (;;)
+X			{
+X				if (fc == '*')
+X					precision = va_arg(*app, int);
+X				else if (fc >= '0' && fc <= '9')
+X				{
+X					precision *= 10;
+X					precision += fc - '0';
+X				}
+X				else
+X					break;
+X
+X				fc = *formatp++;
+X			}
+X		}
+X
+X		if (precision < 0)
+X			precision = 0;
+X
+X		/*
+X		 * Read an optional 'short field' specifier.
+X		 */
+X		if (fc == 'h')
+X		{
+X			use_short_form = 1;
+X			fc = *formatp++;
+X		}
+X
+X		/*
+X		 * Read an optional 'long field' specifier.
+X		 */
+X		if (fc == 'l')
+X		{
+X			use_long_form = 1;
+X			fc = *formatp++;
+X		}
+X
+X		/*
+X		 * Read the conversion character.
+X		 * Do the formatting.
+X		 */
+X		switch (fc)
+X		{
+X		case 'c':
+X			doit(fc, (char)va_arg(*app, int));
+X			break;
+X
+X		case 'd':
+X		case 'i':
+X			if (use_short_form)
+X				doit(fc, (short)va_arg(*app, int));
+X			else if (use_long_form)
+X				doit(fc, va_arg(*app, long));
+X			else
+X				doit(fc, va_arg(*app, int));
+X			break;
+X
+X		case 'E':
+X		case 'e':
+X		case 'f':
+X		case 'G':
+X		case 'g':
+X			doit(fc, va_arg(*app, double));
+X			break;
+X
+X		case 's':
+X			doit(fc, va_arg(*app, char *));
+X			break;
+X
+X		case 'o':
+X		case 'u':
+X		case 'X':
+X		case 'x':
+X			if (use_short_form)
+X				doit(fc, (unsigned short)va_arg(*app, unsigned int));
+X			else if (use_long_form)
+X				doit(fc, va_arg(*app, unsigned long));
+X			else
+X				doit(fc, va_arg(*app, unsigned int));
+X			break;
+X
+X		case '\0':
+X			formatp--;
+X			fc = '%';
+X			/* and fall thru. */
+X		case '%':
+X		default:
+X			(*uputfn)(fc);
+X			break;
+X		}
+X	}
+X}
+END_OF_FILE
+if test 5070 -ne `wc -c <'format.c'`; then
+    echo shar: \"'format.c'\" unpacked with wrong size!
+fi
+# end of 'format.c'
+fi
+if test -f 'go.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'go.c'\"
+else
+echo shar: Extracting \"'go.c'\" \(8593 characters\)
+sed "s/^X//" >'go.c' <<'END_OF_FILE'
+X#include	<stdio.h>
+X#include	"register.h"
+X#include	"symtab.h"
+X#include	"diblock.h"
+X#include	"instrn.h"
+X#include	"process.h"
+X#include	"nels.h"
+X
+X#define	TWOTIMES(s)	s;s
+X#define	FOURTIMES(s)	TWOTIMES(s);TWOTIMES(s)
+X#define	EIGHTTIMES(s)	FOURTIMES(s);FOURTIMES(s)
+X#define	SIXTEENTIMES(s)	EIGHTTIMES(s);EIGHTTIMES(s)
+X
+Xextern void		histo_log();
+Xextern void		hist_log();
+Xextern instrn		*getip();
+Xextern char		*say_pg_register();
+X
+Xextern FILE		*outfp;
+Xextern int		Bflag;
+Xextern int		Hflag;
+Xextern int		Iflag;
+Xextern int		Nflag;
+Xextern unsigned long	instruction_count;
+Xextern unsigned long	instruction_count_since_last_syscall;
+Xextern int		hist_length;
+X
+Xstatic instrn		*ip;
+Xstatic unsigned long	i;
+X
+Xint			compile_ok;
+X
+Xvoid
+Xunrecognised(dipc)
+Xdinstrn	*dipc;
+X{
+X	GLOBALdipc = dipc;
+X	vcouldnot("execute unrecognised instruction: <0x%x> \"%s\" [p.%s]", i, ip->i_name, ip->i_pageno);
+X}
+X
+X/*
+X * Execute the next instruction.
+X */
+Xstatic
+Xdinstrn	*
+Xi_execute(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	opcodesPC;
+X	unsigned int	rs;
+X	unsigned int	rt;
+X	unsigned int	immediate;
+X	unsigned long	target;
+X	unsigned int	rd;
+X	unsigned int	shamt;
+X	unsigned int	funct;
+X	unsigned int	fmt;
+X	unsigned int	ft;
+X	unsigned int	fs;
+X	unsigned int	fd;
+X
+X	/*
+X	 * Signals to be delivered?
+X	 */
+X	if (sigs_pending > 0)
+X	{
+X		dipc = deliver_signal(dipc);
+X
+X		return dipc;
+X	}
+X
+X	/*
+X	 * Get the current pc.
+X	 */
+X	opcodesPC = dipc->di_addr;
+X
+X	/*
+X	 * Check for an unaligned pc.
+X	 */
+X	if ((opcodesPC % 4) != 0)
+X	{
+X		GLOBALdipc = dipc;
+X		vcouldnot("fetch instruction at unaligned address");
+X		return dipc;
+X	}
+X
+X	if (Hflag)
+X		histo_log(opcodesPC);
+X
+X	if (hist_length > 0)
+X		hist_log(opcodesPC);
+X
+X	/*
+X	 * Put into 'i' the instruction word found
+X	 * at address 'opcodesPC' in the address space of
+X	 * process 'P' and make 'ip' point to
+X	 * a description of that instruction.
+X	 */
+X	if (procmget(dipc, opcodesPC, (unsigned char *)&i, sizeof(i)) == -1)
+X		return dipc;
+X
+X	if ((ip = getip(i)) == (instrn *)0)
+X		return dipc;
+X
+X	/*
+X	 * Now,
+X	 * 'i'  contains a copy of the current instruction,
+X	 * 'ip' points to a description of the current instruction
+X	 *	and
+X	 * 'pc' contains the address of the first byte of the
+X	 *      next instruction.
+X	 */
+X
+X	if (Iflag)
+X		fprintf(outfp, "\t%s:\t%s\t", proc_text_address(opcodesPC), ip->i_name);
+X
+X	switch (ip->i_format)
+X	{
+X	case IF_I:
+X		/*
+X		 * Immediate.
+X		 */
+X		rs = i_to_rs(i);
+X		rt = i_to_rt(i);
+X		immediate = i_to_immediate(i);
+X		if (Iflag)
+X		{
+X			fprintf(outfp, "rs=%s,", say_pg_register(rs));
+X			fprintf(outfp, "rt=%s,", say_pg_register(rt));
+X			fprintf(outfp, "immediate=%d", immediate);
+X			if (Bflag)
+X				fprintf(outfp, "\t[p.%s]", ip->i_pageno);
+X			fprintf(outfp, "\n");
+X		}
+X		dipc = (*(ip->i_handler))(dipc, rs, rt, (short)immediate);
+X		break;
+X
+X	case IF_I1:
+X		/*
+X		 * Immediate (cop1).
+X		 */
+X		immediate = i_to_immediate(i);
+X		if (Iflag)
+X		{
+X			fprintf(outfp, "immediate=%d", immediate);
+X			if (Bflag)
+X				fprintf(outfp, "\t[p.%s]", ip->i_pageno);
+X			fprintf(outfp, "\n");
+X		}
+X		dipc = (*(ip->i_handler))(dipc, (short)immediate);
+X		break;
+X
+X	case IF_J:
+X		/*
+X		 * Jump.
+X		 */
+X		target = i_to_target(i);
+X		if (Iflag)
+X		{
+X			fprintf(outfp, "target=%s", proc_text_address((opcodesPC & 0xF0000000) | (target << 2)));
+X
+X			if (Bflag)
+X				fprintf(outfp, "\t[p.%s]", ip->i_pageno);
+X			fprintf(outfp, "\n");
+X		}
+X		dipc = (*(ip->i_handler))(dipc, target);
+X		break;
+X
+X	case IF_M1:
+X		/*
+X		 * Move (cop1).
+X		 */
+X		rt = i_to_rt(i);
+X		fs = i_to_fs(i);
+X		if (Iflag)
+X		{
+X			fprintf(outfp, "rt=%s,", say_pg_register(rt));
+X			fprintf(outfp, "fs=%s", say_fg_register(fs));
+X			if (Bflag)
+X				fprintf(outfp, "\t[p.%s]", ip->i_pageno);
+X			fprintf(outfp, "\n");
+X		}
+X		dipc = (*(ip->i_handler))(dipc, rt, fs);
+X		break;
+X
+X	case IF_C1:
+X		/*
+X		 * Control (cop1).
+X		 */
+X		rt = i_to_rt(i);
+X		fs = i_to_fs(i);
+X		if (Iflag)
+X		{
+X			fprintf(outfp, "rt=%s,", say_pg_register(rt));
+X			fprintf(outfp, "fs=%s", say_fc_register(fs));
+X			if (Bflag)
+X				fprintf(outfp, "\t[p.%s]", ip->i_pageno);
+X			fprintf(outfp, "\n");
+X		}
+X		dipc = (*(ip->i_handler))(dipc, rt, fs);
+X		break;
+X
+X	case IF_R:
+X		/*
+X		 * Register.
+X		 */
+X		rs = i_to_rs(i);
+X		rt = i_to_rt(i);
+X		rd = i_to_rd(i);
+X		shamt = i_to_shamt(i);
+X		funct = i_to_funct(i);
+X		if (Iflag)
+X		{
+X			fprintf(outfp, "rs=%s,", say_pg_register(rs));
+X			fprintf(outfp, "rt=%s,", say_pg_register(rt));
+X			fprintf(outfp, "rd=%s,", say_pg_register(rd));
+X			fprintf(outfp, "shamt=%d,funct=%d", shamt, funct);
+X			if (Bflag)
+X				fprintf(outfp, "\t[p.%s]", ip->i_pageno);
+X			fprintf(outfp, "\n");
+X		}
+X		dipc = (*(ip->i_handler))(dipc, rs, rt, rd, shamt, funct);
+X		break;
+X
+X	case IF_R1:
+X		/*
+X		 * Register (cop1).
+X		 */
+X		fmt = i_to_fmt(i);
+X		ft = i_to_ft(i);
+X		fs = i_to_fs(i);
+X		fd = i_to_fd(i);
+X		if (Iflag)
+X		{
+X			fprintf(outfp, "fmt=%d,", fmt);
+X			fprintf(outfp, "ft=%s,", say_fg_register(ft));
+X			fprintf(outfp, "fs=%s,", say_fg_register(fs));
+X			fprintf(outfp, "fd=%s", say_fg_register(fd));
+X			if (Bflag)
+X				fprintf(outfp, "\t[p.%s]", ip->i_pageno);
+X			fprintf(outfp, "\n");
+X		}
+X		dipc = (*(ip->i_handler))(dipc, fmt, ft, fs, fd);
+X		break;
+X
+X	case IF_U:
+X	default:
+X		/*
+X		 * Undefined.
+X		 */
+X		if (Iflag)
+X			fprintf(outfp, "\n");
+X		unrecognised(dipc);
+X		break;
+X	}
+X
+X	if (Nflag)
+X	{
+X		instruction_count++;
+X		instruction_count_since_last_syscall++;
+X	}
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xi_end_of_block(dipc)
+Xdinstrn	*dipc;
+X{
+X	dinstrn	*olddipc;
+X	int	saved_compile_ok;
+X
+X	olddipc = dipc;
+X
+X	saved_compile_ok = compile_ok;
+X	compile_ok = 0;
+X
+X	dipc = i_execute(dipc);
+X
+X	compile_ok = saved_compile_ok;
+X
+X	if (dipc == olddipc)
+X	{
+X		dipc = addr_to_decoded_instrnp(dipc, dipc->di_addr + sizeof(unsigned long));
+X
+X		dipc--;
+X	}
+X
+X	return dipc;
+X}
+X
+Xstatic unsigned long	lastpageno;
+Xstatic unsigned long	lastaddr;
+Xstatic dinstrn		*lastresult;
+X
+Xdinstrn	*
+Xaddr_to_decoded_instrnp(dipc, addr)
+Xdinstrn		*dipc;
+Xunsigned long	addr;
+X{
+X	unsigned long	pageno;
+X	diblock		*bp;
+X
+X	if ((pageno = addr / SIMULATED_PAGE_SIZE) == lastpageno)
+X		return lastresult + ((long)addr - (long)lastaddr) / sizeof(unsigned long);
+X
+X	lastpageno = pageno;
+X	lastaddr = addr;
+X
+X	if ((bp = addr_to_decoded_block(dipc, addr)) == (diblock *)0)
+X		return (dinstrn *)0;
+X
+X	if (bp->dib_want_init)
+X	{
+X		int		i;
+X		unsigned long	a;
+X
+X		bp->dib_want_init = 0;
+X
+X		for (i = 0, a = bp->dib_first_addr; i < nels(bp->dib_instrn) - 1; i++, a += sizeof(unsigned long))
+X		{
+X			bp->dib_instrn[i].di_handler = i_execute;
+X			bp->dib_instrn[i].di_addr = a;
+X		}
+X
+X		bp->dib_instrn[nels(bp->dib_instrn) - 1].di_handler = i_end_of_block;
+X		bp->dib_instrn[nels(bp->dib_instrn) - 1].di_addr = a;
+X	}
+X
+X	return lastresult = &bp->dib_instrn[(addr - bp->dib_first_addr) / sizeof(unsigned long)];
+X}
+X
+Xint
+Xclear_decoded_page(dipc, addr, remainderp)
+Xdinstrn		*dipc;
+Xunsigned long	addr;
+Xint		*remainderp;
+X{
+X	unsigned long	pageno;
+X	diblock		*bp;
+X
+X	if ((pageno = addr / SIMULATED_PAGE_SIZE) == lastpageno)
+X		lastpageno = 0;
+X
+X	if ((bp = addr_to_decoded_block(dipc, addr)) == (diblock *)0)
+X		return -1;
+X
+X	bp->dib_want_init = 1;
+X
+X	*remainderp = bp->dib_first_addr + SIMULATED_PAGE_SIZE - addr;
+X
+X	return 0;
+X}
+X
+Xint
+Xcompile_known_delayed_branch(dipc, target)
+Xdinstrn		*dipc;
+Xunsigned long	target;
+X{
+X	dinstrn	*dp;
+X
+X	if ((dp = addr_to_decoded_instrnp(dipc, dipc->di_addr + sizeof(unsigned long))) == (dinstrn *)0)
+X		return -1;
+X
+X	dipc->di_2 = (unsigned long *)dp;
+X
+X	if ((dipc->di_3 = (unsigned long *)addr_to_decoded_instrnp(dipc, target)) == (unsigned long *)0)
+X		return -1;
+X
+X	dipc->di_3 = (unsigned long *)(((dinstrn *)dipc->di_3) - 1);
+X
+X	return 0;
+X}
+X
+Xint
+Xcompile_unknown_delayed_branch(dipc)
+Xdinstrn	*dipc;
+X{
+X	dinstrn	*dp;
+X
+X	if ((dp = addr_to_decoded_instrnp(dipc, dipc->di_addr + sizeof(unsigned long))) == (dinstrn *)0)
+X		return -1;
+X
+X	dipc->di_1 = (unsigned long *)dp;
+X
+X	return 0;
+X}
+X
+Xdinstrn	*
+Xdo_delayed_branch(dipc, target)
+Xdinstrn		*dipc;
+Xunsigned long	target;
+X{
+X	dipc = addr_to_decoded_instrnp(dipc, dipc->di_addr + sizeof(unsigned long));
+X
+X	(void)(*dipc->di_handler)(dipc);
+X
+X	dipc = addr_to_decoded_instrnp(dipc, target);
+X
+X	dipc--;
+X
+X	return dipc;
+X}
+X
+X#if	0
+X#define	DIPC_TRACE	1
+X#endif	/* 0 */
+X
+Xstatic
+Xvoid
+Xinterpret(dipc)
+Xdinstrn	*dipc;
+X{
+X	for (;;)
+X	{
+X#if	DIPC_TRACE
+Xprintf("0x%08x: ", dipc);
+Xfflush(stdout);
+Xprintf("0x%08x\n", dipc->di_handler);
+Xfflush(stdout);
+X		dipc = (*dipc->di_handler)(dipc) + 1;
+X#else	/* DIPC_TRACE */
+X		SIXTEENTIMES(dipc = (*dipc->di_handler)(dipc) + 1);
+X#endif	/* DIPC_TRACE */
+X	}
+X}
+X
+X/*
+X * Commence simulation of the process.
+X */
+Xint
+Xgo()
+X{
+X	dinstrn	*idipc;
+X
+X	if (hist_length > 0 || Bflag || Hflag || Iflag || Mflag || Nflag || Rflag)
+X		compile_ok = 0;
+X	else
+X		compile_ok = 1;
+X
+X	if ((idipc = addr_to_decoded_instrnp((dinstrn *)0, P.p_entry_point)) == (dinstrn *)0)
+X		return -1;
+X
+X	interpret(idipc);
+X}
+END_OF_FILE
+if test 8593 -ne `wc -c <'go.c'`; then
+    echo shar: \"'go.c'\" unpacked with wrong size!
+fi
+# end of 'go.c'
+fi
+if test -f 'i_a.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'i_a.c'\"
+else
+echo shar: Extracting \"'i_a.c'\" \(5388 characters\)
+sed "s/^X//" >'i_a.c' <<'END_OF_FILE'
+X#include	"register.h"
+X#include	"symtab.h"
+X#include	"diblock.h"
+X#include	"instrn.h"
+X#include	"process.h"
+X
+Xextern double	fabs();
+X
+Xdinstrn	*
+Xi_absfmt(dipc, fmt, ft, fs, fd)
+Xdinstrn	*dipc;
+Xint	fmt;
+Xint	ft;
+Xint	fs;
+Xint	fd;
+X{
+X	float	singles;
+X	float	singled;
+X	double	doubles;
+X	double	doubled;
+X
+X	switch (fmt)
+X	{
+X	case FMT_SINGLE:
+X		procsget(CP1G(fs), *(unsigned long *)&singles);
+X
+X		singled = (float)fabs(singles);
+X
+X		procsput(CP1G(fd), *(unsigned long *)&singled);
+X
+X		break;
+X
+X	case FMT_DOUBLE:
+X		/*
+X		 * Note apparent reversal of words within
+X		 * doubles here -- no idea why.
+X		 */
+X		procsget(CP1G(fs), *((unsigned long *)&doubles + 1));
+X
+X		procsget(CP1G(fs) + 1, *(unsigned long *)&doubles);
+X
+X		doubled = fabs(doubles);
+X
+X		procsput(CP1G(fd), *((unsigned long *)&doubled + 1));
+X
+X		procsput(CP1G(fd) + 1, *(unsigned long *)&doubled);
+X		break;
+X
+X	default:
+X		unrecognised(dipc);
+X		break;
+X	}
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_add(dipc, rs, rt, rd, shamt, funct)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xint	rd;
+Xint	shamt;
+Xint	funct;
+X{
+X	unsigned long	s;
+X	unsigned long	t;
+X
+X	procsget(rs, s);
+X
+X	procsget(rt, t);
+X
+X	/*
+X	 * TODO -- overflow exception.
+X	 */
+X	procsput(rd, s + t);
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_addfmt(dipc, fmt, ft, fs, fd)
+Xdinstrn	*dipc;
+Xint	fmt;
+Xint	ft;
+Xint	fs;
+Xint	fd;
+X{
+X	float		singles;
+X	float		singlet;
+X	float		singled;
+X	double		doubles;
+X	double		doublet;
+X	double		doubled;
+X	unsigned long	l[2];
+X
+X	switch (fmt)
+X	{
+X	case FMT_SINGLE:
+X		procsget(CP1G(fs), *(unsigned long *)&singles);
+X
+X		procsget(CP1G(ft), *(unsigned long *)&singlet);
+X
+X		singled = singles + singlet;
+X
+X		procsput(CP1G(fd), *(unsigned long *)&singled);
+X
+X		break;
+X
+X	case FMT_DOUBLE:
+X		/*
+X		 * Note apparent reversal of words within
+X		 * doubles here -- no idea why.
+X		 */
+X		procsget(CP1G(fs), *((unsigned long *)&doubles + 1));
+X
+X		procsget(CP1G(fs) + 1, *(unsigned long *)&doubles);
+X
+X		procsget(CP1G(ft), *((unsigned long *)&doublet + 1));
+X
+X		procsget(CP1G(ft) + 1, *(unsigned long *)&doublet);
+X
+X		doubled = doubles + doublet;
+X
+X		procsput(CP1G(fd), *((unsigned long *)&doubled + 1));
+X
+X		procsput(CP1G(fd) + 1, *(unsigned long *)&doubled);
+X		break;
+X
+X	default:
+X		unrecognised(dipc);
+X		break;
+X	}
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_addi_li(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = (long)dipc->di_2;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_addi(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = *dipc->di_1 + (long)dipc->di_2;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_addi(dipc, rs, rt, immediate)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	immediate;
+X{
+X	unsigned long	r;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			if (rs == R_0)
+X				dipc->di_handler = c_addi_li;
+X			else
+X				dipc->di_handler = c_addi;
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = &P.p_state[rs];
+X			dipc->di_2 = (unsigned long *)(long)immediate;
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, r);
+X
+X	procsput(rt, r + immediate);
+X
+X	/*
+X	 * Overflow exception?
+X	 */
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_addiu_li(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = (long)dipc->di_2;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_addiu(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = *dipc->di_1 + (long)dipc->di_2;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_addiu(dipc, rs, rt, immediate)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	immediate;
+X{
+X	unsigned long	s;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			if (rs == R_0)
+X				dipc->di_handler = c_addiu_li;
+X			else
+X				dipc->di_handler = c_addiu;
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = &P.p_state[rs];
+X			dipc->di_2 = (unsigned long *)(long)immediate;
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, s);
+X
+X	procsput(rt, s + (long)immediate);
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_addu_move(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = *dipc->di_2;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_addu_move2(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = *dipc->di_1;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_addu(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = *dipc->di_1 + *dipc->di_2;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_addu(dipc, rs, rt, rd, shamt, funct)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xint	rd;
+Xint	shamt;
+Xint	funct;
+X{
+X	unsigned long	s;
+X	unsigned long	t;
+X
+X	if (compile_ok)
+X	{
+X		if (rd == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			if (rs == R_0)
+X				dipc->di_handler = c_addu_move;
+X			else if (rt == R_0)
+X				dipc->di_handler = c_addu_move2;
+X			else
+X				dipc->di_handler = c_addu;
+X			dipc->di_0 = &P.p_state[rd];
+X			dipc->di_1 = &P.p_state[rs];
+X			dipc->di_2 = &P.p_state[rt];
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, s);
+X
+X	procsget(rt, t);
+X
+X	procsput(rd, s + t);
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_and(dipc, rs, rt, rd, shamt, funct)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xint	rd;
+Xint	shamt;
+Xint	funct;
+X{
+X	unsigned long	s;
+X	unsigned long	t;
+X
+X	procsget(rs, s);
+X
+X	procsget(rt, t);
+X
+X	procsput(rd, s & t);
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_andi(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = *dipc->di_1 & (unsigned long)dipc->di_2;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_andi(dipc, rs, rt, immediate)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	immediate;
+X{
+X	unsigned long	s;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			dipc->di_handler = c_andi;
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = &P.p_state[rs];
+X			dipc->di_2 = (unsigned long *)(((unsigned long)immediate) & 0xFFFF);
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, s);
+X
+X	procsput(rt, s & (((unsigned long)immediate) & 0xFFFF));
+X
+X	return dipc;
+X}
+END_OF_FILE
+if test 5388 -ne `wc -c <'i_a.c'`; then
+    echo shar: \"'i_a.c'\" unpacked with wrong size!
+fi
+# end of 'i_a.c'
+fi
+if test -f 'i_b.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'i_b.c'\"
+else
+echo shar: Extracting \"'i_b.c'\" \(5042 characters\)
+sed "s/^X//" >'i_b.c' <<'END_OF_FILE'
+X#include	"register.h"
+X#include	"symtab.h"
+X#include	"diblock.h"
+X#include	"instrn.h"
+X#include	"process.h"
+X
+Xdinstrn	*
+Xi_bc1f(dipc, offset)
+Xdinstrn	*dipc;
+Xshort	offset;
+X{
+X	unsigned long	c;
+X
+X	procsget(CP1CS, c);
+X
+X	if (Test_Cond(c) == 0)
+X		dipc = do_delayed_branch(dipc, (unsigned long)(dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2)));
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_bc1t(dipc, offset)
+Xdinstrn	*dipc;
+Xshort	offset;
+X{
+X	unsigned long	c;
+X
+X	procsget(CP1CS, c);
+X
+X	if (Test_Cond(c) == 1)
+X		dipc = do_delayed_branch(dipc, (unsigned long)(dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2)));
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_beq0(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 == 0)
+X		do_known_delayed_branch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_beq0_up(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 == 0)
+X		do_known_delayed_upbranch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_beq(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 == *dipc->di_1)
+X		do_known_delayed_branch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_beq_up(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 == *dipc->di_1)
+X		do_known_delayed_upbranch;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_beq(dipc, rs, rt, offset)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	s;
+X	unsigned long	t;
+X	unsigned long	target;
+X
+X	target = dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2);
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = (target > dipc->di_addr) ? c_beq0 : c_beq0_up;
+X		else
+X			dipc->di_handler = (target > dipc->di_addr) ? c_beq : c_beq_up;
+X
+X		dipc->di_0 = &P.p_state[rs];
+X		dipc->di_1 = &P.p_state[rt];
+X
+X		(void)compile_known_delayed_branch(dipc, target);
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, s);
+X
+X	procsget(rt, t);
+X
+X	if (s == t)
+X		dipc = do_delayed_branch(dipc, target);
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bgez(dipc)
+Xdinstrn	*dipc;
+X{
+X	if ((long)*dipc->di_0 >= 0)
+X		do_known_delayed_branch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bgez_up(dipc)
+Xdinstrn	*dipc;
+X{
+X	if ((long)*dipc->di_0 >= 0)
+X		do_known_delayed_upbranch;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_bgez(dipc, rs, rt, offset)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	target;
+X	long		s;
+X
+X	target = dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2);
+X
+X	if (compile_ok)
+X	{
+X		dipc->di_handler = c_bgez;
+X		dipc->di_handler = (target > dipc->di_addr) ? c_bgez : c_bgez_up;
+X		dipc->di_0 = &P.p_state[rs];
+X		(void)compile_known_delayed_branch(dipc, target);
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, *(unsigned long *)&s);
+X
+X	if (s >= 0)
+X		dipc = do_delayed_branch(dipc, target);
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bgtz(dipc)
+Xdinstrn	*dipc;
+X{
+X	if ((long)*dipc->di_0 > 0)
+X		do_known_delayed_branch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bgtz_up(dipc)
+Xdinstrn	*dipc;
+X{
+X	if ((long)*dipc->di_0 > 0)
+X		do_known_delayed_upbranch;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_bgtz(dipc, rs, rt, offset)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	target;
+X	long		s;
+X
+X	target = dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2);
+X
+X	if (compile_ok)
+X	{
+X		dipc->di_handler = (target > dipc->di_addr) ? c_bgtz : c_bgtz_up;
+X		dipc->di_0 = &P.p_state[rs];
+X		(void)compile_known_delayed_branch(dipc, target);
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, *(unsigned long *)&s);
+X
+X	if (s > 0)
+X		dipc = do_delayed_branch(dipc, target);
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_blez(dipc, rs, rt, offset)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	offset;
+X{
+X	long	s;
+X
+X	procsget(rs, *(unsigned long *)&s);
+X
+X	if (s <= 0)
+X		dipc = do_delayed_branch(dipc, (unsigned long)(dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2)));
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_bltz(dipc, rs, rt, offset)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	offset;
+X{
+X	long	s;
+X
+X	procsget(rs, *(unsigned long *)&s);
+X
+X	if (s < 0)
+X		dipc = do_delayed_branch(dipc, (unsigned long)(dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2)));
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bne0(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 != 0)
+X		do_known_delayed_branch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bne0_up(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 != 0)
+X		do_known_delayed_upbranch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bne(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 != *dipc->di_1)
+X		do_known_delayed_branch;
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_bne_up(dipc)
+Xdinstrn	*dipc;
+X{
+X	if (*dipc->di_0 != *dipc->di_1)
+X		do_known_delayed_upbranch;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_bne(dipc, rs, rt, offset)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	target;
+X	unsigned long	s;
+X	unsigned long	t;
+X
+X	target = dipc->di_addr + sizeof(unsigned long) + (((long)offset) << 2);
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = (target > dipc->di_addr) ? c_bne0 : c_bne0_up;
+X		else
+X			dipc->di_handler = (target > dipc->di_addr) ? c_bne : c_bne_up;
+X
+X		dipc->di_0 = &P.p_state[rs];
+X		dipc->di_1 = &P.p_state[rt];
+X		(void)compile_known_delayed_branch(dipc, target);
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(rs, s);
+X
+X	procsget(rt, t);
+X
+X	if (s != t)
+X		dipc = do_delayed_branch(dipc, target);
+X
+X	return dipc;
+X}
+END_OF_FILE
+if test 5042 -ne `wc -c <'i_b.c'`; then
+    echo shar: \"'i_b.c'\" unpacked with wrong size!
+fi
+# end of 'i_b.c'
+fi
+if test -f 'i_l.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'i_l.c'\"
+else
+echo shar: Extracting \"'i_l.c'\" \(8549 characters\)
+sed "s/^X//" >'i_l.c' <<'END_OF_FILE'
+X#include	<stdio.h>
+X#include	"register.h"
+X#include	"symtab.h"
+X#include	"diblock.h"
+X#include	"instrn.h"
+X#include	"process.h"
+X#include	"wcache.h"
+X#include	"talloc.h"
+X#include	"nels.h"
+X
+X#define	char_to_signed_long(C)	(long)(((C) & 0x80) ? ((C) | 0xFFFFFF80) : (C))
+X
+X#define	quiet_procmget_word(dipc,offset,ip,n,S,T) \
+X{ \
+X	int		i; \
+X	unsigned long	*wp; \
+X \
+X	if ((i = offset - P.p_data_region_min) >= 0) \
+X	{ \
+X		if (n == sizeof(int)) \
+X		{ \
+X			if (offset <= P.p_data_region_wlimit) \
+X			{ \
+X				wp = (unsigned long *)&P.p_data_region[i]; \
+X				*ip = *wp; \
+X				S; \
+X				T; \
+X				return dipc; \
+X			} \
+X		} \
+X		else if (n == sizeof(short)) \
+X		{ \
+X			if (offset <= P.p_data_region_limit + 1 - n) \
+X			{ \
+X				*ip = *(unsigned short *)&P.p_data_region[i]; \
+X				S; \
+X				T; \
+X				return dipc; \
+X			} \
+X		} \
+X		else \
+X		{ \
+X			if (offset <= P.p_data_region_limit) \
+X			{ \
+X				*ip = *(unsigned char *)&P.p_data_region[i]; \
+X				S; \
+X				T; \
+X				return dipc; \
+X			} \
+X		} \
+X \
+X		if (offset <= STACK_WMAX) \
+X		{ \
+X			if ((i = offset - P.p_stack_region_min) < 0) \
+X			{ \
+X				(void)proc_grow_stack(dipc, offset); \
+X \
+X				i = offset - P.p_stack_region_min; \
+X			} \
+X \
+X			if (n == sizeof(int)) \
+X			{ \
+X				wp = (unsigned long *)&P.p_stack_region[i]; \
+X				*ip = *wp; \
+X			} \
+X			else if (n == sizeof(short)) \
+X				*ip = *(unsigned short *)&P.p_stack_region[i]; \
+X			else \
+X				*ip = *(unsigned char *)&P.p_stack_region[i]; \
+X \
+X			S; \
+X			T; \
+X			return dipc; \
+X		} \
+X	} \
+X \
+X	(void)quiet_procmget(dipc, offset, (unsigned char *)ip, n); \
+X	S; \
+X	return dipc; \
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lb0(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned char	c;
+X	unsigned long	*lp;
+X
+X	addr = *dipc->di_1;
+X	lp = dipc->di_0;
+X
+X	quiet_procmget_word(dipc, addr, &c, sizeof(c), *lp = (unsigned long)char_to_signed_long(c), ;);
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lb(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned char	c;
+X	unsigned long	*lp;
+X
+X	addr = *dipc->di_1 + (long)dipc->di_2;
+X	lp = dipc->di_0;
+X
+X	quiet_procmget_word(dipc, addr, &c, sizeof(c), *lp = (unsigned long)char_to_signed_long(c), ;);
+X}
+X
+Xdinstrn	*
+Xi_lb(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned char	c;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			if (offset == (short)0)
+X				dipc->di_handler = c_lb0;
+X			else
+X				dipc->di_handler = c_lb;
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = &P.p_state[base];
+X			dipc->di_2 = (unsigned long *)(long)offset;
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(base, b);
+X
+X	if (procmget(dipc, b + (long)offset, (char *)&c, sizeof(c)) != -1)
+X		procsput(rt, char_to_signed_long(c));
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lbu(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned char	c;
+X	unsigned long	*lp;
+X
+X	addr = *dipc->di_1 + (long)dipc->di_2;
+X	lp = dipc->di_0;
+X
+X	quiet_procmget_word(dipc, addr, &c, sizeof(c), *lp = (unsigned long)c, ;);
+X}
+X
+Xdinstrn	*
+Xi_lbu(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned char	c;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			dipc->di_handler = c_lbu;
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = &P.p_state[base];
+X			dipc->di_2 = (unsigned long *)(long)offset;
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(base, b);
+X
+X	if (procmget(dipc, b + (long)offset, (char *)&c, sizeof(c)) != -1)
+X		procsput(rt, (unsigned long)c);
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lh(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned long	*lp;
+X	short		m;
+X
+X	addr = *dipc->di_1 + (long)dipc->di_2;
+X	lp = dipc->di_0;
+X
+X	check_halfword_align(dipc, addr);
+X
+X	quiet_procmget_word(dipc, addr, &m, sizeof(m), *lp = (unsigned long)(long)m, ;);
+X}
+X
+Xdinstrn	*
+Xi_lh(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned long	addr;
+X	short		m;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			dipc->di_handler = c_lh;
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = &P.p_state[base];
+X			dipc->di_2 = (unsigned long *)(long)offset;
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(base, b);
+X
+X	addr = b + (long)offset;
+X
+X	check_halfword_align(dipc, addr);
+X
+X	if (procmget(dipc, addr, (char *)&m, sizeof(m)) != -1)
+X		procsput(rt, (long)m);
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_lhu(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned long	addr;
+X	unsigned short	m;
+X
+X	procsget(base, b);
+X
+X	addr = b + (long)offset;
+X
+X	check_halfword_align(dipc, addr);
+X
+X	if (procmget(dipc, addr, (char *)&m, sizeof(m)) != -1)
+X		procsput(rt, (unsigned long)m);
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lui(dipc)
+Xdinstrn	*dipc;
+X{
+X	*dipc->di_0 = (unsigned long)dipc->di_1;
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_lui(dipc, rs, rt, immediate)
+Xdinstrn	*dipc;
+Xint	rs;
+Xint	rt;
+Xshort	immediate;
+X{
+X	unsigned long	t;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			dipc->di_handler = c_lui;
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = (unsigned long *)((immediate << 16) & 0xFFFF0000);
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	t = (immediate << 16) & 0xFFFF0000;
+X
+X	procsput(rt, t);
+X
+X	return dipc;
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lw0(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned long	*lp;
+X	cent		*cap;
+X
+X	addr = *dipc->di_1;
+X	lp = dipc->di_0;
+X
+X	if ((cap = &wcache[addr % CACHEZ])->c_addr == addr)
+X	{
+X		*lp = *cap->c_ptr;
+X		return dipc;
+X	}
+X
+X	check_word_align(dipc, addr);
+X
+X	quiet_procmget_word(dipc, addr, lp, sizeof(*lp), ;, cap->c_ptr = wp; cap->c_addr = addr);
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lw4(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned long	*lp;
+X	cent		*cap;
+X
+X	addr = *dipc->di_1 + 4;
+X	lp = dipc->di_0;
+X
+X	if ((cap = &wcache[addr % CACHEZ])->c_addr == addr)
+X	{
+X		*lp = *cap->c_ptr;
+X		return dipc;
+X	}
+X
+X	check_word_align(dipc, addr);
+X
+X	quiet_procmget_word(dipc, addr, lp, sizeof(*lp), ;, cap->c_ptr = wp; cap->c_addr = addr);
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lw8(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned long	*lp;
+X	cent		*cap;
+X
+X	addr = *dipc->di_1 + 8;
+X	lp = dipc->di_0;
+X
+X	if ((cap = &wcache[addr % CACHEZ])->c_addr == addr)
+X	{
+X		*lp = *cap->c_ptr;
+X		return dipc;
+X	}
+X
+X	check_word_align(dipc, addr);
+X
+X	quiet_procmget_word(dipc, addr, lp, sizeof(*lp), ;, cap->c_ptr = wp; cap->c_addr = addr);
+X}
+X
+Xstatic
+Xdinstrn	*
+Xc_lw(dipc)
+Xdinstrn	*dipc;
+X{
+X	unsigned long	addr;
+X	unsigned long	*lp;
+X	cent		*cap;
+X
+X	addr = *dipc->di_1 + (long)dipc->di_2;
+X	lp = dipc->di_0;
+X
+X	if ((cap = &wcache[addr % CACHEZ])->c_addr == addr)
+X	{
+X		*lp = *cap->c_ptr;
+X		return dipc;
+X	}
+X
+X	check_word_align(dipc, addr);
+X
+X	quiet_procmget_word(dipc, addr, lp, sizeof(*lp), ;, cap->c_ptr = wp; cap->c_addr = addr);
+X}
+X
+Xdinstrn	*
+Xi_lw(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned long	addr;
+X	unsigned long	t;
+X
+X	if (compile_ok)
+X	{
+X		if (rt == R_0)
+X			dipc->di_handler = c_noop;
+X		else
+X		{
+X			switch (offset)
+X			{
+X			case 0:
+X				dipc->di_handler = c_lw0;
+X				break;
+X
+X			case 4:
+X				dipc->di_handler = c_lw4;
+X				break;
+X
+X			case 8:
+X				dipc->di_handler = c_lw8;
+X				break;
+X
+X			default:
+X				dipc->di_handler = c_lw;
+X				break;
+X			}
+X			dipc->di_0 = &P.p_state[rt];
+X			dipc->di_1 = &P.p_state[base];
+X			dipc->di_2 = (unsigned long *)(long)offset;
+X		}
+X
+X		return (*dipc->di_handler)(dipc);
+X	}
+X
+X	procsget(base, b);
+X
+X	addr = b + (long)offset;
+X
+X	check_word_align(dipc, addr);
+X
+X	if (procmget(dipc, addr, (char *)&t, sizeof(t)) != -1)
+X		procsput(rt, t);
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_lwc1(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned long	addr;
+X	unsigned long	t;
+X
+X	procsget(base, b);
+X
+X	addr = b + (long)offset;
+X
+X	check_word_align(dipc, addr);
+X
+X	if (procmget(dipc, addr, (char *)&t, sizeof(t)) != -1)
+X		procsput(CP1G(rt), t);
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_lwl(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned long	addr;
+X	unsigned long	t;
+X	int		length;
+X
+X	procsget(base, b);
+X
+X	addr = b + offset;
+X
+X	procsget(rt, t);
+X
+X	length = sizeof(t) - (addr - (addr & ~0x3));
+X
+X	if (procmget(dipc, addr, (unsigned char *)&t, length) != -1)
+X		procsput(rt, t);
+X
+X	return dipc;
+X}
+X
+Xdinstrn	*
+Xi_lwr(dipc, base, rt, offset)
+Xdinstrn	*dipc;
+Xint	base;
+Xint	rt;
+Xshort	offset;
+X{
+X	unsigned long	b;
+X	unsigned long	addr;
+X	unsigned long	t;
+X	int		length;
+X
+X	procsget(base, b);
+X
+X	addr = b + offset;
+X
+X	procsget(rt, t);
+X
+X	length = (addr - (addr & ~0x3)) + 1;
+X
+X	if (procmget(dipc, addr & ~0x3, ((unsigned char *)&t) + (sizeof(t) - length), length) != -1)
+X		procsput(rt, t);
+X
+X	return dipc;
+X}
+END_OF_FILE
+if test 8549 -ne `wc -c <'i_l.c'`; then
+    echo shar: \"'i_l.c'\" unpacked with wrong size!
+fi
+# end of 'i_l.c'
+fi
+if test -f 'load.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'load.c'\"
+else
+echo shar: Extracting \"'load.c'\" \(5439 characters\)
+sed "s/^X//" >'load.c' <<'END_OF_FILE'
+X#include	<sys/param.h>
+X#include	<sys/types.h>
+X#include	<sys/immu.h>
+X#include	<fcntl.h>
+X#include	<unistd.h>
+X#include	<stdio.h>
+X#include	"register.h"
+X#include	"symtab.h"
+X#include	"diblock.h"
+X#include	"instrn.h"
+X#include	"process.h"
+X
+X#if	0
+X#define	LOAD_DEBUG	1
+X#endif	/* 0 */
+X
+Xextern int	get_interpreter_data();
+Xextern int	fd_hold();
+Xextern int	fd_release();
+X
+Xextern int	errno;
+X
+Xextern FILE	*outfp;
+Xextern int	Vflag;
+X
+Xstatic int	init_stack();
+X
+X/*
+X * Create a new process environment
+X * and initialise its components.
+X */
+Xint
+Xload(adotout, argp, envp)
+Xchar	*adotout;
+Xchar	**argp;
+Xchar	**envp;
+X{
+X	char	*interpreter_name;
+X	char	*interpreter_arg;
+X	char	**cp;
+X
+X	if (Vflag)
+X	{
+X		fprintf(outfp, "load(adotout=\"%s\",argp={", adotout);
+X		for (cp = argp; *cp != (char *)0; cp++)
+X			fprintf(outfp, "\"%s\",", *cp);
+X		fprintf(outfp, "},envp={");
+X		for (cp = envp; *cp != (char *)0; cp++)
+X			fprintf(outfp, "\"%s\",", *cp);
+X		fprintf(outfp, "})\n");
+X	}
+X
+X	interpreter_name = (char *)0;
+X	interpreter_arg = (char *)0;
+X
+X	if (get_interpreter_data(adotout, &interpreter_name, &interpreter_arg) == 0)
+X	{
+X		char	**nargp;
+X
+X		/*
+X		 * It's an executable interpreter script.
+X		 */
+X		for (cp = argp; *cp != (char *)0; cp++)
+X			;
+X
+X		cp++;
+X
+X		cp++;
+X
+X		if (interpreter_arg != (char *)0)
+X			cp++;
+X
+X		if ((nargp = (char **)malloc((cp - argp) * sizeof(*cp))) == (char **)0)
+X		{
+X			vcouldnot("allocate space for duplicate argv: load()");
+X			return -1;
+X		}
+X
+X		cp = nargp;
+X
+X		*cp++ = argp[0];
+X
+X		if (interpreter_arg != (char *)0)
+X			*cp++ = interpreter_arg;
+X
+X		*cp++ = adotout;
+X
+X		{
+X			int	argi;
+X
+X			for (argi = 1; argp[argi] != (char *)0; argi++)
+X				*cp++ = argp[argi];
+X
+X			*cp = (char *)0;
+X		}
+X
+X		adotout = interpreter_name;
+X		argp = nargp;
+X
+X		if (Vflag)
+X		{
+X			fprintf(outfp, "load'(adotout=\"%s\",argp={", adotout);
+X			for (cp = argp; *cp != (char *)0; cp++)
+X				fprintf(outfp, "\"%s\",", *cp);
+X			fprintf(outfp, "},envp={");
+X			for (cp = envp; *cp != (char *)0; cp++)
+X				fprintf(outfp, "\"%s\",", *cp);
+X			fprintf(outfp, "})\n");
+X		}
+X	}
+X
+X	if (fd_release() == -1)
+X		return -1;
+X
+X	/*
+X	 * Create a new process execution
+X	 * environment.
+X	 */
+X	if (procopen(adotout) == -1)
+X	{
+X		(void)fd_hold();
+X		return -1;
+X	}
+X
+X	if (fd_hold() == -1)
+X		return -1;
+X
+X#if	defined(LOAD_DEBUG)
+X	fprintf(outfp, "procopen'd\n");
+X#endif	/* defined(LOAD_DEBUG) */
+X
+X	/*
+X	 * Initialise the stack (arguments, environment and SP).
+X	 */
+X	if (init_stack(argp, envp) == -1)
+X		return -1;
+X
+X	return 0;
+X}
+X
+Xstatic
+Xint
+Xrpushi(i)
+Xint	i;
+X{
+X	unsigned long	sp;
+X
+X	if (quiet_procsget(R_SP, &sp) == -1)
+X		return -1;
+X
+X	if (quiet_procmput(GLOBALdipc, sp, (char *)&i, sizeof(i)) == -1)
+X		return -1;
+X
+X	sp += sizeof(i);
+X
+X	if (quiet_procsput(R_SP, sp) == -1)
+X		return -1;
+X
+X	return 0;
+X}
+X
+X#define	STRINGS_START	(USERSTACK - (EA_SIZE + NCARGS))
+X
+Xstatic
+Xint
+Xinit_stack(argv, envp)
+Xchar	**argv;
+Xchar	**envp;
+X{
+X	int		argc;
+X	int		envc;
+X	int		argi;
+X	int		envi;
+X	unsigned long	eventual_sp;
+X	unsigned long	stringsp;
+X
+X	/*
+X	 * We make the stack look like this:
+X
+X	USERSTACK(0x7ffff000)	->	|_______________| ___
+X					|               |  ^
+X					| Software FP   |  |
+X					| emulation save|  | EA_SIZE
+X					| area (32bytes)|  |
+X	 				|_______________| _v_
+X					|               |  ^
+X					| WASTED SPACE  |  |
+X					|               |  |
+X					| "e_strn\0"    |  |
+X					|    ***        |  |
+X					| "e_str0\0"    |  | NCARGS
+X					| "a_strn\0"    |  |
+X					|    ***        |  |
+X					| "a_str0\0"    |  |
+X	STRINGS_START		->	|_______________| _v_
+X					| 0             |
+X					| env[n]        |  ^
+X					| ...           |  |
+X					| env[0]        |  |
+X					| 0             |  |
+X					| argv[n]       |  |
+X					| ...           |  | 2*NCARGS
+X					| argv[0]       |  |
+X	SP			->	| argc          |  |
+X					|               |  |
+X					|               |  |
+X					|               |  |
+X					|               |  |
+X					|               |  |
+X	 				|_______________|  v
+X	 *
+X	 */
+X
+X	/*
+X	 * Count the argument strings.
+X	 */
+X	argc = 0;
+X	if (argv != (char **)0)
+X	{
+X		while (argv[argc] != (char *)0)
+X			argc++;
+X	}
+X
+X	/*
+X	 * Count the environment strings.
+X	 */
+X	envc = 0;
+X	if (envp != (char **)0)
+X	{
+X		while (envp[envc] != (char *)0)
+X			envc++;
+X	}
+X
+X	stringsp = STRINGS_START;
+X	eventual_sp = STRINGS_START - (1 + envc + 1 + argc + 1) * NBPW;
+X	eventual_sp &= ~0xF;	/* Quadword align the stack. */
+X
+X	if (quiet_procsput(R_SP, eventual_sp) == -1)
+X		return -1;
+X
+X	/*
+X	 * Push argc.
+X	 */
+X	if (rpushi(argc) == -1)
+X		return -1;
+X
+X	/*
+X	 * Push the argument strings and their pointers.
+X	 */
+X	for (argi = 0; argi < argc; argi++)
+X	{
+X		int	length;
+X
+X		if (rpushi(stringsp) == -1)
+X			return -1;
+X
+X#if	defined(LOAD_DEBUG)
+X		fprintf(outfp, "done an rpushi\n");
+X#endif	/* defined(LOAD_DEBUG) */
+X
+X		length = strlen(argv[argi]) + 1;
+X		if (quiet_procmput(GLOBALdipc, stringsp, argv[argi], length) == -1)
+X			return -1;
+X
+X#if	defined(LOAD_DEBUG)
+X		fprintf(outfp, "done a quiet_procmput\n");
+X#endif	/* defined(LOAD_DEBUG) */
+X
+X		stringsp += length;
+X	}
+X
+X	/*
+X	 * Push a null word.
+X	 */
+X	if (rpushi(0) == -1)
+X		return -1;
+X
+X	/*
+X	 * Push the environment strings and their pointers.
+X	 */
+X	for (envi = 0; envi < envc; envi++)
+X	{
+X		int	length;
+X
+X		if (rpushi(stringsp) == -1)
+X			return -1;
+X
+X		length = strlen(envp[envi]) + 1;
+X		if (quiet_procmput(GLOBALdipc, stringsp, envp[envi], length) == -1)
+X			return -1;
+X
+X		stringsp += length;
+X	}
+X
+X	/*
+X	 * Push a null word.
+X	 */
+X	if (rpushi(0) == -1)
+X		return -1;
+X
+X	/*
+X	 * Reinitialise the stack pointer.
+X	 */
+X	if (quiet_procsput(R_SP, eventual_sp) == -1)
+X		return -1;
+X
+X	return 0;
+X}
+END_OF_FILE
+if test 5439 -ne `wc -c <'load.c'`; then
+    echo shar: \"'load.c'\" unpacked with wrong size!
+fi
+# end of 'load.c'
+fi
+if test -f 'makefile' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'makefile'\"
+else
+echo shar: Extracting \"'makefile'\" \(6895 characters\)
+sed "s/^X//" >'makefile' <<'END_OF_FILE'
+X#
+X# trash
+X#
+XTARGET	=trash
+XUTARGET	=utrash
+XSHELL	=/bin/sh
+XRM	=/bin/rm -rf
+XCHMOD	=/bin/chmod
+X
+XCC	=/bin/cc
+XLD	=/bin/cc
+XDFLAGS	=
+XUDFLAGS	=$(DFLAGS)
+XPFLAG	=
+XCFLAGS	=-g3 -c
+XUCFLAGS	=-j
+XLDFLAGS	=$(PFLAG) -g3
+X# Tried -Olimit at 700 but ran (slightly) slower...
+XULDFLAGS	=$(PFLAG) -O3 -Olimit 600
+XLIBS	=-lmld
+XULIBS	=$(LIBS)
+X#ULIBS	=-klmld
+X
+XOBJS	=\
+X	bzero.o\
+X	bsd43.o\
+X	couldnot.o\
+X	diblock.o\
+X	dmult.o\
+X	dmultu.o\
+X	execvpath.o\
+X	fd.o\
+X	format.o\
+X	generic.o\
+X	getopt.o\
+X	getprbyno.o\
+X	go.o\
+X	histogram.o\
+X	history.o\
+X	i_a.o\
+X	i_b.o\
+X	i_c.o\
+X	i_d.o\
+X	i_j.o\
+X	i_l.o\
+X	i_m.o\
+X	i_n.o\
+X	i_o.o\
+X	i_s.o\
+X	i_syscall.o\
+X	i_u.o\
+X	i_x.o\
+X	load.o\
+X	main.o\
+X	myldopen.o\
+X	myname.o\
+X	optab.o\
+X	posix.o\
+X	process.o\
+X	resource.o\
+X	say.o\
+X	sgttyb.o\
+X	syms.o\
+X	sysmess.o\
+X	sysv.o\
+X	usage.o\
+X	vcouldnot.o\
+X	warning.o\
+X	wcache.o
+X
+XUOBJS	=\
+X	bzero.u\
+X	bsd43.u\
+X	couldnot.u\
+X	diblock.u\
+X	execvpath.u\
+X	fd.u\
+X	format.u\
+X	generic.u\
+X	getopt.u\
+X	getprbyno.u\
+X	go.u\
+X	histogram.u\
+X	history.u\
+X	i_a.u\
+X	i_b.u\
+X	i_c.u\
+X	i_d.u\
+X	i_j.u\
+X	i_l.u\
+X	i_m.u\
+X	i_n.u\
+X	i_o.u\
+X	i_s.u\
+X	i_syscall.u\
+X	i_u.u\
+X	i_x.u\
+X	load.u\
+X	main.u\
+X	myldopen.u\
+X	myname.u\
+X	optab.u\
+X	posix.u\
+X	process.u\
+X	resource.u\
+X	say.u\
+X	sgttyb.u\
+X	syms.u\
+X	sysmess.u\
+X	sysv.u\
+X	usage.u\
+X	vcouldnot.u\
+X	warning.u\
+X	wcache.u
+X
+XUOBJSA	=\
+X	dmult.o\
+X	dmultu.o
+X
+X.c.u	:
+X	$(CC) $(UDFLAGS) $(UCFLAGS) $*.c
+X
+X.c.o	:
+X	$(CC) $(DFLAGS) $(CFLAGS) $*.c
+X
+X.u.o	:
+X	$(CC) $(CFLAGS) $*.u
+X
+X$(TARGET):	$(OBJS) 
+X	$(LD) $(LDFLAGS) -o $(TARGET) $(OBJS) $(LIBS)
+X
+X$(UTARGET):	$(UOBJS) $(UOBJSA)
+X	-$(CC) $(ULDFLAGS) -o $(UTARGET) $(UOBJS) $(UOBJSA) $(ULIBS)
+X	# ld complains and leaves the target unexecutable.
+X	# Not sure what the complaints mean...
+X	$(CHMOD) 755 $(UTARGET)
+X
+Xbzero.u : \
+X	bzero.c
+Xbsd43.u : \
+X	bsd43.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	sysentry.h \
+X	res.h \
+X	nels.h \
+X	flag.h \
+X	generic.h
+Xcouldnot.u : \
+X	couldnot.c
+Xdiblock.u : \
+X	diblock.c \
+X	entry.h \
+X	diblock.h \
+X	talloc.h \
+X	nels.h
+Xexecvpath.u : \
+X	execvpath.c
+Xfd.u : \
+X	fd.c \
+X	nels.h
+Xformat.u : \
+X	format.c
+Xgeneric.u : \
+X	generic.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	res.h
+Xgetopt.u : \
+X	getopt.c
+Xgetprbyno.u : \
+X	getprbyno.c
+Xgo.u : \
+X	go.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	nels.h
+Xhistogram.u : \
+X	histogram.c
+Xhistory.u : \
+X	history.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_a.u : \
+X	i_a.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_b.u : \
+X	i_b.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_c.u : \
+X	i_c.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_d.u : \
+X	i_d.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_j.u : \
+X	i_j.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_l.u : \
+X	i_l.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	wcache.h \
+X	diblock.h
+Xi_m.u : \
+X	i_m.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_n.u : \
+X	i_n.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_o.u : \
+X	i_o.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_s.u : \
+X	i_s.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	wcache.h \
+X	diblock.h
+Xi_syscall.u : \
+X	i_syscall.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	sysentry.h \
+X	res.h \
+X	nels.h
+Xi_u.u : \
+X	i_u.c
+Xi_x.u : \
+X	i_x.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xload.u : \
+X	load.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xmain.u : \
+X	main.c
+Xmyldopen.u : \
+X	myldopen.c
+Xmyname.u : \
+X	myname.c
+Xoptab.u : \
+X	optab.c \
+X	instrn.h
+Xposix.u : \
+X	posix.c \
+X	sysentry.h \
+X	nels.h
+Xprocess.u : \
+X	process.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	wcache.h \
+X	nels.h
+Xresource.u : \
+X	resource.c \
+X	res.h
+Xsay.u : \
+X	say.c \
+X	register.h
+Xsgttyb.u : \
+X	sgttyb.c
+Xsyms.u : \
+X	syms.c \
+X	symtab.h
+Xsysmess.u : \
+X	sysmess.c
+Xsysv.u : \
+X	sysv.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	sysentry.h \
+X	nels.h \
+X	res.h \
+X	flag.h \
+X	generic.h \
+X	diblock.h
+Xusage.u : \
+X	usage.c
+Xvcouldnot.u : \
+X	vcouldnot.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xwarning.u : \
+X	warning.c
+Xwcache.u : \
+X	wcache.c \
+X	nels.h
+X
+Xbzero.o : \
+X	bzero.c
+Xbsd43.o : \
+X	bsd43.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	sysentry.h \
+X	res.h \
+X	nels.h \
+X	flag.h \
+X	generic.h
+Xcouldnot.o : \
+X	couldnot.c
+Xdiblock.o : \
+X	diblock.c \
+X	entry.h \
+X	diblock.h \
+X	talloc.h \
+X	nels.h
+Xexecvpath.o : \
+X	execvpath.c
+Xfd.o : \
+X	fd.c \
+X	nels.h
+Xformat.o : \
+X	format.c
+Xgeneric.o : \
+X	generic.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	res.h
+Xgetopt.o : \
+X	getopt.c
+Xgetprbyno.o : \
+X	getprbyno.c
+Xgo.o : \
+X	go.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h \
+X	nels.h
+Xhistogram.o : \
+X	histogram.c
+Xhistory.o : \
+X	history.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_a.o : \
+X	i_a.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_b.o : \
+X	i_b.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	process.h \
+X	diblock.h
+Xi_c.o : \
+X	i_c.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_d.o : \
+X	i_d.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_j.o : \
+X	i_j.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_l.o : \
+X	i_l.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	wcache.h \
+X	process.h
+Xi_m.o : \
+X	i_m.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_n.o : \
+X	i_n.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_o.o : \
+X	i_o.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xi_s.o : \
+X	i_s.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	wcache.h \
+X	process.h
+Xi_syscall.o : \
+X	i_syscall.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	sysentry.h \
+X	res.h \
+X	nels.h
+Xi_u.o : \
+X	i_u.c
+Xi_x.o : \
+X	i_x.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xload.o : \
+X	load.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xmain.o : \
+X	main.c
+Xmyldopen.o : \
+X	myldopen.c
+Xmyname.o : \
+X	myname.c
+Xoptab.o : \
+X	optab.c \
+X	instrn.h
+Xposix.o : \
+X	posix.c \
+X	sysentry.h \
+X	nels.h
+Xprocess.o : \
+X	process.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	wcache.h \
+X	nels.h
+Xresource.o : \
+X	resource.c \
+X	res.h
+Xsay.o : \
+X	say.c \
+X	register.h
+Xsgttyb.o : \
+X	sgttyb.c
+Xsyms.o : \
+X	syms.c \
+X	symtab.h
+Xsysmess.o : \
+X	sysmess.c
+Xsysv.o : \
+X	sysv.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h \
+X	sysentry.h \
+X	nels.h \
+X	res.h \
+X	flag.h \
+X	generic.h
+Xusage.o : \
+X	usage.c
+Xvcouldnot.o : \
+X	vcouldnot.c \
+X	register.h \
+X	instrn.h \
+X	symtab.h \
+X	diblock.h \
+X	process.h
+Xwarning.o : \
+X	warning.c
+Xwcache.o : \
+X	wcache.c \
+X	nels.h
+X
+Xclobber:	clean
+X	$(RM) $(TARGET) $(UTARGET)
+X
+Xclean:
+X	$(RM) $(OBJS) $(UOBJS) [Mm]ade mon.out core tags
+X
+Xtags:
+X	ctags *.[ch]
+END_OF_FILE
+if test 6895 -ne `wc -c <'makefile'`; then
+    echo shar: \"'makefile'\" unpacked with wrong size!
+fi
+# end of 'makefile'
+fi
+if test -f 'trash.1' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'trash.1'\"
+else
+echo shar: Extracting \"'trash.1'\" \(5996 characters\)
+sed "s/^X//" >'trash.1' <<'END_OF_FILE'
+X.TH TRASH 1
+X.SH NAME
+Xtrash \- trace system calls
+X.SH SYNOPSIS
+X.B trash
+X[
+X.I "-ABCFHILMNPRSTVW"
+X]
+X[
+X.I "-a argc"
+X]
+X[
+X.I "-d fd"
+X]
+X[
+X.I "-f executable"
+X]
+X[
+X.I "-h history_length"
+X]
+X[
+X.I "-o outfile"
+X]
+X[
+X.I "-v"
+X]
+X[
+X.I command
+X]
+X.SH DESCRIPTION
+X.IX trash "" "\fLtrash\fP \(em trace system calls"
+X.I trash
+Xsimulates the specified
+X.I command
+X(default:
+X.IR a.out )
+Xuntil it exits.
+XA line of information is written to
+Xa duplicate (as in
+X.IR dup (2))
+Xof the standard output immediately after each system call returns.
+X.SH OPTIONS
+X.TP
+X.B \-A
+Xall
+X\- show all data in
+X.IR read (2)
+Xand
+X.IR write (2)
+Xarguments and results.
+XNormally, only the first 32 bytes are shown.
+XAlso show the \fCargv\fP and \fCenvp\fP vector arguments to
+X.IR execve (2).
+X.TP
+X.B \-B
+Xbook
+X\- under the
+X.I \-I
+Xoption (see below) print the number of the page
+Xin The Book ("MIPS RISC Architecture" by Gerry Kane)
+Xwhere may be found a description of the simulated instruction.
+X.TP
+X.B \-C
+XC-like
+X\- show only assignments to registers and memory when used
+Xwith the
+X.I \-M
+Xand
+X.I \-R
+Xoptions.
+X.TP
+X.B \-F
+Xfollow
+X\- follow calls to
+X.IR execve (2)
+Xby execution of another instance of
+X.IR trash .
+X.TP
+X.B \-H
+Xhistogram
+X\-
+X.I trash
+Xwill count the number of references to the simulated
+Xprogram's text space (in 4KB quanta) and will print this
+Xinformation whenever it simulates an
+X.IR execve (2),
+Xan
+X.IR exit (2)
+Xor when the simulator exits.
+X.TP
+X.B \-I
+Xinstruction
+X\- print a line describing each MIPS instruction in a uniquely
+Xinformative yet idiosyncratic format.
+X.TP
+X.B \-L
+Xline
+X\- do not make output line buffered.
+X.TP
+X.B \-M
+Xmemory
+X\- print a line describing each (simulated) memory access.
+X.TP
+X.B \-N
+Xnumber
+X\- show the number of (simulated) instructions executed since the
+Xprevious system call and the total number of instructions
+Xsimulated so far.
+X.TP
+X.B \-P
+Xpredisplay
+X\- print a line describing each system call before it is executed.
+X.TP
+X.B \-R
+Xregister
+X\- print a line describing each (simulated) register access.
+X.TP
+X.B \-S
+Xsyscall
+X\- do not print a line describing each system call after it is executed.
+XIf this flag is not present then a line is printed describing each
+Xsystem call after it is executed.
+X.TP
+X.B \-T
+Xtime
+X\- show the number of microseconds of system time that elapse
+Xduring each system call.
+X.TP
+X.B \-V
+Xverbose
+X\- print even more output.
+X.TP
+X.B \-W
+Xoverwrite
+X\- do not truncate the output file before appending to it.
+X.TP
+X.B "\-a argc"
+XThe first
+X.B argc
+Xtrailing arguments are to be taken as the
+Xargument vector for the simulated process.
+XThe next trailing argument is to be ignored.
+XThe remaining trailing arguments are to be
+Xtaken as the environment strings of the simulated process.
+X(This feature is intended for
+X.IR trash 's
+Xown internal use under the
+X.I \-F
+Xoption.)
+X.TP
+X.B "\-d fd"
+XWrite
+X.IR trash 's
+Xoutput to file descriptor
+X.BR fd .
+X(This feature is intended for
+X.IR trash 's
+Xown internal use under the
+X.I \-F
+Xoption.)
+X.TP
+X.B "\-f executable"
+XAn unambiguous specification of the file that
+Xshould be read to obtain the initial process image.
+XWithout this option
+X.I trash
+Xwill search for the file indicated by the first
+Xtrailing argument using the same algorithm as
+X.IR execvp (2)
+Xand
+X.IR execlp (2).
+X.TP
+X.B "\-h history_length"
+X.I trash
+Xwill maintain a history of the last
+X.I history_length
+Xinstructions and will print them whenever it
+Xsimulates an
+X.IR execve (2),
+Xan
+X.IR exit (2)
+Xor when the simulator exits.
+X.TP
+X.B "\-o outfile"
+XWrite
+X.IR trash 's
+Xoutput to
+X.BR outfile .
+X.TP
+X.B \-v
+Xversion
+X\- print the version string and then
+X.IR exit (2).
+X.SH CAVEATS
+X.LP
+XUnder the
+X.I bsd43
+Xuniverse,
+Xmost system calls relating to signals are recognised but silently
+Xignored.
+X.LP
+XUnder the
+X.I bsd43
+Xuniverse,
+Xthe reception of signals by the simulated process is not
+Ximplemented.
+X.LP
+XMost exceptions are ignored or handled crudely.
+X.LP
+XAttempts to access data at
+Xinvalid (simulated) addresses or attempts to access data
+Xat valid (simulated) addresses but in invalid ways are
+Xdetected but are handled crudely.
+X.LP
+XUnder the
+X.I bsd43
+Xuniverse,
+Xthe value returned by the
+X.IR geteuid (2-BSD)
+Xsystem call is actually the result of executing the
+X.IR geteuid (2-SysV)
+Xsystem call under the
+X.I sysv
+Xuniverse.
+X.LP
+XUnder the
+X.I bsd43
+Xuniverse, the value returned by the
+X.IR pipe (2-BSD)
+Xsystem call is actually the result of executing the
+X.IR pipe (2-SysV)
+Xsystem call under the
+X.I sysv
+Xuniverse.
+X.LP
+XThe passing of open file descriptors in
+X.IR ioctl (2)
+Xsystem calls (e.g. see I_FDINSERT in
+X.IR streamio (7-SysV))
+Xis not (yet) supported.
+X.LP
+XSome system calls are not yet implemented.
+X.LP
+XUnder the
+X.I bsd43
+Xuniverse,
+X.IR vfork (2-BSD)
+Xis (incorrectly) implemented as a normal
+X.IR fork (2-BSD),
+Xso programs that rely on the shared memory/state
+Xproperties of the former will not simulate correctly.
+X.LP
+XSeveral MIPS instructions have not been implemented.
+XThese are currently:
+X.IR bgezal ,
+X.IR bltzal ,
+X.IR break ,
+Xall
+X.IR "coprocessor 0" ,
+X.I "coprocessor 2"
+Xand
+X.I "coprocessor 3"
+Xinstructions
+Xand the following
+X.I "coprocessor 1"
+Xinstructions:
+X.IR c.f ,
+X.IR c.nge ,
+X.IR c.ngl ,
+X.IR c.ngle ,
+X.IR c.ngt ,
+X.IR c.seq ,
+X.IR c.sf ,
+X.I c.ueq
+Xand
+X.IR c.un .
+X.LP
+XThe simulator assumes that all the world is
+X.IR big-endian .
+X.LP
+XUnder the
+X.I sysv
+Xuniverse,
+X.IR profil (2-SysV),
+Xand hence executable profiling, is ignored.
+X.LP
+XTo be simulated an executable file must be readable.
+X.LP
+XThe setuid and setgid mode bits of executables are ignored.
+X.LP
+XThe simulation of a process by
+X.I trash
+Xis much slower than the normal execution of that process.
+X.LP
+XThe
+X.IR getdtablesize (2-BSD)
+Xsystem call returns the same value as it would
+Xunder normal execution, but the simulated
+Xprocess will actually appear to run out
+Xof file descriptors
+X.RB ( EMFILE )
+Xat a slightly lower number.
+X.LP
+XUnder the
+X.I \-F
+Xoption the
+X.IR execve
+Xsystem call is not correctly simulated if the
+Xfirst (\fIpath\fP) argument is a shared library.
+X.SH AUTHOR
+XBruce Janson
+X.br
+Xbruce@cs.su.oz.au
+X.SH SEE ALSO
+X.IR trace (1)
+Xunder SunOS4.1.
+X.br
+X.IR truss (1)
+Xunder System V Release 4.0.
+END_OF_FILE
+if test 5996 -ne `wc -c <'trash.1'`; then
+    echo shar: \"'trash.1'\" unpacked with wrong size!
+fi
+# end of 'trash.1'
+fi
+echo shar: End of archive 2 \(of 8\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 8 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

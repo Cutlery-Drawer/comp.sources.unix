@@ -1,0 +1,1982 @@
+Subject:  v18i013:  Geneal, a genealogy browsing program, Part03/03
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Jim McBeath <voder!sci!gumby!jimmc>
+Posting-number: Volume 18, Issue 13
+Archive-name: geneal/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 4)."
+# Contents:  dataman.c family.c famntree.c fgdat.c
+# Wrapped by rsalz@fig.bbn.com on Thu Mar  9 15:55:05 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'dataman.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'dataman.c'\"
+else
+echo shar: Extracting \"'dataman.c'\" \(16428 characters\)
+sed "s/^X//" >'dataman.c' <<'END_OF_FILE'
+X/* dataman - simple data manager for reading data from text files
+X * Written by Jim McBeath (jimmc) at SCI
+X *
+X * Revision history:
+X * 24-Jan-85	Jim McBeath	Put structure description into include file
+X * 14-Mar-86  J. McBeath	Add getRecord()
+X *  9-May-86  J. McBeath	Add unnumbered index mode
+X * 13-May-68  J. McBeath	Bug fix for unnumbered record at start of file;
+X *				add check for duplicate record numbers;
+X *				modify error message scheme; add multi-line
+X *				data value capability.
+X * 18-Sep-86  J. McBeath	make strsave and strsave2 not static
+X * v1.5  jimmc	 8.jan.87  Add checks for trailing spaces
+X * v1.6  jimmc  19.jan.87  Output error messages to error file also,
+X *				add closeDataFile
+X *  8.Jan.88  jimmc  Lint cleanup
+X */
+X
+X/* This module is a very simple data manager which allows a simple
+X   interface to a text file.  The text file is the database.  This
+X   module has routines to read that database (it is assumed that
+X   the writing is done by another program, e.g. a text editor).
+X   The format of the data file is as follows:
+X
+X   A file consists of a sequence of records.  All records are ascii
+X   text.  Records are separated by blank lines.  Lines within each
+X   record contain the data for that record.  The first line of a
+X   record must begin with an integer.  This integer is the index
+X   number of that record, and is used to reference the record.  All
+X   other text on the line with the index number is ignored, so
+X   can be used as a comment line.
+X
+X   Alternatively, the records can all be unnumbered.  In this case,
+X   index numbers are automatically generated.  The only allowable
+X   record number in this mode is 0, which specifies that that record
+X   is a comment record and is to be ignored.  The record numbers in
+X   this mode start at 1 and increase sequentially.
+X
+X   The remaining lines in a record are data items for that record.
+X   A data item consists of a key and a payload.  The key is any
+X   string of alphanumeric characters or '_' or '.' followed immediately
+X   by a colon.  All remaining text on the line,
+X   after the colon, is the payload for that data item.
+X
+X   Both index numbers and key strings must be unique; non-unique
+X   items will not be referenceable.  Index numbers need not be in
+X   any order.  Key strings should be short to increase speed.
+X   (Note that this is not designed to be a particularly fast
+X   system anyway!)
+X*/
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <ctype.h>
+X#include <strings.h>
+X#include "index.h"
+X#include "dataman.h"
+X
+Xstruct dline {
+X	int ltype;	/* what kind of data line we found */
+X#define LBLANK 0	/* nothing at all on the line */
+X#define LCOMMENT 1	/* line starts with a colon */
+X#define LKEY 2		/* normal key:value line */
+X#define LNOKEY 3	/* line with text but no key, no leading colon */
+X	char *key;	/* malloc'ed key string */
+X	char *value;	/* malloc'ed value string, including \n */
+X};
+X
+Xextern char *malloc(), *realloc();
+Xextern int errno;
+Xextern int sys_nerr;
+Xextern char *sys_errlist[];
+Xextern long getIndex();
+X
+Xstruct toplevel *initIndex();
+XFILE *indexfp;		/* used by writeoneindex */
+XFILE *errorfp;		/* used to write out errors when making index */
+X
+X#ifdef vms
+X#define index strchr
+X#endif
+X
+Xint dataDebug=0;		/* set this flag to give debug output */
+Xint dataStatus=0;		/* status after most recent operation */
+Xchar *dataErrMsg="";		/* the error message */
+Xchar dataErrBuf[1000];		/* where we put our error messages */
+Xchar *dataErrStrs[] = {
+X	"successful data operation",	/* 0 */
+X	"can't open data file",		/* 1 */
+X	"no more memory",			/* 2 */
+X	"can't start an index table",	/* 3 */
+X	"invalid pointer to getData",	/* 4 */
+X	"no file open in getData",		/* 5 */
+X	"no index table in getData",	/* 6 */
+X	"no such index number",		/* 7 */
+X	"key not found",			/* 8 */
+X	"mixed records with and without indexes",	/* 9 */
+X	"unnumbered records must not start on first line of file", /* 10 */
+X	"can't open index file",		/* 11 */
+X	"error creating new index file",	/* 12 */
+X};
+X#define ERET(n) { dataStatus = n;  dataErrMsg = dataErrStrs[n]; return 0; }
+X#define EMSGRET { dataStatus = -1; dataErrMsg = dataErrBuf;     return 0; }
+X#define EPRET(n) { sprintf(dataErrBuf, "%s: %s", dataErrStrs[n], \
+X		   (errno<sys_nerr?sys_errlist[errno]:"Unknown unix error")); \
+X		  dataStatus = n; dataErrMsg = dataErrBuf; return 0; }
+X
+X/*..........*/
+X
+Xlong		/* return the last-modification date of a file, or 0 */
+Xfdate(fn)
+Xchar *fn;	/* name of the file to get the date for */
+X{
+X	struct stat sbuf;
+X	int t;
+X
+X	t = stat(fn,&sbuf);
+X	if (t) return 0;
+X	return sbuf.st_mtime;
+X}
+X
+X/*..........*/
+X
+Xlong		/* return the last-modification date of a file, or 0 */
+Xfddate(fp)
+XFILE *fp;	/*  the file to get the date for */
+X{
+X	struct stat sbuf;
+X	int t;
+X
+X	t = fstat(fileno(fp),&sbuf);
+X	if (t) return 0;
+X	return sbuf.st_mtime;
+X}
+X
+X/*..........*/
+X
+Xchar *strsave(ss)
+Xchar *ss;
+X{
+X	char *dd;
+X	dd = malloc((unsigned)(strlen(ss)+1));
+X	if (dd==0) fferror("no more memory");
+X	strcpy(dd,ss);
+X	return dd;
+X}
+X
+X/*..........*/
+X
+Xchar *strsave2(s1,s2)
+Xchar *s1,*s2;
+X{
+X	char *dd;
+X	int l1,l2;
+X	l1 = strlen(s1);
+X	l2 = strlen(s2);
+X	dd = malloc((unsigned)(l1+l2+1));
+X	if (dd==0) fferror("no more memory");
+X	strcpy(dd,s1);
+X	strcpy(dd+l1,s2);
+X	return dd;
+X}
+X
+X/*..........*/
+X
+Xint
+Xwriteoneindex(n,l)
+Xint n;			/* index number */
+Xint l;			/* seek offset */
+X{
+X	if (n<=0) return 0;
+X	putw(n,indexfp);	/* write out the index number */
+X	putw(l,indexfp);	/* write out the seek offset */
+X	return 0;
+X}
+X
+X/*..........*/
+X
+Xchar *dlinebuf=0;
+Xint dlinebufsize=0;
+Xint dlineno;
+Xchar *dfilename;
+X
+Xgetdline(fp)
+XFILE *fp;
+X{
+X	int t;
+X
+X	if (dlinebufsize==0) {
+X		dlinebufsize = 100;	/* a starting point */
+X		dlinebuf = malloc((unsigned)dlinebufsize);
+X		if (dlinebuf==0) fferror("no more memory");
+X	}
+X	dlinebuf[dlinebufsize-1]=0;	/* set to null so we can check it */
+X	dlinebuf[dlinebufsize-2]=0;
+X	dlinebuf[0]=0;
+X	fgets(dlinebuf,dlinebufsize,fp);
+X	while (dlinebuf[dlinebufsize-2]!=0 && dlinebuf[dlinebufsize-2]!='\n') {
+X		t = dlinebufsize-1; /* this is where new piece should start */
+X		dlinebufsize *=2;	/* try twice the size */
+X		dlinebuf = realloc(dlinebuf,(unsigned)dlinebufsize);
+X		if (dlinebuf==0) fferror("no more memory");
+X		dlinebuf[t]=0;
+X		dlinebuf[dlinebufsize-1]=0;
+X		dlinebuf[dlinebufsize-2]=0;
+X		fgets(dlinebuf+t,dlinebufsize-t,fp);
+X			/* pick up next part of line */
+X	}
+X/* We now have the complete line in dlinebuf, no matter how long it was! */
+X	dlineno++;
+X}
+X
+X/*..........*/
+X
+Xstruct dline *		/* reads and parses one line */
+Xreaddline(fp,dlp)
+XFILE *fp;		/* File to read from */
+Xstruct dline *dlp;	/* structure to fill in; if nul, allocates one */
+X{
+X	int c;
+X	char *cp;
+X
+X	if (dlp==0) {
+X		dlp = (struct dline *)malloc(sizeof(struct dline));
+X		if (dlp==0) fferror("no more memory");
+X		dlp->key=0;
+X		dlp->value=0;
+X	}
+X	getdline(fp);	/* read data line into dlinebuf */
+X	for (cp=dlinebuf; (c= *cp)!=0; cp++) {
+X		if (!(isalnum(c)||c=='_'||c=='.')) break;
+X	}
+X	if (c=='\n' || c==0) {
+X		if (cp==dlinebuf) dlp->ltype=LBLANK;
+X		else dlp->ltype=LNOKEY;
+X		dlp->key = 0;
+X		dlp->value = strsave(dlinebuf);
+X	}
+X	else if (c==':') {
+X		if (cp==dlinebuf) { 
+X			dlp->ltype=LCOMMENT; 
+X			dlp->key=0; 
+X		}
+X		else {
+X			dlp->ltype=LKEY;
+X			*cp = 0;	/* null terminate the key */
+X			dlp->key = strsave(dlinebuf);
+X		}
+X		dlp->value = strsave(cp+1);
+X	}
+X	else {
+X		dlp->ltype=LNOKEY;
+X		dlp->key = 0;
+X		dlp->value = strsave(dlinebuf);
+X	}
+X	return dlp;
+X}
+X
+X/*..........*/
+X
+Xstruct dpoint *			/* a pointer to our internal struct */
+X/* returns 0 on error */
+XinitDataFile(fn)		/* init the data file to be used */
+Xchar *fn;			/* the filename to look up */
+X{
+X	FILE *fp, *ifp;
+X	struct dpoint *pp;
+X	struct toplevel *qq;
+X	int iflag,n;
+X	int lastindex=0;
+X	int indexedmode=0;	/* 0 means mode is not yet set */
+X#define INDEXMODEYES 1
+X#define INDEXMODENO 2
+X	long lastftell=0;
+X	char *indexfn;
+X	char *errorfn;
+X#define INDEXSUFF ".index"
+X#define ERRORSUFF ".error"
+X	int l,c;
+X	int t;
+X	long lt;
+X	char *msg;
+X
+X	dfilename = fn;		/* for error messages during init */
+X	dlineno = 0;
+X	fp = fopen(fn,"r");		/* get his data file */
+X	if (!fp) EPRET(1)		/* can't do anything if no file */
+X	pp = (struct dpoint *)malloc(sizeof(struct dpoint));
+X	if (!pp) {			/* if no memory for us */
+X		fclose(fp);		/* dump the file */
+X		EPRET(2)		/* error return */
+X	}
+X	pp->ff = fp;		/* put file pointer into our data block */
+X	qq = initIndex();		/* start up an index table */
+X	if (qq==0) {		/* if can't start up an index table */
+X		fclose(fp);
+X		free((char *)pp);
+X		ERET(3)
+X	}
+X	pp->xx = qq;			/* save pointer to index table */
+X	if (dataDebug) printf("initDataFile: index table is at %X\n", qq);
+X
+X	l = strlen(fn)+sizeof(INDEXSUFF)+1;
+X	indexfn = malloc((unsigned)l);
+X	if (indexfn==0) ERET(2)		/* no more memory */
+X	sprintf(indexfn,"%s%s", fn, INDEXSUFF);
+X	if (fdate(indexfn)>fddate(fp)) {
+X		/* if we have an up-to-date index */
+X		ifp = fopen(indexfn,"r");
+X		if (ifp==0) EPRET(11)
+X			while (!feof(ifp)) {
+X				n = getw(ifp);	/* read the index number */
+X				lastftell = getw(ifp);
+X					/* read the seek offset */
+X				if (n>0) setIndex(qq,n,lastftell);
+X					/* set the table */
+X			}
+X		dataStatus=0;
+X		return pp;		/* done */
+X	}
+X
+X	l = strlen(fn)+sizeof(ERRORSUFF)+1;
+X	errorfn = malloc((unsigned)l);
+X	if (errorfn==0) ERET(2)		/* no more memory */
+X	sprintf(errorfn,"%s%s", fn, ERRORSUFF);
+X	errorfp = fopen(errorfn,"w");	/* the error file */
+X	iflag = 1;		/* note we are looking for start of record */
+X	while (!feof(fp)) {		/* scan through the file */
+X		getdline(fp);		/* read line into dlinebuf */
+X		l = strlen(dlinebuf);
+X		if (l>0 && dlinebuf[l-1]=='\n') --l;
+X		if (l>0 && ((c=dlinebuf[l-1])==' ' || c=='\t')) {
+X			msg="trailing spaces or tabs";
+X			fprintf(stderr,
+X			    "warning: %s in data file %s on line %d\n",
+X			    msg, dfilename, dlineno);
+X			if (errorfp) fprintf(errorfp,
+X			    "warning: %s in data file %s on line %d\n",
+X			    msg, dfilename, dlineno);
+X		}
+X		if (iflag) {		/* looking for start of next record */
+X			if (dlinebuf[0]==0) break;	/* EOF */
+X			if (dlinebuf[0]=='\n') {	/* another blank line */
+X				if (indexedmode!=INDEXMODEYES)
+X					lastftell = ftell(fp);
+X			}
+X			else if (sscanf(dlinebuf,"%d",&n)==1) {
+X				/* if index number */
+X				if (n>0) {	/* ignore records numbered 0 */
+X					switch(indexedmode) {
+X					case 0: 
+X						indexedmode=INDEXMODEYES; 
+X						break;
+X					case INDEXMODENO: 
+X						ERET(9) /* NOTREACHED */
+X					}
+X					if (dataDebug)
+Xprintf("initDataFile: index %d at loc %d\n", n,ftell(fp));
+X					lastftell = ftell(fp);
+X					lt = getIndex(qq,n);
+X					if (lt!=0) {
+X						sprintf(dataErrBuf,
+X"duplicate record index %d (seek offsets %d and %d)",
+X						    n, lt, lastftell);
+X						EMSGRET
+X					}
+X					setIndex(qq,n,lastftell);
+X					    /* remember start of next line */
+X				}
+X				iflag=0;
+X				  /* no longer looking for start of record */
+X			}
+X			else {	/* start of a record without an index */
+X				switch (indexedmode) {
+X				case 0: 
+X					indexedmode=INDEXMODENO; 
+X					break;
+X				case INDEXMODEYES: 
+X					ERET(9)	/* NOTREACHED */
+X				}
+X				if (dataDebug)
+Xprintf("initDataFile: index %d at loc %d\n", lastindex+1,lastftell);
+X				if (lastftell==0)
+X					ERET(10) /* can't start right at 0! */
+X				setIndex(qq,++lastindex,lastftell);
+X					/* remember start of this line */
+X				iflag=0;
+X			}
+X		}
+X		else {			/* in the middle of a record */
+X			if (dlinebuf[0]=='\n') {
+X				/* see if this is a blank line */
+X				if (indexedmode!=INDEXMODEYES)
+X					lastftell = ftell(fp);
+X				iflag++; /* note blank line - */
+X					/*  start looking for next record */
+X			}
+X		}
+X	}
+X	if (errorfp) fclose(errorfp);
+X	/* Now create an index file to use for future runs */
+X	indexfp = fopen(indexfn,"w");
+X	if (indexfp) {		/* if we got it, make the file */
+X		enumIndex(pp->xx,writeoneindex); /* write out the index info */
+X		t = fclose(indexfp);
+X		if (t) { EPRET(12) }
+X	}
+X	dataStatus=0;
+X	return pp;			/* return pointer to our structure */
+X}
+X
+X/*..........*/
+X
+XcloseDataFile(pp)
+Xstruct dpoint *pp;
+X{
+X	if (!pp) ERET(4)		/* check for valid pointer */
+X	if (!(pp->ff)) ERET(5)		/* error return if no file open */
+X	if (!(pp->xx)) ERET(6)		/* error if no index table pointer */
+X	freeIndex(pp->xx);		/* dump the index */
+X	fclose(pp->ff);		/* free up the file pointer */
+X	free((char *)pp);
+X	dataStatus=0;
+X	return 0;
+X}
+X
+X/*..........*/
+X
+Xchar *getdatalastp=0;
+X
+Xchar *				/* returns a pointer to the data string */
+X/*  return NULL if no data */
+XgetData(pp,indexn,key)		/* get a data item */
+Xstruct dpoint *pp;		/* pointer to our structure */
+Xint indexn;			/* the index of the record of interest */
+Xchar *key;			/* the key string */
+X{
+X	long l;
+X	int len;
+X	char *index();
+X	struct dline dl, dl2;
+X	struct dline *dlp, *dlp2;
+X	int unnamedok;
+X	char *oldv, *addv;
+X
+X	if (!pp) ERET(4)		/* check for valid pointer */
+X	if (!(pp->ff)) ERET(5)		/* error return if no file open */
+X	if (!(pp->xx)) ERET(6)		/* error if no index table pointer */
+X	l = getIndex(pp->xx,indexn);  /* get the lseek value for that index */
+X	if (l==0) ERET(7)	/* error if no lseek value for that index */
+X	fseek(pp->ff,l,0);	/* seek to the start of that line */
+X	if (strcmp(key,"unnamed")==0) unnamedok=1;
+X	else unnamedok=0;
+X	while (!feof(pp->ff)) {		/* read lines until eof (or blank) */
+X		dlp = readdline(pp->ff,&dl);
+X		if (dlp->ltype==LBLANK) break;	/* blank line */
+X		else if (dlp->ltype==LCOMMENT) continue;
+X		else if (dlp->ltype==LKEY) unnamedok=0;
+X		if ((dlp->ltype==LNOKEY && unnamedok) ||
+X		    (dlp->ltype==LKEY && strcmp(key,dlp->key)==0)) {
+X			/* we've got a hot one */
+X			dlp2 = readdline(pp->ff,&dl2);
+X			while (dlp2->ltype==LNOKEY) {
+X				oldv = dlp->value;
+X				addv = dlp2->value;
+X				if (*addv == '+')
+X					addv++;
+X					/* skip over leading plus mark */
+X				dlp->value = strsave2(dlp->value,addv);
+X				free(oldv);
+X				free(dlp2->value);
+X				dlp2 = readdline(pp->ff,&dl2);
+X			}
+X			len = strlen(dlp->value);
+X			if (dlp->value[len-1]=='\n') dlp->value[len-1]=0;
+X			free(dlp2->key);
+X			free(dlp2->value);
+X			free(dlp->key);
+X			if (getdatalastp) free(getdatalastp);
+X			getdatalastp = dlp->value;
+X			dataStatus=0;
+X			return dlp->value;
+X		}
+X	}			/* continue - read next line and compare */
+X	ERET(8)			/* eof or blank line, key not found */
+X}
+X
+X/*..........*/
+X
+Xstruct drecord *		/* returns a pointer to a record struct */
+X/*  return NULL if no data or error */
+XgetRecord(pp,indexn,rp)		/* get a complete record */
+Xstruct dpoint *pp;		/* pointer to our structure */
+Xint indexn;			/* the index of the record of interest */
+Xstruct drecord *rp;		/* structure to fill in; if NULL, allocs one */
+X{
+X	int i;
+X	int len;
+X	long l;
+X	char *index();
+X	int numfields;
+X#define MAXRECNUM 1000
+X	char *names[MAXRECNUM];	/* make number of fields */
+X	char *values[MAXRECNUM];
+X	struct dline dl, dl2;
+X	struct dline *dlp, *dlp2;
+X	char *oldv, *addv;
+X
+X	if (!pp) ERET(4)		/* check for valid pointer */
+X	if (!(pp->ff)) ERET(5)		/* error return if no file open */
+X	if (!(pp->xx)) ERET(6)		/* error if no index table pointer */
+X	if (rp==0) {
+X		rp = (struct drecord *)malloc(sizeof(struct drecord));
+X		if (rp==0) return 0;
+X		rp->numfields = 0;
+X		rp->name = 0;
+X		rp->value = 0;
+X	}
+X	for (i=0; i<rp->numfields; i++) {
+X		free(rp->name[i]);
+X		free(rp->value[i]);
+X	};
+X	if (rp->name) free((char *)rp->name);
+X	if (rp->value) free((char *)rp->value);
+X	l = getIndex(pp->xx,indexn);  /* get the lseek value for that index */
+X	if (l==0) ERET(7)	/* error if no lseek value for that index */
+X	fseek(pp->ff,l,0);	/* seek to the start of that line */
+X	numfields = 0;
+X	dlp = readdline(pp->ff,&dl);
+X	while (dlp->ltype!=LBLANK) {
+X		while (dlp->ltype==LCOMMENT) {
+X			free(dlp->value);
+X			dlp = readdline(pp->ff,&dl);
+X		}
+X		if (dlp->ltype==LBLANK) break;
+X		dlp2 = readdline(pp->ff,&dl2);
+X		while (dlp2->ltype==LNOKEY) {
+X			oldv = dlp->value;
+X			addv = dlp2->value;
+X			if (*addv == '+')
+X				addv++;	/* skip over leading plus mark */
+X			dlp->value = strsave2(dlp->value,addv);
+X			free(oldv);
+X			free(dlp2->value);
+X			dlp2 = readdline(pp->ff,&dl2);
+X		}
+X		len = strlen(dlp->value);
+X		if (dlp->value[len-1]=='\n') dlp->value[len-1]=0;
+X		if (dlp->ltype==LNOKEY)
+X			names[numfields] = strsave("unnamed");
+X		else	names[numfields] = dlp->key;
+X		values[numfields] = dlp->value;
+X		numfields++;
+X		dl = dl2;
+X	}
+X	if (dlp->ltype==LBLANK) free(dlp->value);
+X	dataStatus=0;
+X	rp->numfields = numfields;
+X	rp->name = (char **)malloc((unsigned)(numfields*sizeof(char *)));
+X	if (rp->name==0) return 0;
+X	rp->value = (char **)malloc((unsigned)(numfields*sizeof(char *)));
+X	if (rp->value==0) return 0;
+X	for (i=0; i<numfields; i++) {
+X		rp->name[i] = names[i];
+X		rp->value[i] = values[i];
+X	}
+X	return rp;
+X}
+X
+X/* end */
+END_OF_FILE
+if test 16428 -ne `wc -c <'dataman.c'`; then
+    echo shar: \"'dataman.c'\" unpacked with wrong size!
+fi
+# end of 'dataman.c'
+fi
+if test -f 'family.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'family.c'\"
+else
+echo shar: Extracting \"'family.c'\" \(8659 characters\)
+sed "s/^X//" >'family.c' <<'END_OF_FILE'
+X/* family.c - produce a family information page
+X * Written by Jim McBeath (jimmc) at SCI
+X *
+X * Revision history:
+X * 24-Jan-85	Jim McBeath	Remove redundant declaration of gendp
+X * 27-Jan-85	Jim McBeath	Use fgbslist; change fgclist to bclist
+X * 29-Jan-85	Jim McBeath	convert to 7-char-distinct names
+X * 14-Feb-85	(Ian Darwin)	remove mnumstr (unused variable)
+X * 24.Aug.87  jimmc  Add Label stuff, add BUR info
+X * 14.Sep.87  jimmc  Add addr stuff
+X * 27.Oct.87  jimmc  General cleanup; call fggen to get GEN info
+X *  4.Jan.88  jimmc  Make printindented not static
+X *  8.Jan.88  jimmc  Allow lists of families to be printed
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include "geneal.h"
+X#include "pagemap.h"
+X
+X#define PAGEWID 80
+X#define LEFTMARGIN 4
+X#define RIGHTMARGIN 4
+X#define CENTERMARGIN 2
+X#define LEFTCOL ((PAGEWID-LEFTMARGIN-RIGHTMARGIN-CENTERMARGIN)/2)
+X#define RIGHTCOL (PAGEWID-LEFTMARGIN-RIGHTMARGIN-CENTERMARGIN-LEFTCOL)
+X#define ADDRCOL (LEFTMARGIN+20)
+X#define SPOUSEOFFSET 10
+X
+X#define TBLOCKSIZE 1000
+X#define NOTEMAX 500
+X
+Xstruct tblock {		/* a text block */
+X	int width;		/* length of longest line */
+X	int lines;		/* number of lines */
+X	char *text[TBLOCKSIZE];	/* the text pointers */
+X};
+X
+Xextern int dataStatus;
+Xextern char *dataErrStrs[];
+Xextern char *Label;
+X
+Xint notenum;
+Xint notecount;		/* for storing the footnotes */
+Xchar *notes[NOTEMAX];
+X
+Xprintindented(indent,str)
+Xint indent;
+Xchar *str;
+X{
+X	if (!str || !str[0]) return;
+X	fprintf(outfp,"%*s", indent, "");
+X	for (; *str; str++) {
+X		if (*str == '\n') {
+X			fprintf(outfp,"\n%*s", indent, "");
+X		}
+X		else putc(*str,outfp);
+X	}
+X	putc('\n',outfp);
+X}
+X
+X/*..........*/
+X
+Xint			/* 0 if all OK */
+Xfamily(ac,av)
+Xint ac;			/* number of families */
+Xint *av;		/* list of family id numbers */
+X{
+X	int i,t;
+X
+X	t = 0;
+X	for (i=0; i<ac; i++) {
+X		if (i>0) fprintf(outfp,sepstr);
+X		t += family1(av[i]);
+X	}
+X	return t;
+X}
+X
+X/*..........*/
+X
+Xint			/* 0 if OK */
+Xfamily1(famnum)
+Xint famnum;			/* the family to give info about */
+X{
+X	int rtype;
+X	char *famname, *husname, *wifename;
+X	char *huslname, *wifelname;
+X	int husnum, wifenum;
+X	char *headerline;
+X	int i, cnum, clist[1000];
+X	char *ss;
+X	int addrnum;
+X	char *addr;
+X	char *phone;
+X
+X	notecount=notenum=0;
+X	rtype = fgtype(famnum);
+X	if (rtype<=0) {
+X		warning("no such record number %d", famnum);
+X		return 1;
+X	}
+X	if (rtype!='F') {
+X		warning("record %d is not a family", famnum);
+X		return 1;
+X	}
+X	famname = fgstr(famnum,"N");		/* get the family name */
+X	husnum = fgnum(famnum,"H");	/* get husband and wife index nums */
+X	wifenum = fgnum(famnum,"W");
+X	husname = fgbname(husnum);
+X	wifename = fgbname(wifenum);
+X	huslname = fgstr(husnum,"LN");
+X	wifelname = fgstr(wifenum,"LNM");
+X
+X	if (wifelname==0 || wifelname[0]==0) wifelname = fgstr(wifenum,"LN");
+X
+X	if (huslname && huslname[0]==0) huslname=0;
+X	if (wifelname && wifelname[0]==0) wifelname=0;
+X	if (famname && famname[0]==0) famname=0;
+X	if (husname==0 || husname[0]==0) husname = "???";
+X	if (wifename==0 || wifename[0]==0) wifename = "???";
+X	if (famname && (huslname==0 || strcmp(famname,huslname)!=0))
+X		headerline =
+X			tprintf("%s - %s & %s", famname, husname, wifename);
+X	else
+X		headerline = tprintf("%s & %s", husname, wifename);
+X	strup(headerline);
+X	if (Gflag['N'] && Gflag['n']) {
+X		ss = tprintf("[%d]: %s",famnum,headerline);
+X		free(headerline);
+X		headerline = ss;
+X	}
+X	printindented(LEFTMARGIN,Label);
+X	printindented(LEFTMARGIN,headerline);
+X	fprintf(outfp,"\n");
+X	printpair(0,famnum,husnum, wifenum);	/* print data about parents */
+X
+X	addrnum = fgnum(famnum,"ADDR");
+X	if (Gflag['a'] && addrnum>0) {	/* print address if known */
+X		addr = fgstr(addrnum,"ADDR");
+X		printindented(ADDRCOL,addr);
+X		phone = fgstr(addrnum,"PHONE");
+X		printindented(ADDRCOL,phone);
+X		fprintf(outfp,"\n");
+X	}
+X
+X	cnum = fgbclist(famnum,clist);
+X	if (cnum==0) {
+X#if 0		/* be silent about no children... */
+X		printindented(LEFTMARGIN,"NO CHILDREN");
+X#endif
+X	}
+X	else {
+X		fprintf(outfp,"%*s%*s%*s%s\n\n",
+X			LEFTMARGIN, "", -LEFTCOL, "CHILDREN",
+X			CENTERMARGIN, "", "SPOUSES OF CHILDREN");
+X		for (i=0; i<cnum; i++) {
+X			int childnum, mgnum, spousenum, chusnum, cwifenum;
+X			int scount,slist[1000],mnum;
+X
+X			childnum = clist[i];
+X			scount = fgbslist(childnum,slist);
+X			for (mnum=0; mnum<scount; mnum++) {
+X				/* until we run out of marriages */
+X				mgnum = slist[mnum];
+X				chusnum = fgnum(mgnum, "H");
+X				cwifenum = fgnum(mgnum, "W");
+X				if (childnum==chusnum) spousenum=cwifenum;
+X				else if (childnum==cwifenum) spousenum=chusnum;
+X				else {
+Xwarning("person %d claims marriage %d, but not vice-versa!",
+X					    childnum, mgnum);
+X					spousenum= -1;
+X				}
+X				printpair(mnum,mgnum,childnum,spousenum);
+X			}
+X			if (scount==0) printpair(0,-1,childnum,-1);
+X				/* print the individual if no marriage */
+X		}
+X	}
+X	if (notecount>0) {		/* if we accumulated any notes */
+X		printindented(LEFTMARGIN, "-----------------------");
+X		for (i=0; i<notecount; i++)
+X			printindented(LEFTMARGIN, notes[i]);
+X	}
+X	return 0;
+X}
+X
+X/*..........*/
+X
+Xprintpair(n,mn,cn,sn)	/* print info about a couple */
+Xint n;			/* which marriage in the list this is; -1=only one */
+Xint mn;			/* marriage number */
+Xint cn;			/* primary person number */
+Xint sn;			/* spouse number */
+X{
+X	struct tblock cntb, sntb;	/* where to store data */
+X	int i, max;
+X
+X	fampdat(n,mn,cn,&cntb);		/* get the data */
+X	fampdat(-1,mn,sn,&sntb);
+X	/* decide if they should both be on the same lines or not */
+X	if (cntb.width>LEFTCOL || sntb.width>RIGHTCOL) { /* separate */
+X		printtb(&cntb,LEFTMARGIN);	/* output the first one */
+X		printtb(&sntb,LEFTMARGIN+SPOUSEOFFSET);	/* output spouse */
+X	}
+X	else {	/* both on the same line */
+X		if (cntb.lines > sntb.lines) max = cntb.lines;
+X		else max = sntb.lines;
+X		for (i=0; i<max; i++) {
+X			if (i>=cntb.lines)
+X				printindented(
+X					-(LEFTMARGIN+CENTERMARGIN+LEFTCOL),
+X					sntb.text[i]);
+X			else if (i>=sntb.lines)
+X				printindented(LEFTMARGIN, cntb.text[i]);
+X			else
+X/*** Problems here if field in database was > 1 line */
+X				fprintf(outfp,"%*s%*s%*s%s\n", LEFTMARGIN, "",
+X					-LEFTCOL, cntb.text[i], CENTERMARGIN,
+X					"", sntb.text[i]);
+X		}
+X		fprintf(outfp,"\n");
+X	}
+X}
+X
+X/*..........*/
+X
+Xprinttb(b,offset)		/* print a text block */
+Xstruct tblock *b;
+Xint offset;			/* left margin offset */
+X{
+X	int i;
+X
+X	for (i=0; i<b->lines; i++)
+X		printindented(offset, b->text[i]);
+X	if (b->lines!=0) fprintf(outfp,"\n");
+X}
+X
+X/*..........*/
+X
+Xfampdat(i,m,n,b)		/* get a tblock about a person */
+Xint i;			/* iteration number to determine how to format */
+Xint m;			/* marriage number */
+Xint n;			/* the person to get info about */
+Xstruct tblock *b;	/* where to put the data */
+X{
+X	char *name, *birth, *death, *buried, *marriage;
+X
+X	b->lines = b->width = 0;	/* clear it out first */
+X	if (n<=0) return;
+X	name = fgbname(n);
+X	birth = fgbirth(n);
+X	death = fgdeath(n);
+X	buried = fgburied(n);
+X	marriage = fgnmarriage(m);
+X	if (i<=0) {
+X		addtline(name,b);
+X		if (birth && *birth) addtline(birth,b);
+X		if (death && *death) addtline(death,b);
+X		if (buried && *buried) addtline(buried,b);
+X		if (i==0) {
+X			if (marriage && *marriage) addtline(marriage,b);
+X			addnots(n,m,b);		/* add general comment notes */
+X		}
+X		else	/* i== -1 */
+X			addnots(n,-1,b);	/* don't add marriage notes */
+X	}
+X	else {
+X		if (marriage && *marriage)
+X			marriage = tprintf("re-%s", marriage);
+X		else marriage = "remarried:";
+X		addtline(marriage,b);
+X		addnots(-1,m,b);
+X	}
+X}
+X
+X/*..........*/
+X
+Xaddnots(n,m,b)		/* add general comment notes to a block */
+Xint n;			/* index of person */
+Xint m;			/* index of marriage */
+Xstruct tblock *b;	/* text block to add to */
+X{
+X	addnote(n,b,"");
+X	addnote(m,b," (m)");
+X}
+X
+X/*..........*/
+X
+Xaddnote(n,b,ss)		/* add general comment notes to a block */
+Xint n;			/* index of person */
+Xstruct tblock *b;	/* text block to add to */
+Xchar *ss;		/* note indicator string */
+X{
+X	char *gencom;
+X	int lcount;
+X	int hlen;
+X	int t;
+X
+X	lcount = 0;
+X	hlen = strlen(ss)+sizeof("Note")+2;
+X	gencom = fggen(n);
+X	lcount += countlines(gencom);
+X	if (lcount==1 && ((t=strlen(gencom)+hlen)<=b->width||t<LEFTCOL)) {
+X		/* if we have one relatively short string, do it in-line */
+X		addtline(tprintf("[Note%s: %s]", ss, gencom),b);
+X	}
+X	else if (lcount>0) {
+X		addtline(tprintf("[Note %d%s]", 1+notenum, ss),b);
+X		notes[notecount++] = tprintf("Note %d%s:", 1+notenum++, ss);
+X		notes[notecount++] = gencom;	/* add string to notes */
+X		notes[notecount++] = "";
+X	}
+X}
+X
+X/*..........*/
+X
+Xaddtline(ss,b)			/* add a line to a tblock */
+Xchar *ss;			/* the string to add */
+Xstruct tblock *b;		/* the block to add to */
+X{
+X	int l;
+X
+X	if (b->lines >= TBLOCKSIZE) {
+X		warning("tblock overflow!");
+X		return;			/* ignore the addition */
+X	}
+X	b->text[b->lines++] = ss;	/* add in the string */
+X	l = strlen(ss);
+X	if (l> b->width) b->width=l;	/* keep track of width */
+X}
+X
+X/* end */
+END_OF_FILE
+if test 8659 -ne `wc -c <'family.c'`; then
+    echo shar: \"'family.c'\" unpacked with wrong size!
+fi
+# end of 'family.c'
+fi
+if test -f 'famntree.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'famntree.c'\"
+else
+echo shar: Extracting \"'famntree.c'\" \(10181 characters\)
+sed "s/^X//" >'famntree.c' <<'END_OF_FILE'
+X/* famntree.c - produce output suitable for treepar
+X *
+X * 13.Aug.87  jimmc  Initial definition
+X * 14.Aug.87  jimmc  Add globals, textsize
+X * 18.Aug.87  jimmc  Add spouse stuff
+X * 24.Aug.87  jimmc  Add label
+X * 31.Aug.87  jimmc  Add bd2
+X * 14.Sep.87  jimmc  Allow multiple line tnotes
+X * 16.Sep.87  jimmc  Fix bug in fam1fs when id==-1
+X * 18.Sep.87  jimmc  Add #include xalloc.h; use XCALLOC instead of XALLOC;
+X *			add 'addr' field.
+X * 21.Sep.87  jimmc  Use info arrays instead of separate structure members
+X *			add 'buried' field.
+X * 27.Oct.87  jimmc  Make countlines() and linewidth() global
+X *  1.Jan.88  jimmc  Use fglpname instead of fglname
+X *  8.Jan.88  jimmc  Direct output to outfp instead of stdout; lint cleanup
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <strings.h>
+X#include "geneal.h"
+X#include "famntree.h"
+X#include "xalloc.h"
+X
+X#define SX 6
+X#define SY 10
+X#define YOFF (SY/3)
+X#define ROWSPACE 20
+X#define TRACKSPACE 20
+X#define IROWSPACE 30
+X
+X#define NOTNULL(str) ((str)&&(str[0]))
+X
+Xextern char *strsave(), *strsave2();
+X
+Xextern char *Label;
+X
+Xstatic int ypos;
+X
+Xstatic
+Xchar *
+Xpad(padstr,str)
+Xchar *padstr;
+Xchar *str;
+X{
+X	char *new;
+X
+X	new = strsave2(padstr,str);
+X	free(str);
+X	return new;
+X}
+X
+Xstatic
+Xchar *
+Xcpad(padstr,str)
+Xchar *padstr;
+Xchar *str;
+X{
+X
+X	if (!str || !*str) return 0;
+X	return pad(padstr,str);
+X}
+X
+Xstatic
+Xprintsbody(f,s)
+XFILE *f;
+Xchar *s;
+X{
+X	if (!s) return;
+X	for (;*s;s++) {
+X		if (isprint(*s)) {
+X			if (*s=='"') fputc('\\',f);
+X			fputc(*s,f);
+X		}
+X		else if (*s=='\n') fputs("\\n\\\n",f);
+X		else fprintf(f,"\\%03o",*s);
+X	}
+X}
+X
+Xstatic
+Xprintmbody(f,s)	/* like printsbody, but indents all lines based on first */
+XFILE *f;
+Xchar *s;
+X{
+X	int i,n;
+X
+X	if (!s) return;
+X	for (n=0; s[n]==' ';n++) ;	/* EMPTY - count spaces */
+X	for (;*s;s++) {
+X		if (isprint(*s)) {
+X			if (*s=='"') fputc('\\',f);
+X			fputc(*s,f);
+X		}
+X		else if (*s=='\n') {
+X			fputs("\\n\\\n",f);
+X			if (s[1]) for(i=0; i<n; i++) fputc(' ',f);
+X			/* indent following lines by same amount */
+X		}
+X		else fprintf(f,"\\%03o",*s);
+X	}
+X}
+X
+Xstatic
+Xprintstring(f,s)
+XFILE *f;
+Xchar *s;
+X{
+X	fputc('"',f);
+X	printsbody(f,s);
+X	fputc('"',f);
+X}
+X
+Xstatic
+Xprintsline(f,s)
+XFILE *f;
+Xchar *s;
+X{
+X	if (NOTNULL(s)) {
+X		printmbody(f,s);
+X		printsbody(f,"\n");
+X	}
+X}
+X
+Xint 
+Xcountlines(s)
+Xchar *s;
+X{
+X	int n;
+X
+X	if (!s || !s[0]) return 0;
+X	n=1;
+X	while (s) {
+X		s = index(s,'\n');
+X		if (s) {
+X			n++;
+X			s++;
+X		}
+X	}
+X	return n;
+X}
+X
+Xint
+Xlinewidth(s)
+Xchar *s;
+X{
+X	int l,newl;
+X	char *p;
+X
+X	if (!s || !s[0]) return 0;
+X	l = 0;
+X	while (s) {
+X		p = index(s,'\n');
+X		if (p) {
+X			newl = p-s;
+X			s = p+1;
+X		}
+X		else {
+X			newl = strlen(s);
+X			s = p;
+X		}
+X		if (newl>l) l=newl;
+X	}
+X	return l;
+X}
+X
+Xstatic
+Xfamschema()
+X{
+X	fprintf(outfp,"globals schema (\"textsizex.i\" \"textsizey.i\" \
+X\"rowposspace.i\" \"rowdir.s\" \"trackspace.i\" \
+X\"interrowspace.i\" \"label.s\")\n");
+X	fprintf(outfp,"globals (%d %d %d \"V\" %d %d ",
+X	    SX, SY, ROWSPACE, TRACKSPACE, IROWSPACE);
+X	printstring(outfp,Label?Label:"");
+X	fprintf(outfp,")\n\n");
+X
+X	fprintf(outfp,"box schema (\"name.s\" \"sizex.i\" \"sizey.i\" \
+X\"orgx.i\" \"orgy.i\"\n\t\"text.s\" \"textx.i\" \"texty.i\" \"textpos.s\")\n");
+X	fprintf(outfp,"conn schema (\"boxname.s\" \"name.s\" \
+X\"x.i\" \"y.i\" \"side.s\" \"netname.s\")\n\n");
+X}
+X
+Xstatic
+Xfam1out(fi)
+XFamninfo *fi;
+X{
+X	int i,j,n;
+X	Fammember *fm;
+X	Fammemspouse *fs;
+X	int linecount,slinecount;
+X
+X	fprintf(outfp,"box (\"%s\" %d %d %d %d \"",
+X	    fi->boxname, SX*(fi->cols+2), SY*(fi->lines+2),
+X	    SX*0, SY*(ypos+=30,ypos-30));
+X	for (n=0; n<FISIZE; n++)
+X		printsline(outfp,fi->info[n]);
+X	for (i=0; i<fi->namelen; i++)
+X		fputc('=',outfp);
+X	fprintf(outfp,"\\n\\\n");
+X	for (i=0; i<fi->mcount; i++) {
+X		fm = fi->mlist+i;
+X		for (n=0; n<FMSIZE; n++)
+X			printsline(outfp,fm->info[n]);
+X		if (Gflag['m']) {
+X			for (j=0; j<fm->scount; j++) {
+X				fs = fm->slist+j;
+X				for (n=0; n<FSSIZE; n++)
+X					printsline(outfp,fs->info[n]);
+X			}
+X		}
+X	}
+X	fprintf(outfp,"\" %d %d \"NW\")\n", SX*1, SY*(fi->lines+1));
+X
+X	/* output connectors for the box */
+X	if (Gflag['m']) {
+X		/* output connectors for parents */
+X		if (fi->famid>0) {
+X			fprintf(outfp,
+X			    "conn (\"%s\" \"f%d\" %d  %d \"W\" \"f%d\")\n",
+X			    fi->boxname, fi->famid,
+X			    SX*0, SY*((fi->lines+2)/2), fi->famid);
+X		}
+X		/* output connectors for member marriages */
+X		linecount = fi->headerlines;
+X		for (i=0; i<fi->mcount; i++) {
+X			fm = fi->mlist+i;
+X			slinecount = linecount+fm->headerlines;
+X			if (fm->id>0) for (j=0; j<fm->scount; j++) {
+X				fs = fm->slist+j;
+X				if (fs->mid>0) {
+X					fprintf(outfp,
+X					    "conn (\"%s\" \"f%d\" %d %d \"E\" \"f%d\")\n",
+X					    fi->boxname, fs->mid,
+X					    SX*(fs->connx+1),
+X					    SY*(fi->lines-slinecount)+YOFF,
+X					    fs->mid);
+X				}
+X				slinecount += fs->lines;
+X			}
+X			linecount += fm->lines;
+X		}
+X	}
+X	else {
+X		/* output connectors for parents */
+X		if (fi->fatherid>0) {
+X			fprintf(outfp,
+X			    "conn (\"%s\" \"i%d\" %d  %d \"W\" \"i%d\")\n",
+X			    fi->boxname, fi->fatherid,
+X			    SX*0, SY*(fi->lines+1), fi->fatherid);
+X		}
+X		if (fi->motherid>0) {
+X			fprintf(outfp,
+X			    "conn (\"%s\" \"i%d\" %d  %d \"W\" \"i%d\")\n",
+X			    fi->boxname, fi->motherid,
+X			    SX*0, SY*1, fi->motherid);
+X		}
+X		/* output connectors for members */
+X		linecount = fi->headerlines;
+X		for (i=0; i<fi->mcount; i++) {
+X			fm = fi->mlist+i;
+X			if (fm->id>0) {
+X				fprintf(outfp,
+X				    "conn (\"%s\" \"i%d\" %d %d \"E\" \"i%d\")\n",
+X				    fi->boxname, fm->id,
+X				    SX*(fm->connx+1),
+X				    SY*(fi->lines-linecount)+YOFF,
+X				    fm->id);
+X			}
+X			linecount += fm->lines;
+X		}
+X	}
+X}
+X
+Xstatic
+Xfam1fs(fs,mid,fmid)
+XFammemspouse *fs;
+Xint mid;
+Xint fmid;
+X{
+X	int lines, cols;
+X	int tt;
+X	char *marr;
+X	int i;
+X
+X	fs->mid = mid,fmid;
+X	fs->id = fgspouse(fs->mid,fmid);
+X	marr = fgnmarriage(fs->mid);
+X	if (NOTNULL(marr)) fs->info[FS_MD] = pad(" ",marr);
+X	else fs->info[FS_MD] = strsave(" m: ");
+X	if (Gflag['t']) {
+X		fs->info[FS_MTNOTE] = cpad("  ",fgtnote(fs->mid));
+X	}
+X	if (fs->id>0) {
+X		fs->info[FS_NAME] = cpad("  ",fgbname(fs->id));
+X		if (Gflag['b']) {
+X			fs->info[FS_BD] = cpad("   ",fgbirth(fs->id));
+X			fs->info[FS_BD2] = cpad("   ",fgdeath(fs->id));
+X			fs->info[FS_BUR] = cpad("   ",fgburied(fs->id));
+X		} else {
+X			fs->info[FS_BD] = cpad("  ",fgbrtdeath(fs->id));
+X		}
+X		if (Gflag['t']) {
+X			fs->info[FS_TNOTE] = cpad("   ",fgtnote(fs->id));
+X		}
+X	}
+X
+X	lines = 0;
+X	cols = fs->connx = strlen(fs->info[FS_MD]);
+X	for (i=0; i<FSSIZE; i++) {
+X		lines += countlines(fs->info[i]);
+X		if ((tt=linewidth(fs->info[i])) > cols) cols=tt;
+X	}
+X	fs->lines = lines;
+X	fs->cols = cols;
+X}
+X
+Xstatic
+Xfam1fm(fm)
+XFammember *fm;
+X{
+X	int lines, cols;
+X	Fammemspouse *fs;
+X	int *mlist;
+X	int tt;
+X	int i, n;
+X
+X	fm->info[FM_NAME] = fgtname(fm->id);
+X	if (Gflag['b']) {	/* extended birth/death info */
+X		fm->info[FM_BD] = cpad(" ",fgbirth(fm->id));
+X		fm->info[FM_BD2] = cpad(" ",fgdeath(fm->id));
+X		fm->info[FM_BUR] = cpad(" ",fgburied(fm->id));
+X	}
+X	else {
+X		fm->info[FM_BD] = fgbrtdeath(fm->id);
+X	}
+X	if (Gflag['t']) {
+X		fm->info[FM_TNOTE] = cpad(" ",fgtnote(fm->id));
+X	}
+X
+X	lines = 0;
+X	cols = fm->connx = strlen(fm->info[FM_NAME]);
+X	for (i=0; i<FMSIZE; i++) {
+X		lines += countlines(fm->info[i]);
+X		if ((tt=linewidth(fm->info[i])) > cols) cols=tt;
+X	}
+X	fm->lines = fm->headerlines = lines;
+X	fm->cols = cols;
+X
+X	if (Gflag['m']) {	/* include spouse info if set */
+X		fm->scount = fglist(fm->id,"S",&mlist);
+X		fm->slist = XCALLOCM(Fammemspouse,fm->scount,"fam1fi spouse");
+X		for (n=0; n<fm->scount; n++) {
+X			fs = fm->slist+n;
+X			fam1fs(fs,mlist[n],fm->id);
+X			if (fs->cols > fm->cols) fm->cols=fs->cols;
+X			fm->lines += fs->lines;
+X		}
+X	}
+X}
+X
+Xstatic int
+Xfam1fi(fi)		/* stuff common to ind and fam */
+XFamninfo *fi;		/* the family box to fill out */
+X{
+X	int lines, cols;
+X	int tt;
+X	int i;
+X	Fammember *fm;
+X	int addrnum;
+X
+X	if (!fi->info[FI_NAME]) fi->info[FI_NAME] = strsave("****");
+X	if (Gflag['b'] && !Gflag['m'] && fi->famid>0) {
+X		fi->info[FI_MARR] = fgmarriage(fi->famid);
+X	}
+X	if (Gflag['t'] && fi->famid>0) {
+X		fi->info[FI_TNOTE] = fgtnote(fi->famid);
+X	}
+X	if (Gflag['a'] && fi->famid>0) {
+X		addrnum = fgnum(fi->famid,"ADDR");
+X		if (addrnum>0) fi->info[FI_ADDR] = fgaddrphn(addrnum);
+X	}
+X
+X	lines = 1;	/* account for the line of "====" */
+X	cols = 0;
+X	for (i=0; i<FISIZE; i++) {
+X		lines += countlines(fi->info[i]);
+X		if ((tt=linewidth(fi->info[i])) > cols) cols=tt;
+X	}
+X	fi->lines = fi->headerlines = lines;
+X	fi->cols = fi->namelen = cols;
+X
+X	for (i=0; i<fi->mcount; i++) {
+X		fm = fi->mlist+i;
+X		fam1fm(fm);		/* fill out info for each member */
+X		if (fm->cols > fi->cols) fi->cols=fm->cols;
+X		fi->lines += fm->lines;
+X	}
+X	fi->fatherid = fgnum(fi->famid,"H");
+X	fi->motherid = fgnum(fi->famid,"W");
+X	fam1out(fi);	/* write out what we have so far */
+X	return 0;
+X}
+X
+Xstatic int
+Xfam1ind(id)
+Xint id;			/* id of family or individual to output for */
+X{
+X	Famninfo *fi;
+X	Fammember *fm;
+X	char buf[500];
+X
+X	fi = XCALLOCM(Famninfo,1,"fam1ind fi");
+X	fi->famid = fgnum(id,"P");
+X	fi->info[FI_NAME] = fgstr(id,"LN");
+X	sprintf(buf,"I%d",id);
+X	fi->boxname = strsave(buf);
+X	fi->mcount = 1;
+X	fi->mlist = XCALLOCM(Fammember,1,"fam1ind members");
+X	fm = fi->mlist+0;	/* point to first entry */
+X	fm->id = id;
+X	return fam1fi(fi);
+X}
+X
+Xstatic int
+Xfam1fam(id)
+Xint id;			/* id of family or individual to output for */
+X{
+X	Famninfo *fi;
+X	Fammember *fm;
+X	int i;
+X	int *clist;
+X	char buf[500];
+X
+X	fi = XCALLOCM(Famninfo,1,"fam1fam fi");
+X	fi->famid = id;
+X/*** used to use fglname instead of fglpname - should we have a switch? */
+X	fi->info[FI_NAME] = fglpname(id);
+X	sprintf(buf,"F%d",id);
+X	fi->boxname = strsave(buf);
+X	fi->mcount = fglist(id,"C",&clist);
+X	fi->mlist = XCALLOCM(Fammember,fi->mcount,"fam1fam members");
+X	for (i=0; i<fi->mcount; i++) {
+X		fm = fi->mlist+i;
+X		fm->id = clist[i];
+X	}
+X	if (clist) free((char *)clist);
+X	return fam1fi(fi);
+X}
+X
+Xstatic int			/* returns 0 if OK */
+Xfam1tree(id)
+Xint id;			/* id of family or individual to output for */
+X{
+X	switch (fgtype(id)) {
+X	case 'I':
+X		return fam1ind(id);
+X	case 'F':
+X		return fam1fam(id);
+X	default:
+X		return 0;
+X	}
+X}
+X
+Xint			/* returns 0 if OK */
+Xfamntree(idcount,idlist)
+Xint idcount;		/* number of entries in idlist */
+Xint *idlist;		/* array of id numbers in the group to be output */
+X{
+X	int i;
+X	int t=0;
+X
+X	ypos=0;
+X	famschema();		/* write out the schema */
+X	for (i=0; i<idcount; i++) {
+X		t += fam1tree(idlist[i]);
+X	}
+X	return t;
+X}
+X
+X/* end */
+END_OF_FILE
+if test 10181 -ne `wc -c <'famntree.c'`; then
+    echo shar: \"'famntree.c'\" unpacked with wrong size!
+fi
+# end of 'famntree.c'
+fi
+if test -f 'fgdat.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'fgdat.c'\"
+else
+echo shar: Extracting \"'fgdat.c'\" \(11824 characters\)
+sed "s/^X//" >'fgdat.c' <<'END_OF_FILE'
+X/* fgdat.c - routines to get pieces of info records
+X * Written by Jim McBeath (jimmc) at SCI
+X *
+X * Revision history:
+X * 27-Jan-85	Jim McBeath	convert fgclist to fg*list functions
+X *				add addn[cp]list functions
+X * 29-Jan-85	Jim McBeath	add family index in names if index>1
+X *				convert to 7-char-distinct names
+X *  2-Feb-85	Jim McBeath	Convert to LN.A instead of LNM.
+X * 13-Feb-85	(Ian Darwin)	use NULL and \0 instead of 0 for cstr
+X * 17.Aug.87  jimmc  Add fglname
+X * 18.Aug.87  jimmc  Add fgtype, fgspouse
+X * 24.Aug.87  jimmc  Add fgburied
+X * 25.Aug.87  jimmc  Add fgnmarriage
+X * 18.Sep.87  jimmc  Add #include xalloc.h; add fgaddrphn
+X * 26.Oct.87  jimmc  Remove basic routines into fgdatsubs.c
+X * 27.Oct.87  jimmc  Add fggen
+X *  1.Jan.88  jimmc  Make fgtnote and fggen also pick up TGEN; add fglpname
+X *  4.Jan.88  jimmc  Add fglhname
+X *  8.Jan.88  jimmc  Lint cleanup
+X */
+X
+X/* These routines all package up various pieces of information
+X * from specified records.  They each take as arguments a record
+X * ID number; some take a field name as well.  Most return a pointer
+X * to a string allocated from dynamic memory, which can be freed
+X * by passing the pointer to the freestr() function.
+X * The functions in this file in general refer to and format specific
+X * fields; the functions in fgdatsubs are more general, without references
+X * to specific fields.
+X * In the arguments, i is an ID for an individual's record; f is an ID for
+X *  a family record, and n is an ID for either (or sometimes any record kind).
+X *  Functions which return an allocated string are:
+X * fgsname(i)   just the nickname; else first name; else middle name; else "?"
+X * fgtname(i)	all of name but last name
+X * fglname(f)   last name of a family only
+X * fglpname(f)  last name of a family plus names of parents
+X * fgbname(i)	full born (maiden) name
+X * fgfname(i)	full name (including maiden and married last names)
+X * fgbirth(i)	birth date and place
+X * fgdeath(i)	death date and place
+X * fgburied(i)	burial location
+X * fgbrtdeath(i)	birth and death dates
+X * fgmarriage(f)	marriage date and place
+X * fgnmarriage(f)	marriage date and place, and number if +n switch
+X * fgtnote(n)		TNOTE plus TGEN
+X * fggen(n)		GEN plus TGEN
+X *  Functions which return an integer are:
+X * fgspouse(f_m,i_n)	returns the spouse for marriage f_m who is not i_n
+X * fgbclist(f,av)	get child list; return valus is ac, fills array av
+X * fgclist(f,avp)	get child list; return value is ac, fills pointer avp
+X * fgbslist(i,av)	get spouse list; return valus is ac, fills array av
+X * fgslist(i,avp)	get spouse list; return value is ac, fills pointer avp
+X *  Other functions:
+X * fgtype(n)		returns single character which is type code (e.g. 'I')
+X */
+X
+X#include <stdio.h>
+X#include <strings.h>
+X#include "geneal.h"
+X#include "xalloc.h"
+X
+Xextern char *strcrep();
+X
+X/* for forward references */
+Xchar *fgdateplace();
+X
+X/*..........*/
+X
+Xint
+Xfgtype(n)		/* get a type character from the file */
+Xint n;
+X{
+X	return fgchar(n,"T");
+X}
+X
+X/*..........*/
+X
+Xint
+Xfgspouse(m,n)
+Xint m;			/* id of the marriage */
+Xint n;			/* id of the spouse we DONT want */
+X{
+X	int t;
+X
+X	t = fgnum(m,"H");
+X	if (t>0 && t!=n) return t;
+X	t = fgnum(m,"W");
+X	if (t>0 && t!=n) return t;
+X	return -1;
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgsname(n)		/* short name (first name or whatever) */
+Xint n;
+X{
+X	char xname[200];
+X	int l;
+X
+X	xname[0] = 0;
+X	addindex(xname,n);
+X	addncstr(xname,n,"PN");
+X	l = strlen(xname);
+X	addncstr(xname,n,"NN");	/* use nickname if there */
+X	if (!xname[l]) addncstr(xname,n,"FN");
+X	if (!xname[l]) addncstr(xname,n,"MN");
+X	if (!xname[l]) addcstr(xname,"??");
+X	addncstr(xname,n,"SN");
+X	return strsav(xname);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgtname(n)		/* get the full name (except last name) */
+Xint n;			/* person to get data item for */
+X{
+X	char xname[200];
+X
+X	xname[0] = 0;		/* start with null */
+X	addindex(xname,n);	/* put in id number if requested */
+X	addncstr(xname,n,"PN");	/* prefix name */
+X	addncstr(xname,n,"FN");	/* add first name */
+X	addncstr(xname,n,"MN");	/* add middle name */
+X	addnpstr(xname,n,"NN");	/* add nickname in parens */
+X	addncstr(xname,n,"SN");	/* suffix name */
+X	return strsav(xname);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfglname(f)
+Xint f;			/* family id number */
+X{
+X	char xname[200];
+X
+X	xname[0] = 0;		/* start with null */
+X	addindex(xname,f);	/* put in id number if requested */
+X	addncstr(xname,f,"N");	/* the name */
+X	return strsav(xname);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfglpname(f)
+Xint f;			/* family id number */
+X{
+X	char xname[200];
+X	int h,w;
+X	char *fn, *hln, *wln, *hfn, *wfn, *fpn;
+X
+X	xname[0] = 0;
+X	addindex(xname,f);
+X	fn = fgstr(f,"N");	/* get family last name */
+X	h = fgnum(f,"H");	/* husband and wife ID numbers */
+X	w = fgnum(f,"W");
+X	if (h<=0 && w<=0) {
+X		addcstr(xname,fn);
+X		freestr(fn);
+X		return strsav(xname);
+X	}
+X	hln = fgstr(h,"LN");
+X	wln = fgstr(w,"LN.A");	/*** sex-biased assumptions about names... */
+X	hfn = fgsname(h);
+X	wfn = fgsname(w);
+X	if (strcmp(fn,hln)==0 && strcmp(fn,wln)==0) {
+X		fpn = tprintf("%s and %s %s", hfn, wfn, fn);
+X	}
+X	else if (strcmp(fn,hln)==0) {
+X		if (wln && wln[0])
+X			fpn = tprintf("%s %s and %s %s", hfn, hln, wfn, wln);
+X		else
+X			fpn = tprintf("%s %s and %s", hfn, hln, wfn);
+X	}
+X	else {
+X		fpn = tprintf("%s: %s %s and %s %s", fn, hfn, hln, wfn, wln);
+X	}
+X	addcstr(xname,fpn);
+X	freestr(hln);
+X	freestr(wln);
+X	freestr(hfn);
+X	freestr(wfn);
+X	freestr(fn);
+X	freestr(fpn);
+X	return strsav(xname);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfglhname(f)
+Xint f;			/* family id number */
+X{
+X	char xname[200];
+X	int h,w;
+X	char *hpn, *wpn, *fn;
+X
+X	xname[0] = 0;
+X	addindex(xname,f);
+X	h = fgnum(f,"H");	/* husband and wife ID numbers */
+X	w = fgnum(f,"W");
+X	hpn = fgstr(h,"PN");
+X	if (!hpn || !hpn[0]) hpn="Mr.";
+X	wpn = fgstr(w,"PN");
+X	if (!wpn || !wpn[0]) wpn="Mrs.";
+X	addcstr(xname,hpn);
+X	addcstr(xname,"and");
+X	addcstr(xname,wpn);
+X	freestr(hpn);
+X	freestr(wpn);
+X	if (h>0) {
+X		addncstr(xname,h,"FN");
+X		addncstr(xname,h,"MN");
+X		addnpstr(xname,h,"NN");
+X		addncstr(xname,h,"LN");
+X		addncstr(xname,h,"SN");
+X	}
+X	else {
+X		fn = fgstr(f,"N");	/* get family last name */
+X		addcstr(xname,fn);
+X		freestr(fn);
+X	}
+X	return strsav(xname);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgbname(n)		/* get the full born name */
+Xint n;			/* person to get data item for */
+X{
+X	char xname[200];
+X
+X	xname[0] = 0;		/* start with null */
+X	addindex(xname,n);		/* put in id number if requested */
+X	addncstr(xname,n,"PN");
+X	addncstr(xname,n,"FN");
+X	addncstr(xname,n,"MN");
+X	addnpstr(xname,n,"NN");
+X	addncstr(xname,n,"LN");
+X	addncstr(xname,n,"SN");
+X	return strsav(xname);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgfname(n)		/* get the full name */
+Xint n;			/* person to get data item for */
+X{
+X	char xname[200];
+X	char lnaname[200];
+X
+X	fgbstr(n,"LN.A",lnaname);
+X	strcrep(lnaname, ';', ' ');	/* convert semicolons to space */
+X	xname[0] = 0;		/* start with null */
+X	addindex(xname,n);		/* put in id number if requested */
+X	addncstr(xname,n,"PN");
+X	addncstr(xname,n,"FN");
+X	addncstr(xname,n,"MN");
+X	addnpstr(xname,n,"NN");
+X	addncstr(xname,n,"LN");
+X	addcstr(xname,lnaname);
+X	addncstr(xname,n,"SN");
+X	return strsav(xname);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgbirth(n)		/* get birth date info */
+Xint n;			/* person to get data item for */
+X{
+X	return fgdateplace(n,"B","BP","b");
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgdeath(n)		/* get death date info */
+Xint n;			/* person to get data item for */
+X{
+X	return fgdateplace(n,"D","DP","d");
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgburied(n)		/* get burail place */
+Xint n;			/* person to get data item for */
+X{
+X	char b[1000];
+X
+X	fgbstr(n,"BUR",b);
+X	if (*b) return tprintf("bur: %s",b);
+X	else return strsav("");
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgbrtdeath(n)		/* get birth/death date info */
+Xint n;			/* person to get data item for */
+X{
+X	char bdate[100], ddate[100], dates[200];
+X
+X	fgbstr(n,"B",bdate);	/* get birth date */
+X	fgbstr(n,"D",ddate);	/* get death date */
+X	if (*bdate==0 && *ddate==0) return "";
+X	if (*ddate==0) sprintf(dates," ( b: %s )", bdate);
+X	else if (*bdate==0) sprintf(dates," ( d: %s )", ddate);
+X	else sprintf(dates," ( b: %s, d: %s )", bdate, ddate);
+X	return strsav(dates);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgmarriage(n)		/* get marriage date info */
+Xint n;			/* person to get data item for */
+X{
+X	return fgdateplace(n,"M","MP","m");
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgnmarriage(n)		/* get marriage date info and optionally number */
+Xint n;			/* person to get data item for */
+X{
+X	char *s, *t;
+X
+X	s = fgdateplace(n,"M","MP","m");
+X	if (!Gflag['n']) return s;
+X	t = tprintf("%s [%d]",s,n);
+X	freestr(s);
+X	return t;
+X}
+X
+X/*..........*/
+X
+Xchar *fgt2gen(n,item)
+Xint n;
+Xchar *item;
+X{
+Xchar *tgen;
+Xchar *istr;
+Xchar *rstr;
+X
+X	tgen = fgstr(n,"TGEN");
+X	istr = fgstr(n,item);
+X	if (tgen && tgen[0] && istr && istr[0]) {
+X		rstr = tprintf("%s\n%s",tgen,istr);
+X		freestr(tgen);
+X		freestr(istr);
+X		return rstr;
+X	}
+X	if (tgen && tgen[0]) return tgen;
+X	return istr;
+X}
+X
+Xchar * fgtnote(n) int n; { return fgt2gen(n,"TNOTE"); }
+Xchar * fggen(n) int n; { return fgt2gen(n,"GEN"); }
+X
+X/*..........*/
+X
+Xchar *
+Xfgaddrphn(n)
+Xint n;
+X{
+X	char addr[1000];
+X	char phone[1000];
+X	char *t;
+X
+X	fgbstr(n,"ADDR",addr);
+X	fgbstr(n,"PHONE",phone);
+X	if (*addr && *phone)
+X		t = tprintf("%s\n%s",addr,phone);
+X	else if (*addr)
+X		t = strsav(addr);
+X	else if (*phone)
+X		t = strsav(phone);
+X	else
+X		t = strsav("");
+X	return t;
+X}
+X
+X/*..........*/
+X
+Xint
+Xfgclist(n,avp)		/* get child list into allocated array */
+Xint n;			/* family to get list for */
+Xint **avp;		/* where we should put the pointer to the array */
+X{
+X	return fglist(n,"C",avp);
+X}
+X
+X/*..........*/
+X
+Xint
+Xfgbclist(n,av)		/* get child list into specified array */
+Xint n;			/* family to get list for */
+Xint *av;		/* where we should put the data */
+X{
+X	return fgblist(n,"C",av);
+X}
+X
+X/*..........*/
+X
+Xint
+Xfgslist(n,avp)		/* get spouse list into allocated array */
+Xint n;			/* person to get list for */
+Xint **avp;		/* where we should put the pointer to the array */
+X{
+X	return fglist(n,"S",avp);
+X}
+X
+X/*..........*/
+X
+Xint
+Xfgbslist(n,av)		/* get spouse list into specified array */
+Xint n;			/* person to get list for */
+Xint *av;		/* where we should put the data */
+X{
+X	return fgblist(n,"S",av);
+X}
+X
+X/*..........*/
+X
+Xchar *
+Xfgdateplace(n,dk,pk,cc)	/* get date/place info */
+Xint n;			/* person to get data item for */
+Xchar *dk;		/* date keyword */
+Xchar *pk;		/* place keyword */
+Xchar *cc;		/* string to use as output key */
+X{
+X	char date[100], place[100];
+X
+X	fgbstr(n,dk,date);	/* get date */
+X	fgbstr(n,pk,place);	/* get place */
+X	if (*date==0 && *place==0) return "";
+X	if (*date && *place) return tprintf("%s: %s, %s", cc, date, place);
+X	if (*date) return tprintf("%s: %s", cc, date);
+X	return tprintf("%s: %s", cc, place);
+X}
+X
+X/*..........*/
+X
+Xaddncstr(dd,n,ff)	/* add a field value onto a string */
+Xchar *dd;		/* the string being built */
+Xint n;			/* record number */
+Xchar *ff;		/* name of field to get from that record */
+X{
+X	char buf[1000];
+X
+X	fgbstr(n,ff,buf);
+X	addcstr(dd,buf);
+X}
+X
+X/*..........*/
+X
+Xaddnpstr(dd,n,ff)	/* add a field value onto a string in parens */
+Xchar *dd;		/* the string being built */
+Xint n;			/* record number */
+Xchar *ff;		/* name of field to get from that record */
+X{
+X	char buf[1000];
+X
+X	fgbstr(n,ff,buf);
+X	addpstr(dd,buf);
+X}
+X
+X/*..........*/
+X
+Xaddcstr(dd,ss)		/* add a string to another */
+Xchar *dd;		/* the string being built */
+Xchar *ss;		/* the string to add if not null */
+X{
+X	if (ss && *ss) {
+X		if (dd[0]) strcat(dd," ");
+X		strcat(dd,ss);
+X	}
+X}
+X
+X/*..........*/
+X
+Xaddpstr(dd,ss)		/* add a string in parens */
+Xchar *dd;		/* the string to add to */
+Xchar *ss;		/* the string to add in parens if not null */
+X{
+X	if (ss[0]) {
+X		if (dd[0]) strcat(dd," ");
+X		strcat(dd,"(");
+X		strcat(dd,ss);		/* add the string in parens */
+X		strcat(dd,")");
+X	}
+X}
+X
+X/*..........*/
+X
+Xaddindex(ss,n)
+Xchar *ss;			/* the string to add to */
+Xint n;				/* id number of person */
+X{
+X	if (Gflag['N'])
+X		sprintf(ss,"[%d/%d]", n, fgnum(n,"P"));
+X		/* put in both individual and family if requested */
+X	else if (Gflag['n'])
+X		sprintf(ss, "[%d]", n);  /* put in the id number */
+X	/* if neither flag set, put in nothing */
+X}
+X
+X/* end */
+END_OF_FILE
+if test 11824 -ne `wc -c <'fgdat.c'`; then
+    echo shar: \"'fgdat.c'\" unpacked with wrong size!
+fi
+# end of 'fgdat.c'
+fi
+echo shar: End of archive 3 \(of 4\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 4 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

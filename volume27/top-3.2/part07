@@ -1,0 +1,1529 @@
+Newsgroups: comp.sources.unix
+From: phil@eecs.nwu.edu (William LeFebvre)
+Subject: v27i007: top - a top process display, version 3.2, Part07/13
+References: <1.744843136.4744@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: phil@eecs.nwu.edu (William LeFebvre)
+Posting-Number: Volume 27, Issue 7
+Archive-Name: top-3.2/part07
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 13)."
+# Contents:  machine/m_dynix32.c machine/m_osmp41a.c
+# Wrapped by phil@pex on Wed Aug  4 14:22:43 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'machine/m_dynix32.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machine/m_dynix32.c'\"
+else
+echo shar: Extracting \"'machine/m_dynix32.c'\" \(17566 characters\)
+sed "s/^X//" >'machine/m_dynix32.c' <<'END_OF_FILE'
+X/*
+X * top - a top users display for Unix
+X *
+X * SYNOPSIS:  any Sequent Running Dynix 3.2.x
+X *
+X * DESCRIPTION:
+X * This is the machine-dependent module for Sequent Dynix 3.2.0
+X * This makes top work on the following systems:
+X *	Dynix 3.2.0 and perhaps later versions
+X *
+X * CFLAGS: -DBSD
+X *
+X * AUTHOR:  Daniel Trinkle <trinkle@cs.purdue.edu>
+X */
+X
+X#include <sys/types.h>
+X#include <sys/signal.h>
+X#include <sys/param.h>
+X
+X#include <stdio.h>
+X#include <nlist.h>
+X#include <math.h>
+X#include <sys/dir.h>
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X#include <sys/dk.h>
+X#include <sys/vm.h>
+X#include <machine/pte.h>
+X#include <machine/plocal.h>
+X#include <machine/engine.h>
+X#include <sys/file.h>
+X
+X#include "top.h"
+X#include "machine.h"
+X
+X#ifndef uid_t
+X/* some early versions of DYNIX don't have uid_t */
+X#define uid_t int
+X#endif
+X
+X#ifndef pid_t
+X/* ditto pid_t */
+X#define pid_t short
+X#endif
+X
+Xstruct engine *engine;
+Xstruct engine *pengine;
+Xstruct plocal **pplocal;
+Xint Nengine;
+X
+X/* get_process_info passes back a handle.  This is what it looks like: */
+X
+Xstruct handle
+X{
+X    struct proc **next_proc;	/* points to next valid proc pointer */
+X    int remaining;		/* number of pointers remaining */
+X};
+X
+X/* declarations for load_avg */
+Xtypedef long load_avg;
+Xtypedef long pctcpu;
+X#define loaddouble(la) ((double)(la) / FSCALE)
+X#define intload(i) ((int)((i) * FSCALE))
+X#define pctdouble(p) ((double)(p) / FSCALE)
+X
+X/* define what weighted cpu is.  */
+X#define weighted_cpu(pct, pp) ((pp)->p_time == 0 ? 0.0 : \
+X			 ((pct) / (1.0 - exp((pp)->p_time * logcpu))))
+X
+X/* what we consider to be process size: */
+X#define PROCSIZE(pp) ((pp)->p_dsize + (pp)->p_ssize)
+X
+X/* definitions for indices in the nlist array */
+X#define X_AVENRUN	0
+X#define X_CCPU		1
+X#define X_MPID		2
+X#define X_NPROC		3
+X#define X_PROC		4
+X#define X_TOTAL		5
+X#define X_ENGINE	6
+X#define X_NENGINE	7
+X
+Xstatic struct nlist nlst[] = {
+X    { "_avenrun" },		/* 0 */
+X    { "_ccpu" },		/* 1 */
+X    { "_mpid" },		/* 2 */
+X    { "_nproc" },		/* 3 */
+X    { "_proc" },		/* 4 */
+X    { "_total" },		/* 5 */
+X    { "_engine" },		/* 6 */
+X    { "_Nengine" },		/* 7 */
+X    { 0 }
+X};
+X
+X/*
+X *  These definitions control the format of the per-process area
+X */
+X
+Xstatic char header[] =
+X  "  PID X        PRI NICE   SIZE   RES STATE   TIME   WCPU    CPU COMMAND";
+X/* 0123456   -- field to fill in starts at header+6 */
+X#define UNAME_START 6
+X
+X#define Proc_format \
+X	"%5d %-8.8s %3d %4d%6dK %4dK %-5s%4d:%02d %5.2f%% %5.2f%% %.14s"
+X
+X
+X/* process state names for the "STATE" column of the display */
+X/* the extra nulls in the string "run" are for adding a slash and
+X   the processor number when needed */
+X
+Xchar *state_abbrev[] =
+X{
+X    "", "sleep", "WAIT", "run", "start", "zomb", "stop", "RUN"
+X};
+X
+X/* values that we stash away in _init and use in later routines */
+X
+Xstatic double logcpu;
+X
+X#define VMUNIX "/dynix"
+X#define KMEM "/dev/kmem"
+X#define MEM "/dev/mem"
+X
+Xstatic int kmem = -1;
+Xstatic int mem = -1;
+X
+Xstruct vmtotal total;
+X
+X/* these are retrieved from the kernel in _init */
+X
+Xstatic unsigned long proc;
+Xstatic          int  nproc;
+Xstatic load_avg  ccpu;
+X
+X/* these are offsets obtained via nlist and used in the get_ functions */
+X
+Xstatic unsigned long mpid_offset;
+Xstatic unsigned long avenrun_offset;
+Xstatic unsigned long total_offset;
+X
+X/* these are for calculating cpu state percentages */
+X
+Xstatic long cp_time[CPUSTATES];
+Xstatic long cp_old[CPUSTATES];
+Xstatic long cp_diff[CPUSTATES];
+X
+X/* these are for detailing the process states */
+X
+Xint process_states[8];
+Xchar *procstatenames[] = {
+X    "", " sleeping, ", " ABANDONED, ", " runable, ", " starting, ",
+X    " zombie, ", " stopped, ", " running, ",
+X    NULL
+X};
+X
+X/* these are for detailing the cpu states */
+X
+Xint cpu_states[CPUSTATES];
+Xchar *cpustatenames[] = {
+X    "user", "nice", "system", "idle",
+X    NULL
+X};
+X
+X/* these are for detailing the memory statistics */
+X
+Xint memory_stats[5];
+Xchar *memorynames[] = {
+X    "K (", "K) real, ", "K (", "K) virtual, ", "K free", NULL
+X};
+X
+X/* these are for keeping track of the proc array */
+X
+Xstatic int bytes;
+Xstatic int pref_len;
+Xstatic struct proc *pbase;
+Xstatic struct proc **pref;
+X
+X#define pagetok(size)	((size) << (PGSHIFT - LOG1024))
+X
+X/* useful externals */
+Xextern int errno;
+Xextern char *sys_errlist[];
+X
+Xlong lseek();
+Xlong percentages();
+X
+Xmachine_init(statics)
+X
+Xstruct statics *statics;
+X
+X{
+X    register int i;
+X
+X    /* open kernel memory */
+X    if ((kmem = open(KMEM, 0)) < 0)
+X    {
+X	perror(KMEM);
+X	exit(20);
+X    }
+X    if ((mem = open(MEM, 0)) < 0)
+X    {
+X	perror(MEM);
+X	exit(21);
+X    }
+X
+X    /* get the list of symbols we want to access in the kernel */
+X    if ((i = nlist(VMUNIX, nlst)) < 0)
+X    {
+X	fprintf(stderr, "top: nlist failed\n");
+X	return(-1);
+X    }
+X
+X    /* make sure they were all found */
+X    if (i > 0 && check_nlist(nlst) > 0)
+X    {
+X	return(-1);
+X    }
+X
+X    /* get the symbol values out of kmem */
+X    (void) getkval(nlst[X_PROC].n_value,   (int *)(&proc),	sizeof(proc),
+X	    nlst[X_PROC].n_name);
+X    (void) getkval(nlst[X_NPROC].n_value,  &nproc,		sizeof(nproc),
+X	    nlst[X_NPROC].n_name);
+X    (void) getkval(nlst[X_CCPU].n_value,   (int *)(&ccpu),	sizeof(ccpu),
+X	    nlst[X_CCPU].n_name);
+X    (void) getkval(nlst[X_NENGINE].n_value,  &Nengine,  sizeof(int),
+X	    nlst[X_NENGINE].n_name);
+X    (void) getkval(nlst[X_ENGINE].n_value,  &pengine,  sizeof(struct engine *),
+X	    nlst[X_ENGINE].n_name);
+X
+X    engine = (struct engine *)calloc(Nengine, sizeof(struct engine));
+X    if (engine == NULL)
+X    {
+X	fprintf(stderr, "Cannot allocate memory for engine structure\n");
+X	exit(2);
+X    }
+X    (void) getkval(pengine,  &engine[0],  Nengine * sizeof(struct engine),
+X	    "engine array");
+X    pplocal = (struct plocal **)calloc(Nengine, sizeof(struct plocal *));
+X    if (pplocal == NULL)
+X    {
+X	fprintf(stderr, "Cannot allocate memory for plocal structures\n");
+X	exit(2);
+X    }
+X    for (i = 0; i < Nengine; i++) {
+X	pplocal[i] = (struct plocal *)&engine[i].e_local->pp_local[0][0];
+X    }
+X
+X    /* stash away certain offsets for later use */
+X    mpid_offset = nlst[X_MPID].n_value;
+X    avenrun_offset = nlst[X_AVENRUN].n_value;
+X    total_offset = nlst[X_TOTAL].n_value;
+X
+X    /* this is used in calculating WCPU -- calculate it ahead of time */
+X    logcpu = log(loaddouble(ccpu));
+X
+X    /* allocate space for proc structure array and array of pointers */
+X    bytes = nproc * sizeof(struct proc);
+X    pbase = (struct proc *)malloc(bytes);
+X    pref  = (struct proc **)malloc(nproc * sizeof(struct proc *));
+X
+X    /* Just in case ... */
+X    if (pbase == (struct proc *)NULL || pref == (struct proc **)NULL)
+X    {
+X	fprintf(stderr, "top: can't allocate sufficient memory\n");
+X	return(-1);
+X    }
+X
+X    /* fill in the statics information */
+X    statics->procstate_names = procstatenames;
+X    statics->cpustate_names = cpustatenames;
+X    statics->memory_names = memorynames;
+X
+X    /* all done! */
+X    return(0);
+X}
+X
+Xchar *format_header(uname_field)
+X
+Xregister char *uname_field;
+X
+X{
+X    register char *ptr;
+X
+X    ptr = header + UNAME_START;
+X    while (*uname_field != '\0')
+X    {
+X	*ptr++ = *uname_field++;
+X    }
+X
+X    return(header);
+X}
+X
+Xget_system_info(si)
+X
+Xstruct system_info *si;
+X
+X{
+X    load_avg avenrun[3];
+X    struct plocal plocal;
+X    register int i, j;
+X
+X    /* get the cp_time array */
+X    for (j = 0; j < CPUSTATES; j++)
+X	cp_time[j] = 0L;
+X    for (i = 0; i < Nengine; i++) {
+X	(void) getkval(pplocal[i], &plocal, sizeof(struct plocal), "plocal array");
+X	for (j = 0; j < CPUSTATES; j++)
+X	    cp_time[j] += (long)plocal.cnt.v_time[j];
+X    }
+X
+X    /* get load average array */
+X    (void) getkval(avenrun_offset, (int *)avenrun, sizeof(avenrun),
+X		   "_avenrun");
+X
+X    /* get mpid -- process id of last process */
+X    (void) getkval(mpid_offset, &(si->last_pid), sizeof(si->last_pid),
+X		   "_mpid");
+X
+X    /* convert load averages to doubles */
+X    {
+X	register int i;
+X	register double *infoloadp;
+X	register load_avg *sysloadp;
+X
+X	infoloadp = si->load_avg;
+X	sysloadp = avenrun;
+X	for (i = 0; i < 3; i++)
+X	{
+X	    *infoloadp++ = loaddouble(*sysloadp++);
+X	}
+X    }
+X
+X    /* convert cp_time counts to percentages */
+X    (void) percentages(CPUSTATES, cpu_states, cp_time, cp_old, cp_diff);
+X
+X    /* get total -- systemwide main memory usage structure */
+X    (void) getkval(total_offset, (int *)(&total), sizeof(total),
+X		   "_total");
+X    /* convert memory stats to Kbytes */
+X    memory_stats[0] = pagetok(total.t_rm);
+X    memory_stats[1] = pagetok(total.t_arm);
+X    memory_stats[2] = pagetok(total.t_vm);
+X    memory_stats[3] = pagetok(total.t_avm);
+X    memory_stats[4] = pagetok(total.t_free);
+X
+X    /* set arrays and strings */
+X    si->cpustates = cpu_states;
+X    si->memory = memory_stats;
+X}
+X
+Xstatic struct handle handle;
+X
+Xcaddr_t get_process_info(si, sel, compare)
+X
+Xstruct system_info *si;
+Xstruct process_select *sel;
+Xint (*compare)();
+X
+X{
+X    register int i;
+X    register int total_procs;
+X    register int active_procs;
+X    register struct proc **prefp;
+X    register struct proc *pp;
+X
+X    /* these are copied out of sel for speed */
+X    int show_idle;
+X    int show_system;
+X    int show_uid;
+X
+X    /* read all the proc structures in one fell swoop */
+X    (void) getkval(proc, (int *)pbase, bytes, "proc array");
+X
+X    /* get a pointer to the states summary array */
+X    si->procstates = process_states;
+X
+X    /* set up flags which define what we are going to select */
+X    show_idle = sel->idle;
+X    show_system = sel->system;
+X    show_uid = sel->uid != -1;
+X
+X    /* count up process states and get pointers to interesting procs */
+X    total_procs = 0;
+X    active_procs = 0;
+X    bzero((char *)process_states, sizeof(process_states));
+X    prefp = pref;
+X    for (pp = pbase, i = 0; i < nproc; pp++, i++)
+X    {
+X	/*
+X	 *  Place pointers to each valid proc structure in pref[].
+X	 *  Process slots that are actually in use have a non-zero
+X	 *  status field.  Processes with SSYS set are system
+X	 *  processes---these get ignored unless show_sysprocs is set.
+X	 */
+X	if (pp->p_stat != 0 &&
+X	    (show_system || ((pp->p_flag & SSYS) == 0)))
+X	{
+X	    total_procs++;
+X	    process_states[pp->p_stat]++;
+X	    if ((pp->p_stat != SZOMB) &&
+X		(show_idle || (pp->p_pctcpu != 0) || (pp->p_stat == SRUN)) &&
+X		(!show_uid || pp->p_uid == (uid_t)sel->uid))
+X	    {
+X		*prefp++ = pp;
+X		active_procs++;
+X	    }
+X	}
+X    }
+X
+X    /* if requested, sort the "interesting" processes */
+X    if (compare != NULL)
+X    {
+X	qsort((char *)pref, active_procs, sizeof(struct proc *), compare);
+X    }
+X
+X    /* remember active and total counts */
+X    si->p_total = total_procs;
+X    si->p_active = pref_len = active_procs;
+X
+X    /* pass back a handle */
+X    handle.next_proc = pref;
+X    handle.remaining = active_procs;
+X    return((caddr_t)&handle);
+X}
+X
+Xchar fmt[128];		/* static area where result is built */
+X
+Xchar *format_next_process(handle, get_userid)
+X
+Xcaddr_t handle;
+Xchar *(*get_userid)();
+X
+X{
+X    register struct proc *pp;
+X    register long cputime;
+X    register double pct;
+X    struct user u;
+X    struct handle *hp;
+X
+X    /* find and remember the next proc structure */
+X    hp = (struct handle *)handle;
+X    pp = *(hp->next_proc++);
+X    hp->remaining--;
+X    
+X
+X    /* get the process's user struct and set cputime */
+X    if (getu(pp, &u) == -1)
+X    {
+X	(void) strcpy(u.u_comm, "<swapped>");
+X	cputime = 0;
+X    }
+X    else
+X    {
+X	/* set u_comm for system processes */
+X	if (u.u_comm[0] == '\0')
+X	{
+X	    if (pp->p_pid == 0)
+X	    {
+X		(void) strcpy(u.u_comm, "Swapper");
+X	    }
+X	    else if (pp->p_pid == 2)
+X	    {
+X		(void) strcpy(u.u_comm, "Pager");
+X	    }
+X	}
+X
+X	cputime = u.u_ru.ru_utime.tv_sec + u.u_ru.ru_stime.tv_sec;
+X    }
+X
+X    /* calculate the base for cpu percentages */
+X    pct = pctdouble(pp->p_pctcpu);
+X
+X    /* format this entry */
+X    sprintf(fmt,
+X	    Proc_format,
+X	    pp->p_pid,
+X	    (*get_userid)(pp->p_uid),
+X	    pp->p_pri - PZERO,
+X	    pp->p_nice - NZERO,
+X	    pagetok(PROCSIZE(pp)),
+X	    pagetok(pp->p_rssize),
+X	    state_abbrev[pp->p_stat],
+X	    cputime / 60l,
+X	    cputime % 60l,
+X	    100.0 * weighted_cpu(pct, pp),
+X	    100.0 * pct,
+X	    printable(u.u_comm));
+X
+X    /* return the result */
+X    return(fmt);
+X}
+X
+X/*
+X *  getu(p, u) - get the user structure for the process whose proc structure
+X *	is pointed to by p.  The user structure is put in the buffer pointed
+X *	to by u.  Return 0 if successful, -1 on failure (such as the process
+X *	being swapped out).
+X */
+X
+Xgetu(p, u)
+X
+Xregister struct proc *p;
+Xstruct user *u;
+X
+X{
+X    struct pte uptes[UPAGES];
+X    register caddr_t upage;
+X    register struct pte *pte;
+X    register nbytes, n;
+X
+X    /*
+X     *  Check if the process is currently loaded or swapped out.  The way we
+X     *  get the u area is totally different for the two cases.  For this
+X     *  application, we just don't bother if the process is swapped out.
+X     */
+X    if ((p->p_flag & SLOAD) == 0)
+X    {
+X	return(-1);
+X    }
+X
+X    /*
+X     *  Process is currently in memory, we hope!
+X     */
+X#ifdef ns32000
+X    if (!getkval(p->p_upte, uptes, sizeof(uptes), "!p->p_upte"))
+X#else
+X    if (!getkval(p->p_pttop, uptes, sizeof(uptes), "!p->p_upte"))
+X#endif
+X    {
+X	/* we can't seem to get to it, so pretend it's swapped out */
+X	return(-1);
+X    } 
+X    upage = (caddr_t)u;
+X    pte = uptes;
+X    for (nbytes = sizeof(struct user); nbytes > 0; nbytes -= NBPG)
+X    {
+X    	(void) lseek(mem, (long)(pte++->pg_pfnum * NBPG), 0);
+X	n = MIN(nbytes, NBPG);
+X	if (read(mem, upage, n) != n)
+X	{
+X	    /* we can't seem to get to it, so pretend it's swapped out */
+X	    return(-1);
+X	}
+X	upage += n;
+X    }
+X    return(0);
+X}
+X
+X/*
+X * check_nlist(nlst) - checks the nlist to see if any symbols were not
+X *		found.  For every symbol that was not found, a one-line
+X *		message is printed to stderr.  The routine returns the
+X *		number of symbols NOT found.
+X */
+X
+Xint check_nlist(nlst)
+X
+Xregister struct nlist *nlst;
+X
+X{
+X    register int i;
+X
+X    /* check to see if we got ALL the symbols we requested */
+X    /* this will write one line to stderr for every symbol not found */
+X
+X    i = 0;
+X    while (nlst->n_name != NULL)
+X    {
+X	if (nlst->n_type == 0)
+X	{
+X	    /* this one wasn't found */
+X	    fprintf(stderr, "kernel: no symbol named `%s'\n", nlst->n_name);
+X	    i = 1;
+X	}
+X	nlst++;
+X    }
+X
+X    return(i);
+X}
+X
+X
+X/*
+X *  getkval(offset, ptr, size, refstr) - get a value out of the kernel.
+X *	"offset" is the byte offset into the kernel for the desired value,
+X *  	"ptr" points to a buffer into which the value is retrieved,
+X *  	"size" is the size of the buffer (and the object to retrieve),
+X *  	"refstr" is a reference string used when printing error meessages,
+X *	    if "refstr" starts with a '!', then a failure on read will not
+X *  	    be fatal (this may seem like a silly way to do things, but I
+X *  	    really didn't want the overhead of another argument).
+X *  	
+X */
+X
+Xgetkval(offset, ptr, size, refstr)
+X
+Xunsigned long offset;
+Xint *ptr;
+Xint size;
+Xchar *refstr;
+X
+X{
+X    if (lseek(kmem, (long)offset, 0) == -1)
+X    {
+X	if (*refstr == '!')
+X	{
+X	    refstr++;
+X	}
+X	fprintf(stderr, "%s: lseek to %s: %s\n",
+X	    KMEM, refstr, sys_errlist[errno]);
+X	quit(22);
+X    }
+X    if (read(kmem, (char *)ptr, size) == -1)
+X    {
+X	if (*refstr == '!')
+X	{
+X	    /* we lost the race with the kernel, process isn't in memory */
+X	    return(0);
+X	} 
+X	else 
+X	{
+X	    fprintf(stderr, "%s: reading %s: %s\n",
+X		KMEM, refstr, sys_errlist[errno]);
+X	    quit(23);
+X	}
+X    }
+X    return(1);
+X}
+X    
+X/* comparison routine for qsort */
+X
+X/*
+X *  proc_compare - comparison function for "qsort"
+X *	Compares the resource consumption of two processes using five
+X *  	distinct keys.  The keys (in descending order of importance) are:
+X *  	percent cpu, cpu ticks, state, resident set size, total virtual
+X *  	memory usage.  The process states are ordered as follows (from least
+X *  	to most important):  WAIT, zombie, sleep, stop, start, run.  The
+X *  	array declaration below maps a process state index into a number
+X *  	that reflects this ordering.
+X */
+X
+Xstatic unsigned char sorted_state[] =
+X{
+X    0,	/* not used		*/
+X    3,	/* sleep		*/
+X    1,	/* ABANDONED (WAIT)	*/
+X    6,	/* run			*/
+X    5,	/* start		*/
+X    2,	/* zombie		*/
+X    4,	/* stop			*/
+X    7	/* RUN			*/
+X};
+X 
+Xproc_compare(pp1, pp2)
+X
+Xstruct proc **pp1;
+Xstruct proc **pp2;
+X
+X{
+X    register struct proc *p1;
+X    register struct proc *p2;
+X    register int result;
+X    register pctcpu lresult;
+X
+X    /* remove one level of indirection */
+X    p1 = *pp1;
+X    p2 = *pp2;
+X
+X    /* compare percent cpu (pctcpu) */
+X    if ((lresult = p2->p_pctcpu - p1->p_pctcpu) == 0)
+X    {
+X	/* use cpticks to break the tie */
+X	if ((result = p2->p_cpticks - p1->p_cpticks) == 0)
+X	{
+X	    /* use process state to break the tie */
+X	    if ((result = sorted_state[p2->p_stat] -
+X			  sorted_state[p1->p_stat])  == 0)
+X	    {
+X		/* use priority to break the tie */
+X		if ((result = p2->p_pri - p1->p_pri) == 0)
+X		{
+X		    /* use resident set size (rssize) to break the tie */
+X		    if ((result = p2->p_rssize - p1->p_rssize) == 0)
+X		    {
+X			/* use total memory to break the tie */
+X			result = PROCSIZE(p2) - PROCSIZE(p1);
+X		    }
+X		}
+X	    }
+X	}
+X    }
+X    else
+X    {
+X	result = lresult < 0 ? -1 : 1;
+X    }
+X
+X    return(result);
+X}
+X
+X
+X/*
+X * proc_owner(pid) - returns the uid that owns process "pid", or -1 if
+X *		the process does not exist.
+X *		It is EXTREMLY IMPORTANT that this function work correctly.
+X *		If top runs setuid root (as in SVR4), then this function
+X *		is the only thing that stands in the way of a serious
+X *		security problem.  It validates requests for the "kill"
+X *		and "renice" commands.
+X */
+X
+Xint proc_owner(pid)
+X
+Xint pid;
+X
+X{
+X    register int cnt;
+X    register struct proc **prefp;
+X    register struct proc *pp;
+X
+X    prefp = pref;
+X    cnt = pref_len;
+X    while (--cnt >= 0)
+X    {
+X	if ((pp = *prefp++)->p_pid == (pid_t)pid)
+X	{
+X	    return((int)pp->p_uid);
+X	}
+X    }
+X    return(-1);
+X}
+END_OF_FILE
+if test 17566 -ne `wc -c <'machine/m_dynix32.c'`; then
+    echo shar: \"'machine/m_dynix32.c'\" unpacked with wrong size!
+fi
+# end of 'machine/m_dynix32.c'
+fi
+if test -f 'machine/m_osmp41a.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'machine/m_osmp41a.c'\"
+else
+echo shar: Extracting \"'machine/m_osmp41a.c'\" \(17755 characters\)
+sed "s/^X//" >'machine/m_osmp41a.c' <<'END_OF_FILE'
+X/*
+X * top - a top users display for Unix
+X *
+X * SYNOPSIS:  any Solbourne running OS/MP 4.1A
+X *
+X * DESCRIPTION:
+X * This is the machine-dependent module for OS/MP 4.1A
+X * This makes top work on the following systems:
+X *	Solbourne machines running OS/MP 4.1A only
+X *
+X * LIBS:  -lkvm
+X *
+X * AUTHOR:  William LeFebvre <phil@eecs.nwu.edu>
+X *          Brett McCoy <brtmac@maverick.ksu.ksu.edu>
+X */
+X
+X#include <sys/types.h>
+X#include <sys/signal.h>
+X/* make sure param.h gets loaded with KERNEL defined to get PZERO & NZERO */
+X#define KERNEL
+X#include <sys/param.h>
+X#undef KERNEL
+X
+X#include <stdio.h>
+X#include <kvm.h>
+X#include <nlist.h>
+X#include <math.h>
+X#include <sys/dir.h>
+X#include <sys/user.h>
+X#include <sys/proc.h>
+X#include <sys/dk.h>
+X#include <sys/vm.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+X#include <vm/page.h>
+X
+X#include "top.h"
+X#include "machine.h"
+X
+X/* declarations for load_avg */
+X#include "loadavg.h"
+X
+X/* get_process_info passes back a handle.  This is what it looks like: */
+X
+Xstruct handle
+X{
+X    struct proc **next_proc;	/* points to next valid proc pointer */
+X    int remaining;		/* number of pointers remaining */
+X};
+X
+X/* define what weighted cpu is.  */
+X#define weighted_cpu(pct, pp) ((pp)->p_time == 0 ? 0.0 : \
+X			 ((pct) / (1.0 - exp((pp)->p_time * logcpu))))
+X
+X/* what we consider to be process size: */
+X#define PROCSIZE(pp) ((pp)->p_tsize + (pp)->p_dsize + (pp)->p_ssize)
+X
+X/* definitions for indices in the nlist array */
+X#define X_AVENRUN	0
+X#define X_CCPU		1
+X#define X_MPID		2
+X#define X_NPROC		3
+X#define X_PROC		4
+X#define X_TOTAL		5
+X#define X_CP_TIME	6
+X#define X_PAGES		7
+X#define X_EPAGES	8
+X#define X_NCPUS		9
+X#define X_CP_MP_TIME	10
+X
+Xstatic struct nlist nlst[] = {
+X    { "_avenrun" },		/* 0 */
+X    { "_ccpu" },		/* 1 */
+X    { "_mpid" },		/* 2 */
+X    { "_nproc" },		/* 3 */
+X    { "_proc" },		/* 4 */
+X    { "_total" },		/* 5 */
+X    { "_cp_time" },		/* 6 */
+X    { "_pages" },		/* 7 */
+X    { "_epages" },		/* 8 */
+X    { "_ncpus" },		/* 9 */
+X    { "_cp_mp_time" },		/* 10 */
+X    { 0 }
+X};
+X
+X/*
+X *  These definitions control the format of the per-process area
+X */
+X
+Xstatic char header[] =
+X  "  PID X        PRI  NI   SIZE    RES STATE    TIME   WCPU    CPU COMMAND";
+X/* 0123456   -- field to fill in starts at header+6 */
+X#define UNAME_START 6
+X
+X#define Proc_format \
+X	"%5d %-8.8s %3d %3d%6dK %5dK %-5s%5d:%02d %5.2f%% %5.2f%% %.14s"
+X
+X
+X/* process state names for the "STATE" column of the display */
+X/* the extra nulls in the string "run" are for adding a slash and
+X   the processor number when needed */
+X
+Xchar *state_abbrev[] =
+X{
+X    "", "sleep", "WAIT", "run/\0\0", "start", "zomb", "stop"
+X};
+X
+X/* values that we stash away in _init and use in later routines */
+X
+Xstatic double logcpu;
+Xkvm_t *kd;
+X
+X/* these are retrieved from the kernel in _init */
+X
+Xstatic unsigned long proc;
+Xstatic          int  nproc;
+Xstatic load_avg ccpu;
+Xstatic unsigned long pages;
+Xstatic unsigned long epages;
+Xstatic		int  ncpus;
+X
+X/* these are offsets obtained via nlist and used in the get_ functions */
+X
+Xstatic unsigned long mpid_offset;
+Xstatic unsigned long avenrun_offset;
+Xstatic unsigned long total_offset;
+Xstatic unsigned long cp_time_offset;
+Xstatic unsigned long cp_mp_time_offset;
+X
+X/* these are for calculating cpu state percentages */
+X
+Xstatic long cp_time[CPUSTATES];
+Xstatic long cp_old[CPUSTATES];
+Xstatic long cp_diff[CPUSTATES];
+Xstatic long cp_mp_time[MAXNCPUS][CPUSTATES];
+Xstatic long cp_mp_old[MAXNCPUS][CPUSTATES];
+Xstatic long cp_mp_diff[MAXNCPUS][CPUSTATES];
+Xint which_cpu_states = 9;
+X
+X/* these are for detailing the process states */
+X
+Xint process_states[7];
+Xchar *procstatenames[] = {
+X    "", " sleeping, ", " ABANDONED, ", " running, ", " starting, ",
+X    " zombie, ", " stopped, ",
+X    NULL
+X};
+X
+X/* these are for detailing the cpu states */
+X
+Xint cpu_states[5];
+Xint cpu_mp_states[MAXNCPUS][5];
+Xchar *cpustatenames[] = {
+X    "user", "nice", "system", "idle",
+X    NULL
+X};
+X
+X/* these are for detailing the memory statistics */
+X
+Xint memory_stats[4];
+Xchar *memorynames[] = {
+X    "K available, ", "K in use, ", "K free, ", "K locked", NULL
+X};
+X
+X/* these are for keeping track of the proc array */
+X
+Xstatic int bytes;
+Xstatic int pref_len;
+Xstatic struct proc *pbase;
+Xstatic struct proc **pref;
+X
+X/* these are for getting the memory statistics */
+X
+Xstatic struct page *physpage;
+Xstatic int bytesize;
+Xstatic int count;
+Xstatic int pageshift;		/* log base 2 of the pagesize */
+X
+X/* define pagetok in terms of pageshift */
+X
+X#define pagetok(size) ((size) << pageshift)
+X
+X/* useful externals */
+Xextern int errno;
+Xextern char *sys_errlist[];
+X
+Xlong lseek();
+Xlong time();
+Xlong percentages();
+X
+Xmachine_init(statics)
+X
+Xstruct statics *statics;
+X
+X{
+X    register int i;
+X    register int pagesize;
+X
+X    /* initialize the kernel interface */
+X    if ((kd = kvm_open(NULL, NULL, NULL, O_RDONLY, "top")) == NULL)
+X    {
+X	perror("kvm_open");
+X	return(-1);
+X    }
+X
+X    /* get the list of symbols we want to access in the kernel */
+X    if ((i = kvm_nlist(kd, nlst)) < 0)
+X    {
+X	fprintf(stderr, "top: nlist failed\n");
+X	return(-1);
+X    }
+X
+X    /* make sure they were all found */
+X    if (i > 0 && check_nlist(nlst) > 0)
+X    {
+X	return(-1);
+X    }
+X
+X    /* get the symbol values out of kmem */
+X    (void) getkval(nlst[X_PROC].n_value,   (int *)(&proc),	sizeof(proc),
+X	    nlst[X_PROC].n_name);
+X    (void) getkval(nlst[X_NPROC].n_value,  &nproc,		sizeof(nproc),
+X	    nlst[X_NPROC].n_name);
+X    (void) getkval(nlst[X_CCPU].n_value,   (int *)(&ccpu),	sizeof(ccpu),
+X	    nlst[X_CCPU].n_name);
+X    (void) getkval(nlst[X_PAGES].n_value,  (int *)(&pages),	sizeof(pages),
+X	    nlst[X_PAGES].n_name);
+X    (void) getkval(nlst[X_EPAGES].n_value, (int *)(&epages),	sizeof(epages),
+X	    nlst[X_EPAGES].n_name);
+X
+X    /* stash away certain offsets for later use */
+X    mpid_offset = nlst[X_MPID].n_value;
+X    avenrun_offset = nlst[X_AVENRUN].n_value;
+X    total_offset = nlst[X_TOTAL].n_value;
+X    cp_time_offset = nlst[X_CP_TIME].n_value;
+X    cp_mp_time_offset = nlst[X_CP_MP_TIME].n_value;
+X    (void) getkval(nlst[X_NCPUS].n_value, (int *)(&ncpus), sizeof(ncpus),
+X		   nlst[X_NCPUS].n_name);
+X
+X    /* this is used in calculating WCPU -- calculate it ahead of time */
+X    logcpu = log(loaddouble(ccpu));
+X
+X    /* allocate space for proc structure array and array of pointers */
+X    bytes = nproc * sizeof(struct proc);
+X    pbase = (struct proc *)malloc(bytes);
+X    pref  = (struct proc **)malloc(nproc * sizeof(struct proc *));
+X
+X    /* Just in case ... */
+X    if (pbase == (struct proc *)NULL || pref == (struct proc **)NULL)
+X    {
+X	fprintf(stderr, "top: can't allocate sufficient memory\n");
+X	return(-1);
+X    }
+X
+X    /* allocate a table to hold all the page structs */
+X    bytesize = epages - pages;
+X    count = bytesize / sizeof(struct page);
+X    physpage = (struct page *)malloc(epages - pages);
+X    if (physpage == NULL)
+X    {
+X	fprintf(stderr, "top: can't allocate sufficient memory\n");
+X	return(-1);
+X    }
+X   
+X    /* get the page size with "getpagesize" and calculate pageshift from it */
+X    pagesize = getpagesize();
+X    pageshift = 0;
+X    while (pagesize > 1)
+X    {
+X	pageshift++;
+X	pagesize >>= 1;
+X    }
+X
+X    /* we only need the amount of log(2)1024 for our conversion */
+X    pageshift -= LOG1024;
+X
+X    /* fill in the statics information */
+X    statics->procstate_names = procstatenames;
+X    statics->cpustate_names = cpustatenames;
+X    statics->memory_names = memorynames;
+X
+X    /* all done! */
+X    return(0);
+X}
+X
+Xchar *format_header(uname_field)
+X
+Xregister char *uname_field;
+X
+X{
+X    register char *ptr;
+X
+X    ptr = header + UNAME_START;
+X    while (*uname_field != '\0')
+X    {
+X	*ptr++ = *uname_field++;
+X    }
+X
+X    return(header);
+X}
+X
+Xget_system_info(si)
+X
+Xstruct system_info *si;
+X
+X{
+X    load_avg avenrun[3];
+X    int		i;
+X    int	 	j;
+X
+X    /* get the cp_time array */
+X    (void) getkval(cp_time_offset, (int *)cp_time, sizeof(cp_time),
+X		   "_cp_time");
+X
+X    /* get the cp_mp_time arrays as well */
+X    (void) getkval(cp_mp_time_offset, (int *) cp_mp_time, sizeof(cp_mp_time),
+X		 "_cp_mp_time");
+X
+X    /* get load average array */
+X    (void) getkval(avenrun_offset, (int *)avenrun, sizeof(avenrun),
+X		   "_avenrun");
+X
+X    /* get mpid -- process id of last process */
+X    (void) getkval(mpid_offset, &(si->last_pid), sizeof(si->last_pid),
+X		   "_mpid");
+X
+X    /* get the array of physpage descriptors */
+X    (void) getkval(pages, (int *)physpage, bytesize, "array _page");
+X
+X    /* convert load averages to doubles */
+X    {
+X	register double *infoloadp;
+X	register load_avg *sysloadp;
+X
+X	infoloadp = si->load_avg;
+X	sysloadp = avenrun;
+X	for (i = 0; i < 3; i++)
+X	{
+X	    *infoloadp++ = loaddouble(*sysloadp++);
+X	}
+X    }
+X
+X    /* calculate percentages for each of the cpu's */
+X    for (i = 0; i < ncpus; i++)
+X	(void) percentages(CPUSTATES, cpu_mp_states[i], cp_mp_time[i],
+X			   cp_mp_old[i], cp_mp_diff[i]);
+X
+X    /* if the selected cpu doesn't exist show summary of all cpu's */
+X    /* otherwise, show stats for selected cpu */
+X    if (which_cpu_states >= ncpus) {
+X	for (i = 0; i < CPUSTATES; i++) {
+X	    cpu_states[i] = 0;
+X	    for (j = 0; j < ncpus; j++)
+X		cpu_states[i] += cpu_mp_states[j][i];
+X	}
+X    } else {
+X	for (i = 0; i < CPUSTATES; i++) {
+X	    cpu_states[i] = cpu_mp_states[which_cpu_states][i];
+X	}
+X    }
+X
+X    /* sum memory statistics */
+X    {
+X	register struct page *pp;
+X	register int cnt;
+X	register int inuse;
+X	register int free;
+X	register int locked;
+X
+X	/* bop thru the array counting page types */
+X	pp = physpage;
+X	inuse = free = locked = 0;
+X	for (cnt = count; --cnt >= 0; pp++)
+X	{
+X	    if (pp->p_free)
+X	    	free++;
+X	    else if (pp->p_lock || pp->p_keepcnt > 0)
+X	    	locked++;
+X	    else
+X	    	inuse++;
+X	}
+X
+X	/* convert memory stats to Kbytes */
+X	memory_stats[0] = pagetok(inuse + free);
+X	memory_stats[1] = pagetok(inuse);
+X	memory_stats[2] = pagetok(free);
+X	memory_stats[3] = pagetok(locked);
+X    }
+X
+X    /* set arrays and strings */
+X    si->cpustates = cpu_states;
+X    si->memory = memory_stats;
+X}
+X
+Xstatic struct handle handle;
+X
+Xcaddr_t get_process_info(si, sel, compare)
+X
+Xstruct system_info *si;
+Xstruct process_select *sel;
+Xint (*compare)();
+X
+X{
+X    register int i;
+X    register int total_procs;
+X    register int active_procs;
+X    register struct proc **prefp;
+X    register struct proc *pp;
+X
+X    /* these are copied out of sel for speed */
+X    int show_idle;
+X    int show_system;
+X    int show_uid;
+X    int show_command;
+X
+X    /* read all the proc structures in one fell swoop */
+X    (void) getkval(proc, (int *)pbase, bytes, "proc array");
+X
+X    /* get a pointer to the states summary array */
+X    si->procstates = process_states;
+X
+X    /* set up flags which define what we are going to select */
+X    show_idle = sel->idle;
+X    show_system = sel->system;
+X    show_uid = sel->uid != -1;
+X    show_command = sel->command != NULL;
+X
+X    /* count up process states and get pointers to interesting procs */
+X    total_procs = 0;
+X    active_procs = 0;
+X    bzero((char *)process_states, sizeof(process_states));
+X    prefp = pref;
+X    for (pp = pbase, i = 0; i < nproc; pp++, i++)
+X    {
+X	/*
+X	 *  Place pointers to each valid proc structure in pref[].
+X	 *  Process slots that are actually in use have a non-zero
+X	 *  status field.  Processes with SSYS set are system
+X	 *  processes---these get ignored unless show_sysprocs is set.
+X	 */
+X	if (pp->p_stat != 0 &&
+X	    (show_system || ((pp->p_flag & SSYS) == 0)))
+X	{
+X	    total_procs++;
+X	    process_states[pp->p_stat]++;
+X	    if ((pp->p_stat != SZOMB) &&
+X		(show_idle || (pp->p_pctcpu != 0) || (pp->p_stat == SRUN)) &&
+X		(!show_uid || pp->p_uid == (uid_t)sel->uid))
+X	    {
+X		*prefp++ = pp;
+X		active_procs++;
+X	    }
+X	}
+X    }
+X
+X    /* if requested, sort the "interesting" processes */
+X    if (compare != NULL)
+X    {
+X	qsort((char *)pref, active_procs, sizeof(struct proc *), compare);
+X    }
+X
+X    /* remember active and total counts */
+X    si->p_total = total_procs;
+X    si->p_active = pref_len = active_procs;
+X
+X    /* pass back a handle */
+X    handle.next_proc = pref;
+X    handle.remaining = active_procs;
+X    return((caddr_t)&handle);
+X}
+X
+Xchar fmt[128];		/* static area where result is built */
+X
+Xchar *format_next_process(handle, get_userid)
+X
+Xcaddr_t handle;
+Xchar *(*get_userid)();
+X
+X{
+X    register struct proc *pp;
+X    register long cputime;
+X    register double pct;
+X    struct user u;
+X    struct handle *hp;
+X
+X    /* find and remember the next proc structure */
+X    hp = (struct handle *)handle;
+X    pp = *(hp->next_proc++);
+X    hp->remaining--;
+X    
+X    /* get the process's user struct and set cputime */
+X    if (getu(pp, &u) == -1)
+X    {
+X	(void) strcpy(u.u_comm, "<swapped>");
+X	cputime = 0;
+X    }
+X    else
+X    {
+X	/* set u_comm for system processes */
+X	if (u.u_comm[0] == '\0')
+X	{
+X	    if (pp->p_pid == 0)
+X	    {
+X		(void) strcpy(u.u_comm, "Swapper");
+X	    }
+X	    else if (pp->p_pid == 2)
+X	    {
+X		(void) strcpy(u.u_comm, "Pager");
+X	    }
+X	}
+X
+X	cputime = u.u_ru.ru_utime.tv_sec + u.u_ru.ru_stime.tv_sec;
+X    }
+X
+X    /* calculate the base for cpu percentages */
+X    pct = pctdouble(pp->p_pctcpu);
+X
+X    state_abbrev[SRUN][4] = (pp->p_lastcpu) + '0';
+X
+X    /* format this entry */
+X    sprintf(fmt,
+X	    Proc_format,
+X	    pp->p_pid,
+X	    (*get_userid)(pp->p_uid),
+X	    pp->p_pri - PZERO,
+X	    pp->p_nice - NZERO,
+X	    pagetok(PROCSIZE(pp)),
+X	    pagetok(pp->p_rssize),
+X	    state_abbrev[pp->p_stat],
+X	    cputime / 60l,
+X	    cputime % 60l,
+X	    100.0 * weighted_cpu(pct, pp),
+X	    100.0 * pct,
+X	    printable(u.u_comm));
+X
+X    /* return the result */
+X    return(fmt);
+X}
+X
+X/*
+X *  getu(p, u) - get the user structure for the process whose proc structure
+X *	is pointed to by p.  The user structure is put in the buffer pointed
+X *	to by u.  Return 0 if successful, -1 on failure (such as the process
+X *	being swapped out).
+X */
+X
+Xgetu(p, u)
+X
+Xregister struct proc *p;
+Xstruct user *u;
+X
+X{
+X    register struct user *lu;
+X
+X    lu = kvm_getu(kd, p);
+X    if (lu == NULL)
+X    {
+X	return(-1);
+X    }
+X    else
+X    {
+X	*u = *lu;
+X	return(0);
+X    }
+X}
+X
+X/*
+X * check_nlist(nlst) - checks the nlist to see if any symbols were not
+X *		found.  For every symbol that was not found, a one-line
+X *		message is printed to stderr.  The routine returns the
+X *		number of symbols NOT found.
+X */
+X
+Xint check_nlist(nlst)
+X
+Xregister struct nlist *nlst;
+X
+X{
+X    register int i;
+X
+X    /* check to see if we got ALL the symbols we requested */
+X    /* this will write one line to stderr for every symbol not found */
+X
+X    i = 0;
+X    while (nlst->n_name != NULL)
+X    {
+X	if (nlst->n_type == 0)
+X	{
+X	    /* this one wasn't found */
+X	    fprintf(stderr, "kernel: no symbol named `%s'\n", nlst->n_name);
+X	    i = 1;
+X	}
+X	nlst++;
+X    }
+X
+X    return(i);
+X}
+X
+X
+X/*
+X *  getkval(offset, ptr, size, refstr) - get a value out of the kernel.
+X *	"offset" is the byte offset into the kernel for the desired value,
+X *  	"ptr" points to a buffer into which the value is retrieved,
+X *  	"size" is the size of the buffer (and the object to retrieve),
+X *  	"refstr" is a reference string used when printing error meessages,
+X *	    if "refstr" starts with a '!', then a failure on read will not
+X *  	    be fatal (this may seem like a silly way to do things, but I
+X *  	    really didn't want the overhead of another argument).
+X *  	
+X */
+X
+Xgetkval(offset, ptr, size, refstr)
+X
+Xunsigned long offset;
+Xint *ptr;
+Xint size;
+Xchar *refstr;
+X
+X{
+X    if (kvm_read(kd, offset, ptr, size) != size)
+X    {
+X	if (*refstr == '!')
+X	{
+X	    return(0);
+X	}
+X	else
+X	{
+X	    fprintf(stderr, "top: kvm_read for %s: %s\n",
+X		refstr, sys_errlist[errno]);
+X	    quit(23);
+X	    /*NOTREACHED*/
+X	}
+X    }
+X    return(1);
+X}
+X    
+X/* comparison routine for qsort */
+X
+X/*
+X *  proc_compare - comparison function for "qsort"
+X *	Compares the resource consumption of two processes using five
+X *  	distinct keys.  The keys (in descending order of importance) are:
+X *  	percent cpu, cpu ticks, state, resident set size, total virtual
+X *  	memory usage.  The process states are ordered as follows (from least
+X *  	to most important):  WAIT, zombie, sleep, stop, start, run.  The
+X *  	array declaration below maps a process state index into a number
+X *  	that reflects this ordering.
+X */
+X
+Xstatic unsigned char sorted_state[] =
+X{
+X    0,	/* not used		*/
+X    3,	/* sleep		*/
+X    1,	/* ABANDONED (WAIT)	*/
+X    6,	/* run			*/
+X    5,	/* start		*/
+X    2,	/* zombie		*/
+X    4	/* stop			*/
+X};
+X 
+Xproc_compare(pp1, pp2)
+X
+Xstruct proc **pp1;
+Xstruct proc **pp2;
+X
+X{
+X    register struct proc *p1;
+X    register struct proc *p2;
+X    register int result;
+X    register pctcpu lresult;
+X
+X    /* remove one level of indirection */
+X    p1 = *pp1;
+X    p2 = *pp2;
+X
+X    /* compare percent cpu (pctcpu) */
+X    if ((lresult = p2->p_pctcpu - p1->p_pctcpu) == 0)
+X    {
+X	/* use cpticks to break the tie */
+X	if ((result = p2->p_cpticks - p1->p_cpticks) == 0)
+X	{
+X	    /* use process state to break the tie */
+X	    if ((result = sorted_state[p2->p_stat] -
+X			  sorted_state[p1->p_stat])  == 0)
+X	    {
+X		/* use priority to break the tie */
+X		if ((result = p2->p_pri - p1->p_pri) == 0)
+X		{
+X		    /* use resident set size (rssize) to break the tie */
+X		    if ((result = p2->p_rssize - p1->p_rssize) == 0)
+X		    {
+X			/* use total memory to break the tie */
+X			result = PROCSIZE(p2) - PROCSIZE(p1);
+X		    }
+X		}
+X	    }
+X	}
+X    }
+X    else
+X    {
+X	result = lresult < 0 ? -1 : 1;
+X    }
+X
+X    return(result);
+X}
+X
+X/*
+X * proc_owner(pid) - returns the uid that owns process "pid", or -1 if
+X *		the process does not exist.
+X *		It is EXTREMLY IMPORTANT that this function work correctly.
+X *		If top runs setuid root (as in SVR4), then this function
+X *		is the only thing that stands in the way of a serious
+X *		security problem.  It validates requests for the "kill"
+X *		and "renice" commands.
+X */
+X
+Xint proc_owner(pid)
+X
+Xint pid;
+X
+X{
+X    register int cnt;
+X    register struct proc **prefp;
+X    register struct proc *pp;
+X
+X    prefp = pref;
+X    cnt = pref_len;
+X    while (--cnt >= 0)
+X    {
+X	if ((pp = *prefp++)->p_pid == (pid_t)pid)
+X	{
+X	    return((int)pp->p_uid);
+X	}
+X    }
+X    return(-1);
+X}
+END_OF_FILE
+if test 17755 -ne `wc -c <'machine/m_osmp41a.c'`; then
+    echo shar: \"'machine/m_osmp41a.c'\" unpacked with wrong size!
+fi
+# end of 'machine/m_osmp41a.c'
+fi
+echo shar: End of archive 7 \(of 13\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 13 archives.
+    echo "Now read README and INSTALL, then run Configure"
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

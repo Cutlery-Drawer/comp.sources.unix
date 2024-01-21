@@ -1,0 +1,1543 @@
+From: island!argv@sun.com (Dan Heller)
+Subject: Mail User's Shell, version 6.0
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 9 (of 14)."
+# Contents:  loop.c tool_help
+# Wrapped by rsalz@fig.bbn.com on Wed Apr 13 20:04:51 1988
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'loop.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'loop.c'\"
+else
+echo shar: Extracting \"'loop.c'\" \(24591 characters\)
+sed "s/^X//" >'loop.c' <<'END_OF_FILE'
+X/* loop.c 	(c) copyright 1986 (Dan Heller) */
+X
+X/*
+X * Here is where the main loop for text mode exists. Also, all the
+X * history is kept here and all the command parsing and execution
+X * and alias expansion in or out of text/graphics mode is done here.
+X */
+X
+X#include "mush.h"
+X
+X#ifdef BSD
+X#include <sys/wait.h>
+X#else
+X#ifndef SYSV
+X#include <wait.h>
+X#endif /* SYSV */
+X#endif /* BSD */
+X
+X#define ever (;;)
+X#define MAXARGS		100
+X#define isdelimeter(c)	(index(" \t;|", c))
+X
+char *alias_expand(), *hist_expand(), *reference_hist(), *hist_from_str();
+char **calloc();
+X
+struct history {
+X    int histno;
+X    char **argv;
+X    struct history *prev;
+X    struct history *next;
+X};
+static struct history *hist_head, *hist_tail;
+struct history *malloc();
+X#define NULL_HIST	(struct history *)0
+X
+static char *last_aliased;
+static int hist_size, print_only;
+X
+do_loop()
+X{
+X    register char *p, **argv;
+X    char	  **last_argv = DUBL_NULL, line[256];
+X    int   	  argc, c = (iscurses - 1);
+X    struct history *new;
+X#ifdef CURSES
+X    int		  save_echo_flg = FALSE;
+X#endif /* CURSES */
+X
+X    /* catch the right signals -- see main.c for other signal catching */
+X    (void) signal(SIGINT, catch);
+X    (void) signal(SIGQUIT, catch);
+X    (void) signal(SIGHUP, catch);
+X    (void) signal(SIGTERM, catch);
+X    (void) signal(SIGCHLD, sigchldcatcher);
+X    (void) signal(SIGPIPE, SIG_IGN); /* if pager is terminated before end */
+X
+X    turnoff(glob_flags, IGN_SIGS);
+X    if (hist_size == 0) /* if user didn't set history in .rc file */
+X	hist_size = 1;
+X
+X    for ever {
+X	if (setjmp(jmpbuf)) {
+X	    Debug("jumped back to main loop (%s: %d)\n", __FILE__,__LINE__);
+X#ifdef CURSES
+X	    if (c > 0) { /* don't pass last command back to curses_command() */
+X		iscurses = TRUE;
+X		c = hit_return();
+X	    }
+X#endif /* CURSES */
+X	}
+X#ifdef CURSES
+X	if (iscurses || c > -1) {
+X	    /* if !iscurses, we know that we returned from a curses-based
+X	     * call and we really ARE still in curses. Reset tty modes!
+X	     */
+X	    if (ison(glob_flags, ECHO_FLAG)) {
+X		turnoff(glob_flags, ECHO_FLAG);
+X		echo_off();
+X		save_echo_flg = TRUE;
+X	    }
+X	    if (!iscurses) {
+X		iscurses = TRUE;
+X		c = hit_return();
+X	    }
+X	    if ((c = curses_command(c)) == -1 && save_echo_flg) {
+X		echo_on();
+X		turnon(glob_flags, ECHO_FLAG);
+X		save_echo_flg = FALSE;
+X	    }
+X	    continue;
+X	}
+X#endif /* CURSES */
+X	clear_msg_list(msg_list);
+X	(void) check_new_mail();
+X
+X	/* print a prompt according to printf like format:
+X	 * (current message, deleted, unread, etc) are found in mail_status.
+X	 */
+X	mail_status(1);
+X	if (Getstr(line, 256, 0) > -1)
+X	    p = line;
+X	else {
+X	    if (p = do_set(set_options, "ignoreeof")) {
+X		if (!*p)
+X		    continue;
+X		else
+X		    p = strcpy(line, p); /* so processing won't destroy var */
+X	    } else {
+X		(void) quit(0, DUBL_NULL);
+X		continue; /* quit may return if new mail arrives */
+X	    }
+X	}
+X
+X	skipspaces(0);
+X	if (!*p && !(p = do_set(set_options, "newline"))) {
+X	    (void) readmsg(0, DUBL_NULL, msg_list);
+X	    continue;
+X	}
+X	if (!*p) /* if newline is set, but no value, then continue */
+X	    continue;
+X
+X	/* upon error, argc = -1 -- still save in history so user can
+X	 * modify syntax error. if !argv, error is too severe.  We pass
+X	 * the last command typed in last_argv for history reference, and
+X	 * get back the current command _as typed_ (unexpanded by aliases
+X	 * or history) in last_argv.
+X	 */
+X	if (!(argv = make_command(p, &last_argv, &argc)))
+X	    continue;
+X	/* now save the new argv in the newly created history structure */
+X	if (!(new = malloc(sizeof (struct history))))
+X	    error("can't increment history");
+X	else {
+X	    new->histno = ++hist_no;
+X	    new->argv = last_argv; /* this is the command _as typed_ */
+X	    new->next = NULL_HIST;
+X	    new->prev = hist_head;
+X	    /* if first command, the tail of the list is "new" because
+X	     * nothing is in the list.  If not the first command, the
+X	     * head of the list's "next" pointer points to the new command.
+X	     */
+X	    if (hist_head)
+X		hist_head->next = new;
+X	    else
+X		hist_tail = new;
+X	    hist_head = new;
+X	}
+X	/*
+X	 * truncate the history list to the size of the history.
+X	 * Free the outdated command (argv) and move the tail closer to front.
+X	 * use a while loop in case the last command reset histsize to "small"
+X	 */
+X	while (hist_head->histno - hist_tail->histno >= hist_size) {
+X	    hist_tail = hist_tail->next;
+X	    free_vec(hist_tail->prev->argv);
+X	    xfree(hist_tail->prev);
+X	    hist_tail->prev = NULL_HIST;
+X	}
+X
+X	if (print_only) {
+X	    print_only = 0;
+X	    free_vec(argv);
+X	} else if (argc > -1)
+X	    (void) do_command(argc, argv, msg_list);
+X    }
+X}
+X
+X/* make a command from "buf".
+X * first, expand history references. make an argv from that and save
+X * in last_argv (to be passed back and stored in history). After that,
+X * THEN expand aliases. return that argv to be executed as a command.
+X */
+char **
+make_command(start, last_argv, argc)
+register char *start, ***last_argv;
+int *argc;
+X{
+X    register char *p, **tmp;
+X    char buf[BUFSIZ];
+X
+X    if (!last_argv)
+X	tmp = DUBL_NULL;
+X    else
+X	tmp = *last_argv;
+X    /* first expand history -- (here's where argc gets set)
+X     * pass the buffer, the history list to reference if \!* (or whatever)
+X     * result in static buffer (pointed to by p) -- even if history parsing is
+X     * ignored, do this to remove \'s behind !'s and verifying matching quotes
+X     */
+X    if (!(p = hist_expand(start, tmp, argc)) || Strcpy(buf, p) > BUFSIZ)
+X	return DUBL_NULL;
+X    /* if history was referenced in the command, echo new command */
+X    if (*argc)
+X	puts(buf);
+X
+X    /* argc may == -1; ignore this error for now but catch it later */
+X    if (!(tmp = mk_argv(buf, argc, 0)))
+X	return DUBL_NULL;
+X
+X    /* save this as the command typed */
+X    if (last_argv)
+X	*last_argv = tmp;
+X
+X    /* expand all aliases (recursively)
+X     * pass _this_ command (as typed and without aliases) to let aliases
+X     * with "!*" be able to reference the command line just typed.
+X     */
+X    if (alias_stuff(buf, *argc, tmp) == -1)
+X	return DUBL_NULL;
+X
+X    /* now, expand variable references and make another argv */
+X    if (!variable_expand(buf))
+X	return DUBL_NULL;
+X
+X    if (!last_argv)
+X	free_vec(tmp);
+X
+X    /* with everything expanded, build final argv from new buffer
+X     * Note that backslashes and quotes still exist. Those are removed
+X     * because argument final is 1.
+X     */
+X    tmp = mk_argv(buf, argc, 1);
+X    return tmp;
+X}
+X
+X/*
+X * do the command specified by the argument vector, argv.
+X * First check to see if argc < 0. If so, someone called this
+X * command and they should not have! make_command() will return
+X * an argv but it will set argc to -1 if there's a sytanx error.
+X */
+do_command(argc, argv, list)
+char **argv, list[];
+X{
+X    register char *p;
+X    char **tmp = argv;
+X    int i, status;
+X    long do_pipe = ison(glob_flags, DO_PIPE);
+X
+X    turnoff(glob_flags, IS_PIPE);
+X
+X    if (argc <= 0) {
+X	turnoff(glob_flags, DO_PIPE);
+X	return -1;
+X    }
+X
+X    clear_msg_list(list);
+X
+X    for (i = 0; do_pipe >= 0 && argc; argc--) {
+X	p = argv[i];
+X	if (!strcmp(p, "|") || !strcmp(p, ";")) {
+X	    if (do_pipe = (*p == '|'))
+X		turnon(glob_flags, DO_PIPE);
+X	    argv[i] = NULL;
+X	    /* if piping, then don't call next command if this one fails. */
+X	    if ((status = exec_argv(i, argv, list)) <= -1 && do_pipe) {
+X		print("Broken pipe.\n");
+X		do_pipe = -1, turnoff(glob_flags, DO_PIPE);
+X	    }
+X	    /* if command failed and piping, or command worked and not piping */
+X	    if (do_pipe <= 0)
+X		status = 0, clear_msg_list(list);
+X	    /* else command worked and piping: set is_pipe */
+X	    else if (!status)
+X		turnon(glob_flags, IS_PIPE), turnoff(glob_flags, DO_PIPE);
+X	    argv[i] = p;
+X	    argv += (i+1);
+X	    i = 0;
+X	} else
+X	    i++;
+X    }
+X    if (do_pipe >= 0)
+X	status = exec_argv(i, argv, list);
+X    Debug("freeing: "), print_argv(tmp);
+X    free_vec(tmp);
+X    turnoff(glob_flags, DO_PIPE);
+X    return status;
+X}
+X
+exec_argv(argc, argv, list)
+register char **argv, list[];
+X{
+X    register int n;
+X
+X    if (!argv || !*argv || **argv == '\\' && !*++*argv) {
+X	if (ison(glob_flags, IS_PIPE) || ison(glob_flags, DO_PIPE))
+X	    print("Invalid null command.\n");
+X	return -1;
+X    }
+X    Debug("executing: "), print_argv(argv);
+X
+X    /* if interrupted during execution of a command, return -1 */
+X    if (isoff(glob_flags, IGN_SIGS) && setjmp(jmpbuf)) {
+X	Debug("jumped back to exec_argv (%s: %d)\n", __FILE__, __LINE__);
+X	return -1;
+X    }
+X
+X    /* standard commands */
+X    for (n = 0; cmds[n].command; n++)
+X	if (!strcmp(argv[0], cmds[n].command))
+X	    return (*cmds[n].func)(argc, argv, list);
+X
+X    /* ucb-Mail compatible commands */
+X    for (n = 0; ucb_cmds[n].command; n++)
+X	if (!strcmp(argv[0], ucb_cmds[n].command))
+X	    return (*ucb_cmds[n].func)(argc, argv, list);
+X
+X    /* for hidden, undocumented commands */
+X    for (n = 0; hidden_cmds[n].command; n++)
+X	if (!strcmp(argv[0], hidden_cmds[n].command))
+X	    return (*hidden_cmds[n].func)(argc, argv, list);
+X
+X#ifdef SUNTOOL
+X    /* check tool-only commands */
+X    if (istool)
+X	for (n = 0; fkey_cmds[n].command; n++)
+X	    if (!strcmp(argv[0], fkey_cmds[n].command))
+X		return (*fkey_cmds[n].func)(argc, argv);
+X#endif /* SUNTOOL */
+X
+X    if ((isdigit(**argv) || index("^.*$-`{}", **argv))
+X			&& (n = get_msg_list(argv, list)) != 0) {
+X	if (n > 0 && isoff(glob_flags, DO_PIPE))
+X	    for (n = 0; n < msg_cnt; n++)
+X		if (msg_bit(list, n)) {
+X		    display_msg((current_msg = n), (long)0);
+X		    unset_msg_bit(list, n);
+X		}
+X	return 0;
+X    } else if (strlen(*argv) == 1 && index("$^.", **argv)) {
+X	if (!msg_cnt)
+X	    print("No messages.");
+X	else {
+X	    if (**argv != '.')
+X		current_msg = (**argv == '$') ? msg_cnt-1 : 0;
+X	    set_msg_bit(list, current_msg);
+X	    display_msg(current_msg, (long)0);
+X	}
+X	return 0;
+X    }
+X    /* get_msg_list will set the current message bit if nothing parsed */
+X    unset_msg_bit(list, current_msg);
+X
+X    if (!istool && do_set(set_options, "unix")) {
+X	if (ison(glob_flags, IS_PIPE) || ison(glob_flags, DO_PIPE))
+X	    print("There is no piping to or from UNIX commands.\n");
+X	else
+X	    execute(argv);  /* try to execute a unix command */
+X	return -1; /* doesn't affect messages! */
+X    }
+X
+X    print("%s: command not found.\n", *argv);
+X    if (!istool)
+X	print("type '?' for valid commands, or type `help'\n");
+X    return -1;
+X}
+X
+X/* recursively look for aliases on a command line.  aliases may
+X * reference other aliases.
+X */
+alias_stuff(b, argc, Argv)
+register char 	*b, **Argv;
+X{
+X    register char 	*p, **argv = DUBL_NULL;
+X    register int 	n = 0, i = 0, Argc;
+X    static int 		loops;
+X    int 		dummy;
+X
+X    if (++loops == 20) {
+X	print("Alias loop.\n");
+X	return -1;
+X    }
+X    for (Argc = 0; Argc < argc; Argc++) {
+X	register char *h = Argv[n + ++i];
+X	register char *p2 = "";
+X
+X	/* we've hit a command separator or the end of the line */
+X	if (h && strcmp(h, ";") && strcmp(h, "|"))
+X	    continue;
+X
+X	/* create a new argv containing this (possible subset) of argv */
+X	if (!(argv = calloc((unsigned)(i+1), sizeof (char *))))
+X	    continue;
+X	while (i--)
+X	    strdup(argv[i], Argv[n+i]);
+X
+X	if ((!last_aliased || strcmp(last_aliased, argv[0]))
+X			&& (p = alias_expand(argv[0]))) {
+X	    /* if history was referenced, ignore the rest of argv
+X	     * else copy all of argv onto the end of the buffer.
+X	     */
+X	    if (!(p2 = hist_expand(p, argv, &dummy)))
+X		break;
+X	    if (!dummy)
+X		(void) argv_to_string(p2+strlen(p2), argv+1);
+X	    if (Strcpy(b, p2) > BUFSIZ) {
+X		print("Not enough buffer space.\n");
+X		break;
+X	    }
+X	    /* release old argv and build a new one based on new string */
+X	    free_vec(argv);
+X	    if (!(argv = mk_argv(b, &dummy, 0)))
+X		break;
+X	    if (alias_stuff(b, dummy, argv) == -1)
+X		break;
+X	} else
+X	    b = argv_to_string(b, argv);
+X	xfree(last_aliased), last_aliased = NULL;
+X	free_vec(argv);
+X	b += strlen(b);
+X	if (h) {
+X	    p2 = h;
+X	    while (++Argc < argc && (h = Argv[Argc]))
+X		if (strcmp(h, ";") && strcmp(h, "|"))
+X		    break;
+X	    b += strlen(sprintf(b, " %s ", p2));
+X	    n = Argc--;
+X	}
+X	i = 0;
+X    }
+X    xfree(last_aliased), last_aliased = NULL;
+X    --loops;
+X    if (Argc < argc) {
+X	free_vec(argv);
+X	return -1;
+X    }
+X    return 0;
+X}
+X
+char *
+alias_expand(cmd)
+register char *cmd;
+X{
+X    register char *p;
+X    register int x;
+X
+X    if (!(p = do_set(functions, cmd)))
+X	return NULL;
+X    last_aliased = savestr(cmd); /* to be freed elsewhere; don't strdup! */
+X    if (isoff(glob_flags, WARNING))
+X	return p;
+X    for (x = 0; cmds[x].command; x++)
+X	if (!strcmp(cmd, cmds[x].command)) {
+X	    wprint("(real command: \"%s\" aliased to \"%s\")\n", cmd, p);
+X	    return p;
+X	}
+X    for (x = 0; ucb_cmds[x].command; x++)
+X	if (!strcmp(cmd, ucb_cmds[x].command)) {
+X	    wprint("(ucb-command: \"%s\" aliased to \"%s\")\n", cmd, p);
+X	    return p;
+X	}
+X    return p;
+X}
+X
+X/* expand history references and separate message lists from other tokens */
+char *
+hist_expand(str, argv, hist_was_referenced)
+register char *str, **argv;
+register int *hist_was_referenced;
+X{
+X    static char   buf[BUFSIZ];
+X    register int  b = 0, inquotes = 0;
+X    int 	  first_space = 0, ignore_bang;
+X
+X    ignore_bang = (ison(glob_flags, IGN_BANG) ||
+X		   do_set(set_options, "ignore_bang"));
+X
+X    if (hist_was_referenced)
+X	*hist_was_referenced = 0;
+X    while (*str) {
+X	while (!inquotes && isspace(*str))
+X	    str++;
+X	do  {
+X	    if (!*str)
+X		break;
+X	    if (b >= BUFSIZ-1) {
+X		print("argument list too long.\n");
+X		return NULL;
+X	    }
+X	    if ((buf[b] = *str++) == '\'') {
+X		/* make sure there's a match! */
+X		inquotes = !inquotes;
+X	    }
+X	    if (!first_space && !inquotes && index("0123456789{}*$", buf[b])
+X			     && b && !index("0123456789{}- \t", buf[b-1])) {
+X		buf[b+1] = buf[b];
+X		buf[b++] = ' ';
+X		while ((buf[++b] = *str++) && index("0123456789-,${}", buf[b]))
+X		    ;
+X		if (!buf[b])
+X		    str--;
+X		first_space++;
+X	    }
+X	    /* check for (;) (|) or any other delimeter and separate it from
+X	     * other tokens.
+X	     */
+X	    if (!inquotes && buf[b] != '\0' && isdelimeter(buf[b]) &&
+X		(b < 0 || buf[b-1] != '\\')) {
+X		if (b && !isspace(buf[b-1]))
+X		    buf[b+1] = buf[b], buf[b++] = ' ';
+X		b++;
+X		break;
+X	    }
+X	    /* if double-quotes, just copy byte by byte, char by char ... */
+X	    if (buf[b] == '"') {
+X		int B = b;
+X		while ((buf[++B] = *str++) && buf[B] != '"')
+X		    ;
+X		if (buf[B])
+X		    b = B;
+X		else
+X		    str--;
+X		b++;
+X		continue;
+X	    }
+X	    if (buf[b] == '\\') {
+X		if ((buf[++b] = *str) == '!')
+X		    buf[--b] = '!';
+X		++str;
+X	    } else if (buf[b] == '!' && *str && *str != '\\' && !isspace(*str)
+X			&& !ignore_bang) {
+X		char word[BUFSIZ];
+X		if (!(str = reference_hist(str, word, argv)))
+X		    return NULL;
+X		if (hist_was_referenced)
+X		    *hist_was_referenced = 1;
+X		if (strlen(word) + b >= BUFSIZ) {
+X		    print("argument list too long.\n");
+X		    return NULL;
+X		}
+X		b += Strcpy(&buf[b], word) - 1;
+X	    }
+X	    b++;
+X	} while (*str && (!isdelimeter(*str) || str[-1] == '\\'));
+X	if (!inquotes)
+X	    first_space++, buf[b++] = ' ';
+X    }
+X    buf[b] = 0;
+X    return buf;
+X}
+X
+X/*
+X * find mush variable references and expand them to their values.
+X * variables are preceded by a '$' and cannot be within single
+X * quotes.  Only if expansion has been made do we copy buf back into str.
+X * RETURN 0 on failure, 1 on success.
+X */
+variable_expand(str)
+register char *str;
+X{
+X    register int     b = 0;
+X    char             buf[BUFSIZ], *start = str;
+X    int		     expanded = 0;
+X
+X    while (*str) {
+X	if (*str == '~' && (str == start || isspace(*(str-1)))) {
+X	    register char *p = any(str, " \t"), *tmp;
+X	    int x = 1;
+X	    if (p)
+X		*p = 0;
+X	    tmp = getpath(str, &x);
+X	    /* if error, print message and return 0 */
+X	    if (x == -1) {
+X		wprint("%s: %s\n", str, tmp);
+X		return 0;
+X	    }
+X	    b += Strcpy(buf+b, tmp);
+X	    if (p)
+X		*p = ' ', str = p;
+X	    else
+X		str += strlen(str);
+X	    expanded = 1;
+X	}
+X	/* if single-quotes, just copy byte by byte, char by char ... */
+X	if ((buf[b] = *str++) == '\'') {
+X	    while ((buf[++b] = *str++) && buf[b] != '\'')
+X		;
+X	    if (!buf[b])
+X		str--;
+X	}
+X	/* If $ is eoln, continue.  Variables must start with a `$'
+X	 * and continue with {, _, a-z, A-Z or it is not a variable.      }
+X	 */
+X	if (buf[b] == '$' &&
+X	    (isalpha(*str) || *str == '{' || *str == '_'))  /* } */  {
+X	    register char c, *p, *var, *end;
+X
+X	    if (*(end = var = str) == '{')  /* } */   {
+X		if (!isalpha(*++str) && *str != '_') {
+X		    print("Illegal variable name.\n");
+X		    return 0;
+X		}
+X		if (!(end = index(var, '}'))) /* { */   {
+X		    print("Unmatched '{'.\n"); /* } */
+X		    return 0;
+X		}
+X		*end++ = 0;
+X	    } else
+X		while (isalnum(*++end) || *end == '_')
+X		    ;
+X	    /* advance "str" to the next parse-point, replace the end
+X	     * of "var" (end) with a null, and save char in `c'
+X	     */
+X	    c = *(str = end), *end = 0;
+X
+X	    /* get the value of the variable. */
+X	    if (p = do_set(set_options, var))
+X		b += Strcpy(buf+b, p);
+X	    else {
+X		print("%s: undefined variable\n", var);
+X		return 0;
+X	    }
+X	    expanded = 1;
+X	    *str = c; /* replace the null with the old character */
+X	} else
+X	    b++;
+X    }
+X    buf[b] = 0;
+X    if (expanded) /* if any expansions were done, copy back into orig buf */
+X	(void) strcpy(start, buf);
+X    return 1;
+X}
+X
+X/* make an vector of space delimeted character strings out of string "str".
+X * place in "argc" the number of args made. If final is true, then remove
+X * quotes and backslants according to standard.
+X */
+char **
+mk_argv(str, argc, final)
+register char *str;
+register int *argc;
+X{
+X    register char	*s, *p;
+X    register int	tmp, err = 0;
+X    char		*newargv[MAXARGS], **argv, *p2, c;
+X
+X    *argc = 0;
+X    while (*str) {
+X	while (isspace(*str))
+X	    ++str;
+X	if (*str) {		/* found beginning of a word */
+X	    s = p = str;
+X	    do  {
+X		if (p - s >= BUFSIZ-1) {
+X		    print("argument list too long.\n");
+X		    return DUBL_NULL;
+X		}
+X		if ((*p = *str++) == '\\') {
+X		    if (final && (*str == ';' || *str == '|'))
+X			/* make ";" look like " ;" */
+X			*p = ' ';
+X		    if (*++p = *str) /* assign and compare to NULL */
+X			str++;
+X		    continue;
+X		}
+X		if (p2 = index("\"'", *p)) {
+X		    register char c2 = *p2;
+X		    /* you can't escape quotes inside quotes of the same type */
+X		    if (!(p2 = index(str, c2))) {
+X			if (final)
+X			    print("Unmatched %c.\n", c2);
+X			err++;
+X			p2 = str;
+X		    }
+X		    tmp = (int)(p2 - str) + 1; /* take upto & include quote */
+X		    (void) strncpy(p + !final, str, tmp);
+X		    p += tmp - 2 * final; /* change final to a boolean */
+X		    if (*(str = p2))
+X			str++;
+X		}
+X	    } while (++p, *str && (!isdelimeter(*str) || str[-1] == '\\'));
+X	    if (c = *str) /* set c = *str, check for null */
+X		str++;
+X	    *p = 0;
+X	    if (*s) {
+X		newargv[*argc] = savestr(s);
+X		(*argc)++;
+X	    }
+X	    *p = c;
+X	}
+X    }
+X    if (!*argc)
+X	return DUBL_NULL;
+X    /* newargv[*argc] = NULL; */
+X    if (!(argv = calloc((unsigned)((*argc)+1), sizeof(char *)))) {
+X	perror("mk_argv: calloc");
+X	return DUBL_NULL;
+X    }
+X    for (tmp = 0; tmp < *argc; tmp++)
+X	argv[tmp] = newargv[tmp];
+X    if (err)
+X	*argc = -1;
+X    return argv;
+X}
+X
+X/*
+X * reference previous history from syntax of str and place result into buf
+X * We know we've got a history reference -- we're passed the string starting
+X * the first char AFTER the '!' (which indicates history reference)
+X */
+char *
+reference_hist(str, buf, hist_ref)
+register char *str, *buf, **hist_ref;
+X{
+X    int 	   relative = *str == '-'; /* relative from current hist_no */
+X    int 	   old_hist, argstart = 0, lastarg, argend = 0, n = 0;
+X    register char  *p, **argv = hist_ref;
+X    struct history *hist;
+X
+X    buf[0] = 0;
+X    if (index("!:$*", *str)) {
+X	old_hist = hist_no;
+X	if (*str == '!')
+X	    str++;
+X    } else if (isdigit(*(str + relative)))
+X	str = my_atoi(str + relative, &old_hist);
+X    else if (!(p = hist_from_str(str, &old_hist)))
+X	return NULL;
+X    else
+X	str = p;
+X    if (relative)
+X	old_hist = (hist_no-old_hist) + 1;
+X    if (old_hist == hist_no) {
+X	if (!(argv = hist_ref))
+X	    print("You haven't done anything yet!\n");
+X    } else {
+X	if (old_hist <= hist_no-hist_size || old_hist > hist_no ||
+X	    old_hist <= 0) {
+X	    if (old_hist <= 0)
+X		print("You haven't done that many commands, yet.\n");
+X	    else
+X		print("Event %d %s.\n", old_hist,
+X		    (old_hist > hist_no)? "hasn't happened yet": "expired");
+X	    return NULL;
+X	}
+X	hist = hist_head;
+X	while (hist && hist->histno != old_hist)
+X	    hist = hist->prev;
+X	if (hist)
+X	    argv = hist->argv;
+X    }
+X    if (!argv)
+X	return NULL;
+X    while (argv[argend+1])
+X	argend++;
+X    lastarg = argend;
+X    if (*str && index(":$*-", *str)) {
+X	int isrange;
+X	if (*str == ':' && isdigit(*++str))
+X	    str = my_atoi(str, &argstart);
+X	if (isrange = (*str == '-'))
+X	    str++;
+X	if (!isdigit(*str)) {
+X	    if (*str == 'p')
+X		str++, print_only = 1;
+X	    else if (!*str || isdelimeter(*str))
+X		if (isrange)
+X		    argend--; /* unspecified end of range implies last-1 arg */
+X		else
+X		    argend = argstart; /* no range specified; use arg given */
+X	    else {
+X		if (*str == '*')
+X		    if (argv[0])
+X			argstart = 1, argend = ++lastarg;
+X		    else
+X			argstart = 0;
+X		else if (*str == '$' && !isrange)
+X		    argstart = argend;
+X		else if (*str != '$')
+X		    print("%c: unknown arguement selector.\n", *str);
+X		str++;
+X	    }
+X	} else
+X	    str = my_atoi(str, &argend);
+X    }
+X    if (argstart > lastarg || argend > lastarg || argstart > argend) {
+X	print("Bad argument selector.\n");
+X	return NULL;
+X    }
+X    while (argstart <= argend) {
+X	n += Strcpy(&buf[n], argv[argstart++]);
+X	buf[n++] = ' ';
+X    }
+X    buf[--n] = 0;
+X    return str;
+X}
+X
+X/* find a history command that contains the string "str"
+X * place that history number in "hist" and return the end of the string
+X * parsed: !?foo (find command with "foo" in it) !?foo?bar (same, but add "bar")
+X * in the second example, return the pointer to "bar"
+X */
+char *
+hist_from_str(str, hist_number)
+register char *str;
+register int *hist_number;
+X{
+X    register char *p = NULL, c = 0;
+X    int 	  full_search = 0, len, found;
+X    char 	  buf[BUFSIZ];
+X    struct history *hist;
+X#ifndef REGCMP
+X    extern char   *re_comp();
+X#else
+X    extern char   *regcmp();
+X#endif /* REGCMP */
+X
+X    if (*str == '?') {
+X	if (p = index(++str, '?'))
+X	    *p++ = 0;
+X	else
+X	    p = str + strlen(str);
+X	full_search = 1;
+X    } else if (*str == '{')
+X	if (!(p = index(str, '}'))) {   /* { */
+X	    print("Unmatched '}'");
+X	    return NULL;
+X	} else
+X	    *p++ = 0, ++str;
+X    else
+X	p = str;
+X    while (*p && *p != ':' && !isspace(*p))
+X	p++;
+X    c = *p, *p = 0;
+X    if (*str) {
+X#ifndef REGCMP
+X	if (re_comp(str))
+X#else
+X	if (!regcmp(str, NULL))
+X#endif /* REGCMP */
+X	    return NULL;
+X    } else {
+X	*hist_number = hist_no;
+X	return p;
+X    }
+X    len = strlen(str);
+X    /* move thru the history in reverse searching for a string match. */
+X    for (hist = hist_head; hist; hist = hist->prev) {
+X	if (full_search) {
+X	    (void) argv_to_string(buf, hist->argv);
+X	    Debug("Checking for (%s) in (#%d: %s)\n", str, hist->histno, buf);
+X	}
+X	if (!full_search) {
+X	    (void) strcpy(buf, hist->argv[0]);
+X	    Debug("Checking for (%s) in (#%d: %*s)\n",
+X		str, hist->histno, len, buf);
+X	    found = !strncmp(buf, str, len);
+X	} else
+X	    found =
+X#ifndef REGCMP
+X		re_exec(buf)
+X#else
+X		!!regex(str, buf, NULL) /* convert to boolean value */
+X#endif /* REGCMP */
+X				== 1;
+X	if (found) {
+X	    *hist_number = hist->histno;
+X	    Debug("Found it in history #%d\n", *hist_number);
+X	    *p = c;
+X	    return p;
+X	}
+X    }
+X    print("%s: event not found\n", str);
+X    return NULL;
+X}
+X
+disp_hist(n, argv)  /* argc not used -- use space for the variable, "n" */
+register int n;
+char **argv;
+X{
+X    register int	list_num = TRUE, num_of_hists = hist_size;
+X    register int	reverse = FALSE;
+X    struct history	*hist = hist_tail;
+X
+X    while (*++argv && *argv[0] == '-') {
+X	n = 1;
+X	do  switch(argv[0][n]) {
+X		case 'h': list_num = FALSE;
+X		when 'r': reverse = TRUE; hist = hist_head;
+X		otherwise: print("usage: history [-h] [-r] [#histories]\n");
+X			   return -1;
+X	    }
+X	while (argv[0][++n]);
+X    }
+X    if (*argv)
+X	if (!isdigit(**argv)) {
+X	    print("history: badly formed number\n");
+X	    return -1;
+X	} else
+X	    num_of_hists = atoi(*argv);
+X
+X    if (num_of_hists > hist_size || num_of_hists > hist_no)
+X	num_of_hists = min(hist_size, hist_no);
+X
+X    if (!reverse)
+X	while (hist_no - hist->histno > num_of_hists) {
+X	    printf("skipping %d\n", hist->histno);
+X	    hist = hist->next;
+X	}
+X
+X    do_pager(NULL, TRUE);
+X    for (n = 0; n < num_of_hists && hist; n++) {
+X	char buf[256];
+X	if (list_num)
+X	    do_pager(sprintf(buf, "%4.d  ", hist->histno), FALSE);
+X	(void) argv_to_string(buf, hist->argv);
+X	(void) do_pager(buf, FALSE);
+X	if (do_pager("\n", FALSE) == -1)
+X	    break;
+X	hist = (reverse)? hist->prev : hist->next;
+X    }
+X    do_pager(NULL, FALSE);
+X    return -1;
+X}
+X
+init_history(newsize)
+X{
+X    if ((hist_size = newsize) < 1)
+X	hist_size = 1;
+X}
+END_OF_FILE
+if test 24591 -ne `wc -c <'loop.c'`; then
+    echo shar: \"'loop.c'\" unpacked with wrong size!
+fi
+# end of 'loop.c'
+fi
+if test -f 'tool_help' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'tool_help'\"
+else
+echo shar: Extracting \"'tool_help'\" \(23733 characters\)
+sed "s/^X//" >'tool_help' <<'END_OF_FILE'
+X@(#)tool_help	(c) copyright 10/18/86 (Dan Heller)
+X
+X%general%
+X
+X      IF ALL ELSE FAILS, READ THE DIRECTIONS!
+X
+This famous  quote applies here more  than ever. If
+you are unfamiliar with this mailtool, get yourself
+acquainted with it by choosing  HELP options in all
+menu items. If you get frustrated or confused about
+how to use or run a command, or if you want to know
+how something  works or get to know quick shortcuts
+in achieving tasks, it is  advisable to look at the
+Help option available with the item.
+X
+Since there  are many different  options to some of
+the commands in  mailtool, explanation  of  options
+for the commands can be found by choosing the RIGHT
+mouse button over an item. This will display a menu
+of options for the command. One of the menu options
+will almost always be a Help option.
+X
+Give yourself a head start, try selecting this same
+item with the RIGHT mouse button.  When you do, you
+will given some more help topics to choose from.
+X%%
+X
+X%help%
+Help was designed for users to get  help from anywhere on  the mailtool
+window.  The RIGHT mouse button may be selected on virtually every -
+X on any of the windows on the entire tool and  a menu will appear.
+The last item in almost  every menu  is a "help" item.  You will get an
+appropriate help message describing what you can do at the position you
+are in on the mailtool window.
+X
+If a help  message isn't much help, it may be more helpful to reference
+a different help item which  describes in more detail  what you want to
+know.  For example, reading the help for  "folder" will help you better
+understand  the method in  which mail messages are stored than it would
+if you had read the help message for "save" first.
+X%%
+X
+X%mouse%
+The mouse is an image (cursor) which moves across the screen. Its
+position indicates which window is to receive input when you type
+or click a mouse button.
+X
+The mouse may take upon  different images which  indicate various
+things. When the image looks like a "coffee cup",  Mushtool is in
+the process of doing something,  like sending mail, or reading in
+new mail.  In this event, you should wait till the cursor returns
+to its normal state before attempting to do anything else. Go get
+some coffee.
+X
+When the mouse looks like a pair of glasses, you are reading mail
+and when it looks like a pencil, you  are editing a letter.  When
+in the  Header Window, the cursor will look like the mouse device
+that you hold  with the buttons  flashing on and off.  This is to
+remind  you that you  can use each button  to do different tasks.
+X
+In one window, the Main Panel Window, the cursor image looks like
+an envelope.  Placing the cursor over "Panel Items" and selecting
+the LEFT button will do that command.  Selecting the RIGHT  mouse
+button will give a menu of options to choose from. In most cases,
+Help is  available and the end of each menu list to help you with
+the proper use of Panel Items.
+X
+When you are asked a yes or no question, choosing either the LEFT
+or RIGHT mouse buttons is the same as typing "y" or "n".
+X%%
+X
+X%respond%
+This item responds to mail in 4 ways.
+In all cases, at least one recipient of your message will be the
+sender of the message you are responding to. If a subject was in
+the author's letter, then it will be used as your subject.
+X
+The first and most used method of response is to the author of the
+message only.  Selecting this item with the LEFT mouse button will
+use this method for responding to mail.
+X
+If you want to include a copy of the author's message, then choose
+the menu item which  says to include the message.  If you wish for
+all the recipients of the message to receive a copy of your reply,
+then choosing the third item will include them.
+X
+The fourth menu item will mail to the author and everyone listed on
+the To and Cc lines of the message, and include the message you are
+responding to in your text.
+X
+In such cases where you include the message you are responding to,
+the included message will be indented by "> " to identify it from
+your message. If you would like to have a string other than the
+default used, then set the appropriate option to whatever you would
+prefer by selecting the "Opts" item, moving the mouse on top of the
+string, "indent-str", selecting the LEFT mouse button and typing the
+desired string.
+X%%
+X
+X%menu_respond%
+When you respond to a message using the menu item, you respond to the author
+of the message only. Since there are  more ways to respond to a message, you
+may want to choose the  Main Panel Window's Reply item. This item also gives
+far more extensive help than described here.
+X%%
+X
+X%menu_delete%
+This menu may delete or undelete
+whichever  message you happen to
+have the cursor sitting on.  For
+deleting messages  only, you can
+simply  select the  MIDDLE mouse
+button  over the message  header
+you would like deleted.
+X
+For extensive information on -
+X or undeletion of messages
+try the the  Main Panel Window's
+item for Delete.
+X%%
+X
+X%delete%
+You may  delete or undelete  messages with this item.
+When using the LEFT mouse button, you will delete the
+current message (HIGHLIGHTED in the headers' window).
+Otherwise, you may select the menu item for undelete.
+X
+You may  delete or undelete a  "range" of messages by
+typing the range in the Header Window.
+X
+For help on valid  message ranges, select the menu in
+the area  marked "range" in the  Header Panel Window.
+X%%
+X
+X%folder%
+This item changes your "folder" -- which is  a place to keep all your
+individual messages. Usually, if you are a heavy mail user, you would
+organize your mail in such a way in which related mail would be saved
+together in one folder.   You create folders simply by saving mail to
+a filename.  Additional mail can  be saved to those files in the same
+way.  To manipulate messages in folders,  you "change folders" to the
+folder you wish to access using the folder item.   Since it may occur
+that you switch  back and forth  between two folders, you may use the
+previous  folder menu item which updates changes  made to the current
+folder and  changes your  folder to the one previous to  the current.
+X
+You may also select  the exact name of the  folder you wish to access
+by selecting  the left  mouse button on the "folder"  item and TYPING
+the exact  name of the folder  you wish to access.  The "pathname" to
+the folder may start with a tilde (~) indicating your home directory.
+Or, it may  contain a plus sign before the  name indicating your Mail
+directory (+reports, for example).  Alternatively, you  can type  '%'
+to access your system Mailbox, the place where all your mail is first
+delivered.  And finally, you can type '#' to indicate  the previously
+accessed folder.  See the help for "chdir" for more information.
+X%%
+X
+X%chdir%
+This is used to just change working directories.
+Your  working directory contains files and other
+directories.  Files can be "mail folders"  which
+contain mail  messages.  You can change to other
+directories using some of the following methods:
+X
+You can select from the menu, HOME or Mail, which
+are your home and default mail directories. Or,
+select the left mouse button and TYPE in the name
+of the directory you would like to change to.
+X
+Typed names may have the following syntax:
+X
+X~[/subpath]   will change to your home directory and
+X              a path below that, if specified. Also,
+X              you can specify other users: ~username
+X+[subpath]    This is your default Mail directory.
+X%%
+X
+X%save%
+You may save messages in  two ways. The most commonly used method is to
+save messages to  your mailbox folder  ("mbox") in your home directory.
+If you use mail very frequently and save large amounts of mail, you can
+save messages to other folders for better organization.
+X
+Usually, when messages are saved, mushtool  marks them for deletion for
+the next update.  If you don't want to have saved messages deleted, you
+must undelete them or set the variable "keepsave" in the options screen.
+X
+There is a text item  in the Main Panel Window which allows you to type
+the  name of the file to save a message.  Select the  LEFT mouse button
+over the "Save" item, and type the filename and hit return. If there is
+no filename specified, then messages are saved to your mbox file.
+X
+You can specify a range, or group of messages to save by typing a range
+in the  Header Panel Window.  If there is a  message list in that panel
+item, then the range of messages specified there will be saved. If not,
+the current message will be saved.
+X
+For additional information, see the help option for Folders.
+X%%
+X
+X%quit%
+There are various ways in which you may be finished with mailtool.
+The most commonly used method  is to simply "close" the tool to an
+iconic form. This means that you haven't really quit, but you have
+merely put it on "hold" till later.  It will become an icon on the
+side or corner of the screen and appear to sit and do nothing.  To
+close the tool to icon form, there are two methods which have will
+have two different effects.
+X
+The first method is to select  this panel item with the left mouse
+button.  This  will update your current  folder (deleting messages
+marked for deletion) and close the tool.  The second method  is to
+use the tool manager around the perimeter of the window and select
+X"close".  This will close the tool without updating your mailfile.
+X
+Whenever the mailtool is  in the "closed"  state, it  periodically
+checks your mail and updates your folder with the  new mail. While
+mailtool is in iconic form, it will display the number of messages
+you have in the current folder.
+X
+There are two equally similar methods of exiting  mailtool, rather
+than just closing to an icon:  you may select the second menu item
+in the menu given by this panel item or you may use the tool mana-
+X "quit" item.
+X
+Using the tool manager's quit will exit the tool without updating
+your folder whereas the panel item's menu selection will have the
+mailtool prompt you whether to update the current folder or not.
+X%%
+X
+X%help_menu_help_msg%
+Selecting an item within this menu will
+give you help on that item. If you want
+to execute the action, choose the other
+menu by placing the mouse over the menu
+BEHIND this menu, continue to keep your
+RIGHT mouse button depressed and select
+the LEFT mouse button  over the menu on
+the bottom and select that action.
+X%%
+X
+X%msg_menu%
+When given menu in the Header Window, you will have a choice
+of actions to take.  The message may not be the current one,
+it may be  any message that  appears in  the Headers Window.
+The "title" of the menu  will indicate which message you are
+referring to.
+X
+At this point, you can select actions to take. You can Read,
+Delete, Undelete, Save, Reply to, or Print messages. Most of
+these are self explanatory, but if you need help with one of
+these, place the  mouse over the menu BEHIND the given menu,
+continue to have the RIGHT mouse button depressed and select
+the LEFT mouse button over the Help Menu.
+X
+This action toggles the menus such  that you can change back
+and forth between these menus. The menu you are on will tell
+which action to take on that message.  In  either case,  you
+place the mouse over the action to take, and,  if you are on
+the help menu, help will be given regarding that  particular
+action. If not in  the help menu,  then that specific action
+will actually be taken.
+X%%
+X
+X%edit%
+Choosing this item with the LEFT mouse button in
+the Main Panel Window or in the Menu item will
+allow you to access a full-screen editor. The
+editor which you will use is indicated when you
+select the "opts" item in the Main Panel Window.
+X
+While you are typing a letter, you can specify
+explicitly which editor to use by typing (on a
+line by itself) "~v editor". Type "~?" on a line
+by itself while typing to see a list of valid
+X"~commands".
+X
+Upon exiting the editor, you can continue typing
+and even reenter the editor if you like in the
+same manner.
+X%%
+X
+X%update%
+This item will update the current folder you are using.
+Changes are updated to the folder; that is, deleted mail
+is removed and all other mail is copied back to the folder
+unless otherwise specified. See the help in "folder" for
+more information on folders.
+X
+If new mail has arrived, it will incorporate it. Otherwise,
+new mail is incorporated every two minutes or so, if some
+comes in.
+X%%
+X
+X%headers%
+The message headers are displayed in their own separate window.
+The "current" message is usually displayed in either BOLD or
+REVERSE text. This "highlighted" message is the one which is
+displayed at the bottom, larger window. In the message window,
+each message is displayed in the following format:
+the message number is displayed first; if it is the "current"
+message, then there is a '>' sign.
+The next character is the 'status' character:
+X    'N' -- New (and unread)
+X    'U' -- not new, but still Unread
+X    '*' -- delete messages (set show_deleted)
+X    'P' -- preserve in spoolfile.
+X    'O' -- Old message which has also been Read.
+If there is just a space (no character), the message is new, but
+you've already read it. You should explicitly save or delete these.
+X
+Following that is the Author of the message and/or all or part of
+his network address and login name.  Following that is the number
+of lines the message is. In quotes is all or part of the "Subject"
+X(if one was specified).
+X
+To read a message, select either the READ item in the main panel
+subwindow or move the mouse over the message header you want to read
+and press the LEFT mouse button. Or, the MIDDLE mouse button will
+delete that message. Choosing the RIGHT mouse button will give you
+a menu of things to do then. Included in the menu, is a help item
+which describes the selections in the menu.
+X%%
+X
+X%preserve%
+Usually, after you read mail and you "update" or quit  mailtool, unread
+messages are copied back into your system mailbox, deleted messages are
+removed, and messages which have been read but not deleted are saved in
+your "mbox" file.  Specifying "hold" prevents this from ever happening,
+but you can mark specific messages to be held in your system mailbox by
+preserving them.
+X%%
+X
+X%compose%
+When you start to compose a letter for mailing,
+you will be prompted  for the login name(s), of
+whom  you want to mail, the (optional)  subject
+of the message, and an  optional list of carbon
+copy recipients.  This is an additional list of
+login names  who will be  mailed copies of your
+message.
+X
+After that, anything you type will be added to
+your  message.  If you select the  RIGHT mouse
+button in the window in  which you are type to
+get a menu of  things to do.  You may enter an
+editor if your message needs to be modified in
+more detail.
+X
+When you're through with your message, you can
+send it by typing (on a line by itself) "." or
+X^D.  Or, you can select  the Send item  in the
+Main Panel Window  and your mail will be sent.
+You cannot send mail while still in an editor;
+you must exit the editor first.
+X
+If you have the option "autoedit" set, you are
+automatically put into an editor when you want
+to compose or  whenever you reply to a letter.
+In this case, whenever  you're through editing
+the letter, you will be put back into the main
+editing mode  where you terminate and send the
+letter using any of the above methods.
+X%%
+X
+X%next%
+You can page through all your messages by selecting  "Next" after reading
+each message. The same effect is gotten when you select the "Delete" item
+when the option,  "autoprint" is set to be true  (see "opts") except that
+the current message is deleted before the next one is displayed. Deleting
+mail which is  not important  helps the  efficiency of mailtool and reduces
+unnecessary use of system resources.
+X
+In the Header Window, you will notice the cursor looks like the mouse you
+use.  The blinking buttons on the mouse image remind you that you can use
+any of the  three buttons  at any  time.  When you  move the mouse over a
+message and choose a button, the message under the  mouse is going to be
+the one affected.  Choosing left button will read the message, the middle
+button will delete it, and the right button will give you a menu.
+X%%
+X
+X%aliases%
+Aliases are used as a method of mailing to users with long addresses using
+short names. For example, if you wanted to mail to
+X    argv@spam.istc.sri.com
+but didn't want to type that all the time, then you could make an alias by
+selecting the alias menu item that specifies "adding alias" and then TYPE:
+X    Dan argv@spam.istc.sri.com
+If you want to mail to a list of people and do so frequently enough to want
+an alias name for the whole list, then  you would type something like this:
+X    project-group fred mary bob@foo-bar herb sly@baz.bitnet
+X
+To mail to an "alias" you would compose a letter and address the letter:
+X
+To: Dan
+Subject: Alias example
+Cc: project-group
+X(rest of letter)
+X%%
+X
+X%alts%
+X"Alternates" are alternate names for YOU.  In messages you
+receive, your account will appear on the "To" or "Cc" list.
+When you REPLY to those messages, mailtool will construct
+a message header for your letter which will contain the To
+and Cc lists of recipients from the original message. You
+would probably want your name taken off the list so you do
+not mail yourself a copy of your own message. If you have
+other account names or accounts on other machines, you can
+let mailtool know what those mail addresses are so they can
+be removed from the lists as well.
+X
+Note, that if YOU add your name MANUALLY (type it yourself)
+to either of the lists, it will not be removed.
+X
+You can set such a list in your .mailrc file in your home
+directory by adding the line:
+X
+alts hostname1 hostname2 ...
+X
+If you prefer to not have your name removed from lists when
+responding to mail, set the option "metoo" and this prevents
+the need for alternates and your name will never be removed.
+X%%
+X
+X%opts%
+To set or unset options and their values, move the mouse over
+the option of your choice and select the LEFT button to toggle
+true/false values. If an option requires a string value, you
+must type the value, so select the LEFT button to reference
+the option, and then type away.  Use a Carriage Return to enter
+the final value for the option.
+X
+You may select the RIGHT mouse button anywhere in the window
+to give a menu which consists of saving options permanently,
+reading in previous settings (from ~/.mailrc), and other things.
+X%%
+X
+X%ignore%
+When reading mail, the message "headers" may clutter up the
+window with information you are not interested in.  For
+example, you may not be interested in the "Received" or
+X"Message-Id" field of the mail message. You would find that
+in time, it will become annoying to see these uninteresting
+message headers.
+X
+You can specify which message headers should not be shown,
+thus shortening the appearance of the length of the message.
+X
+Typical settings:
+X    Received
+X    Message-Id
+X    Status
+X%%
+X
+X%printer%
+This item will send the current message, or the message specified on the
+menu header, to the printer. The printer used is given by the "printer"
+option (see opts in Main Panel Window). To specify a different printer,
+change the printer option by selecting the item "Opts" in the Main Panel
+Window, moving the mouse over the Printer option, selecting the LEFT
+mouse button and typing the name of the printer which you'd like to use.
+X
+Be sure to set this option before printing because the DEFAULT option may
+not be what you want.
+X
+You can print messages that are NOT the current message by moving the
+mouse into the Header Window and selecting the RIGHT mouse button on top
+of the message you want to print and selecting the PRINT menu option.
+X%%
+X
+X%windows%
+X"Windows" are the boxes which contain items, text, or graphic
+images.  There are two "panel" windows. A panel window is one
+which contains items,  which are the little boxes  with words
+that you can place the mouse over and click the left or mouse
+button.
+X
+Each  window has a separate  function for different purposes.
+Starting at the top of the main "tool" (contains all windows)
+we have the "header panel." Everything in this panel pertains
+to the message headers, only.  The panel in the middle of the
+tool is the "mail panel" which is more general and applies to
+just about everything. For a description of each of the items
+within any panel, select the  "Help"  option  from  the  menu
+you get by selecting the RIGHT mouse button.
+X%%
+X
+X%options%
+Move the cursor over the option you wish to change.
+The LEFT mouse button turns toggles values off and on.
+The MIDDLE mouse button displays the meaning of a
+variable. If the option needs typed input, use the LEFT
+mouse button.  Sometimes value can be both toggle and
+string values so you may have to click the left button
+more than once to type.  When entering text values, you
+must use RETURN, so the value you typed will be associated
+with the option specified. Unsetting the option will -
+associate the a string value with that option.
+X
+Once values are disassociated with options, they can
+only be retrieved by either reentering their values or
+by selecting the "restore options" item in the menu.
+Doing so will read in the last copy of the saved options
+from your .mailrc file.
+X
+Selecting the Save option in the menu will save the
+current settings in ~/.mailrc.  Selecting the quit
+option in the menu does NOT imply that values are
+saved permanently; changed values will remain through-
+out the rest of the mail session.  To save options more
+permanently, select the save menu item.
+X%%
+X
+X%function keys%
+Selecting the panel item "Opts" with the MENU button will give you
+a choice of the type of options you can set. If you choose the one
+that says "function keys", then you can edit the commands that the
+function keys on the keyboard may execute.  Once in this mode, you
+will find more extensive help.
+X%%
+X
+X%fkeys%
+Usually the LAST function key in each set (top, left,
+and right set of keys) will display the current settings
+of all they keys.  The command which does this is 
+X`key_settings X' where X is L, R, or T (left right top)
+referencing the associated function keys.  To set a function
+key to a specific command or set of commands, place the mouse
+over the icon image of the key on the screen and click the
+left mouse button.  Type a command from the list of commands
+at the bottom of the window and enter RETURN.
+X
+Many commands take arguments or flags, so be sure to enter
+them here if you want those options. Clicking the middle button
+will display the current value for that key.  If you want to
+set a key for multiple commands, separate the commands with
+semicolons:
+X
+L9:  update ; close
+X
+This example would update your mailbox (committing changes)
+and close the tool to an icon.
+X%%
+X
+X%message range%
+You can specify a large group of messages using a combination of special
+symbols in addition to numbers.  For example, if you wish to save all of
+the messages, then you can use `*' to represent them all. If you were to
+type the  "star" and select the Save  menu option for "save range", then
+you would save ALL the messages you have (including deleted ones).
+X
+If you would like to save messages 4 through 9, then you would specify:
+X4-9
+If you want to specify the messages between 2 and 32 except for messages
+X6, 8 and message 12-14, you would type:
+X2-32 {6,8,12-14}
+Commas or spaces can be used to separate numbers.
+X
+Note that you cannot specify negated messages without first specifying
+normal messages; e.g. {2-5} 1-11   doesn't make sense.
+X%%
+X
+X%sort%
+Sorting messages can   be accomplished by  selecting one  of the
+menu items in this panel item.  By default (using the LEFT mouse
+button),  sorting is  done by  message status.  New messages are
+first, followed  by unread messages,  old/read messages, replied
+to  messages,  and  finally deleted messages.  You may also sort
+messages by author, date, or subject by selecting the menu item.
+X%%
+END_OF_FILE
+if test 23733 -ne `wc -c <'tool_help'`; then
+    echo shar: \"'tool_help'\" unpacked with wrong size!
+fi
+# end of 'tool_help'
+fi
+echo shar: End of archive 9 \(of 14\).
+cp /dev/null ark9isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 14 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

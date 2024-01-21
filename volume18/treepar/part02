@@ -1,0 +1,2216 @@
+Subject:  v18i016:  Tree-structured data placer/router/plotter, Part02/03
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Jim McBeath <voder!sci!gumby!jimmc>
+Posting-number: Volume 18, Issue 16
+Archive-name: treepar/part02
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 3)."
+# Contents:  network.c tklex.c treepar.n
+# Wrapped by rsalz@fig.bbn.com on Thu Mar  9 15:55:40 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'network.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'network.c'\"
+else
+echo shar: Extracting \"'network.c'\" \(20960 characters\)
+sed "s/^X//" >'network.c' <<'END_OF_FILE'
+X/* network.c - read and write the network files
+X *
+X * 28.Jul.87  jimmc  Initial definition
+X *  1.Aug.87  jimmc  Add filename arg to NPlot
+X *  2.Aug.87  jimmc  Fill in code for nets
+X * 12.Aug.87  jimmc  Make some routines not static, add NCreate routines
+X * 14.Aug.87  jimmc  Add Globals stuff
+X * 22.Sep.87  jimmc  Use xalloc.h stuff
+X *  3.Nov.87  jimmc  Add rowdir
+X *  6.Nov.87  jimmc  xalloc, xrealloc changed: remove (char *)NULL arg
+X * 18.Jan.88  jimmc  Use TFhandle and TkHandle instead of casts
+X * 26.Jan.88  jimmc  Output backslash before outputting double quotes
+X * 27.Jan.88  jimmc  Add feedthrough stuff
+X * 29.Feb.88  jimmc  Improve robustness when doing partial place/route
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <strings.h>
+X#include "xalloc.h"
+X#include "network.h"
+X#include "tklex.h"
+X#include "tfile.h"
+X#include "plot.h"
+X
+Xextern char *index();
+Xextern char *strsav();
+X
+XNbase *NCurBase;
+Xstatic Nbase *Tbase;
+Xstatic Nnet *Tnet;
+Xstatic Ngroup *Tpath;
+XTFhandle Thandle;
+X
+Xchar Tflag[256];
+Xint Tflagcount = sizeof(Tflag)/sizeof(Tflag[0]);
+X
+Xchar Tflagr[256+1];
+X
+X/* VARARGS2 */
+Xfileerror(handle,fmt,a0,a1,a2)
+XTkHandle handle;
+Xchar *fmt;
+Xchar *a0, *a1, *a2;
+X{
+Xchar buf[1200];
+X
+X	sprintf(buf,fmt,a0,a1,a2);
+X	fprintf(stderr,"Line %d: %s\n",TkLineNumber(handle),buf);
+X}
+X
+Xstatic expand(group,size)
+XNgroup *group;		/* group to expand */
+Xint size;		/* size of each item in the array, in bytes */
+X{
+X	if (group->count>=group->alloc) {	/* need more space */
+X		if (group->alloc==0) group->alloc = 15;
+X		else group->alloc *= 2;
+X		if (group->d.x) group->d.x =
+X		    (char **)xrealloc((char *)group->d.x,group->alloc*size);
+X		else group->d.x = (char **)xalloc(group->alloc*size);
+X	}
+X}
+X
+Xinsertp(group,item)
+XNgroup *group;
+Xchar *item;
+X{
+X	expand(group,sizeof(char *));
+X	group->d.x[group->count++] = item;
+X}
+X
+Xremovep(group,item)
+XNgroup *group;
+Xchar *item;
+X{
+Xint cct,i;
+X
+X	cct = group->count;
+X	for (i=cct-1; i>=0; i--) { /* find it in list */
+X		if (group->d.x[i]==item) {
+X			if (i<cct-1) {
+X				group->d.x[i] = group->d.x[cct-1];
+X			}
+X			group->count--;
+X			return;
+X		}
+X	}
+X}
+X
+X/* Name routines */
+X
+XNDumpString(f,s)
+XFILE *f;
+Xchar *s;
+X{
+X	if (!s) {
+X		fprintf(f,"\"\"");
+X		return;
+X	}
+X	fputc('"',f);
+X	for (;*s;s++) {
+X		if (*s=='"') fputs("\\\"",f);
+X		else if (isprint(*s)) fputc(*s,f);
+X		else if (*s=='\n') fputs("\\n\\\n",f);
+X		else fprintf(f,"\\%03o",*s);
+X	}
+X	fputc('"',f);
+X}
+X
+X/* Bounding box routines */
+X
+Xint BBset;
+Xstatic Npoint BBlow,BBhigh;
+X
+XNInitBB()
+X{
+X	BBset = 0;
+X	BBlow.X = BBlow.Y = 0;
+X	BBhigh.X = BBhigh.Y = 0;
+X}
+X
+XNAddBB(p)
+XNpoint p;
+X{
+X	if (!BBset) {
+X		BBlow.X = BBhigh.X = p.X;
+X		BBlow.Y = BBhigh.Y = p.Y;
+X		BBset++;
+X	}
+X	else {
+X		if (p.X < BBlow.X) BBlow.X = p.X;
+X		if (p.X > BBhigh.X) BBhigh.X = p.X;
+X		if (p.Y < BBlow.Y) BBlow.Y = p.Y;
+X		if (p.Y > BBhigh.Y) BBhigh.Y = p.Y;
+X	}
+X}
+X
+Xstatic struct _oposinfo {
+X	char *text;
+X	int icode;
+X} OposTab[] = {
+X	"N", N,
+X	"S", S,
+X	"E", E,
+X	"W", W,
+X	"NE", NE,
+X	"NW", NW,
+X	"SE", SE,
+X	"SW", SW,
+X	"C", C,
+X};
+Xstatic int OposTabSize = sizeof(OposTab)/sizeof(OposTab[0]);
+X
+Xint NGetOposInt(s)
+Xchar *s;
+X{
+Xint i;
+X
+X	for (i=0; i<OposTabSize; i++) {
+X		if (strcmp(s,OposTab[i].text)==0) {
+X			return OposTab[i].icode;
+X		}
+X	}
+X	return -1;
+X}
+X
+Xchar *
+XNGetOposString(n)
+Xint n;
+X{
+Xint i;
+X
+X	for (i=0; i<OposTabSize; i++) {
+X		if (n==OposTab[i].icode) return OposTab[i].text;
+X	}
+X	return "??";
+X}
+X
+X/* Box routines */
+X
+XNbox *
+XNCreateBox(name,originx,originy,sizex,sizey,text,textx,texty,textpos,
+X	rownum,rowpos)
+Xchar *name;
+Xint originx,originy;
+Xint sizex,sizey;
+Xchar *text;
+Xint textx,texty;
+Xchar *textpos;
+Xint rownum;
+Xint rowpos;
+X{
+XNbox *box;
+X
+X	box = XCALLOC(Nbox,1);
+X	box->name = name;
+X	box->origin.X = originx;
+X	box->origin.Y = originy;
+X	box->size.X = sizex;
+X	box->size.Y = sizey;
+X	box->text = text;
+X	box->text_origin.X = textx;
+X	box->text_origin.Y = texty;
+X	box->text_opos = NGetOposInt(textpos);
+X	box->rownum = rownum;
+X	box->rowpos = rowpos;
+X	insertp(&(Tbase->boxlist),(char *)box);
+X	return box;
+X}
+X
+XNSetupBox(handle)
+XTFhandle handle;
+X{
+X	TFSetup(handle,"box",NCreateBox,
+X		"name.s","orgx.i","orgy.i","sizex.i","sizey.i",
+X		"text.s","textx.i","texty.i","textpos.s",
+X		"rownum.i","rowpos.i",0);
+X}
+X
+XNWriteBox(f,box,i)
+XFILE *f;	/* file to write to */
+XNbox *box;	/* the box to write out */
+Xint i;		/* counter */
+X{
+X	if (!box) return;
+X	if (i==0) {	/* write out the schema the first time */
+X		fprintf(f,"\nbox schema (\"name.s\" \"sizex.i\" \"sizey.i\" \
+X\"orgx.i\" \"orgy.i\"\n\t\"text.s\" \"textx.i\" \"texty.i\" \"textpos.s\" \
+X\"rownum.i\" \"rowpos.i\")\n");
+X	}
+X	fprintf(f,"\nbox (");
+X	NDumpString(f,box->name);
+X	fprintf(f," %d %d %d %d ",box->size.X,box->size.Y,
+X		box->origin.X,box->origin.Y);
+X	NDumpString(f,box->text);
+X	fprintf(f," %d %d \"%s\"",box->text_origin.X,box->text_origin.Y,
+X			NGetOposString(box->text_opos));
+X	fprintf(f," %d %d",box->rownum,box->rowpos);
+X	fprintf(f,")\n");
+X}
+X
+XNBoundBox(box)
+XNbox *box;
+X{
+XNpoint p;
+X	NAddBB(box->origin);
+X	p.X = box->origin.X + box->size.X;
+X	p.Y = box->origin.Y + box->size.Y;
+X	NAddBB(p);
+X}
+X
+XNPlotBox(box)
+XNbox *box;
+X{
+X	if (RIsFeedBox(box)) {
+X		if (Tflag['f'])
+X			plotx(box->origin.X,box->origin.Y);
+X		return;
+X	}
+X	PBox(box->origin.X,box->origin.Y,
+X		box->origin.X+box->size.X, box->origin.Y+box->size.Y);
+X	if (box->text) {
+X		if (!Tflag['T']) { /* 'T' flag turns off box text */
+X			PText(box->origin.X+box->text_origin.X,
+X				box->origin.Y+box->text_origin.Y,
+X				box->text_opos,box->text);
+X		}
+X		if (Tflag['l']) {	/* 'l' flag puts in label instead */
+X			PText(box->origin.X+box->text_origin.X,
+X				box->origin.Y+box->text_origin.Y,
+X				box->text_opos,box->name);
+X		}
+X	}
+X}
+X
+XNbox *
+XNFindBox(base,name)
+XNbase *base;
+Xchar *name;		/* name of the box to find */
+X{
+Xint i;
+X
+X	for (i=0; i<base->boxlist.count; i++) {
+X		if (strcmp(base->boxlist.d.box[i]->name,name)==0)
+X			return base->boxlist.d.box[i];
+X	}
+X	return 0;
+X}
+X
+XNIFreeBox(box)
+XNbox *box;
+X{
+X	removep(&(Tbase->boxlist),(char *)box);
+X	NFreeBox(box);
+X}
+X
+XNFreeBox(box)
+XNbox *box;
+X{
+X	if (box->name) tfree(box->name);
+X	if (box->text) tfree(box->text);
+X	tfree(box);
+X}
+X
+XNClearBoxConns(box)
+XNbox *box;
+X{
+X	box->connlist.count = 0;
+X}
+X
+X/* Net routines */
+X
+XNnet *
+XNCreateNet(name,rownum)
+Xchar *name;
+X{
+XNnet *net;
+X
+X	net = XCALLOC(Nnet,1);
+X	net->name = name;
+X	net->rownum = rownum;
+X	Tnet = net;	/* for future path input */
+X	Tpath = 0;
+X	insertp(&(Tbase->netlist),(char *)net);
+X	return net;
+X}
+X
+XNSetNet(net)
+XNnet *net;
+X{
+X	Tnet = net;
+X	Tpath = 0;
+X}
+X
+XNCreate1Path(x0,y0,x1,y1)
+Xint x0,y0;
+Xint x1,y1;
+X{
+X	NCreatePath(x0,y0);
+X	NCreatePath(x1,y1);
+X	NCreateEndPath();
+X}
+X
+XNCreatePath(x,y)
+Xint x,y;
+X{
+X	if (!Tnet) return;
+X	if (!Tpath) {
+X		Tpath = XCALLOC(Ngroup,1);
+X		insertp(&(Tnet->pathlist),(char *)Tpath);
+X	}
+X	expand(Tpath,sizeof(Npoint));
+X	Tpath->d.pt[Tpath->count].X = x;
+X	Tpath->d.pt[Tpath->count++].Y = y;
+X}
+X
+XNCreateEndPath()
+X{
+X	Tpath = 0;
+X}
+X
+XNSetupNet(handle)
+XTFhandle handle;
+X{
+X	TFSetup(handle,"net",NCreateNet,"name.s","rownum.i",0);
+X	TFSetup(handle,"path",NCreatePath,"x.i","y.i",0);
+X	TFSetup(handle,"endpath",NCreateEndPath,0);
+X}
+X
+XNWriteNet(f,net,n)
+XFILE *f;
+XNnet *net;
+Xint n;
+X{
+Xint i,j;
+XNgroup *path;
+X
+X	if (!net) return;
+X	if (n==0) {
+X		fprintf(f,"\nnet schema \
+X(\"name.s\" \"rownum.i\" /* angle */)\n");
+X		fprintf(f,"path schema (\"x.i\" \"y.i\") endpath schema ()\n");
+X	}
+X	fprintf(f,"\nnet (");
+X	NDumpString(f,net->name);
+X	fprintf(f," %d",net->rownum);
+X	fprintf(f," /* %c */",net->angle?net->angle:'0');
+X	fprintf(f,")\n");
+X
+X	for (i=0; i<net->pathlist.count; i++) {
+X		path = net->pathlist.d.path[i];
+X		fprintf(f,"    path");
+X		for (j=0; j<path->count; j++) {
+X			fprintf(f," (%d %d)",
+X				path->d.pt[j].X,path->d.pt[j].Y);
+X		}
+X		if (i<net->pathlist.count-1) fprintf(f," endpath ()");
+X		fprintf(f,"\n");
+X	}
+X}
+X
+XNBoundNet(net)
+XNnet *net;
+X{
+Xint i,j;
+XNgroup *path;
+X
+X	for (i=0; i<net->pathlist.count; i++) {
+X		path = net->pathlist.d.path[i];
+X		for (j=0; j<path->count; j++)
+X			NAddBB(path->d.pt[j]);
+X	}
+X}
+X
+XNPlotNet(net)
+XNnet *net;
+X{
+Xint i,j;
+XNgroup *path;
+X
+X	for (i=0; i<net->pathlist.count; i++) {
+X		path = net->pathlist.d.path[i];
+X		for (j=0; j<path->count-1; j++)
+X			PLine(path->d.pt[j].X,path->d.pt[j].Y,
+X				path->d.pt[j+1].X,path->d.pt[j+1].Y);
+X	}
+X}
+X
+XNnet *
+XNFindNet(base,name)
+XNbase *base;
+Xchar *name;		/* name of the net to find */
+X{
+Xint i;
+X
+X	for (i=0; i<base->netlist.count; i++) {
+X		if (strcmp(base->netlist.d.net[i]->name,name)==0)
+X			return base->netlist.d.net[i];
+X	}
+X	return 0;
+X}
+X
+XNIFreeNet(net)
+XNnet *net;
+X{
+X	removep(&(Tbase->netlist),(char *)net);
+X	NFreeNet(net);
+X}
+X
+XNFreeNet(net)
+XNnet *net;
+X{
+Xextern int NFreeGroupOnly();
+X
+X	if (net->name) tfree(net->name);
+X	NFreeGroup(&(net->pathlist),NFreeGroupOnly);
+X	NFreeGroupOnly(&(net->connlist));
+X	tfree(net);
+X}
+X
+XNClearNetConns(net)
+XNnet *net;
+X{
+X	net->connlist.count = 0;
+X}
+X
+X/* Conn routines */
+X
+XNBoundConn(){}
+X
+Xstatic
+Xplotx(x,y)
+X{
+Xint size;
+X
+X	size = NCurBase->textsize.Y;
+X	PLine(x+size,y-size,x-size,y+size);
+X	PLine(x+size,y+size,x-size,y-size);
+X}
+X
+XNPlotConn(conn)
+XNconn *conn;
+X{
+X	if (!Tflag['c']) return;
+X		/* only plot connectors if the 'c' flag is set */
+X	plotx(conn->apos.X,conn->apos.Y);
+X}
+X
+XNconn *
+XNCreateConn(boxname,connname,boxx,boxy,side,netname)
+Xchar *boxname;		/* name of the box this conn goes to */
+Xchar *connname;		/* connector name - only needs uniqeness in the box */
+Xint boxx,boxy;		/* connector coords relative to box origin */
+Xchar *side;		/* which side (N,S,E,W) */
+Xchar *netname;		/* name of the attached net */
+X{
+XNconn *conn;
+Xchar *s,*dirs;
+X
+X	if (!connname || !*connname) {
+X		fileerror(Thandle->tkhandle,"no name for connector");
+X		return 0;
+X	}
+X	if (!boxname || !*boxname) {
+X		fileerror(Thandle->tkhandle,"no box name for connector");
+X		return 0;
+X	}
+X	if (!netname || !*netname) {
+X		fileerror(Thandle->tkhandle,"warning: no net for connector");
+X	}
+X	if (!side) side="N";
+X	conn = XCALLOC(Nconn,1);
+X	conn->boxname = boxname;
+X	conn->name = connname;
+X	conn->pos.X = boxx;
+X	conn->pos.Y = boxy;
+X	dirs = "NSEW";
+X	s = index(dirs,side[0]);
+X	if (!s) conn->side = 0;
+X	else conn->side = s-dirs;
+X	conn->netname = netname;
+X	insertp(&(Tbase->connlist),(char *)conn);
+X	return conn;
+X}
+X
+XNSetupConn(handle)
+XTFhandle handle;
+X{
+X	TFSetup(handle,"conn",NCreateConn,"boxname.s","name.s",
+X		"x.i","y.i","side.s","netname.s",0);
+X}
+X
+XNWriteConn(f,conn,i)
+XFILE *f;	/* file to write to */
+XNconn *conn;	/* the conn to write out */
+Xint i;		/* counter */
+X{
+X	if (!conn) return;
+X	if (i==0) {	/* write out the schema the first time */
+X		fprintf(f,"\nconn schema (\"boxname.s\" \"name.s\" \
+X\"x.i\" \"y.i\" ");
+X		if (Tflag['c']) {
+X			fprintf(f,"\"ax.i\" \"ay.i\" ");
+X		}
+X		fprintf(f,"\"side.s\" \"netname.s\")\n\n");
+X	}
+X	fprintf(f,"conn (");
+X	NDumpString(f,conn->boxname);
+X	fputc(' ',f);
+X	NDumpString(f,conn->name);
+X	fprintf(f," %d %d",conn->pos.X, conn->pos.Y);
+X	if (Tflag['c']) {
+X		fprintf(f," %d %d",conn->apos.X, conn->apos.Y);
+X	}
+X	fprintf(f," \"%c\" ","NSEW"[conn->side]);
+X	NDumpString(f,conn->netname);
+X	fprintf(f,")\n");
+X}
+X
+X/* free a connector and remove it from the general conn list */
+XNIFreeConn(conn)
+XNconn *conn;
+X{
+X	removep(&(Tbase->connlist),(char *)conn);
+X	NFreeConn(conn);
+X}
+X
+XNFreeConn(conn)
+XNconn *conn;
+X{
+X	if (conn->name) tfree(conn->name);
+X	if (conn->netname) tfree(conn->netname);
+X	if (conn->boxname) tfree(conn->boxname);
+X	tfree(conn);
+X}
+X
+XNPosConn(conn)	/* set the apos in a conn */
+XNconn *conn;
+X{
+X	if (conn->box) {
+X		conn->apos.X = conn->box->origin.X + conn->pos.X;
+X		conn->apos.Y = conn->box->origin.Y + conn->pos.Y;
+X	}
+X}
+X
+XNLinkConn(conn)
+XNconn *conn;
+X{
+X	NLinkConnBox(conn);
+X	NLinkConnNet(conn);
+X}
+X
+XNLinkConnBox(conn)
+XNconn *conn;
+X{
+XNbox *box;
+X
+X	box = NFindBox(Tbase,conn->boxname);
+X	if (!box) {
+X		printf("can't find box %s, connector %s\n",
+X			conn->boxname, conn->name);
+X	}
+X	else {
+X		conn->box = box;
+X		insertp(&(box->connlist),(char *)conn);
+X		NPosConn(conn);
+X	}
+X}
+X
+XNLinkConnNet(conn)
+XNconn *conn;
+X{
+XNnet *net;
+X
+X	net = NFindNet(Tbase,conn->netname);
+X	if (!net) {
+X		net = NCreateNet(strsav(conn->netname),0);
+X	}
+X	conn->net = net;
+X	insertp(&(net->connlist),(char *)conn);
+X}
+X
+XNUnLinkConnNet(conn)
+XNconn *conn;
+X{
+XNnet *net;
+X
+X	net = conn->net;
+X	if (!net) return;
+X	removep(&(net->connlist),(char *)conn);
+X	conn->net = 0;
+X}
+X
+X/* Row routines */
+X
+XNBoundRow(){}
+XNPlotRow(){}
+X
+XNCreateRow(rownum,size,pos)
+Xint rownum;
+Xint size;
+Xint pos;
+X{
+XNrow *row;
+X
+X	row = XCALLOC(Nrow,1);
+X	row->rownum = rownum;
+X	row->size = size;
+X	row->pos = pos;
+X	insertp(&(Tbase->rowlist),(char *)row);
+X}
+X
+XNSetupRow(handle)
+XTFhandle handle;
+X{
+X	TFSetup(handle,"row",NCreateRow,"rownum.i","size.i","pos.i",0);
+X}
+X
+XNWriteRow(f,row,i)
+XFILE *f;	/* file to write to */
+XNrow *row;	/* the row to write out */
+Xint i;		/* counter */
+X{
+X	if (!row) return;
+X	if (i==0) {	/* write out the schema the first time */
+X		fprintf(f,"\nrow schema (\"rownum.i\" \"size.i\" \
+X\"pos.i\")\n\n");
+X	}
+X	fprintf(f,"row (%d %d %d", row->rownum, row->size, row->pos);
+X	fprintf(f,")\n");
+X}
+X
+XNFreeRow(row)
+XNrow *row;
+X{
+X	tfree(row);
+X}
+X
+X/* globals routines */
+X
+Xstatic
+XNDefaultGlobals(base)
+XNbase *base;
+X{
+X	base->textsize.X = 1;
+X	base->textsize.Y = 1;
+X	base->interrowspace = 3;
+X	base->rowposspace = 2;
+X	base->trackspace = 2;
+X	base->rowdir = 'H';
+X	base->label.s = 0;
+X}
+X
+Xstatic
+XNCreateGlobals(textsizex,textsizey,interrowspace,rowposspace,trackspace,
+X	rowdir,label)
+Xint textsizex, textsizey;
+Xint interrowspace;
+Xint rowposspace;
+Xint trackspace;
+Xchar *rowdir;
+Xchar *label;
+X{
+X	Tbase->textsize.X = textsizex;
+X	Tbase->textsize.Y = textsizey;
+X	Tbase->interrowspace = interrowspace;
+X	Tbase->rowposspace = rowposspace;
+X	Tbase->trackspace = trackspace;
+X	if (rowdir && (rowdir[0]=='V' || rowdir[0]=='H'))
+X		Tbase->rowdir = rowdir[0];
+X/*** else error */
+X	Tbase->label.s = label;
+X}
+X
+Xstatic
+XNSetupGlobals(handle)
+XTFhandle handle;
+X{
+X	TFSetup(handle,"globals",NCreateGlobals,"textsizex.i","textsizey.i",
+X		"interrowspace.i","rowposspace.i","trackspace.i",
+X		"rowdir.s","label.s",0);
+X}
+X
+Xstatic
+XNWriteGlobals(f,base)
+XFILE *f;
+XNbase *base;
+X{
+X	fprintf(f,"\nglobals schema (\"textsizex.i\" \"textsizey.i\" \
+X\"interrowspace.i\" \"rowposspace.i\" \"trackspace.i\" \
+X\"rowdir.s\" \"label.s\")\n");
+X	fprintf(f,"(%d %d %d %d %d \"%c\" ",
+X			base->textsize.X, base->textsize.Y,
+X			base->interrowspace, base->rowposspace,
+X			base->trackspace, base->rowdir);
+X	NDumpString(f,base->label.s);
+X	fprintf(f,")\n");
+X}
+X
+X/* label routines */
+X
+X/* ARGSUSED (so far!) */
+Xint		/* 1 if OK to go there */
+XNCheckLabel(base,where)
+XNbase *base;
+Xint where;		/* compass code */
+X{
+X	return 0;	/*** not yet done! */
+X}
+X
+XNSetLabel(base)
+XNbase *base;
+X{
+Xchar *cp, *cp2;
+Xint xsize, ysize;
+Xint l;
+X
+X	if (!base->label.s || !base->label.s[0]) return;
+X	cp = base->label.s;
+X	xsize = 0;
+X	ysize = 0;
+X	while (cp && *cp) {
+X		cp2 = index(cp,'\n');
+X		if (!cp2) l=strlen(cp);
+X		else l=(cp2++)-cp;
+X		if (l>xsize) xsize=l;
+X		ysize++;
+X		cp = cp2;
+X	}
+X	base->label.tsize.X = xsize;
+X	base->label.tsize.Y = ysize;
+X	if (NCheckLabel(base,SW)) {
+X	}
+X	else if (NCheckLabel(base,SE)) {
+X	}
+X	else {
+X		base->label.origin.X = 0;	/*** not right! */
+X		base->label.origin.Y = -(ysize+3)*base->textsize.Y;
+X	}
+X}
+X
+XNBoundLabel(base)
+XNbase *base;
+X{
+XNpoint p;
+X
+X	if (!base->label.s || !base->label.s[0]) return;
+X	NAddBB(base->label.origin);
+X	p.X = base->label.origin.X + (base->label.tsize.X+2)*base->textsize.X;
+X	p.Y = base->label.origin.Y + (base->label.tsize.Y+2)*base->textsize.Y;
+X	NAddBB(p);
+X}
+X
+XNPlotLabel(base)
+XNbase *base;
+X{
+XNpoint p;
+X
+X	if (!base->label.s || !base->label.s[0]) return;
+X	p.X = base->label.origin.X + (base->label.tsize.X+2)*base->textsize.X;
+X	p.Y = base->label.origin.Y + (base->label.tsize.Y+2)*base->textsize.Y;
+X	PBox(base->label.origin.X,base->label.origin.Y,p.X,p.Y);
+X	if (!Tflag['T']) { /* 'T' flag turns off text */
+X		PText(base->label.origin.X+base->textsize.X,
+X			base->label.origin.Y+base->textsize.Y,
+X			SW,base->label.s);
+X	}
+X}
+X
+X/* Group routines */
+X
+XNDumpGroup(f,group,funcp)
+XFILE *f;
+XNgroup *group;
+Xint (*funcp)();
+X{
+Xint i;
+X	for (i=0; i<group->count ;i++)
+X		(*funcp)(f,group->d.x[i],i);
+X}
+X
+XNDoGroup(group,funcp)
+XNgroup *group;
+Xint (*funcp)();
+X{
+Xint i;
+X
+X	for (i=0;i<group->count;i++)
+X		(*funcp)(group->d.x[i]);
+X}
+X
+XNRDoGroup(group,funcp)
+XNgroup *group;
+Xint (*funcp)();
+X{
+Xint i;
+X
+X	for (i=group->count-1;i>=0;i--)
+X		(*funcp)(group->d.x[i]);
+X}
+X
+XNClearGroup(group)
+XNgroup *group;
+X{
+X	group->count = group->alloc = 0;
+X	group->d.x = 0;
+X}
+X
+XNFreeGroupOnly(group)
+XNgroup *group;
+X{
+X	if (group->d.x)
+X		tfree(group->d.x);
+X	NClearGroup(group);
+X}
+X
+XNFreeGroup(group,funcp)
+XNgroup *group;
+Xint (*funcp)();
+X{
+X	NDoGroup(group,funcp);
+X	NFreeGroupOnly(group);
+X}
+X
+X/* Base routines */
+X
+XNSetBase(base)
+XNbase *base;
+X{
+X	Tbase = base;
+X}
+X
+XNFreeNetwork(base)	/* deallocates everything */
+XNbase *base;
+X{
+X	if (!base) return;
+X	NFreeGroup(&(base->boxlist),NFreeBox);
+X	NFreeGroup(&(base->netlist),NFreeNet);
+X	NFreeGroup(&(base->connlist),NFreeConn);
+X	NFreeGroup(&(base->rowlist),NFreeRow);
+X	tfree(base);
+X}
+X
+XNbase *
+XNReadNetwork(filename)
+Xchar *filename;
+X{
+XTFhandle handle;
+X
+X	Tbase = XCALLOC(Nbase,1);
+X	Thandle = handle = TFInit(filename);
+X	if (!handle) {
+X		printf("can't open file %s",filename);
+X		return 0;
+X	}
+X	NDefaultGlobals(Tbase);
+X	NSetupGlobals(handle);
+X	NSetupBox(handle);
+X	NSetupNet(handle);
+X	NSetupConn(handle);
+X	NSetupRow(handle);
+X	TFScan(handle);
+X	TFDone(handle);
+X	NDoGroup(&(Tbase->connlist),NLinkConn);
+X		/* put together the box/conn/net links */
+X	return Tbase;
+X}
+X
+Xint		/* 0 if error */
+XNRead(filename)
+Xchar *filename;
+X{
+XNbase *newbase;
+X
+X	newbase = NReadNetwork(filename);
+X	if (newbase) {
+X		NFreeNetwork(NCurBase);
+X		NCurBase = newbase;
+X/* Note that Tbase==NCurBase at this point, which is important! */
+X		return 1;		/* all OK */
+X	}
+X	return 0;	/* no go */
+X}
+X
+Xint
+XNWrite(filename)
+Xchar *filename;
+X{
+XFILE *f;
+Xint t;
+X
+X	if (!NCurBase) {
+X		printf("no data to write");
+X		return 0;
+X	}
+X	if (strcmp(filename,"stdout")==0) f=stdout;
+X	else if (strcmp(filename,"stderr")==0) f=stderr;
+X	else f=fopen(filename,"w");
+X	if (!f) {
+X		printf("can't open file %s for output\n",filename);
+X		return 0;
+X	}
+X	fprintf(f,"/* TF netlist */\n");
+X		/*** should add date, etc. */
+X	NWriteGlobals(f,NCurBase);
+X	NDumpGroup(f,&(NCurBase->boxlist),NWriteBox);
+X	NDumpGroup(f,&(NCurBase->netlist),NWriteNet);
+X	NDumpGroup(f,&(NCurBase->connlist),NWriteConn);
+X	NDumpGroup(f,&(NCurBase->rowlist),NWriteRow);
+X	fprintf(f,"/* end */\n");
+X	if (f==stdout || f==stderr) fflush(f);
+X	else {
+X		t = ferror(f) || fclose(f);
+X		if (t) {
+X			printf("error closing file %s\n",filename);
+X			return 0;
+X		}
+X	}
+X	return 1;
+X}
+X
+Xstatic int
+XNDoPlot()
+X{
+X	if (!(PInit(BBlow.X,BBlow.Y,BBhigh.X,BBhigh.Y))) {
+X		printf("can't init plot\n");
+X		return 0;
+X	}
+X	PTextSize(NCurBase->textsize.X,NCurBase->textsize.Y);
+X			/* specify the size of text */
+X	NDoGroup(&(NCurBase->boxlist),NPlotBox);
+X	NDoGroup(&(NCurBase->netlist),NPlotNet);
+X	NDoGroup(&(NCurBase->connlist),NPlotConn);
+X	NDoGroup(&(NCurBase->rowlist),NPlotRow);
+X	NPlotLabel(NCurBase);
+X	PDone();
+X	return 1;
+X}
+X
+Xstatic int
+XNBoundPlot()
+X{
+X	if (!NCurBase) {
+X		printf("no data to plot");
+X		return 0;
+X	}
+X	NInitBB();
+X	NDoGroup(&(NCurBase->boxlist),NBoundBox);
+X	NDoGroup(&(NCurBase->netlist),NBoundNet);
+X	NDoGroup(&(NCurBase->connlist),NBoundConn);
+X	NDoGroup(&(NCurBase->rowlist),NBoundRow);
+X	NSetLabel(NCurBase);
+X	NBoundLabel(NCurBase);
+X	return 1;
+X}
+X
+Xint
+XNPlot(ptype,filename)
+Xchar *ptype;
+Xchar *filename;
+X{
+X	if (!NBoundPlot()) return 0;
+X	if (!(PSetType(ptype,filename))) { return 0; }
+X	return NDoPlot();
+X}
+X
+Xstatic int
+XNPartPlot(ptype,filename,xnum,ynum,lx,ly,hx,hy)
+Xchar *ptype;
+Xchar *filename;
+Xint xnum,ynum;		/* repetition numbers */
+Xdouble lx,ly,hx,hy;
+X{
+Xchar nbuf[2000];
+X
+X	sprintf(nbuf,"%s_%d_%d",filename,xnum,ynum);
+X	if (!(PSetType(ptype,nbuf))) { return 0; }
+X	PSetWindow(lx,ly,hx,hy);
+X	return NDoPlot();
+X}
+X
+Xint
+XNPlot4(ptype,filename)
+Xchar *ptype;
+Xchar *filename;
+X{
+X	return NPlotXY(ptype,filename,2,2);
+X}
+X
+X#define MAXPLOTREP 64
+X
+Xint
+XNPlotXY(ptype,filename,xnum,ynum)
+Xchar *ptype;
+Xchar *filename;
+Xint xnum,ynum;
+X{
+Xint x,y;
+Xdouble xinc, yinc;
+Xdouble xbase,ybase;
+X
+X	if (xnum<=0 || ynum<=0 || xnum>MAXPLOTREP || ynum>MAXPLOTREP) {
+X		printf("Bad repeat number\n");
+X		return 0;
+X	}
+X	if (!NBoundPlot()) return 0;
+X	xinc = 1.0/(double)xnum;
+X	yinc = 1.0/(double)ynum;
+X	xbase = 0.;
+X	for (x=0; x<xnum; x++) {
+X		ybase = 0.;
+X		for (y=0; y<ynum; y++) {
+X			if (!NPartPlot(ptype,filename,x,y,
+X				xbase,ybase,xbase+xinc,ybase+yinc)) return 0;
+X			ybase += yinc;
+X		}
+X		xbase += xinc;
+X	}
+X	return 1;
+X}
+X
+Xchar *
+XTFlags(flags)
+Xchar *flags;
+X{
+Xint i;
+Xchar *cp, *np;
+X
+X	if (!flags) flags="";
+X	switch (flags[0]) {
+X	case '=':
+X		for (i=0; i<Tflagcount; i++) Tflag[i]=0;
+X		/* FALL THROUGH */
+X	case '+':
+X		for (cp=flags+1; *cp; cp++)
+X			Tflag[*cp] = 1;
+X		break;
+X	case '-':
+X		for (cp=flags+1; *cp; cp++)
+X			Tflag[*cp] = 0;
+X		break;
+X	case '?':
+X	case '\0':
+X		break;		/* just return the value */
+X	case 'h':
+X		TFlagsHelp();
+X		break;
+X	default:
+X		break;	/*** should output error message */
+X	}
+X	for (np=Tflagr, i=0; i<Tflagcount; i++)
+X		if (Tflag[i]) *np++ = i;
+X	*np = '\0';
+X	return Tflagr;
+X}
+X
+XTFlagsHelp()
+X{
+X	printf("TFlags [+-=?][flagchars]\n");
+X	printf("c  enables plotting of connectors\n");
+X	printf("f  enables plotting of feedthough boxes\n");
+X	printf("l  enables label where text normally goes in boxes\n");
+X	printf("m  memory debugging - makes free not do anything\n");
+X	printf("T  disables normal text in boxes\n");
+X}
+X
+X/* end */
+END_OF_FILE
+if test 20960 -ne `wc -c <'network.c'`; then
+    echo shar: \"'network.c'\" unpacked with wrong size!
+fi
+# end of 'network.c'
+fi
+if test -f 'tklex.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'tklex.c'\"
+else
+echo shar: Extracting \"'tklex.c'\" \(10529 characters\)
+sed "s/^X//" >'tklex.c' <<'END_OF_FILE'
+X/* tklex.c - lexical input routines
+X *
+X * 26.Jul.87  jimmc  Initial definition
+X * 12.Aug.87  jimmc  Change name TkClean to TkDone
+X * 13.Aug.87  jimmc  Allow negative numbers
+X * 18.Jan.88  jimmc  Move definition of TkInfo into tklex.h
+X * 26.Jan.88  jimmc  Read in negative numbers properly
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <strings.h>
+X#include "tklex.h"
+X
+Xextern char *malloc(),*calloc(),*realloc();
+X
+Xstatic int (*TkFatalP)();
+Xstatic int (*TkWarnP)();
+XTkInfo *TkGinfo;		/* used for debugging */
+X
+X/* VARARGS1 */
+Xstatic TkFatal(msg,a0,a1)
+Xchar *msg;
+Xchar *a0,*a1;
+X{
+Xchar buf[1200];
+X
+X	sprintf(buf,msg,a0,a1);
+X	if (TkFatalP) {
+X		(*TkFatalP)(buf);
+X	}
+X	fprintf(stderr,"Tk: %s\n",buf);
+X	exit(1);
+X}
+X
+X/* VARARGS1 */
+Xstatic TkWarn(msg,a0,a1,a2)
+Xchar *msg;
+Xchar *a0,*a1,*a2;
+X{
+Xchar buf[1200];
+X
+X	sprintf(buf,msg,a0,a1,a2);
+X	if (TkWarnP) {
+X		(*TkWarnP)(buf);
+X	}
+X	else {
+X		fprintf(stderr,"Tk: %s\n",buf);
+X	}
+X	/* continue processing */
+X}
+X
+X/* VARARGS2 */
+Xstatic TkFileWarn(info,msg,a0,a1)
+XTkInfo *info;
+Xchar *msg;
+Xchar *a0,*a1;
+X{
+Xchar buf[1200];
+X
+X	sprintf(buf,msg,a0,a1);
+X	TkWarn("File %s, line %d: %s", info->filename, info->lineno, buf);
+X}
+X
+Xstatic StoreNextChar(info,c)	/* store another char into stringvalue */
+XTkInfo *info;
+Xint c;
+X{
+X	if (info->stringcount>=info->stringalloc) {	/* need more space */
+X		if (info->stringalloc==0) info->stringalloc = 60;
+X		else info->stringalloc *= 2;
+X		if (info->stringvalue)
+X			info->stringvalue = realloc(info->stringvalue,
+X				(unsigned)(info->stringalloc));
+X		else info->stringvalue = malloc((unsigned)(info->stringalloc));
+X		if (!info->stringvalue) {
+X			info->stringalloc = 0;
+X			TkFatal("no more memory to input string, line %d",
+X				info->lineno);
+X		}
+X	}
+X	info->stringvalue[info->stringcount++] = c;
+X}
+X
+Xstatic int		/* returns the next input character */
+XTkGetChar(info)
+XTkInfo *info;
+X{
+Xint c;
+X	if (info->pbindex!=info->pballoc) {	/* we have pushback */
+X		c = info->pbchars[info->pbindex++];
+X		if (c==255) c=EOF;
+X	}
+X	else {
+X		c = getc(info->f);
+X	}
+X	if (c<='\f' && c>='\n') info->lineno++;
+X	return c;
+X}
+X
+Xstatic
+XTkPushChar(info,c)
+XTkInfo *info;
+Xint c;
+X{
+Xchar *newspace;
+Xint oldsize;
+X
+X	if (info->pbindex==0) {	/* no more space for pushback */
+X		oldsize = info->pballoc;
+X		if (info->pballoc==0) info->pballoc=58;
+X		else info->pballoc *= 2;
+X		newspace = malloc((unsigned)(info->pballoc+1));
+X		if (!newspace) TkFatal("no memory for pushback");
+X		info->pbindex = info->pballoc - oldsize;
+X		if (oldsize) strcpy(newspace+info->pbindex,info->pbchars);
+X		else newspace[info->pballoc]=0;
+X		if (info->pbchars) free(info->pbchars);
+X		info->pbchars = newspace;
+X	}
+X	info->pbchars[--(info->pbindex)] = c;
+X	if (c<='\f' && c>='\n') info->lineno--;
+X}
+X
+X
+Xstatic int
+Xbackslash(info)	/* originally from LISCH1 */
+XTkInfo *info;
+X{
+X	register int c ;
+X
+X	switch(c = TkGetChar(info)) {
+X	case '\\':  return('\\') ;
+X	case 'b':   return('\b') ;
+X	case 'e':   return('\033') ;        /* escape */
+X	case 'f':   return('\f') ;
+X	case 'n':   return('\n') ;
+X	case 'r':   return('\r') ;
+X	case 't':   return('\t') ;
+X	case 'v':   return('\013') ;        /* vertical tab */
+X	case '"':   return('"') ;
+X	case '\'':  return('\'') ;
+X	case '^':
+X		c = TkGetChar(info) ;
+X		if (isprint(c))
+X			return(c & ~0140) ; /* convert to control char range */
+X		else {
+X			TkPushChar(info,c) ;
+X			return('^') ;
+X		}
+X	default:
+X		if (! isdigit(c))
+X			return(c) ;
+X		else {
+X			int i, n ;
+X			char buf[4] ;
+X
+X			buf[0] = c ;
+X			for (i = 1; i < 3; i++)
+X			if (! isdigit(buf[i] = TkGetChar(info))) {
+X				TkPushChar(info,buf[i]) ;
+X				break ;
+X			}
+X			buf[i] = '\0' ;
+X			sscanf(buf, "%o", &n) ;
+X			return(n) ;
+X		}
+X	}
+X}
+X
+XINTFUNCPTR  /* returns previous value (pointer to function returning int) */
+XTkSetFatalHandler(p)
+Xint (*p)();
+X{
+Xint (*oldp)();
+X
+X	oldp = TkFatalP;
+X	TkFatalP = p;
+X	return oldp;
+X}
+X
+XINTFUNCPTR  /* returns previous value (pointer to function returning int) */
+XTkSetWarnHandler(p)
+Xint (*p)();
+X{
+Xint (*oldp)();
+X
+X	oldp = TkWarnP;
+X	TkWarnP = p;
+X	return oldp;
+X}
+X
+XTkHandle		/* returns a handle for calls to TkGet, 0 on error */
+XTkInit(filename)	/* the input file to read */
+Xchar *filename;		/* name of the file to read from; stdin is special */
+X{
+XTkInfo *info;
+X
+X	info = (TkInfo *)calloc(sizeof(TkInfo),1);
+X	if (!info) TkFatal("no memory for info block");
+X	if (strcmp(filename,"stdin")==0) info->f = stdin;
+X	else info->f = fopen(filename,"r");
+X	if (!info->f) {
+X		TkWarn("Error opening input file %s", filename);
+X		return 0;
+X	}
+X	info->filename = malloc((unsigned)(strlen(filename)+1));
+X	if (!info->filename) TkFatal("no memory for filename copy");
+X	strcpy(info->filename,filename);
+X	info->lineno++;		/* first line in file is line 1 */
+X	return (TkHandle)info;
+X}
+X
+Xint			/* returns 0 if all OK */
+XTkDone(handle)
+XTkHandle handle;
+X{
+XTkInfo *info;
+Xint t=0;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) TkFatal("no handle for cleanup");
+X	if (info->f) {
+X		t = ferror(info->f) || fclose(info->f);
+X		if (t) TkFileWarn(info,"error closing file");
+X	}
+X	if (info->filename) free(info->filename);
+X	if (info->pbchars) free(info->pbchars);
+X	if (info->stringvalue) free(info->stringvalue);
+X	free((char *)info);
+X	return t;
+X}
+X
+XTkPush(handle,t)	/* allow ONE token to be pushed back */
+XTkHandle handle;
+Xint t;		/* the token to push back */
+X{
+XTkInfo *info;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) TkFatal("no handle for input");
+X	info->pushedtoken = t;
+X}
+X
+Xint		/* token type as defined in lex.h */
+XTkGet(handle)	/* returns the next input token */
+XTkHandle handle; /* the handle for the input stream as returned by TkInit */
+X{
+XTkInfo *info;
+Xint c;
+Xint negflag=0;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) TkFatal("no handle for input");
+X	if (info->pushedtoken) {
+X		c = info->pushedtoken;
+X		info->pushedtoken = 0;
+X		return c;
+X	}
+XtryAgain:
+X	c = TkGetChar(info);
+X	while (isspace(c)) {		/* skip over white space */
+X		c = TkGetChar(info);
+X	}
+X	switch (c) {
+X	case EOF:	return TkEOF;
+X	case '(':	return TkOParen;
+X	case ')':	return TkCParen;
+X	case '"':		/* start of string */
+X		info->stringcount = 0;	/* clear string */
+X		while (1) {
+X			c = TkGetChar(info);
+X			switch (c) {
+X			case EOF:
+X				TkFileWarn(info,"EOF in string");
+X				goto stringDone;
+X			case '\\':
+X				if ((c=TkGetChar(info))=='\n') break;
+X				TkPushChar(info,c);
+X				c = backslash(info);
+X				StoreNextChar(info,c);
+X				break;
+X			case '\n':
+X				TkPushChar(info,c);	/* for err msg */
+XTkFileWarn(info,"newline in string - string terminated");
+X				/* FALL THROUGH */
+X			case '"':
+X				goto stringDone;
+X			default:
+X				if (isprint(c))
+X					StoreNextChar(info,c);
+X				else
+XTkFileWarn(info,"illegal character (%03o) in string - ignored",c);
+X				break;
+X			}
+X		}
+XstringDone:
+X		StoreNextChar(info,'\000');
+X		return TkString;
+X	case '/':		/* possibly start of comment */
+X		if ((c=TkGetChar(info))!='*') {
+X			TkPushChar(info,c);
+X			c = '/';
+X			goto notComment;
+X		}
+X		while (1) {	/* exit via goto or return */
+X			c = TkGetChar(info);
+X			if (c==EOF) {
+X				TkFileWarn(info,"EOF in comment");
+X				return TkEOF;
+X			}
+X			if (c=='*') {
+X				c = TkGetChar(info);
+X				if (c=='/') goto tryAgain;  /* end of comment */
+X				else TkPushChar(info,c); /* in case ** */
+X			}
+X		}
+X	case '-':		/* possible negative number */
+X		c = TkGetChar(info);
+X		if (!isdigit(c)) {
+X			TkPushChar(info,c);
+X			/* if not a digit, put it back and complain
+X			 * about the '-' below */
+X			c = '-';
+X		}
+X		else {
+X		    /* if it is a digit, leave it in c to be picked up below */
+X			negflag = 1;
+X		}
+X		break;
+X	default:	break;	/* fall out of switch, do more checking */
+X	}
+X	if (isdigit(c)) {
+X		info->stringcount = 0;
+X		if (negflag) StoreNextChar(info,'-');
+X		while (isdigit(c)) {
+X			StoreNextChar(info,c);
+X			c = TkGetChar(info);
+X		}
+X		TkPushChar(info,c);	/* put back that last char */
+X		StoreNextChar(info,'\000');
+X		return TkNumber;
+X	}
+X	if (isalpha(c)||c=='_') {	/* symbol */
+X		info->stringcount = 0;
+X		while (isalnum(c)||c=='_') {
+X			StoreNextChar(info,c);
+X			c = TkGetChar(info);
+X		}
+X		TkPushChar(info,c);	/* put back that last char */
+X		StoreNextChar(info,'\000');
+X		return TkSymbol;
+X	}
+XnotComment:
+X	TkFileWarn(info, "illegal character (%c, %03o) in input - ignored",
+X		c, c);
+X	goto tryAgain;
+X}
+X
+Xint
+XTkNumberValue(handle)
+XTkHandle handle;
+X{
+XTkInfo *info;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) TkFatal("no handle for input");
+X	if (!info->stringvalue) TkFatal("no string for numeric value");
+X	if (info->stringvalue[0]=='-')
+X		return (-atoi(info->stringvalue+1));
+X	return atoi(info->stringvalue);
+X}
+X
+Xstatic	/* may become public at some point in the future */
+Xchar *
+XTkSStringValue(handle)	/* like TkStringValue, but doesn't copy the string */
+XTkHandle handle;
+X{
+XTkInfo *info;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) TkFatal("no handle for input");
+X	if (!info->stringvalue) TkFatal("no string for string value");
+X	return info->stringvalue;
+X}
+X
+Xchar *
+XTkStringValue(handle)
+XTkHandle handle;
+X{
+Xchar *oldstring,*newstring;
+X
+X	oldstring = TkSStringValue(handle);
+X	newstring = malloc((unsigned)(strlen(oldstring)+1));
+X	if (!newstring) TkFatal("no memory for string copy");
+X	strcpy(newstring,oldstring);
+X	return newstring;
+X}
+X
+Xint
+XTkLineNumber(handle)
+XTkHandle handle;
+X{
+XTkInfo *info;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) TkFatal("no handle for input");
+X	return info->lineno;
+X}
+X
+X/* Now for some debugging routines to help test things */
+X
+XTkDebugHandle(handle)	/* for debugging purposes */
+XTkHandle handle;
+X{
+XTkInfo *info;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) {
+X		TkWarn("no handle for debug");
+X		return;
+X	}
+X	TkGinfo = info;		/* set the global for debugging */
+X}
+X
+XTkPrintToken(handle,token)	/* debugging routine to print token */
+XTkHandle handle;
+Xint token;		/* token type as returned by TkGet */
+X{
+XTkInfo *info;
+X
+X	info = (TkInfo *)handle;
+X	if (!info) {
+X		TkWarn("no handle for debug");
+X		return;
+X	}
+X	printf("line %d: ",info->lineno);
+X	switch (token) {
+X	case TkEOF:
+X		printf("EOF");
+X		break;
+X	case TkNumber:
+X		printf("Number: %d",TkNumberValue(handle));
+X		break;
+X	case TkString:
+X		printf("String: \"%s\"",TkSStringValue(handle));
+X		break;
+X	case TkSymbol:
+X		printf("Symbol: %s",TkSStringValue(handle));
+X		break;
+X	case TkOParen:
+X		printf("(");
+X		break;
+X	case TkCParen:
+X		printf(")");
+X		break;
+X	default:
+X		printf("???? <%d>",token);
+X		break;
+X	}
+X	printf("\n");
+X}
+X
+X/* for debugging - scans a file, reads all tokens, and prints them
+X * all back out again. */
+XTkDebugFile(filename)
+Xchar *filename;
+X{
+XTkHandle handle;
+Xint c;
+X
+X	handle = TkInit(filename);
+X	if (!handle) {
+X		printf("can't get a handle for %s\n", filename);
+X		return 1;
+X	}
+X	for (c=TkGet(handle);c!=TkEOF;c=TkGet(handle)) {
+X		TkPrintToken(handle,c);
+X	}
+X	TkPrintToken(handle,c);
+X	TkDone(handle);	/* done with that one */
+X	return 0;
+X}
+X
+X/* end */
+END_OF_FILE
+if test 10529 -ne `wc -c <'tklex.c'`; then
+    echo shar: \"'tklex.c'\" unpacked with wrong size!
+fi
+# end of 'tklex.c'
+fi
+if test -f 'treepar.n' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'treepar.n'\"
+else
+echo shar: Extracting \"'treepar.n'\" \(18581 characters\)
+sed "s/^X//" >'treepar.n' <<'END_OF_FILE'
+X.\" treepar.1
+X.TH TREEPAR 1 " 1 March 1988"
+X.SH NAME
+Xtreepar \- A place and route (and plot) program for tree-structure data
+X
+X.SH SYNOPSIS
+X.br
+Xtreepar [-e <commands>]
+X
+X.SH DESCRIPTION
+X.I Treepar
+Xis a program which does automatic placement and routing of tree-structured
+Xdata.
+XIt reads and writes files in a textual format
+Xand knows how to plot to a few different kinds of devices.
+XThe place, route, and plot steps are split out into a number of
+Xsmall steps, which makes it possible to tweak the results of one
+Xstep before proceeding to the next.
+XThis is done by writing out a text file, modifying it, reading it
+Xback in and continuing the place and route steps where they were left off.
+X.LP
+XTreepar is intended for tree-structure data where each node in the
+Xtree has an arbitrary number of ancestors and descendants, and each
+Xnode has associated with it a block of text.
+XIt was originally written specifically to produce family trees of various
+Xkinds, but can be used for anything else which shares those characteristics.
+XThe
+X.I geneal
+Xgenealogy program can produce output in treepar format for plotting
+Xfamily trees.
+X.LP
+XTreepar will handle arbitrary network-structure data, but may not
+Xmake a very nice looking plot.
+XIt will insert feedthroughs where necessary, but is not particularly
+Xintelligent about where in the row a feedthrough should go.
+X.LP
+XTreepar uses the
+X.I spin
+Xinterpreter as a front end.
+XControl of treepar is accomplished by entering simple or complex commands
+Xto the spin interpreter, which parses and executes them.
+XWhenever a treepar command is encountered, it is executed.
+XGiven an understanding of the the spin interpreter and a list of the
+Xtreepar functions, the full capabilities of treepar are available.
+XThe list of treepar functions is described below.
+X
+X.SH SWITCHES
+X.LP
+XThere is only one command line switch, which is the
+X.I -e
+Xswitch.
+XThe argument to this switch is a fragment of spin code to be executed.
+XThis code fragment can contain any valid commands.
+XWhen the execution is done, commands are then read from standard input.
+XTypically the argument to the -e switch is a compound command which
+Xexecutes the desired function and then exits.
+XHere's an example of how the -e switch might be used:
+X.LP
+X.nf
+X.DS
+X% treepar -e '(NRead "foo.tf")(Rpar)(NPlot HPA "foo.hpa")(quit)'
+X.DE
+X
+X.SH ENVIRONMENT
+X.LP
+XTreepar uses the following environment variables:
+X.TP
+X.B HPPENNUM
+XWhen creating an HP plot file, this environment variable controls the
+Xnumber of the pen used in the SP (select pen) command.
+XBy default, it is 1.
+X.TP
+X.B DISPLAY
+XUsed by the X plot driver to determine what screen to display on.
+X
+X.SH KEY CONCEPTS
+X.LP
+XTreepar reads data from a text file.
+XThe data describes a set of boxes, connectors, and nets.
+XEach box has a size, some text inside it, and some connectors.
+XEach connector is associated with a net and a box.
+XEach net is associated with a set of connectors.
+X.LP
+XTreepar uses a channel assignment and routing approach.
+XThe place and route algorithms are optimized for
+Xappearance, not for size.
+XOptimizing for appearance is rather subjective, so treepar has been
+Xdesigned to make it easy to modify the layout of the boxes at any
+Xpoint during the place and route process.
+XHow to do this is discussed below in the function grouping describing
+Xthe place and route functions.
+X.LP
+XTreepar examines the connectivity of the boxes and assigns a
+X"generation" number to each box.
+XThe intent is that boxes with the same generation number will all come
+Xout in the same row (or column, as determined by the row direction setting).
+XThis is appropriate for things like family trees.
+X.LP
+XThe generation number is calculated by counting hops from the root.
+XThe number is either incremented or decremented depending on the
+Xdirection that a connector leaves a box,
+Xand which direction it enters another box.
+XThe direction of a connector is determined
+Xby the side of the box which the connector is on.
+XConnectors must all be on the north and south edges of a box if
+Xrows are horizontal, or on the east and west edges if rows are vertical.
+XThus
+Xif a hop moves out of box A on a south connector and into box B
+Xon a north connector, the generation number of B is one more than
+Xthe generation number of A.
+XIf a hop moves out of box A on a north connector and into box B
+Xon a south connector, the generation number of B is one less than A.
+XIf a hop moves out of box A on a north connector and into box B
+Xon a north connector, box B will have the same generation number as A.
+X.LP
+XWhen routing, the primary goal is to minimize the number
+Xof crossed lines.
+XIn a strict tree, it is always possible to generate a placement and
+Xrouting which contains no line crossings;
+Xhowever, treepar is not guaranteed to find the appropriate placement
+Xunless the root of the tree is specified to the placement routine.
+X.LP
+XThe placement and routing
+Xalgorithms in treepar will work for arbitrary networks,
+Xbut since they are based on the concept of generation numbers, they
+Xare strongly affected by which node is selected as the root.
+XThe routing algorithm will insert feedthroughs into rows as required
+Xin order to route from one channel to another, but may not put the
+Xfeedthroughs in the best location.
+XYou may want to write out a text file and make some modifications
+Xto the placement.
+X
+X.SH FUNCTIONS
+X.LP
+XAll of the treepar functions take as operands either integers, strings, or
+Xfloats;
+Xall functions return either an integer, a string, or a float.
+XIn the descriptions below, these three types of data are indicated by
+Xthe letters i, s, and d (double) appended to the operand name.
+XA type of I means an optional integer argument.
+XA type of S means an optional string argument.
+X
+X.LP
+XFile input and output routines:
+X.TP
+X.B NRead filename.s
+XReads in a file in treepar format (see the section FILE FORMAT).
+XReturns 0 if no errors reading the file.
+X.TP
+X.B NWrite filename.s
+XWrites out a file in treepar format (see the section FILE FORMAT).
+XReturns 0 if no errors writing the file.
+X
+X.LP
+XPlace and route routines:
+X.LP
+XThe place and route routines are normally executed in the order they
+Xare documented here.
+XThis is done by the Rpar command (given near the end of this list),
+Xso normally only that command needs to be executed.
+XThe commands are split up to allow tweaking to be done.
+XIf you don't like the way one of the algorithms is working, you
+Xcan modify its output before proceeding.
+XFor example, if you run Rpar and decide you want more space between
+Xthe boxes in a row, you can rerun RSelect and RSpace, then write out a file
+Xwith NWrite, edit it, read it back with NRead, and finish by executing
+XROrder, RPosition, and RRoute.
+X.TP
+X.B RSelect boxname.S
+XDetermines (selects) which row each box and net belongs to
+X(calculates the generation numbers).
+XThe argument is used to determine which box to start the ordering
+Xfrom.
+XFor any singly-connected network (or tree)
+Xdata, this argument should not affect
+Xthe row selection.
+X.TP
+X.B RUnFeed
+XRemoves any existing feedthroughs.
+X.TP
+X.B RFeed
+XInserts feedthroughs as necessary.
+XDoes not remove old feedthroughs first.
+X.TP
+X.B RReFeed
+XCalls RUnFeed then RFeed.
+X.TP
+X.B RSpace
+XGenerates the row datastructures and sizes them.
+X.TP
+X.B ROrder boxname.S
+XOrders the boxes within each row.
+XThe argument is used to determine which box to start the ordering
+Xfrom.
+XFor simple trees, the boxname is normally given as the root of the tree.
+X.TP
+X.B RPosition
+XPositions the boxes within the rows.
+X.TP
+X.B RRoute
+XDoes the channel route.
+X.TP
+X.B Rpar boxname.S
+XDoes all of the place and route steps:
+XRSelect, RReFeed, RSpace, ROrder, RPosition, and RRoute.
+XThe boxname is passed through to the called functions which take a boxname
+Xargument.
+XFor simple trees, the boxname is normally given as the root of the tree.
+X.TP
+X.B RReFeedpar boxname.S
+XDoes all of the place and route steps from ReFeed on.
+XThe boxname is passed through to the called functions which take a boxname
+Xargument.
+XFor simple trees, the boxname is normally given as the root of the tree.
+X.TP
+X.B RSpacePar boxname.S
+XDoes all of the place and route steps from RSpace on.
+XThe boxname is passed through to the called functions which take a boxname
+Xargument.
+XFor simple trees, the boxname is normally given as the root of the tree.
+X
+X.LP
+XPlotting routines:
+X.TP
+X.B NPlot dev.S file.S
+XGenerates a plot of the data.
+XThe default device is "X", which plots to the X server.
+XFor devices which output to files, such as HPA, the file argument
+Xis the name of the file to output to.
+XThe special names "stdout" and "stderr" refer to the streams of those names.
+XThe default is stdout.
+XThe file argument is ignored if the device is X.
+XAvailable devices are listed below.
+X.TP
+X.B NPlotXY dev.S file.S xcount.I ycount.I
+XGenerates a multi-page plot of the data.
+XThe dev and file arguments are treated the same as in Nplot.
+XThe xcount and ycount arguments specify the number of slices in
+Xthat dimension.
+XThus using 3 for both will produce 9 pages of output.
+XThe pages are each put into separate files, where the string _%d_%d is
+Xappended to the specified filename, with the %d's replaced by the x
+Xand y values (0 based) of that piece.
+XThe default values of xcount and ycount are 2.
+X.TP
+X.B PSetWindow lx.d ly.d hx.d hy.d
+XSets the window coordinates.
+XThis can be used to pick out a particular region to be plotted by the
+XNPlot command.
+X
+X.LP
+XMiscellaneous:
+X.TP
+X.B TFlags newflags.s
+XSets or clears flags, according to the first character in the string.
+XThe return value is a string which is a list of the flags which are
+Xset after the execution of the command.
+XIf the first character is a "+", each remaining character in the string
+Xis considered a flag character and is set.
+XIf the first character is a "-", each remaining character in the string
+Xis considered a flag character and is cleared.
+XIf the first character is a "=",
+Xall flags are cleared, then each remaining character in the string
+Xis considered a flag character and is set.
+XIf the first character is a "?", no operation is performed, but
+Xthe current list of flags which are set is returned as a string.
+XIf the first character is a "h", a help message is printed.
+XA list of the flags and what they control is given below.
+X.TP
+X.B TVersion
+XReturns a string which is the current version string for treepar.
+X
+X.SH PLOT DEVICES
+X.LP
+XThe following plot devices are supported:
+X.TP
+X.B X
+XThe X Window system, Version 10.4.
+XThe normal DISPLAY environment variable mechanism can be used to
+Xdisplay on remote screens.
+XThe filename argument to Nplot is ignored.
+X.TP
+X.B HP?
+XWhere ? is one of [ABCDE], such as "HPA" or "HPD".
+XGenerates a file with HP plot commands.
+XThe letter [ABCDE] is the paper size to generate commands for.
+X.TP
+X.B HP?R
+XWhere ? is one of [ABCDE], such as "HPAR".
+XLike HP?, but generates commands for a rotated plot.
+XThis device should be used when the picture is taller than it is wide.
+X.TP
+X.B TEST
+XOutputs a short text string for each plotting command.
+XThis is used for debugging.
+X.TP
+X.B SIZE
+XOutputs a message about the scaled size of the picture.
+XThis is used to determine the aspect ratio of the picture.
+XIt can be used to determine whether HP? or HP?R should be used,
+Xwithout having to plot the picture anywhere first.
+X
+X.SH FLAGS
+X.LP
+XThere are a number of flags which control various output options.
+XThese flags are set by the function TFlags, described above.
+XThe current state of the flags can be examined with the command
+X(TFlags "?").
+XA help message describing what the flags do is printed by the command
+X(TFlags h).
+XThe flags and their function are:
+X.TP
+X.B c
+XEnables plotting of connectors on boxes (i.e. they will be specifically
+Xmarked on the plot).
+XEach connector is marked by an X.
+XAlso output absolute connector positions in text files.
+XThis is normally used for debugging.
+X.TP
+X.B f
+XEnables plotting of feedthrough box positions.
+XEach feedthrough is marked by an X.
+XThis is normally used for debugging.
+X.TP
+X.B l
+XEnables plotting of box names.
+XThis flag is normally only set when the T flag is also set.
+X.TP
+X.B m
+XMemory debugging.
+XWhen set, calls to free memory don't do anything.
+X.TP
+X.B T
+XDisables the printing of the text associated with each box.
+XUsing +Tl is useful for seeing the names of boxes so that one
+Xcan be picked as an argument for the Rpar command.
+X
+X.SH FILE FORMAT
+X.LP
+XAt the lowest level, a treepar file consists of a series of text records.
+XEach text record consists of from zero to two keywords followed by
+Xa set of values in parentheses.
+XThe values can be either integers or strings.
+XString values are enclosed in double quotes, with C style escapes
+Xfor special characters.
+X.LP
+XAt the next level up, there are two kinds of records: schema definitions
+Xand data records.
+X.LP
+XA schema definition record has two keywords, where the first is the
+Xname of the type of record being defined, and the second is the word
+X"schema".
+XEnclosed in the parentheses are an arbitrary number of strings, each of
+Xwhich defines the name and type of one of the fields in that schema.
+XThis is represented as the string "name.t", where name is the field
+Xname and t is either an i for integer values or an s for string values.
+X.LP
+XA data record normally has one keyword, which is the name of the record
+Xtype, followed by the data in parentheses.
+XEach item of data in the parentheses must match the corresponding item
+Xin the schema definition as to type.
+XThe number of data items in the data record must be the same as in the
+Xschema definition for that data type.
+X.LP
+XIf a data record has no keyword, then it is assumed to be a data record
+Xof the same type as the previous data record or schema definition.
+XThis is a simple shorthand to reduce the number of keywords required
+Xin the file.
+X.LP
+XThe data types used in treepar are
+Xglobals, box, conn (connector), row, net,
+Xpath, and endpath.
+XEach one has a set of fields associated with it which are used by
+Xtreepar.
+XThe order of the fields does not matter.
+XExtra fields are ignored.
+XNot all record types are required, and not all fields in any given
+Xrecord type are required.
+XMany of the values are computed during the place and route process.
+XAn example text file below shows a minimal text file.
+X.LP
+XThere is only one globals data record, which has the following fields:
+X.TP
+X.B textsizex.i
+XThe width of each character.
+X.TP
+X.B textsizey.i
+XThe height of each character.
+X.TP
+X.B interrowspace.i
+XThe amount of space to put between each row.
+X.TP
+X.B rowposspace.i
+XThe amount of space to put between each box within a row.
+X.TP
+X.B trackspace.i
+XThe amount of space to put between each routed line.
+X.TP
+X.B rowdir.s
+X"H" for horizontal rows, "V" for vertical rows.
+X.TP
+X.B label.s
+XA label for the overall plot.
+X.LP
+XA box record has the following fields:
+X.TP
+X.B name.s
+XThe name of the box.
+XThis is reference by connector records.
+X.TP
+X.B sizex.i
+XThe width of the box.
+X.TP
+X.B sizey.i
+XThe height of the box.
+X.TP
+X.B orgx.i
+XThe x position of the lower left corner of the box.
+X.TP
+X.B orgy.i
+XThe y position of the lower left corner of the box.
+X.TP
+X.B text.s
+XThe text to go into the box.
+XThis text may contain newlines (using C syntax, i.e. backslash-n).
+X.TP
+X.B textx.i
+XThe x position of the text relative to the lower left corner of the box.
+X.TP
+X.B texty.i
+XThe y position of the text relative to the lower left corner of the box.
+X.TP
+X.B textpos.s
+XIndicates which part of the text is to be placed at the point given by
+Xthe textx and texty values.
+XTextpos is one of the eight compass points (e.g. "N" or "SE"), or "C"
+Xfor center.
+X.LP
+XA conn record has the following fields:
+X.TP
+X.B boxname.s
+XThe name of the box this connector is associated with.
+X.TP
+X.B name.s
+XThe name of this connector on that box.
+X.TP
+X.B x.i
+XThe x position of the connector relative to the lower left corner of
+Xthe box.
+X.TP
+X.B y.i
+XThe y position of the connector relative to the lower left corner of
+Xthe box.
+X.TP
+X.B ax.i
+XThe absolute x position of the connector.
+X.TP
+X.B ay.i
+XThe absolute y position of the connector.
+X.TP
+X.B side.s
+XThe side of the box the connector is on.
+XThis string is one of the four compass points (e.g. "N" or "E").
+X.TP
+X.B netname.s
+XThe name of the net this connector is associated with.
+X.LP
+XFor a full place and route, row records are not required.
+XA row record has the following fields:
+X.TP
+X.B rownum.i
+XThe index number of the row.
+X.TP
+X.B size.i
+XThe size of the row (in the typically short dimension).
+X.TP
+X.B pos.i
+XThe position of the row
+X(y location of the row if row direction is horizontal).
+X.LP
+XFor a full place and route, records are not required.
+XA net record has the following fields:
+X.TP
+X.B name.s
+XThe name of the net.
+XThis name is referred to by connectors.
+X.TP
+X.B rownum.i
+XThe row number which the net is in.
+X.LP
+XPath records are for specifying the path of a net.
+XA path record applies to the most recently preceding net record.
+XA path is actually specified as a series of path records, each of
+Xwhich is just a point value.
+XA path record has the following fields:
+X.TP
+X.B x.i
+XThe x position of a point in the path.
+X.TP
+X.B y.i
+XThe y position of a point in the path.
+X.LP
+XAn endpath record has no fields.
+XIt is used to terminate one path before starting another path on a net.
+XThis is only required when the path for a net is not a simple
+Xmultiline.
+X
+X.SH SAMPLE DATA FILE
+X.LP
+XHere is a very small text file which illustrates the use of some of
+Xthe record types.
+XThis is all the information which is required in order to do
+Xa full place and route.
+XNote that there are no net records or row records, and various
+Xfields are missing out of the box and connector records.
+XThese values are generated during the place and route process.
+X.LP
+X.nf
+X.DS
+Xglobals schema ("textsizex.i" "textsizey.i" "rowposspace.i"
+X      "rowdir.s" "trackspace.i" "interrowspace.i" "label.s")
+Xglobals (6 10 20 "V" 20 30 "Sample Data File")
+X
+Xbox schema ("name.s" "sizex.i" "sizey.i"
+X      "text.s" "textx.i" "texty.i" "textpos.s")
+Xconn schema ("boxname.s" "name.s" "x.i" "y.i"
+X      "side.s" "netname.s")
+X
+Xbox ("I74" 84 60 "Strauss\\n\\
+X=======\\n\\
+X[74] Hirsch\\n\\
+X b: ca 1850?\\n\\
+X" 6 50 "NW")
+Xconn ("I74" "i74" 72 23 "E" "i74")
+Xconn ("I74" "i80" 0 50 "W" "i80")
+X
+Xbox ("I80" 60 50 "Levi\\n\\
+X====\\n\\
+X[80] Ben\\n\\
+X" 6 40 "NW")
+Xconn ("I80" "i80" 54 13 "E" "i80")
+X.DE
+X
+X.SH BUGS
+X.LP
+XThe routing algorithm sometimes does not notice when two connectors
+Xon opposites sides of a routing channel are directly across from
+Xeach other but not on the same net;
+Xit may generate lines which overlap.
+XA workaround is to output a text file, modify the positions of the boxes,
+Xand finish the place and route with RRoute.
+X.LP
+XConnectors which are not on an appropriate side (for example, an East
+Xconnector when row direction is horizontal) may cause strange results.
+END_OF_FILE
+if test 18581 -ne `wc -c <'treepar.n'`; then
+    echo shar: \"'treepar.n'\" unpacked with wrong size!
+fi
+# end of 'treepar.n'
+fi
+echo shar: End of archive 2 \(of 3\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

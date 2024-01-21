@@ -1,0 +1,2350 @@
+Subject:  v08i010:  A Micro-Emacs variant that resembles GNU Emacs
+Newsgroups: mod.sources
+Approved: mirror!rs
+
+Submitted by: Bob Larson <seismo!usc-oberon!blarson>
+Mod.sources: Volume 8, Issue 10
+Archive-name: micrognu/Part03
+
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	line.c
+#	main.c
+#	paragraph.c
+#	random.c
+#	region.c
+#	prefix.c
+#	version.c
+#	word.c
+# This archive created: Sat Nov 15 15:02:19 1986
+export PATH; PATH=/bin:$PATH
+if test -f 'line.c'
+then
+	echo shar: will not over-write existing file "'line.c'"
+else
+cat << \SHAR_EOF > 'line.c'
+/*
+ *		Text line handling.
+ * The functions in this file
+ * are a general set of line management
+ * utilities. They are the only routines that
+ * touch the text. They also touch the buffer
+ * and window structures, to make sure that the
+ * necessary updating gets done. There are routines
+ * in this file that handle the kill buffer too.
+ * It isn't here for any good reason.
+ *
+ * Note that this code only updates the dot and
+ * mark values in the window list. Since all the code
+ * acts on the current window, the buffer that we
+ * are editing must be being displayed, which means
+ * that "b_nwnd" is non zero, which means that the
+ * dot and mark values in the buffer headers are
+ * nonsense.
+ */
+#include	"def.h"
+
+#define	NBLOCK	16			/* Line block chunk size	*/
+
+#ifndef	KBLOCK
+#define	KBLOCK	256			/* Kill buffer block size.	*/
+#endif
+
+static char	*kbufp	= NULL;		/* Kill buffer data.		*/
+static RSIZE	kused	= 0;		/* # of bytes used in KB.	*/
+static RSIZE	ksize	= 0;		/* # of bytes allocated in KB.	*/
+static RSIZE	kstart  = 0;		/* # of first used byte in KB.	*/
+char	*malloc();
+/*
+ * This routine allocates a block
+ * of memory large enough to hold a LINE
+ * containing "used" characters. The block is
+ * always rounded up a bit. Return a pointer
+ * to the new block, or NULL if there isn't
+ * any memory left. Print a message in the
+ * message line if no space.
+ */
+LINE	*
+lalloc(used) register RSIZE used; {
+	register LINE	*lp;
+	register int	size;
+
+	/*NOSTRICT*/
+	size = (NBLOCK-1+used) & ~(NBLOCK-1);
+	if (size == 0)				/* Assume that an empty	*/
+		size = NBLOCK;			/* line is for type-in.	*/
+	/*NOSTRICT*/
+	if ((lp=(LINE *)malloc(sizeof(LINE)+size)) == NULL) {
+		ewprintf("Can't get %d bytes", sizeof(LINE) + size);
+		return (NULL);
+	}
+	lp->l_size = size;
+	/*NOSTRICT*/
+	lp->l_used = used;
+	return (lp);
+}
+
+/*
+ * Delete line "lp". Fix all of the
+ * links that might point at it (they are
+ * moved to offset 0 of the next line.
+ * Unlink the line from whatever buffer it
+ * might be in. Release the memory. The
+ * buffers are updated too; the magic conditions
+ * described in the above comments don't hold
+ * here.
+ */
+lfree(lp) register LINE *lp; {
+	register BUFFER	*bp;
+	register WINDOW	*wp;
+
+	wp = wheadp;
+	while (wp != NULL) {
+		if (wp->w_linep == lp)
+			wp->w_linep = lp->l_fp;
+		if (wp->w_dotp  == lp) {
+			wp->w_dotp  = lp->l_fp;
+			wp->w_doto  = 0;
+		}
+		if (wp->w_markp == lp) {
+			wp->w_markp = lp->l_fp;
+			wp->w_marko = 0;
+		}
+		wp = wp->w_wndp;
+	}
+	bp = bheadp;
+	while (bp != NULL) {
+		if (bp->b_nwnd == 0) {
+			if (bp->b_dotp  == lp) {
+				bp->b_dotp = lp->l_fp;
+				bp->b_doto = 0;
+			}
+			if (bp->b_markp == lp) {
+				bp->b_markp = lp->l_fp;
+				bp->b_marko = 0;
+			}
+		}
+		bp = bp->b_bufp;
+	}
+	lp->l_bp->l_fp = lp->l_fp;
+	lp->l_fp->l_bp = lp->l_bp;
+	free((char *) lp);
+}
+
+/*
+ * This routine gets called when
+ * a character is changed in place in the
+ * current buffer. It updates all of the required
+ * flags in the buffer and window system. The flag
+ * used is passed as an argument; if the buffer is being
+ * displayed in more than 1 window we change EDIT to
+ * HARD. Set MODE if the mode line needs to be
+ * updated (the "*" has to be set).
+ */
+lchange(flag) register int flag; {
+	register WINDOW	*wp;
+
+	if (curbp->b_nwnd != 1)			/* Ensure hard.		*/
+		flag = WFHARD;
+	if ((curbp->b_flag&BFCHG) == 0) {	/* First change, so 	*/
+		flag |= WFMODE;			/* update mode lines.	*/
+		curbp->b_flag |= BFCHG;
+	}
+	wp = wheadp;
+	while (wp != NULL) {
+		if (wp->w_bufp == curbp)
+			wp->w_flag |= flag;
+		wp = wp->w_wndp;
+	}
+}
+
+/*
+ * Insert "n" copies of the character "c"
+ * at the current location of dot. In the easy case
+ * all that happens is the text is stored in the line.
+ * In the hard case, the line has to be reallocated.
+ * When the window list is updated, take special
+ * care; I screwed it up once. You always update dot
+ * in the current window. You update mark, and a
+ * dot in another window, if it is greater than
+ * the place where you did the insert. Return TRUE
+ * if all is well, and FALSE on errors.
+ */
+linsert(n, c) RSIZE n; {
+	register char	*cp1;
+	register char	*cp2;
+	register LINE	*lp1;
+	register LINE	*lp2;
+	register LINE	*lp3;
+	register int	doto;
+	register RSIZE	i;
+	register WINDOW	*wp;
+
+	lchange(WFEDIT);
+	lp1 = curwp->w_dotp;			/* Current line		*/
+	if (lp1 == curbp->b_linep) {		/* At the end: special	*/
+		if (curwp->w_doto != 0) {
+			ewprintf("bug: linsert");
+			return (FALSE);
+		}
+		if ((lp2=lalloc(n)) == NULL)	/* Allocate new line	*/
+			return (FALSE);
+		lp3 = lp1->l_bp;		/* Previous line	*/
+		lp3->l_fp = lp2;		/* Link in		*/
+		lp2->l_fp = lp1;
+		lp1->l_bp = lp2;
+		lp2->l_bp = lp3;
+		for (i=0; i<n; ++i)
+			lp2->l_text[i] = c;
+		wp = wheadp;			/* Update windows	*/
+		while (wp != NULL) {
+			if (wp->w_linep == lp1)
+				wp->w_linep = lp2;
+			if (wp->w_dotp == lp1)
+				wp->w_dotp = lp2;
+			if (wp->w_markp == lp1)
+				wp->w_markp = lp2;
+			wp = wp->w_wndp;
+		}
+		/*NOSTRICT*/
+		curwp->w_doto = n;
+		return (TRUE);
+	}
+	doto = curwp->w_doto;			/* Save for later.	*/
+	/*NOSTRICT (2) */
+	if (lp1->l_used+n > lp1->l_size) {	/* Hard: reallocate	*/
+		if ((lp2=lalloc((RSIZE) (lp1->l_used+n))) == NULL)
+			return (FALSE);
+		cp1 = &lp1->l_text[0];
+		cp2 = &lp2->l_text[0];
+		while (cp1 != &lp1->l_text[doto])
+			*cp2++ = *cp1++;
+		/*NOSTRICT*/
+		cp2 += n;
+		while (cp1 != &lp1->l_text[lp1->l_used])
+			*cp2++ = *cp1++;
+		lp1->l_bp->l_fp = lp2;
+		lp2->l_fp = lp1->l_fp;
+		lp1->l_fp->l_bp = lp2;
+		lp2->l_bp = lp1->l_bp;
+		free((char *) lp1);
+	} else {				/* Easy: in place	*/
+		lp2 = lp1;			/* Pretend new line	*/
+		/*NOSTRICT*/
+		lp2->l_used += n;
+		cp2 = &lp1->l_text[lp1->l_used];
+
+		cp1 = cp2-n;
+		while (cp1 != &lp1->l_text[doto])
+			*--cp2 = *--cp1;
+	}
+	for (i=0; i<n; ++i)			/* Add the characters	*/
+		lp2->l_text[doto+i] = c;
+	wp = wheadp;				/* Update windows	*/
+	while (wp != NULL) {
+		if (wp->w_linep == lp1)
+			wp->w_linep = lp2;
+		if (wp->w_dotp == lp1) {
+			wp->w_dotp = lp2;
+			if (wp==curwp || wp->w_doto>doto)
+				/*NOSTRICT*/
+				wp->w_doto += n;
+		}
+		if (wp->w_markp == lp1) {
+			wp->w_markp = lp2;
+			if (wp->w_marko > doto)
+				/*NOSTRICT*/
+				wp->w_marko += n;
+		}
+		wp = wp->w_wndp;
+	}
+	return (TRUE);
+}
+
+/*
+ * Insert a newline into the buffer
+ * at the current location of dot in the current
+ * window. The funny ass-backwards way it does things
+ * is not a botch; it just makes the last line in
+ * the file not a special case. Return TRUE if everything
+ * works out and FALSE on error (memory allocation
+ * failure). The update of dot and mark is a bit
+ * easier then in the above case, because the split
+ * forces more updating.
+ */
+lnewline() {
+	register char	*cp1;
+	register char	*cp2;
+	register LINE	*lp1;
+	register LINE	*lp2;
+	register int	doto;
+	register WINDOW	*wp;
+
+	lchange(WFHARD);
+	lp1  = curwp->w_dotp;			/* Get the address and	*/
+	doto = curwp->w_doto;			/* offset of "."	*/
+	if ((lp2=lalloc((RSIZE) doto)) == NULL)	/* New first half line	*/
+		return (FALSE);
+	cp1 = &lp1->l_text[0];			/* Shuffle text around	*/
+	cp2 = &lp2->l_text[0];
+	while (cp1 != &lp1->l_text[doto])
+		*cp2++ = *cp1++;
+	cp2 = &lp1->l_text[0];
+	while (cp1 != &lp1->l_text[lp1->l_used])
+		*cp2++ = *cp1++;
+	lp1->l_used -= doto;
+	lp2->l_bp = lp1->l_bp;
+	lp1->l_bp = lp2;
+	lp2->l_bp->l_fp = lp2;
+	lp2->l_fp = lp1;
+	wp = wheadp;				/* Windows		*/
+	while (wp != NULL) {
+		if (wp->w_linep == lp1)
+			wp->w_linep = lp2;
+		if (wp->w_dotp == lp1) {
+			if (wp->w_doto < doto)
+				wp->w_dotp = lp2;
+			else
+				wp->w_doto -= doto;
+		}
+		if (wp->w_markp == lp1) {
+			if (wp->w_marko < doto)
+				wp->w_markp = lp2;
+			else
+				wp->w_marko -= doto;
+		}
+		wp = wp->w_wndp;
+	}	
+	return (TRUE);
+}
+
+/*
+ * This function deletes "n" bytes,
+ * starting at dot. It understands how do deal
+ * with end of lines, etc. It returns TRUE if all
+ * of the characters were deleted, and FALSE if
+ * they were not (because dot ran into the end of
+ * the buffer. The "kflag" indicates either no insertion,
+ * or direction of insertion into the kill buffer.
+ */
+ldelete(n, kflag) RSIZE n; {
+	register char	*cp1;
+	register char	*cp2;
+	register LINE	*dotp;
+	register int	doto;
+	register RSIZE	chunk;
+	register WINDOW	*wp;
+
+	/*
+	 * HACK - doesn't matter, and fixes back-over-nl bug for empty
+	 *	kill buffers.
+	 */
+	if (kused == kstart) kflag = KFORW;
+
+	while (n != 0) {
+		dotp = curwp->w_dotp;
+		doto = curwp->w_doto;
+		if (dotp == curbp->b_linep)	/* Hit end of buffer.	*/
+			return (FALSE);
+		chunk = dotp->l_used-doto;	/* Size of chunk.	*/
+		if (chunk > n)
+			chunk = n;
+		if (chunk == 0) {		/* End of line, merge.	*/
+			lchange(WFHARD);
+			if (ldelnewline() == FALSE
+			|| (kflag!=KNONE && kinsert('\n', kflag)==FALSE))
+				return (FALSE);
+			--n;
+			continue;
+		}
+		lchange(WFEDIT);
+		cp1 = &dotp->l_text[doto];	/* Scrunch text.	*/
+		cp2 = cp1 + chunk;
+		if (kflag == KFORW) {
+			while (ksize - kused < chunk)
+				if (kgrow(FALSE) == FALSE) return FALSE;
+			bcopy(cp1, &(kbufp[kused]), (int) chunk);
+			kused += chunk;
+		} else if (kflag == KBACK) {
+			while (kstart < chunk)
+				if (kgrow(TRUE) == FALSE) return FALSE;
+			bcopy(cp1, &(kbufp[kstart-chunk]), (int) chunk);
+			kstart -= chunk;
+		} else if (kflag != KNONE) panic("broken ldelete call");
+		while (cp2 != &dotp->l_text[dotp->l_used])
+			*cp1++ = *cp2++;
+		dotp->l_used -= (int) chunk;
+		wp = wheadp;			/* Fix windows		*/
+		while (wp != NULL) {
+			if (wp->w_dotp==dotp && wp->w_doto>=doto) {
+				/*NOSTRICT*/
+				wp->w_doto -= chunk;
+				if (wp->w_doto < doto)
+					wp->w_doto = doto;
+			}	
+			if (wp->w_markp==dotp && wp->w_marko>=doto) {
+				/*NOSTRICT*/
+				wp->w_marko -= chunk;
+				if (wp->w_marko < doto)
+					wp->w_marko = doto;
+			}
+			wp = wp->w_wndp;
+		}
+		n -= chunk;
+	}
+	return (TRUE);
+}
+
+/*
+ * Delete a newline. Join the current line
+ * with the next line. If the next line is the magic
+ * header line always return TRUE; merging the last line
+ * with the header line can be thought of as always being a
+ * successful operation, even if nothing is done, and this makes
+ * the kill buffer work "right". Easy cases can be done by
+ * shuffling data around. Hard cases require that lines be moved
+ * about in memory. Return FALSE on error and TRUE if all
+ * looks ok.
+ */
+ldelnewline() {
+	register char	*cp1;
+	register char	*cp2;
+	register LINE	*lp1;
+	register LINE	*lp2;
+	register LINE	*lp3;
+	register WINDOW	*wp;
+
+	lp1 = curwp->w_dotp;
+	lp2 = lp1->l_fp;
+	if (lp2 == curbp->b_linep) {		/* At the buffer end.	*/
+		if (lp1->l_used == 0)		/* Blank line.		*/
+			lfree(lp1);
+		return (TRUE);
+	}
+	if (lp2->l_used <= lp1->l_size-lp1->l_used) {
+		cp1 = &lp1->l_text[lp1->l_used];
+		cp2 = &lp2->l_text[0];
+		while (cp2 != &lp2->l_text[lp2->l_used])
+			*cp1++ = *cp2++;
+		wp = wheadp;
+		while (wp != NULL) {
+			if (wp->w_linep == lp2)
+				wp->w_linep = lp1;
+			if (wp->w_dotp == lp2) {
+				wp->w_dotp  = lp1;
+				wp->w_doto += lp1->l_used;
+			}
+			if (wp->w_markp == lp2) {
+				wp->w_markp  = lp1;
+				wp->w_marko += lp1->l_used;
+			}
+			wp = wp->w_wndp;
+		}		
+		lp1->l_used += lp2->l_used;
+		lp1->l_fp = lp2->l_fp;
+		lp2->l_fp->l_bp = lp1;
+		free((char *) lp2);
+		return (TRUE);
+	}
+	if ((lp3=lalloc((RSIZE) (lp1->l_used+lp2->l_used))) == NULL)
+		return (FALSE);
+	cp1 = &lp1->l_text[0];
+	cp2 = &lp3->l_text[0];
+	while (cp1 != &lp1->l_text[lp1->l_used])
+		*cp2++ = *cp1++;
+	cp1 = &lp2->l_text[0];
+	while (cp1 != &lp2->l_text[lp2->l_used])
+		*cp2++ = *cp1++;
+	lp1->l_bp->l_fp = lp3;
+	lp3->l_fp = lp2->l_fp;
+	lp2->l_fp->l_bp = lp3;
+	lp3->l_bp = lp1->l_bp;
+	wp = wheadp;
+	while (wp != NULL) {
+		if (wp->w_linep==lp1 || wp->w_linep==lp2)
+			wp->w_linep = lp3;
+		if (wp->w_dotp == lp1)
+			wp->w_dotp  = lp3;
+		else if (wp->w_dotp == lp2) {
+			wp->w_dotp  = lp3;
+			wp->w_doto += lp1->l_used;
+		}
+		if (wp->w_markp == lp1)
+			wp->w_markp  = lp3;
+		else if (wp->w_markp == lp2) {
+			wp->w_markp  = lp3;
+			wp->w_marko += lp1->l_used;
+		}
+		wp = wp->w_wndp;
+	}
+	free((char *) lp1);
+	free((char *) lp2);
+	return (TRUE);
+}
+
+/*
+ * Replace plen characters before dot with argument string.
+ * Control-J characters in st are interpreted as newlines.
+ * There is a casehack disable flag (normally it likes to match
+ * case of replacement to what was there).
+ */
+lreplace(plen, st, f)
+register RSIZE	plen;			/* length to remove		*/
+char		*st;			/* replacement string		*/
+int		f;			/* case hack disable		*/
+{
+	register RSIZE	rlen;		/* replacement length		*/
+	register int	rtype;		/* capitalization 		*/
+	register int	c;		/* used for random characters	*/
+	register int	doto;		/* offset into line		*/
+
+	/*
+	 * Find the capitalization of the word that was found.
+	 * f says use exact case of replacement string (same thing that
+	 * happens with lowercase found), so bypass check.
+	 */
+	/*NOSTRICT*/
+	(VOID) backchar(TRUE, (int) plen, KRANDOM);
+	rtype = _L;
+	c = lgetc(curwp->w_dotp, curwp->w_doto);
+	if (ISUPPER(c)!=FALSE  &&  f==FALSE) {
+		rtype = _U|_L;
+		if (curwp->w_doto+1 < llength(curwp->w_dotp)) {
+			c = lgetc(curwp->w_dotp, curwp->w_doto+1);
+			if (ISUPPER(c) != FALSE) {
+				rtype = _U;
+			}
+		}
+	}
+
+	/*
+	 * make the string lengths match (either pad the line
+	 * so that it will fit, or scrunch out the excess).
+	 * be careful with dot's offset.
+	 */
+	rlen = strlen(st);
+	doto = curwp->w_doto;
+	if (plen > rlen)
+		(VOID) ldelete((RSIZE) (plen-rlen), KNONE);
+	else if (plen < rlen) {
+		if (linsert((RSIZE) (rlen-plen), ' ') == FALSE)
+			return (FALSE);
+	}
+	curwp->w_doto = doto;
+
+	/*
+	 * do the replacement:  If was capital, then place first 
+	 * char as if upper, and subsequent chars as if lower.  
+	 * If inserting upper, check replacement for case.
+	 */
+	while ((c = *st++&0xff) != '\0') {
+		if ((rtype&_U)!=0  &&  ISLOWER(c)!=0)
+			c = TOUPPER(c);
+		if (rtype == (_U|_L))
+			rtype = _L;
+		if (c == SEOL) {
+			if (curwp->w_doto == llength(curwp->w_dotp))
+				(VOID) forwchar(FALSE, 1, KRANDOM);
+			else {
+				if (ldelete((RSIZE) 1, KNONE) != FALSE)
+					(VOID) lnewline();
+			}
+		} else if (curwp->w_dotp == curbp->b_linep) {
+			(VOID) linsert((RSIZE) 1, c);
+		} else if (curwp->w_doto == llength(curwp->w_dotp)) {
+			if (ldelete((RSIZE) 1, KNONE) != FALSE)
+				(VOID) linsert((RSIZE) 1, c);
+		} else
+			lputc(curwp->w_dotp, curwp->w_doto++, c);
+	}
+	lchange(WFHARD);
+	return (TRUE);
+}
+
+/*
+ * Delete all of the text
+ * saved in the kill buffer. Called by commands
+ * when a new kill context is being created. The kill
+ * buffer array is released, just in case the buffer has
+ * grown to immense size. No errors.
+ */
+kdelete() {
+	if (kbufp != NULL) {
+		free((char *) kbufp);
+		kbufp = NULL;
+		kstart = kused = ksize = 0;
+	}
+}
+
+/*
+ * Insert a character to the kill buffer,
+ * enlarging the buffer if there isn't any room. Always
+ * grow the buffer in chunks, on the assumption that if you
+ * put something in the kill buffer you are going to put
+ * more stuff there too later. Return TRUE if all is
+ * well, and FALSE on errors. Print a message on
+ * errors. Dir says whether to put it at back or front.
+ */
+kinsert(c, dir) {
+
+	if (kused == ksize && dir == KFORW && kgrow(FALSE) == FALSE)
+		return FALSE;
+	if (kstart == 0 && dir == KBACK && kgrow(TRUE) == FALSE)
+		return FALSE;
+	if (dir == KFORW) kbufp[kused++] = c;
+	else if (dir == KBACK) kbufp[--kstart] = c;
+	else panic("broken kinsert call");		/* Oh shit! */
+	return (TRUE);
+}
+
+/*
+ * kgrow - just get more kill buffer for the callee. back is true if
+ * we are trying to get space at the beginning of the kill buffer.
+ */
+kgrow(back) {
+	register int	nstart;
+	register char	*nbufp;
+
+	if ((nbufp=malloc((int)(ksize+KBLOCK))) == NULL) {
+		ewprintf("Can't get %ld bytes", (long)(ksize+KBLOCK));
+		return (FALSE);
+	}
+	nstart = (back == TRUE) ? (kstart + KBLOCK) : (KBLOCK / 4) ;
+	bcopy(&(kbufp[kstart]), &(nbufp[nstart]), (int) (kused-kstart));
+	if (kbufp != NULL)
+		free((char *) kbufp);
+	kbufp  = nbufp;
+	ksize += KBLOCK;
+	kused = kused - kstart + nstart;
+	kstart = nstart;
+	return TRUE;
+}
+
+/*
+ * This function gets characters from
+ * the kill buffer. If the character index "n" is
+ * off the end, it returns "-1". This lets the caller
+ * just scan along until it gets a "-1" back.
+ */
+kremove(n) {
+	if (n < 0 || n + kstart >= kused)
+		return (-1);
+	return (kbufp[n + kstart] & 0xFF);
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'main.c'
+then
+	echo shar: will not over-write existing file "'main.c'"
+else
+cat << \SHAR_EOF > 'main.c'
+/*
+ *		Mainline, macro commands.
+ */
+#include	"def.h"
+
+int	thisflag;			/* Flags, this command		*/
+int	lastflag;			/* Flags, last command		*/
+int	curgoal;			/* Goal column			*/
+BUFFER	*curbp;				/* Current buffer		*/
+WINDOW	*curwp;				/* Current window		*/
+BUFFER	*bheadp;			/* BUFFER listhead		*/
+WINDOW	*wheadp = (WINDOW *)NULL;	/* WINDOW listhead		*/
+KEY	kbdm[NKBDM] = {(KCTLX|')')};	/* Macro			*/
+KEY	*kbdmip;			/* Input  for above		*/
+KEY	*kbdmop;			/* Output for above		*/
+char	pat[NPAT];			/* Pattern			*/
+#ifdef	HASH
+SYMBOL	*symbol[NSHASH];		/* Symbol table listhead.	*/
+#else
+/* should really be a *symbol, but don't want to break the hash code yet */
+SYMBOL	*symbol[1];
+#endif
+SYMBOL	*binding[NKEYS];		/* Key bindings.		*/
+#ifdef	DPROMPT
+extern char prompt[], *promptp;		/* delayed prompting		*/
+#endif
+
+main(argc, argv) char *argv[]; {
+	register KEY	c;
+	register int	f;
+	register int	n;
+	register int	mflag;
+#ifdef	STARTUP
+	char		*sfile, *startupfile();
+#endif
+	char		bname[NBUFN];
+
+#ifdef SYSINIT
+	SYSINIT;				/* system dependent.	*/
+#endif
+	vtinit();				/* Virtual terminal.	*/
+	edinit();				/* Buffers, windows.	*/
+	keymapinit();				/* Symbols, bindings.	*/
+	/* doing update() before reading files causes the error messages from
+	 * the file I/O show up on the screen.  (and also an extra display
+	 * of the mode line if there are files specified on the command line.)
+	 */
+	update();
+#ifdef	STARTUP					/* User startup file.	*/
+	if ((sfile = startupfile()) != NULL)
+		(VOID) load(sfile);
+#endif
+	while (--argc > 0) {
+		makename(bname, *++argv);
+		curbp = bfind(bname, TRUE);
+		(VOID) showbuffer(curbp, curwp, 0);
+		(VOID) readin(*argv);
+	}
+	lastflag = 0;				/* Fake last flags.	*/
+loop:
+#ifdef	DPROMPT
+	*(promptp = prompt) = '\0';
+	if(epresf == KPROMPT) eerase();
+#endif
+	update();				/* Fix up the screen.	*/
+	c = getkey(KPROMPT);
+	if (epresf == TRUE) {
+		eerase();
+		update();
+	}
+	f = FALSE;
+	n = 1;
+	if (((KMETA|'0') <= c && c <= (KMETA|'9')) || c == (KMETA|'-')) {
+		f = TRUE;
+		c = c & ~KMETA;
+	} else if (c == (KCTRL|'U')) {
+		f = TRUE;
+		n = 4;
+		while ((c=getkey(KNOMAC | KPROMPT)) == (KCTRL|'U')) 
+			n *= 4;
+	}
+	if (f == TRUE) {
+		if ((c>='0' && c<='9') || c=='-') {
+			if (c == '-') {
+				n = 0;
+				mflag = TRUE;
+			} else {
+				n = ((int) c) - '0';
+				mflag = FALSE;
+			}
+			while ((c=getkey(KNOMAC | KPROMPT))>='0' && c<='9')
+				n = 10*n + ((int) c) - '0';
+			if (mflag != FALSE)
+				n = -n;
+		}
+	}
+	if (kbdmip != NULL) {			/* Terminate macros.	*/
+		if (c!=(KCTLX|')') && kbdmip>&kbdm[NKBDM-6]) {
+			(VOID) ctrlg(FALSE, 0, KRANDOM);
+			goto loop;
+		}
+		if (f != FALSE) {
+			kbdmip[-1] = (KEY) (KCTRL|'U');/* overwrite ESC */
+			*kbdmip++ = (KEY) n;
+			*kbdmip++ = (KEY) c;
+		}
+	}
+	switch (execute(c, f, n)) {		/* Do it.		*/
+		case TRUE: break;
+		case ABORT:
+			   ewprintf("Quit");	/* and fall through */
+		case FALSE: default:
+			   ttbeep();
+			   if (kbdmip != NULL) {
+				   kbdm[0] = (KEY) (KCTLX|')');
+				   kbdmip = NULL;
+			   }
+	}
+	goto loop;
+}
+
+/*
+ * Command execution. Look up the binding in the the
+ * binding array, and do what it says. Return a very bad status
+ * if there is no binding, or if the symbol has a type that
+ * is not usable (there is no way to get this into a symbol table
+ * entry now). Also fiddle with the flags.
+ */
+execute(c, f, n) KEY c; {
+	register SYMBOL	*sp;
+	register int	status;
+
+	if ((sp=binding[c]) != NULL) {
+		thisflag = 0;
+		status = (*sp->s_funcp)(f, n, c);
+		lastflag = thisflag;
+		return (status);
+	}
+	lastflag = 0;
+	return (FALSE);
+}
+
+/*
+ * Initialize all of the buffers
+ * and windows. The buffer name is passed down as
+ * an argument, because the main routine may have been
+ * told to read in a file by default, and we want the
+ * buffer name to be right.
+ */
+edinit() {
+	register BUFFER	*bp;
+	register WINDOW	*wp;
+
+	bheadp = NULL;
+	bp = bfind("*scratch*", TRUE);		/* Text buffer.		*/
+	wp = (WINDOW *)malloc(sizeof(WINDOW));	/* Initial window.	*/
+	if (bp==NULL || wp==NULL) panic("edinit");
+	curbp  = bp;				/* Current ones.	*/
+	wheadp = wp;
+	curwp  = wp;
+	wp->w_wndp  = NULL;			/* Initialize window.	*/
+	wp->w_bufp  = bp;
+	bp->b_nwnd  = 1;			/* Displayed.		*/
+	wp->w_linep = bp->b_linep;
+	wp->w_dotp  = bp->b_linep;
+	wp->w_doto  = 0;
+	wp->w_markp = NULL;
+	wp->w_marko = 0;
+	wp->w_toprow = 0;
+	wp->w_ntrows = nrow-2;			/* 2 = mode, echo.	*/
+	wp->w_force = 0;
+	wp->w_flag  = WFMODE|WFHARD;		/* Full.		*/
+}
+
+/*
+ * Quit command. If an argument, always
+ * quit. Otherwise confirm if a buffer has been
+ * changed and not written out. Normally bound
+ * to "C-X C-C".
+ */
+/*ARGSUSED*/
+quit(f, n, k) {
+	register int	s;
+
+	if ((s = anycb(FALSE)) == ABORT) return ABORT;
+	if (s == FALSE
+	|| eyesno("Some modified buffers exist, really exit") == TRUE) {
+		vttidy();
+		exit(GOOD);
+	}
+	return TRUE;
+}
+
+/*
+ * Begin a keyboard macro.
+ * Error if not at the top level
+ * in keyboard processing. Set up
+ * variables and return.
+ */
+/*ARGSUSED*/
+ctlxlp(f, n, k) {
+	if (kbdmip!=NULL || kbdmop!=NULL) {
+		ewprintf("Already defining kbd macro!");
+		return (FALSE);
+	}
+	ewprintf("Defining kbd macro...");
+	kbdmip = &kbdm[0];
+	return (TRUE);
+}
+
+/*
+ * End keyboard macro. Check for
+ * the same limit conditions as the
+ * above routine. Set up the variables
+ * and return to the caller.
+ */
+/*ARGSUSED*/
+ctlxrp(f, n, k) {
+	if (kbdmip == NULL) {
+		ewprintf("Not defining kbd macro.");
+		return (FALSE);
+	}
+	ewprintf("Keyboard macro defined");
+	kbdmip = NULL;
+	return (TRUE);
+}
+
+/*
+ * Execute a macro.
+ * The command argument is the
+ * number of times to loop. Quit as
+ * soon as a command gets an error.
+ * Return TRUE if all ok, else
+ * FALSE.
+ */
+/*ARGSUSED*/
+ctlxe(f, n, k) {
+	register KEY	c;
+	register int	af;
+	register int	an;
+	register int	s;
+
+	if (kbdmip!=NULL || kbdmop!=NULL) {
+		ewprintf("Not now");
+		return (FALSE);
+	}
+	if (n < 0) 
+		return (TRUE);
+	do {
+		kbdmop = &kbdm[0];
+		do {
+			af = FALSE;
+			an = 1;
+			if ((c = *kbdmop++) == (KCTRL|'U')) {
+				af = TRUE;
+				an = (int) *kbdmop++;
+				c  = *kbdmop++;
+			}
+			s = TRUE;
+		} while (c!=(KCTLX|')') && (s=execute(c, af, an))==TRUE);
+		kbdmop = NULL;
+	} while (s==TRUE && --n);
+	return (s);
+}
+
+/*
+ * User abort. Should be called by any input routine that sees a C-g
+ * to abort whatever C-g is aborting these days. Currently does
+ * nothing.
+ */
+/*ARGSUSED*/
+ctrlg(f, n, k) {
+	return (ABORT);
+}
+
+/*
+ * Display the version. All this does
+ * is copy the version string onto the echo line.
+ */
+/*ARGSUSED*/
+showversion(f, n, k) {
+
+	ewprintf(version);
+	return TRUE ;
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'paragraph.c'
+then
+	echo shar: will not over-write existing file "'paragraph.c'"
+else
+cat << \SHAR_EOF > 'paragraph.c'
+/*
+ * Code for dealing with paragraphs and filling. Adapted from MicroEMACS 3.6
+ * and GNU-ified by mwm@ucbvax.  Several bug fixes by blarson@usc-oberon.
+ */
+#include "def.h"
+
+static int	fillcol = 70 ;
+#define	MAXWORD	256
+
+/*
+ * go back to the begining of the current paragraph
+ * here we look for a <NL><NL> or <NL><TAB> or <NL><SPACE>
+ * combination to delimit the begining of a paragraph
+ */
+/*ARGSUSED*/
+gotobop(f, n, k) {
+	register int suc;	/* success of last backchar */
+
+	if (n < 0)	/* the other way...*/
+		return(gotoeop(f, -n, KRANDOM));
+
+	while (n-- > 0) {	/* for each one asked for */
+
+		/* first scan back until we are in a word */
+		suc = backchar(FALSE, 1, KRANDOM);
+		while (!inword() && suc)
+			suc = backchar(FALSE, 1, KRANDOM);
+		curwp->w_doto = 0;	/* and go to the B-O-Line */
+
+		/* and scan back until we hit a <NL><SP> <NL><TAB> or <NL><NL> */
+		while (lback(curwp->w_dotp) != curbp->b_linep)
+			if (llength(lback(curwp->w_dotp)) 
+			    && lgetc(curwp->w_dotp,0) != ' '
+			    && lgetc(curwp->w_dotp,0) != '\t')
+				curwp->w_dotp = lback(curwp->w_dotp);
+			else
+				break;
+	}
+	curwp->w_flag |= WFMOVE;	/* force screen update */
+	return TRUE;
+}
+
+/*
+ * go forword to the end of the current paragraph
+ * here we look for a <NL><NL> or <NL><TAB> or <NL><SPACE>
+ * combination to delimit the begining of a paragraph
+ */
+/*ARGSUSED*/
+gotoeop(f, n, k) {
+	register int suc;	/* success of last backchar */
+
+	if (n < 0)	/* the other way...*/
+		return(gotobop(f, -n, KRANDOM));
+
+	while (n-- > 0) {	/* for each one asked for */
+
+		/* Find the first word on/after the current line */
+		curwp->w_doto = 0;
+		suc = forwchar(FALSE, 1, KRANDOM);
+		while (!inword() && suc)
+			suc = forwchar(FALSE, 1, KRANDOM);
+		curwp->w_doto = 0;
+		if (curwp->w_dotp == curbp->b_linep)
+			break;				/* check for eob */
+		curwp->w_dotp = lforw(curwp->w_dotp);
+
+		/* and scan forword until we hit a <NL><SP> or ... */
+		while (curwp->w_dotp != curbp->b_linep) {
+			if (llength(curwp->w_dotp)
+			    && lgetc(curwp->w_dotp,0) != ' '
+			    && lgetc(curwp->w_dotp,0) != '\t')
+				curwp->w_dotp = lforw(curwp->w_dotp);
+			else
+				break;
+		}
+	}
+	curwp->w_flag |= WFMOVE;	/* force screen update */
+	return TRUE;
+}
+
+/*
+ * Fill the current paragraph according to the current
+ * fill column
+ */
+/*ARGSUSED*/
+fillpara(f, n, k) {
+	register int	c;		/* current char durring scan	*/
+	register int	wordlen;	/* length of current word	*/
+	register int	clength;	/* position on line during fill	*/
+	register int	i;		/* index during word copy	*/
+	register int	eopflag;	/* Are we at the End-Of-Paragraph? */
+	int	 	firstflag;	/* first word? (needs no space)	*/
+	int		newlength;	/* tentative new line length	*/
+	int		eolflag;	/* was at end of line		*/
+	LINE	 	*eopline;	/* pointer to line just past EOP */
+	char wbuf[MAXWORD];		/* buffer for current word	*/
+
+	/* record the pointer to the line just past the EOP */
+	(VOID) gotoeop(FALSE, 1, KRANDOM);
+	eopline = curwp->w_dotp;
+
+	/* and back top the begining of the paragraph */
+	(VOID) gotobop(FALSE, 1, KRANDOM);
+
+	/* initialize various info */
+	i = TRUE;
+	while (i == TRUE && !inword())
+		i = forwchar(FALSE, 1, KRANDOM);
+	clength = curwp->w_doto;
+	wordlen = 0;
+
+	/* scan through lines, filling words */
+	firstflag = TRUE;
+	eopflag = FALSE;
+	while (!eopflag) {
+		/* get the next character in the paragraph */
+		if (eolflag=(curwp->w_doto == llength(curwp->w_dotp))) {
+			c = ' ';
+			if (lforw(curwp->w_dotp) == eopline)
+				eopflag = TRUE;
+		} else
+			c = lgetc(curwp->w_dotp, curwp->w_doto);
+
+		/* and then delete it */
+		if (ldelete((RSIZE) 1, KNONE) == FALSE) return FALSE ;
+
+		/* if not a separator, just add it in */
+		if (c != ' ' && c != '\t') {
+			if (wordlen < MAXWORD - 1)
+				wbuf[wordlen++] = c;
+			else {
+				/* You loose chars beyond MAXWORD if the word
+				 * is to long. I'm to lazy to fix it now; it
+				 * just silently truncated the word before, so
+				 * I get to feel smug.
+				 */
+				ewprintf("Word too long!");
+			}
+		} else if (wordlen) {
+			/* calculate tenatitive new length with word added */
+			newlength = clength + 1 + wordlen;
+			/* if at end of line or at doublespace and previous
+			 * character was one of '.','?','!' doublespace here.
+			 */
+			if((eolflag || curwp->w_doto==llength(curwp->w_dotp)
+			    || (c=lgetc(curwp->w_dotp,curwp->w_doto))==' '
+			    || c=='\t')
+			  && ISEOSP(wbuf[wordlen-1])
+			  && wordlen<MAXWORD-1)
+				wbuf[wordlen++] = ' ';
+			/* at a word break with a word waiting */
+ 			if (newlength <= fillcol) {
+				/* add word to current line */
+				if (!firstflag) {
+					(VOID) linsert((RSIZE) 1, ' ');
+					++clength;
+				}
+				firstflag = FALSE;
+			} else {
+				if(curwp->w_doto > 0 &&
+				    lgetc(curwp->w_dotp,curwp->w_doto-1)==' ') {
+				    	curwp->w_doto -= 1;
+					(VOID) ldelete((RSIZE) 1, KNONE);
+				}
+				/* start a new line */
+				(VOID) lnewline();
+				clength = 0;
+			}
+
+			/* and add the word in in either case */
+			for (i=0; i<wordlen; i++) {
+				(VOID) linsert((RSIZE) 1, wbuf[i]);
+				++clength;
+			}
+			wordlen = 0;
+		}
+	}
+	/* and add a last newline for the end of our new paragraph */
+	(VOID) lnewline();
+	/* we realy should wind up where we started, (which is hard to keep
+	 * track of) but I think the end of the last line is better than the
+	 * begining of the blank line.	 */
+	(VOID) backchar(FALSE, 1, KRANDOM);
+	return TRUE;
+}
+
+/* delete n paragraphs starting with the current one */
+/*ARGSUSED*/
+killpara(f, n, k) {
+	register int status;	/* returned status of functions */
+
+	while (n--) {		/* for each paragraph to delete */
+
+		/* mark out the end and begining of the para to delete */
+		(VOID) gotoeop(FALSE, 1, KRANDOM);
+
+		/* set the mark here */
+	        curwp->w_markp = curwp->w_dotp;
+	        curwp->w_marko = curwp->w_doto;
+
+		/* go to the begining of the paragraph */
+		(VOID) gotobop(FALSE, 1, KRANDOM);
+		curwp->w_doto = 0;	/* force us to the begining of line */
+	
+		/* and delete it */
+		if ((status = killregion(FALSE, 1, KRANDOM)) != TRUE)
+			return(status);
+
+		/* and clean up the 2 extra lines */
+		(VOID) ldelete((RSIZE) 1, KFORW);
+	}
+	return(TRUE);
+}
+
+/*
+ * check to see if we're past fillcol, and if so,
+ * justify this line. As a last step, justify the line.
+ */
+/*ARGSUSED*/
+fillword(f, n, k) {
+	register char	c;
+	register int	col, i, nce;
+
+	for (i = col = 0; col <= fillcol; ++i, ++col) {
+		if (i == curwp->w_doto) return selfinsert(f, n, k) ;
+		c = lgetc(curwp->w_dotp, i);
+		if (c == '\t') col |= 0x07;
+		else if (ISCTRL(c) != FALSE) ++col;
+	}
+	if (curwp->w_doto != llength(curwp->w_dotp)) {
+		(VOID) selfinsert(f, n, k);
+		nce = llength(curwp->w_dotp) - curwp->w_doto;
+	} else nce = 0;
+	curwp->w_doto = i;
+
+	if ((c = lgetc(curwp->w_dotp, curwp->w_doto)) != ' ' && c != '\t')
+		do {
+			(VOID) backchar(FALSE, 1, KRANDOM);
+		} while ((c = lgetc(curwp->w_dotp, curwp->w_doto)) != ' '
+		      && c != '\t' && curwp->w_doto > 0);
+
+	if (curwp->w_doto == 0)
+		do {
+			(VOID) forwchar(FALSE, 1, KRANDOM);
+		} while ((c = lgetc(curwp->w_dotp, curwp->w_doto)) != ' '
+		      && c != '\t' && curwp->w_doto < llength(curwp->w_dotp));
+
+	(VOID) delwhite(FALSE, 1, KRANDOM);
+	(VOID) backdel(FALSE, 1, KRANDOM);
+	(VOID) lnewline();
+	curwp->w_doto = llength(curwp->w_dotp) - nce;
+	curwp->w_flag |= WFMOVE;
+	if (nce == 0 && curwp->w_doto != 0) return fillword(f, n, k);
+	return TRUE;
+}
+
+/* Set fill column to n. */
+/*ARGSUSED*/
+setfillcol(f, n, k) {
+	extern int	getcolpos() ;
+
+	fillcol = ((f == FALSE) ? getcolpos() : n);
+	if (kbdmop == NULL) ewprintf("Fill column set to %d", fillcol);
+        return(TRUE);
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'random.c'
+then
+	echo shar: will not over-write existing file "'random.c'"
+else
+cat << \SHAR_EOF > 'random.c'
+/*
+ *		Assorted commands.
+ * The file contains the command
+ * processors for a large assortment of unrelated
+ * commands. The only thing they have in common is
+ * that they are all command processors.
+ */
+#include	"def.h"
+
+/*
+ * Display a bunch of useful information about
+ * the current location of dot. The character under the
+ * cursor (in octal), the current line, row, and column, and
+ * approximate position of the cursor in the file (as a percentage)
+ * is displayed. The column position assumes an infinite position
+ * display; it does not truncate just because the screen does.
+ * This is normally bound to "C-X =".
+ */
+/*ARGSUSED*/
+showcpos(f, n, k) {
+	register LINE	*clp;
+	register long	nchar;
+	long		cchar;
+	register int	nline, row;
+	int		cline, cbyte;	/* Current line/char/byte */
+	int		ratio;
+	KEY		keychar();
+
+	clp = lforw(curbp->b_linep);		/* Collect the data.	*/
+	nchar = 0;
+	nline = 0;
+	for (;;) {
+		++nline;			/* Count this line	*/
+		if (clp == curwp->w_dotp) {
+			cline = nline;		/* Mark line		*/
+			cchar = nchar + curwp->w_doto;
+			if (curwp->w_doto == llength(clp))
+				cbyte = '\n';
+			else
+				cbyte = lgetc(clp, curwp->w_doto);
+		}
+		nchar += llength(clp) + 1;	/* Now count the chars	*/
+		if (clp == curbp->b_linep) break ;
+		clp = lforw(clp);
+	}
+	row = curwp->w_toprow;			/* Determine row.	*/
+	clp = curwp->w_linep;
+	while (clp!=curbp->b_linep && clp!=curwp->w_dotp) {
+		++row;
+		clp = lforw(clp);
+	}
+	++row;					/* Convert to origin 1.	*/
+	/*NOSTRICT*/	
+	/* nchar can't be zero (because of the "bonus" \n at end of file) */
+	ratio = (100L*cchar) / nchar;
+	ewprintf("Char: %c (0%o)  point=%ld(%d%%)  line=%d  row=%d  col=%d",
+		(int) keychar(cbyte, FALSE), cbyte, cchar, ratio, cline, row,
+		getcolpos());
+	return (TRUE);
+}
+
+getcolpos() {
+	register int	col, i, c;
+
+	col = 0;				/* Determine column.	*/
+	for (i=0; i<curwp->w_doto; ++i) {
+		c = lgetc(curwp->w_dotp, i);
+		if (c == '\t')
+			col |= 0x07;
+		else if (ISCTRL(c) != FALSE)
+			++col;
+		++col;
+	}
+	return col + 1;				/* Convert to origin 1.	*/
+}
+/*
+ * Twiddle the two characters on either side of
+ * dot. If dot is at the end of the line twiddle the
+ * two characters before it. Return with an error if dot
+ * is at the beginning of line; it seems to be a bit
+ * pointless to make this work. This fixes up a very
+ * common typo with a single stroke. Normally bound
+ * to "C-T". This always works within a line, so
+ * "WFEDIT" is good enough.
+ */
+/*ARGSUSED*/
+twiddle(f, n, k) {
+	register LINE	*dotp;
+	register int	doto, odoto;
+	register int	cl;
+	register int	cr;
+
+	dotp = curwp->w_dotp;
+	odoto = doto = curwp->w_doto;
+	if (doto==llength(dotp) && --doto<0)
+		return (FALSE);
+	cr = lgetc(dotp, doto);
+	if (--doto < 0)
+		return (FALSE);
+	cl = lgetc(dotp, doto);
+	lputc(dotp, doto+0, cr);
+	lputc(dotp, doto+1, cl);
+	if (odoto != llength(dotp)) ++(curwp->w_doto);
+	lchange(WFEDIT);
+	return (TRUE);
+}
+
+/*
+ * Quote the next character, and
+ * insert it into the buffer. All the characters
+ * are taken literally, with the exception of the newline,
+ * which always has its line splitting meaning. The character
+ * is always read, even if it is inserted 0 times, for
+ * regularity.
+ */
+/*ARGSUSED*/
+quote(f, n, k) {
+	register int	s;
+	register KEY	c;
+
+	if (kbdmop != NULL) c = (KEY) *kbdmop++;
+	else c = getkey(KQUOTE);
+	if (n < 0)
+		return (FALSE);
+	if (n == 0)
+		return (TRUE);
+	if (c == '\n') {
+		do {
+			s = lnewline();
+		} while (s==TRUE && --n);
+		return (s);
+	}
+	return (linsert((RSIZE) n, (char) c));
+}
+
+/*
+ * Ordinary text characters are bound to this function,
+ * which inserts them into the buffer. Characters marked as control
+ * characters (using the CTRL flag) may be remapped to their ASCII
+ * equivalent. This makes TAB (C-I) work right, and also makes the
+ * world look reasonable if a control character is bound to this
+ * this routine by hand. Any META or CTLX flags on the character
+ * are discarded. This is the only routine that actually looks
+ * the the "k" argument.
+ */
+/*ARGSUSED*/
+selfinsert(f, n, k) {
+	register int	c;
+
+	if (n < 0)
+		return (FALSE);
+	if (n == 0)
+		return (TRUE);
+	c = k & KCHAR;
+	if ((k&KCTRL)!=0 && c>='@' && c<='_')	/* ASCII-ify.		*/
+		c -= '@';
+	return (linsert((RSIZE) n, c));
+}
+
+/*
+ * Open up some blank space. The basic plan
+ * is to insert a bunch of newlines, and then back
+ * up over them. Everything is done by the subcommand
+ * procerssors. They even handle the looping. Normally
+ * this is bound to "C-O".
+ */
+/*ARGSUSED*/
+openline(f, n, k) {
+	register int	i;
+	register int	s;
+
+	if (n < 0)
+		return (FALSE);
+	if (n == 0)
+		return (TRUE);
+	i = n;					/* Insert newlines.	*/
+	do {
+		s = lnewline();
+	} while (s==TRUE && --i);
+	if (s == TRUE)				/* Then back up overtop	*/
+		s = backchar(f, n, KRANDOM);	/* of them all.		*/
+	return (s);
+}
+
+/*
+ * Insert a newline.
+ * If you are at the end of the line and the
+ * next line is a blank line, just move into the
+ * blank line. This makes "C-O" and "C-X C-O" work
+ * nicely, and reduces the ammount of screen
+ * update that has to be done. This would not be
+ * as critical if screen update were a lot
+ * more efficient.
+ */
+/*ARGSUSED*/
+newline(f, n, k) {
+	register LINE	*lp;
+	register int	s;
+
+	if (n < 0)
+		return (FALSE);
+	while (n--) {
+		lp = curwp->w_dotp;
+		if (llength(lp) == curwp->w_doto
+		&& lp != curbp->b_linep
+		&& llength(lforw(lp)) == 0) {
+			if ((s=forwchar(FALSE, 1, KRANDOM)) != TRUE)
+				return (s);
+		} else if ((s=lnewline()) != TRUE)
+			return (s);
+	}
+	return (TRUE);
+}
+
+/*
+ * Delete blank lines around dot.
+ * What this command does depends if dot is
+ * sitting on a blank line. If dot is sitting on a
+ * blank line, this command deletes all the blank lines
+ * above and below the current line. If it is sitting
+ * on a non blank line then it deletes all of the
+ * blank lines after the line. Normally this command
+ * is bound to "C-X C-O". Any argument is ignored.
+ */
+/*ARGSUSED*/
+deblank(f, n, k) {
+	register LINE	*lp1;
+	register LINE	*lp2;
+	register RSIZE	nld;
+
+	lp1 = curwp->w_dotp;
+	while (llength(lp1)==0 && (lp2=lback(lp1))!=curbp->b_linep)
+		lp1 = lp2;
+	lp2 = lp1;
+	nld = (RSIZE) 0;
+	while ((lp2=lforw(lp2))!=curbp->b_linep && llength(lp2)==0)
+		++nld;
+	if (nld == 0)
+		return (TRUE);
+	curwp->w_dotp = lforw(lp1);
+	curwp->w_doto = 0;
+	return (ldelete((RSIZE)nld, KNONE));
+}
+
+/*
+ * Delete any whitespace around dot, then insert a space.
+ */
+/*ARGSUSED*/
+delwhite(f, n, k) {
+	register int	col, c, s;
+
+	col = curwp->w_doto;
+	while ((c = lgetc(curwp->w_dotp, col)) == ' ' || c == '\t')
+		++col;
+	do
+		if ((s = backchar(FALSE, 1, KRANDOM)) == FALSE) break;
+	while ((c = lgetc(curwp->w_dotp, curwp->w_doto)) == ' ' || c == '\t') ;
+
+	if (s == TRUE) (VOID) forwchar(FALSE, 1, KRANDOM);
+	(VOID) ldelete((RSIZE)(col - curwp->w_doto), KNONE);
+	return linsert((RSIZE) 1, ' ');
+}
+/*
+ * Insert a newline, then enough
+ * tabs and spaces to duplicate the indentation
+ * of the previous line. Assumes tabs are every eight
+ * characters. Quite simple. Figure out the indentation
+ * of the current line. Insert a newline by calling
+ * the standard routine. Insert the indentation by
+ * inserting the right number of tabs and spaces.
+ * Return TRUE if all ok. Return FALSE if one
+ * of the subcomands failed. Normally bound
+ * to "C-J".
+ */
+/*ARGSUSED*/
+indent(f, n, k) {
+	register int	nicol;
+	register int	c;
+	register int	i;
+
+	if (n < 0)
+		return (FALSE);
+	while (n--) {
+		nicol = 0;
+		for (i=0; i<llength(curwp->w_dotp); ++i) {
+			c = lgetc(curwp->w_dotp, i);
+			if (c!=' ' && c!='\t')
+				break;
+			if (c == '\t')
+				nicol |= 0x07;
+			++nicol;
+		}
+		if (lnewline() == FALSE
+		|| ((i=nicol/8)!=0 && linsert((RSIZE) i, '\t')==FALSE)
+		|| ((i=nicol%8)!=0 && linsert((RSIZE) i,  ' ')==FALSE))
+			return (FALSE);
+	}
+	return (TRUE);
+}
+
+/*
+ * Delete forward. This is real
+ * easy, because the basic delete routine does
+ * all of the work. Watches for negative arguments,
+ * and does the right thing. If any argument is
+ * present, it kills rather than deletes, to prevent
+ * loss of text if typed with a big argument.
+ * Normally bound to "C-D".
+ */
+/*ARGSUSED*/
+forwdel(f, n, k) {
+	if (n < 0)
+		return (backdel(f, -n, KRANDOM));
+	if (f != FALSE) {			/* Really a kill.	*/
+		if ((lastflag&CFKILL) == 0)
+			kdelete();
+		thisflag |= CFKILL;
+	}
+	return (ldelete((RSIZE) n, f ? KFORW : KNONE));
+}
+
+/*
+ * Delete backwards. This is quite easy too,
+ * because it's all done with other functions. Just
+ * move the cursor back, and delete forwards.
+ * Like delete forward, this actually does a kill
+ * if presented with an argument.
+ */
+/*ARGSUSED*/
+backdel(f, n, k) {
+	register int	s;
+
+	if (n < 0)
+		return (forwdel(f, -n, KRANDOM));
+	if (f != FALSE) {			/* Really a kill.	*/
+		if ((lastflag&CFKILL) == 0)
+			kdelete();
+		thisflag |= CFKILL;
+	}
+	if ((s=backchar(f, n, KRANDOM)) == TRUE)
+		s = ldelete((RSIZE) n, f ? KFORW : KNONE);
+	return (s);
+}
+
+/*
+ * Kill line. If called without an argument,
+ * it kills from dot to the end of the line, unless it
+ * is at the end of the line, when it kills the newline.
+ * If called with an argument of 0, it kills from the
+ * start of the line to dot. If called with a positive
+ * argument, it kills from dot forward over that number
+ * of newlines. If called with a negative argument it
+ * kills any text before dot on the current line,
+ * then it kills back abs(arg) lines.
+ */
+/*ARGSUSED*/
+killline(f, n, k) {
+	register RSIZE	chunk;
+	register LINE	*nextp;
+	register int	i, c;
+
+	if ((lastflag&CFKILL) == 0)		/* Clear kill buffer if	*/
+		kdelete();			/* last wasn't a kill.	*/
+	thisflag |= CFKILL;
+	if (f == FALSE) {
+		for (i = curwp->w_doto; i < llength(curwp->w_dotp); ++i)
+			if ((c = lgetc(curwp->w_dotp, i)) != ' ' && c != '\t')
+				break;
+		if (i == llength(curwp->w_dotp))
+			chunk = llength(curwp->w_dotp)-curwp->w_doto + 1;
+		else {
+			chunk = llength(curwp->w_dotp)-curwp->w_doto;
+			if (chunk == 0)
+				chunk = 1;
+		}
+	} else if (n > 0) {
+		chunk = llength(curwp->w_dotp)-curwp->w_doto+1;
+		nextp = lforw(curwp->w_dotp);
+		i = n;
+		while (--i) {
+			if (nextp == curbp->b_linep)
+				break;
+			chunk += llength(nextp)+1;
+			nextp = lforw(nextp);
+		}
+	} else {				/* n <= 0		*/
+		chunk = curwp->w_doto;
+		curwp->w_doto = 0;
+		i = n;
+		while (i++) {
+			if (lback(curwp->w_dotp) == curbp->b_linep)
+				break;
+			curwp->w_dotp = lback(curwp->w_dotp);
+			curwp->w_flag |= WFMOVE;
+			chunk += llength(curwp->w_dotp)+1;
+		}
+	}
+	/*
+	 * KFORW here is a bug. Should be KBACK/KFORW, but we need to
+	 * rewrite the ldelete code (later)?
+	 */
+	return (ldelete(chunk,  KFORW));
+}
+
+/*
+ * Yank text back from the kill buffer. This
+ * is really easy. All of the work is done by the
+ * standard insert routines. All you do is run the loop,
+ * and check for errors. The blank
+ * lines are inserted with a call to "newline"
+ * instead of a call to "lnewline" so that the magic
+ * stuff that happens when you type a carriage
+ * return also happens when a carriage return is
+ * yanked back from the kill buffer.
+ * An attempt has been made to fix the cosmetic bug
+ * associated with a yank when dot is on the top line of
+ * the window (nothing moves, because all of the new
+ * text landed off screen).
+ */
+/*ARGSUSED*/
+yank(f, n, k) {
+	register int	c;
+	register int	i;
+	register LINE	*lp;
+	register int	nline;
+
+	if (n < 0)
+		return (FALSE);
+	nline = 0;				/* Newline counting.	*/
+	while (n--) {
+		isetmark();			/* mark around last yank */
+		i = 0;
+		while ((c=kremove(i)) >= 0) {
+			if (c == '\n') {
+				if (newline(FALSE, 1, KRANDOM) == FALSE)
+					return (FALSE);
+				++nline;
+			} else {
+				if (linsert((RSIZE) 1, c) == FALSE)
+					return (FALSE);
+			}
+			++i;
+		}
+	}
+	lp = curwp->w_linep;			/* Cosmetic adjustment	*/
+	if (curwp->w_dotp == lp) {		/* if offscreen insert.	*/
+		while (nline-- && lback(lp)!=curbp->b_linep)
+			lp = lback(lp);
+		curwp->w_linep = lp;		/* Adjust framing.	*/
+		curwp->w_flag |= WFHARD;
+	}
+	return (TRUE);
+}
+/*
+ * Commands to toggle the four modes. Without an argument, sets the
+ * mode on, with an argument, sets the mode off.
+ */
+/*ARGSUSED*/
+bsmapmode(f, n, k) {
+
+	if (f == FALSE) mode |= MBSMAP;
+	else mode &= ~MBSMAP;
+	upmodes((BUFFER *) NULL);
+	return TRUE;
+}
+
+/*ARGSUSED*/
+flowmode(f, n, k) {
+	if (f == FALSE) mode |= MFLOW;
+	else mode &= ~MFLOW;
+	upmodes((BUFFER *) NULL);
+	return TRUE;
+}
+
+/*ARGSUSED*/
+indentmode(f, n, k) {
+
+	if (f == FALSE) {
+		mode |= MINDENT;
+		if ((binding[KCTRL|'M'] = symlookup("newline-and-indent"))
+		    == NULL)
+			panic("no newline-and-indent in indentmode");
+		if ((binding[KCTRL|'J'] = symlookup("insert-newline")) == NULL)
+			panic("no insert-newline in indentmode");
+	} else {
+		mode &= ~MINDENT;
+		if ((binding[KCTRL|'M'] = symlookup("insert-newline")) == NULL)
+			panic("no insert-newline in indentmode");
+		if ((binding[KCTRL|'J'] = symlookup("newline-and-indent"))
+		    == NULL)
+			panic("no newline-and-indent in indentmode");
+	}
+	upmodes((BUFFER *) NULL);
+	return TRUE;
+}	
+
+/*ARGSUSED*/
+fillmode(f, n, k) {
+
+	if (f == FALSE) {
+		mode |= MFILL;
+		if ((binding[' '] = symlookup("insert-with-wrap")) == NULL)
+			panic("no insert-with-wrap in fillmode");
+	} else {
+		mode &= ~MFILL;
+		if ((binding[' '] = symlookup("self-insert-command")) == NULL)
+			panic("no self-insert-command in fillmode");
+	}
+	upmodes((BUFFER *) NULL);
+	return TRUE;
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'region.c'
+then
+	echo shar: will not over-write existing file "'region.c'"
+else
+cat << \SHAR_EOF > 'region.c'
+/*
+ *		Region based commands.
+ * The routines in this file
+ * deal with the region, that magic space
+ * between "." and mark. Some functions are
+ * commands. Some functions are just for
+ * internal use.
+ */
+#include	"def.h"
+
+/*
+ * Kill the region. Ask "getregion"
+ * to figure out the bounds of the region.
+ * Move "." to the start, and kill the characters.
+ */
+/*ARGSUSED*/
+killregion(f, n, k) {
+	register int	s;
+	REGION		region;
+
+	if ((s=getregion(&region)) != TRUE)
+		return (s);
+	if ((lastflag&CFKILL) == 0)		/* This is a kill type	*/
+		kdelete();			/* command, so do magic	*/
+	thisflag |= CFKILL;			/* kill buffer stuff.	*/
+	curwp->w_dotp = region.r_linep;
+	curwp->w_doto = region.r_offset;
+	return (ldelete(region.r_size, KFORW));
+}
+
+/*
+ * Copy all of the characters in the
+ * region to the kill buffer. Don't move dot
+ * at all. This is a bit like a kill region followed
+ * by a yank.
+ */
+/*ARGSUSED*/
+copyregion(f, n, k) {
+	register LINE	*linep;
+	register int	loffs;
+	register int	s;
+	REGION		region;
+
+	if ((s=getregion(&region)) != TRUE)
+		return (s);
+	if ((lastflag&CFKILL) == 0)		/* Kill type command.	*/
+		kdelete();
+	thisflag |= CFKILL;
+	linep = region.r_linep;			/* Current line.	*/
+	loffs = region.r_offset;		/* Current offset.	*/
+	while (region.r_size--) {
+		if (loffs == llength(linep)) {	/* End of line.		*/
+			if ((s=kinsert('\n', KFORW)) != TRUE)
+				return (s);
+			linep = lforw(linep);
+			loffs = 0;
+		} else {			/* Middle of line.	*/
+			if ((s=kinsert(lgetc(linep, loffs), KFORW)) != TRUE)
+				return (s);
+			++loffs;
+		}
+	}
+	return (TRUE);
+}
+
+/*
+ * Lower case region. Zap all of the upper
+ * case characters in the region to lower case. Use
+ * the region code to set the limits. Scan the buffer,
+ * doing the changes. Call "lchange" to ensure that
+ * redisplay is done in all buffers. 
+ */
+/*ARGSUSED*/
+lowerregion(f, n, k) {
+	register LINE	*linep;
+	register int	loffs;
+	register int	c;
+	register int	s;
+	REGION		region;
+
+	if ((s=getregion(&region)) != TRUE)
+		return (s);
+	lchange(WFHARD);
+	linep = region.r_linep;
+	loffs = region.r_offset;
+	while (region.r_size--) {
+		if (loffs == llength(linep)) {
+			linep = lforw(linep);
+			loffs = 0;
+		} else {
+			c = lgetc(linep, loffs);
+			if (ISUPPER(c) != FALSE)
+				lputc(linep, loffs, TOLOWER(c));
+			++loffs;
+		}
+	}
+	return (TRUE);
+}
+
+/*
+ * Upper case region. Zap all of the lower
+ * case characters in the region to upper case. Use
+ * the region code to set the limits. Scan the buffer,
+ * doing the changes. Call "lchange" to ensure that
+ * redisplay is done in all buffers. 
+ */
+/*ARGSUSED*/
+upperregion(f, n, k) {
+	register LINE	*linep;
+	register int	loffs;
+	register int	c;
+	register int	s;
+	REGION		region;
+
+	if ((s=getregion(&region)) != TRUE)
+		return (s);
+	lchange(WFHARD);
+	linep = region.r_linep;
+	loffs = region.r_offset;
+	while (region.r_size--) {
+		if (loffs == llength(linep)) {
+			linep = lforw(linep);
+			loffs = 0;
+		} else {
+			c = lgetc(linep, loffs);
+			if (ISLOWER(c) != FALSE)
+				lputc(linep, loffs, TOUPPER(c));
+			++loffs;
+		}
+	}
+	return (TRUE);
+}
+
+/*
+ * This routine figures out the bound of the region
+ * in the current window, and stores the results into the fields
+ * of the REGION structure. Dot and mark are usually close together,
+ * but I don't know the order, so I scan outward from dot, in both
+ * directions, looking for mark. The size is kept in a long. At the
+ * end, after the size is figured out, it is assigned to the size
+ * field of the region structure. If this assignment loses any bits,
+ * then we print an error. This is "type independent" overflow
+ * checking. All of the callers of this routine should be ready to
+ * get an ABORT status, because I might add a "if regions is big,
+ * ask before clobberring" flag.
+ */
+getregion(rp) register REGION *rp; {
+	register LINE	*flp;
+	register LINE	*blp;
+	register long	fsize;			/* Long now.		*/
+	register long	bsize;
+
+	if (curwp->w_markp == NULL) {
+		ewprintf("No mark set in this window");
+		return (FALSE);
+	}
+	if (curwp->w_dotp == curwp->w_markp) {	/* "r_size" always ok.	*/
+		rp->r_linep = curwp->w_dotp;
+		if (curwp->w_doto < curwp->w_marko) {
+			rp->r_offset = curwp->w_doto;
+			rp->r_size = (RSIZE) (curwp->w_marko-curwp->w_doto);
+		} else {
+			rp->r_offset = curwp->w_marko;
+			rp->r_size = (RSIZE) (curwp->w_doto-curwp->w_marko);
+		}
+		return (TRUE);
+	}
+	blp = curwp->w_dotp;			/* Get region size.	*/
+	flp = curwp->w_dotp;
+	bsize = curwp->w_doto;
+	fsize = llength(flp)-curwp->w_doto+1;
+	while (flp!=curbp->b_linep || lback(blp)!=curbp->b_linep) {
+		if (flp != curbp->b_linep) {
+			flp = lforw(flp);
+			if (flp == curwp->w_markp) {
+				rp->r_linep = curwp->w_dotp;
+				rp->r_offset = curwp->w_doto;
+				return (setsize(rp,
+					(RSIZE) (fsize+curwp->w_marko)));
+			}
+			fsize += llength(flp)+1;
+		}
+		if (lback(blp) != curbp->b_linep) {
+			blp = lback(blp);
+			bsize += llength(blp)+1;
+			if (blp == curwp->w_markp) {
+				rp->r_linep = blp;
+				rp->r_offset = curwp->w_marko;
+				return (setsize(rp,
+					(RSIZE) (bsize-curwp->w_marko)));
+			}
+		}
+	}
+	ewprintf("Bug: lost mark");		/* Gak!			*/
+	return (FALSE);
+}
+
+/*
+ * Set size, and check for overflow.
+ */
+setsize(rp, size) register REGION *rp; register RSIZE size; {
+
+	rp->r_size = size;
+	if (rp->r_size != size) {
+		ewprintf("Region is too large");
+		return (FALSE);
+	}
+	return (TRUE);
+}
+
+#ifdef	PREFIXREGION
+/*
+ * Implements one of my favorite keyboard macros; put a string at the
+ * beginning of a number of lines in a buffer.  The quote string is
+ * settable by using set-prefix-string.  Great for quoting mail, which
+ * is the real reason I wrote it, but also has uses for creating bar
+ * comments (like the one you're reading) in C code.
+ */
+
+#define PREFIXLENGTH 40
+static char prefix_string[PREFIXLENGTH] = { '>', '\0' };
+
+/*
+ * Prefix the region with whatever is in prefix_string.
+ * Leaves dot at the beginning of the line after the end
+ * of the region.  If an argument is given, prompts for the
+ * line prefix string.
+ */
+
+/*ARGSUSED*/
+prefixregion(f, n, k)
+{
+	register int	s;
+	register LINE	*first, *last;
+	register int	nline;
+	REGION		region;
+	char		*prefix = prefix_string;
+
+	if ((f == TRUE) && ((s = setprefix(FALSE, 1, KRANDOM)) != TRUE))
+		return (s);
+
+	/* get # of lines to affect */
+	if ((s = getregion(&region)) != TRUE)
+		return (s);
+	first = region.r_linep;
+	last = (first == curwp->w_dotp) ? curwp->w_markp : curwp->w_dotp;
+	for (nline = 1; first != last; nline++)
+		first = lforw(first);
+
+	/*move to beginning of region */
+	curwp->w_dotp = region.r_linep;
+	curwp->w_doto = region.r_offset;
+
+	/* for each line, go to beginning and insert the prefix string */
+	while (nline--) {
+		gotobol();
+		for (prefix = prefix_string; *prefix; prefix++)
+			(VOID) linsert((RSIZE) 1, *prefix);
+		forwline(FALSE, 1, KRANDOM);
+	}
+	gotobol();
+	return (TRUE);
+}
+
+/*
+ * Set prefix string.
+ */
+
+/*ARGSUSED*/
+setprefix(f, n, k)
+{
+	char		buf[PREFIXLENGTH];
+	register int	s;
+
+	if (prefix_string[0] == '\0')
+		s = ereply("Prefix string: ",buf,sizeof buf);
+	else
+		s = ereply("Prefix string (default %s): ",
+				buf,sizeof buf,prefix_string);
+	if (s == TRUE)
+		(VOID) strcpy(prefix_string, buf);
+	if ((s == FALSE) && (prefix_string[0] != '\0'))	/* CR -- use old one */
+		s = TRUE;
+	return (s);
+}
+#endif
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'prefix.c'
+then
+	echo shar: will not over-write existing file "'prefix.c'"
+else
+cat << \SHAR_EOF > 'prefix.c'
+/*
+ * This code is a kludge for the two prefix sequences from GNU (well,
+ * the two I want) that uemacs doesn't have. Rather than quadruple the table
+ * space for keys, plus have to test for them everywhere, I'll just kludge
+ * it with functions that are bound to those keys. Later, maybe I'll do
+ * prefixes right.
+ */
+
+#include "def.h"
+
+/*ARGSUSED*/
+ctlx4hack(f, n, k) {
+	register KEY	c;
+
+	if ((c = getkey(KPROMPT)) == 'b' || c == 'B')
+		return poptobuffer(f, n, KRANDOM);
+	if (c == 'f' || c == (KCTRL|'F') || c == 'F')
+		return poptofile(f, n, KRANDOM);
+	
+	if (c == (KCTRL|'G') || c == (KCTLX|KCTRL|'G')
+	||  c == (KMETA|KCTRL|'G')) {
+		(VOID) ctrlg(FALSE, 1, KRANDOM);
+		return ABORT;
+	}
+	return FALSE;
+}
+
+/*ARGSUSED*/
+help(f, n, k) {
+	register KEY	c;
+
+	c = getkey(KPROMPT);
+	while (c == (KCTRL|'H')) {
+		ewprintf("B C: ");
+		c = getkey(0);
+	}
+	if (c == 'b' || c == 'B') return wallchart(f, n, KRANDOM);
+	if (c == 'c' || c == 'C') return desckey(f, n, KRANDOM);
+
+	if (c == (KCTRL|'G') || c == (KCTLX|KCTRL|'G')
+	||  c == (KMETA|KCTRL|'G')) {
+		(VOID) ctrlg(FALSE, 1, KRANDOM);
+		return ABORT;
+	}
+	return FALSE;
+}
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'version.c'
+then
+	echo shar: will not over-write existing file "'version.c'"
+else
+cat << \SHAR_EOF > 'version.c'
+/*
+ * This file contains the string that get written 
+ * out by the emacs-version command.
+ * Rich had it generated by a command file. I do
+ * it manually, until I can figure out a way to get
+ * the MicroGnuEmacs version number generated in an
+ * reasonable and automatic manner.
+ */
+
+char	*version = "MicroGnuEmacs 1a" ;
+SHAR_EOF
+fi # end of overwriting check
+if test -f 'word.c'
+then
+	echo shar: will not over-write existing file "'word.c'"
+else
+cat << \SHAR_EOF > 'word.c'
+/*
+ *		Word mode commands.
+ * The routines in this file
+ * implement commands that work word at
+ * a time. There are all sorts of word mode
+ * commands. If I do any sentence and/or paragraph
+ * mode commands, they are likely to be put in
+ * this file.
+ */
+#include	"def.h"
+
+/*
+ * Move the cursor backward by
+ * "n" words. All of the details of motion
+ * are performed by the "backchar" and "forwchar"
+ * routines.
+ */
+/*ARGSUSED*/
+backword(f, n, k) {
+	if (n < 0)
+		return (forwword(f, -n, KRANDOM));
+	if (backchar(FALSE, 1, KRANDOM) == FALSE)
+		return (FALSE);
+	while (n--) {
+		while (inword() == FALSE) {
+			if (backchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+		while (inword() != FALSE) {
+			if (backchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+	}
+	return (forwchar(FALSE, 1, KRANDOM));
+}
+
+/*
+ * Move the cursor forward by
+ * the specified number of words. All of the
+ * motion is done by "forwchar".
+ */
+/*ARGSUSED*/
+forwword(f, n, k) {
+	if (n < 0)
+		return (backword(f, -n, KRANDOM));
+	while (n--) {
+		while (inword() == FALSE) {
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+		while (inword() != FALSE) {
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+	}
+	return (TRUE);
+}
+
+/*
+ * Move the cursor forward by
+ * the specified number of words. As you move,
+ * convert any characters to upper case.
+ */
+/*ARGSUSED*/
+upperword(f, n, k) {
+	register int	c;
+
+	if (n < 0)
+		return (FALSE);
+	while (n--) {
+		while (inword() == FALSE) {
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+		while (inword() != FALSE) {
+			c = lgetc(curwp->w_dotp, curwp->w_doto);
+			if (ISLOWER(c) != FALSE) {
+				c = TOUPPER(c);
+				lputc(curwp->w_dotp, curwp->w_doto, c);
+				lchange(WFHARD);
+			}
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+	}
+	return (TRUE);
+}
+
+/*
+ * Move the cursor forward by
+ * the specified number of words. As you move
+ * convert characters to lower case.
+ */
+/*ARGSUSED*/
+lowerword(f, n, k) {
+	register int	c;
+
+	if (n < 0)
+		return (FALSE);
+	while (n--) {
+		while (inword() == FALSE) {
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+		while (inword() != FALSE) {
+			c = lgetc(curwp->w_dotp, curwp->w_doto);
+			if (ISUPPER(c) != FALSE) {
+				c = TOLOWER(c);
+				lputc(curwp->w_dotp, curwp->w_doto, c);
+				lchange(WFHARD);
+			}
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+	}
+	return (TRUE);
+}
+
+/*
+ * Move the cursor forward by
+ * the specified number of words. As you move
+ * convert the first character of the word to upper
+ * case, and subsequent characters to lower case. Error
+ * if you try and move past the end of the buffer.
+ */
+/*ARGSUSED*/
+capword(f, n, k) {
+	register int	c;
+
+	if (n < 0)
+		return (FALSE);
+	while (n--) {
+		while (inword() == FALSE) {
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+		}
+		if (inword() != FALSE) {
+			c = lgetc(curwp->w_dotp, curwp->w_doto);
+			if (ISLOWER(c) != FALSE) {
+				c = TOUPPER(c);
+				lputc(curwp->w_dotp, curwp->w_doto, c);
+				lchange(WFHARD);
+			}
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				return TRUE;
+			while (inword() != FALSE) {
+				c = lgetc(curwp->w_dotp, curwp->w_doto);
+				if (ISUPPER(c) != FALSE) {
+					c = TOLOWER(c);
+					lputc(curwp->w_dotp, curwp->w_doto, c);
+					lchange(WFHARD);
+				}
+				if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+					return TRUE;
+			}
+		}
+	}
+	return (TRUE);
+}
+
+/*
+ * Kill forward by "n" words.
+ */
+/*ARGSUSED*/
+delfword(f, n, k) {
+	register RSIZE	size;
+	register LINE	*dotp;
+	register int	doto;
+
+	if (n < 0)
+		return (FALSE);
+	if ((lastflag&CFKILL) == 0)		/* Purge kill buffer.	*/
+		kdelete();
+	thisflag |= CFKILL;
+	dotp = curwp->w_dotp;
+	doto = curwp->w_doto;
+	size = 0;
+	while (n--) {
+		while (inword() == FALSE) {
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				goto out;	/* Hit end of buffer.	*/
+			++size;
+		}
+		while (inword() != FALSE) {
+			if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+				goto out;	/* Hit end of buffer.	*/
+			++size;
+		}
+	}
+out:
+	curwp->w_dotp = dotp;
+	curwp->w_doto = doto;
+	return (ldelete(size, KFORW));
+}
+
+/*
+ * Kill backwards by "n" words. The rules
+ * for success and failure are now different, to prevent
+ * strange behavior at the start of the buffer. The command
+ * only fails if something goes wrong with the actual delete
+ * of the characters. It is successful even if no characters
+ * are deleted, or if you say delete 5 words, and there are
+ * only 4 words left. I considered making the first call
+ * to "backchar" special, but decided that that would just
+ * be wierd. Normally this is bound to "M-Rubout" and
+ * to "M-Backspace".
+ */
+/*ARGSUSED*/
+delbword(f, n, k) {
+	register RSIZE	size;
+
+	if (n < 0)
+		return (FALSE);
+	if ((lastflag&CFKILL) == 0)		/* Purge kill buffer.	*/
+		kdelete();
+	thisflag |= CFKILL;
+	if (backchar(FALSE, 1, KRANDOM) == FALSE)
+		return (TRUE);			/* Hit buffer start.	*/
+	size = 1;				/* One deleted.		*/
+	while (n--) {
+		while (inword() == FALSE) {
+			if (backchar(FALSE, 1, KRANDOM) == FALSE)
+				goto out;	/* Hit buffer start.	*/
+			++size;
+		}
+		while (inword() != FALSE) {
+			if (backchar(FALSE, 1, KRANDOM) == FALSE)
+				goto out;	/* Hit buffer start.	*/
+			++size;
+		}
+	}
+	if (forwchar(FALSE, 1, KRANDOM) == FALSE)
+		return (FALSE);
+	--size;					/* Undo assumed delete.	*/
+out:
+	return (ldelete(size, KBACK));
+}
+
+/*
+ * Return TRUE if the character at dot
+ * is a character that is considered to be
+ * part of a word. The word character list is hard
+ * coded. Should be setable.
+ */
+inword() {
+	if (curwp->w_doto == llength(curwp->w_dotp))
+		return (FALSE);
+	if (ISWORD(lgetc(curwp->w_dotp, curwp->w_doto)) != FALSE)
+		return (TRUE);
+	return (FALSE);
+}
+
+SHAR_EOF
+fi # end of overwriting check
+#	End of shell archive
+exit 0
+-- 
+Bob Larson
+Arpa: Blarson@Usc-Eclb.Arpa	or	blarson@usc-oberon.arpa
+Uucp: (ihnp4,hplabs,tektronix)!sdcrdcf!usc-oberon!blarson
+

@@ -1,0 +1,1971 @@
+Path: uunet!munnari!sources-request
+From: sources-request@munnari.oz
+Newsgroups: comp.sources.unix
+Subject: v11i031:  MUSBUS 5.0 -- Monash University Benchmark, Part03/04
+Message-ID: <1827@munnari.oz>
+Date: 17 Sep 87 08:18:22 GMT
+Sender: kre@munnari.oz
+Lines: 1961
+Approved: kre@munnari.oz.au
+
+Submitted by: kenj@moncsbruce.oz.au (Ken McDonell)
+Posting-number: Volume 11, Issue 31
+Archive-name: musbus/Part03
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create the files:
+#	grep.dat
+#	hanoi.c
+#	iamalive.c
+#	keyb.c
+#	limit.c
+#	log.785
+#	log.sun3-50
+#	log.uVaxII
+#	makework.c
+#	makework.h
+#	mem.awk
+# This archive created: Thu Sep 17 06:48:15 EST 1987
+export PATH; PATH=/bin:$PATH
+echo 'x - grep.dat'
+if test -f 'grep.dat'
+then
+	echo 'shar: over-writing existing file grep.dat'
+fi
+sed 's/^X//' > grep.dat <<'End-of-File-Grunt'
+X/*
+X *  makework  -- emulate a series of terminal users
+X *
+X *  makework [ -r rate ] [ -c copyfile ] nusers
+X *
+X *  job streams are specified on standard input with lines of the form
+X *  full_path_name_for_command [ options ] [ <standard_input_file ]
+X *
+X *  "standard input" is send to all nuser instances of the commands in the
+X *  job streams at a rate not in excess of "rate" characters per second
+X *  per command
+X *
+X *  $Header: grep.dat,v 1.1 87/06/17 16:23:56 kjmcdonell Beta $
+X */
+X
+X#include <stdio.h>
+X#include <signal.h>
+X
+X#define DEF_RATE	5.0
+X#define GRANULE		5
+X#define CHUNK		60
+X#define MAXCHILD	12
+X#define MAXWORK		10
+X
+Xfloat	thres;
+Xfloat	est_rate = DEF_RATE;
+Xint	nusers;		/* number of concurrent users to be simulated by
+X			 * this process */
+Xint	firstuser;	/* ordinal identification of first user for this
+X			 * process */
+Xint	nwork = 0;	/* number of job streams */
+Xint	exit_status = 0;	/* returned to parent */
+Xint	sigpipe;	/* pipe write error flag */
+X
+Xstruct st_work {
+X	char	*cmd;		/* name of command to run */
+X	char	**av;		/* arguments to command */
+X	char	*input;		/* standard input buffer */
+X	int	inpsize;	/* size of standard input buffer */
+X	char	*outf;		/* standard output (filename) */
+X} work[MAXWORK];
+X
+Xstruct {
+X	int	xmit;	/* # characters sent */
+X	char	*bp;	/* std input buffer pointer */
+X	int	blen;	/* std input buffer length */
+X	int	fd;	/* stdin to command */
+X	int	pid;	/* child PID */
+X	char	*line;	/* start of input line */ 
+X	int	firstjob;	/* inital piece of work */
+X	int	thisjob;	/* current piece of work */
+X} child[MAXCHILD], *cp;
+X
+Xmain(argc, argv)
+Xint	argc;
+Xchar	*argv[];
+X{
+X    int		i;
+X    int		l;
+X    int		fcopy = 0;	/* fd for copy output */
+X    int		master = 1;	/* the REAL master, == 0 for clones */
+X    int		nchild;		/* no. of children for a clone to run */
+X    int		done;		/* count of children finished */
+X    int		output;		/* aggregate output char count for all
+X				   children */
+X    int		c;
+X    int		thiswork = 0;	/* next job stream to allocate */
+X    int		nch;		/* # characters to write */
+X    int		written;	/* # characters actully written */
+X    char	logname[15];	/* name of the log file(s) */
+X    int		onalarm();
+X    int		pipeerr();
+X    int		wrapup();
+X    int		grunt();
+X    int		pvec[2];	/* for pipes */
+X    char	*p;
+X    char	*prog;		/* my name */
+X
+X#if ! debug
+X    freopen("masterlog.00", "a", stderr);
+X#endif
+X    fprintf(stderr, "*** New Run ***  ");
+X    prog = argv[0];
+X    while (argc > 1 && argv[1][0] == '-')  {
+X	p = &argv[1][1];
+X	argc--;
+X	argv++;
+X	while (*p) {
+X	    switch (*p) {
+X	    case 'r':
+X			est_rate = atoi(argv[1]);
+X			sscanf(argv[1], "%f", &est_rate);
+X			if (est_rate <= 0) {
+X			    fprintf(stderr, "%s: bad rate, reset to %.2f chars/sec\n", prog, DEF_RATE);
+X			    est_rate = DEF_RATE;
+X			}
+X			argc--;
+X			argv++;
+X			break;
+X
+X	    case 'c':
+X			fcopy = open(argv[1], 1);
+X			if (fcopy < 0)
+X				fcopy = creat(argv[1], 0600);
+X			if (fcopy < 0) {
+X			    fprintf(stderr, "%s: cannot open copy file '%s'\n",
+X				prog, argv[1]);
+X			    exit(2);
+X			}
+X			lseek(fcopy, 0L, 2);	/* append at end of file */
+X			argc--;
+X			argv++;
+X			break;
+X
+X	    default:
+X		fprintf(stderr, "%s: bad flag '%c'\n", prog, *p);
+X			exit(4);
+X	    }
+X	    p++;
+X	}
+X    }
+X    
+X    if (argc < 2) {
+X	fprintf(stderr, "%s: missing nusers\n", prog);
+X	exit(4);
+X    }
+X
+X    nusers = atoi(argv[1]);
+X    if (nusers < 1) {
+X	fprintf(stderr, "%s: impossible nusers (%d<-%s)\n", prog, nusers, argv[1]);
+X	exit(4);
+X    }
+X    fprintf(stderr, "%d Users\n", nusers);
+X    argc--;
+X    argv++;
+X
+X    /* build job streams */
+X    getwork();
+X#if debug
+X    dumpwork();
+X#endif
+X
+X    /* clone copies of myself to run up to MAXCHILD jobs each */
+X    firstuser = MAXCHILD;
+X    fprintf(stderr, "master pid %d\n", getpid());
+X    fflush(stderr);
+X    while (nusers > MAXCHILD) {
+X	fflush(stderr);
+X	if (nusers >= 2*MAXCHILD)
+X	    /* the next clone must run MAXCHILD jobs */
+X	    nchild = MAXCHILD;
+X	else
+X	    /* the next clone must run the leftover jobs */
+X	    nchild = nusers - MAXCHILD;
+X	if ((l = fork()) == -1) {
+X	    /* fork failed */
+X	    fatal("** clone fork failed **\n");
+X	    goto bepatient;
+X	} else if (l > 0) {
+X	    fprintf(stderr, "master clone pid %d\n", l);
+X	    /* I am the master with nchild fewer jobs to run */
+X	    nusers -= nchild;
+X	    firstuser += MAXCHILD;
+X	    continue;
+X	} else {
+X	    /* I am a clone, run MAXCHILD jobs */
+X#if ! debug
+X	    sprintf(logname, "masterlog.%02d", firstuser/MAXCHILD);
+X	    freopen(logname, "w", stderr);
+X#endif
+X	    master = 0;
+X	    nusers = nchild;
+X	    break;
+X	}
+X    }
+X    if (master)
+X	firstuser = 0;
+X
+X    close(0);
+X    for (i = 0; i < nusers; i++ ) {
+X	fprintf(stderr, "user %d job %d ", firstuser+i, thiswork);
+X	if (pipe(pvec) == -1) {
+X	    /* this is fatal */
+X	    fatal("** pipe failed **\n");
+X	    goto bepatient;
+X	}
+X	fflush(stderr);
+X	if ((child[i].pid = fork()) == 0) {
+X	    int	fd;
+X	    /* the command */
+X	    if (pvec[0] != 0) {
+X		close(0);
+X		dup(pvec[0]);
+X	    }
+X#if ! debug
+X	    sprintf(logname, "userlog.%02d", firstuser+i);
+X	    freopen(logname, "w", stderr);
+X#endif
+X	    for (fd = 3; fd < 24; fd++)
+X		close(fd);
+X	    if (work[thiswork].outf[0] != '\0') {
+X		/* redirect std output */
+X		char	*q;
+X		for (q = work[thiswork].outf; *q != '\n'; q++) ;
+X		*q = '\0';
+X		if (freopen(work[thiswork].outf, "w", stdout) == NULL) {
+X		    fprintf(stderr, "makework: cannot open %s for std output\n",
+X			work[thiswork].outf);
+X		    fflush(stderr);
+X		}
+X		*q = '\n';
+X	    }
+X	    execv(work[thiswork].cmd, work[thiswork].av);
+X	    /* don't expect to get here! */
+X	    fatal("** exec failed **\n");
+X	    goto bepatient;
+X	}
+X	else if (child[i].pid == -1) {
+X	    fatal("** fork failed **\n");
+X	    goto bepatient;
+X	}
+X	else {
+X	    close(pvec[0]);
+X	    child[i].fd = pvec[1];
+X	    child[i].line = child[i].bp = work[thiswork].input;
+X	    child[i].blen = work[thiswork].inpsize;
+X	    child[i].thisjob = thiswork;
+X	    child[i].firstjob = thiswork;
+X	    fprintf(stderr, "pid %d pipe fd %d", child[i].pid, child[i].fd);
+X	    if (work[thiswork].outf[0] != '\0') {
+X		char *q;
+X		fprintf(stderr, " > ");
+X		for (q=work[thiswork].outf; *q != '\n'; q++)
+X		    fputc(*q, stderr);
+X	    }
+X	    fputc('\n', stderr);
+X	    thiswork++;
+X	    if (thiswork >= nwork)
+X		thiswork = 0;
+X	}
+X    }
+X    fflush(stderr);
+X
+X    srand(time(0));
+X    thres = 0;
+X    done = output = 0;
+X    for (i = 0; i < nusers; i++) {
+X	if (child[i].blen == 0)
+X	    done++;
+X	else
+X	    thres += est_rate * GRANULE;
+X    }
+X    est_rate = thres;
+X
+X    signal(SIGALRM, onalarm);
+X    signal(SIGPIPE, pipeerr);
+X    alarm(GRANULE);
+X    while (done < nusers) {
+X	for (i = 0; i < nusers; i++) {
+X	    cp = &child[i];
+X	    if (cp->xmit >= cp->blen) continue;
+X	    l = rand() % CHUNK + 1;	/* 1-CHUNK chars */
+X	    if (l == 0) continue;
+X	    if (cp->xmit + l > cp->blen)
+X		l = cp->blen - cp->xmit;
+X	    p = cp->bp;
+X	    cp->bp += l;
+X	    cp->xmit += l;
+X#if debug
+X	    fprintf(stderr, "child %d, %d processed, %d to go\n", i, cp->xmit, cp->blen - cp->xmit);
+X#endif
+X	    while (p < cp->bp) {
+X		if (*p == '\n' || (p == &cp->bp[-1] && cp->xmit >= cp->blen)) {
+X		    /* write it out */
+X		    nch = p - cp->line + 1;
+X		    if ((written = write(cp->fd, cp->line, nch)) != nch) {
+X			/* argh! */
+X			cp->line[nch] = '\0';
+X			fprintf(stderr, "user %d job %d cmd %s ",
+X				firstuser+i, cp->thisjob, cp->line);
+X 			fprintf(stderr, "write(,,%d) returns %d\n", nch, written);
+X			if (sigpipe)
+X			    fatal("** SIGPIPE error **\n");
+X			else
+X			    fatal("** write error **\n");
+X			goto bepatient;
+X
+X		    }
+X		    if (fcopy)
+X			write(fcopy, cp->line, p - cp->line + 1);
+X#if debug
+X		    fprintf(stderr, "child %d gets \"", i);
+X		    {
+X			char *q = cp->line;
+X			while (q <= p) {
+X				if (*q >= ' ' && *q <= '~')
+X					fputc(*q, stderr);
+X				else
+X					fprintf(stderr, "\\%03o", *q);
+X				q++;
+X			}
+X		    }
+X		    fputc('"', stderr);
+X#endif
+X		    cp->line = &p[1];
+X		}
+X		p++;
+X	    }
+X	    if (cp->xmit >= cp->blen) {
+X		done++;
+X		close(cp->fd);
+X#if debug
+X	fprintf(stderr, "child %d, close std input\n", i);
+X#endif
+X	    }
+X	    output += l;
+X	}
+X	while (output > thres) {
+X	    pause();
+X#if debug
+X	    fprintf(stderr, "after pause: output, thres, done %d %.2f %d\n", output, thres, done);
+X#endif
+X	}
+X    }
+X
+Xbepatient:
+X    alarm(0);
+X/****
+X *  If everything is going OK, we should simply be able to keep
+X *  looping unitil 'wait' fails, however some descendent process may
+X *  be in a state from which it can never exit, and so a timeout
+X *  is used.
+X *  5 minutes should be ample, since the time to run all jobs is of
+X *  the order of 5-10 minutes, however some machines are painfully slow,
+X *  so the timeout has been set at 20 minutes (1200 seconds).
+X ****/
+X    signal(SIGALRM, grunt);
+X    alarm(1200);
+X    while ((c = wait(&l)) != -1) {
+X        for (i = 0; i < nusers; i++) {
+X	    if (c == child[i].pid) {
+X		fprintf(stderr, "user %d job %d pid %d done", firstuser+i, child[i].thisjob, c);
+X		if (l != 0) {
+X		    if (l & 0x7f)
+X			fprintf(stderr, " status %d", l & 0x7f);
+X		    if (l & 0xff00)
+X			fprintf(stderr, " exit code %d", (l>>8) & 0xff);
+X		    exit_status = 4;
+X		}
+X		fputc('\n', stderr);
+X		c = child[i].pid = -1;
+X		break;
+X	    }
+X	}
+X	if (c != -1) {
+X	    fprintf(stderr, "master clone done, pid %d ", c);
+X	    if (l != 0) {
+X		if (l & 0x7f)
+X		    fprintf(stderr, " status %d", l & 0x7f);
+X		if (l & 0xff00)
+X		    fprintf(stderr, " exit code %d", (l>>8) & 0xff);
+X		exit_status = 4;
+X	    }
+X	    fputc('\n', stderr);
+X	}
+X    }
+X    alarm(0);
+X    wrapup("Finished waiting ...");
+X
+X
+X}
+X
+Xonalarm()
+X{
+X    thres += est_rate;
+X    signal(SIGALRM, onalarm);
+X    alarm(GRANULE);
+X}
+X
+Xgrunt()
+X{
+X    /* timeout after label "bepatient" in main */
+X    exit_status = 4;
+X    wrapup("Timed out waiting for jobs to finish ...");
+X}
+X
+Xpipeerr()
+X{
+X	sigpipe++;
+X}
+X
+Xwrapup(reason)
+Xchar	*reason;
+X{
+X    int i;
+X    int killed = 0;
+X    fflush(stderr);
+X    for (i = 0; i < nusers; i++) {
+X	if (child[i].pid > 0 && kill(child[i].pid, SIGKILL) != -1) {
+X	    if (!killed) {
+X		killed++;
+X		fprintf(stderr, "%s\n", reason);
+X		fflush(stderr);
+X	    }
+X	    fprintf(stderr, "user %d job %d pid %d killed off\n", firstuser+i, child[i].thisjob, child[i].pid);
+X	fflush(stderr);
+X	}
+X    }
+X    exit(exit_status);
+X}
+X
+Xgetwork()
+X{
+X    int			i;
+X    int			f;
+X    int			ac;
+X    char		*lp;
+X    char		*q;
+X    struct st_work	*w;
+X    char		line[512];
+X    char		c;
+X    char		*malloc(), *realloc();
+X
+X    while (gets(line) != NULL) {
+X	if (nwork >= MAXWORK) {
+X	    fprintf(stderr, stderr, "Too many jobs specified, .. increase MAXWORK\n");
+X	    exit(4);
+X	}
+X	w = &work[nwork];
+X	lp = line;
+X	i = 1;
+X	while (*lp && *lp != ' ') {
+X	    i++;
+X	    lp++;
+X	}
+X	w->cmd = (char *)malloc(i);
+X	strncpy(w->cmd, line, i-1);
+X	w->cmd[i-1] = '\0';
+X	w->inpsize = 0;
+X	w->input = "";
+X	/* start to build arg list */
+X	ac = 2;
+X	w->av = (char **)malloc(2*sizeof(char *));
+X	q = w->cmd;
+X	while (*q) q++;
+X	q--;
+X	while (q >= w->cmd) {
+X	    if (*q == '/') {
+X		q++;
+X		break;
+X	    }
+X	    q--;
+X	}
+X	w->av[0] = q;
+X	while (*lp) {
+X	    if (*lp == ' ') {
+X		/* space */
+X		lp++;
+X		continue;
+X	    }
+X	    else if (*lp == '<') {
+X		/* standard input for this job */
+X		q = ++lp;
+X		while (*lp && *lp != ' ') lp++;
+X		c = *lp;
+X		*lp = '\0';
+X		if ((f = open(q, 0)) == -1) {
+X		    fprintf(stderr, "cannot open input file (%s) for job %d\n",
+X				q, nwork);
+X		    exit(4);
+X		}
+X		/* gobble input */
+X		w->input = (char *)malloc(512);
+X		while ((i = read(f, &w->input[w->inpsize], 512)) > 0) {
+X		    w->inpsize += i;
+X		    w->input = (char *)realloc(w->input, w->inpsize+512);
+X		}
+X		w->input = (char *)realloc(w->input, w->inpsize);
+X		close(f);
+X		/* extract stdout file name from line beginning "C=" */
+X		w->outf = "";
+X		for (q = w->input; q < &w->input[w->inpsize-10]; q++) {
+X		    if (*q == '\n' && strncmp(&q[1], "C=", 2) == 0) {
+X			w->outf = &q[3];
+X			break;
+X		    }
+X		}
+X#if debug
+X		if (*w->outf) {
+X		    fprintf(stderr, "stdout->");
+X		    for (q=w->outf; *q != '\n'; q++)
+X			fputc(*q, stderr);
+X		    fputc('\n', stderr);
+X		}
+X#endif
+X	    }
+X	    else {
+X		/* a command option */
+X		ac++;
+X		w->av = (char **)realloc(w->av, ac*sizeof(char *));
+X		q = lp;
+X		i = 1;
+X		while (*lp && *lp != ' ') {
+X		    lp++;
+X		    i++;
+X		}
+X		w->av[ac-2] = (char *)malloc(i);
+X		strncpy(w->av[ac-2], q, i-1);
+X		w->av[ac-2][i-1] = '\0';
+X	    }
+X	}
+X	w->av[ac-1] = (char *)0;
+X	nwork++;
+X    }
+X}
+X
+X#if debug
+Xdumpwork()
+X{
+X    int		i;
+X    int		j;
+X
+X    for (i = 0; i < nwork; i++) {
+X	fprintf(stderr, "job %d: cmd: %s\n", i, work[i].cmd);
+X	j = 0;
+X	while (work[i].av[j]) {
+X		fprintf(stderr, "argv[%d]: %s\n", j, work[i].av[j]);
+X		j++;
+X	}
+X	fprintf(stderr, "input: %d chars text: ", work[i].inpsize);
+X	if (work[i].input == (char *)0)
+X		fprintf(stderr, "<NULL>\n");
+X	else {
+X	        register char	*pend;
+X	        char		*p;
+X		char		c;
+X		p = work[i].input;
+X		while (*p) {
+X			pend = p;
+X			while (*pend && *pend != '\n')
+X				pend++;
+X			c = *pend;
+X			*pend = '\0';
+X			fprintf(stderr, "%s\n", p);
+X			*pend = c;
+X			p = &pend[1];
+X		}
+X	}
+X    }
+X}
+X#endif
+X
+Xfatal(s)
+Xchar *s;
+X{
+X    int	i;
+X    fprintf(stderr, s);
+X    fflush(stderr);
+X    perror("Reason?");
+X    fflush(stderr);
+X    for (i = 0; i < nusers; i++) {
+X	if (child[i].pid > 0 && kill(child[i].pid, SIGKILL) != -1) {
+X	    fprintf(stderr, "pid %d killed off\n", child[i].pid);
+X	    fflush(stderr);
+X	}
+X    }
+X    exit_status = 4;
+X    return;
+X}
+End-of-File-Grunt
+if test 13130 -ne `cat 'grep.dat' | wc -c`
+then
+	echo 'shar: transmission error (expected 13130 characters)'
+fi
+echo 'x - hanoi.c'
+if test -f 'hanoi.c'
+then
+	echo 'shar: over-writing existing file hanoi.c'
+fi
+sed 's/^X//' > hanoi.c <<'End-of-File-Grunt'
+X/*
+X *  $Header: hanoi.c,v 3.5 87/08/06 08:11:14 kenj Exp $
+X */
+X#define PRINT 0
+X#define DISK 3
+X#define other(i,j) (6-(i+j))
+Xint num[4];
+Xlong cnt;
+Xmain(argc,argv)
+Xchar **argv;
+X{
+X	int disk;
+X	disk  = DISK;
+X	if(argc > 1)disk = atoi(argv[1]);
+X	num[1] = disk;
+X	if(PRINT)printf("Start %d on A\n",disk);
+X	mov(disk,1,3);
+X	printf("For %d disks, %ld moves\n",disk,cnt);
+X
+X	exit(0);
+X}
+X
+Xmov(n,f,t)
+X{
+X	int o;
+X	if(n == 1) {
+X		num[f]--;
+X		num[t]++;
+X		if(PRINT)printf("Move from %d to %d, result: A:%d B:%d C%d\n",
+X			f,t,num[1],num[2],num[3]);
+X		cnt++;
+X		return;
+X	}
+X	o = other(f,t);
+X	mov(n-1,f,o);
+X	mov(1,f,t);
+X	mov(n-1,o,t);
+X	return;
+X}
+End-of-File-Grunt
+if test 619 -ne `cat 'hanoi.c' | wc -c`
+then
+	echo 'shar: transmission error (expected 619 characters)'
+fi
+echo 'x - iamalive.c'
+if test -f 'iamalive.c'
+then
+	echo 'shar: over-writing existing file iamalive.c'
+fi
+sed 's/^X//' > iamalive.c <<'End-of-File-Grunt'
+X/*
+X * echo argv[1] without \n, to tell user we are still alive
+X *
+X *  $Header: iamalive.c,v 3.4 87/06/22 14:23:22 kjmcdonell Beta $
+X */
+Xmain(argc, argv)
+Xint	argc;
+Xchar	*argv[];
+X{
+X	if (argc == 2)
+X		printf("%s ", argv[1]);
+X	exit(0);
+X}
+End-of-File-Grunt
+if test 233 -ne `cat 'iamalive.c' | wc -c`
+then
+	echo 'shar: transmission error (expected 233 characters)'
+fi
+echo 'x - keyb.c'
+if test -f 'keyb.c'
+then
+	echo 'shar: over-writing existing file keyb.c'
+fi
+sed 's/^X//' > keyb.c <<'End-of-File-Grunt'
+X/*
+X *  keyb -- emulate a user typing at a terminal
+X *
+X *  keyb [ datafile ]
+X *
+X *  standard input is copied to standard output at a rate not in excess
+X *  of "rate" characters per second, and copied to "copyfile" if
+X *  specified
+X *
+X *  environment variables $rate and $tty control typing rate (characters
+X *  per second) and destination of echoed output.
+X *
+X *  $Header: keyb.c,v 3.5 87/06/22 14:24:28 kjmcdonell Beta $
+X */
+X
+X#include <stdio.h>
+X#include <signal.h>
+X
+X#define DEF_RATE	5
+X#define GRANULE		5
+X
+Xint	thres;
+Xint	est_rate = DEF_RATE;
+Xint	sigpipe;	/* pipe write error flag */
+X
+Xmain(argc, argv)
+Xint	argc;
+Xchar	*argv[];
+X{
+X    int		i;
+X    int		l;
+X    int		fcopy = 0;	/* fd for copy output */
+X    int		output;		/* aggregate output char count */
+X    int		c;
+X    int		nch;		/* # characters read */
+X    char	buf[16];	/* the current glob of data */
+X    int		onalarm();
+X    int		pipeerr();
+X    char	*getenv();
+X    int		written;
+X    char	*p;
+X    char	*prog;		/* my name */
+X
+X    prog = argv[0];
+X    if ((p = getenv("rate")) != (char *)0) {
+X	sscanf(p, "%f", &est_rate);
+X	if (est_rate <= 0) {
+X	    fprintf(stderr, "%s: bad rate, reset to %.2f chars/sec\n", prog, DEF_RATE);
+X	    est_rate = DEF_RATE;
+X	}
+X#ifdef DEBUG
+X	else
+X	    fprintf(stderr, "%s: typing rate %.2f chars/sec\n", est_rate);
+X#endif
+X    }
+X    if ((p = getenv("tty")) != (char *)0) {
+X	fcopy = open(p, 1);
+X	if (fcopy < 0)
+X		fcopy = creat(p, 0600);
+X	if (fcopy < 0) {
+X	    fprintf(stderr, "%s: cannot open copy file '%s'\n", prog, p);
+X	    exit(2);
+X	}
+X	lseek(fcopy, 0L, 2);	/* append at end of file */
+X    }
+X    
+X    if (argc == 2) {
+X	/* datafile argument specified */
+X	close(0);
+X	if (open(argv[1], 0) < 0) {
+X	    fprintf(stderr, "%s: Cannot open %s\n", prog, argv[1]);
+X	    exit(4);
+X	}
+X    }
+X
+X    srand(time(0));
+X    thres = est_rate = est_rate * GRANULE;
+X    output = 0;
+X
+X    signal(SIGPIPE, pipeerr);
+X    signal(SIGALRM, onalarm);
+X    alarm(GRANULE);
+X    while (1) {
+X	l = rand() % 15 + 1;	/* 1-15 chars */
+X	if (l == 0) continue;
+X	nch = read(0, buf, l);
+X	if (nch == 0)
+X	    break;
+X	if ((written = write(1, buf, nch)) != nch) {
+X	    /* argh! */
+X	    if (sigpipe)
+X		fprintf(stderr, "type: ** SIGPIPE error ** buf: %s\n", buf);
+X	    else
+X		fprintf(stderr, "type: ** write error ** buf: %s\n", buf);
+X	    exit(4);
+X	}
+X	if (fcopy)
+X	    write(fcopy, buf, nch);
+X	output += nch;
+X	while (output > thres)
+X	    pause();
+X    }
+X    alarm(0);
+X    exit(0);
+X}
+X
+Xonalarm()
+X{
+X    thres += est_rate;
+X    signal(SIGALRM, onalarm);
+X    alarm(GRANULE);
+X}
+X
+Xpipeerr()
+X{
+X	sigpipe++;
+X}
+End-of-File-Grunt
+if test 2513 -ne `cat 'keyb.c' | wc -c`
+then
+	echo 'shar: transmission error (expected 2513 characters)'
+fi
+echo 'x - limit.c'
+if test -f 'limit.c'
+then
+	echo 'shar: over-writing existing file limit.c'
+fi
+sed 's/^X//' > limit.c <<'End-of-File-Grunt'
+X/*
+X *  Force a UNIX system to the per process and per user limits
+X *
+X *  $Header: limit.c,v 3.4 87/06/22 14:25:11 kjmcdonell Beta $
+X */
+X
+X#define	CLICK	1024
+X#define	MAXCHN	100
+X
+X#include <signal.h>
+X#include <setjmp.h>
+X
+Xint	parent;		/* parent's pid */
+Xint	child;		/* child's pid */
+Xint	pid[MAXCHN];
+Xint	ncall;
+Xint	level;
+Xjmp_buf	env;
+X
+Xmain(argc, argv)
+Xint	argc;
+Xchar	*argv[];
+X{
+X	char	*top;
+X	int	pad;
+X	int	end;
+X	int	i;
+X	int	status;
+X	float	f;
+X	int	flag();
+X	int	wakeup();
+X	long	last;
+X
+X	/* open files (file descriptors) */
+X	for (i = 3; open(".", 0) > 0; i++) ;
+X	printf("Maximum open files per process: %d\n", i);
+X	while (--i > 2)
+X		close(i);
+X
+X	/* process address space */
+X	top = (char *)sbrk(0);
+X#if debug
+X	printf("inital top of program: 0x%x\n", top);
+X#endif
+X	pad = (((int)top+CLICK-1)/CLICK)*CLICK - (int)top;
+X	sbrk(pad);
+X	for (i = 0; (char *)sbrk(CLICK) != (char *)-1; i++) ;
+X#if debug
+X	printf("final top of program: 0x%x\n", sbrk(0));
+X#endif
+X	brk(top);
+X#if debug
+X	printf("top of program restored to: 0x%x\n", sbrk(0));
+X#endif
+X	end = (((int)top+pad)/CLICK) + i;
+X	f = ((float)end * CLICK) / 1024;
+X	printf("Process address space limit: ");
+X	if (f < 1024)
+X		printf("%.2f Kbytes\n", f);
+X	else {
+X		f /= 1024;
+X		printf("%.2f Mbytes\n", f);
+X	}
+X
+X	/* process creations */
+X	printf("Maximum number of child processes:");
+X	i = 0;
+X	while (1) {
+X#if debug
+X		printf("about to fork\n");
+X#endif
+X		if ((pid[i] = fork()) == -1) {
+X#if debug
+X			perror("fork failed");
+X#endif
+X			break;
+X		} else if (pid[i] != 0) {
+X#if debug
+X			printf("child %d: pid=%d\n", i+1, pid[i]);
+X#endif
+X			i++;
+X			if (i >= MAXCHN) {
+X				printf(" more than");
+X				break;
+X			}
+X		} else {
+X#if debug
+X			printf("child %d pausing\n", getpid());
+X#endif
+X			pause();
+X#if debug
+X			printf("child %d exiting\n", getpid());
+X#endif
+X			exit(1);
+X		}
+X	}
+X	printf(" %d\n", i);
+X	while (--i >= 0) {
+X		kill(pid[i], SIGKILL);
+X		wait(0);
+X	}
+X
+X	ncall = level = 0;
+X	parent = getpid();
+X	signal(SIGTERM, flag);
+X	if ((child = fork()) == 0) {
+X		signal(SIGALRM, wakeup);
+X		recurse();
+X		exit(4);
+X	}
+X	while ((i = wait(&status)) == -1) {
+X	}
+X	printf("Estimated maximum stack size: %d Kbytes\n", level);
+X	exit(0);
+X}
+X
+Xrecurse()
+X{
+X	int	temp[1024 / sizeof(int)];
+X#if debug
+X	printf("recursion @ level %d\n", ncall);
+X#endif
+X	temp[1024 / sizeof(int) - 1] = 1;
+X	ncall++;
+X	kill(parent, SIGTERM);
+X	while (ncall > level) {
+X		alarm(2);
+X		pause();
+X	}
+X	if (ncall < 8000)
+X		/* less than 8M bytes of temp storage! */
+X		recurse();
+X	else
+X		/* give up! */
+X		exit(0);
+X}
+X
+Xflag()
+X{
+X	signal(SIGTERM, flag);
+X	level++;
+X	if (child != 0)
+X		kill(child, SIGTERM);
+X}
+X
+Xwakeup()
+X{
+X	signal(SIGALRM, wakeup);
+X}
+End-of-File-Grunt
+if test 2588 -ne `cat 'limit.c' | wc -c`
+then
+	echo 'shar: transmission error (expected 2588 characters)'
+fi
+echo 'x - log.785'
+if test -f 'log.785'
+then
+	echo 'shar: over-writing existing file log.785'
+fi
+sed 's/^X//' > log.785 <<'End-of-File-Grunt'
+X
+XMC="VAX 11/785"
+XOPT="FPA"
+XMEM="8 Mbytes"
+XUNIX="BSD 4.3 "
+XDISKS="2 x RA81"
+X
+XStart Benchmark Run (MUSBUS Version 5.0.Beta)
+X  Mon Jun 22 17:37:44 EDT 1987 (long iterations 6 times)
+X  11 interactive users.
+X
+XArithmetic Test (type = arithoh): 1000 Iterations
+XElapsed Time: 0.35 seconds (variance 0.007)
+XCPU Time: 0.22 seconds [ 0.22u + 0.00s ] (variance 0.002)
+X
+XArithmetic Test (type = register): 1000 Iterations
+XElapsed Time: 1.47 seconds (variance 0.011) (Actual: 1.12 )
+XCPU Time: 1.12 seconds [ 1.12u + 0.00s ] (variance 0.002) (Actual: 0.90 )
+X
+XArithmetic Test (type = short): 1000 Iterations
+XElapsed Time: 1.98 seconds (variance 0.022) (Actual: 1.63 )
+XCPU Time: 1.70 seconds [ 1.70u + 0.00s ] (variance -0.000) (Actual: 1.48 )
+X
+XArithmetic Test (type = int): 1000 Iterations
+XElapsed Time: 1.50 seconds (variance 0.008) (Actual: 1.15 )
+XCPU Time: 1.30 seconds [ 1.30u + 0.00s ] (variance -0.000) (Actual: 1.08 )
+X
+XArithmetic Test (type = long): 1000 Iterations
+XElapsed Time: 1.78 seconds (variance 0.078) (Actual: 1.43 )
+XCPU Time: 1.35 seconds [ 1.33u + 0.02s ] (variance 0.003) (Actual: 1.13 )
+X
+XArithmetic Test (type = float): 1000 Iterations
+XElapsed Time: 2.98 seconds (variance 0.726) (Actual: 2.63 )
+XCPU Time: 2.43 seconds [ 2.40u + 0.03s ] (variance 0.003) (Actual: 2.21 )
+X
+XArithmetic Test (type = double): 1000 Iterations
+XElapsed Time: 3.70 seconds (variance 1.016) (Actual: 3.35 )
+XCPU Time: 2.37 seconds [ 2.30u + 0.07s ] (variance 0.011) (Actual: 2.15 )
+X
+XArithmetic Test (sqrt(2) with dc to 99 decimal places)
+XElapsed Time: 2.43 seconds (variance 1.051)
+XCPU Time: 1.45 seconds [ 1.33u + 0.12s ] (variance 0.007)
+X
+XRecursion Test: Tower of Hanoi Problem
+X
+X17 Disk Problem:
+XElapsed Time: 5.42 seconds (variance 2.230)
+XCPU Time: 4.30 seconds [ 4.20u + 0.10s ] (variance 0.008)
+X
+XSystem Call Overhead Test: 5 x 4000 Calls
+XElapsed Time: 3.97 seconds (variance 0.243)
+XCPU Time: 3.23 seconds [ 0.35u + 2.88s ] (variance 0.007)
+X
+XPipe Throughput Test: read & write 2048 x 512 byte blocks
+XElapsed Time: 3.60 seconds (variance 0.020)
+XCPU Time: 3.08 seconds [ 0.03u + 3.05s ] (variance 0.006)
+X
+XPipe-based Context Switching Test: 2 x 500 Switches
+XElapsed Time: 1.57 seconds (variance 0.015)
+XCPU Time: 0.70 seconds [ 0.05u + 0.65s ] (variance -0.000)
+X
+XProcess Creation Test: 100 forks
+XElapsed Time: 1.93 seconds (variance 0.387)
+XCPU Time: 1.45 seconds [ 0.00u + 1.45s ] (variance 0.003)
+X
+XExecl Throughput Test: 100 execs
+XElapsed Time: 5.90 seconds (variance 28.036)
+XCPU Time: 2.35 seconds [ 0.00u + 2.35s ] (variance 0.007)
+X
+XC Compiler Test:
+X
+Xcc -c cctest.c
+XElapsed Time: 4.10 seconds (variance 0.130)
+XCPU Time: 2.53 seconds [ 1.73u + 0.80s ] (variance 0.003)
+X
+Xcc cctest.o
+XElapsed Time: 1.73 seconds (variance 0.303)
+XCPU Time: 0.70 seconds [ 0.20u + 0.50s ] (variance 0.010)
+X
+XSequential Memory Access Test: 100000 Accesses
+X
+XArray Size: 8 Kbytes
+X** Iteration  2  real loop < ohead:  100000 -478 0.017
+XElapsed Time: 0.16 seconds (variance 0.015)
+XCPU Time: 0.11 seconds (variance 0.003)
+XReal Rate: 613497 int array accesses / second
+X
+XArray Size: 64 Kbytes
+XElapsed Time: 0.19 seconds (variance 0.005)
+XCPU Time: 0.17 seconds (variance 0.001)
+XReal Rate: 528634 int array accesses / second
+X
+XArray Size: 512 Kbytes
+X** Iteration  4  real loop < ohead:  100000 -461 0.200
+XElapsed Time: 0.36 seconds (variance 0.051)
+XCPU Time: 0.29 seconds (variance 0.002)
+XReal Rate: 278552 int array accesses / second
+X
+XRandom Memory Access Test: 100000 Accesses
+X
+XArray Size: 8 Kbytes
+XElapsed Time: 0.15 seconds (variance 0.001)
+XCPU Time: 0.15 seconds (variance 0.001)
+XReal Rate: 667408 int array accesses / second
+X
+XArray Size: 64 Kbytes
+XElapsed Time: 0.18 seconds (variance 0.003)
+XCPU Time: 0.18 seconds (variance 0.000)
+XReal Rate: 555042 int array accesses / second
+X
+XArray Size: 512 Kbytes
+XElapsed Time: 0.32 seconds (variance 0.001)
+XCPU Time: 0.33 seconds (variance 0.000)
+XReal Rate: 309917 int array accesses / second
+X
+XFilesystem Throughput Test:
+X
+XFile Size: 62 blocks
+XWrite: 221.4 Kbytes per second   (variance 2919.0)
+XRead:  181.6 Kbytes per second   (variance 1253.2)
+XCopy:  62.4 Kbytes per second   (variance 130.2)
+X
+XFile Size: 125 blocks
+XWrite: 252.0 Kbytes per second   (variance 919.1)
+XRead:  151.9 Kbytes per second   (variance 230.7)
+XCopy:  80.9 Kbytes per second   (variance 66.2)
+X
+XFile Size: 250 blocks
+XWrite: 300.1 Kbytes per second   (variance 2511.2)
+XRead:  170.1 Kbytes per second   (variance 173.9)
+XCopy:  71.1 Kbytes per second   (variance 44.4)
+X
+XFile Size: 500 blocks
+XWrite: 338.7 Kbytes per second   (variance 375.2)
+XRead:  178.2 Kbytes per second   (variance 541.2)
+XCopy:  86.1 Kbytes per second   (variance 43.5)
+X
+X
+XOutput sent to ... /dev/ttyh0
+XDirectories for temporary files ... Tmp
+X
+XFilesystem    kbytes    used   avail capacity  Mounted on
+X/dev/ra0a       7429    4997    1689    75%    /
+X/dev/ra0g      38879     672   34319     2%    /tmp
+X/dev/ra0h     361860  286238   39436    88%    /usr
+X/dev/ra1g      38879   33960    1031    97%    /backup
+X/dev/ra1h     361860  273307   52367    84%    /u
+X
+XSIGALRM check:  12 x 5 sec delays takes 60.04 wallclock secs (error -0.06%)
+XSimulated Multi-user Work Load Test:
+X
+X1 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 391.10 seconds (variance 0.656)
+XCPU Time: 15.67 seconds [ 9.10u + 6.57s ] (variance 0.503)
+X
+X4 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 392.73 seconds (variance 0.281)
+XCPU Time: 61.37 seconds [ 37.07u + 24.30s ] (variance 1.853)
+X
+X8 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 395.17 seconds (variance 3.797)
+XCPU Time: 125.30 seconds [ 75.33u + 49.97s ] (variance 0.092)
+X
+X  15 interactive users.
+XEnd Benchmark Run (Tue Jun 23 08:50:34 EDT 1987) ....
+End-of-File-Grunt
+if test 5694 -ne `cat 'log.785' | wc -c`
+then
+	echo 'shar: transmission error (expected 5694 characters)'
+fi
+echo 'x - log.sun3-50'
+if test -f 'log.sun3-50'
+then
+	echo 'shar: over-writing existing file log.sun3-50'
+fi
+sed 's/^X//' > log.sun3-50 <<'End-of-File-Grunt'
+X
+XMC="Sun 3/50"
+XOPT=""
+XMEM="4 Mbytes"
+XUNIX="Sun OS 3.2 +4.3BSD"
+XDISKS="Sun 3/180 NFS server, 8 Mb, 2 Eagles, Zylogics controller"
+X
+XStart Benchmark Run (MUSBUS Version 5.0.Beta)
+X  Wed Jun 24 14:55:15 EDT 1987 (long iterations 6 times)
+X  1 interactive users.
+X
+XArithmetic Test (type = arithoh): 1000 Iterations
+XElapsed Time: 0.32 seconds (variance 0.002)
+XCPU Time: 0.22 seconds [ 0.20u + 0.02s ] (variance 0.002)
+X
+XArithmetic Test (type = register): 1000 Iterations
+XElapsed Time: 1.32 seconds (variance 0.002)
+XCPU Time: 1.22 seconds [ 1.20u + 0.02s ] (variance 0.002)
+X
+XArithmetic Test (type = short): 1000 Iterations
+XElapsed Time: 1.55 seconds (variance 0.007)
+XCPU Time: 1.42 seconds [ 1.40u + 0.02s ] (variance 0.002)
+X
+XArithmetic Test (type = int): 1000 Iterations
+XElapsed Time: 1.62 seconds (variance 0.010)
+XCPU Time: 1.52 seconds [ 1.50u + 0.02s ] (variance 0.002)
+X
+XArithmetic Test (type = long): 1000 Iterations
+XElapsed Time: 1.58 seconds (variance 0.006)
+XCPU Time: 1.48 seconds [ 1.47u + 0.02s ] (variance 0.002)
+X
+XArithmetic Test (type = float): 1000 Iterations
+XElapsed Time: 41.70 seconds (variance 0.560)
+XCPU Time: 40.98 seconds [ 40.78u + 0.20s ] (variance 0.026)
+X
+XArithmetic Test (type = double): 1000 Iterations
+XElapsed Time: 37.03 seconds (variance 0.023)
+XCPU Time: 36.72 seconds [ 36.57u + 0.15s ] (variance 0.006)
+X
+XArithmetic Test (sqrt(2) with dc to 99 decimal places)
+XElapsed Time: 1.65 seconds (variance 0.007)
+XCPU Time: 1.50 seconds [ 1.37u + 0.13s ] (variance 0.000)
+X
+XRecursion Test: Tower of Hanoi Problem
+X
+X17 Disk Problem:
+XElapsed Time: 2.13 seconds (variance 0.003)
+XCPU Time: 2.03 seconds [ 2.00u + 0.03s ] (variance 0.003)
+X
+XSystem Call Overhead Test: 5 x 4000 Calls
+XElapsed Time: 3.65 seconds (variance 0.007)
+XCPU Time: 3.53 seconds [ 0.53u + 3.00s ] (variance 0.007)
+X
+XPipe Throughput Test: read & write 2048 x 512 byte blocks
+XElapsed Time: 6.02 seconds (variance 0.014)
+XCPU Time: 5.88 seconds [ 0.10u + 5.78s ] (variance 0.002)
+X
+XPipe-based Context Switching Test: 2 x 500 Switches
+XElapsed Time: 1.63 seconds (variance 0.007)
+XCPU Time: 0.80 seconds [ 0.00u + 0.80s ] (variance 0.012)
+X
+XProcess Creation Test: 100 forks
+XElapsed Time: 2.65 seconds (variance 0.015)
+XCPU Time: 2.50 seconds [ 0.02u + 2.48s ] (variance 0.000)
+X
+XExecl Throughput Test: 100 execs
+XElapsed Time: 6.93 seconds (variance 0.019)
+XCPU Time: 6.07 seconds [ 0.00u + 6.07s ] (variance 0.007)
+X
+XC Compiler Test:
+X
+Xcc -c cctest.c
+XElapsed Time: 7.13 seconds (variance 0.103)
+XCPU Time: 3.13 seconds [ 1.97u + 1.17s ] (variance 0.003)
+X
+Xcc cctest.o
+XElapsed Time: 3.53 seconds (variance 0.103)
+XCPU Time: 0.80 seconds [ 0.33u + 0.47s ] (variance 0.030)
+X
+XSequential Memory Access Test: 100000 Accesses
+X
+XArray Size: 8 Kbytes
+XElapsed Time: 0.12 seconds (variance 0.000)
+XCPU Time: 0.14 seconds (variance 0.000)
+XReal Rate: 810811 int array accesses / second
+X
+XArray Size: 64 Kbytes
+X** Iteration  6  real loop < ohead:  100000 -500 0.167
+XElapsed Time: 0.32 seconds (variance 0.104)
+XCPU Time: 0.15 seconds (variance 0.001)
+XReal Rate: 309438 int array accesses / second
+X
+XArray Size: 512 Kbytes
+XElapsed Time: 0.17 seconds (variance 0.002)
+XCPU Time: 0.18 seconds (variance 0.001)
+XReal Rate: 588235 int array accesses / second
+X
+XRandom Memory Access Test: 100000 Accesses
+X
+XArray Size: 8 Kbytes
+XElapsed Time: 0.22 seconds (variance 0.000)
+XCPU Time: 0.22 seconds (variance 0.000)
+XReal Rate: 448430 int array accesses / second
+X
+XArray Size: 64 Kbytes
+XElapsed Time: 0.28 seconds (variance 0.009)
+XCPU Time: 0.25 seconds (variance 0.001)
+XReal Rate: 357782 int array accesses / second
+X
+XArray Size: 512 Kbytes
+XElapsed Time: 0.32 seconds (variance 0.021)
+XCPU Time: 0.27 seconds (variance 0.005)
+XReal Rate: 316289 int array accesses / second
+X
+XFilesystem Throughput Test:
+X
+XFile Size: 62 blocks
+XWrite: 69.3 Kbytes per second   (variance 383.2)
+XRead:  227.1 Kbytes per second   (variance 96.7)
+XCopy:  76.3 Kbytes per second   (variance 8.4)
+X
+XFile Size: 125 blocks
+XWrite: 66.8 Kbytes per second   (variance 6.3)
+XRead:  237.4 Kbytes per second   (variance 26.4)
+XCopy:  61.6 Kbytes per second   (variance 13.1)
+X
+XFile Size: 250 blocks
+XWrite: 59.4 Kbytes per second   (variance 3.8)
+XRead:  238.9 Kbytes per second   (variance 6.8)
+XCopy:  52.4 Kbytes per second   (variance 5.7)
+X
+XFile Size: 500 blocks
+XWrite: 45.5 Kbytes per second   (variance 14.0)
+XRead:  243.5 Kbytes per second   (variance 1.9)
+XCopy:  28.8 Kbytes per second   (variance 74.5)
+X
+X
+XOutput sent to ... /dev/console
+XDirectories for temporary files ... Tmp
+X
+XFilesystem            kbytes    used   avail capacity  Mounted on
+X/dev/nd0                3859    2795     678    80%    /
+X/dev/ndp1               8639    3856    3919    50%    /pub
+Xlily-lilynet:/          7735    4764    2197    68%    /server_root
+Xlily-lilynet:/u       278443  188883   61715    75%    /u
+Xlily-lilynet:/usr     161167  142089    2961    98%    /usr
+Xlily-lilynet:/usr/private/lily13
+X                      161167  142089    2961    98%    /private_nfs
+X
+XSIGALRM check:  12 x 5 sec delays takes 60.00 wallclock secs (error 0.00%)
+XSimulated Multi-user Work Load Test:
+X
+X1 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 359.70 seconds (variance 29.656)
+XCPU Time: 20.17 seconds [ 8.33u + 11.83s ] (variance 0.163)
+X
+X4 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 361.23 seconds (variance 18.906)
+XCPU Time: 89.73 seconds [ 34.37u + 55.37s ] (variance 1.201)
+X
+X8 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 374.20 seconds (variance 348.797)
+XCPU Time: 189.17 seconds [ 69.17u + 120.00s ] (variance 1.023)
+X
+X  1 interactive users.
+XEnd Benchmark Run (Wed Jun 24 14:55:15 EDT 1987) ....
+End-of-File-Grunt
+if test 5641 -ne `cat 'log.sun3-50' | wc -c`
+then
+	echo 'shar: transmission error (expected 5641 characters)'
+fi
+echo 'x - log.uVaxII'
+if test -f 'log.uVaxII'
+then
+	echo 'shar: over-writing existing file log.uVaxII'
+fi
+sed 's/^X//' > log.uVaxII <<'End-of-File-Grunt'
+X
+XMC="uVaxII (VaxStation II/GPX)"
+XOPT="FP unit"
+XMEM="3 Mbytes"
+XUNIX="Ultrix 1.2"
+XDISKS="RD53"
+X
+XStart Benchmark Run (MUSBUS Version 5.0.Beta)
+X  Tue Jun 23 17:18:21 EDT 1987 (long iterations 6 times)
+X  2 interactive users.
+X
+XArithmetic Test (type = arithoh): 1000 Iterations
+XElapsed Time: 0.52 seconds (variance 0.002)
+XCPU Time: 0.37 seconds [ 0.37u + 0.00s ] (variance 0.003)
+X
+XArithmetic Test (type = register): 1000 Iterations
+XElapsed Time: 2.15 seconds (variance 0.051) (Actual: 1.63 )
+XCPU Time: 1.92 seconds [ 1.90u + 0.02s ] (variance 0.002) (Actual: 1.55 )
+X
+XArithmetic Test (type = short): 1000 Iterations
+XElapsed Time: 3.12 seconds (variance 0.114) (Actual: 2.60 )
+XCPU Time: 2.83 seconds [ 2.80u + 0.03s ] (variance 0.003) (Actual: 2.46 )
+X
+XArithmetic Test (type = int): 1000 Iterations
+XElapsed Time: 2.45 seconds (variance 0.003) (Actual: 1.93 )
+XCPU Time: 2.30 seconds [ 2.30u + 0.00s ] (variance 0.000) (Actual: 1.93 )
+X
+XArithmetic Test (type = long): 1000 Iterations
+XElapsed Time: 2.48 seconds (variance 0.006) (Actual: 1.96 )
+XCPU Time: 2.30 seconds [ 2.28u + 0.02s ] (variance 0.004) (Actual: 1.93 )
+X
+XArithmetic Test (type = float): 1000 Iterations
+XElapsed Time: 5.13 seconds (variance 0.031) (Actual: 4.61 )
+XCPU Time: 4.82 seconds [ 4.80u + 0.02s ] (variance 0.002) (Actual: 4.45 )
+X
+XArithmetic Test (type = double): 1000 Iterations
+XElapsed Time: 3.97 seconds (variance 0.015) (Actual: 3.45 )
+XCPU Time: 3.72 seconds [ 3.70u + 0.02s ] (variance 0.002) (Actual: 3.35 )
+X
+XArithmetic Test (sqrt(2) with dc to 99 decimal places)
+XElapsed Time: 2.92 seconds (variance 0.086)
+XCPU Time: 2.53 seconds [ 2.40u + 0.13s ] (variance 0.003)
+X
+XRecursion Test: Tower of Hanoi Problem
+X
+X17 Disk Problem:
+XElapsed Time: 5.20 seconds (variance 0.008)
+XCPU Time: 4.97 seconds [ 4.93u + 0.03s ] (variance 0.007)
+X
+XSystem Call Overhead Test: 5 x 4000 Calls
+XElapsed Time: 5.55 seconds (variance 0.055)
+XCPU Time: 5.28 seconds [ 0.75u + 4.53s ] (variance 0.002)
+X
+XPipe Throughput Test: read & write 2048 x 512 byte blocks
+XElapsed Time: 4.12 seconds (variance 0.010)
+XCPU Time: 3.92 seconds [ 0.12u + 3.80s ] (variance 0.002)
+X
+XPipe-based Context Switching Test: 2 x 500 Switches
+XElapsed Time: 2.13 seconds (variance 0.031)
+XCPU Time: 0.90 seconds [ 0.03u + 0.87s ] (variance 0.004)
+X
+XProcess Creation Test: 100 forks
+XElapsed Time: 1.98 seconds (variance 0.162)
+XCPU Time: 1.63 seconds [ 0.00u + 1.63s ] (variance 0.003)
+X
+XExecl Throughput Test: 100 execs
+XElapsed Time: 5.80 seconds (variance 0.716)
+XCPU Time: 3.02 seconds [ 0.10u + 2.92s ] (variance 0.010)
+X
+XC Compiler Test:
+X
+Xcc -c cctest.c
+XElapsed Time: 5.50 seconds (variance 0.130)
+XCPU Time: 3.83 seconds [ 2.87u + 0.97s ] (variance 0.013)
+X
+Xcc cctest.o
+XElapsed Time: 3.27 seconds (variance 0.103)
+XCPU Time: 0.77 seconds [ 0.30u + 0.47s ] (variance 0.003)
+X
+XSequential Memory Access Test: 100000 Accesses
+X
+XArray Size: 8 Kbytes
+XElapsed Time: 0.20 seconds (variance 0.005)
+XCPU Time: 0.21 seconds (variance 0.001)
+XReal Rate: 508475 int array accesses / second
+X
+XArray Size: 64 Kbytes
+XElapsed Time: 0.44 seconds (variance 0.113)
+XCPU Time: 0.26 seconds (variance 0.001)
+XReal Rate: 227273 int array accesses / second
+X
+XArray Size: 512 Kbytes
+XElapsed Time: 0.38 seconds (variance 0.001)
+XCPU Time: 0.38 seconds (variance 0.001)
+XReal Rate: 262009 int array accesses / second
+X
+XRandom Memory Access Test: 100000 Accesses
+X
+XArray Size: 8 Kbytes
+XElapsed Time: 0.16 seconds (variance 0.000)
+XCPU Time: 0.17 seconds (variance 0.000)
+XReal Rate: 631579 int array accesses / second
+X
+XArray Size: 64 Kbytes
+XElapsed Time: 0.33 seconds (variance 0.000)
+XCPU Time: 0.33 seconds (variance 0.000)
+XReal Rate: 301508 int array accesses / second
+X
+XArray Size: 512 Kbytes
+XElapsed Time: 0.57 seconds (variance 0.004)
+XCPU Time: 0.55 seconds (variance 0.001)
+XReal Rate: 175953 int array accesses / second
+X
+XFilesystem Throughput Test:
+X
+XFile Size: 62 blocks
+XWrite: 86.7 Kbytes per second   (variance 1049.1)
+XRead:  78.4 Kbytes per second   (variance 421.1)
+XCopy:  38.1 Kbytes per second   (variance 34.4)
+X
+XFile Size: 125 blocks
+XWrite: 116.2 Kbytes per second   (variance 3099.1)
+XRead:  82.6 Kbytes per second   (variance 2.8)
+XCopy:  42.2 Kbytes per second   (variance 19.6)
+X
+XFile Size: 250 blocks
+XWrite: 193.0 Kbytes per second   (variance 1404.6)
+XRead:  91.8 Kbytes per second   (variance 14.9)
+XCopy:  46.1 Kbytes per second   (variance 5.4)
+X
+XFile Size: 500 blocks
+XWrite: 99.0 Kbytes per second   (variance 89.5)
+XRead:  97.5 Kbytes per second   (variance 20.6)
+XCopy:  47.3 Kbytes per second   (variance 1.6)
+X
+XOutput sent to ... /dev/ttyp0
+XDirectories for temporary files ... Tmp
+X
+XFilesystem    total    kbytes  kbytes  percent
+X   node       kbytes    used    free   used    Mounted on
+X/dev/ra0a       7447    4721    1981    70%    /
+X/dev/ra0g      42003   30222    7580    80%    /usr
+X
+XSIGALRM check:  12 x 5 sec delays takes 60.05 wallclock secs (error -0.08%)
+XSimulated Multi-user Work Load Test:
+X
+X1 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 355.97 seconds (variance 0.953)
+XCPU Time: 22.20 seconds [ 15.23u + 6.97s ] (variance 0.010)
+X
+X4 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 359.60 seconds (variance 6.688)
+XCPU Time: 88.80 seconds [ 61.20u + 27.60s ] (variance 0.026)
+X
+X8 Concurrent Users, each with Input Keyboard Rate 2 chars / sec
+XElapsed Time: 380.70 seconds (variance 90.094)
+XCPU Time: 178.37 seconds [ 123.30u + 55.07s ] (variance 0.652)
+X
+X  1 interactive users.
+XEnd Benchmark Run (Wed Jun 24 09:33:55 EDT 1987) ....
+End-of-File-Grunt
+if test 5474 -ne `cat 'log.uVaxII' | wc -c`
+then
+	echo 'shar: transmission error (expected 5474 characters)'
+fi
+echo 'x - makework.c'
+if test -f 'makework.c'
+then
+	echo 'shar: over-writing existing file makework.c'
+fi
+sed 's/^X//' > makework.c <<'End-of-File-Grunt'
+X/*
+X *  makework  -- emulate a series of terminal users
+X *
+X *  makework nusers
+X *
+X *  job streams are specified on standard input with lines of the form
+X *  home_dir cmd_path_name [ options ] [ <stdin_file ] [ >stdout_file ]
+X *
+X *  Input is send to all nuser instances of the commands in the
+X *  job streams at a rate not in excess of "rate" characters per second
+X *  per command
+X *
+X *  environment variables $rate and $tty control typing rate (characters
+X *  per second) and destination of echoed output.
+X *
+X *  $Header: makework.c,v 3.9 87/09/17 05:55:13 kenj Exp $
+X */
+X
+X#include "makework.h"
+X
+X#define DEF_RATE	5.0
+X#define GRANULE		5
+X#define CHUNK		60
+X
+Xfloat	thres;
+Xfloat	est_rate = DEF_RATE;
+Xint	firstuser;	/* ordinal identification of first user for this
+X			 * process */
+Xint	exit_status = 0;
+Xint	sigpipe;	/* pipe write error flag */
+Xint	nstream;
+X
+Xstatic stream *cp;
+X
+Xmain(argc, argv)
+Xint	argc;
+Xchar	*argv[];
+X{
+X    int		i;
+X    int		l;
+X    int		fcopy = 0;	/* fd for copy output */
+X    int		master = 1;	/* the REAL master, == 0 for clones */
+X    int		cmseq = 0;	/* clone/master seq number */
+X    int		done;		/* count of children finished */
+X    int		output;		/* aggregate output char count for all
+X				   children */
+X    int		c;
+X    int		nch;		/* # characters to write */
+X    int		written;	/* # characters actully written */
+X    char	logname[20];	/* name of the log file(s) */
+X    int		nusers;
+X    int		onalarm();
+X    int		pipeerr();
+X    int		wrapup();
+X    int		grunt();
+X    int		pvec[2];	/* for pipes */
+X    char	*p;
+X    char	*prog;		/* my name */
+X    char	*getenv();
+X
+X#ifndef DEBUG
+X    freopen("Tmp/masterlog.00", "a", stderr);
+X#endif
+X    fprintf(stderr, "*** New Run ***  ");
+X    prog = argv[0];
+X    if ((p = getenv("rate")) != (char *)0) {
+X	sscanf(p, "%f", &est_rate);
+X	if (est_rate <= 0) {
+X	    fprintf(stderr, "%s: bad rate, reset to %.2f chars/sec\n", prog, DEF_RATE);
+X	    est_rate = DEF_RATE;
+X	}
+X#ifdef DEBUG
+X	else
+X	    fprintf(stderr, "%s: typing rate reset to %.2f chars/sec\n", prog, est_rate);
+X#endif
+X    }
+X    if ((p = getenv("tty")) != (char *)0) {
+X	fcopy = open(p, 1);
+X	if (fcopy < 0)
+X		fcopy = creat(p, 0600);
+X	if (fcopy < 0) {
+X	    fprintf(stderr, "%s: cannot open copy file '%s'\n", prog, p);
+X	    fflush(stderr);
+X	    exit(2);
+X	}
+X	lseek(fcopy, 0L, 2);	/* append at end of file */
+X    }
+X    
+X    if (argc < 2) {
+X	fprintf(stderr, "%s: missing nusers\n", prog);
+X	fflush(stderr);
+X	exit(4);
+X    }
+X
+X    nusers = atoi(argv[1]);
+X    if (nusers < 1) {
+X	fprintf(stderr, "%s: impossible nusers (%d<-%s)\n", prog, nusers, argv[1]);
+X	fflush(stderr);
+X	exit(4);
+X    }
+X    fprintf(stderr, "%d Users\n", nusers);
+X    argc--;
+X    argv++;
+X
+X    /* clone copies of myself to run up to MAXSTREAM jobs each */
+X    firstuser = MAXSTREAM;
+X    fprintf(stderr, "master pid %d\n", getpid());
+X    fflush(stderr);
+X    while (nusers > MAXSTREAM) {
+X	fflush(stderr);
+X	if (nusers >= 2*MAXSTREAM)
+X	    /* the next clone must run MAXSTREAM jobs */
+X	    nstream = MAXSTREAM;
+X	else
+X	    /* the next clone must run the leftover jobs */
+X	    nstream = nusers - MAXSTREAM;
+X	/* build job streams for the clone */
+X	getwork(nstream);
+X#ifdef DEBUG
+X	dumpwork();
+X#endif
+X	cmseq = firstuser/MAXSTREAM;
+X	if ((l = fork()) == -1) {
+X	    /* fork failed */
+X	    fatal("** clone fork failed **\n");
+X	    goto bepatient;
+X	} else if (l > 0) {
+X	    fprintf(stderr, "clone %d pid %d\n", cmseq, l);
+X	    /* I am the master with nstream fewer jobs to run */
+X	    nusers -= nstream;
+X	    firstuser += MAXSTREAM;
+X	    continue;
+X	} else {
+X	    /* I am a clone, run MAXSTREAM jobs */
+X	    master = 0;
+X	    nusers = nstream;
+X#ifndef DEBUG
+X	    sprintf(logname, "Tmp/masterlog.%02d", cmseq);
+X	    freopen(logname, "w", stderr);
+X#endif
+X	    break;
+X	}
+X    }
+X    if (master) {
+X	firstuser = 0;
+X	cmseq = 0;
+X	nstream = nusers;
+X	/* build job streams for the master */
+X	getwork(nstream);
+X#ifdef DEBUG
+X	dumpwork();
+X#endif
+X    }
+X
+X    close(0);
+X
+X    for (i = 0; i < nstream; i++ ) {
+X	if (master)
+X	    fprintf(stderr, "user %d master stream %d ", firstuser+i, i);
+X	else
+X	    fprintf(stderr, "user %d clone %d stream %d ", firstuser+i, cmseq, i);
+X	if (pipe(pvec) == -1) {
+X	    /* this is fatal */
+X	    fatal("** pipe failed **\n");
+X	    goto bepatient;
+X	}
+X	fflush(stderr);
+X	if ((work[i].pid = fork()) == 0) {
+X	    int	fd;
+X	    /* the command */
+X	    if (pvec[0] != 0) {
+X		close(0);
+X		dup(pvec[0]);
+X	    }
+X#ifndef DEBUG
+X	    sprintf(logname, "Tmp/userlog.%02d", firstuser+i);
+X	    freopen(logname, "w", stderr);
+X#endif
+X	    for (fd = 3; fd < 24; fd++)
+X		close(fd);
+X	    if (work[i].tty[0] != '\0') {
+X		/* redirect std output */
+X		if (freopen(work[i].tty, "w", stdout) == NULL) {
+X		    fprintf(stderr, "makework: cannot open %s for std output\n",
+X			work[i].tty);
+X		    fflush(stderr);
+X		    goto bepatient;
+X		}
+X	    }
+X	    if (chdir(work[i].home) == -1) {
+X		fprintf(stderr, "makework: chdir to \"%s\" failed!\n",
+X		    work[i].home);
+X		fflush(stderr);
+X		goto bepatient;
+X	    }
+X	    sprintf(logname, "USER.%02d", firstuser+i);
+X	    if (close(creat(logname, 0600)) == -1) {
+X		fprintf(stderr, "makework: creat \"%s\" failed!\n", logname);
+X		fflush(stderr);
+X		goto bepatient;
+X	    }
+X
+X	    execv(work[i].cmd, work[i].av);
+X	    /* don't expect to get here! */
+X	    fatal("** exec failed **\n");
+X	    goto bepatient;
+X	}
+X	else if (work[i].pid == -1) {
+X	    fatal("** fork failed **\n");
+X	    goto bepatient;
+X	}
+X	else {
+X	    close(pvec[0]);
+X	    work[i].fd = pvec[1];
+X	    work[i].line = work[i].bp = work[i].buf;
+X	    fprintf(stderr, "pid %d pipe fd %d", work[i].pid, work[i].fd);
+X	    if (work[i].tty[0] != '\0')
+X		fprintf(stderr, " > %s", work[i].tty);
+X	    fputc('\n', stderr);
+X	}
+X    }
+X    fflush(stderr);
+X
+X    srand(time(0));
+X    thres = 0;
+X    done = output = 0;
+X    for (i = 0; i < nstream; i++) {
+X	if (work[i].blen == 0)
+X	    done++;
+X	else
+X	    thres += est_rate * GRANULE;
+X    }
+X    est_rate = thres;
+X
+X    signal(SIGALRM, onalarm);
+X    signal(SIGPIPE, pipeerr);
+X    alarm(GRANULE);
+X    while (done < nstream) {
+X	for (i = 0; i < nstream; i++) {
+X	    cp = &work[i];
+X	    if (cp->xmit >= cp->blen) continue;
+X	    l = rand() % CHUNK + 1;	/* 1-CHUNK chars */
+X	    if (l == 0) continue;
+X	    if (cp->xmit + l > cp->blen)
+X		l = cp->blen - cp->xmit;
+X	    p = cp->bp;
+X	    cp->bp += l;
+X	    cp->xmit += l;
+X#ifdef DEBUG
+X	    fprintf(stderr, "child %d, %d processed, %d to go\n", i, cp->xmit, cp->blen - cp->xmit);
+X#endif
+X	    while (p < cp->bp) {
+X		if (*p == '\n' || (p == &cp->bp[-1] && cp->xmit >= cp->blen)) {
+X		    /* write it out */
+X		    nch = p - cp->line + 1;
+X		    if ((written = write(cp->fd, cp->line, nch)) != nch) {
+X			/* argh! */
+X			cp->line[nch] = '\0';
+X			fprintf(stderr, "user %d cmd %s ",
+X				firstuser+i, cp->line);
+X 			fprintf(stderr, "write(,,%d) returns %d\n", nch, written);
+X			if (sigpipe)
+X			    fatal("** SIGPIPE error **\n");
+X			else
+X			    fatal("** write error **\n");
+X			goto bepatient;
+X
+X		    }
+X		    if (fcopy)
+X			write(fcopy, cp->line, p - cp->line + 1);
+X#ifdef DEBUG
+X		    fprintf(stderr, "child %d gets \"", i);
+X		    {
+X			char *q = cp->line;
+X			while (q <= p) {
+X				if (*q >= ' ' && *q <= '~')
+X					fputc(*q, stderr);
+X				else
+X					fprintf(stderr, "\\%03o", *q);
+X				q++;
+X			}
+X		    }
+X		    fputc('"', stderr);
+X#endif
+X		    cp->line = &p[1];
+X		}
+X		p++;
+X	    }
+X	    if (cp->xmit >= cp->blen) {
+X		done++;
+X		close(cp->fd);
+X#ifdef DEBUG
+X	fprintf(stderr, "child %d, close std input\n", i);
+X#endif
+X	    }
+X	    output += l;
+X	}
+X	while (output > thres) {
+X	    pause();
+X#ifdef DEBUG
+X	    fprintf(stderr, "after pause: output, thres, done %d %.2f %d\n", output, thres, done);
+X#endif
+X	}
+X    }
+X
+Xbepatient:
+X    alarm(0);
+X/****
+X *  If everything is going OK, we should simply be able to keep
+X *  looping unitil 'wait' fails, however some descendent process may
+X *  be in a state from which it can never exit, and so a timeout
+X *  is used.
+X *  5 minutes should be ample, since the time to run all jobs is of
+X *  the order of 5-10 minutes, however some machines are painfully slow,
+X *  so the timeout has been set at 20 minutes (1200 seconds).
+X ****/
+X    signal(SIGALRM, grunt);
+X    alarm(1200);
+X    while ((c = wait(&l)) != -1) {
+X        for (i = 0; i < nstream; i++) {
+X	    if (c == work[i].pid) {
+X		fprintf(stderr, "user %d pid %d done", firstuser+i, c);
+X		if (l != 0) {
+X		    if (l & 0x7f)
+X			fprintf(stderr, " status %d", l & 0x7f);
+X		    if (l & 0xff00)
+X			fprintf(stderr, " exit code %d", (l>>8) & 0xff);
+X		    exit_status = 4;
+X		}
+X		fputc('\n', stderr);
+X		c = work[i].pid = -1;
+X		break;
+X	    }
+X	}
+X	if (c != -1) {
+X	    fprintf(stderr, "clone %d done, pid %d ", cmseq, c);
+X	    if (l != 0) {
+X		if (l & 0x7f)
+X		    fprintf(stderr, " status %d", l & 0x7f);
+X		if (l & 0xff00)
+X		    fprintf(stderr, " exit code %d", (l>>8) & 0xff);
+X		exit_status = 4;
+X	    }
+X	    fputc('\n', stderr);
+X	}
+X    }
+X    alarm(0);
+X    wrapup("Finished waiting ...");
+X
+X
+X}
+X
+Xonalarm()
+X{
+X    thres += est_rate;
+X    signal(SIGALRM, onalarm);
+X    alarm(GRANULE);
+X}
+X
+Xgrunt()
+X{
+X    /* timeout after label "bepatient" in main */
+X    exit_status = 4;
+X    wrapup("Timed out waiting for jobs to finish ...");
+X}
+X
+Xpipeerr()
+X{
+X	sigpipe++;
+X}
+X
+Xwrapup(reason)
+Xchar	*reason;
+X{
+X    int i;
+X    int killed = 0;
+X    fflush(stderr);
+X    for (i = 0; i < nstream; i++) {
+X	if (work[i].pid > 0 && kill(work[i].pid, SIGKILL) != -1) {
+X	    if (!killed) {
+X		killed++;
+X		fprintf(stderr, "%s\n", reason);
+X		fflush(stderr);
+X	    }
+X	    fprintf(stderr, "user %d pid %d killed off\n", firstuser+i, work[i].pid);
+X	fflush(stderr);
+X	}
+X    }
+X    exit(exit_status);
+X}
+End-of-File-Grunt
+if test 9455 -ne `cat 'makework.c' | wc -c`
+then
+	echo 'shar: transmission error (expected 9455 characters)'
+fi
+echo 'x - makework.h'
+if test -f 'makework.h'
+then
+	echo 'shar: over-writing existing file makework.h'
+fi
+sed 's/^X//' > makework.h <<'End-of-File-Grunt'
+X#include <stdio.h>
+X#include <signal.h>
+X/* $Header: makework.h,v 1.4 87/06/24 08:33:56 kjmcdonell Beta $ */
+X
+X#define MAXSTREAM	12
+X
+Xtypedef struct st_stream {
+X	char	*home;		/* home dir for job stream */
+X	char	*cmd;		/* name of command to run */
+X	char	**av;		/* arguments to command */
+X	char	*buf;		/* standard input buffer */
+X	int	blen;		/* size of standard input buffer */
+X	int	xmit;		/* # characters sent */
+X	char	*bp;		/* std input buffer pointer */
+X	char	*tty;		/* standard output (filename) */
+X	int	fd;		/* stdin to command */
+X	int	pid;		/* PID of stream command */
+X	char	*line;		/* start of input line */ 
+X} stream;
+X
+Xextern stream work[];
+X
+Xextern int	nstream;	/* number of concurrent streams to be
+X				 * simulated by this process */
+Xextern int	exit_status;	/* returned to parent */
+End-of-File-Grunt
+if test 787 -ne `cat 'makework.h' | wc -c`
+then
+	echo 'shar: transmission error (expected 787 characters)'
+fi
+echo 'x - mem.awk'
+if test -f 'mem.awk'
+then
+	echo 'shar: over-writing existing file mem.awk'
+fi
+sed 's/^X//' > mem.awk <<'End-of-File-Grunt'
+X# $Header: mem.awk,v 3.4 87/06/22 14:27:39 kjmcdonell Beta $
+X/real/	{ next }
+X/^[0-9][ .0-9-]*$/ && NF==3 { \
+X	r=$2/1000; \
+X	if (r < 0) { \
+X	    print "** Iteration ",iter+1," real loop < ohead: ",$0; \
+X	    r=0; \
+X	} \
+X	iter++; numacc=$1; real+=r; r2+=r*r; cpu+=$3; c2+=$3*$3; \
+X	next; \
+X    }
+X{ print "** Iteration ",iter+1," Failed: ",$0 }
+XEND {\
+X	if (iter > 0) { \
+X	    printf "Elapsed Time: %.2f seconds",real/iter; \
+X	    if (iter > 1) printf " (variance %.3f)",(r2-2*real*real/iter+real*real/iter)/(iter-1); \
+X	    printf "\nCPU Time: %.2f seconds",cpu/iter; \
+X	    if (iter > 1) printf " (variance %.3f)",(c2-2*cpu*cpu/iter+cpu*cpu/iter)/(iter-1); \
+X	    print; \
+X	    printf "Real Rate: %.0f int array accesses / second\n",(numacc*iter)/real; \
+X	} else { \
+X	    print "Elapsed Time: -- no measured results!!"; \
+X	    print "CPU Time: -- no measured results!!"; \
+X	} \
+X    }
+End-of-File-Grunt
+if test 882 -ne `cat 'mem.awk' | wc -c`
+then
+	echo 'shar: transmission error (expected 882 characters)'
+fi

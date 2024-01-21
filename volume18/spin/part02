@@ -1,0 +1,662 @@
+Subject:  v18i010:  Simple programmable interface kit, Part01/02
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Jim McBeath <voder!sci!gumby!jimmc>
+Posting-number: Volume 18, Issue 10
+Archive-name: spin/part01
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 2)."
+# Contents:  exec.c
+# Wrapped by rsalz@fig.bbn.com on Thu Mar  9 15:55:26 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'exec.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'exec.c'\"
+else
+echo shar: Extracting \"'exec.c'\" \(13333 characters\)
+sed "s/^X//" >'exec.c' <<'END_OF_FILE'
+X/* exec.c - execution for spin
+X *
+X * 16.Oct.87  jimmc  Initial definition
+X * 21.Oct.87  jimmc  Add xexec stuff
+X * 22.Oct.87  jimmc  Add I and S arg types
+X *  4.Nov.87  jimmc  Add longjmp stuff, use SPescape
+X *  5.Nov.87  jimmc  Add SPbool
+X * 30.Nov.87  jimmc  Lint cleanup
+X * 18.Jan.88  jimmc  Allow negative default values for I arg format
+X */
+X/* LINTLIBRARY */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <strings.h>
+X#include "goto.h"
+X#include "xalloc.h"
+X#include "spin.h"
+X#include "spinparse.h"
+X#include "exec.h"
+X
+Xtypedef char *string;
+Xtypedef int (*intfuncp)();
+Xtypedef double (*dblfuncp)();
+Xtypedef string (*strfuncp)();
+Xtypedef SPtoken * (*listfuncp)();
+X
+Xint (*SPxexecp)();
+X
+XSPsetxexecp(funcp)
+Xint (*funcp)();
+X{
+X	SPxexecp = funcp;
+X}
+X
+XSPtoken *
+XSPnewnil()
+X{
+XSPtoken *rval;
+X
+X	ALLOCTOKEN(rval)
+X	rval->type = SPTokNil;
+X	return rval;
+X}
+X
+XSPtoken *
+XSPcopytoken(tk)
+XSPtoken *tk;
+X{
+XSPtoken *newtk, *ltk, *newltk, *prevltk;
+X
+X	if (!tk) return NIL;
+X	if (tk->type==SPTokList) {
+X		ALLOCTOKEN(newtk)
+X		*newtk = *tk;
+X		newtk->value.l = NIL;
+X		prevltk = NIL;
+X		for (ltk=tk->value.l; ltk; ltk=ltk->next) {
+X			newltk = SPcopytoken(ltk);
+X			newltk->next = NIL;
+X			if (!newtk->value.l) newtk->value.l = newltk;
+X			else prevltk->next = newltk;
+X			prevltk = newltk;
+X		}
+X		return newtk;
+X	}
+X	ALLOCTOKEN(newtk)
+X	*newtk = *tk;	/* structure copy */
+X	if (tk->type==SPTokStr || tk->type==SPTokName) {
+X		newtk->value.s = XALLOCM(char,strlen(tk->value.s)+1,
+X					"copy token");
+X		strcpy(newtk->value.s,tk->value.s);
+X	}
+X	return newtk;
+X}
+X
+XSPtoken *
+XSPexec(tk)
+XSPtoken *tk;
+X{
+XSPtoken *SPexeclist(), *SPexecname();
+X
+X#if 0	/* sometimes useful for debugging */
+Xprintf("exec\n");
+XSPdumptoken(tk);
+X#endif
+X	if (!tk) return NIL;
+X	if (tk->type!=SPTokList) {	/* treat as constant */
+X		return SPcopytoken(tk);
+X	}
+X/* It is a list, so we need to examine the first item in the list
+X * and base our mode of execution on that item.
+X */
+X	tk = tk->value.l;
+X	if (!tk) return SPnewnil();
+X	switch (tk->type) {
+X	case SPTokList:
+X		return SPexeclist(tk);
+X	case SPTokName:
+X		return SPexecname(tk);
+X	default:
+X		SPescape("BadExecList",
+X			"bad node type %c in list execution",tk->type);
+X		/* NOTREACHED */
+X	}
+X}
+X
+XSPtoken *
+XSPqexec(tk)
+XSPtoken *tk;
+X{
+X	if (!tk) return NIL;
+X	if (tk->type==SPTokList) return SPexec(tk);
+X	return tk;
+X}
+X
+Xint
+XSPbool(tk)	/* returns boolean value for token */
+XSPtoken *tk;
+X{
+X	if (!tk) return 0;
+X	switch (tk->type) {
+X	case SPTokInt:
+X		return (tk->value.n!=0);
+X	case SPTokFloat:
+X		return (tk->value.f!=0.0);
+X	case SPTokNil:
+X		return 0;
+X	case SPTokStr:
+X	case SPTokName:
+X		return (tk->value.s!=0 && tk->value.s[0]!=0);
+X	case SPTokList:
+X		return (tk->value.l!=0);
+X	default:
+X		SPescape("UnknownType","unknown node type %c",tk->type);
+X		/* NOTREACHED */
+X	}
+X}
+X
+Xint
+XSPbooleval(tk)
+XSPtoken *tk;
+X{
+X	return SPbool(SPqexec(tk));
+X}
+X
+XSPtoken *
+XSPexecname(tk)
+XSPtoken *tk;
+X{
+Xchar *name;
+XSPfuncinfo *finfo, *SPfindfunc();
+XSPtoken *tkval;
+Xint argc;
+Xint argv[100];
+Xchar *argstr;
+Xint argtype;
+XSPtoken *rval;
+Xint rtype;
+Xint t;
+Xint n;
+Xfloat f;
+Xchar *s;
+XSPtoken *l;
+Xint dflti;
+Xchar *dflts, *dflts0;
+Xdouble *dptr;
+Xint (*ifp)();
+Xdouble (*ffp)();
+Xchar * (*sfp)();
+XSPtoken * (*lfp)();
+Xstatic char *badargs="BadArgument";
+Xstatic char *toomanyargsdef="TooManyArgsDef";
+Xstatic char *badargstr="BadArgstrFormat";
+X
+X	if (!tk || tk->type!=SPTokName) return NIL;
+X	name = tk->value.s;
+X#if 0
+Xprintf("execname %s\n", name);
+X#endif
+X	finfo = SPfindfunc(name);
+X	if (!finfo) {
+X		/* maybe it's a user-defined function */
+X		if (SPxexecp) {
+X			ALLOCTOKEN(rval)
+X			t = (*SPxexecp)(name,tk->next,rval);
+X			if (t) return rval;	/* he did it! */
+X			FREETOKEN(rval)
+X		}
+X		SPescape("NoSuchFunction","can't fund function %s",name);
+X		/* NOTREACHED */
+X	}
+X	argc = 0;
+X	argstr = finfo->args+1;
+X	tk = tk->next;
+X	while (*argstr && *argstr!=';') {
+X		argtype = *argstr;
+X		switch (argtype) {
+X		case 'b':		/* any type, converted to bool int */
+X			tkval = SPqexec(tk);
+X			if (!tkval) {
+X				SPescape(badargs,"needed arg for %s",name);
+X				/* NOTREACHED */
+X			}
+X			argv[argc++] = SPbool(tkval);
+X			break;
+X		case 'i':		/* int */
+X			tkval = SPqexec(tk);
+X			if (tkval && tkval->type==SPTokInt) {
+X				argv[argc++] = tkval->value.n;
+X			}
+X			else {
+X				SPescape(badargs,"needed int for %s",name);
+X				/* NOTREACHED */
+X			}
+X			break;
+X		case 'I':	/* optional int */
+X			if (argstr[1]=='-') {
+X				argstr++;
+X				dflti = -atoi(argstr+1);
+X			} else {
+X				dflti = atoi(argstr+1);
+X			}
+X			while (isdigit(argstr[1])) argstr++;
+X			tkval = SPqexec(tk);
+X			if (tkval)
+X				if (tkval->type==SPTokInt) {
+X					argv[argc++] = tkval->value.n;
+X				}
+X				else {
+X					SPescape(badargs,"needed int for %s",
+X						name);
+X					/* NOTREACHED */
+X				}
+X			else {
+X				argv[argc++] = dflti;
+X			}
+X			break;
+X		case 'f':		/* float */
+X			tkval = SPqexec(tk);
+X			if (tkval && tkval->type==SPTokFloat) {
+X				dptr = (double *)(argv+argc);
+X				*dptr = (double)(tkval->value.f);
+X				argc = ((int *)dptr)-argv;
+X			}
+X			else {
+X				SPescape(badargs,"needed float for %s",name);
+X				/* NOTREACHED */
+X			}
+X			break;
+X		case 'n':		/* name */
+X		case 's':		/* string */
+X			tkval = SPqexec(tk);
+X			if (tkval && (tkval->type==SPTokName ||
+X			    (argtype=='s'&&tkval->type==SPTokStr))) {
+X				((char **)argv)[argc++] = tkval->value.s;
+X			}
+X			else {
+X				SPescape(badargs,"needed %s for %s",
+X					argtype=='n'?"name":"string",name);
+X				/* NOTREACHED */
+X			}
+X			break;
+X		case 'S':		/* optional string */
+X			if (argstr[1]=='N') {
+X				dflts = NIL;
+X				++argstr;
+X			}
+X			else if (argstr[1]=='"') {	/* read str */
+X				argstr += 2;	/* point past quote */
+X				dflts0 = argstr;
+X				while (*argstr!=0 && *argstr!='"') {
+X					argstr++;
+X				}
+X				dflts = XALLOC(char,argstr-dflts0+1);
+X				strncpy(dflts,dflts0,argstr-dflts0);
+X				dflts[argstr-dflts0]=0;
+X			}
+X			else {
+X				SPescape("BadArgstrFormat",
+X					"bad format in arg string for %s",
+X					name);
+X				/* NOTREACHED */
+X			}
+X			tkval = SPqexec(tk);
+X			if (tkval) {
+X				if ((tkval->type==SPTokName ||
+X				    (argtype=='S'&&tkval->type==SPTokStr))) {
+X					((char **)argv)[argc++] =
+X						tkval->value.s;
+X					XFREE(dflts);
+X				}
+X				else {
+X					SPescape(badargs,"needed %s for %s",
+X					    argtype=='n'?"name":"string",name);
+X					/* NOTREACHED */
+X				}
+X			}
+X			else {
+X				((char **)argv)[argc++] = dflts;
+X			}
+X			break;
+X		case 'V':		/* single evaluated variable */
+X			tkval = SPqexec(tk);
+X			if (!tkval) tkval=SPnewnil();
+X			((SPtoken **)argv)[argc++] = tkval;
+X			break;
+X		case 'L':		/* unevaluated list */
+X			((SPtoken **)argv)[argc++] = tk;
+X			break;
+X		case 'R':	/* remainder of list as one arg, uneval. */
+X			ALLOCTOKEN(tkval)
+X			tkval->type = SPTokList;
+X			tkval->next = 0;
+X			tkval->value.l = tk;
+X			tk = 0;
+X			((SPtoken **)argv)[argc++] = tkval;
+X			break;
+X		default:
+X			SPescape(badargstr,
+X				"bad arg type %c in func %s",argtype,name);
+X			/* NOTREACHED */
+X		}
+X		if (*argstr) argstr++;
+X		if (tk) tk = tk->next;
+X	}
+X	if (tk) {
+X		SPescape("TooManyArgs","too many arguments for %s",name);
+X		/* NOTREACHED */
+X	}
+X	if (*argstr && *argstr!=';') {
+X		SPescape("NotEnoughArgs","not enough arguments for %s", name);
+X		/* NOTREACHED */
+X	}
+X	ALLOCTOKEN(rval)
+X	rtype = finfo->args[0];
+X	switch (rtype) {	/* return value type */
+X	case 'i':	/* int */
+X	case 'v':	/* no return value */
+X		ifp = finfo->funcp;
+X		switch (argc) {
+X		case 0: n = (*ifp)(); break;
+X		case 1: n = (*ifp)(argv[0]); break;
+X		case 2: n = (*ifp)(argv[0],argv[1]); break;
+X		case 3: n = (*ifp)(argv[0],argv[1],argv[2]); break;
+X		case 4: n = (*ifp)(argv[0],argv[1],argv[2],argv[3]); break;
+X		default:
+X			SPescape(toomanyargsdef,
+X				"too many args in definition of %s",name);
+X			/* NOTREACHED */
+X		}
+X		if (rtype=='v') {
+X			rval->type = SPTokNil;
+X		} else {
+X			rval->type = SPTokInt;
+X			rval->value.n = n;
+X		}
+X		break;
+X	case 'f':	/* float (double) */
+X		ffp = (dblfuncp)(finfo->funcp);
+X		switch (argc) {
+X		case 0: f = (*ffp)(); break;
+X		case 1: f = (*ffp)(argv[0]); break;
+X		case 2: f = (*ffp)(argv[0],argv[1]); break;
+X		case 3: f = (*ffp)(argv[0],argv[1],argv[2]); break;
+X		case 4: f = (*ffp)(argv[0],argv[1],argv[2],argv[3]); break;
+X		default:
+X			SPescape(toomanyargsdef,
+X				"too many args in definition of %s",name);
+X			/* NOTREACHED */
+X		}
+X		rval->type = SPTokFloat;
+X		rval->value.f = f;
+X		break;
+X	case 'n':	/* name */
+X	case 's':	/* string */
+X	case 'S':	/* allocated string */
+X		sfp = (strfuncp)(finfo->funcp);
+X		switch (argc) {
+X		case 0: s = (*sfp)(); break;
+X		case 1: s = (*sfp)(argv[0]); break;
+X		case 2: s = (*sfp)(argv[0],argv[1]); break;
+X		case 3: s = (*sfp)(argv[0],argv[1],argv[2]); break;
+X		case 4: s = (*sfp)(argv[0],argv[1],argv[2],argv[3]); break;
+X		default:
+X			SPescape(toomanyargsdef,
+X				"too many args in definition of %s",name);
+X			/* NOTREACHED */
+X		}
+X		if (rtype=='n')
+X			rval->type = SPTokName;
+X		else
+X			rval->type = SPTokStr;
+X		if (islower(rtype) || !s) {
+X			if (!s) s="";
+X			rval->value.s =
+X				XALLOCM(char,strlen(s)+1,"eval str func");
+X		}
+X		else {
+X			rval->value.s = s;	/* allocated for us */
+X		}
+X		strcpy(rval->value.s,s);
+X		break;
+X	case 'V':	/* returns an already allocated var token */
+X	case 'l':	/* returns a static list */
+X	case 'L':	/* returns an already-allocated list */
+X		lfp = (listfuncp)finfo->funcp;
+X		switch (argc) {
+X		case 0: l = (*lfp)(); break;
+X		case 1: l = (*lfp)(argv[0]); break;
+X		case 2: l = (*lfp)(argv[0],argv[1]); break;
+X		case 3: l = (*lfp)(argv[0],argv[1],argv[2]); break;
+X		case 4: l = (*lfp)(argv[0],argv[1],argv[2],argv[3]); break;
+X		default:
+X			SPescape(toomanyargsdef,
+X				"too many args in definition of %s",name);
+X			/* NOTREACHED */
+X		}
+X		FREETOKEN(rval)
+X		if (islower(rtype))
+X			rval = SPcopytoken(l);
+X		else
+X			rval = l;
+X		break;
+X	default:
+X		SPescape(badargstr,"bad return code type %c for %s",rtype,name);
+X		rval->type = SPTokNil;
+X		break;
+X	}
+X	return rval;
+X}
+X
+X/* execute all of the nodes in a list of nodes */
+XSPtoken *
+XSPexeclist(tklist)
+XSPtoken *tklist;
+X{
+XSPtoken *rval;
+Xjmp_bufp savejbufp;
+Xjmp_buf ourjbuf;
+XSPtoken *tk, *jtk;
+X
+X	rval = NIL;
+X	savejbufp = SPjbufp;
+X	SPjbufp = jmpbuf_addr(ourjbuf);
+X	for (tk=tklist; tk; tk=tk->next) {
+X		if (rval) FREETOKEN(rval)
+X		if (setjmp(jmpbuf_ref(SPjbufp))) {	/* process goto */
+X			for (jtk=tklist; jtk; jtk=jtk->next) {
+X				if (SPisgotolabel(jtk)) {
+X					tk = jtk;	/* go there */
+X					goto foundlabel; /* resume execution */
+X				}
+X			}
+X			/* didn't find the label, keep going up */
+X			SPjbufp = savejbufp;
+X			longjmp(jmpbuf_ref(SPjbufp),1);
+X		}
+Xfoundlabel:
+X		rval = SPexec(tk);	/* execute one node */
+X	}
+X	SPjbufp = savejbufp;
+X	return rval;
+X}
+X
+Xint	/* returns 1 if the node is a label list and matches SPgotolabel */
+XSPisgotolabel(tk)
+XSPtoken *tk;
+X{
+XSPtoken *tkl, *tkln;
+X
+X	if (tk &&
+X	    tk->type==SPTokList &&
+X	    ((tkl=tk->value.l)) &&
+X	    tkl->type==SPTokName &&
+X	    tkl->value.s &&
+X	    strcmp(tkl->value.s,"label")==0 &&
+X	    ((tkln=tkl->next)) &&
+X	    tkln->type==SPTokName &&
+X	    tkln->value.s &&
+X	    strcmp(tkln->value.s,SPgotolabel)==0
+X	   ) {
+X		return 1;	/* found it */
+X	}
+X	return 0;	/* not this one */
+X}
+X
+X/*..........*/
+X
+XSPfuncinfo *SPfuncbase;
+X
+XSPfuncinfo *
+XSPfindfunc(name)
+Xchar *name;		/* name of the func to find */
+X{
+XSPfuncinfo *finfo;
+X
+X	for (finfo=SPfuncbase; finfo; finfo=finfo->next)
+X		if (strcmp(finfo->name,name)==0) return finfo;
+X	return NIL;
+X}
+X
+XSPfuncinfo *
+XSPnewfunc(name)		/* make a new entry for the name */
+Xchar *name;
+X{
+XSPfuncinfo *finfo;
+X
+X	finfo = XALLOCM(SPfuncinfo,1,"newfunc");
+X	finfo->name = name;
+X	finfo->next = SPfuncbase;
+X	SPfuncbase = finfo;
+X	return finfo;
+X}
+X
+X/* VARARGS2 */ /* not really - but third arg is of variable type */
+Xvoid
+XSPdeffunc(name,args,funcp)
+Xchar *name;		/* the name of the function */
+Xchar *args;		/* type of args encoded as string */
+Xvoid (*funcp)();	/* pointer to the function */
+X{
+XSPfuncinfo *finfo;
+X
+X	if (strlen(args)<1) {
+X		SPwerror("args string for %s is too short", name);
+X		return;
+X	}
+X	finfo = SPfindfunc(name);	/* find the function */
+X	if (finfo) {		/* redefinition */
+X		SPwerror("%s redefined",name);
+X	}
+X	else {			/* new */
+X		finfo = SPnewfunc(name);
+X	}
+X	finfo->args = args;
+X	finfo->funcp = funcp;
+X}
+X
+X/*..........*/
+X
+XSPprintval(stream,tk,indent)
+XFILE *stream;
+XSPtoken *tk;
+Xint indent;
+X{
+Xint i;
+XSPtoken *ltk;
+X
+X	for (i=0;i<indent;i++)
+X		fputs("  ",stream);
+X	if (!tk) fprintf(stream,"<NIL>\n");
+X	else switch (tk->type) {
+X	case SPTokNil: fprintf(stream,"NIL\n"); break;
+X	case SPTokInt: fprintf(stream,"INT %d\n",tk->value.n); break;
+X	case SPTokFloat: fprintf(stream,"FLOAT %g\n",tk->value.f); break;
+X	case SPTokStr: fprintf(stream,"STRING %s\n",tk->value.s); break;
+X	case SPTokName: fprintf(stream,"NAME %s\n",tk->value.s); break;
+X	case SPTokList:
+X		fprintf(stream,"LIST:\n");
+X		for (ltk=tk->value.l; ltk; ltk=ltk->next)
+X			SPprintval(stream,ltk,indent+1);
+X		break;
+X	default:
+X		fprintf(stream,"Type %03o (%c)\n",tk->type,tk->type);
+X		break;
+X	}
+X}
+X
+X/*..........*/
+X
+X/* some debug routines which print out tokens */
+Xvoid
+XSPdumptoken(tk)
+XSPtoken *tk;
+X{
+X	if (!tk) {
+X		printf("NIL pointer\n");
+X		return;
+X	}
+X	if (!isprint(tk->type)) {
+X		printf("bad type: %03o\n", tk->type);
+X		return;
+X	}
+X	printf("type=%c",tk->type);
+X	switch (tk->type) {
+X	case SPTokInt:
+X		printf(" %d", tk->value.n);
+X		break;
+X	case SPTokFloat:
+X		printf(" %f", tk->value.f);
+X		break;
+X	case SPTokStr:
+X	case SPTokName:
+X		printf(" %s", tk->value.s);
+X		break;
+X	case SPTokList:
+X		printf("\n");
+X		SPdumptokenlist(tk->value.l);
+X		break;
+X	}
+X	printf("\n");
+X}
+X
+Xvoid
+XSPdumptokenlist(tk)
+XSPtoken *tk;
+X{
+X	while (tk) {
+X		SPdumptoken(tk);
+X		tk = tk->next;
+X	}
+X}
+X
+X/* end */
+END_OF_FILE
+if test 13333 -ne `wc -c <'exec.c'`; then
+    echo shar: \"'exec.c'\" unpacked with wrong size!
+fi
+# end of 'exec.c'
+fi
+echo shar: End of archive 2 \(of 2\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked both archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

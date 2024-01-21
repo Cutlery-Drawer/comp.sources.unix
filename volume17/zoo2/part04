@@ -1,0 +1,1421 @@
+Subject:  v17i067:  Zoo archive program, Part04/10
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Rahul Dhesi <bsu-cs!dhesi@iuvax.cs.indiana.edu>
+Posting-number: Volume 17, Issue 67
+Archive-name: zoo2/part04
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 4 (of 10)."
+# Wrapped by rsalz@papaya.bbn.com on Thu Feb  2 18:03:59 1989
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'lzc.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'lzc.c'\"
+else
+echo shar: Extracting \"'lzc.c'\" \(8454 characters\)
+sed "s/^X//" >'lzc.c' <<'END_OF_FILE'
+X#ifndef LINT
+Xstatic char sccsid[]="@(#) lzc.c 2.6 88/01/30 18:39:15";
+X#endif /* LINT */
+X
+X#include "options.h"
+X/*
+XLempel-Ziv compression.  Mostly based on Tom Pfau's assembly language
+Xcode.
+X
+XThe contents of this file are hereby released to the public domain.
+X
+X                                    -- Rahul Dhesi  1986/12/31
+X*/
+X
+X#include "zoo.h"
+X#include "zooio.h"
+X#include "various.h"
+X#include "zoofns.h"           /* function definitions */
+X/* zoomem.h defines IN_BUF_SIZE & OUT_BUF_SIZE */
+X#include "zoomem.h"
+X#include "debug.h"
+X#include "assert.h"
+X/* lzconst.h contains constants for lzd() and lzc() */
+X#include "lzconst.h"
+X
+X#ifdef LINT_ARGS
+Xvoid init_ctab(NOTHING);
+Xvoid wr_ccode(int);
+Xint rd_cch(NOTHING);
+Xint lukup_ccode(int, int, int *);
+Xvoid ad_ccode(int, int, int);
+Xvoid check_ratio(NOTHING);
+Xvoid flush_c(int);
+X#else
+Xvoid init_ctab();
+Xvoid wr_ccode();
+Xint rd_cch();
+Xint lukup_ccode();
+Xvoid ad_ccode();
+Xvoid check_ratio();
+Xvoid flush_c();
+X#endif
+X
+X/* interval at which to check ratio */
+X#define CHECKGAP 4000
+X#define NEXT_USE  1
+X#define FIRST_USE 2
+X#define FOUND 0
+X
+Xstruct   tabentry {
+X   int first;
+X   int next;
+X   char z_ch;
+X};
+X
+Xextern char *out_buf_adr;
+Xextern char *in_buf_adr;
+Xextern char memflag;                    /* memory allocated? */
+Xstruct tabentry *table;                 /* this table also used by lzd.c */
+Xstatic unsigned int free_code;
+Xstatic int nbits;
+Xstatic unsigned int max_code;
+Xstatic unsigned int bitsout;
+Xstatic int bit_interval;
+Xstatic unsigned int bytesin, ratio, ratflag;
+Xstatic unsigned int in_offset, in_size;
+Xstatic unsigned int bit_offset;
+X
+X#ifdef UNBUF_IO
+X#define		BLOCKFILE		int
+X#define		BLOCKREAD		read
+X#define		BLOCKWRITE		write
+Xint read PARMS ((int, VOIDPTR, unsigned));
+Xint write PARMS ((int, VOIDPTR, unsigned));
+X#else
+X#define		BLOCKFILE		ZOOFILE
+X#define		BLOCKREAD		zooread
+X#define		BLOCKWRITE		zoowrite
+X#endif /* UNBUF_IO */
+X
+Xstatic BLOCKFILE in_f, out_f;
+X
+Xint lzc (input_f, output_f)
+XBLOCKFILE input_f, output_f;
+X{
+X   int nextch, prefix_code, k;
+X   int status;
+X   int where;
+X
+X   in_f = input_f;
+X   out_f = output_f;
+X
+X   bit_offset = in_offset = in_size = 0;
+X
+X   if (memflag == 0) {
+X     table = (struct tabentry *) emalloc((MAXMAX+10) * sizeof(struct tabentry));
+X     memflag++;
+X   }
+X
+X   init_ctab();
+X   wr_ccode(CLEAR);
+X   nextch = rd_cch();
+X   if (nextch == EOF) {                  /* note real EOF, not Z_EOF */
+X      wr_ccode (Z_EOF);
+X		flush_c ((int) ((bit_offset + 7) / 8));
+X      return (0);                         /* normal return from compress */
+X   }
+X
+X   /* compression loop begins here with nextch holding the next input char */
+Xloop1:
+X   if (ratflag != 0)
+X      check_ratio();
+X   nextch &= 0xff;                       /* turn character to code */
+X   assert(nextch < 256);
+Xloop2:
+X   prefix_code = nextch;
+X   nextch = rd_cch();
+X   if (nextch == EOF) {                  /* note real EOF, not Z_EOF */
+X      wr_ccode (prefix_code);
+X      wr_ccode (Z_EOF);
+X		flush_c ((int) ((bit_offset + 7) / 8));
+X      return (0);                         /* normal return from compress */
+X   }
+X   nextch &= 0xff;                        /* force to 8 bits */
+X   assert(nextch < 256);
+X
+X   k = nextch;
+X   status = lukup_ccode (prefix_code, nextch, &where);
+X   if (status == FOUND) {
+X      nextch = where;                     /* where found */
+X      goto loop2;
+X   }
+X   assert(status == FIRST_USE || status == NEXT_USE);
+X
+X   /* reach here with status = FIRST_USE or NEXT_USE */
+X   ad_ccode (status, nextch, where);
+X
+X   wr_ccode (prefix_code);
+X   nextch = k;
+X
+X   if (free_code <= max_code)
+X      goto loop1;
+X   assert(nbits >= 9 && nbits <= MAXBITS);
+X   if (nbits >= MAXBITS) {
+X   /* To continue using table after it is full, remove next two lines */
+X      wr_ccode (CLEAR);
+X      init_ctab();
+X
+X      goto loop1;
+X   }
+X
+X   nbits++;
+X   assert(nbits >= 9 && nbits <= MAXBITS);
+X   max_code = max_code << 1;
+X   goto loop1;
+X} /* end lzc() */
+X
+Xvoid wr_ccode (code)
+Xint code;
+X{
+X   unsigned int ofs_inbyte, hibits;
+X   int byte_offset;
+X
+X#ifdef DEBUG
+Xif (code == CLEAR)
+X   printf(" CLEAR\n");
+X#endif
+X
+X   assert(nbits >= 9 && nbits <= MAXBITS);
+X   bitsout += nbits;                /* total number of bits written */
+X   bit_interval -= nbits;
+X   if (bit_interval < 0)
+X      ratflag = 1;                  /* time to check ratio */
+X
+X   byte_offset = bit_offset / 8;
+X   ofs_inbyte = bit_offset % 8;     /* offset within byte */
+X   bit_offset += nbits;             /* allowing for new code */
+X
+X   if (byte_offset >= OUTBUFSIZ - 4) {
+X      flush_c (byte_offset);
+X      bit_offset = ofs_inbyte + nbits;
+X      out_buf_adr[0] = out_buf_adr [byte_offset];
+X      byte_offset = 0;
+X   }
+X
+X   code = code & 0xffff;            /* force to 16 bits */
+X
+X   if (ofs_inbyte == 0)
+X      out_buf_adr[byte_offset]  = code & 0xff;
+X   else
+X      out_buf_adr[byte_offset] |= (code << ofs_inbyte) & 0xff;
+X
+X   hibits = ((unsigned int) code) >> (8 - ofs_inbyte);
+X   out_buf_adr[byte_offset+1] = hibits & 0xff;
+X   out_buf_adr[byte_offset+2] = (((unsigned int) hibits) >> 8) & 0xff;
+X
+X   assert(nbits >= 9 && nbits <= MAXBITS);
+X} /* end wr_ccode() */
+X
+Xvoid init_ctab()
+X{
+X   int i;
+X   bytesin = bitsout = ratio = ratflag = 0;
+X   bit_interval = CHECKGAP;
+X   nbits = 9;
+X   max_code = 512;
+X#ifdef COMMENT
+X   for (i = 0; i < 256; i++) {
+X#endif
+X   for (i = 0; i < MAXMAX+1; i++) {
+X      table[i].z_ch = table[i].first = table[i].next = -1;
+X   }
+X#ifdef COMMENT
+X   /*DEBUG*/ table[MAXMAX].first   = table[MAXMAX].next = -1;
+X   /*DEBUG*/ table[MAXMAX-1].first = table[MAXMAX-1].next = -1;
+X#endif
+X   free_code = FIRST_FREE;
+X} /* end init_ctab() */
+X
+Xint rd_cch()
+X{
+X   int count;
+X   bytesin++;
+X   if (in_offset == in_size) {
+X      count = BLOCKREAD (in_f, in_buf_adr, INBUFSIZ);
+X      if (count == -1)
+X         prterror ('f', "Error reading input file during compression.\n");
+X      addbfcrc (in_buf_adr, count);
+X      if (count == 0) {
+X         debug((printf("\nEOF on input\n")))
+X         return (EOF);              /* real EOF, not Z_EOF */
+X      }
+X      in_size = count;
+X      debug((printf("\ninput %d chars\n", count)))
+X      in_offset = 0;
+X   }
+X   in_offset++;
+X   return (in_buf_adr[in_offset-1] & 0xff);
+X} /* end rd_cch () */
+X
+Xvoid check_ratio()
+X{
+X#ifdef COMMENT
+X   int rat;
+X   if (bitsout > 16383) {     /* avoid overflow */
+X      bitsout /= 4;
+X      bytesin /= 4;
+X   }
+X   rat = (2 * bitsout) / bytesin;
+X   if (1.1 * rat < ratio) {
+X      printf("#");
+X      wr_ccode (CLEAR);
+X      init_ctab();
+X      bit_interval = CHECKGAP;
+X      bitsout = 0;
+X      bytesin = 0;
+X      ratio = 0;
+X   } else
+X      ratio = ((ratio << 2) + ((2 * bitsout) / bytesin)) / 5;
+X#else
+X   bit_interval = CHECKGAP;
+X   bitsout = 0;
+X   bytesin = 0;
+X#endif
+X} /* end check_ratio() */
+X
+Xvoid ad_ccode (status, ch, index)
+Xint status, index, ch;
+X{
+X   assert(status == FIRST_USE || status == NEXT_USE);
+X#ifdef COMMENT
+X   if (free_code >= MAXMAX)      /* to fix apparent bug in original */
+X      return;
+X#endif
+X#ifdef COMMENT
+X   if (status == NEXT_USE)
+X      table[index].next = free_code;
+X   else                 /* else must be FIRST_USE */
+X      table[index].first = free_code;
+X#endif
+X   if (status == NEXT_USE)
+X      table[index].next = (free_code >= MAXMAX ? -1 : free_code);
+X   else                 /* else must be FIRST_USE */
+X      table[index].first = (free_code >= MAXMAX ? -1 : free_code);
+X
+X#ifdef COMMENT
+X   if (free_code < MAXMAX) {
+X#endif
+X   if (free_code <= MAXMAX) {
+X      table[free_code].first = table[free_code].next = -1;
+X      table[free_code].z_ch = ch & 0xff;
+X      free_code++;
+X   }
+X} /* end ad_ccode() */
+X
+Xint lukup_ccode (index, ch, where)
+Xint index;                        /* where to start looking */
+Xint ch;                             /* char to look for */
+Xint *where;                       /* last entry looked at */
+X{
+X   *where = index;
+X   index = table[index].first;
+X   if (index == -1) {
+X      return (FIRST_USE);           /* not found, first use */
+X   } else {
+X      while (1) {
+X         if ((table[index].z_ch & 0xff) == (ch & 0xff)) {
+X            *where = index;
+X            return (FOUND);
+X         }
+X         *where = index;
+X         index = table[index].next;
+X         if (index == -1) {
+X            return (NEXT_USE);
+X         }
+X      } /* end while */
+X   } /* end else */
+X} /* end lukup_ccode() */
+X
+Xvoid flush_c (count)
+Xint count;
+X{
+X   int status;
+X#ifdef DEBUG
+Xprintf(" <flushed %d bytes> ", count);
+X#endif
+X	if (count != 0) {
+X		status = BLOCKWRITE (out_f, out_buf_adr, count);
+X		if (status == -1)
+X			prterror ('f', "Error writing during compression.\n");
+X	}
+X}
+END_OF_FILE
+if test 8454 -ne `wc -c <'lzc.c'`; then
+    echo shar: \"'lzc.c'\" unpacked with wrong size!
+fi
+# end of 'lzc.c'
+fi
+if test -f 'lzd.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'lzd.c'\"
+else
+echo shar: Extracting \"'lzd.c'\" \(7771 characters\)
+sed "s/^X//" >'lzd.c' <<'END_OF_FILE'
+X#ifndef LINT
+Xstatic char sccsid[]="@(#) lzd.c 2.6 88/01/30 20:39:18";
+X#endif /* LINT */
+X
+X#include "options.h"
+X/*
+XLempel-Ziv decompression.  Mostly based on Tom Pfau's assembly language
+Xcode.  The contents of this file are hereby released to the public domain.
+X                                 -- Rahul Dhesi 1986/11/14
+X*/
+X
+X#include "zoo.h"
+X#include "zooio.h"
+X#include "various.h"
+X#include "zoofns.h"           /* function definitions */
+X/* zoomem.h defines IN_BUF_SIZE & OUT_BUF_SIZE */
+X#include "zoomem.h"
+X#include "debug.h"
+X#include "assert.h"
+X/* lzconst.h contains constants for lzd() and lzc() */
+X#include "lzconst.h"
+X
+X#define  STACKSIZE   4000
+X
+Xstruct tabentry {
+X   unsigned next;
+X   char z_ch;
+X};
+X
+X
+X#ifdef LINT_ARGS
+Xvoid init_dtab(NOTHING);
+Xunsigned rd_dcode(NOTHING);
+Xvoid wr_dchar (char);
+Xvoid ad_dcode(NOTHING);
+X#else
+Xvoid init_dtab();
+Xunsigned rd_dcode();
+Xvoid wr_dchar();
+Xvoid ad_dcode();
+X#endif
+X
+X#ifdef FILTER
+X/* to send data back to zoofilt */
+Xextern unsigned int filt_lzd_word;
+X#endif /* FILTER */
+X
+X
+Xstatic unsigned stack_pointer = 0;
+Xstatic unsigned *stack;
+X
+X#define  push(x)  {  \
+X                     stack[stack_pointer++] = (x);                   \
+X                     if (stack_pointer >= STACKSIZE)                 \
+X                        prterror ('f', "Stack overflow in lzd().\n");\
+X                  }
+X#define  pop()    (stack[--stack_pointer])
+X
+Xextern char *out_buf_adr;        /* output buffer */
+Xextern char *in_buf_adr;         /* input buffer */
+X
+Xchar memflag = 0;                /* memory allocated? flag */
+Xextern struct tabentry *table;   /* hash table from lzc.c */
+Xstatic unsigned cur_code;
+Xstatic unsigned old_code;
+Xstatic unsigned in_code;
+X
+Xstatic unsigned free_code;
+Xstatic int nbits;
+Xstatic unsigned max_code;
+X
+Xstatic char fin_char;
+Xstatic char k;
+Xstatic unsigned masks[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0,
+X                        0x1ff, 0x3ff, 0x7ff, 0xfff, 0x1fff };
+Xstatic unsigned bit_offset;
+Xstatic unsigned output_offset;
+X
+X#ifdef UNBUF_IO
+X#define		BLOCKFILE		int
+X#define		BLOCKREAD		read
+X#define		BLOCKWRITE		blockwrite
+Xint read PARMS ((int, VOIDPTR, unsigned));
+Xint write PARMS ((int, VOIDPTR, unsigned));
+X#else
+X#define		BLOCKFILE		ZOOFILE
+X#define		BLOCKREAD		zooread
+X#define		BLOCKWRITE		zoowrite
+X#endif /* UNBUF_IO */
+X
+Xstatic BLOCKFILE in_f, out_f; 
+X
+Xint lzd(input_f, output_f)
+XBLOCKFILE input_f, output_f;          /* input & output file handles */
+X{
+X   in_f = input_f;                 /* make it avail to other fns */
+X   out_f = output_f;               /* ditto */
+X   nbits = 9;
+X   max_code = 512;
+X   free_code = FIRST_FREE;
+X   stack_pointer = 0;
+X   bit_offset = 0;
+X   output_offset = 0;
+X
+X   if (BLOCKREAD (in_f, in_buf_adr, INBUFSIZ) == -1)
+X      return(IOERR);
+X   if (memflag == 0) {
+X     table = (struct tabentry *) emalloc((MAXMAX+10) * sizeof(struct tabentry));
+X     stack = (unsigned *) emalloc (sizeof (unsigned) * STACKSIZE + 20);
+X     memflag++;
+X   }
+X
+X   init_dtab();             /* initialize table */
+X
+Xloop:
+X   cur_code = rd_dcode();
+Xgoteof: /* special case for CLEAR then Z_EOF, for 0-length files */
+X   if (cur_code == Z_EOF) {
+X      debug((printf ("lzd: Z_EOF\n")))
+X      if (output_offset != 0) {
+X         if (BLOCKWRITE (out_f, out_buf_adr, output_offset) != output_offset)
+X            prterror ('f', "Output error in lzd().\n");
+X         addbfcrc(out_buf_adr, output_offset);
+X      }
+X#ifdef FILTER
+X		/* get next two bytes and put them where zoofilt can find them */
+X		/* nbits known to be in range 9..13 */
+X		bit_offset = ((bit_offset + 7) / 8) * 8; /* round up to next byte */
+X		filt_lzd_word = rd_dcode();
+X		filt_lzd_word |= (rd_dcode() << nbits);
+X		filt_lzd_word &= 0xffff;
+X#endif
+X      return (0);
+X   }
+X
+X   assert(nbits >= 9 && nbits <= 13);
+X
+X   if (cur_code == CLEAR) {
+X      debug((printf ("lzd: CLEAR\n")))
+X      init_dtab();
+X      fin_char = k = old_code = cur_code = rd_dcode();
+X		if (cur_code == Z_EOF)		/* special case for 0-length files */
+X			goto goteof;
+X      wr_dchar(k);
+X      goto loop;
+X   }
+X
+X   in_code = cur_code;
+X   if (cur_code >= free_code) {        /* if code not in table (k<w>k<w>k) */
+X      cur_code = old_code;             /* previous code becomes current */
+X      push(fin_char);
+X   }
+X
+X   while (cur_code > 255) {               /* if code, not character */
+X      push(table[cur_code].z_ch);         /* push suffix char */
+X      cur_code = table[cur_code].next;    /* <w> := <w>.code */
+X   }
+X
+X   assert(nbits >= 9 && nbits <= 13);
+X
+X   k = fin_char = cur_code;
+X   push(k);
+X   while (stack_pointer != 0) {
+X      wr_dchar(pop());
+X   }
+X   assert(nbits >= 9 && nbits <= 13);
+X   ad_dcode();
+X   old_code = in_code;
+X
+X   assert(nbits >= 9 && nbits <= 13);
+X
+X   goto loop;
+X} /* lzd() */
+X
+X/* rd_dcode() reads a code from the input (compressed) file and returns
+Xits value. */
+Xunsigned rd_dcode()
+X{
+X   register char *ptra, *ptrb;    /* miscellaneous pointers */
+X   unsigned word;                     /* first 16 bits in buffer */
+X   unsigned byte_offset;
+X   char nextch;                           /* next 8 bits in buffer */
+X   unsigned ofs_inbyte;               /* offset within byte */
+X
+X   ofs_inbyte = bit_offset % 8;
+X   byte_offset = bit_offset / 8;
+X   bit_offset = bit_offset + nbits;
+X
+X   assert(nbits >= 9 && nbits <= 13);
+X
+X   if (byte_offset >= INBUFSIZ - 5) {
+X      int space_left;
+X
+X      assert(byte_offset >= INBUFSIZ - 5);
+X      debug((printf ("lzd: byte_offset near end of buffer\n")))
+X
+X      bit_offset = ofs_inbyte + nbits;
+X      space_left = INBUFSIZ - byte_offset;
+X      ptrb = byte_offset + in_buf_adr;          /* point to char */
+X      ptra = in_buf_adr;
+X      /* we now move the remaining characters down buffer beginning */
+X      debug((printf ("rd_dcode: space_left = %d\n", space_left)))
+X      while (space_left > 0) {
+X         *ptra++ = *ptrb++;
+X         space_left--;
+X      }
+X      assert(ptra - in_buf_adr == ptrb - (in_buf_adr + byte_offset));
+X      assert(space_left == 0);
+X      if (BLOCKREAD (in_f, ptra, byte_offset) == -1)
+X         prterror ('f', "I/O error in lzd:rd_dcode.\n");
+X      byte_offset = 0;
+X   }
+X   ptra = byte_offset + in_buf_adr;
+X   /* NOTE:  "word = *((int *) ptra)" would not be independent of byte order. */
+X   word = (unsigned char) *ptra; ptra++;
+X   word = word | ( ((unsigned char) *ptra) << 8 ); ptra++;
+X
+X   nextch = *ptra;
+X   if (ofs_inbyte != 0) {
+X      /* shift nextch right by ofs_inbyte bits */
+X      /* and shift those bits right into word; */
+X      word = (word >> ofs_inbyte) | (((unsigned)nextch) << (16-ofs_inbyte));
+X   }
+X   return (word & masks[nbits]); 
+X} /* rd_dcode() */
+X
+Xvoid init_dtab()
+X{
+X   nbits = 9;
+X   max_code = 512;
+X   free_code = FIRST_FREE;
+X}
+X
+Xvoid wr_dchar (ch)
+Xchar ch;
+X{
+X   if (output_offset >= OUTBUFSIZ) {      /* if buffer full */
+X      if (BLOCKWRITE (out_f, out_buf_adr, output_offset) != output_offset)
+X         prterror ('f', "Write error in lzd:wr_dchar.\n");
+X      addbfcrc(out_buf_adr, output_offset);     /* update CRC */
+X      output_offset = 0;                  /* restore empty buffer */
+X   }
+X   assert(output_offset < OUTBUFSIZ);
+X   out_buf_adr[output_offset++] = ch;        /* store character */
+X} /* wr_dchar() */
+X
+X/* adds a code to table */
+Xvoid ad_dcode()
+X{
+X   assert(nbits >= 9 && nbits <= 13);
+X   assert(free_code <= MAXMAX+1);
+X   table[free_code].z_ch = k;                /* save suffix char */
+X   table[free_code].next = old_code;         /* save prefix code */
+X   free_code++;
+X   assert(nbits >= 9 && nbits <= 13);
+X   if (free_code >= max_code) {
+X      if (nbits < MAXBITS) {
+X         debug((printf("lzd: nbits was %d\n", nbits)))
+X         nbits++;
+X         assert(nbits >= 9 && nbits <= 13);
+X         debug((printf("lzd: nbits now %d\n", nbits)))
+X         max_code = max_code << 1;        /* double max_code */
+X         debug((printf("lzd: max_code now %d\n", max_code)))
+X      }
+X   }
+X}
+END_OF_FILE
+if test 7771 -ne `wc -c <'lzd.c'`; then
+    echo shar: \"'lzd.c'\" unpacked with wrong size!
+fi
+# end of 'lzd.c'
+fi
+if test -f 'needed.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'needed.c'\"
+else
+echo shar: Extracting \"'needed.c'\" \(8256 characters\)
+sed "s/^X//" >'needed.c' <<'END_OF_FILE'
+X#ifndef LINT
+Xstatic char sccsid[]="@(#) needed.c 2.16 88/01/31 15:54:37";
+X#endif /* LINT */
+X
+X/*
+XCopyright (C) 1986, 1987 Rahul Dhesi -- All rights reserved
+X(C) Copyright 1988 Rahul Dhesi -- All rights reserved
+X*/
+X
+X#define	STRCMP(s1,op,s2)		(strcmp(s1,s2) op 0)
+X
+X#include "options.h"
+X/* Accepts a filename from an archive and returns 1 if a command-line
+X   argument filename matches it.  Otherwise returns 0. Returns
+X   1 if no arguments were supplied (so by default, all files will
+X   be extracted */
+X
+X#include "zoo.h"
+X
+X#ifdef NEEDCTYP
+X#include <ctype.h>              /* for tolower() */
+X#else
+X#include "portable.h"
+X#endif
+X
+X#include "zooio.h"
+X#include "zoofns.h"
+X#include "various.h"
+X#include "debug.h"
+X
+Xextern int next_arg;          /* filenames start at this position */
+Xextern int arg_count;         /* count of arguments supplied to program */
+Xextern char **arg_vector;     /* vector of arguments supplied to program */
+X/* Uses FIRST_ARG in zoo.h, so must be recompiled when switching
+X   between Ooz and Zoo */
+X
+Xint needed(pathname, direntry, header)
+Xchar *pathname;
+Xstruct direntry *direntry;
+Xstruct zoo_header *header;
+X{
+X   register int i;
+X   register char *arg;
+X   char *justname;
+X	char arg_copy[PATHSIZE];				/* working copy of an argument */
+X	char path_copy[PATHSIZE];				/* working copy of pathname */
+X	char *p;										/* a temporary pointer */
+X	char *q;										/* a temporary pointer */
+X
+X	/* if no filenames supplied, match latest version of each 
+X		(but match any version if versions not enabled) */
+X   if (arg_count <= FIRST_ARG &&
+X			(!(header->vdata & VFL_ON) || 
+X			!(direntry->vflag & VFL_ON) || (direntry->vflag & VFL_LAST))) {
+X		 
+X      return (1);                   	/* .. then all files are needed */
+X	}
+X
+X   /* count backwards and stop if '+' is encountered */
+X   for (i = arg_count-1;  i >= next_arg; i--) {
+X      arg = arg_vector[i];
+X#ifdef FOLD
+X      strlwr(pathname); strlwr(arg);
+X#endif
+X#ifdef DEBUG
+Xprintf("needed: testing [%s] and [%s]\n", pathname, arg);
+X#endif
+X      if (STRCMP(arg,==,"+"))
+X         return (0);
+X
+X      /* If the argument contains a slash, the match fails if the
+X         path prefixes don't match */
+X      if (strchr(arg, *PATH_CH) != NULL) {      /* found slash */
+X         strcpy(arg_copy,arg);
+X         strcpy(path_copy,pathname);
+X         p = findlast(arg_copy, PATH_CH);
+X         if (p != NULL)
+X            *p = '\0';
+X			else {
+X				p = findlast (arg_copy, VER_INPUT);
+X				if (p != NULL)
+X					*p = '\0';
+X			}
+X         p = findlast(path_copy, PATH_CH);
+X         if (p != NULL)
+X            *p = '\0';
+X			else {
+X				p = findlast (path_copy, VER_DISPLAY);
+X				if (p != NULL)
+X					*p = '\0';
+X			}
+X         if (!match_half(path_copy, arg_copy)) {
+X#ifdef DEBUG
+Xprintf ("needed(): match failed for [%s] and [%s]\n",
+X	path_copy, arg_copy);
+X#endif
+X            continue;                     /* no match this time in loop */
+X         }
+X      }
+X
+X      /*
+X      We reach here either if the pattern had no slashes, or if it had a 
+X		slash but the path prefixes matched.  Now we will test to see if the 
+X		filename parts match.  If the argument contains VER_INPUT character, 
+X		then this separates the filename from a version number, and only that 
+X		specific version will match.  If not, then only the latest version 
+X		will match.  However, if the argument has a version character but
+X		nothing following it, that matches all versions.  Also, version
+X		0 matches only the latest version and version ^0 matches all
+X		versions except the latest one.
+X      */
+X		strcpy (arg_copy, arg);							/* local copy of argument */
+X		strcpy (path_copy, pathname);					/* local copy of pathname */
+X		p = findlast(arg_copy, VER_INPUT);			/* p is version in argument */
+X		q = findlast(path_copy, VER_DISPLAY);		/* q is version in archive */
+X		if (p != NULL && p != lastptr(arg_copy)) {/* nonnull version in arg */
+X			if (q != NULL) {								/* nonnull ver. in archive */
+X				char *pp = p+1;							/* point to actual version */
+X				char *qq = q+1;
+X				if (STRCMP(pp, ==, "0") && !(direntry->vflag & VFL_LAST) ||
+X				 	STRCMP(pp, ==, "^0") && (direntry->vflag & VFL_LAST)) {
+X						debug(("needed:  no match versions [%s] and [%s]\n", qq, pp))
+X						continue;
+X				}
+X				if (STRCMP(pp, !=, "0") && STRCMP(pp, !=, "^0") &&
+X					!match_half (qq, pp)) {
+X					debug(("needed:  no match versions [%s] and [%s]\n", qq, pp))
+X					continue;									/* no match this loop */
+X				}
+X			}
+X		}
+X		/* Special case test:  If argument has version but no filename,
+X			then filename is assumed to match */
+X		if (p == arg_copy) {								/* 1st char is version char */
+X			return (1);										/* .. so declare a match */
+X		}
+X
+X		/* 
+X		Reach here if argument has no version character, or if argument has 
+X		version character and it matches version in pathname.  Now we check to 
+X		see if argument has no version character and if pathname is latest 
+X		version.  If so, the versions do match;  if not, then the match fails.  
+X		But if version numbering is not enabled, then versions always match.
+X		If the match fails, we do a "continue", else we fall through and
+X		proceed to test the filenames.  (Note:  It is intuitively better
+X		to first compare filenames and then see if versions match, but
+X		since they are both just independent fields, it's equally correct
+X		to compare versions first, as we are doing here, and then see if
+X		filenames match.  It may even be more efficient.)
+X		*/
+X
+X		if (p == NULL && 										/* no version char typed */
+X				!(													/* NOT */
+X					(direntry->vflag & VFL_ON) == 0 || 	/*  no versions */
+X					(direntry->vflag & VFL_LAST) ||		/*  .. or latest version */
+X					q == NULL									/*  .. or no version char */
+X				)
+X			)
+X		{
+X#ifdef DEBUG
+Xprintf("needed: fail--no version typed and not latest version\n");
+X#endif
+X			continue;											/* match fails */
+X		} 
+X		/* versions match and we fall through */;
+X
+X		/* reach here if versions match -- so strip them and compare rest */
+X		if (p != NULL)
+X			*p = '\0';							/* strips version from arg_copy */
+X		if (q != NULL)
+X			*q = '\0';							/* strips version from path_copy */
+X
+X		justname = nameptr(path_copy);		/* filename without any pathname */
+X      if (match_half (justname, nameptr(arg_copy)))
+X         return (1);
+X#ifdef DEBUG
+Xprintf ("needed: fname-only match failed [%s] and [%s]\n",
+X justname, nameptr(arg_copy));
+X#endif
+X
+X      /* try for a character range */
+X      if (match_half (arg, "?-?")) { 			/* character range given */
+X         if (arg[0] <= *justname && arg[2] >= *justname)
+X            return (1);
+X      }
+X   }
+X   return (0);
+X
+X} /* needed */
+X
+X/***********************/
+X/*
+Xmatch_half() compares a pattern with a string.  Wildcards accepted in
+Xthe pattern are:  "*" for zero or more arbitrary characters;  "?"
+Xfor any one characters.  Unlike the MS-DOS wildcard match, "*" is
+Xcorrectly handled even if it isn't at the end of the pattern. ".'
+Xis not special.
+X
+XOriginally written by Jeff Damens of Columbia University Center for
+XComputing Activities.  Taken from the source code for C-Kermit version
+X4C.
+X*/
+X
+Xint match_half (string, pattern) 
+Xregister char *string, *pattern;
+X{
+X   char *psave,*ssave;        /* back up pointers for failure */
+X   psave = ssave = NULL;
+X   while (1) {
+X#ifdef IGNORECASE
+X      for (; 
+X         tolower(*pattern) == tolower(*string); 
+X         pattern++,string++                        )  /* skip first */
+X#else
+X      for (; *pattern == *string; pattern++,string++)  /* skip first */
+X#endif /* IGNORECASE */
+X
+X         if (*string == '\0') 
+X            return(1);                          /* end of strings, succeed */
+X      if (*string != '\0' && *pattern == '?') {
+X         pattern++;                             /* '?', let it match */
+X         string++;
+X      } else if (*pattern == '*') {             /* '*' ... */
+X         psave = ++pattern;                     /* remember where we saw it */
+X         ssave = string;                        /* let it match 0 chars */
+X      } else if (ssave != NULL && *ssave != '\0') {   /* if not at end  */
+X         /* ...have seen a star */
+X         string = ++ssave;                      /* skip 1 char from string */
+X         pattern = psave;                       /* and back up pattern */
+X      } else 
+X         return(0);                             /* otherwise just fail */
+X   }
+X}
+X
+END_OF_FILE
+if test 8256 -ne `wc -c <'needed.c'`; then
+    echo shar: \"'needed.c'\" unpacked with wrong size!
+fi
+# end of 'needed.c'
+fi
+if test -f 'nextfile.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'nextfile.c'\"
+else
+echo shar: Extracting \"'nextfile.c'\" \(8490 characters\)
+sed "s/^X//" >'nextfile.c' <<'END_OF_FILE'
+X#ifndef LINT
+Xstatic char sccsid[]="@(#) nextfile.c 2.2 87/12/26 12:23:43";
+X#endif /* LINT */
+X
+X#include "options.h"
+X/*
+XCopyright (C) 1986, 1987 Rahul Dhesi -- All rights reserved
+X*/
+X/*
+XFunctions to collect filenames from command line etc.  Nextfile() is
+Xused by both Atoz and Zoo.  Wildcard expansion by nextfile() is specific to 
+XMS-DOS and this implementation is specific to Microsoft C.  If the symbol 
+XPORTABLE is defined, nextfile() becomes effectively a no-op that will return
+Xthe original filespec the first time and NULL subsequently.
+X*/
+X
+X#define  FMAX  3        /* Number of different filename patterns */
+X
+X#ifndef	OK_STDIO
+X#include <stdio.h>
+X#define	OK_STDIO
+X#endif
+X#include "various.h"
+X#include "zoo.h"        /* solely to define PATHSIZE */
+X
+X#ifdef PORTABLE
+X#ifndef SPECNEXT
+X/* If portable version, nextfile() is effectively a no-op and any wildcard
+Xexpansion must be done by the runtime system before the command line
+Xis received by this program
+X*/
+Xchar *nextfile (what, filespec, fileset)
+Xint what;                        /* whether to initialize or match      */
+Xregister char *filespec;         /* filespec to match if initializing   */
+Xregister int fileset;            /* which set of files                  */
+X{
+X   static int first_time [FMAX+1];
+X   static char saved_fspec [FMAX+1][PATHSIZE];  /* our own copy of filespec */
+X
+X   if (what == 0) {
+X      strcpy (saved_fspec[fileset], filespec);  /* save the filespec */
+X      first_time[fileset] = 1;
+X      return (NULL);
+X   }
+X
+X   if (first_time[fileset]) {
+X      first_time[fileset] = 0;
+X      return (saved_fspec[fileset]);
+X   } else {
+X      return (NULL);
+X   }
+X}
+X#endif /* SPECNEXT */
+X#else
+X/* if not PORTABLE  then */
+X
+X#include "intdos.h"     /* registers for MS-DOS interrupts              */
+X#include "dta.h"        /* format of MS-DOS disk transfer area (dta)    */
+X#include "assert.h"     /* macro definition:  assert() macro            */
+X
+Xvoid setdta (struct dta_t *);
+Xvoid fcbpath (struct dta_t *, char *, char *);
+X
+X
+X/*******************/
+X/*
+Xnextfile() returns the name of the next source file matching a filespec.
+X
+XINPUT
+X   what: A flag specifying what to do.  If "what" is 0, nextfile() 
+X      initializes itself.  If "what" is 1, nextfile() returns the next 
+X      matching filename.  
+X   filespec:  The filespec, usually containing wildcard characters, that 
+X      specifies which files are needed.  If "what" is 0, filespec must be 
+X      the filespec for which matching filenames are needed.  If "what" is 1, 
+X      nextfile() does not use "filespec" and "filespec" should be NULL to 
+X      avoid an assertion error during debugging.
+X   fileset:  nextfile() can keep track of more than one set of filespecs.
+X      The fileset specifies which filespec is being matched and therefore
+X      which set of files is being considered.  "fileset" can be in the
+X      range 0:FMAX.  Initialization of one fileset does not affect the
+X      other filesets.
+X
+XOUTPUT
+X   IF what == 0 THEN
+X      return value is NULL
+X   ELSE IF what == 1 THEN
+X      IF a matching filename is found THEN
+X         return value is pointer to matching filename including supplied path
+X      ELSE
+X         IF at least one file matched previously but no more match THEN
+X            return value is NULL
+X         ELSE IF supplied filespec never matched any filename THEN
+X            IF this is the first call with what == 1 THEN
+X               return value is pointer to original filespec
+X            ELSE
+X               return value is NULL
+X            END IF
+X         END IF
+X      END IF
+X   END IF
+X
+XNOTE
+X
+X   Initialization done when "what"=0 is not dependent on the correctness
+X   of the supplied filespec but simply initializes internal variables
+X   and makes a local copy of the supplied filespec.  If the supplied
+X   filespec was illegal, the only effect is that the first time that
+X   nextfile() is called with "what"=1, it will return the original 
+X   filespec instead of a matching filename.  That the filespec was
+X   illegal will become obvious when the caller attempts to open the
+X   returned filename for input/output and the open attempt fails.
+X
+XUSAGE HINTS
+X
+Xnextfile() can be used in the following manner:
+X
+X      char *filespec;                  -- will point to filespec
+X      char *this_file;                 -- will point to matching filename
+X      filespec = parse_command_line(); -- may contain wildcards
+X      FILE *stream;
+X   
+X      nextfile (0, filespec, 0);          -- initialize fileset 0
+X      while ((this_file = nextfile(1, (char *) NULL, 0)) != NULL) {
+X         stream = fopen (this_file, "whatever");
+X         if (stream == NULL)
+X            printf ("could not open %s\n", this_file);
+X         else
+X            perform_operations (stream);
+X      }
+X*/             
+X               
+Xchar *nextfile (what, filespec, fileset)
+Xint what;                        /* whether to initialize or match      */
+Xregister char *filespec;         /* filespec to match if initializing   */
+Xregister int fileset;            /* which set of files                  */
+X{
+X   static struct dta_t new_dta [FMAX+1];     /* our own private dta        */
+X   static int first_time [FMAX+1];
+X   static char pathholder [FMAX+1][PATHSIZE]; /* holds a pathname to return */
+X   static char saved_fspec [FMAX+1][PATHSIZE];/* our own copy of filespec   */
+X   union REGS regs;
+X
+X   assert(fileset >= 0 && fileset <= FMAX);
+X   if (what == 0) {
+X      assert(filespec != NULL);
+X      strcpy (saved_fspec[fileset], filespec);  /* save the filespec */
+X      first_time[fileset] = 1;
+X      return (NULL);
+X   }
+X
+X   setdta (&new_dta[fileset]);   /* set new dta -- our very own */      
+X   assert(what == 1);
+X   assert(filespec == NULL);
+X   assert(first_time[fileset] == 0 || first_time[fileset] == 1);
+X
+X   if (first_time[fileset]) {             /* first time -- initialize etc. */
+X      /* find first matching file */
+X      regs.h.ah = 0x4e;                   /* FindFirst DOS call      */
+X      regs.x.dx = (unsigned int) saved_fspec[fileset]; /* filespec to match */
+X      regs.x.cx = 0;                      /* search attributes       */
+X      intdos (&regs, &regs);
+X   } else {
+X      /* find next matching file */
+X      regs.h.ah = 0x4f;                   /* FindNext DOS call       */
+X      intdos (&regs, &regs);
+X   }
+X
+X   if (regs.x.carry != 0) {            /* if error status                  */
+X      if (first_time[fileset]) {       /*   if file never matched then     */
+X         first_time[fileset] = 0;
+X         return (saved_fspec[fileset]);/*      return original filespec    */
+X      } else {                         /*   else                           */
+X         first_time[fileset] = 0;      /*                                  */
+X         return (NULL);                /*      return (NULL) for no more   */
+X      }
+X   } else {                                        /* a file matched */
+X      first_time[fileset] = 0;         
+X      /* add path info  */
+X      fcbpath (&new_dta[fileset], saved_fspec[fileset], pathholder[fileset]); 
+X      return (pathholder[fileset]);                /* matching path  */
+X   }
+X} /* nextfile */
+X
+X/*******************/
+X/* This function sets the dta to a new dta */
+Xvoid setdta (dta)
+Xstruct dta_t *dta;
+X{
+X   union REGS regs;
+X   regs.h.ah = 0x1a;                /* SetDTA Call       */
+X   regs.x.dx = (unsigned int) dta;  /* new DTA address   */
+X   intdos (&regs, &regs);
+X}
+X
+X/*******************/
+X/* 
+Xfcbpath() accepts a pointer to the Disk Transfer Area (the DTA format is
+Xdescribed on page 131 of Tandy-1000 programmers reference manual), a
+Xcharacter pointer to a pathname that may contain wildcards, and a character
+Xpointer to a buffer.  Copies into buffer the path prefix from the pathname
+Xand the filename prefix from the DTA so that it forms a complete path
+X*/
+X
+Xvoid fcbpath (dta, old_path, new_path)
+Xstruct dta_t *dta;
+Xchar *old_path;
+Xregister char *new_path;
+X{
+X   register int i;
+X   int length, start_pos;
+X      
+X   strcpy(new_path, old_path);               /* copy the whole thing first */
+X   length = strlen(new_path);
+X   i = length - 1;                           /* i points to end of path */
+X   while (i >= 0 && new_path[i] != '/' && new_path[i] != '\\' && new_path[i] != ':')
+X      i--;
+X   /* either we found a "/", "\", or ":", or we reached the beginning of
+X      the name.  In any case, i points to the last character of the
+X      path part. */
+X   start_pos = i + 1;
+X   for (i = 0; i < 13; i++)
+X      new_path[start_pos+i] = dta->fname[i];
+X   new_path[start_pos+13] = '\0';
+X}
+X#endif /* PORTABLE */
+X
+END_OF_FILE
+if test 8490 -ne `wc -c <'nextfile.c'`; then
+    echo shar: \"'nextfile.c'\" unpacked with wrong size!
+fi
+# end of 'nextfile.c'
+fi
+if test -f 'zooadd2.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'zooadd2.c'\"
+else
+echo shar: Extracting \"'zooadd2.c'\" \(8463 characters\)
+sed "s/^X//" >'zooadd2.c' <<'END_OF_FILE'
+X#ifndef LINT
+X/* @(#) zooadd2.c 2.14 88/01/27 10:40:32 */
+Xstatic char sccsid[]="@(#) zooadd2.c 2.14 88/01/27 10:40:32";
+X#endif /* LINT */
+X
+X/*
+XCopyright (C) 1986, 1987 Rahul Dhesi -- All rights reserved
+X(C) Copyright 1988 Rahul Dhesi -- All rights reserved
+X*/
+X#include "options.h"
+X#include "zoo.h"
+X#ifndef	OK_STDIO
+X#include <stdio.h>
+X#define	OK_STDIO
+X#endif
+X#include "various.h"
+X#include "zooio.h"
+X#include "zoofns.h"
+X#include "errors.i"
+X#include "assert.h"
+X#include "debug.h"
+X#include "parse.h"
+X
+X/*
+XMiscellaneous routines to support zooadd().
+X*/
+X
+X/****************
+XThis function is called with zoo_file positioned to the first
+Xdirectory entry in an archive.  It skips past all existing files,
+Xcounts the number of deleted files, saves the latest data and time
+Xencountered, and adds all filenames encountered to a global list. The
+Xlong filename is added if available, else the MSDOS filename is
+Xadded.  
+X*/
+X
+Xvoid skip_files (zoo_file, latest_date, latest_time, delcount, 
+X                  latest_name, latest_pos)
+XZOOFILE zoo_file;
+Xunsigned int *latest_date, *latest_time;
+Xint *delcount;
+Xchar latest_name[];
+Xlong *latest_pos;
+X{
+X   long save_offset, next_ptr;
+X   struct direntry direntry;
+X   struct direntry *drp = &direntry;
+X
+X   *latest_pos = 0L;
+X   do {
+X      /* read a directory entry */
+X      save_offset = zootell (zoo_file);     /* save pos'n of this dir entry */
+X      readdir (&direntry, zoo_file, 1);   /* read directory entry */
+X      if (drp->next == 0L) {                 /* END OF CHAIN */
+X         zooseek (zoo_file, save_offset, 0);      /* back up */
+X         break;                                 /* EXIT on end of chain */
+X      } else
+X         *latest_pos = save_offset;
+X      /* remember most recent date and time, for files not marked deleted */
+X      if (!drp->deleted)
+X         if (drp->date > *latest_date ||
+X            (drp->date == *latest_date && drp->time > *latest_time)) {
+X               *latest_date = drp->date;
+X               *latest_time = drp->time;
+X         }
+X      next_ptr = drp->next;            /* ptr to next dir entry */
+X      if (drp->deleted)
+X         ++(*delcount);                      /* count deleted entries */
+X      /* add name of file and position of direntry into global list */
+X      /* but only if the entry is not deleted */
+X      if (!drp->deleted) {
+X#ifdef FOLD
+X			/* IS THIS REALLY NEEDED?  IF SO, WHAT ABOUT drp->lfname? */
+X         strlwr(drp->fname);
+X#endif
+X			/* add full pathname to global list */
+X			strcpy (latest_name, fullpath (drp));
+X         addfname (latest_name, save_offset, drp->date, drp->time,
+X							drp->vflag, drp->version_no);
+X      }
+X      zooseek (zoo_file, next_ptr, 0);   /* ..seek to next dir entry */
+X   } while (next_ptr != 0L);              /* loop terminates on null ptr */
+X}
+X
+X/*******************/
+X/* kill_files() deletes all files in the supplied list of pointers to
+Xfilenames */
+X
+Xint kill_files (flist, pathlength)
+Xchar *flist[];                      /* list of ptrs to input fnames */
+Xint pathlength;                     /* length of longest pathname */
+X{
+X   int status = 0;
+X   int fptr;
+X   prterror ('M', "-----\nErasing added files...\n");
+X   for (fptr = 0;  flist[fptr] != NULL; fptr++) {
+X#ifdef CHEKUDIR
+X				if (isuadir(flist[fptr]))
+X					continue;
+X#else /* CHEKUDIR */
+X# ifdef CHEKDIR
+X				if (isfdir(flist[fptr]))
+X					continue;
+X# endif /* CHEKDIR */
+X#endif /* CHEKUDIR */
+X      prterror ('m', "%-*s -- ", pathlength, flist[fptr]);
+X      if (unlink (flist[fptr]) == 0) {
+X         prterror ('M', "erased\n");
+X      } else {
+X         prterror ('w', "Could not erase %s.\n", flist[fptr]);
+X         status = 1;
+X      }
+X   }
+X   return (status);
+X}
+X
+X#ifndef PORTABLE
+X/*******************/
+Xvoid copyfields (drp, thp)
+Xstruct direntry *drp;
+Xstruct tiny_header *thp;
+X{
+X   drp->org_size = thp->org_size;
+X   drp->file_crc = thp->file_crc;
+X   drp->size_now = thp->size_now;
+X   drp->major_ver = thp->major_ver;
+X   drp->minor_ver = thp->minor_ver;
+X}
+X#endif
+X
+X/*******************/
+X/* processes option switches for zooadd() */
+Xvoid opts_add (option, zootime, quiet, suppress, move, new, pack,
+X          update, add_comment, z_fmt, need_dir, inargs, genson)
+Xchar *option;
+Xint *zootime, *quiet, *suppress, *move, *new, *pack,
+X   *update, *add_comment, *z_fmt, *need_dir, *inargs,
+X	*genson;
+X
+X{
+X   if (*option == 'T') {
+X      (*zootime)++;
+X      option++;
+X      while (*option) {
+X         switch (*option) {
+X            case 'q': (*quiet)++; break;
+X            default:
+X               prterror ('f', inv_option, *option);
+X         }
+X      option++;
+X      }
+X   }
+X   
+X   while (*option) {
+X      switch (*option) {
+X         case 'a': break;  
+X         case 'f': (*suppress)++; break;        /* suppress compression */
+X         case 'M': (*move)++; break;            /* delete files after adding them */
+X         case 'n': (*new)++; break;             /* add only files not in archive */
+X         case 'P': (*pack)++; break;            /* pack after adding */
+X         case 'u': (*update)++;   break;        /* add only files already in archive */
+X         case 'q': (*quiet)++; break;           /* be quiet */
+X         case 'c': (*add_comment)++; break;     /* add comment */
+X         case ':': *need_dir = 0; break;        /* don't store directories */
+X         case 'I': (*inargs)++; break;        	/* get filenames from stdin */
+X/* #ifdef PORTABLE */ /* avoid Turbo C warning about unused param */
+X         case 'z': (*z_fmt)++; break;           /* look for Z format files */
+X/* #endif */
+X			case '+': 
+X						*genson = 1;  break;
+X			case '-': 
+X						*genson = 0;  break;
+X         default:
+X            prterror ('f', inv_option, *option);
+X      }
+X      option++;
+X   } /* end while */
+X}
+X
+X
+X/* 
+XStores long filename into direntry.lfname iff it is different from MSDOS
+Xfilename.  Also stores directory name if need_dir is true.  Moved out of 
+Xzooadd() so zooadd() doesn't get too big for optimization.
+X*/
+Xvoid storefname (direntry, this_path, need_dir)
+Xstruct direntry *direntry;
+Xchar *this_path;
+Xint need_dir;
+X{
+X   struct path_st path_st;
+X   parse (&path_st, this_path);
+X   direntry->lfname[0] = '\0';
+X   direntry->namlen = 0;
+X#ifdef SPECMOD
+X   specfname (path_st.lfname);
+X   specdir (path_st.dir);
+X#endif
+X   if (strcmp(path_st.lfname,direntry->fname) != 0) {
+X         strcpy (direntry->lfname, path_st.lfname); /* full filename */
+X         direntry->namlen = strlen(direntry->lfname) + 1;
+X   }
+X   if (need_dir) {
+X      strcpy (direntry->dirname, path_st.dir);   /* directory name */
+X      direntry->dirlen = strlen(direntry->dirname) + 1;
+X      if (direntry->dirlen == 1) /* don't store trailing null alone */
+X         direntry->dirlen = 0;
+X   } else {
+X      direntry->dirname[0] = '\0';
+X      direntry->dirlen = 0;
+X   }
+X}
+X
+X/* 
+XFunction getsdtin() gets a pathname from standard input, cleans
+Xit if necessary by removing any following blanks/tabs and other
+Xjunk, and returns it in a static area that is overwritten by each
+Xcall.
+X*/
+Xchar *getstdin()
+X{
+X	char *chptr;									/* temp pointer */
+X	static char tempname[PATHSIZE];
+X	do {
+X		if (fgets (tempname, PATHSIZE, stdin) == NULL)
+X			return (NULL);
+X		/* remove trailing blank, tab, newline */
+X		for (chptr = tempname; *chptr != '\0';  chptr++) {
+X			if (
+X	/* PURIFY means remove trailing blanks/tabs and all subsequent chars */
+X#ifdef PURIFY
+X					*chptr == '\t' || *chptr == ' ' ||
+X#endif
+X					*chptr == '\n'						/* always remove trailing \n */
+X				)
+X			{
+X	
+X				*chptr = '\0';
+X				break;
+X			}
+X		}
+X	} while (*tempname == '\0');				/* get a nonempty line */
+X#ifdef FOLD
+X	strlwr (tempname);
+X#endif
+X	return (tempname);
+X}
+X
+X/* 
+XFunction newdir() adds some default information to a directory entry.
+XThis will be a new directory entry added to an archive.
+X*/
+Xvoid newdir (direntry)
+Xregister struct direntry *direntry;
+X{
+X#ifdef GETTZ
+X	long gettz();
+X#endif
+X   direntry->zoo_tag = ZOO_TAG;
+X   direntry->type = 2;                  /* type is now 2 */
+X#ifdef GETTZ
+X	direntry->tz = (uchar) (gettz() / (15 * 60)); /* seconds => 15-min units */
+X#else
+X   direntry->tz = NO_TZ;                /* timezone unknown */
+X#endif
+X   direntry->struc = 0;                 /* unstructured file */
+X   direntry->system_id = SYSID_NIX;     /* identify **IX filesystem */
+X	direntry->vflag = VFL_ON|VFL_LAST;	 /* latest version */
+X	direntry->version_no = 1;					/* begin with version 1 */
+X	/* 1 for namlen, 1 for dirlen, 2 for system id, 3 for attributes,
+X		1 for version flag and 2 for version number */
+X   direntry->var_dir_len = direntry->dirlen + direntry->namlen + 10;
+X}
+END_OF_FILE
+if test 8463 -ne `wc -c <'zooadd2.c'`; then
+    echo shar: \"'zooadd2.c'\" unpacked with wrong size!
+fi
+# end of 'zooadd2.c'
+fi
+echo shar: End of archive 4 \(of 10\).
+cp /dev/null ark4isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 10 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

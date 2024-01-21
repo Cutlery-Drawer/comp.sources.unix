@@ -1,0 +1,1969 @@
+Subject:  v24i041:  Email fax-sending package, Part03/05
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: 516a90d5 4fc99e87 0f262bf5 b7da1c66
+
+Submitted-by: klaus u schallhorn <cnix!klaus>
+Posting-number: Volume 24, Issue 41
+Archive-name: faxpax/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then feed it
+# into a shell via "sh file" or similar.  To overwrite existing files,
+# type "sh file -c".
+# The tool that generated this appeared in the comp.sources.unix newsgroup;
+# send mail to comp-sources-unix@uunet.uu.net if you want that tool.
+# Contents:  faxclient/fax.c faxhost/spool.fax.c sample.fax.aliases
+#   writefax.man
+# Wrapped by rsalz@litchi.bbn.com on Wed Mar 13 14:08:02 1991
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+echo If this archive is complete, you will see the following message:
+echo '          "shar: End of archive 3 (of 5)."'
+if test -f 'faxclient/fax.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'faxclient/fax.c'\"
+else
+  echo shar: Extracting \"'faxclient/fax.c'\" \(14931 characters\)
+  sed "s/^X//" >'faxclient/fax.c' <<'END_OF_FILE'
+X#include <stdio.h>
+X#include <malloc.h>
+X#include <unistd.h>
+X#include <pwd.h>
+X#include <string.h>
+X#include <signal.h>
+X#include <sys/time.h>
+X#include <sys/stat.h>
+X
+X#include "../faxconfig.h"
+X
+X#ifdef	NETWIDE_FAX
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <netdb.h>
+X#endif
+X
+X
+X/*
+X	fax.c
+X
+X	accept fax from user.
+X
+X	src is either a file or stdin, dest is spooler somewhere on the net.
+X	do some parsing && error checking before we invoke the spooler.
+X	allow aliases and lists for destination fax.
+X	argv[1] must be either a phone no [no alpha, just digits && ispunct()],
+X	an alias [as found in $HOME/fax.aliases], or name of a fax list file.
+X
+X	format of alias file:
+X	=====================
+X	alias   phone no   ftao, starts with a colon	     optional comment
+X	---------------------------------------------------------------------
+X	fred    12345678   :for the attention of fred bloggs # comment
+X	bill	98765
+X	joe	7654323	   :The Lady in Pnik
+X
+X	format of fax list
+X	==================
+X	phone no   ftao, starts with a colon		opt. comment	
+X	------------------------------------------------------------
+X	12345678   :for the attention of fred bloggs    # comment
+X	9274356						# no ftao
+X	87340875   :z. Hd. Herrn Meier			# needs it on time
+X
+X	first released version 0.99 [desperado version]
+X	cleaned up Jan 21st '91,
+X	Copyright (C) 1991, klaus schallhorn, klaus@cnix.uucp
+X
+X	Permission to use, copy, modify, and distribute this software 
+X	and its documentation for any purpose and without fee is hereby 
+X	granted, provided that the above copyright notice appear in 
+X	all copies and that both that copyright notice and this permission 
+X	notice appear in supporting documentation. 
+X
+X	This software is provided "as is" without express or implied warranty.
+X*/
+X
+Xextern	int errno;
+X
+Xchar	me[80], tmpname[256], io[256], *hpfont, **phone, **ftao, *fname,
+X	*retfax, *home;
+Xchar	*get_aka(), *get_list(), *getenv();
+X
+Xstruct	passwd *pwentry, *getpwuid();
+Xint	now, mail, hires, entries, alloced, save, broken;
+XFILE	*collect_msg();
+Xvoid	breakread();
+X
+X
+Xnoalpha(s)	/* allow digits and ispunct() in phone nos */
+Xchar *s;
+X{
+X	while (*s)
+X	{
+X		if (isalpha(*s))
+X			return(FALSE);
+X		++s;
+X	}
+X	return(TRUE);
+X}
+Xfstbyte(s,skip)
+Xchar *s;
+Xint skip;
+X{
+X	s += skip;
+X	while (*s && isspace(*s))
+X	{
+X		++skip;
+X		++s;
+X	}
+X	return(skip);
+X}
+Xvoid get_rc()	/* read user defaults stashed in $HOME/.faxrc */
+X{
+X	FILE *rc;
+X	char *ptr, *save_str();
+X
+X	if (*home == '/' && *(home+1) == '\0')
+X		strcpy(io,"/.faxrc");
+X	else sprintf(io,"%s/.faxrc",home);
+X
+X	if ((rc = fopen(io, "r")) == NULL)
+X		return;
+X
+X	while (fgets(io, 248, rc) != NULL)
+X	{
+X		if (io[0] == '#')
+X			continue;
+X
+X		if ((ptr = strchr(io, '\n')) != NULL)
+X			*ptr = '\0';
+X		ptr = io;
+X		if (!strncmp(io, "font", 4))
+X		{
+X			ptr += fstbyte(io, 4);
+X			hpfont = save_str(ptr);
+X		}
+X		else if (!strncmp(io, "resolution", 10))
+X		{
+X			ptr += fstbyte(io, 10);
+X			hires = get_bool(ptr, "high");
+X		}
+X		else if (!strncmp(io, "mail", 4))	/* mail success msg */
+X		{
+X			ptr += fstbyte(io, 4);
+X			mail = get_bool(ptr, "true");
+X		}
+X		else if (!strncmp(io, "now", 3))	/* send now */
+X		{
+X			ptr += fstbyte(io, 3);
+X			now = get_bool(ptr, "true");
+X		}
+X		else if (!strncmp(io, "save", 4))	/* save in $HOME/FaxSent */
+X		{
+X			ptr += fstbyte(io, 4);
+X			save = get_bool(ptr, "true");
+X		}
+X		else if (!strncmp(io, "retfax", 6))	/* return faxno */
+X		{
+X			ptr += fstbyte(io, 6);
+X			retfax = save_str(ptr);
+X		}
+X	}
+X}
+Xchar *save_str(s)
+Xchar *s;
+X{
+X	char *p;
+X
+X	if ((p = malloc(1+strlen(s))) == NULL)
+X	{
+X		fprintf(stderr,"can't allocate memory\n");
+X		exit(1);
+X	}
+X	strcpy(p, s);
+X	return(p);
+X}
+Xget_bool(from,true)
+Xchar *from, *true;
+X{
+X	if (!strncmp(from, true, strlen(true)))
+X		return(TRUE);
+X	return(FALSE);
+X}
+X
+Xchar *get_aka(s) /* allocate and return a phone number for an alias */
+Xchar *s;
+X{
+X	char tmp[256], phoneno[80], alias[80], *ptr, *eptr;
+X	FILE *fp;
+X	int len, found;
+X
+X	errno = 0;
+X	if (*home == '/' && *(home+1) == '\0')
+X		strcpy(tmp,"/fax.aliases");
+X	else sprintf(tmp,"%s/fax.aliases",home);
+X
+X	len = strlen(s);
+X	found = 0;
+X	if ((fp = fopen(tmp, "r")) != NULL)
+X	{
+X		while (fgets(tmp, 248, fp) != NULL)
+X		{
+X			if (sscanf(tmp, "%s %s",alias,phoneno) < 2)
+X				continue;
+X			if (!strcmp(s, alias, len))
+X			{
+X				found = TRUE;
+X				break;
+X			}
+X		}
+X		fclose(fp);
+X	}
+X	if (!found)	/* check if there's a file by that name */
+X	{
+X		if ((phone[0] = get_list(s)) == NULL)
+X		{
+X			fprintf(stderr,"no alias for %s, no faxlist %s\n",s,s);
+X			return(NULL);
+X		}
+X		return(phone[0]);
+X	}
+X
+X	if ((phone[0] = malloc(1+strlen(phoneno))) == NULL)
+X	{
+X		fprintf(stderr,"can't allocate memory\n");
+X		return(NULL);
+X	}
+X	strcpy(phone[0], phoneno);
+X	if ((ptr = strchr(tmp, ':')) != NULL)
+X	{
+X		if ((eptr = strrchr(tmp, '#')) != NULL)
+X			*eptr = '\0';
+X		if ((ftao[0] = malloc(1+strlen(++ptr))) == NULL)
+X		{
+X			fprintf(stderr,"can't allocate memory\n");
+X			return(NULL);
+X		}
+X		strcpy(ftao[0], ptr);
+X	}
+X	++entries;
+X	return(phone[0]);
+X}
+Xchar *get_list(name)	/* read and allocate a list of phone nos */
+Xchar *name;
+X{
+X	static char tmp[256], phoneno[80], *fname0, *fname1, *ptr, *eptr;
+X	FILE *fp;
+X	int i;
+X
+X		/* check listnames: 
+X			if name[0] == '/', use absolute path
+X			else check ".", then $HOME
+X		*/
+X	errno = 0;
+X	if (*name == '/')
+X	{
+X		fname0 = name;
+X		fname1 = NULL;
+X	}
+X	else
+X	{
+X		if (*home == '/' && *(home+1) == '\0')
+X			sprintf(tmp,"/%s",name);
+X		else sprintf(tmp,"%s/%s",home,name);
+X		fname0 = name;
+X		fname1 = tmp;
+X	}
+X
+X	if ((fp = fopen(fname0, "r")) == NULL)
+X		if ((fp = fopen(fname1, "r")) == NULL)
+X			return(NULL);
+X
+X	while (fgets(tmp, 248, fp) != NULL)
+X	{
+X		if (sscanf(tmp, "%s",phoneno) < 1 || tmp[0] == '#')
+X			continue;
+X
+X		if ((phone[entries] = malloc(1+strlen(phoneno))) == NULL)
+X		{
+X			fprintf(stderr,"can't allocate memory\n");
+X			return(NULL);
+X		}
+X		strcpy(phone[entries], phoneno);
+X
+X		if ((ptr = strchr(tmp, ':')) != NULL)
+X		{
+X			if ((eptr = strrchr(tmp, '#')) != NULL)
+X				*eptr = '\0';
+X			if ((ftao[entries] = malloc(1+strlen(++ptr))) == NULL)
+X			{
+X				fprintf(stderr,"can't allocate memory\n");
+X				return(NULL);
+X			}
+X			strcpy(ftao[entries], ptr);
+X		}
+X		else ftao[entries] = NULL;
+X
+X		if (++entries == alloced) /* reshuffle base ptrs */
+X		{
+X			if ((phone = (char **)realloc(phone,
+X				((alloced + 8) * sizeof(char *)))) == NULL)
+X			{
+X				fprintf(stderr,"can't allocate memory\n");
+X				return(NULL);
+X			}
+X				/* increment alloced now */
+X			if ((ftao = (char **)realloc(ftao,
+X				((alloced += 8) * sizeof(char *)))) == NULL)
+X			{
+X				fprintf(stderr,"can't allocate memory\n");
+X				return(NULL);
+X			}
+X		}
+X	}
+X	fclose(fp);
+X	for (i=entries; i<alloced; i++)
+X		phone[i] = ftao[i] = NULL;
+X	return(phone[0]);
+X}
+X
+Xmain(argc,argv)
+Xint argc;
+Xchar *argv[];
+X{
+X#ifdef	NETWIDE_FAX
+X	struct hostent *hent;
+X	struct sockaddr_in sin;
+X	struct servent *sent;
+X	int s;
+X#endif
+X	int i, ac, piped, type;
+X	FILE *ofp, *faxfp;
+X
+X	if (argc == 1)
+X	{
+X		fprintf(stderr,"fax phone [file], -opt for options\n");
+X		exit(1);
+X	}
+X
+X	if ((home = getenv("HOME")) == NULL)
+X	{
+X		fprintf(stderr,"you're homeless\n");
+X		exit(1);
+X	}
+X	if (argc == 2 && (!strncmp(argv[1], "-opt", 4)))	/* usage */
+X		usage();
+X
+X	if ((pwentry = getpwuid(getuid())) == NULL)
+X	{
+X		fprintf(stderr,"you don't exist {%d}\n",errno);
+X		exit(1);
+X	}
+X	setuid(getuid());
+X	setgid(getgid());
+X
+X	piped = 0;
+X	now = mail = hires = save = 0;
+X	type = ASCII;
+X	hpfont = retfax = fname = (char *)NULL;
+X	ofp = faxfp = (FILE *)NULL;
+X	me[0] = tmpname[0] = '\0';
+X
+X	if ((phone = (char **)malloc(8*sizeof(char *))) == NULL)
+X		fprintf(stderr,"can't allocate memory");
+X	if ((ftao = (char **)malloc(8*sizeof(char *))) == NULL)
+X		fprintf(stderr,"can't allocate memory");
+X	for (i=0; i<8; i++)
+X		phone[i] = ftao[i] = NULL;
+X	alloced = 8;
+X	entries = 0;
+X
+X	get_rc();
+X
+X	for (ac=1; ac<argc; ac++)
+X	{
+X		if (phone[0] == NULL) /* first av[] is phone no, alias or list */
+X		{
+X			if (noalpha(argv[ac]))
+X			{
+X				phone[0] = argv[ac];
+X				entries = 1;
+X			}
+X			else if ((phone[0] = get_aka(argv[ac])) == NULL)
+X				exit(1);
+X		}
+X		else if (!strncmp(argv[ac], "-a", 2))	/* attn: fred bloggs */
+X		{
+X			ftao[0] = &argv[ac][2];
+X			entries = 1;
+X		}
+X		else if (!strncmp(argv[ac], "-f", 2))	/* use hp compat font */
+X			hpfont = &argv[ac][2];
+X		else if (!strncmp(argv[ac], "-h", 2))	/* high res, expensive */
+X			hires = TRUE;
+X		else if (!strncmp(argv[ac], "-l", 2))	/* low res */
+X			hires = FALSE;
+X		else if (!strncmp(argv[ac], "-m", 2))	/* mail success msg */
+X			mail = TRUE;
+X		else if (!strncmp(argv[ac], "-n", 2))	/* send now */
+X			now = TRUE;
+X		else if (!strncmp(argv[ac], "-r", 2))	/* return faxno */
+X			retfax = &argv[ac][2];
+X		else if (!strncmp(argv[ac], "-s", 2))	/* save in $HOME/FaxSent */
+X			save = TRUE;
+X		else fname = argv[ac];
+X	}
+X
+X	if (phone[0] == NULL)
+X	{
+X		fprintf(stderr,"no recipient\n");
+X		exit(1);
+X	}
+X	if (fname == NULL)
+X	{
+X		if (isatty(fileno(stdin)))
+X			fprintf(stderr,"reading stdin:\n");
+X		if ((faxfp = collect_msg()) == NULL)
+X			exit(1);
+X	}
+X	else if ((faxfp = fopen(fname, "r")) == NULL)
+X	{
+X		fprintf(stderr,"can't open %s for input\n",fname);
+X		exit(1);
+X	}
+X
+X#ifdef	NETWIDE_FAX
+X				/* that's me, with a little bit of luck */
+X	if (gethostname(me, 80))
+X	{
+X		fprintf(stderr,"I don't exist {%d}\n",errno);
+X		exit(1);
+X	}
+X
+X	if ((hent = gethostbyname(FAXHOST)) == NULL)
+X	{
+X		fprintf(stderr,"%s not known {%d}\n",FAXHOST,errno);
+X		exit(1);
+X	}
+X
+X	if (strcmp(me, hent->h_name))		/* FAXHOST != me */
+X	{
+X		if ((sent = getservbyname(FAXSERVER, "tcp")) == NULL)
+X		{
+X			fprintf(stderr,"%s service not known {%d}\n",FAXSERVER,errno);
+X			exit(1);
+X		}
+X
+X		/* grab a socket */
+X		if ((s = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+X		{
+X			fprintf(stderr," can't grab a socket {%d}\n",errno);
+X			exit(1);
+X		}
+X		sin.sin_family = AF_INET;
+X		sin.sin_port = htons(sent->s_port);
+X		bcopy(hent->h_addr, &sin.sin_addr, hent->h_length);
+X
+X		/* now try to connect */
+X		if (connect(s, &sin, sizeof(sin)) < 0)
+X		{
+X			fprintf(stderr,"can't connect {%d}\n",errno);
+X			exit(1);
+X		}
+X		if ((ofp = fdopen(s, "w")) == NULL)
+X		{
+X			fprintf(stderr,"can't open socket for buffered write {%d}\n",errno);
+X			exit(1);
+X		}
+X	}
+X	else
+X#endif
+X	{
+X		char ppath[128];
+X
+X		me[0] = '\0';	/* running on faxhost */
+X		sprintf(ppath,"%s/%s",FAXLIB,FAXSERVER);
+X		if ((ofp = popen(ppath, "w")) == NULL)
+X		{
+X			fprintf(stderr,"can't pipe to %s {%d}\n",ppath,errno);
+X			exit(1);
+X		}
+X		piped = TRUE;
+X	}
+X
+X/* do something useful */
+X
+X	ac = spoolfax(me, pwentry->pw_name, ofp, faxfp, type);
+X
+X	if (piped)
+X		pclose(ofp);
+X#ifdef	NETWIDE_FAX
+X	else close(s);
+X#endif
+X	if (save)
+X		savefax((fname==NULL)?tmpname:fname);
+X
+X	if (tmpname[0])
+X		unlink(tmpname);
+X	exit(ac);
+X}
+X
+Xspoolfax(host, user, outfp, infp, ftype)
+Xchar *host, *user;
+XFILE *outfp, *infp;
+Xint ftype;
+X{
+X	char tmp[256];
+X	int nread, i;
+X
+X	if (*host)
+X		sprintf(tmp,"%s@%s",user,host);
+X	else strcpy(tmp,user);
+X
+X#define	write_err()	fprintf(stderr,"can't spool fax {%d}\n",errno)
+X
+X	errno = 0;
+X	if (fprintf(outfp,"user %s\n",tmp) == EOF)
+X		return(write_err());
+X	if (fprintf(outfp,"uid %d\n",getuid()) == EOF)
+X		return(write_err());
+X
+X	if (fprintf(outfp,"now %d\n",now) == EOF)
+X		return(write_err());
+X	if (fprintf(outfp,"mail %d\n",mail) == EOF)
+X		return(write_err());
+X	if (fprintf(outfp,"type %d\n",ftype) == EOF)
+X		return(write_err());
+X	if (fprintf(outfp,"hires %d\n",hires) == EOF)
+X		return(write_err());
+X
+X	if (fprintf(outfp,"font %s\n",(hpfont)?hpfont:"none") == EOF)
+X		return(write_err());
+X
+X	if (fprintf(outfp,"retfax %s\n",(retfax)?retfax:"none") == EOF)
+X		return(write_err());
+X
+X	fprintf(outfp,"#\n");	/* marker for spoolfax */
+X
+X	for (i=0; i<entries; i++)
+X	{
+X		if (fprintf(outfp,"phone %s",phone[i]) == EOF)
+X			return(write_err());
+X		if (ftao[i])
+X		{
+X			if (fprintf(outfp," :%s",ftao[i]) == EOF)
+X				return(write_err());
+X		}
+X		fprintf(outfp,"\n");
+X	}
+X	if (fprintf(outfp,"data\n") == EOF)
+X		return(write_err());
+X
+X	while ((nread = fread(tmp, 1, 256, infp)) > 0)
+X		if (fwrite(tmp, 1, nread, outfp) != nread)
+X			return(write_err());
+X	fflush(outfp);
+X	return(0);
+X}
+Xvoid breakread()
+X{
+X	broken = TRUE;
+X}
+X
+XFILE *collect_msg()
+X{
+X	static FILE *fp;
+X	int written, tty;
+X
+X	broken = written = 0;
+X	signal(SIGINT, breakread);
+X	siginterrupt(SIGINT, 1);	/* interrupt sys calls */
+X
+X	tty = isatty(fileno(stdin));
+X	if (*home == '/' && *(home+1) == '\0')
+X		strcpy(tmpname,"/.infax.XXXXXX");
+X	else sprintf(tmpname,"%s/.infax.XXXXXX",home);
+X	mktemp(tmpname);
+X	if ((fp = fopen(tmpname, "w+")) == NULL)
+X	{
+X		fprintf(stderr,"can't create tmp file\n");
+X		return(NULL);
+X	}
+X	while (fgets(io, 248, stdin) != NULL)
+X	{
+X		if (broken)
+X		{
+X			written = 0;
+X			break;
+X		}
+X		if (io[0] == '.' && tty)
+X			break;
+X		else if (io[0] == '~' && io[1] == 'v' && tty)
+X		{
+X			fclose(fp);
+X			edit(tmpname);
+X			if ((fp = fopen(tmpname, "a+")) == NULL)
+X			{
+X				fprintf(stderr,"no tmp file ?\n");
+X				return(NULL);
+X			}
+X			written = (int)ftell(fp);
+X			fprintf(stderr,"(continue)\n");
+X			continue;
+X		}	
+X		else if (io[0] == '~' && io[1] == 'p' && tty)
+X		{
+X			rewind(fp);
+X			fprintf(stderr,"-------\nMessage contains:\n");
+X			while (fgets(io, 248, fp) != NULL)
+X				fputs(io, stderr);
+X			fprintf(stderr,"(continue)\n");
+X			fseek(fp, 0L, 2);
+X			continue;
+X		}
+X		written += strlen(io);
+X		fputs(io, fp);
+X	}
+X	fclose(fp);
+X	if (broken || !written)
+X	{
+X		unlink(tmpname);
+X		fprintf(stderr,"null message, not sent\n");
+X		return(NULL);
+X	}
+X	if ((fp = fopen(tmpname, "r")) == NULL)
+X	{
+X		fprintf(stderr,"can't re-read your tmp file\n");
+X		return(NULL);
+X	}
+X	return(fp);
+X}
+Xsavefax(infile)
+Xchar *infile;
+X{
+X	time_t ca;
+X	struct tm *tml, *localtime();
+X	struct stat fred;
+X	char FaxSent[256];
+X	FILE *in, *sfp;
+X
+X	time(&ca);
+X	tml = localtime(&ca);
+X	++tml->tm_mon;		/* jan is often 0 */
+X	
+X	if (*home == '/' && *(home+1) == '\0')
+X	{
+X		strcpy(FaxSent, "/FaxSent");
+X		sprintf(io,"/FaxSent/%s.%02d%02d%02d",
+X			phone[0],tml->tm_year,tml->tm_mon,tml->tm_mday);
+X	}
+X	else
+X	{
+X		sprintf(FaxSent,"%s/FaxSent",home);
+X		sprintf(io,"%s/FaxSent/%s.%02d%02d%02d",home,
+X			phone[0],tml->tm_year,tml->tm_mon,tml->tm_mday);
+X	}
+X
+X	if (stat(FaxSent, &fred) && mkdir(FaxSent, 0700))
+X	{
+X		fprintf(stderr,"no directory %s\n",FaxSent);
+X		exit(1);
+X	}
+X	if (((sfp = fopen(io, "a")) == NULL)
+X		|| ((in = fopen(infile, "r")) == NULL))
+X	{
+X		fprintf(stderr,"can't save your fax to %s in %s\n",
+X			phone[0],io);
+X		exit(1);
+X	}
+X	fprintf(sfp,"\n\nSPOOLED %02d.%02d.%2d %02d:%02d:%02d\n",
+X		tml->tm_mday,tml->tm_mon,tml->tm_year,
+X		tml->tm_hour,tml->tm_min,tml->tm_sec);
+X
+X	while (fgets(io, 250, in) != NULL)
+X		fputs(io, sfp);
+X	fclose(in);
+X	fclose(sfp);
+X}
+Xedit(what)
+Xchar *what;
+X{
+X	char *ed;
+X
+X	if ((ed = getenv("EDITOR")) == NULL)
+X		ed = "/usr/ucb/vi";
+X
+X	sprintf(io, "%s %s\n",ed,what);
+X	system(io);
+X}
+Xusage()
+X{
+X	char tmp[40];
+X
+X	puts("fax options:");
+X	puts("-a\"for the attention of fred bloggs\"");
+X	puts("-h   use high resolution");
+X	puts("-f   use an hp ljet  compatible font");
+X	puts("-n   send it now");
+X	puts("-m   confirm result by mail when sent");
+X	puts("-r   specify return fax no");
+X	if (*home == '/' && *(home+1) == '\0')
+X		strcpy(tmp, "/FaxSent");
+X	else sprintf(tmp,"%s/FaxSent",home);
+X	printf("-s   save message in %s/phoneno.date\n",tmp);
+X	puts("if called without a file name, fax reads stdin");
+X	exit(1);
+X}
+END_OF_FILE
+  if test 14931 -ne `wc -c <'faxclient/fax.c'`; then
+    echo shar: \"'faxclient/fax.c'\" unpacked with wrong size!
+  fi
+  # end of 'faxclient/fax.c'
+fi
+if test -f 'faxhost/spool.fax.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'faxhost/spool.fax.c'\"
+else
+  echo shar: Extracting \"'faxhost/spool.fax.c'\" \(14959 characters\)
+  sed "s/^X//" >'faxhost/spool.fax.c' <<'END_OF_FILE'
+X#include <stdio.h>
+X#include <string.h>
+X#include <time.h>
+X#include <ctype.h>
+X#include <unistd.h>
+X
+X#include "../faxconfig.h"
+X
+X/*
+X	spool.fax
+X
+X	spool faxes,
+X	read incoming jobs,
+X	split into straight through jobs and jobs where that
+X		need special handling due to "f.t.a.o. fred bloggs"
+X	convert input -> pbm -> g3
+X	if straight through jobs > 1 && phone_nos > 1,
+X		split into batches of size (phone_nos/faxmodems)
+X
+X	this looks [and is] rather messy due to the last minute addition
+X	of special treatment of those guys that doen't have their own
+X	fax machine but want their fax addressed [marked] "for the
+X	attention of whatever". The quick fix I made works, but
+X	the resulting mess is barely understandable [to me, that is].
+X
+X	I'm gonna rework him as soon as there's some time - I probably
+X	have to anyway when I add prettier file types. Currently
+X	the only thing that works as advertised is files pushed through
+X	texttopbm. spooling faxes with pbm files should work, but I haven't
+X	had the time to test these [hey, I'm doing this in my spare time].
+X
+X	first released version 0.99 [desperado version]
+X	cleaned up Jan 22nd '91, 
+X	Copyright (C) 1991, klaus schallhorn, klaus@cnix.uucp
+X
+X	Permission to use, copy, modify, and distribute this software 
+X	and its documentation for any purpose and without fee is hereby 
+X	granted, provided that the above copyright notice appear in 
+X	all copies and that both that copyright notice and this permission 
+X	notice appear in supporting documentation. 
+X
+X	This software is provided "as is" without express or implied warranty.
+X*/
+X
+X
+Xlong	xpos;
+Xint	type, hires, pages, blah, mail;
+Xchar	tmp_nam[256], user[80], retfax[80], font[256], Ftao[256];
+Xchar	io[1024], Xfile[256], Dfile[256];
+Xchar	oldname[256], newname[256], linkbase[256], linkto[256], dataname[256];
+X#ifdef	JOBID
+X	jobid[80];
+Xstruct	tm *tml, *localtime();
+X#endif
+X
+Xextern	int errno;
+X
+Xchk_config()
+X{
+X	FILE *cfg;
+X	char buf[256];
+X	int i;
+X
+X	sprintf(buf, "%s/fax.config", FAXLIB);
+X	errno = 0;
+X	if ((cfg = fopen(buf, "r")) == NULL)
+X	{
+X		unlink(Xfile);
+X		unlink(Dfile);
+X		fax_log(ERROR, "spool.fax: can't read %s\n",buf);
+X		mailexit(user);
+X	}
+X	i = 0;
+X	while (fgets(buf, 254, cfg) != NULL)
+X	{
+X		if (buf[0] == '#')
+X			continue;
+X		if (!strncmp(buf, "device", 6))
+X			++i;
+X	}
+X	fclose(cfg);
+X	return(i);
+X}
+X
+Xmain()
+X{
+X	FILE *fp;
+X	int nread, phones, tread, count, ftaofs;
+X	time_t now;
+X	char *ptr;
+X
+X	phones = count = ftaofs = tread = errno = 0;
+X	user[0] = retfax[0] = font[0] = Ftao[0] = '\0';
+X
+X	if (chdir(FAXSPOOL))	/* quick one, job done */
+X	{
+X		fax_log(ERROR,"spool.fax: can't cd to %s\n",FAXSPOOL);
+X		mailexit(FAXADMIN);
+X	}
+X
+X	(void)time(&now);
+X
+X#ifdef	JOBID
+X	tml = localtime(&now);
+X	++tml->tm_mon;		/* jan is 0 */
+X
+X	sprintf(jobid, "%02d%02d-%d",tml->tm_mon,tml->tm_mday,getpid());
+X#endif
+X	sprintf(tmp_nam,"%s/X.faxXXXXXX",FAXSPOOL);
+X	mktemp(tmp_nam);
+X	strcpy(Xfile, tmp_nam);
+X
+X	if ((fp = fopen(tmp_nam, "w")) == NULL)
+X	{
+X		fax_log(ERROR,"spool.fax: can't create X.file\n");
+X		mailexit(FAXADMIN);
+X	}
+X		
+X	chmod(tmp_nam, FAXFMODE);
+X
+X	fprintf(fp,"spooled %ld\n",(long)now);
+X	fprintf(fp,"tries %3d\n",0);
+X
+X	while (fgets(io, 254, stdin) != NULL)
+X	{
+X		if (!count)
+X		{
+X			if (io[0] == 'f')	/* font */
+X			{
+X				ptr = io;
+X				while (*ptr && (!isspace(*ptr)))
+X					++ptr;
+X				++ptr;
+X				if (strncmp(ptr, "none", 4))
+X					strcpy(font, ptr);	/* else use default */
+X			}
+X			else if (io[0] == 'h')	/* hires */
+X			{
+X				ptr = io;
+X				while (*ptr && (!isdigit(*ptr)))
+X					++ptr;
+X				hires = atoi(ptr);
+X			}
+X			else if (io[0] == 'm')	/* hires */
+X			{
+X				ptr = io;
+X				while (*ptr && (!isdigit(*ptr)))
+X					++ptr;
+X				mail = atoi(ptr);
+X			}
+X			else if (io[0] == 'r')	/* return faxno */
+X			{
+X				ptr = io;
+X				while (*ptr && (!isspace(*ptr)))
+X					++ptr;
+X				strcpy(retfax, ++ptr);
+X			}
+X			else if (io[0] == 't')	/* type */
+X			{
+X				ptr = io;
+X				while (*ptr && (!isdigit(*ptr)))
+X					++ptr;
+X				type = atoi(ptr);
+X			}
+X			else if (io[0] == 'u' && (!user[0]))	/* user */
+X			{
+X				ptr = io;
+X				while (*ptr && (!isspace(*ptr)))
+X					++ptr;
+X				strcpy(user, ++ptr);
+X			}
+X			else if (io[0] == '#')
+X			{
+X				xpos = ftell(fp);
+X				count = TRUE;
+X			}
+X		}
+X		else
+X		{
+X			if (io[0] == 'd')	/* data follows */
+X				break;
+X			else if (io[0] == 'p')	/* last minute fix */
+X			{			/* forgot ftao for 1off faxes */
+X				++phones;	/* added to faxconvert */
+X				if ((ptr = strchr(io, ':')) != NULL)
+X				{
+X					ftaofs++;
+X					strcpy(Ftao, (ptr+1));
+X				}
+X			}
+X		}
+X		fputs(io, fp);
+X	}
+X	sprintf(tmp_nam,"%s/D.faxXXXXXX",FAXSPOOL);
+X	mktemp(tmp_nam);
+X	strcpy(Dfile, tmp_nam);
+X
+X		/* make a note of D.file name in X.file */
+X	fprintf(fp,"data %s\n",tmp_nam);
+X	fflush(fp);
+X	if (ferror(fp))
+X	{
+X		unlink(Xfile);
+X		fax_log(ERROR,"spool.fax: can't write X.file\n");
+X		mailexit(FAXADMIN);
+X	}
+X	fclose(fp);
+X
+X	if ((!user[0]) || (!phones))
+X	{
+X		unlink(Xfile);
+X		fax_log(ERROR,"spool.fax: doesn't look like a fax job to me\n");
+X		mailexit(FAXADMIN);
+X	}
+X
+X	if ((fp = fopen(tmp_nam, "w")) == NULL)
+X	{
+X		unlink(Xfile);
+X		fax_log(ERROR,"spool.fax: can't create D.file\n");
+X		mailexit(user);
+X	}
+X	chmod(tmp_nam, FAXFMODE);
+X
+X	while ((nread = fread(io, 1, 256, stdin)) > 0)
+X	{
+X		tread += nread;
+X		if (fwrite(io, 1, nread, fp) != nread)
+X		{
+X			unlink(Xfile);
+X			fax_log(ERROR,"spool.fax: can't write D.file\n");
+X			mailexit(user);
+X		}
+X	}
+X	fflush(fp);
+X	if ((!tread) || ferror(fp))	/* empty file ? */
+X	{
+X		unlink(Xfile);
+X		unlink(Dfile);
+X		fax_log(ERROR,"spool.fax: can't write D.file, rcvd bytes %d\n",tread);
+X		mailexit(user);
+X	}
+X	fclose(fp);
+X
+X	if ((nread = fork()) < 0)
+X	{
+X		unlink(Xfile);
+X		unlink(Dfile);
+X		fax_log(ERROR,"spool.fax: can't fork to convert files\n");
+X		mailexit(user);
+X	}
+X	else if (!nread)	/* child */
+X	{
+X		if (setpgrp(0,0))
+X		{
+X			fax_log(ERROR, "spool.fax: can't create new prgp\n");
+X			mailexit(FAXADMIN);
+X		}
+X		if (setuid(geteuid()))
+X		{
+X			fax_log(ERROR, "spool.fax: can't setuid(geteuid())\n");
+X			mailexit(FAXADMIN);
+X		}
+X		if (setgid(getegid()))
+X		{
+X			fax_log(ERROR, "spool.fax: can't setgid(getegid())\n");
+X			mailexit(FAXADMIN);
+X		}
+X
+X		if (!share_fax(Xfile,Dfile,phones,ftaofs))
+X#ifndef	JOBID
+X			fax_log(0, "spool.fax: user %s, %d pages, %d reciepient%c\n",
+X				user, pages, phones, (phones > 1)?'s':' ');
+X#else
+X			fax_log(0, "spool.fax: jobid %s, user %s, %d pages, %d reciepient%c\n",
+X				jobid, user, pages, phones, (phones > 1)?'s':' ');
+X
+X		if (mail)
+X		{
+X			sprintf(io,"echo \"the job id of your spooled fax is %s \" | mail %s",
+X				jobid,user);
+X			system(io);
+X		}
+X#endif
+X
+X	}
+X	exit(0);
+X}
+Xshare_fax(xnam,dnam,phones,oneoffs)
+Xchar *xnam,*dnam;
+Xint phones, oneoffs;
+X{
+X	FILE *X, *x;
+X	char name[256], io[1024], *head;
+X	int i, split, batches, done, per_batch, devices;
+X
+X	/* split a job into packets 
+X	   check for jobs with special headers [ftao], do separately,
+X	   split the balance into packets so that load is distributed
+X	   evenly between faxmodems
+X	*/
+X
+X	devices = chk_config();	/* or dead */
+X
+X	if (phones == 1)	/* doesn't need much splitting */
+X		return(faxconvert(xnam,dnam,0));
+X	else Ftao[0] = '\0';	/* last minute fix, spoolfax is due for a rewrite */
+X
+X	if (oneoffs)		/* special handling */
+X		phones -= xoneoffs(xnam,dnam);
+X
+X			/* integer divide of 7 faxes / 10 modems == 0 */
+X	per_batch = max(1,(phones/devices));
+X	errno = 0;
+X	if ((X = fopen(xnam, "r")) == NULL)
+X	{
+X		fax_log(ERROR,"spool.fax: can't open X.file %s\n",xnam);
+X		mailexit(user);
+X	}
+X	if ((head = malloc((int)xpos)) == NULL)
+X	{
+X		fax_log(ERROR,"spool.fax: can't allocate memory\n");
+X		mailexit(user);
+X	}
+X	if (fread(head, 1, (int)xpos, X) != (int)xpos)
+X	{
+X		fax_log(ERROR,"spool.fax: can't read X.file %s\n",xnam);
+X		mailexit(user);
+X	}
+X
+X	for (done=batches=split=0;;)
+X	{
+X		if (done || (split == phones))
+X			break;
+X
+X		sprintf(name, "%s%d",xnam,batches);
+X		if ((x = fopen(name, "w")) == NULL)	/* buggered */
+X		{					/* rm all batches */
+Xbuggered:
+X			for (i=0; i<batches; i++)		/* but leave main job */
+X			{				/* for manual cleanup */
+X				sprintf(name, "%s%d",xnam,i);
+X				unlink(name);
+X			}
+X			unlink(xnam);
+X			unlink(dnam);
+X			fax_log(ERROR,"spool.fax: serious problems during split %s\n",xnam);
+X			mailexit(user);
+X		}
+X
+X		chmod(name, FAXFMODE);
+X		if (fwrite(head, 1, (int)xpos, x) != (int)xpos)
+X			goto buggered;
+X
+X		for (i=0; i<per_batch; )
+X		{
+X			if (fgets(io, 256, X) == NULL)
+X				goto buggered;
+X			if (io[0] == '#' || (strchr(io, ':') != NULL))
+X				continue;
+X			if (!strncmp(io, "data", 4)) /* no more phone nos */
+X			{
+X				if (!i)
+X					unlink(name);
+X				done = 1;
+X				break;
+X			}
+X			fputs(io, x);
+X			++split;
+X			++i;
+X		}
+X		fprintf(x,"data %s\n",dnam);
+X		fflush(x);
+X		if (ferror(x))
+X			goto buggered;
+X		fclose(x);
+X		batches += (i > 0);
+X	}
+X	fclose(X);
+X	unlink(xnam);	/* passed on simply as a "basename" */
+X	return(faxconvert(xnam,dnam,batches));
+X}
+Xxoneoffs(xnam,dnam)
+Xchar *xnam,*dnam;
+X{
+X	FILE *X, *D, *x, *d;
+X	char ftao[128], newxnam[256], newdnam[256], txnam[256], tdnam[256],
+X		*head, *ptr;
+X	int split, nread;
+X
+X	errno = 0;
+X	if ((D = fopen(dnam, "r")) == NULL)
+X	{
+X		fax_log(ERROR,"spool.fax: can't open D.file %s for ftao\n",dnam);
+X		mailexit(user);
+X	}
+X	if ((X = fopen(xnam, "r")) == NULL)
+X	{
+X		fax_log(ERROR,"spool.fax: can't open X.file %s for ftao\n",xnam);
+X		mailexit(user);
+X	}
+X		/* read header of X file */
+X	if ((head = malloc((int)xpos)) == NULL)
+X	{
+X		fax_log(ERROR,"spool.fax: can't allocate memory\n");
+X		mailexit(user);
+X	}
+X	if (fread(head, 1, (int)xpos, X) != (int)xpos)
+X	{
+X		fax_log(ERROR,"spool.fax: can't read X.file %s for ftao\n",xnam);
+X		mailexit(user);
+X	}
+X
+X	split = 0;	/* find jobs with phone 1234 :f.t.a.o fred */
+X	sprintf(txnam,"%s/X.fxXXXXXX",FAXSPOOL);
+X	mktemp(txnam);
+X	sprintf(tdnam,"%s/D.fxXXXXXX",FAXSPOOL);
+X	mktemp(tdnam);
+X
+X	while (fgets(io, 256, X) != NULL)
+X	{
+X		if (io[0] == '#' || ((ptr = strchr(io, ':')) == NULL))
+X			continue;
+X
+X		sprintf(newxnam, "%s%d", txnam,split);
+X		errno = 0;
+Xbuggered:
+X		if ((x = fopen(newxnam, "w")) == NULL)
+X		{
+X			fax_log(ERROR,"spool.fax: can't create %s for load sharing\n",newxnam);
+X			mailexit(user);
+X		}
+X		chmod(newxnam, FAXFMODE);
+X
+X		if (fwrite(head, 1, (int)xpos, x) != (int)xpos)
+X			goto buggered;
+X
+X		strcpy(ftao, (ptr+1));	/* save whats after ptr */
+X		*ptr = '\0';		/* zero out at ':' */
+X
+X		/* io now contains just the phone number */
+X		/* ftao contains now "f.t.a.o. fred" */
+X
+X		/* make new data name */
+X		sprintf(newdnam,"%s%d", tdnam,split);
+X
+X		fprintf(x,"%s\ndata %s\n",io,newdnam);
+X		fflush(x);
+X		if (ferror(x))
+X			goto buggered;
+X		fclose(x);
+X
+X		errno = 0;
+X		if ((d = fopen(newdnam, "w")) == NULL)
+X			goto buggered;
+X		chmod(newdnam, FAXFMODE);
+X
+X		fprintf(d,"%s\n",ftao);	/* make this part of the fax file */
+X
+X					/* add the balance */
+X		while ((nread = fread(io, 1, 1024, D)) > 0)
+X			fwrite(io, 1, nread, d);
+X		fflush(d);
+X		if (ferror(d))
+X			goto buggered;
+X		fclose(d);
+X		faxconvert(newxnam, newdnam, 0);	/* or die */
+X		++split;
+X		rewind(D);
+X	}
+X	fclose(X);
+X	fclose(D);
+X	free(head);
+X	return(split);
+X}
+Xfaxconvert(xn, dn, batches)
+Xchar *xn, *dn;
+Xint batches;
+X{
+X	int j, batch;
+X	char scratchbuf[256], tmp[256], *ptr;
+X	FILE *p, *fp;
+X
+X	/* do D.files [data] first, if they're ok, do Xfiles */
+X	/* sendfax scans directory for x.files only */
+X	/* in case of multiple batches convert data once, then make links */
+X
+X	batch = 0;
+X	do	/* at least once */
+X	{
+X		if (!batch)	/* first time around */
+X		{
+X			strcpy(oldname, dn);
+X			strcpy(newname, dn);
+X			ptr = strrchr(newname, '/');
+X			*(ptr+1) = 'd';
+X			strcpy(linkto, newname);
+X			strcat(newname, "0");
+X			strcpy(linkbase, newname);
+X
+X				/* strip newlines */
+X			if ((ptr = strchr(font, '\n')) != NULL)
+X				*ptr = '\0';
+X			if ((ptr = strchr(user, '\n')) != NULL)
+X				*ptr = '\0';
+X			if ((ptr = strchr(retfax, '\n')) != NULL)
+X				*ptr = '\0';
+X
+X			switch(type)
+X			{
+X			case ASCII:
+X				errno = 0;
+X				if ((fp = fopen(oldname, "r")) == NULL)
+X				{
+X					fax_log(ERROR,"spool.fax: can't read textfile %s for conversion\n",oldname);
+X					mailexit(user);
+X				}
+X				sprintf(scratchbuf,"%s/texttopbm %s %s%s -o%s.pbm",
+X					LOCALBIN,
+X					(hires)?"-h":"",
+X					(font[0])?"-f":"",
+X					(font[0])?font:"",
+X					newname);
+X
+X				if ((p = popen(scratchbuf, "w")) == NULL)
+X				{
+X					fax_log(ERROR,"spool.fax: can't pipe to texttopbm with %s\n",scratchbuf);
+X					mailexit(user);
+X				}
+X
+X				if (Ftao[0]) /* make this part of the fax file */
+X					fprintf(p,"%s\n",Ftao);
+X				fprintf(p,"fax from %s",user);
+X				if (strncmp(retfax, "none", 4))
+X					fprintf(p,", fax # %s - ",retfax);
+X				else fputc(' ',p);
+X				timestamp(p,(time_t)0L);
+X
+X				fprintf(p,"\n\n");
+X
+X				while (fgets(scratchbuf, 254, fp) != NULL)
+X					fputs(scratchbuf, p);
+X
+X				fflush(p);
+X				if (ferror(p))
+X				{
+X					fax_log(ERROR,"spool.fax: can't unplump from texttopbm with %s\n",scratchbuf);
+X					mailexit(user);
+X				}
+X				pclose(p);
+X				fclose(fp);
+X				unlink(oldname);	/* rm text input file */
+X
+X					/* have one or more pbm files now */
+X				for (pages=0;;pages++)
+X				{
+X					sprintf(tmp, "%s.pbm.%d",newname,pages);
+X					if (access(tmp, R_OK))
+X						break;
+X					sprintf(scratchbuf,"%s/pbmtog3 -s <%s >%s.g3.%d",LOCALBIN,tmp,newname,pages);
+X					if (system(scratchbuf))
+X					{
+X						fax_log(ERROR,"spool.fax: can't execute pbmtog3 with %s\n",scratchbuf);
+X						mailexit(user);
+X					}
+X					unlink(tmp);	/* get rid of pbm file */
+X					sprintf(tmp, "%s.g3.%d",newname,pages);
+X					chmod(tmp, FAXFMODE);
+X				}
+X				strcpy(dataname, linkbase);
+X				break;
+X
+X			case PBM:
+X				sprintf(scratchbuf,"pbmtog3 -s <%s >%s.g3.0",oldname,newname);
+X				errno = 0;
+X				if (system(scratchbuf))
+X				{
+X					fax_log(ERROR,"spool.fax: can't execute pbmtog3 with %s\n",scratchbuf);
+X					mailexit(user);
+X				}
+X				unlink(oldname);	/* again: get rid of pbm file */
+X				sprintf(tmp,"%s.g3.0",newname);
+X				chmod(tmp, FAXFMODE);
+X				pages = 1;
+X				strcpy(dataname, newname);
+X				break;
+X			}
+X		}
+X		else
+X		{
+X			for (j=0; j<pages; j++)
+X			{
+X				sprintf(dataname,   "%s%d.g3.%d",linkto,batch,j);
+X				sprintf(scratchbuf, "%s.g3.%d",linkbase,j);
+X				if (link(scratchbuf, dataname))
+X				{
+X					fax_log(ERROR,"spool.fax: can't link %s to %s\n",linkbase,tmp);
+X					mailexit(user);
+X				}
+X			}
+X			sprintf(dataname, "%s%d",linkto,batch);
+X		}
+X
+X
+X				/* now do the X.file */
+X		if (batches)	/* xn is basename only in case of batches */
+X			sprintf(oldname, "%s%d", xn, batch);
+X		else strcpy(oldname, xn);
+X
+X		strcpy(newname, oldname);
+X		ptr = strrchr(newname, '/');
+X		*(ptr+1) = 'x';
+X		if ((p = fopen(oldname, "r")) == NULL)
+X		{
+X			fax_log(ERROR,"spool.fax: can't open %s after splitting D.files\n",oldname);
+X			mailexit(user);
+X		}
+X		if ((fp = fopen(newname, "w")) == NULL)
+X		{
+X			fax_log(ERROR,"spool.fax: can't create new %s\n",newname);
+X			mailexit(user);
+X		}
+X		chmod(newname, FAXFMODE);
+X
+X		while (fgets(scratchbuf, 126, p) != NULL)
+X		{
+X			if (!strncmp(scratchbuf, "data", 4))
+X				fprintf(fp,"data %s\n",dataname);
+X			else fputs(scratchbuf, fp);
+X		}
+X		fprintf(fp,"pages %d\n",pages);
+X#ifdef	JOBID
+X		fprintf(fp,"jobid %s\n",jobid);
+X#endif
+X		fflush(fp);
+X		if (ferror(fp))
+X		{
+X			fax_log(ERROR,"spool.fax: can't write new %s\n",newname);
+X			mailexit(user);
+X		}
+X		fclose(fp);
+X		unlink(oldname);
+X	} while (++batch < batches);
+X
+X	unlink(dn);
+X	return(0);
+X}
+END_OF_FILE
+  if test 14959 -ne `wc -c <'faxhost/spool.fax.c'`; then
+    echo shar: \"'faxhost/spool.fax.c'\" unpacked with wrong size!
+  fi
+  # end of 'faxhost/spool.fax.c'
+fi
+if test -f 'sample.fax.aliases' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'sample.fax.aliases'\"
+else
+  echo shar: Extracting \"'sample.fax.aliases'\" \(290 characters\)
+  sed "s/^X//" >'sample.fax.aliases' <<'END_OF_FILE'
+X# sample fax.aliases file
+X# alias   phone no   ftao, starts with a colon	     optional comment
+X#---------------------------------------------------------------------
+Xfred    12345678   :for the attention of fred bloggs # comment
+Xbill	98765
+Xjoe	7654323	   :The Lady in Pink # should see her
+END_OF_FILE
+  if test 290 -ne `wc -c <'sample.fax.aliases'`; then
+    echo shar: \"'sample.fax.aliases'\" unpacked with wrong size!
+  fi
+  # end of 'sample.fax.aliases'
+fi
+if test -f 'writefax.man' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'writefax.man'\"
+else
+  echo shar: Extracting \"'writefax.man'\" \(20046 characters\)
+  sed "s/^X//" >'writefax.man' <<'END_OF_FILE'
+X>From cat!fulcrum!ukc.ac.uk!mcsun.eu.net!mcsun.uucp!aimed!nick Thu Dec 13 15:41:13 1990
+XReturn-Path: <cat!fulcrum!ukc.ac.uk!mcsun.eu.net!mcsun.uucp!aimed!nick>
+XSubject: Re: writefax.man
+XTo: klaus u schallhorn <klaus@cnix.uucp>
+XDate: Wed, 12 Dec 90 16:49:33 EST
+X>From: Nick Pemberton <aimed!nick>
+XX-Mailer: ELM [version 2.3 PL6]
+XSender: uucp.mcsun!aimed!nick@mcsun.eu.net
+X	
+X> I've just studied the document you posted to various newsgroups
+X> and compared it to a document I received from a faxmodem
+X> manufacturer, that asked me to sign a non disclosure agreement
+X> in order to get what you posted.      ************************
+X	
+XThat sounds reasonably scary....
+X	
+X> 
+X> Can you let me know the source of the document and if it's
+X> "secret" as well or whether I've been done. I'd really like to know.
+X
+XI downloaded it from the Zoom Technologies BBS, at 1-617-451-5284. Zoom
+Xare the folks who manufacture the modem - the chipset must be Sierra's.
+X
+XAs you can see from the document, there are no restrictive covenants
+Xon it, and zoom never mentioned such restrictions. I'd question having to
+Xsign such an agreement.
+X
+XNick.
+X
+X-- 
+XNick Pemberton  		 uucp: !{lsuc, uunet!mnetor}!aimed!nick
+XAIM, Inc			  bus: (416) 429-1085
+XToronto, Ontario, Canada         Home: (416) 690-0647
+X
+X
+X>From cat.fulcrum.bt.co.uk!uzi-9mm.fulcrum.bt.co.uk!axion!ukc!mcsun!sunic!uupsi!rpi!zaphod.mps.ohio-state.edu!wuarchive!cs.utexas.edu!utgpu!utzoo!mnetor!geac!aimed!nick Wed Dec 12 10:38:53 GMT 1990
+XArticle: 112 of comp.dcom.modems
+XXref: cnix alt.fax:79 comp.dcom.modems:112 comp.periphs:92
+XPath: cnix!cat.fulcrum.bt.co.uk!uzi-9mm.fulcrum.bt.co.uk!axion!ukc!mcsun!sunic!uupsi!rpi!zaphod.mps.ohio-state.edu!wuarchive!cs.utexas.edu!utgpu!utzoo!mnetor!geac!aimed!nick
+X>From: nick@aimed.UUCP (Nick Pemberton)
+XNewsgroups: alt.fax,comp.dcom.modems,comp.periphs
+XSubject: Here is WRITEFAX.MAN, details on ZOOM modem programming
+XMessage-ID: <8658@aimed.UUCP>
+XDate: 8 Dec 90 00:30:56 GMT
+XOrganization: AIM, Inc, Toronto, Ontario
+XLines: 496
+X
+XWell, after much waiting, dialing, etc, I finally have a copy of
+XWRITEFAX.MAN, which is a guide to programming the ZOOM MX 2400S modem,
+Xamongst others. I have had a number of requests for this file, so I
+Xthought I'd post it (its not that large anyway....)
+X
+X------------snip----------snip--------snip---------
+X 
+X      SendFax Application Software Interface Specification Rev 2
+X
+X
+X
+XContents
+X
+X1.0    Introduction
+X
+X2.0    Physical interface
+X
+X3.0    Command set
+X
+X4.0    Data format
+X
+X5.0    Example sessions
+X
+X
+X
+X
+X.pa
+X.he       SendFax Application Software Interface Specification
+X
+X
+X
+X1.0    Introduction
+X
+XThis  document  defines the specifications  for  the  application 
+Xsoftware interface to a PC Fax/Modem board incorporating Sierra's 
+XSC11046, 2400 bps modem with Send only Fax at 4800 bps  (SendFax) 
+Xchip.
+X
+XThe  device is intended to be used in internal cards for the  IBM 
+XPC  or  compatible  computers or for  use  in  standalone  modems 
+Xinterfacing to   any  computer using a standard RS232 port. 
+X
+XFunctions  and commands are defined to allow an extension to  Fax 
+Xreceive mode in the future.
+X 
+XThe Fax/Modem board is designed such that it appears to the PC as 
+Xa serial port.  The address of the board is user selectable to be 
+Xone  of four ports, COM1, COM2, COM3 or COM4.  The  DCE  hardware 
+Xmakes  and terminates calls, manages the  communications  session 
+Xand  transmits  image  data in  accordance  with  the  procedures 
+Xdefined  in the CCITT recommendation T.30.  The image data is  in 
+Xmodified  Huffman  compressed format as described  in  the  CCITT 
+Xrecommendation T.4.  
+X
+XThe  application  software running in the DTE  will  provide  the 
+Xfunctions  of  user interface, conversion of user data  files  in 
+Xvarious  formats  to fax format per CCITT T.4  specification  and 
+Xtransfer  of  data  to the DCE for modulation  according  to  the 
+Xprotocol defined in this document.
+X
+X 
+X.pa
+X
+X
+X
+X2.0    Physical Interface
+X
+X2.1 Internal PC version
+X
+XThe  hardware  appears to the PC as a serial port at  an  address 
+Xthat  is user selectable to be one of four ports.  Table 1  lists 
+Xthe addresses and interrupt levels for various port selections.
+X
+XTo   the  application  software,  the  hardware  appears  as   an 
+X8250/16450  type UART.  The application software writes or  reads 
+Xdata  to  and  from registers in the UART.   Table  2  shows  the 
+Xvarious registers and their addresses.  DTR and OUT2 bits in  MCR 
+Xmust be set before communicating with the hardware.  The software 
+Xsends  commands  and  data  to the hardware  by  writing  to  the 
+Xtransmitter  holding  register (THR) in the UART.   Data  can  be 
+Xwritten  to THR when THRE and/or TSRE bits in LSR are  set.    It 
+Xreceives  responses  or  data from the hardware  by  reading  the 
+Xreceive  buffer register (RBR).  Software should first check  the 
+XLSR to see if DR bit is set indicating data is available in  RBR. 
+XInterrupts  can  also  be  used  to  inform  the  software   that 
+Xtransmitter is empty or data is available in the receiver.  Refer 
+Xto  the  8250/16450  data sheet or the  IBM  technical  reference 
+Xmanual  for more information on programming, reading and  writing 
+Xto the UART.
+X
+X2.2 RS232 Standalone version
+X
+XThe UART in the SC11011 controller can be configured by  changing 
+Xone  bit  (Bit3) in the code to present its serial  port  to  the 
+Xoutside  world.   To enable the DTR control function,  the  AT&D2 
+Xcommand must be issued befoer entering the fax mode. 
+X
+XThe  standard 2400 bps modem command set is extended for the  Fax 
+Xapplication using a format of AT#F...  These commands were developed
+Xin accordance with the original set proposed in the TIA T30 committee
+Xin spring of 1989. Sierra is continuing to work with the T29.2 committee
+Xto define teh ultimate standard command set for fax and data modems. 
+X
+XIn  the idle state the hardware is in  the  normal 2400  bps modem
+Xmode.  The UART is programmed at speeds from  300 to 2400 bps to
+Xcommunicate with the hardware. In the fax mode, the DTE is set to 19.2Kbps.
+XFour  states  are defined to allow a clear understanding  of  the 
+Xhardware control process:
+X
+X     1. Modem command mode:   AT commands accepted
+X                              2400 bps max
+X                              modem data mode entered online
+X                              
+X     2. Modem data mode:      +++ escapes to modem command mode
+X                              2400 bps max
+X
+X     3. Fax command mode:     entered from modem command mode 
+X                              with #F1
+X                              19.2 kbps only
+X                         
+X     4. Fax data mode:        commands and data at 19.2kbps only
+X                              return to fax command by:
+X                                   sending command #F 
+X                                   end of call/ call disconnect 
+X                                   dropping DTR 
+X
+XAfter  power-up  the  hardware is in the normal  2400  bps  modem 
+Xcommand mode.
+X
+XA  special command puts the hardware in the Fax mode.    Once  in 
+Xthe  Fax  mode, the UART must be programmed for 19,200  bps  data 
+Xrate, 8 bits and no parity.  This is because the image data  must 
+Xbe  sent  to  the hardware at a rate that  is  faster  than  line 
+Xtransmission  rate.   For 4800 bps synchronous transmission  line 
+Xrate, the UART rate must be at least 9600 bps.  To allow for  the 
+Xfuture accomodation of 9600 bps line transmission rate, the  UART 
+Xspeed  in  Fax mode is fixed at 19,200 bps.   The UART  speed  is 
+Xprogrammed by setting the DLAB bit in the modem control  register 
+X(MCR)  and by writing appropriate values to the  divisor  latches 
+XDLL  and  DLM.   Table 3 provides the DLL,  DLM  speed  selection 
+Xvalues.    Flow  control  (XON/XOFF or RTS/CTS)  is  required  to 
+Xsynchronize  the flow of information between the DTE and the  DCE 
+Xduring image data transmission and HDLC frame reception.  In  the 
+Xdata transmission mode, software must not send data when CTS  bit 
+Xis  off  or  when <XOFF> is received.   Data can  be  sent  after 
+Xreceiving <XON> or when CTS bit is set.
+X  
+X.pa
+X
+X
+X
+XTable 1.       COM port addresses
+X
+XCOM1   3F8 - 3FF    IRQ4
+XCOM2   2F8 - 2FF    IRQ3
+XCOM3   3E8 - 3EF    IRQ4
+XCOM4   2E8 - 2EF    IRQ3
+X
+XTable 2.1       UART registers
+X
+XI/O decode (Hex)
+XCOM1   COM2    COM3    COM4    R/W     DLAB    Register
+X----------------------------------------------------------------
+X3F8    2F8     3E8     2E8      W        0       THR        
+X3F8    2F8     3E8     2E8      R        0       RBR          
+X3F8    2F8     3E8     2E8     R/W       1       DLL
+X3F9    2F9     3E9     2E9     R/W       1       DLM
+X3F9    2F9     3E9     2E9     R/W       0       IER
+X3FA    2FA     3EA     2EA      R        0       IIR
+X3FB    2FB     3EB     2EB     R/W       0       LCR
+X3FC    2FC     3EC     2EC     R/W       0       MCR
+X3FD    2FD     3ED     2ED     R/W       0       LSR   
+X3FE    2FE     3EE     2EE     R/W       0       MSR
+X
+XTable 2.2      Register bit defintions
+X
+XRegister       7     6     5     4     3     2     1     0
+X---------------------------------------------------------------
+XTHR            -------- TRANSMIT DATA (DLAB = 0) ---------
+XRBR            -------- RECEIVE DATA  (DLAB = 0) ---------
+XDLL            ---- DIVISOR LATCH LS BYTE (DLAB = 1) -----         
+XDLM            ---- DIVISOR LATCH MS BYTE (DLAB = 1) -----
+XIER            0    0     0      0    MSI   LSI  THRE   DA
+XIIR            0    0     0      0     0    ID1   ID0   IP/
+XLCR          DLAB   SB    SP    EPS   PEN   STB  WLS1  WLS0
+XMCR            0    0     0    LOOP  OUT2  OUT1   RTS   DTR
+XLSR            0   TSRE  THRE   BI    FE    PE    OR    DR
+XMSR          RLSD   RI    DSR   CTS  DRLS  TERI  DDSR  DCTS  
+X---------------------------------------------------------------
+X
+XTable 3.       Speed selection table 
+X
+XSPEED (BPS)    DLM (HEX)   DLL (HEX)
+X----------------------------------------
+X300               01          80
+X1200              00          60
+X2400              00          30
+X4800              00          18
+X9600              00          0C
+X19200             00          06      
+X----------------------------------------
+X
+X
+X
+X3.0    Command Set
+X
+XExtensions to the Hayes AT command set for Fax mode operation are 
+Xdefined in this section.
+X
+XGeneral
+X
+X1) All extended commands start with the # prefix. This represents 
+Xa  major  change  from previous versions  which  utilized  the  + 
+Xprefix. The change was made to provide upward compatibility  with 
+Xfuture  TIA command sets which are expected to use the +  symbol. 
+XFor the immediate future, the firmware will accept either prefix.
+X
+X2)  All extended commands have only one alpha character  followed 
+Xby a numeric value in the range of decimal 0 to 255.  Value 0 may 
+Xbe omitted.
+X
+X3)  Fax mode assumes XON/XOFF or CTS flow control in  data  mode.  
+X&D2 command must be issued for DTR controlled abort.
+X
+X4) Once the hardware enters the Fax mode, it  will remain in  Fax 
+Xmode ( and accept commands at 19.2 kbps ) until one of  following 
+Xoccurs :
+X
+X       a) software issues a #F request to return to command mode
+X       b) a call disconnect frame is received
+X       c) application software issues an abort by dropping DTR
+X
+XCOMMANDS
+X
+X
+X#Bn     Speed control
+X
+X#B/B0   Reserved         
+X#B1     Reserved
+X#B2     Reserved for V.23
+X#B3     Reserved for V.23
+X#B4    Fax transmission speed of 2400 bps
+X#B5     Fax transmission speed of 4800 bps
+X#B6     Fax transmission speed of 7200 bps
+X#B7     Fax transmission speed of 9600 bps
+X
+XThis  command is used to specify the initial speed at  which  the 
+Xhardware will attempt to connect to the remote Fax machine.   For 
+Xthe SC11046 based hardware this will normally be 4800 bps, so  B5 
+Xcommand  will  be  used.  However, the user  at  his  option  can 
+Xspecify a lower initial speed of 2400 bps by issuing B4.  If  the 
+Xhigher  initial speed is specified, the hardware will attempt  to 
+Xestablish connection at the higher speed and will fallback to the 
+Xlower speed if unsuccessful.
+X
+X
+X
+X
+X 
+X
+XEn     Received frame display format selection
+X
+XE/E0   Disable display of received HDLC frames
+XE1     Display frame in binary format
+XE2     Display frame in 2 digit ASCII Hex format
+X
+X
+X
+XFn     Mode control
+X
+XF/F0   Return to normal modem mode (300 to 2400 bps data rate)
+XF1     Enter Fax mode (19,200 bps data rate)
+X
+X
+XKn     DTE flow control
+X
+XK/K0   Disable flow control
+XK3     Enable CTS flow control
+XK4     Enable XON/XOFF flow control
+X
+XMn     Speaker Control
+XM0     Speaker Always Off
+XM1     Speaker Off after Connect Message
+XM2     Speaker Always On
+XM3     Speaker Off during Dial
+X
+XPn     Number of pages to be transmitted (n = 1 to 255)
+X
+X
+XRn     Resolution control
+X
+XR/R0   Send document with normal resolution
+XR1     Send document with fine resolution
+X
+X
+XTn     Test modes
+X
+XT/T0   End test mode
+XT1     Enter  test mode 1.  This mode is used to dial  a  remote       
+X       Fax   machine  and  automatically  send  a  message   stored 
+X       in EPROM.
+X.pa
+X
+X
+XFAX result codes
+X
+XDuring the Fax session the hardware will report the status of the 
+Xcall with result codes.  An action by the software may or may not 
+Xbe necessary depending on the response.
+X
+XAll the normal Hayes result codes will also be reported.
+X
+XVerbose                Digit   Usage
+X
+X
+XCED                      a     Ansertone detected 
+X
+XCFR                      g     Remote machine confirmation to receive
+X
+XCONNECT 2400/FAX         w     Connection speed 2400 bps
+X
+XCONNECT 4800/FAX         x     Connection speed 4800 bps
+X
+XCONNECT 7200/FAX         y     Connection speed 7200 bps
+X
+XCONNECT 9600/FAX         z     Connection speed 9600 bps
+X
+XCRC ERROR                e     Error in received frame
+X
+XCRP                      c     Repeat request
+X
+XCSI                      -     Remote machine Identification
+X
+XDCN                      d     Disconnect
+X 
+XDIS                      b     Remote machine capabilities frame
+X
+XFTT                      f     Failure to train
+X
+XINVALID FRAME            i     Received frame is invalid
+X
+X MCF                      m     Message received OK
+X
+XRTN                      h     Message not received OK
+X
+XRTP                      j     Retrain positive
+X.pa
+X
+X
+X4.0    Data format
+X
+XThe  Transmit Subscriber Identification data encoded in the  T.30 
+Xnegotiation  will be taken from the nvram location  Z3. 
+X
+X
+XImage  data  will be in compressed format  with  one  dimensional 
+Xcoding  rules  in accordance with the  CCITT  specification  T.4.  
+XData will be coded assuming the receiving Fax machine is  capable 
+Xof  a  scan time of 0 milliseconds per line.  Each line  of  data 
+Xmust  terminate  with a minimum of 3 bytes of zeroes  before  the  
+XEOL   sequence.  The  zeroes must be byte aligned.  The    software 
+Xwill   detect  the zero  bytes at the end of each line  and  fill 
+Xin  the  required   number   of zeroes  based  on  the  speed  of 
+Xconnection  and the minimum scan time per  line specified by  the 
+Xreceiving  Fax machine.  Data  must  be coded with MSB the  first 
+Xbit   to  be  transmitted from DTE to modem.The modem sends the
+Xdata LSB first to the phone line..    Transmission  of  data    
+Xwill   be synchronized using flow control (XON/XOFF or CTS). After
+Xsending the  last  byte of page data, software will  wait   for a
+Xresponse  from the hardware before issuing a command  or  sending
+Xdata  for the next page.
+X
+X5.0    Example sessions
+X
+XIn  the  following  example sessions, the  response  is  enclosed 
+Xwithin  <> brackets.  The defaults are B3 (4800 bps), P1  (single 
+Xpage), R0 (normal resolution) and T0 (no test mode).    
+X
+XEach  command line terminates with a CRLF, a response begins  and 
+Xterminates with a CRLF.
+X
+Xi) Send 1 page of document with normal resolution
+X
+XCommand                       Response
+X
+XATX4&D2#B3#P1#R0#T0#F1        <OK>      ; Enter Fax mode
+X                              <XOFF> CTS -> 0
+X
+XATDT4082639337                <OK>      ; Dial a Fax machine
+X                                        ; any AT response valid
+X                              <CED>
+X                                        ;  Answertone detected
+X
+X                              <CSI = 408 263 1234>
+X                                        ; Called machine 
+X                                        ; identification
+X                              <DIS>
+X                                        ; Capabilities 
+X                                        ; frame received
+X
+X                              <CFR>
+X                                        ; OK to send page data
+X
+X                              <CONNECT 4800/FAX>
+X                                        ; Connection speed
+X   
+X                              <XON>  CTS -> 1
+X                                        ; Page 1 data is sent 
+X                                        ; using flow control
+X---DATA--SENT---
+X                              <XOFF> CTS -> 0
+X---DATA STOPPED---
+X                              <XON>  CTS -> 1
+X---DATA--SENT---
+X                                        ; No more data for page 1
+X                                        ; tx underflow
+X
+X                              <XOFF> CTS -> 0
+X                              <MCF>
+X                                        ; Page 1 transmission OK
+X          
+X                              <NO CARRIER>
+X                                        ; Call terminated, return to 
+X                                        ; command mode
+X
+Xno new commands 
+Xuntil here
+Xii) Send 2 pages of document with normal resolution
+X
+XCommand                       Response                          
+X
+XATX4&D2#B3#P2#R0#T0#F1                  ; Enter Fax mode
+X                              <XOFF> CTS -> 0
+X                              <OK>
+X
+XATDT4082639337                <OK>      ; Dial a Fax machine
+X                                        ; any AT response valid
+X                              <CED>
+X                                        ; Answertone detected
+X
+X                              <INVALID FRAME> 
+X                                        ; Received frame invalid
+X
+X                              <CSI = 408 263 1234>
+X                                        ; Called machine 
+X                                        ; identification
+X
+X                              <DIS>
+X                                        ; Capabilities 
+X                                        ; frame received
+X
+X
+X                              <CFR>
+X                                        ; OK to send page data
+X                
+X                              <CONNECT 4800/FAX>
+X                                        ; Connection speed
+X
+X                              <XON>  CTS -> 1
+X                                        ; Page 1 data is sent
+X                                        ; using flow control
+X---DATA--SENT---
+X                              <XOFF> CTS -> 0
+X---DATA STOPPED---
+X                              <XON>  CTS -> 1
+X---DATA--SENT---
+X                                        ; No more data for page 1
+X                                        ; tx underrun
+X                              <XOFF> CTS -> 0
+X                              <MCF>
+X                                        ; Page 1 transmission OK
+X                                        
+X                              <XON>  CTS -> 1
+X                                        ; Page 2 Data is sent
+X                                        ; using flow control
+X---DATA--SENT---
+X                              <XOFF> CTS -> 0
+X---DATA STOPPED---
+X                              <XON>  CTS -> 1
+X---DATA--SENT---
+X                                        ; No more data for page 2
+X                                        ; tx underrun
+X
+X                              <XOFF> CTS -> 0
+X                              <MCF>
+X                                        ; Page 2 transmission OK
+X                              <NO CARRIER>
+X                                        ; Call terminated, return to 
+X                                        ; command mode 
+Xno new commands 
+Xuntil here
+X
+X-- 
+XNick Pemberton  		 uucp: !{lsuc, uunet!mnetor}!aimed!nick
+XAIM, Inc			  bus: (416) 429-1085
+XToronto, Ontario, Canada         Home: (416) 690-0647
+X
+X
+END_OF_FILE
+  if test 20046 -ne `wc -c <'writefax.man'`; then
+    echo shar: \"'writefax.man'\" unpacked with wrong size!
+  fi
+  # end of 'writefax.man'
+fi
+echo shar: End of archive 3 \(of 5\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 5 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 5 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still must unpack the following archives:
+    echo "        " ${MISSING}
+fi
+exit 0
+exit 0 # Just in case...

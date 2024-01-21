@@ -1,0 +1,2200 @@
+Subject:  v13i079:  Sun RPC, release 3.9, Part02/15
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Stephen X. Nahm <sxn@Sun.COM>
+Posting-number: Volume 13, Issue 79
+Archive-name: rpc3.9/part02
+
+
+#! /bin/sh
+# This is a shell archive. To extract, remove the header and type "sh filename"
+#
+cd rpc
+echo x - clnt_raw.c
+cat > clnt_raw.c <<'Funky_Stuff'
+/* @(#)clnt_raw.c	1.2 87/11/09 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)clnt_raw.c 1.22 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * clnt_raw.c
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ *
+ * Memory based rpc for simple testing and timing.
+ * Interface to create an rpc client and server in the same process.
+ * This lets us similate rpc and get round trip overhead, without
+ * any interference from the kernal.
+ */
+
+#include <rpc/rpc.h>
+#include <sys/time.h>
+
+#define MCALL_MSG_SIZE 24
+
+/*
+ * This is the "network" we will be moving stuff over.
+ */
+static struct clntraw_private {
+	CLIENT	client_object;
+	XDR	xdr_stream;
+	char	_raw_buf[UDPMSGSIZE];
+	char	mashl_callmsg[MCALL_MSG_SIZE];
+	u_int	mcnt;
+} *clntraw_private;
+
+static enum clnt_stat	clntraw_call();
+static void		clntraw_abort();
+static void		clntraw_geterr();
+static bool_t		clntraw_freeres();
+static bool_t		clntraw_control();
+static void		clntraw_destroy();
+
+static struct clnt_ops client_ops = {
+	clntraw_call,
+	clntraw_abort,
+	clntraw_geterr,
+	clntraw_freeres,
+	clntraw_destroy,
+	clntraw_control
+};
+
+void	svc_getreq();
+
+/*
+ * Create a client handle for memory based rpc.
+ */
+CLIENT *
+clntraw_create(prog, vers)
+	u_long prog;
+	u_long vers;
+{
+	register struct clntraw_private *clp = clntraw_private;
+	struct rpc_msg call_msg;
+	XDR *xdrs = &clp->xdr_stream;
+	CLIENT	*client = &clp->client_object;
+
+	if (clp == 0) {
+		clp = (struct clntraw_private *)calloc(1, sizeof (*clp));
+		if (clp == 0)
+			return (0);
+		clntraw_private = clp;
+	}
+	/*
+	 * pre-serialize the staic part of the call msg and stash it away
+	 */
+	call_msg.rm_direction = CALL;
+	call_msg.rm_call.cb_rpcvers = RPC_MSG_VERSION;
+	call_msg.rm_call.cb_prog = prog;
+	call_msg.rm_call.cb_vers = vers;
+	xdrmem_create(xdrs, clp->mashl_callmsg, MCALL_MSG_SIZE, XDR_ENCODE); 
+	if (! xdr_callhdr(xdrs, &call_msg)) {
+		perror("clnt_raw.c - Fatal header serialization error.");
+	}
+	clp->mcnt = XDR_GETPOS(xdrs);
+	XDR_DESTROY(xdrs);
+
+	/*
+	 * Set xdrmem for client/server shared buffer
+	 */
+	xdrmem_create(xdrs, clp->_raw_buf, UDPMSGSIZE, XDR_FREE);
+
+	/*
+	 * create client handle
+	 */
+	client->cl_ops = &client_ops;
+	client->cl_auth = authnone_create();
+	return (client);
+}
+
+static enum clnt_stat 
+clntraw_call(h, proc, xargs, argsp, xresults, resultsp, timeout)
+	CLIENT *h;
+	u_long proc;
+	xdrproc_t xargs;
+	caddr_t argsp;
+	xdrproc_t xresults;
+	caddr_t resultsp;
+	struct timeval timeout;
+{
+	register struct clntraw_private *clp = clntraw_private;
+	register XDR *xdrs = &clp->xdr_stream;
+	struct rpc_msg msg;
+	enum clnt_stat status;
+	struct rpc_err error;
+
+	if (clp == 0)
+		return (RPC_FAILED);
+call_again:
+	/*
+	 * send request
+	 */
+	xdrs->x_op = XDR_ENCODE;
+	XDR_SETPOS(xdrs, 0);
+	((struct rpc_msg *)clp->mashl_callmsg)->rm_xid ++ ;
+	if ((! XDR_PUTBYTES(xdrs, clp->mashl_callmsg, clp->mcnt)) ||
+	    (! XDR_PUTLONG(xdrs, (long *)&proc)) ||
+	    (! AUTH_MARSHALL(h->cl_auth, xdrs)) ||
+	    (! (*xargs)(xdrs, argsp))) {
+		return (RPC_CANTENCODEARGS);
+	}
+	(void)XDR_GETPOS(xdrs);  /* called just to cause overhead */
+
+	/*
+	 * We have to call server input routine here because this is
+	 * all going on in one process. Yuk.
+	 */
+	svc_getreq(1);
+
+	/*
+	 * get results
+	 */
+	xdrs->x_op = XDR_DECODE;
+	XDR_SETPOS(xdrs, 0);
+	msg.acpted_rply.ar_verf = _null_auth;
+	msg.acpted_rply.ar_results.where = resultsp;
+	msg.acpted_rply.ar_results.proc = xresults;
+	if (! xdr_replymsg(xdrs, &msg))
+		return (RPC_CANTDECODERES);
+	_seterr_reply(&msg, &error);
+	status = error.re_status;
+
+	if (status == RPC_SUCCESS) {
+		if (! AUTH_VALIDATE(h->cl_auth, &msg.acpted_rply.ar_verf)) {
+			status = RPC_AUTHERROR;
+		}
+	}  /* end successful completion */
+	else {
+		if (AUTH_REFRESH(h->cl_auth))
+			goto call_again;
+	}  /* end of unsuccessful completion */
+
+	if (status == RPC_SUCCESS) {
+		if (! AUTH_VALIDATE(h->cl_auth, &msg.acpted_rply.ar_verf)) {
+			status = RPC_AUTHERROR;
+		}
+		if (msg.acpted_rply.ar_verf.oa_base != NULL) {
+			xdrs->x_op = XDR_FREE;
+			(void)xdr_opaque_auth(xdrs, &(msg.acpted_rply.ar_verf));
+		}
+	}
+
+	return (status);
+}
+
+static void
+clntraw_geterr()
+{
+}
+
+
+static bool_t
+clntraw_freeres(cl, xdr_res, res_ptr)
+	CLIENT *cl;
+	xdrproc_t xdr_res;
+	caddr_t res_ptr;
+{
+	register struct clntraw_private *clp = clntraw_private;
+	register XDR *xdrs = &clp->xdr_stream;
+	bool_t rval;
+
+	if (clp == 0)
+	{
+		rval = (bool_t) RPC_FAILED;
+		return (rval);
+	}
+	xdrs->x_op = XDR_FREE;
+	return ((*xdr_res)(xdrs, res_ptr));
+}
+
+static void
+clntraw_abort()
+{
+}
+
+static bool_t
+clntraw_control()
+{
+	return (FALSE);
+}
+
+static void
+clntraw_destroy()
+{
+}
+Funky_Stuff
+len=`wc -c < clnt_raw.c`
+if [ $len !=     5845 ] ; then
+  echo error: clnt_raw.c was $len bytes long, should have been     5845
+fi
+echo x - clnt_simple.c
+cat > clnt_simple.c <<'Funky_Stuff'
+/* @(#)clnt_simple.c	1.1 87/11/04 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)clnt_simple.c 1.35 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/* 
+ * clnt_simple.c
+ * Simplified front end to rpc.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include <rpc/rpc.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netdb.h>
+#include <strings.h>
+
+static struct callrpc_private {
+	CLIENT	*client;
+	int	socket;
+	int	oldprognum, oldversnum, valid;
+	char	*oldhost;
+} *callrpc_private;
+
+callrpc(host, prognum, versnum, procnum, inproc, in, outproc, out)
+	char *host;
+	xdrproc_t inproc, outproc;
+	char *in, *out;
+{
+	register struct callrpc_private *crp = callrpc_private;
+	struct sockaddr_in server_addr;
+	enum clnt_stat clnt_stat;
+	struct hostent *hp;
+	struct timeval timeout, tottimeout;
+
+	if (crp == 0) {
+		crp = (struct callrpc_private *)calloc(1, sizeof (*crp));
+		if (crp == 0)
+			return (0);
+		callrpc_private = crp;
+	}
+	if (crp->oldhost == NULL) {
+		crp->oldhost = malloc(256);
+		crp->oldhost[0] = 0;
+		crp->socket = RPC_ANYSOCK;
+	}
+	if (crp->valid && crp->oldprognum == prognum && crp->oldversnum == versnum
+		&& strcmp(crp->oldhost, host) == 0) {
+		/* reuse old client */		
+	} else {
+		crp->valid = 0;
+		(void)close(crp->socket);
+		crp->socket = RPC_ANYSOCK;
+		if (crp->client) {
+			clnt_destroy(crp->client);
+			crp->client = NULL;
+		}
+		if ((hp = gethostbyname(host)) == NULL)
+			return ((int) RPC_UNKNOWNHOST);
+		timeout.tv_usec = 0;
+		timeout.tv_sec = 5;
+		bcopy(hp->h_addr, (char *)&server_addr.sin_addr, hp->h_length);
+		server_addr.sin_family = AF_INET;
+		server_addr.sin_port =  0;
+		if ((crp->client = clntudp_create(&server_addr, (u_long)prognum,
+		    (u_long)versnum, timeout, &crp->socket)) == NULL)
+			return ((int) rpc_createerr.cf_stat);
+		crp->valid = 1;
+		crp->oldprognum = prognum;
+		crp->oldversnum = versnum;
+		(void) strcpy(crp->oldhost, host);
+	}
+	tottimeout.tv_sec = 25;
+	tottimeout.tv_usec = 0;
+	clnt_stat = clnt_call(crp->client, procnum, inproc, in,
+	    outproc, out, tottimeout);
+	/* 
+	 * if call failed, empty cache
+	 */
+	if (clnt_stat != RPC_SUCCESS)
+		crp->valid = 0;
+	return ((int) clnt_stat);
+}
+Funky_Stuff
+len=`wc -c < clnt_simple.c`
+if [ $len !=     3463 ] ; then
+  echo error: clnt_simple.c was $len bytes long, should have been     3463
+fi
+echo x - clnt_tcp.c
+cat > clnt_tcp.c <<'Funky_Stuff'
+/* @(#)clnt_tcp.c	1.2 87/11/09 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)clnt_tcp.c 1.37 87/10/05 Copyr 1984 Sun Micro";
+#endif
+ 
+/*
+ * clnt_tcp.c, Implements a TCP/IP based, client side RPC.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ *
+ * TCP based RPC supports 'batched calls'.
+ * A sequence of calls may be batched-up in a send buffer.  The rpc call
+ * return immediately to the client even though the call was not necessarily
+ * sent.  The batching occurs if the results' xdr routine is NULL (0) AND
+ * the rpc timeout value is zero (see clnt.h, rpc).
+ *
+ * Clients should NOT casually batch calls that in fact return results; that is,
+ * the server side should be aware that a call is batched and not produce any
+ * return message.  Batched calls that produce many result messages can
+ * deadlock (netlock) the client and the server....
+ *
+ * Now go hang yourself.
+ */
+
+#include <stdio.h>
+#include <rpc/rpc.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netdb.h>
+#include <errno.h>
+#include <rpc/pmap_clnt.h>
+
+#define MCALL_MSG_SIZE 24
+
+extern int errno;
+
+static int	readtcp();
+static int	writetcp();
+
+static enum clnt_stat	clnttcp_call();
+static void		clnttcp_abort();
+static void		clnttcp_geterr();
+static bool_t		clnttcp_freeres();
+static bool_t           clnttcp_control();
+static void		clnttcp_destroy();
+
+static struct clnt_ops tcp_ops = {
+	clnttcp_call,
+	clnttcp_abort,
+	clnttcp_geterr,
+	clnttcp_freeres,
+	clnttcp_destroy,
+	clnttcp_control
+};
+
+struct ct_data {
+	int		ct_sock;
+	bool_t		ct_closeit;
+	struct timeval	ct_wait;
+	bool_t          ct_waitset;       /* wait set by clnt_control? */
+	struct sockaddr_in ct_addr; 
+	struct rpc_err	ct_error;
+	char		ct_mcall[MCALL_MSG_SIZE];	/* marshalled callmsg */
+	u_int		ct_mpos;			/* pos after marshal */
+	XDR		ct_xdrs;
+};
+
+/*
+ * Create a client handle for a tcp/ip connection.
+ * If *sockp<0, *sockp is set to a newly created TCP socket and it is
+ * connected to raddr.  If *sockp non-negative then
+ * raddr is ignored.  The rpc/tcp package does buffering
+ * similar to stdio, so the client must pick send and receive buffer sizes,];
+ * 0 => use the default.
+ * If raddr->sin_port is 0, then a binder on the remote machine is
+ * consulted for the right port number.
+ * NB: *sockp is copied into a private area.
+ * NB: It is the clients responsibility to close *sockp.
+ * NB: The rpch->cl_auth is set null authentication.  Caller may wish to set this
+ * something more useful.
+ */
+CLIENT *
+clnttcp_create(raddr, prog, vers, sockp, sendsz, recvsz)
+	struct sockaddr_in *raddr;
+	u_long prog;
+	u_long vers;
+	register int *sockp;
+	u_int sendsz;
+	u_int recvsz;
+{
+	CLIENT *h;
+	register struct ct_data *ct;
+	struct timeval now;
+	struct rpc_msg call_msg;
+
+	h  = (CLIENT *)mem_alloc(sizeof(*h));
+	if (h == NULL) {
+		(void)fprintf(stderr, "clnttcp_create: out of memory\n");
+		rpc_createerr.cf_stat = RPC_SYSTEMERROR;
+		rpc_createerr.cf_error.re_errno = errno;
+		goto fooy;
+	}
+	ct = (struct ct_data *)mem_alloc(sizeof(*ct));
+	if (ct == NULL) {
+		(void)fprintf(stderr, "clnttcp_create: out of memory\n");
+		rpc_createerr.cf_stat = RPC_SYSTEMERROR;
+		rpc_createerr.cf_error.re_errno = errno;
+		goto fooy;
+	}
+
+	/*
+	 * If no port number given ask the pmap for one
+	 */
+	if (raddr->sin_port == 0) {
+		u_short port;
+		if ((port = pmap_getport(raddr, prog, vers, IPPROTO_TCP)) == 0) {
+			mem_free((caddr_t)ct, sizeof(struct ct_data));
+			mem_free((caddr_t)h, sizeof(CLIENT));
+			return ((CLIENT *)NULL);
+		}
+		raddr->sin_port = htons(port);
+	}
+
+	/*
+	 * If no socket given, open one
+	 */
+	if (*sockp < 0) {
+		*sockp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		(void)bindresvport(*sockp, (struct sockaddr_in *)0);
+		if ((*sockp < 0)
+		    || (connect(*sockp, (struct sockaddr *)raddr,
+		    sizeof(*raddr)) < 0)) {
+			rpc_createerr.cf_stat = RPC_SYSTEMERROR;
+			rpc_createerr.cf_error.re_errno = errno;
+			(void)close(*sockp);
+			goto fooy;
+		}
+		ct->ct_closeit = TRUE;
+	} else {
+		ct->ct_closeit = FALSE;
+	}
+
+	/*
+	 * Set up private data struct
+	 */
+	ct->ct_sock = *sockp;
+	ct->ct_wait.tv_usec = 0;
+	ct->ct_waitset = FALSE;
+	ct->ct_addr = *raddr;
+
+	/*
+	 * Initialize call message
+	 */
+	(void)gettimeofday(&now, (struct timezone *)0);
+	call_msg.rm_xid = getpid() ^ now.tv_sec ^ now.tv_usec;
+	call_msg.rm_direction = CALL;
+	call_msg.rm_call.cb_rpcvers = RPC_MSG_VERSION;
+	call_msg.rm_call.cb_prog = prog;
+	call_msg.rm_call.cb_vers = vers;
+
+	/*
+	 * pre-serialize the staic part of the call msg and stash it away
+	 */
+	xdrmem_create(&(ct->ct_xdrs), ct->ct_mcall, MCALL_MSG_SIZE,
+	    XDR_ENCODE);
+	if (! xdr_callhdr(&(ct->ct_xdrs), &call_msg)) {
+		if (ct->ct_closeit) {
+			(void)close(*sockp);
+		}
+		goto fooy;
+	}
+	ct->ct_mpos = XDR_GETPOS(&(ct->ct_xdrs));
+	XDR_DESTROY(&(ct->ct_xdrs));
+
+	/*
+	 * Create a client handle which uses xdrrec for serialization
+	 * and authnone for authentication.
+	 */
+	xdrrec_create(&(ct->ct_xdrs), sendsz, recvsz,
+	    (caddr_t)ct, readtcp, writetcp);
+	h->cl_ops = &tcp_ops;
+	h->cl_private = (caddr_t) ct;
+	h->cl_auth = authnone_create();
+	return (h);
+
+fooy:
+	/*
+	 * Something goofed, free stuff and barf
+	 */
+	mem_free((caddr_t)ct, sizeof(struct ct_data));
+	mem_free((caddr_t)h, sizeof(CLIENT));
+	return ((CLIENT *)NULL);
+}
+
+static enum clnt_stat
+clnttcp_call(h, proc, xdr_args, args_ptr, xdr_results, results_ptr, timeout)
+	register CLIENT *h;
+	u_long proc;
+	xdrproc_t xdr_args;
+	caddr_t args_ptr;
+	xdrproc_t xdr_results;
+	caddr_t results_ptr;
+	struct timeval timeout;
+{
+	register struct ct_data *ct = (struct ct_data *) h->cl_private;
+	register XDR *xdrs = &(ct->ct_xdrs);
+	struct rpc_msg reply_msg;
+	u_long x_id;
+	u_long *msg_x_id = (u_long *)(ct->ct_mcall);	/* yuk */
+	register bool_t shipnow;
+	int refreshes = 2;
+
+	if (!ct->ct_waitset) {
+		ct->ct_wait = timeout;
+	}
+
+	shipnow =
+	    (xdr_results == (xdrproc_t)0 && timeout.tv_sec == 0
+	    && timeout.tv_usec == 0) ? FALSE : TRUE;
+
+call_again:
+	xdrs->x_op = XDR_ENCODE;
+	ct->ct_error.re_status = RPC_SUCCESS;
+	x_id = ntohl(--(*msg_x_id));
+	if ((! XDR_PUTBYTES(xdrs, ct->ct_mcall, ct->ct_mpos)) ||
+	    (! XDR_PUTLONG(xdrs, (long *)&proc)) ||
+	    (! AUTH_MARSHALL(h->cl_auth, xdrs)) ||
+	    (! (*xdr_args)(xdrs, args_ptr))) {
+		if (ct->ct_error.re_status == RPC_SUCCESS)
+			ct->ct_error.re_status = RPC_CANTENCODEARGS;
+		(void)xdrrec_endofrecord(xdrs, TRUE);
+		return (ct->ct_error.re_status);
+	}
+	if (! xdrrec_endofrecord(xdrs, shipnow))
+		return (ct->ct_error.re_status = RPC_CANTSEND);
+	if (! shipnow)
+		return (RPC_SUCCESS);
+	/*
+	 * Hack to provide rpc-based message passing
+	 */
+	if (timeout.tv_sec == 0 && timeout.tv_usec == 0) {
+		return(ct->ct_error.re_status = RPC_TIMEDOUT);
+	}
+
+
+	/*
+	 * Keep receiving until we get a valid transaction id
+	 */
+	xdrs->x_op = XDR_DECODE;
+	while (TRUE) {
+		reply_msg.acpted_rply.ar_verf = _null_auth;
+		reply_msg.acpted_rply.ar_results.where = NULL;
+		reply_msg.acpted_rply.ar_results.proc = xdr_void;
+		if (! xdrrec_skiprecord(xdrs))
+			return (ct->ct_error.re_status);
+		/* now decode and validate the response header */
+		if (! xdr_replymsg(xdrs, &reply_msg)) {
+			if (ct->ct_error.re_status == RPC_SUCCESS)
+				continue;
+			return (ct->ct_error.re_status);
+		}
+		if (reply_msg.rm_xid == x_id)
+			break;
+	}
+
+	/*
+	 * process header
+	 */
+	_seterr_reply(&reply_msg, &(ct->ct_error));
+	if (ct->ct_error.re_status == RPC_SUCCESS) {
+		if (! AUTH_VALIDATE(h->cl_auth, &reply_msg.acpted_rply.ar_verf)) {
+			ct->ct_error.re_status = RPC_AUTHERROR;
+			ct->ct_error.re_why = AUTH_INVALIDRESP;
+		} else if (! (*xdr_results)(xdrs, results_ptr)) {
+			if (ct->ct_error.re_status == RPC_SUCCESS)
+				ct->ct_error.re_status = RPC_CANTDECODERES;
+		}
+		/* free verifier ... */
+		if (reply_msg.acpted_rply.ar_verf.oa_base != NULL) {
+			xdrs->x_op = XDR_FREE;
+			(void)xdr_opaque_auth(xdrs, &(reply_msg.acpted_rply.ar_verf));
+		}
+	}  /* end successful completion */
+	else {
+		/* maybe our credentials need to be refreshed ... */
+		if (refreshes-- && AUTH_REFRESH(h->cl_auth))
+			goto call_again;
+	}  /* end of unsuccessful completion */
+	return (ct->ct_error.re_status);
+}
+
+static void
+clnttcp_geterr(h, errp)
+	CLIENT *h;
+	struct rpc_err *errp;
+{
+	register struct ct_data *ct =
+	    (struct ct_data *) h->cl_private;
+
+	*errp = ct->ct_error;
+}
+
+static bool_t
+clnttcp_freeres(cl, xdr_res, res_ptr)
+	CLIENT *cl;
+	xdrproc_t xdr_res;
+	caddr_t res_ptr;
+{
+	register struct ct_data *ct = (struct ct_data *)cl->cl_private;
+	register XDR *xdrs = &(ct->ct_xdrs);
+
+	xdrs->x_op = XDR_FREE;
+	return ((*xdr_res)(xdrs, res_ptr));
+}
+
+static void
+clnttcp_abort()
+{
+}
+
+static bool_t
+clnttcp_control(cl, request, info)
+	CLIENT *cl;
+	int request;
+	char *info;
+{
+	register struct ct_data *ct = (struct ct_data *)cl->cl_private;
+
+	switch (request) {
+	case CLSET_TIMEOUT:
+		ct->ct_wait = *(struct timeval *)info;
+		ct->ct_waitset = TRUE;
+		break;
+	case CLGET_TIMEOUT:
+		*(struct timeval *)info = ct->ct_wait;
+		break;
+	case CLGET_SERVER_ADDR:
+		*(struct sockaddr_in *)info = ct->ct_addr;
+		break;
+	default:
+		return (FALSE);
+	}
+	return (TRUE);
+}
+
+
+static void
+clnttcp_destroy(h)
+	CLIENT *h;
+{
+	register struct ct_data *ct =
+	    (struct ct_data *) h->cl_private;
+
+	if (ct->ct_closeit) {
+		(void)close(ct->ct_sock);
+	}
+	XDR_DESTROY(&(ct->ct_xdrs));
+	mem_free((caddr_t)ct, sizeof(struct ct_data));
+	mem_free((caddr_t)h, sizeof(CLIENT));
+}
+
+/*
+ * Interface between xdr serializer and tcp connection.
+ * Behaves like the system calls, read & write, but keeps some error state
+ * around for the rpc level.
+ */
+static int
+readtcp(ct, buf, len)
+	register struct ct_data *ct;
+	caddr_t buf;
+	register int len;
+{
+#ifdef FD_SETSIZE
+	fd_set mask;
+	fd_set readfds;
+
+	if (len == 0)
+		return (0);
+	FD_ZERO(&mask);
+	FD_SET(ct->ct_sock, &mask);
+#else
+	register int mask = 1 << (ct->ct_sock);
+	int readfds;
+
+	if (len == 0)
+		return (0);
+
+#endif /* def FD_SETSIZE */
+	while (TRUE) {
+		readfds = mask;
+		switch (select(_rpc_dtablesize(), &readfds, (int*)NULL, (int*)NULL,
+			       &(ct->ct_wait))) {
+		case 0:
+			ct->ct_error.re_status = RPC_TIMEDOUT;
+			return (-1);
+
+		case -1:
+			if (errno == EINTR)
+				continue;
+			ct->ct_error.re_status = RPC_CANTRECV;
+			ct->ct_error.re_errno = errno;
+			return (-1);
+		}
+		break;
+	}
+	switch (len = read(ct->ct_sock, buf, len)) {
+
+	case 0:
+		/* premature eof */
+		ct->ct_error.re_errno = ECONNRESET;
+		ct->ct_error.re_status = RPC_CANTRECV;
+		len = -1;  /* it's really an error */
+		break;
+
+	case -1:
+		ct->ct_error.re_errno = errno;
+		ct->ct_error.re_status = RPC_CANTRECV;
+		break;
+	}
+	return (len);
+}
+
+static int
+writetcp(ct, buf, len)
+	struct ct_data *ct;
+	caddr_t buf;
+	int len;
+{
+	register int i, cnt;
+
+	for (cnt = len; cnt > 0; cnt -= i, buf += i) {
+		if ((i = write(ct->ct_sock, buf, cnt)) == -1) {
+			ct->ct_error.re_errno = errno;
+			ct->ct_error.re_status = RPC_CANTSEND;
+			return (-1);
+		}
+	}
+	return (len);
+}
+Funky_Stuff
+len=`wc -c < clnt_tcp.c`
+if [ $len !=    12089 ] ; then
+  echo error: clnt_tcp.c was $len bytes long, should have been    12089
+fi
+echo x - clnt_udp.c
+cat > clnt_udp.c <<'Funky_Stuff'
+/* @(#)clnt_udp.c	1.2 87/11/09 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)clnt_udp.c 1.39 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * clnt_udp.c, Implements a UDP/IP based, client side RPC.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include <rpc/rpc.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <netdb.h>
+#include <errno.h>
+#include <rpc/pmap_clnt.h>
+
+extern int errno;
+
+/*
+ * UDP bases client side rpc operations
+ */
+static enum clnt_stat	clntudp_call();
+static void		clntudp_abort();
+static void		clntudp_geterr();
+static bool_t		clntudp_freeres();
+static bool_t           clntudp_control();
+static void		clntudp_destroy();
+
+static struct clnt_ops udp_ops = {
+	clntudp_call,
+	clntudp_abort,
+	clntudp_geterr,
+	clntudp_freeres,
+	clntudp_destroy,
+	clntudp_control
+};
+
+/* 
+ * Private data kept per client handle
+ */
+struct cu_data {
+	int		   cu_sock;
+	bool_t		   cu_closeit;
+	struct sockaddr_in cu_raddr;
+	int		   cu_rlen;
+	struct timeval	   cu_wait;
+	struct timeval     cu_total;
+	struct rpc_err	   cu_error;
+	XDR		   cu_outxdrs;
+	u_int		   cu_xdrpos;
+	u_int		   cu_sendsz;
+	char		   *cu_outbuf;
+	u_int		   cu_recvsz;
+	char		   cu_inbuf[1];
+};
+
+/*
+ * Create a UDP based client handle.
+ * If *sockp<0, *sockp is set to a newly created UPD socket.
+ * If raddr->sin_port is 0 a binder on the remote machine
+ * is consulted for the correct port number.
+ * NB: It is the clients responsibility to close *sockp.
+ * NB: The rpch->cl_auth is initialized to null authentication.
+ *     Caller may wish to set this something more useful.
+ *
+ * wait is the amount of time used between retransmitting a call if
+ * no response has been heard;  retransmition occurs until the actual
+ * rpc call times out.
+ *
+ * sendsz and recvsz are the maximum allowable packet sizes that can be
+ * sent and received.
+ */
+CLIENT *
+clntudp_bufcreate(raddr, program, version, wait, sockp, sendsz, recvsz)
+	struct sockaddr_in *raddr;
+	u_long program;
+	u_long version;
+	struct timeval wait;
+	register int *sockp;
+	u_int sendsz;
+	u_int recvsz;
+{
+	CLIENT *cl;
+	register struct cu_data *cu;
+	struct timeval now;
+	struct rpc_msg call_msg;
+
+	cl = (CLIENT *)mem_alloc(sizeof(CLIENT));
+	if (cl == NULL) {
+		(void) fprintf(stderr, "clntudp_create: out of memory\n");
+		rpc_createerr.cf_stat = RPC_SYSTEMERROR;
+		rpc_createerr.cf_error.re_errno = errno;
+		goto fooy;
+	}
+	sendsz = ((sendsz + 3) / 4) * 4;
+	recvsz = ((recvsz + 3) / 4) * 4;
+	cu = (struct cu_data *)mem_alloc(sizeof(*cu) + sendsz + recvsz);
+	if (cu == NULL) {
+		(void) fprintf(stderr, "clntudp_create: out of memory\n");
+		rpc_createerr.cf_stat = RPC_SYSTEMERROR;
+		rpc_createerr.cf_error.re_errno = errno;
+		goto fooy;
+	}
+	cu->cu_outbuf = &cu->cu_inbuf[recvsz];
+
+	(void)gettimeofday(&now, (struct timezone *)0);
+	if (raddr->sin_port == 0) {
+		u_short port;
+		if ((port =
+		    pmap_getport(raddr, program, version, IPPROTO_UDP)) == 0) {
+			goto fooy;
+		}
+		raddr->sin_port = htons(port);
+	}
+	cl->cl_ops = &udp_ops;
+	cl->cl_private = (caddr_t)cu;
+	cu->cu_raddr = *raddr;
+	cu->cu_rlen = sizeof (cu->cu_raddr);
+	cu->cu_wait = wait;
+	cu->cu_total.tv_sec = -1;
+	cu->cu_total.tv_usec = -1;
+	cu->cu_sendsz = sendsz;
+	cu->cu_recvsz = recvsz;
+	call_msg.rm_xid = getpid() ^ now.tv_sec ^ now.tv_usec;
+	call_msg.rm_direction = CALL;
+	call_msg.rm_call.cb_rpcvers = RPC_MSG_VERSION;
+	call_msg.rm_call.cb_prog = program;
+	call_msg.rm_call.cb_vers = version;
+	xdrmem_create(&(cu->cu_outxdrs), cu->cu_outbuf,
+	    sendsz, XDR_ENCODE);
+	if (! xdr_callhdr(&(cu->cu_outxdrs), &call_msg)) {
+		goto fooy;
+	}
+	cu->cu_xdrpos = XDR_GETPOS(&(cu->cu_outxdrs));
+	if (*sockp < 0) {
+		int dontblock = 1;
+
+		*sockp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+		if (*sockp < 0) {
+			rpc_createerr.cf_stat = RPC_SYSTEMERROR;
+			rpc_createerr.cf_error.re_errno = errno;
+			goto fooy;
+		}
+		/* attempt to bind to prov port */
+		(void)bindresvport(*sockp, (struct sockaddr_in *)0);
+		/* the sockets rpc controls are non-blocking */
+		(void)ioctl(*sockp, FIONBIO, (char *) &dontblock);
+		cu->cu_closeit = TRUE;
+	} else {
+		cu->cu_closeit = FALSE;
+	}
+	cu->cu_sock = *sockp;
+	cl->cl_auth = authnone_create();
+	return (cl);
+fooy:
+	if (cu)
+		mem_free((caddr_t)cu, sizeof(*cu) + sendsz + recvsz);
+	if (cl)
+		mem_free((caddr_t)cl, sizeof(CLIENT));
+	return ((CLIENT *)NULL);
+}
+
+CLIENT *
+clntudp_create(raddr, program, version, wait, sockp)
+	struct sockaddr_in *raddr;
+	u_long program;
+	u_long version;
+	struct timeval wait;
+	register int *sockp;
+{
+
+	return(clntudp_bufcreate(raddr, program, version, wait, sockp,
+	    UDPMSGSIZE, UDPMSGSIZE));
+}
+
+static enum clnt_stat 
+clntudp_call(cl, proc, xargs, argsp, xresults, resultsp, utimeout)
+	register CLIENT	*cl;		/* client handle */
+	u_long		proc;		/* procedure number */
+	xdrproc_t	xargs;		/* xdr routine for args */
+	caddr_t		argsp;		/* pointer to args */
+	xdrproc_t	xresults;	/* xdr routine for results */
+	caddr_t		resultsp;	/* pointer to results */
+	struct timeval	utimeout;	/* seconds to wait before giving up */
+{
+	register struct cu_data *cu = (struct cu_data *)cl->cl_private;
+	register XDR *xdrs;
+	register int outlen;
+	register int inlen;
+	int fromlen;
+#ifdef FD_SETSIZE
+	fd_set readfds;
+	fd_set mask;
+#else
+	int readfds;
+	register int mask;
+#endif /* def FD_SETSIZE */
+	struct sockaddr_in from;
+	struct rpc_msg reply_msg;
+	XDR reply_xdrs;
+	struct timeval time_waited;
+	bool_t ok;
+	int nrefreshes = 2;	/* number of times to refresh cred */
+	struct timeval timeout;
+
+	if (cu->cu_total.tv_usec == -1) {
+		timeout = utimeout;     /* use supplied timeout */
+	} else {
+		timeout = cu->cu_total; /* use default timeout */
+	}
+
+	time_waited.tv_sec = 0;
+	time_waited.tv_usec = 0;
+call_again:
+	xdrs = &(cu->cu_outxdrs);
+	xdrs->x_op = XDR_ENCODE;
+	XDR_SETPOS(xdrs, cu->cu_xdrpos);
+	/*
+	 * the transaction is the first thing in the out buffer
+	 */
+	(*(u_short *)(cu->cu_outbuf))++;
+	if ((! XDR_PUTLONG(xdrs, (long *)&proc)) ||
+	    (! AUTH_MARSHALL(cl->cl_auth, xdrs)) ||
+	    (! (*xargs)(xdrs, argsp)))
+		return (cu->cu_error.re_status = RPC_CANTENCODEARGS);
+	outlen = (int)XDR_GETPOS(xdrs);
+
+send_again:
+	if (sendto(cu->cu_sock, cu->cu_outbuf, outlen, 0,
+	    (struct sockaddr *)&(cu->cu_raddr), cu->cu_rlen)
+	    != outlen) {
+		cu->cu_error.re_errno = errno;
+		return (cu->cu_error.re_status = RPC_CANTSEND);
+	}
+
+	/*
+	 * Hack to provide rpc-based message passing
+	 */
+	if (timeout.tv_sec == 0 && timeout.tv_usec == 0) {
+		return (cu->cu_error.re_status = RPC_TIMEDOUT);
+	}
+	/*
+	 * sub-optimal code appears here because we have
+	 * some clock time to spare while the packets are in flight.
+	 * (We assume that this is actually only executed once.)
+	 */
+	reply_msg.acpted_rply.ar_verf = _null_auth;
+	reply_msg.acpted_rply.ar_results.where = resultsp;
+	reply_msg.acpted_rply.ar_results.proc = xresults;
+#ifdef FD_SETSIZE
+	FD_ZERO(&mask);
+	FD_SET(cu->cu_sock, &mask);
+#else
+	mask = 1 << cu->cu_sock;
+#endif /* def FD_SETSIZE */
+	for (;;) {
+		readfds = mask;
+		switch (select(_rpc_dtablesize(), &readfds, (int *)NULL, 
+			       (int *)NULL, &(cu->cu_wait))) {
+
+		case 0:
+			time_waited.tv_sec += cu->cu_wait.tv_sec;
+			time_waited.tv_usec += cu->cu_wait.tv_usec;
+			while (time_waited.tv_usec >= 1000000) {
+				time_waited.tv_sec++;
+				time_waited.tv_usec -= 1000000;
+			}
+			if ((time_waited.tv_sec < timeout.tv_sec) ||
+				((time_waited.tv_sec == timeout.tv_sec) &&
+				(time_waited.tv_usec < timeout.tv_usec)))
+				goto send_again;	
+			return (cu->cu_error.re_status = RPC_TIMEDOUT);
+
+		/*
+		 * buggy in other cases because time_waited is not being
+		 * updated.
+		 */
+		case -1:
+			if (errno == EINTR)
+				continue;	
+			cu->cu_error.re_errno = errno;
+			return (cu->cu_error.re_status = RPC_CANTRECV);
+		}
+		do {
+			fromlen = sizeof(struct sockaddr);
+			inlen = recvfrom(cu->cu_sock, cu->cu_inbuf, 
+				(int) cu->cu_recvsz, 0,
+				(struct sockaddr *)&from, &fromlen);
+		} while (inlen < 0 && errno == EINTR);
+		if (inlen < 0) {
+			if (errno == EWOULDBLOCK)
+				continue;	
+			cu->cu_error.re_errno = errno;
+			return (cu->cu_error.re_status = RPC_CANTRECV);
+		}
+		if (inlen < sizeof(u_long))
+			continue;	
+		/* see if reply transaction id matches sent id */
+		if (*((u_long *)(cu->cu_inbuf)) != *((u_long *)(cu->cu_outbuf)))
+			continue;	
+		/* we now assume we have the proper reply */
+		break;
+	}
+
+	/*
+	 * now decode and validate the response
+	 */
+	xdrmem_create(&reply_xdrs, cu->cu_inbuf, (u_int)inlen, XDR_DECODE);
+	ok = xdr_replymsg(&reply_xdrs, &reply_msg);
+	/* XDR_DESTROY(&reply_xdrs);  save a few cycles on noop destroy */
+	if (ok) {
+		_seterr_reply(&reply_msg, &(cu->cu_error));
+		if (cu->cu_error.re_status == RPC_SUCCESS) {
+			if (! AUTH_VALIDATE(cl->cl_auth,
+				&reply_msg.acpted_rply.ar_verf)) {
+				cu->cu_error.re_status = RPC_AUTHERROR;
+				cu->cu_error.re_why = AUTH_INVALIDRESP;
+			}
+			if (reply_msg.acpted_rply.ar_verf.oa_base != NULL) {
+				xdrs->x_op = XDR_FREE;
+				(void)xdr_opaque_auth(xdrs,
+				    &(reply_msg.acpted_rply.ar_verf));
+			} 
+		}  /* end successful completion */
+		else {
+			/* maybe our credentials need to be refreshed ... */
+			if (nrefreshes > 0 && AUTH_REFRESH(cl->cl_auth)) {
+				nrefreshes--;
+				goto call_again;
+			}
+		}  /* end of unsuccessful completion */
+	}  /* end of valid reply message */
+	else {
+		cu->cu_error.re_status = RPC_CANTDECODERES;
+	}
+	return (cu->cu_error.re_status);
+}
+
+static void
+clntudp_geterr(cl, errp)
+	CLIENT *cl;
+	struct rpc_err *errp;
+{
+	register struct cu_data *cu = (struct cu_data *)cl->cl_private;
+
+	*errp = cu->cu_error;
+}
+
+
+static bool_t
+clntudp_freeres(cl, xdr_res, res_ptr)
+	CLIENT *cl;
+	xdrproc_t xdr_res;
+	caddr_t res_ptr;
+{
+	register struct cu_data *cu = (struct cu_data *)cl->cl_private;
+	register XDR *xdrs = &(cu->cu_outxdrs);
+
+	xdrs->x_op = XDR_FREE;
+	return ((*xdr_res)(xdrs, res_ptr));
+}
+
+static void 
+clntudp_abort(/*h*/)
+	/*CLIENT *h;*/
+{
+}
+
+static bool_t
+clntudp_control(cl, request, info)
+	CLIENT *cl;
+	int request;
+	char *info;
+{
+	register struct cu_data *cu = (struct cu_data *)cl->cl_private;
+
+	switch (request) {
+	case CLSET_TIMEOUT:
+		cu->cu_total = *(struct timeval *)info;
+		break;
+	case CLGET_TIMEOUT:
+		*(struct timeval *)info = cu->cu_total;
+		break;
+	case CLSET_RETRY_TIMEOUT:
+		cu->cu_wait = *(struct timeval *)info;
+		break;
+	case CLGET_RETRY_TIMEOUT:
+		*(struct timeval *)info = cu->cu_wait;
+		break;
+	case CLGET_SERVER_ADDR:
+		*(struct sockaddr_in *)info = cu->cu_raddr;
+		break;
+	default:
+		return (FALSE);
+	}
+	return (TRUE);
+}
+	
+static void
+clntudp_destroy(cl)
+	CLIENT *cl;
+{
+	register struct cu_data *cu = (struct cu_data *)cl->cl_private;
+
+	if (cu->cu_closeit) {
+		(void)close(cu->cu_sock);
+	}
+	XDR_DESTROY(&(cu->cu_outxdrs));
+	mem_free((caddr_t)cu, (sizeof(*cu) + cu->cu_sendsz + cu->cu_recvsz));
+	mem_free((caddr_t)cl, sizeof(CLIENT));
+}
+Funky_Stuff
+len=`wc -c < clnt_udp.c`
+if [ $len !=    12060 ] ; then
+  echo error: clnt_udp.c was $len bytes long, should have been    12060
+fi
+echo x - get_myaddress.c
+cat > get_myaddress.c <<'Funky_Stuff'
+/* @(#)get_myaddress.c	1.1 87/11/04 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)get_myaddress.c 1.4 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * get_myaddress.c
+ *
+ * Get client's IP address via ioctl.  This avoids using the yellowpages.
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <rpc/types.h>
+#include <rpc/pmap_prot.h>
+#include <sys/socket.h>
+#include <stdio.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
+/* 
+ * don't use gethostbyname, which would invoke yellow pages
+ */
+get_myaddress(addr)
+	struct sockaddr_in *addr;
+{
+	int s;
+	char buf[BUFSIZ];
+	struct ifconf ifc;
+	struct ifreq ifreq, *ifr;
+	int len;
+
+	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+	    perror("get_myaddress: socket");
+	    exit(1);
+	}
+	ifc.ifc_len = sizeof (buf);
+	ifc.ifc_buf = buf;
+	if (ioctl(s, SIOCGIFCONF, (char *)&ifc) < 0) {
+		perror("get_myaddress: ioctl (get interface configuration)");
+		exit(1);
+	}
+	ifr = ifc.ifc_req;
+	for (len = ifc.ifc_len; len; len -= sizeof ifreq) {
+		ifreq = *ifr;
+		if (ioctl(s, SIOCGIFFLAGS, (char *)&ifreq) < 0) {
+			perror("get_myaddress: ioctl");
+			exit(1);
+		}
+		if ((ifreq.ifr_flags & IFF_UP) &&
+		    ifr->ifr_addr.sa_family == AF_INET) {
+			*addr = *((struct sockaddr_in *)&ifr->ifr_addr);
+			addr->sin_port = htons(PMAPPORT);
+			break;
+		}
+		ifr++;
+	}
+	(void) close(s);
+}
+Funky_Stuff
+len=`wc -c < get_myaddress.c`
+if [ $len !=     2668 ] ; then
+  echo error: get_myaddress.c was $len bytes long, should have been     2668
+fi
+echo x - getrpcent.c
+cat > getrpcent.c <<'Funky_Stuff'
+/* @(#)getrpcent.c	1.4 87/11/13 3.9 RPCSRC */
+#if !defined(lint) && defined(SCCSIDS)
+static  char sccsid[] = "@(#)getrpcent.c 1.9 87/08/11  Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+
+/*
+ * Copyright (c) 1985 by Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <rpc/rpc.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
+/*
+ * Internet version.
+ */
+struct rpcdata {
+	FILE	*rpcf;
+	char	*current;
+	int	currentlen;
+	int	stayopen;
+#define	MAXALIASES	35
+	char	*rpc_aliases[MAXALIASES];
+	struct	rpcent rpc;
+	char	line[BUFSIZ+1];
+	char	*domain;
+} *rpcdata, *_rpcdata();
+
+static	struct rpcent *interpret();
+struct	hostent *gethostent();
+char	*inet_ntoa();
+static	char *index();
+
+static char RPCDB[] = "/etc/rpc";
+
+static struct rpcdata *
+_rpcdata()
+{
+	register struct rpcdata *d = rpcdata;
+
+	if (d == 0) {
+		d = (struct rpcdata *)calloc(1, sizeof (struct rpcdata));
+		rpcdata = d;
+	}
+	return (d);
+}
+
+struct rpcent *
+getrpcbynumber(number)
+	register int number;
+{
+	register struct rpcdata *d = _rpcdata();
+	register struct rpcent *p;
+	int reason;
+	char adrstr[10], *val = NULL;
+	int vallen;
+
+	if (d == 0)
+		return (0);
+	setrpcent(0);
+	while (p = getrpcent()) {
+		if (p->r_number == number)
+			break;
+	}
+	endrpcent();
+	return (p);
+}
+
+struct rpcent *
+getrpcbyname(name)
+	char *name;
+{
+	struct rpcent *rpc;
+	char **rp;
+
+	setrpcent(0);
+	while(rpc = getrpcent()) {
+		if (strcmp(rpc->r_name, name) == 0)
+			return (rpc);
+		for (rp = rpc->r_aliases; *rp != NULL; rp++) {
+			if (strcmp(*rp, name) == 0)
+				return (rpc);
+		}
+	}
+	endrpcent();
+	return (NULL);
+}
+
+setrpcent(f)
+	int f;
+{
+	register struct rpcdata *d = _rpcdata();
+
+	if (d == 0)
+		return;
+	if (d->rpcf == NULL)
+		d->rpcf = fopen(RPCDB, "r");
+	else
+		rewind(d->rpcf);
+	if (d->current)
+		free(d->current);
+	d->current = NULL;
+	d->stayopen |= f;
+}
+
+endrpcent()
+{
+	register struct rpcdata *d = _rpcdata();
+
+	if (d == 0)
+		return;
+	if (d->current && !d->stayopen) {
+		free(d->current);
+		d->current = NULL;
+	}
+	if (d->rpcf && !d->stayopen) {
+		fclose(d->rpcf);
+		d->rpcf = NULL;
+	}
+}
+
+struct rpcent *
+getrpcent()
+{
+	struct rpcent *hp;
+	int reason;
+	char *key = NULL, *val = NULL;
+	int keylen, vallen;
+	register struct rpcdata *d = _rpcdata();
+
+	if (d == 0)
+		return;
+	if (d->rpcf == NULL && (d->rpcf = fopen(RPCDB, "r")) == NULL)
+		return (NULL);
+    if (fgets(d->line, BUFSIZ, d->rpcf) == NULL)
+		return (NULL);
+	return interpret(d->line, strlen(d->line));
+}
+
+static struct rpcent *
+interpret(val, len)
+{
+	register struct rpcdata *d = _rpcdata();
+	char *p;
+	register char *cp, **q;
+
+	if (d == 0)
+		return;
+	strncpy(d->line, val, len);
+	p = d->line;
+	d->line[len] = '\n';
+	if (*p == '#')
+		return (getrpcent());
+	cp = index(p, '#');
+	if (cp == NULL)
+    {
+		cp = index(p, '\n');
+		if (cp == NULL)
+			return (getrpcent());
+	}
+	*cp = '\0';
+	cp = index(p, ' ');
+	if (cp == NULL)
+    {
+		cp = index(p, '\t');
+		if (cp == NULL)
+			return (getrpcent());
+	}
+	*cp++ = '\0';
+	/* THIS STUFF IS INTERNET SPECIFIC */
+	d->rpc.r_name = d->line;
+	while (*cp == ' ' || *cp == '\t')
+		cp++;
+	d->rpc.r_number = atoi(cp);
+	q = d->rpc.r_aliases = d->rpc_aliases;
+	cp = index(p, ' ');
+	if (cp != NULL)
+		*cp++ = '\0';
+	else
+    {
+		cp = index(p, '\t');
+		if (cp != NULL)
+			*cp++ = '\0';
+	}
+	while (cp && *cp) {
+		if (*cp == ' ' || *cp == '\t') {
+			cp++;
+			continue;
+		}
+		if (q < &(d->rpc_aliases[MAXALIASES - 1]))
+			*q++ = cp;
+		cp = index(p, ' ');
+		if (cp != NULL)
+			*cp++ = '\0';
+		else
+	    {
+			cp = index(p, '\t');
+			if (cp != NULL)
+				*cp++ = '\0';
+		}
+	}
+	*q = NULL;
+	return (&d->rpc);
+}
+Funky_Stuff
+len=`wc -c < getrpcent.c`
+if [ $len !=     4805 ] ; then
+  echo error: getrpcent.c was $len bytes long, should have been     4805
+fi
+echo x - getrpcport.c
+cat > getrpcport.c <<'Funky_Stuff'
+/* @(#)getrpcport.c	1.2 87/11/13 3.9 RPCSRC */
+#if !defined(lint) && defined(SCCSIDS)
+static  char sccsid[] = "@(#)getrpcport.c 1.3 87/08/11 SMI";
+#endif
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+
+/*
+ * Copyright (c) 1985 by Sun Microsystems, Inc.
+ */
+
+#include <stdio.h>
+#include <rpc/rpc.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
+getrpcport(host, prognum, versnum, proto)
+	char *host;
+{
+	struct sockaddr_in addr;
+	struct hostent *hp;
+
+	if ((hp = gethostbyname(host)) == NULL)
+		return (0);
+	bcopy(hp->h_addr, (char *) &addr.sin_addr, hp->h_length);
+	addr.sin_family = AF_INET;
+	addr.sin_port =  0;
+	return (pmap_getport(&addr, prognum, versnum, proto));
+}
+Funky_Stuff
+len=`wc -c < getrpcport.c`
+if [ $len !=     1890 ] ; then
+  echo error: getrpcport.c was $len bytes long, should have been     1890
+fi
+echo x - netdb.h
+cat > netdb.h <<'Funky_Stuff'
+/* @(#)netdb.h	1.1 87/11/13 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ *
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+/*	@(#)rpc.h 1.8 87/07/24 SMI	*/
+
+/* Really belongs in <netdb.h> */
+
+struct rpcent {
+      char    *r_name;        /* name of server for this rpc program */
+      char    **r_aliases;    /* alias list */
+      int     r_number;       /* rpc program number */
+};
+
+struct rpcent *getrpcbyname(), *getrpcbynumber(), *getrpcent();
+Funky_Stuff
+len=`wc -c < netdb.h`
+if [ $len !=     1637 ] ; then
+  echo error: netdb.h was $len bytes long, should have been     1637
+fi
+echo x - pmap_clnt.c
+cat > pmap_clnt.c <<'Funky_Stuff'
+/* @(#)pmap_clnt.c	1.1 87/11/04 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)pmap_clnt.c 1.37 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * pmap_clnt.c
+ * Client interface to pmap rpc service.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <rpc/rpc.h>
+#include <rpc/pmap_prot.h>
+#include <rpc/pmap_clnt.h>
+#include <sys/time.h>
+
+static struct timeval timeout = { 5, 0 };
+static struct timeval tottimeout = { 60, 0 };
+
+void clnt_perror();
+
+
+/*
+ * Set a mapping between program,version and port.
+ * Calls the pmap service remotely to do the mapping.
+ */
+bool_t
+pmap_set(program, version, protocol, port)
+	u_long program;
+	u_long version;
+	int protocol;
+	u_short port;
+{
+	struct sockaddr_in myaddress;
+	int socket = -1;
+	register CLIENT *client;
+	struct pmap parms;
+	bool_t rslt;
+
+	get_myaddress(&myaddress);
+	client = clntudp_bufcreate(&myaddress, PMAPPROG, PMAPVERS,
+	    timeout, &socket, RPCSMALLMSGSIZE, RPCSMALLMSGSIZE);
+	if (client == (CLIENT *)NULL)
+		return (FALSE);
+	parms.pm_prog = program;
+	parms.pm_vers = version;
+	parms.pm_prot = protocol;
+	parms.pm_port = port;
+	if (CLNT_CALL(client, PMAPPROC_SET, xdr_pmap, &parms, xdr_bool, &rslt,
+	    tottimeout) != RPC_SUCCESS) {
+		clnt_perror(client, "Cannot register service");
+		return (FALSE);
+	}
+	CLNT_DESTROY(client);
+	(void)close(socket);
+	return (rslt);
+}
+
+/*
+ * Remove the mapping between program,version and port.
+ * Calls the pmap service remotely to do the un-mapping.
+ */
+bool_t
+pmap_unset(program, version)
+	u_long program;
+	u_long version;
+{
+	struct sockaddr_in myaddress;
+	int socket = -1;
+	register CLIENT *client;
+	struct pmap parms;
+	bool_t rslt;
+
+	get_myaddress(&myaddress);
+	client = clntudp_bufcreate(&myaddress, PMAPPROG, PMAPVERS,
+	    timeout, &socket, RPCSMALLMSGSIZE, RPCSMALLMSGSIZE);
+	if (client == (CLIENT *)NULL)
+		return (FALSE);
+	parms.pm_prog = program;
+	parms.pm_vers = version;
+	parms.pm_port = parms.pm_prot = 0;
+	CLNT_CALL(client, PMAPPROC_UNSET, xdr_pmap, &parms, xdr_bool, &rslt,
+	    tottimeout);
+	CLNT_DESTROY(client);
+	(void)close(socket);
+	return (rslt);
+}
+Funky_Stuff
+len=`wc -c < pmap_clnt.c`
+if [ $len !=     3374 ] ; then
+  echo error: pmap_clnt.c was $len bytes long, should have been     3374
+fi
+echo x - pmap_clnt.h
+cat > pmap_clnt.h <<'Funky_Stuff'
+/* @(#)pmap_clnt.h	1.1 87/11/04 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+/*	@(#)pmap_clnt.h 1.10 86/07/16 SMI	*/
+
+/*
+ * pmap_clnt.h
+ * Supplies C routines to get to portmap services.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+/*
+ * Usage:
+ *	success = pmap_set(program, version, protocol, port);
+ *	success = pmap_unset(program, version);
+ *	port = pmap_getport(address, program, version, protocol);
+ *	head = pmap_getmaps(address);
+ *	clnt_stat = pmap_rmtcall(address, program, version, procedure,
+ *		xdrargs, argsp, xdrres, resp, tout, port_ptr)
+ *		(works for udp only.) 
+ * 	clnt_stat = clnt_broadcast(program, version, procedure,
+ *		xdrargs, argsp,	xdrres, resp, eachresult)
+ *		(like pmap_rmtcall, except the call is broadcasted to all
+ *		locally connected nets.  For each valid response received,
+ *		the procedure eachresult is called.  Its form is:
+ *	done = eachresult(resp, raddr)
+ *		bool_t done;
+ *		caddr_t resp;
+ *		struct sockaddr_in raddr;
+ *		where resp points to the results of the call and raddr is the
+ *		address if the responder to the broadcast.
+ */
+
+extern bool_t		pmap_set();
+extern bool_t		pmap_unset();
+extern struct pmaplist	*pmap_getmaps();
+enum clnt_stat		pmap_rmtcall();
+enum clnt_stat		clnt_broadcast();
+extern u_short		pmap_getport();
+Funky_Stuff
+len=`wc -c < pmap_clnt.h`
+if [ $len !=     2525 ] ; then
+  echo error: pmap_clnt.h was $len bytes long, should have been     2525
+fi
+echo x - pmap_getmaps.c
+cat > pmap_getmaps.c <<'Funky_Stuff'
+/* @(#)pmap_getmaps.c	1.1 87/11/04 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)pmap_getmaps.c 1.10 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * pmap_getmap.c
+ * Client interface to pmap rpc service.
+ * contains pmap_getmaps, which is only tcp service involved
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <rpc/rpc.h>
+#include <rpc/pmap_prot.h>
+#include <rpc/pmap_clnt.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <errno.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#define NAMELEN 255
+#define MAX_BROADCAST_SIZE 1400
+
+extern int errno;
+
+/*
+ * Get a copy of the current port maps.
+ * Calls the pmap service remotely to do get the maps.
+ */
+struct pmaplist *
+pmap_getmaps(address)
+	 struct sockaddr_in *address;
+{
+	struct pmaplist *head = (struct pmaplist *)NULL;
+	int socket = -1;
+	struct timeval minutetimeout;
+	register CLIENT *client;
+
+	minutetimeout.tv_sec = 60;
+	minutetimeout.tv_usec = 0;
+	address->sin_port = htons(PMAPPORT);
+	client = clnttcp_create(address, PMAPPROG,
+	    PMAPVERS, &socket, 50, 500);
+	if (client != (CLIENT *)NULL) {
+		if (CLNT_CALL(client, PMAPPROC_DUMP, xdr_void, NULL, xdr_pmaplist,
+		    &head, minutetimeout) != RPC_SUCCESS) {
+			clnt_perror(client, "pmap_getmaps rpc problem");
+		}
+		CLNT_DESTROY(client);
+	}
+	(void)close(socket);
+	address->sin_port = 0;
+	return (head);
+}
+Funky_Stuff
+len=`wc -c < pmap_getmaps.c`
+if [ $len !=     2682 ] ; then
+  echo error: pmap_getmaps.c was $len bytes long, should have been     2682
+fi
+echo x - pmap_getport.c
+cat > pmap_getport.c <<'Funky_Stuff'
+/* @(#)pmap_getport.c	1.1 87/11/04 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)pmap_getport.c 1.9 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * pmap_getport.c
+ * Client interface to pmap rpc service.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <rpc/rpc.h>
+#include <rpc/pmap_prot.h>
+#include <rpc/pmap_clnt.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <net/if.h>
+
+static struct timeval timeout = { 5, 0 };
+static struct timeval tottimeout = { 60, 0 };
+
+/*
+ * Find the mapped port for program,version.
+ * Calls the pmap service remotely to do the lookup.
+ * Returns 0 if no map exists.
+ */
+u_short
+pmap_getport(address, program, version, protocol)
+	struct sockaddr_in *address;
+	u_long program;
+	u_long version;
+	u_int protocol;
+{
+	u_short port = 0;
+	int socket = -1;
+	register CLIENT *client;
+	struct pmap parms;
+
+	address->sin_port = htons(PMAPPORT);
+	client = clntudp_bufcreate(address, PMAPPROG,
+	    PMAPVERS, timeout, &socket, RPCSMALLMSGSIZE, RPCSMALLMSGSIZE);
+	if (client != (CLIENT *)NULL) {
+		parms.pm_prog = program;
+		parms.pm_vers = version;
+		parms.pm_prot = protocol;
+		parms.pm_port = 0;  /* not needed or used */
+		if (CLNT_CALL(client, PMAPPROC_GETPORT, xdr_pmap, &parms,
+		    xdr_u_short, &port, tottimeout) != RPC_SUCCESS){
+			rpc_createerr.cf_stat = RPC_PMAPFAILURE;
+			clnt_geterr(client, &rpc_createerr.cf_error);
+		} else if (port == 0) {
+			rpc_createerr.cf_stat = RPC_PROGNOTREGISTERED;
+		}
+		CLNT_DESTROY(client);
+	}
+	(void)close(socket);
+	address->sin_port = 0;
+	return (port);
+}
+Funky_Stuff
+len=`wc -c < pmap_getport.c`
+if [ $len !=     2846 ] ; then
+  echo error: pmap_getport.c was $len bytes long, should have been     2846
+fi
+echo x - pmap_prot.c
+cat > pmap_prot.c <<'Funky_Stuff'
+/* @(#)pmap_prot.c	1.1 87/11/04 3.9 RPCSRC */
+/*
+ * Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+ * unrestricted use provided that this legend is included on all tape
+ * media and as a part of the software program in whole or part.  Users
+ * may copy or modify Sun RPC without charge, but are not authorized
+ * to license or distribute it to anyone else except as part of a product or
+ * program developed by the user.
+ * 
+ * SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+ * WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+ * 
+ * Sun RPC is provided with no support and without any obligation on the
+ * part of Sun Microsystems, Inc. to assist in its use, correction,
+ * modification or enhancement.
+ * 
+ * SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+ * INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+ * OR ANY PART THEREOF.
+ * 
+ * In no event will Sun Microsystems, Inc. be liable for any lost revenue
+ * or profits or other special, indirect and consequential damages, even if
+ * Sun has been advised of the possibility of such damages.
+ * 
+ * Sun Microsystems, Inc.
+ * 2550 Garcia Avenue
+ * Mountain View, California  94043
+ */
+#if !defined(lint) && defined(SCCSIDS)
+static char sccsid[] = "@(#)pmap_prot.c 1.17 87/08/11 Copyr 1984 Sun Micro";
+#endif
+
+/*
+ * pmap_prot.c
+ * Protocol for the local binder service, or pmap.
+ *
+ * Copyright (C) 1984, Sun Microsystems, Inc.
+ */
+
+#include <rpc/types.h>
+#include <rpc/xdr.h>
+#include <rpc/pmap_prot.h>
+
+
+bool_t
+xdr_pmap(xdrs, regs)
+	XDR *xdrs;
+	struct pmap *regs;
+{
+
+	if (xdr_u_long(xdrs, &regs->pm_prog) && 
+		xdr_u_long(xdrs, &regs->pm_vers) && 
+		xdr_u_long(xdrs, &regs->pm_prot))
+		return (xdr_u_long(xdrs, &regs->pm_port));
+	return (FALSE);
+}
+Funky_Stuff
+len=`wc -c < pmap_prot.c`
+if [ $len !=     1879 ] ; then
+  echo error: pmap_prot.c was $len bytes long, should have been     1879
+fi
+cd ..
+echo more files to follow
+exit

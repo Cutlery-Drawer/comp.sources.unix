@@ -1,0 +1,2277 @@
+Subject:  v16i075:  IDA Sendmail kit, Part03/08
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Lennart Lovstrand <lovstran@arisia.xerox.com>
+Posting-number: Volume 16, Issue 75
+Archive-name: ida2/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 8)."
+# Contents:  ida/aux/rmail.c ida/aux/xalparse.c
+#   ida/patches/alias.c.diff ida/patches/deliver.c.diff
+#   ida/patches/main.c.diff ida/patches/recipient.c.diff
+#   ida/patches/sendmail.h.diff
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f ida/aux/rmail.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"ida/aux/rmail.c\"
+else
+echo shar: Extracting \"ida/aux/rmail.c\" \(7381 characters\)
+sed "s/^X//" >ida/aux/rmail.c <<'END_OF_ida/aux/rmail.c'
+X/*
+X**  RMAIL -- Receive remote mail requests.
+X**  Copyright (c) 1987 Lennart Lovstrand
+X**  CIS Dept, Univ of Linkoping, Sweden
+X**
+X**  Use it, abuse it, but don't sell it.
+X**
+X**  Version 2.6 of 5-May-87.
+X**
+X**  This time logging selected header lines + more liberal parsing of
+X**  the initial from-line but not yet with accounting & like; 14-Apr-85.
+X**  Dbm lookup of UUCP domain names added 5-May-87.
+X**
+X**  The following definitions below are optional:
+X**	LOGFILE -- If defined, should be the name of a file in which to
+X**		log the raw addresses of each message.
+X**	DEFAULT_HOST -- If no host is found in the envelope recipients,
+X**		this host is assumed [defaults to your local host].
+X**	DEFAULT_DOMAIN -- If the sending host is unqualifed, add this
+X**		domain to the host for use in the Received: line.
+X**	DOMAINTABLE -- If defined, should point to your local domain
+X**		lookup database.  It is used for the same purpose as
+X**		the DEFAULT_DOMAIN.
+X*/
+X
+X#include <stdio.h>
+X#include <fcntl.h>
+X#include <ctype.h>
+X#include <sys/time.h>
+X#include <strings.h>
+X#ifdef MDBM
+X# include "mdbm_compat.h"
+X#else MDBM
+X# include <ndbm.h>
+X# define DBMFILE DBM
+X#endif MDBM
+X#include "useful.h"
+X
+X#define STRSIZ		1024
+X#define COMMA		','
+X/* #define LOGFILE		"/usr/lib/uucp/rmail.log" */
+X#define SENDMAIL	"/usr/lib/sendmail"
+X#define NETCHRS		"%@!:"
+X/* #define DEFAULT_HOST	"liuida" */
+X#define DEFAULT_DOMAIN	"UUCP"
+X/* #define DOMAINTABLE	"/usr/lib/mail/domaintable" */
+X
+X#define H_CC		"cc"
+X#define H_FROM		"from"
+X#define H_MESSAGE_ID	"message_id"
+X#define H_RETURN_PATH	"return-path"
+X#define H_TO		"to"
+X#define H_VIA		"via"
+X
+X#define MAKELC(C)	(isupper(C) ? tolower(C) : C)
+X#define EATSPACE(P)	while (*P == ' ') P++
+X
+XFILE *popen();
+Xchar *Progname;
+Xint Debug = FALSE;
+XDBMFILE	*Dbm;
+X
+Xmain(argc, argv)
+X    int argc;
+X    char **argv;
+X{
+X    char from_[STRSIZ], cmd[STRSIZ], s_mac[STRSIZ], f_opt[STRSIZ], s[STRSIZ];
+X    char *v_opt = "";
+X    char *p, *user, *host, *domain = "";
+X    char *acctsys = (char *) getenv("ACCTSYS");
+X    FILE *outf;
+X#ifdef LOGFILE
+X    FILE *logf = NULL;
+X#endif LOGFILE
+X#ifdef DOMAINTABLE
+X    datum key, val;
+X#endif DOMAINTABLE
+X    int insideheader, printedlast = FALSE;
+X    int c, errflg = FALSE;
+X    
+X    extern int optind;
+X    extern char *optarg;
+X
+X#ifdef DEFAULT_DOMAIN
+X    domain = DEFAULT_DOMAIN;
+X#endif DEFAULT_DOMAIN
+X
+X    Progname = argv[0];
+X    while ((c = getopt(argc, argv, "D:dv")) != EOF) {
+X	switch (c) {
+X	  case 'D':
+X	    domain = optarg;
+X	    break;
+X	  case 'd':
+X	    Debug++;
+X	    break;
+X	  case 'v':
+X	    v_opt = " -v";
+X	    break;
+X	  default:
+X	    errflg = TRUE;
+X	    break;
+X	}
+X    }
+X    if (errflg || optind >= argc) {
+X	(void) fprintf(stderr, "usage: %s [-Ddomain] user ...\n", Progname);
+X	exit(2);
+X    }
+X
+X    /*
+X     * set our real uid to root as well as our effective uid so
+X     * make sendmail accept the -oM options
+X     */
+X    (void) setreuid(0, 0);
+X
+X#ifdef DOMAINTABLE
+X    Dbm = dbm_open(DOMAINTABLE, O_RDONLY);
+X    if (Dbm == NULL)
+X	perror(DOMAINTABLE);
+X#endif DOMAINTABLE
+X
+X#ifdef LOGFILE
+X    if ((logf = fopen(Debug ? "/dev/tty" : LOGFILE, "a")) != NULL) {
+X	struct timeval t;
+X	int a;
+X
+X	(void) gettimeofday(&t, (struct timezone *) NULL);
+X	(void) fprintf(logf, "\n[%.12s] ", ctime(&t.tv_sec) + 4);
+X	for (a = 0; a < argc; a++)
+X	    (void) fprintf(logf, " '%s'", argv[a]);
+X	(void) putc('\n', logf);
+X    } else
+X	(void) fprintf(stderr, "%s: couldn't open log file \"%s\"\n",
+X		       Progname, LOGFILE);
+X#endif LOGFILE
+X
+X    user = NULL;
+X    host = NULL;
+X    (void) gets(from_);
+X
+X#ifdef LOGFILE
+X    if (logf != NULL)
+X	(void) fprintf(logf, "%s\n", from_);
+X#endif LOGFILE
+X
+X    if (strncmp(from_, "From ", 5) == 0 || strncmp(from_, ">From ", 6) == 0) {
+X	user = index(from_, ' ') + 1;
+X	EATSPACE(user);
+X	if ((p = index(user, ' ')) != NULL) {
+X	    *p = '\0';
+X	    while ((p = index(p + 1, 'r')) != NULL) {
+X		if (strncmp(p, "remote from ", 12) == 0) {
+X		    host = p + 12;
+X		    EATSPACE(host);
+X		    if ((p = index(host, '\n')) != NULL)
+X			*p = '\0';
+X		    if (strcmp(host, "somewhere") == 0)
+X			host = NULL;
+X		    break;
+X		}
+X	    }
+X	}
+X    }
+X
+X    if (acctsys == NULL)
+X	acctsys = host;
+X
+X    if (host)
+X	(void) sprintf(f_opt, " -f%s!%s", host, user);
+X    else if (user)
+X	(void) sprintf(f_opt, " -f%s", user);
+X    else
+X	*f_opt = '\0';
+X
+X    if (acctsys) {
+X#ifdef DOMAINTABLE
+X	if (Dbm != NULL) {
+X	    key.dptr = acctsys;
+X	    key.dsize = strlen(acctsys) + 1;
+X	    val = dbm_fetch(Dbm, key);
+X	    if (val.dptr != NULL)
+X		acctsys = val.dptr;
+X	}
+X#endif DOMAINTABLE
+X	if (index(acctsys, '.') == NULL && *domain != '\0')
+X	    (void) sprintf(s_mac, " -oMs%s.%s", acctsys, domain);
+X	else
+X	    (void) sprintf(s_mac, " -oMs%s", acctsys);
+X    } else
+X	*s_mac = '\0';
+X
+X    (void) sprintf(cmd, "exec %s -ee -i -oMrUUCP%s%s%s",
+X		   SENDMAIL, s_mac, f_opt, v_opt);
+X
+X    for (; optind < argc; optind++) {
+X	(void) strcat(cmd, " '");
+X#ifdef DEFAULT_HOST
+X	if (anyin(argv[optind], NETCHRS) == NULL) {
+X	    (void) strcat(cmd, DEFAULT_HOST);
+X	    (void) strcat(cmd, "!");
+X	}
+X#endif DEFAULT_HOST
+X	if (*argv[optind] == '(')
+X	    (void) strncat(cmd, &argv[optind][1], strlen(argv[optind])-2);
+X	else
+X	    (void) strcat(cmd, argv[optind]);
+X	(void) strcat(cmd, "'");
+X    }
+X
+X#ifdef LOGFILE
+X    if (logf != NULL)
+X	(void) fprintf(logf, "%s\n", cmd);
+X#endif LOGFILE
+X    if (Debug)
+X	outf = stdout;
+X    else {
+X	outf = popen(cmd, "w");
+X	if (outf == NULL) {
+X	    (void) fprintf(stderr, "%s: could not open pipe thru %s\n",
+X			   Progname, cmd);
+X	    exit(1);
+X	}
+X    }
+X
+X    insideheader = TRUE;
+X    while (gets(s)) {
+X	if (*s == NULL)
+X	    insideheader = FALSE;
+X
+X#ifdef LOGFILE
+X	if (logf != NULL && insideheader &&
+X	    ((printedlast && isspace(*s)) ||
+X	     iskey(H_FROM, s) || iskey(H_TO, s) || iskey(H_CC, s) ||
+X	     iskey(H_RETURN_PATH, s) || iskey(H_MESSAGE_ID, s))) {
+X		 (void) fprintf(logf, "\t%s\n", s);
+X		 printedlast = TRUE;
+X	     } else
+X		 printedlast = FALSE;
+X#endif LOGFILE
+X	(void) fprintf(outf, "%s\n", s);
+X    }
+X
+X#ifdef LOGFILE
+X    if (logf != NULL)
+X	(void) fclose(logf);
+X#endif LOGFILE
+X
+X    if (!Debug)
+X	exit((pclose(outf) >> 8) & 0377);
+X}
+X
+X/*
+X**	ANYIN -- Does the target string contain chars from the pattern string?
+X*/
+Xanyin(t, p)
+X    char *t;
+X    register char *p;
+X{
+X    for (; *p != '\0'; p++)
+X	if (index(t, *p) != NULL)
+X	    return TRUE;
+X    return FALSE;
+X}
+X
+X/*
+X**	ISKEY -- Checks if the line is prefixed by the supplied keyword
+X**	(immediately followed by a colon)
+X*/
+Xiskey(key, line)
+X    char *key, *line;
+X{
+X    for (; *key != NULL && *line != NULL; key++, line++)
+X	if (MAKELC(*key) != MAKELC(*line))
+X	    break;
+X
+X    return *key == NULL && *line == ':';
+X}
+X
+X/*
+X**	EXTRACT_ADDRESS -- Finds and extracts the machine address part
+X**	of an address field.
+X*/
+X
+Xchar *
+Xextract_address(field, address)
+X    char *field, *address;
+X{
+X    char *address_start = address;
+X
+X    while(*field && *field != COMMA && *field != '>')
+X	switch (*field) {
+X	  case '<':
+X	    return extract_address(field, address_start);
+X	  case '(':
+X	    while (*field && *field != ')');
+X	    field++;
+X	    break;
+X	  case '"':
+X	    do
+X		*address++ = *field++;
+X	    while (*field && *field != '"');
+X	    if (*field)
+X		*address++ = *field++;
+X	    break;
+X	  case ' ':
+X	    *address++ = *field++;
+X	    EATSPACE(field);
+X	    break;
+X	  case '\\':
+X	    *address++ = *field++;
+X	    /* fall through */
+X	  default:
+X	    *address++ = *field++;
+X	}
+X    *address = NULL;
+X    if (*field)
+X	return index(field, COMMA)+1;
+X    else
+X	return field;
+X}
+X
+X
+END_OF_ida/aux/rmail.c
+if test 7381 -ne `wc -c <ida/aux/rmail.c`; then
+    echo shar: \"ida/aux/rmail.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f ida/aux/xalparse.c -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"ida/aux/xalparse.c\"
+else
+echo shar: Extracting \"ida/aux/xalparse.c\" \(6648 characters\)
+sed "s/^X//" >ida/aux/xalparse.c <<'END_OF_ida/aux/xalparse.c'
+X/*
+X**  XALPARSE -- Xaliases file parser.
+X**  Copyright (c) 1987 Lennart Lovstrand
+X**  CIS Dept, Univ of Linkoping, Sweden
+X**
+X**  Use it, abuse it, but don't sell it.
+X*/
+X
+X#include "useful.h"
+X#include <stdio.h>
+X#include <ctype.h>
+X
+X#ifndef lint
+Xstatic char	SccsId[] = "@(#)xalparse.c 1.1 (lel@ida.liu.se) 4/12/87";
+X#endif !lint
+X
+Xstruct alias {
+X  bool a_in, a_out;
+X  char *a_name;
+X};
+X
+X#define ANULL	(struct alias *) NULL
+X
+X/*
+X**  XPARSE -- Parse an xaliases file, producing aliases + generics files.
+X**
+X**	This program parses a file in ``xaliases'' format, producing
+X**	a standard aliases file + a generics file.  The xaliases input
+X**	file has entry of the following format:
+X**		generic_list: mbox_list
+X**	where elements in both lists are separated by commas.  In
+X**	addition, each element in the mbox_list may be prefixed with
+X**	either or both of the ``redirection characters,'' "<" and ">".
+X
+X**	In its simplest form, the generic_list has just one member and
+X**	the mbox_list uses no redirection characters.  This
+X**	corresponds exactly to the standard aliases format and
+X**	function.
+X
+X**	The first extention is made by allowing more than one entry on
+X**	the left hand side, thus making "a, b: c" as shorthand for the
+X**	two entries "a: c" and "b: c".
+X
+X**	The second extension is made by adding the previously
+X**	mentioned redirection characters to the addresses on the right
+X**	hand side.  These control in what direction the aliases should
+X**	be used.
+X**
+X**	etc.
+X*/
+X
+Xint iflag = FALSE, Iflag = FALSE, Oflag = FALSE;
+X
+Xmain(argc, argv)
+X     int argc;
+X     char **argv;
+X{
+X  extern int optind;
+X  extern char *optarg;
+X  char c;
+X  FILE *xaliases, *aliases, *generics;
+X
+X
+X  if (argc != 4) {
+X    fprintf(stderr, "usage: %s xaliases aliases generics\n", argv[0]);
+X    exit(1);
+X  }
+X
+X  if (strcmp(argv[1], "-") == 0)
+X    xaliases = stdin;
+X  else {
+X    xaliases = fopen(argv[1], "r");
+X    if (xaliases == NULL)
+X      perror(argv[1]), exit(2);
+X  }
+X  aliases = fopen(argv[2], "w");
+X  if (aliases == NULL)
+X    perror(argv[2]), exit(2);
+X  generics = fopen(argv[3], "w");
+X  if (generics == NULL)
+X    perror(argv[3]), exit(2);
+X  
+X  parsefile(xaliases, aliases, generics);
+X  exit(0);
+X}
+X
+Xparsefile(xaliases, aliases, generics)
+X     FILE *xaliases, *aliases, *generics;
+X{
+X  extern char *index();
+X  char line[BUFSIZ];
+X  struct alias *rhs[BUFSIZ], *lhs[BUFSIZ];
+X  struct alias **a, **r, **first;
+X
+X  while (readline(line, sizeof(line), xaliases) >= 0) {
+X    parseline(line, lhs, rhs);
+X
+X    for (first = rhs; *first != ANULL; first++)
+X      if ((*first)->a_in)
+X	break;
+X    if (*first != ANULL)
+X      for (a = lhs; *a != ANULL; a++) {
+X	fprintf(aliases, "%s:%s", (*a)->a_name, (*first)->a_name);
+X	for (r = first+1; *r != ANULL; r++)
+X	  if ((*r)->a_in)
+X	    fprintf(aliases, ",%s", (*r)->a_name);
+X	fprintf(aliases, "\n");
+X      }
+X
+X    for (first = rhs; *first != ANULL; first++)
+X      if ((*first)->a_out)
+X	break;
+X    if (*first != ANULL) {
+X      fprintf(generics, "%s\t%s", lhs[0]->a_name, (*first)->a_name);
+X      for (r = first+1; *r != ANULL; r++)
+X	if ((*r)->a_out)
+X	  fprintf(generics, " %s", (*r)->a_name);
+X      fprintf(generics, "\n");
+X    }
+X
+X    freebufs(lhs, rhs);
+X  }
+X}
+X
+X/**
+X **	PEEKC -- Return the next char to be read.
+X **/
+X
+Xpeekc(stream)
+X     FILE *stream;
+X{
+X  int c;
+X
+X  c = getc(stream);
+X  if (c != EOF)
+X    ungetc(c, stream);
+X  return c;
+X}
+X
+X/**
+X **	READLINE -- Read a (logical) line and return the # of chars read
+X **/
+X
+Xreadline(buf, bufsiz, stream)
+X     char *buf;
+X     int bufsiz;
+X     FILE *stream;
+X{
+X  int len;
+X  char *sharp;
+X
+X  if (fgets(buf, bufsiz, stream) == NULL)
+X    return -1;
+X  buf[strlen(buf)-1] = '\0';
+X
+X  /*
+X  if ((sharp = index(buf, '#')) != NULL)
+X    *sharp = '\0';
+X  */
+X  if (buf[0] == '#')
+X    buf[0] = '\0';
+X
+X  len = strlen(buf);
+X  if (isspace(peekc(stream)))
+X    return len + readline(&buf[len], bufsiz-len, stream);
+X  else
+X    return len;
+X}
+X
+X/**
+X **	PARSETHING
+X **/
+X
+X
+X#define LHS	1
+X#define RHS	2
+X
+Xchar *
+Xparsething(line, thing, side)
+X     char *line;
+X     struct alias **thing;
+X     int side;
+X{
+X  register char *s, *d;
+X  register bool
+X    insideroute = FALSE,
+X    insidestring = FALSE,
+X    quotedchar = FALSE;
+X  bool i_mark, o_mark;
+X  char buf[BUFSIZ];
+X  extern char *malloc();
+X
+X  s = line;
+X  d = buf;
+X
+X  while (*s != '\0' && isspace(*s)) s++;
+X  if (side == RHS) {
+X    if (o_mark = (*s == '<')) s++;
+X    if (i_mark = (*s == '>')) s++;
+X    i_mark = i_mark || !o_mark;			/* default to '>' */
+X    while (*s != '\0' && isspace(*s)) s++;
+X  }
+X
+X  for (;*s != '\0'; s++) {
+X    /* exit if non-quoted comma (or colon & LHS) */
+X    if (!insidestring && !quotedchar && !insideroute &&
+X	*s == ',' || ((side == LHS) && *s == ':'))
+X      break;
+X
+X    /* copy if not unquoted whitespace */
+X    if (insidestring || quotedchar || !isspace(*s))
+X      *d++ = *s;
+X
+X    /* special quote character handling */
+X    if (quotedchar)
+X      quotedchar = FALSE;
+X    else {
+X      quotedchar = (*s == '\\');
+X      if (!insidestring)
+X	if (*s == '<')
+X	  insideroute = TRUE;
+X	else if (*s == '>')
+X	  insideroute = FALSE;
+X      if (*s == '"')
+X	insidestring = !insidestring;
+X    }
+X  }
+X  while (d > buf && isspace(d[-1])) d--;
+X  *d = '\0';
+X
+X  if (d == buf && *s == '\0') {
+X    *thing = ANULL;
+X    return NULL;
+X  } else {
+X    *thing = (struct alias *) malloc(sizeof(struct alias));
+X    (*thing)->a_in = i_mark;
+X    (*thing)->a_out = o_mark;
+X    (*thing)->a_name = malloc(strlen(buf) + 1);
+X    strcpy((*thing)->a_name, buf);
+X    return s;
+X  }
+X}
+X
+X/**
+X **	PARSELINE
+X **/
+X
+Xparseline(line, lhs, rhs)
+X     char *line;
+X     struct alias **lhs, **rhs;
+X{
+X  line--;
+X
+X  while ((line = parsething(line+1, lhs++, LHS)) != NULL)
+X    if (*line == ':')
+X      break;
+X  *lhs = NULL;
+X
+X  if (line != NULL)
+X    while ((line = parsething(line+1, rhs++, RHS)) != NULL);
+X  *rhs = ANULL;
+X}
+X
+X/**
+X **	FREEBUFS
+X **/
+X
+Xfreebufs(lhs, rhs)
+X     struct alias **lhs, **rhs;
+X{
+X  while (*lhs != ANULL) {
+X    free((*lhs)->a_name);
+X    free(*lhs);
+X    lhs++;
+X  }
+X  while (*rhs != ANULL) {
+X    free((*rhs)->a_name);
+X    free(*rhs);
+X    rhs++;
+X  }
+X}
+X
+X/**
+X **	COMPRESSLINE -- Remove all heading & trailing whitespace around items.
+X **/
+X
+Xcompressline(line)
+X     char *line;
+X{
+X  register char *d, *s, *b, *e;
+X
+X  for (d = s = line; *s != '\0'; s++) {
+X		/* eat initial whitespace */
+X    while (*s != '\0' && isspace(*s)) s++;
+X    if (*s == '\0')
+X      break;
+X		/* remember beginning of "word" and find end */
+X    b = s;
+X    while (*s != '\0' && *s != ',' && *s != ':') s++;
+X    e = s - 1;
+X		/* backspace end thru whitespace */
+X    while (e >= b && isspace(*e)) e--;
+X		/* copy "word" w/o whitespace */
+X    while (b <= e) *d++ = *b++;
+X		/* copy separator */
+X    *d++ = *s;
+X    if (*s == '\0')
+X      return;
+X  }
+X  *d = '\0';
+X}
+END_OF_ida/aux/xalparse.c
+if test 6648 -ne `wc -c <ida/aux/xalparse.c`; then
+    echo shar: \"ida/aux/xalparse.c\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f ida/patches/alias.c.diff -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"ida/patches/alias.c.diff\"
+else
+echo shar: Extracting \"ida/patches/alias.c.diff\" \(9228 characters\)
+sed "s/^X//" >ida/patches/alias.c.diff <<'END_OF_ida/patches/alias.c.diff'
+X*** alias.c.orig	Sat Apr  2 01:22:15 1988
+X--- alias.c	Tue Aug 30 04:19:45 1988
+X***************
+X*** 58,71 ****
+X  */
+X  
+X  
+X! #ifdef DBM
+X! typedef struct
+X! {
+X! 	char	*dptr;
+X! 	int	dsize;
+X! } DATUM;
+X  extern DATUM fetch();
+X! #endif DBM
+X  
+X  alias(a, sendq)
+X  	register ADDRESS *a;
+X--- 58,66 ----
+X  */
+X  
+X  
+X! #if defined(DBM) && !defined(NDBM)
+X  extern DATUM fetch();
+X! #endif DBM && !NDBM
+X  
+X  alias(a, sendq)
+X  	register ADDRESS *a;
+X***************
+X*** 76,82 ****
+X  
+X  # ifdef DEBUG
+X  	if (tTd(27, 1))
+X! 		printf("alias(%s)\n", a->q_paddr);
+X  # endif
+X  
+X  	/* don't realias already aliased names */
+X--- 71,77 ----
+X  
+X  # ifdef DEBUG
+X  	if (tTd(27, 1))
+X! 		printf("alias(%s)\n", a->q_user);
+X  # endif
+X  
+X  	/* don't realias already aliased names */
+X***************
+X*** 125,131 ****
+X  **		none.
+X  **
+X  **	Warnings:
+X! **		The return value will be trashed across calls.
+X  */
+X  
+X  char *
+X--- 120,127 ----
+X  **		none.
+X  **
+X  **	Warnings:
+X! **		The return value will be trashed across calls
+X! **		unless NDBM is defined and we're using mapkey().
+X  */
+X  
+X  char *
+X***************
+X*** 133,149 ****
+X  	char *name;
+X  {
+X  # ifdef DBM
+X  	DATUM rhs, lhs;
+X  
+X  	/* create a key for fetch */
+X! 	lhs.dptr = name;
+X  	lhs.dsize = strlen(name) + 1;
+X  	rhs = fetch(lhs);
+X  	return (rhs.dptr);
+X  # else DBM
+X  	register STAB *s;
+X  
+X  	s = stab(name, ST_ALIAS, ST_FIND);
+X  	if (s == NULL)
+X  		return (NULL);
+X  	return (s->s_alias);
+X--- 129,178 ----
+X  	char *name;
+X  {
+X  # ifdef DBM
+X+ # ifdef NDBM
+X+ 	char *newname;
+X+ 
+X+ # ifdef DEBUG
+X+ 	if (tTd(27, 3))
+X+ 	    printf("aliaslookup(\"%s\") => ", name);
+X+ # endif DEBUG
+X+ 	newname = (char *) mapkey(DB_ALIAS, name, 0, 0);
+X+ # ifdef DEBUG
+X+ 	if (tTd(27, 3))
+X+ 	    printf("%s\n", newname == NULL ? "NOT_FOUND" : newname);
+X+ # endif DEBUG
+X+ 	return newname;
+X+ 
+X+ # else NDBM
+X+ 
+X  	DATUM rhs, lhs;
+X+ 	char *lowname = xalloc(strlen(name) + 1); /* potential space hog */
+X  
+X  	/* create a key for fetch */
+X! 	(void) strcpy(lowname, name);
+X! 	(void) makelower(lowname);
+X! 	lhs.dptr = lowname;
+X  	lhs.dsize = strlen(name) + 1;
+X+ # ifdef DEBUG
+X+ 	if (tTd(27, 3))
+X+ 	    printf("aliaslookup(\"%s\") => ", lhs.dptr);
+X+ # endif DEBUG
+X  	rhs = fetch(lhs);
+X+ # ifdef DEBUG
+X+ 	if (tTd(27, 3))
+X+ 	    printf("%s\n", rhs.dptr == NULL ? "NOT_FOUND" : rhs.dptr);
+X+ # endif DEBUG
+X+ 	(void) free(lowname);
+X  	return (rhs.dptr);
+X+ # endif !NDBM
+X  # else DBM
+X  	register STAB *s;
+X  
+X  	s = stab(name, ST_ALIAS, ST_FIND);
+X+ # ifdef DEBUG
+X+ 	if (tTd(27, 3))
+X+ 	    printf("%s\n", s == NULL ? "NOT_FOUND" : s->s_alias);
+X+ # endif DEBUG
+X  	if (s == NULL)
+X  		return (NULL);
+X  	return (s->s_alias);
+X***************
+X*** 155,161 ****
+X  **	Very different depending on whether we are running DBM or not.
+X  **
+X  **	Parameters:
+X- **		aliasfile -- location of aliases.
+X  **		init -- if set and if DBM, initialize the DBM files.
+X  **
+X  **	Returns:
+X--- 184,189 ----
+X***************
+X*** 169,176 ****
+X  
+X  # define DBMMODE	0666
+X  
+X! initaliases(aliasfile, init)
+X! 	char *aliasfile;
+X  	bool init;
+X  {
+X  #ifdef DBM
+X--- 197,203 ----
+X  
+X  # define DBMMODE	0666
+X  
+X! initaliases(init)
+X  	bool init;
+X  {
+X  #ifdef DBM
+X***************
+X*** 186,195 ****
+X  		return;
+X  	initialized = TRUE;
+X  
+X! 	if (aliasfile == NULL || stat(aliasfile, &stb) < 0)
+X  	{
+X! 		if (aliasfile != NULL && init)
+X! 			syserr("Cannot open %s", aliasfile);
+X  		NoAlias = TRUE;
+X  		errno = 0;
+X  		return;
+X--- 213,229 ----
+X  		return;
+X  	initialized = TRUE;
+X  
+X! 	if (AliasFile == NULL ||
+X! #ifdef YPMARK
+X! 	    (AliasFile[0] != YPMARK &&
+X! #endif YPMARK
+X! 	     stat(AliasFile, &stb) < 0)
+X! #ifdef YPMARK
+X! 	    )
+X! #endif YPMARK
+X  	{
+X! 		if (AliasFile != NULL && init)
+X! 			syserr("Cannot open %s", AliasFile);
+X  		NoAlias = TRUE;
+X  		errno = 0;
+X  		return;
+X***************
+X*** 202,230 ****
+X  	**	to us to rebuild it.
+X  	*/
+X  
+X  	if (!init)
+X! 		dbminit(aliasfile);
+X  	atcnt = SafeAlias * 2;
+X  	if (atcnt > 0)
+X- 	{
+X  		while (!init && atcnt-- >= 0 && aliaslookup("@") == NULL)
+X- 		{
+X- 			/*
+X- 			**  Reinitialize alias file in case the new
+X- 			**  one is mv'ed in instead of cp'ed in.
+X- 			**
+X- 			**	Only works with new DBM -- old one will
+X- 			**	just consume file descriptors forever.
+X- 			**	If you have a dbmclose() it can be
+X- 			**	added before the sleep(30).
+X- 			*/
+X- 
+X  			sleep(30);
+X- # ifdef NDBM
+X- 			dbminit(aliasfile);
+X- # endif NDBM
+X- 		}
+X- 	}
+X  	else
+X  		atcnt = 1;
+X  
+X--- 236,249 ----
+X  	**	to us to rebuild it.
+X  	*/
+X  
+X+ #ifndef NDBM
+X  	if (!init)
+X! 		dbminit(AliasFile);
+X! #endif !NDBM
+X  	atcnt = SafeAlias * 2;
+X  	if (atcnt > 0)
+X  		while (!init && atcnt-- >= 0 && aliaslookup("@") == NULL)
+X  			sleep(30);
+X  	else
+X  		atcnt = 1;
+X  
+X***************
+X*** 238,247 ****
+X  	*/
+X  
+X  	modtime = stb.st_mtime;
+X! 	(void) strcpy(buf, aliasfile);
+X! 	(void) strcat(buf, ".pag");
+X  	stb.st_ino = 0;
+X! 	if (!init && (stat(buf, &stb) < 0 || stb.st_mtime < modtime || atcnt < 0))
+X  	{
+X  		errno = 0;
+X  		if (AutoRebuild && stb.st_ino != 0 &&
+X--- 257,270 ----
+X  	*/
+X  
+X  	modtime = stb.st_mtime;
+X! 	(void) strcpy(buf, AliasFile);
+X! 	(void) strcat(buf, DB_PAGEXT);
+X  	stb.st_ino = 0;
+X! 	if (!init &&
+X! #ifdef YPMARK
+X! 	    AliasFile[0] != YPMARK &&
+X! #endif YPMARK
+X! 	    (stat(buf, &stb) < 0 || stb.st_mtime < modtime || atcnt < 0))
+X  	{
+X  		errno = 0;
+X  		if (AutoRebuild && stb.st_ino != 0 &&
+X***************
+X*** 282,291 ****
+X  				automatic ? "auto" : "", username());
+X  		}
+X  #endif LOG
+X! 		readaliases(aliasfile, TRUE);
+X  	}
+X  # else DBM
+X! 	readaliases(aliasfile, init);
+X  # endif DBM
+X  }
+X  /*
+X--- 305,314 ----
+X  				automatic ? "auto" : "", username());
+X  		}
+X  #endif LOG
+X! 		readaliases(TRUE);
+X  	}
+X  # else DBM
+X! 	readaliases(init);
+X  # endif DBM
+X  }
+X  /*
+X***************
+X*** 295,301 ****
+X  **	when we are not going to use the DBM stuff.
+X  **
+X  **	Parameters:
+X- **		aliasfile -- the pathname of the alias file master.
+X  **		init -- if set, initialize the DBM stuff.
+X  **
+X  **	Returns:
+X--- 318,323 ----
+X***************
+X*** 302,314 ****
+X  **		none.
+X  **
+X  **	Side Effects:
+X! **		Reads aliasfile into the symbol table.
+X  **		Optionally, builds the .dir & .pag files.
+X  */
+X  
+X  static
+X! readaliases(aliasfile, init)
+X! 	char *aliasfile;
+X  	bool init;
+X  {
+X  	register char *p;
+X--- 324,335 ----
+X  **		none.
+X  **
+X  **	Side Effects:
+X! **		Reads AliasFile into the symbol table.
+X  **		Optionally, builds the .dir & .pag files.
+X  */
+X  
+X  static
+X! readaliases(init)
+X  	bool init;
+X  {
+X  	register char *p;
+X***************
+X*** 321,331 ****
+X  	register STAB *s;
+X  	char line[BUFSIZ];
+X  
+X! 	if ((af = fopen(aliasfile, "r")) == NULL)
+X  	{
+X  # ifdef DEBUG
+X  		if (tTd(27, 1))
+X! 			printf("Can't open %s\n", aliasfile);
+X  # endif
+X  		errno = 0;
+X  		NoAlias++;
+X--- 342,364 ----
+X  	register STAB *s;
+X  	char line[BUFSIZ];
+X  
+X! # ifdef YPMARK
+X! 	if (AliasFile[0] == YPMARK) {
+X! # ifdef DEBUG
+X! 	    if (tTd(27, 1))
+X! 		printf("Can't reinit YP databases: \"%s\"\n", AliasFile);
+X! # endif
+X! 	    /* reuse old aliases */
+X! 	    errno = 0;
+X! 	    return;
+X! 	}
+X! # endif YPMARK
+X! 
+X! 	if ((af = fopen(AliasFile, "r")) == NULL)
+X  	{
+X  # ifdef DEBUG
+X  		if (tTd(27, 1))
+X! 			printf("Can't open %s\n", AliasFile);
+X  # endif
+X  		errno = 0;
+X  		NoAlias++;
+X***************
+X*** 356,363 ****
+X  	if (init)
+X  	{
+X  		oldsigint = signal(SIGINT, SIG_IGN);
+X! 		(void) strcpy(line, aliasfile);
+X! 		(void) strcat(line, ".dir");
+X  		if (close(creat(line, DBMMODE)) < 0)
+X  		{
+X  			syserr("cannot make %s", line);
+X--- 389,396 ----
+X  	if (init)
+X  	{
+X  		oldsigint = signal(SIGINT, SIG_IGN);
+X! 		(void) strcpy(line, AliasFile);
+X! 		(void) strcat(line, DB_PAGEXT);
+X  		if (close(creat(line, DBMMODE)) < 0)
+X  		{
+X  			syserr("cannot make %s", line);
+X***************
+X*** 364,371 ****
+X  			(void) signal(SIGINT, oldsigint);
+X  			return;
+X  		}
+X! 		(void) strcpy(line, aliasfile);
+X! 		(void) strcat(line, ".pag");
+X  		if (close(creat(line, DBMMODE)) < 0)
+X  		{
+X  			syserr("cannot make %s", line);
+X--- 397,404 ----
+X  			(void) signal(SIGINT, oldsigint);
+X  			return;
+X  		}
+X! 		(void) strcpy(line, AliasFile);
+X! 		(void) strcat(line, DB_DIREXT);
+X  		if (close(creat(line, DBMMODE)) < 0)
+X  		{
+X  			syserr("cannot make %s", line);
+X***************
+X*** 372,378 ****
+X  			(void) signal(SIGINT, oldsigint);
+X  			return;
+X  		}
+X! 		dbminit(aliasfile);
+X  	}
+X  
+X  	/*
+X--- 405,415 ----
+X  			(void) signal(SIGINT, oldsigint);
+X  			return;
+X  		}
+X! # ifdef NDBM
+X! 		mapinit(DB_ALIAS);
+X! # else NDBM
+X! 		dbminit(AliasFile);
+X! # endif NDBM
+X  	}
+X  
+X  	/*
+X***************
+X*** 379,385 ****
+X  	**  Read and interpret lines
+X  	*/
+X  
+X! 	FileName = aliasfile;
+X  	LineNumber = 0;
+X  	naliases = bytes = longest = 0;
+X  	skipping = FALSE;
+X--- 416,422 ----
+X  	**  Read and interpret lines
+X  	*/
+X  
+X! 	FileName = AliasFile;
+X  	LineNumber = 0;
+X  	naliases = bytes = longest = 0;
+X  	skipping = FALSE;
+X***************
+X*** 498,504 ****
+X--- 535,545 ----
+X  			key.dptr = al.q_user;
+X  			content.dsize = rhssize;
+X  			content.dptr = rhs;
+X+ # ifdef NDBM
+X+ 			(void) dbm_store(AliasDbm, key, content);
+X+ # else NDBM
+X  			store(key, content);
+X+ # endif NDBM
+X  		}
+X  		else
+X  # endif DBM
+X***************
+X*** 522,528 ****
+X--- 563,573 ----
+X  
+X  		key.dsize = 2;
+X  		key.dptr = "@";
+X+ # ifdef NDBM
+X+ 		(void) dbm_store(AliasDbm, key, key);
+X+ # else NDBM
+X  		store(key, key);
+X+ # endif NDBM
+X  
+X  		/* restore the old signal */
+X  		(void) signal(SIGINT, oldsigint);
+END_OF_ida/patches/alias.c.diff
+if test 9228 -ne `wc -c <ida/patches/alias.c.diff`; then
+    echo shar: \"ida/patches/alias.c.diff\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f ida/patches/deliver.c.diff -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"ida/patches/deliver.c.diff\"
+else
+echo shar: Extracting \"ida/patches/deliver.c.diff\" \(6664 characters\)
+sed "s/^X//" >ida/patches/deliver.c.diff <<'END_OF_ida/patches/deliver.c.diff'
+X*** deliver.c.orig	Thu May  5 20:40:23 1988
+X--- deliver.c	Fri Sep 23 19:56:56 1988
+X***************
+X*** 28,33 ****
+X--- 28,85 ----
+X  #include <resolv.h>
+X  
+X  /*
+X+ **  Status error messages
+X+ */
+X+ #define MAXENDERR	(sizeof(Enderr) / sizeof(*Enderr))
+X+ char *Enderr[] = {
+X+ 	"IMPOSSIBLE",
+X+ 	/* SIGHUP */	"hangup",
+X+ 	/* SIGINT */	"interrupt",
+X+ 	/* SIGQUIT */	"quit",
+X+ 	/* SIGILL */	"illegal instruction",
+X+ 	/* SIGTRAP */	"trace trap",
+X+ 	/* SIGIOT */	"IOT instruction",
+X+ 	/* SIGEMT */	"EMT instruction",
+X+ 	/* SIGFPE */	"floating point exception",
+X+ 	/* SIGKILL */	"kill",
+X+ 	/* SIGBUS */	"bus error",
+X+ 	/* SIGSEGV */	"segmentation violation",
+X+ 	/* SIGSYS */	"bad argument to system call",
+X+ 	/* SIGPIPE */	"write on a pipe with no one to read it",
+X+ 	/* SIGALRM */	"alarm clock",
+X+ 	/* SIGTERM */	"software termination signal",
+X+ 	/* SIGURG */	"urgent condition present on socket",
+X+ 	/* SIGSTOP */	"stop",
+X+ 	/* SIGTSTP */	"stop signal generated from keyboard",
+X+ 	/* SIGCONT */	"continue after stop",
+X+ 	/* SIGCHLD */	 "child status has changed",
+X+ 	/* SIGTTIN */	"background read attempted from control terminal",
+X+ 	/* SIGTTOU */	"background write attempted to control terminal",
+X+ 	/* SIGIO */	"I/O is possible on a descriptor",
+X+ 	/* SIGXCPU */	"cpu time limit exceeded",
+X+ 	/* SIGXFSZ */	"file size limit exceeded",
+X+ 	/* SIGVTALRM */	"virtual time alarm",
+X+ 	/* SIGPROF */	"profiling timer alarm",
+X+ 	/* SIGWINCH */	"window changed",
+X+ 	/* SIGLOST */	"resource lost",
+X+ 	/* SIGUSR1 */	"user-defined signal 1",
+X+ 	/* SIGUSR2 */	"user-defined signal 2"
+X+ };
+X+ 
+X+ /*
+X+ **  Name server error messages
+X+ */
+X+ #define MAXH_ERR		(sizeof(H_Errmsg) / sizeof(*H_Errmsg))
+X+ char *H_Errmsg[] = {
+X+ 	/* XXX */		"[Unknown error]",
+X+ 	/* HOST_NOT_FOUND */	"Authoritative answer from name server",
+X+ 	/* TRY_AGAIN */		"Non-authoritiatve answer or name server failure",
+X+ 	/* NO_RECOVERY */	"Non recoverable name server error",
+X+ 	/* NO_DATA */		"Valid name but no data [address]"
+X+ };
+X+ 
+X+ 
+X+ /*
+X  **  DELIVER -- Deliver a message to a list of addresses.
+X  **
+X  **	This routine delivers to everyone on the same host as the
+X***************
+X*** 131,137 ****
+X  
+X  	/* rewrite from address, using rewriting rules */
+X  	expand("\001f", buf, &buf[sizeof buf - 1], e);
+X! 	(void) strcpy(tfrombuf, remotename(buf, m, TRUE, TRUE));
+X  
+X  	define('g', tfrombuf, e);		/* translated sender address */
+X  	define('h', host, e);			/* to host */
+X--- 183,189 ----
+X  
+X  	/* rewrite from address, using rewriting rules */
+X  	expand("\001f", buf, &buf[sizeof buf - 1], e);
+X! 	(void) strcpy(tfrombuf, remotename(buf, m, TRUE, TRUE, FALSE));
+X  
+X  	define('g', tfrombuf, e);		/* translated sender address */
+X  	define('h', host, e);			/* to host */
+X***************
+X*** 371,377 ****
+X  
+X  	if (ctladdr == NULL)
+X  		ctladdr = &e->e_from;
+X! 	_res.options &= ~(RES_DEFNAMES | RES_DNSRCH);		/* XXX */
+X  #ifdef SMTP
+X  	if (clever) {
+X  		expand("\001w", buf, &buf[sizeof(buf) - 1], e);
+X--- 423,429 ----
+X  
+X  	if (ctladdr == NULL)
+X  		ctladdr = &e->e_from;
+X! 	/* _res.options &= ~(RES_DEFNAMES | RES_DNSRCH);		/* XXX */
+X  #ifdef SMTP
+X  	if (clever) {
+X  		expand("\001w", buf, &buf[sizeof(buf) - 1], e);
+X***************
+X*** 421,427 ****
+X  		message(Arpa_Info, "Connecting to %s (%s)...", host, m->m_name);
+X  		rcode = sendoff(e, m, pv, ctladdr);
+X  	}
+X! 	_res.options |= RES_DEFNAMES | RES_DNSRCH;	/* XXX */
+X  
+X  	/*
+X  	**  Do final status disposal.
+X--- 473,479 ----
+X  		message(Arpa_Info, "Connecting to %s (%s)...", host, m->m_name);
+X  		rcode = sendoff(e, m, pv, ctladdr);
+X  	}
+X! 	/* _res.options |= RES_DEFNAMES | RES_DNSRCH;	/* XXX */
+X  
+X  	/*
+X  	**  Do final status disposal.
+X***************
+X*** 647,653 ****
+X  	/* see if it died a horrid death */
+X  	if ((st & 0377) != 0)
+X  	{
+X! 		syserr("mailer %s died with signal %o", name, st);
+X  		ExitStat = EX_TEMPFAIL;
+X  		return (EX_TEMPFAIL);
+X  	}
+X--- 699,707 ----
+X  	/* see if it died a horrid death */
+X  	if ((st & 0377) != 0)
+X  	{
+X! 		syserr("%s died because of %s (%d)--requeueing message",
+X! 		       name, ((st >= 0) && (st < MAXENDERR)) ?
+X! 		       Enderr[st] : "unknown error code", st);
+X  		ExitStat = EX_TEMPFAIL;
+X  		return (EX_TEMPFAIL);
+X  	}
+X***************
+X*** 1006,1013 ****
+X  		message(Arpa_Info, &statmsg[4]);
+X  	else
+X  	{
+X  		Errors++;
+X! 		usrerr(statmsg);
+X  	}
+X  
+X  	/*
+X--- 1060,1073 ----
+X  		message(Arpa_Info, &statmsg[4]);
+X  	else
+X  	{
+X+ 		extern char Arpa_Usrerr[];
+X+ 
+X  		Errors++;
+X! 		if (stat == EX_NOHOST && h_errno != 0)
+X! 			usrerr("%s (%s)", statmsg,
+X! 				H_Errmsg[h_errno > MAXH_ERR ? 0 : h_errno]);
+X! 		else
+X! 			usrerr(statmsg);
+X  	}
+X  
+X  	/*
+X***************
+X*** 1079,1110 ****
+X  	register FILE *fp;
+X  	register MAILER *m;
+X  {
+X! 	char *template = "\001l\n";
+X  	char buf[MAXLINE];
+X  
+X  	if (bitnset(M_NHDR, m->m_flags))
+X  		return;
+X  
+X  # ifdef UGLYUUCP
+X  	if (bitnset(M_UGLYUUCP, m->m_flags))
+X  	{
+X  		char *bang;
+X- 		char xbuf[MAXLINE];
+X  
+X  		expand("\001g", buf, &buf[sizeof buf - 1], CurEnv);
+X  		bang = index(buf, '!');
+X  		if (bang == NULL)
+X! 			syserr("No ! in UUCP! (%s)", buf);
+X  		else
+X  		{
+X  			*bang++ = '\0';
+X! 			(void) sprintf(xbuf, "From %s  \001d remote from %s\n", bang, buf);
+X! 			template = xbuf;
+X  		}
+X  	}
+X  # endif UGLYUUCP
+X  	expand(template, buf, &buf[sizeof buf - 1], CurEnv);
+X  	putline(buf, fp, m);
+X  }
+X  /*
+X  **  PUTBODY -- put the body of a message.
+X--- 1139,1192 ----
+X  	register FILE *fp;
+X  	register MAILER *m;
+X  {
+X! 	extern char *macvalue();
+X! 	char *oldg = macvalue('g', CurEnv);
+X! 	char template[MAXLINE];
+X! 	char newg[MAXLINE];
+X  	char buf[MAXLINE];
+X  
+X+ 	strcpy(template, "\001l\n");
+X+ 
+X  	if (bitnset(M_NHDR, m->m_flags))
+X  		return;
+X  
+X+ 	/* construct path through us if needed */
+X+ 	if (bitnset(M_FROMPATH, m->m_flags)) {
+X+ 		char myname[MAXLINE];
+X+ 
+X+ 		expand("\001k", myname, &myname[sizeof myname - 1], CurEnv);
+X+ 		if (index(oldg, '!') == NULL
+X+ 		    || strncmp(oldg, myname, strlen(myname)) != 0) {
+X+ 			sprintf(newg, "%s!%s", myname, oldg);
+X+ 			define('g', newg, CurEnv);
+X+ 		}
+X+ 	}
+X+ 
+X  # ifdef UGLYUUCP
+X  	if (bitnset(M_UGLYUUCP, m->m_flags))
+X  	{
+X  		char *bang;
+X  
+X  		expand("\001g", buf, &buf[sizeof buf - 1], CurEnv);
+X  		bang = index(buf, '!');
+X  		if (bang == NULL)
+X! 			syserr("No `!' in UUCP envelope \"from\" address! (%s)",
+X! 			       buf);
+X  		else
+X  		{
+X  			*bang++ = '\0';
+X! 			(void) sprintf(template,
+X! 				       "From %s  \001d remote from %s\n",
+X! 				       bang, buf);
+X  		}
+X  	}
+X  # endif UGLYUUCP
+X  	expand(template, buf, &buf[sizeof buf - 1], CurEnv);
+X  	putline(buf, fp, m);
+X+ 
+X+ 	/* redefine old from address */
+X+ 	if (bitnset(M_FROMPATH, m->m_flags))
+X+ 		define('g', oldg, CurEnv);
+X  }
+X  /*
+X  **  PUTBODY -- put the body of a message.
+END_OF_ida/patches/deliver.c.diff
+if test 6664 -ne `wc -c <ida/patches/deliver.c.diff`; then
+    echo shar: \"ida/patches/deliver.c.diff\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f ida/patches/main.c.diff -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"ida/patches/main.c.diff\"
+else
+echo shar: Extracting \"ida/patches/main.c.diff\" \(8294 characters\)
+sed "s/^X//" >ida/patches/main.c.diff <<'END_OF_ida/patches/main.c.diff'
+X*** main.c.orig	Tue Apr 19 21:40:01 1988
+X--- main.c	Fri Aug 26 03:10:02 1988
+X***************
+X*** 110,116 ****
+X  	bool queuemode = FALSE;		/* process queue requests */
+X  	bool nothaw;
+X  	static bool reenter = FALSE;
+X! 	char jbuf[30];			/* holds MyHostName */
+X  	extern bool safefile();
+X  	extern time_t convtime();
+X  	extern putheader(), putbody();
+X--- 110,116 ----
+X  	bool queuemode = FALSE;		/* process queue requests */
+X  	bool nothaw;
+X  	static bool reenter = FALSE;
+X! 	char jbuf[60];			/* holds MyHostName */
+X  	extern bool safefile();
+X  	extern time_t convtime();
+X  	extern putheader(), putbody();
+X***************
+X*** 118,123 ****
+X--- 118,124 ----
+X  	extern intsig();
+X  	extern char **myhostname();
+X  	extern char *arpadate();
+X+ 	extern char *index();
+X  	extern char **environ;
+X  
+X  	/*
+X***************
+X*** 134,140 ****
+X--- 135,143 ----
+X  	reenter = TRUE;
+X  
+X  	/* Enforce use of local time */
+X+ #ifndef sun
+X  	unsetenv("TZ");
+X+ #endif !sun
+X  
+X  	/*
+X  	**  Be sure we have enough file descriptors.
+X***************
+X*** 187,192 ****
+X--- 190,203 ----
+X  		}
+X  		else if (strncmp(p, "-bz", 3) == 0)
+X  			nothaw = TRUE;
+X+ 		else if (strncmp(p, "-Z", 2) == 0)
+X+ 		{
+X+ 			FreezeFile = &p[2];
+X+ 			if (FreezeFile[0] == '\0')
+X+ 				FreezeFile = "sendmail.fc";
+X+ 			(void) setgid(getrgid());
+X+ 			(void) setuid(getruid());
+X+ 		}
+X  # ifdef DEBUG
+X  		else if (strncmp(p, "-d", 2) == 0)
+X  		{
+X***************
+X*** 236,242 ****
+X--- 247,257 ----
+X  	FullName = getenv("NAME");
+X  
+X  # ifdef LOG
+X+ #ifndef sun
+X  	openlog("sendmail", LOG_PID, LOG_MAIL);
+X+ #else
+X+ 	openlog("sendmail", LOG_PID);
+X+ #endif
+X  # endif LOG
+X  	errno = 0;
+X  	from = NULL;
+X***************
+X*** 257,262 ****
+X--- 272,281 ----
+X  			p = newstr(jbuf);
+X  			define('w', p, CurEnv);
+X  			setclass('w', p);
+X+ 			if ((p = index(jbuf, '.')) != NULL)
+X+ 				*p = '\0';
+X+ 			makelower(jbuf);
+X+ 			define('k', newstr(jbuf), CurEnv);
+X  		}
+X  		while (av != NULL && *av != NULL)
+X  		{
+X***************
+X*** 288,293 ****
+X--- 307,314 ----
+X  		OpMode = MD_PRINT;
+X  	else if (strcmp(p, "smtpd") == 0)
+X  		OpMode = MD_DAEMON;
+X+ 	else if (strcmp(p, "bsmtp") == 0)
+X+ 		OpMode = MD_BSMTP;
+X  	while ((p = *++av) != NULL && p[0] == '-')
+X  	{
+X  		switch (p[1])
+X***************
+X*** 301,306 ****
+X--- 322,328 ----
+X  				break;
+X  # endif DAEMON
+X  			  case MD_SMTP:
+X+ 			  case MD_BSMTP:
+X  # ifndef SMTP
+X  				syserr("I don't speak SMTP");
+X  				break;
+X***************
+X*** 324,335 ****
+X  		  case 'C':	/* select configuration file (already done) */
+X  			break;
+X  
+X  #ifdef DEBUG
+X  		  case 'd':	/* debugging -- redo in case frozen */
+X  			tTsetup(tTdvect, sizeof tTdvect, "0-99.1");
+X  			tTflag(&p[2]);
+X  			setbuf(stdout, (char *) NULL);
+X! 			_res.options |= RES_DEBUG;
+X  			break;
+X  #endif
+X  
+X--- 346,361 ----
+X  		  case 'C':	/* select configuration file (already done) */
+X  			break;
+X  
+X+ 		  case 'Z':	/* select frozen config file (already done) */
+X+ 			break;
+X+ 
+X  #ifdef DEBUG
+X  		  case 'd':	/* debugging -- redo in case frozen */
+X  			tTsetup(tTdvect, sizeof tTdvect, "0-99.1");
+X  			tTflag(&p[2]);
+X  			setbuf(stdout, (char *) NULL);
+X! 			if (tTd(8, 8))
+X! 				_res.options |= RES_DEBUG;
+X  			break;
+X  #endif
+X  
+X***************
+X*** 496,502 ****
+X  
+X  	  case MD_INITALIAS:
+X  		/* initialize alias database */
+X! 		initaliases(AliasFile, TRUE);
+X  		exit(EX_OK);
+X  
+X  	  case MD_DAEMON:
+X--- 522,528 ----
+X  
+X  	  case MD_INITALIAS:
+X  		/* initialize alias database */
+X! 		initaliases(TRUE);
+X  		exit(EX_OK);
+X  
+X  	  case MD_DAEMON:
+X***************
+X*** 505,511 ****
+X  
+X  	  default:
+X  		/* open the alias database */
+X! 		initaliases(AliasFile, FALSE);
+X  		break;
+X  	}
+X  
+X--- 531,537 ----
+X  
+X  	  default:
+X  		/* open the alias database */
+X! 		initaliases(FALSE);
+X  		break;
+X  	}
+X  
+X***************
+X*** 521,529 ****
+X  
+X  			if (m == NULL)
+X  				continue;
+X! 			printf("mailer %d (%s): P=%s S=%d R=%d M=%ld F=", i, m->m_name,
+X! 				m->m_mailer, m->m_s_rwset, m->m_r_rwset,
+X! 				m->m_maxsize);
+X  			for (j = '\0'; j <= '\177'; j++)
+X  				if (bitnset(j, m->m_flags))
+X  					(void) putchar(j);
+X--- 547,556 ----
+X  
+X  			if (m == NULL)
+X  				continue;
+X! 			printf("mailer %d (%s): P=%s S=%d/%d R=%d/%d M=%ld F=",
+X! 				i, m->m_name, m->m_mailer,
+X! 				m->m_se_rwset, m->m_sh_rwset,
+X! 				m->m_re_rwset, m->m_rh_rwset, m->m_maxsize);
+X  			for (j = '\0'; j <= '\177'; j++)
+X  				if (bitnset(j, m->m_flags))
+X  					(void) putchar(j);
+X***************
+X*** 550,555 ****
+X--- 577,583 ----
+X  		char buf[MAXLINE];
+X  
+X  		printf("ADDRESS TEST MODE\nEnter <ruleset> <address>\n");
+X+ 		printf("[Note: No initial ruleset 3 call]\n");
+X  		for (;;)
+X  		{
+X  			register char **pvp;
+X***************
+X*** 576,582 ****
+X  				pvp = prescan(++p, ',', pvpbuf);
+X  				if (pvp == NULL)
+X  					continue;
+X! 				rewrite(pvp, 3);
+X  				p = q;
+X  				while (*p != '\0')
+X  				{
+X--- 604,610 ----
+X  				pvp = prescan(++p, ',', pvpbuf);
+X  				if (pvp == NULL)
+X  					continue;
+X! 				/* rewrite(pvp, 3); */
+X  				p = q;
+X  				while (*p != '\0')
+X  				{
+X***************
+X*** 654,661 ****
+X  	**  commands.  This will never return.
+X  	*/
+X  
+X! 	if (OpMode == MD_SMTP)
+X! 		smtp();
+X  # endif SMTP
+X  
+X  	/*
+X--- 682,694 ----
+X  	**  commands.  This will never return.
+X  	*/
+X  
+X! 	if (OpMode == MD_SMTP || OpMode == MD_BSMTP) {
+X! 		bool batched = (OpMode == MD_BSMTP);
+X! 		OpMode = MD_SMTP;
+X! 		/* have to run unbuffered or else will lose synchronization */
+X! 		setbuf(InChannel, (char *) NULL);
+X! 		smtp(batched);
+X! 	}
+X  # endif SMTP
+X  
+X  	/*
+X***************
+X*** 794,805 ****
+X  **		initializes several macros to be themselves.
+X  */
+X  
+X- struct metamac
+X- {
+X- 	char	metaname;
+X- 	char	metaval;
+X- };
+X- 
+X  struct metamac	MetaMacros[] =
+X  {
+X  	/* LHS pattern matching characters */
+X--- 827,832 ----
+X***************
+X*** 812,820 ****
+X  	/* the conditional operations */
+X  	'?', CONDIF,	'|', CONDELSE,	'.', CONDFI,
+X  
+X! 	/* and finally the hostname lookup characters */
+X  	'[', HOSTBEGIN,	']', HOSTEND,
+X  
+X  	'\0'
+X  };
+X  
+X--- 839,855 ----
+X  	/* the conditional operations */
+X  	'?', CONDIF,	'|', CONDELSE,	'.', CONDFI,
+X  
+X! 	/* and finally the hostname and database lookup characters */
+X  	'[', HOSTBEGIN,	']', HOSTEND,
+X+ 	'(', KEYBEGIN,	')', KEYEND,
+X  
+X+ #ifdef MACVALUE
+X+ 	/* run-time macro expansion, not at freeze time */
+X+ 	'&', MACVALUE,
+X+ #endif
+X+ #ifdef QUOTE822
+X+ 	'!', QUOTE822,	/* quote next macro if RFC822 requires it */
+X+ #endif
+X  	'\0'
+X  };
+X  
+X***************
+X*** 863,868 ****
+X--- 898,904 ----
+X  		char	*frzedata;	/* address of edata */
+X  		char	*frzend;	/* address of end */
+X  		char	frzver[252];	/* sendmail version */
+X+ 		char	frzdatecompiled[64];	/* sendmail compilation date */
+X  	} frzinfo;
+X  };
+X  
+X***************
+X*** 874,879 ****
+X--- 910,916 ----
+X  	extern char edata, end;
+X  	extern char *sbrk();
+X  	extern char Version[];
+X+ 	extern char datecompiled[];
+X  
+X  	if (freezefile == NULL)
+X  		return;
+X***************
+X*** 893,898 ****
+X--- 930,936 ----
+X  	fhdr.frzinfo.frzedata = &edata;
+X  	fhdr.frzinfo.frzend = &end;
+X  	(void) strcpy(fhdr.frzinfo.frzver, Version);
+X+ 	(void) strcpy(fhdr.frzinfo.frzdatecompiled, datecompiled);
+X  
+X  	/* write out the freeze header */
+X  	if (write(f, (char *) &fhdr, sizeof fhdr) != sizeof fhdr ||
+X***************
+X*** 926,931 ****
+X--- 964,970 ----
+X  	union frz fhdr;
+X  	extern char edata, end;
+X  	extern char Version[];
+X+ 	extern char datecompiled[];
+X  	extern caddr_t brk();
+X  
+X  	if (freezefile == NULL)
+X***************
+X*** 943,949 ****
+X  	if (read(f, (char *) &fhdr, sizeof fhdr) < sizeof fhdr ||
+X  	    fhdr.frzinfo.frzedata != &edata ||
+X  	    fhdr.frzinfo.frzend != &end ||
+X! 	    strcmp(fhdr.frzinfo.frzver, Version) != 0)
+X  	{
+X  		(void) close(f);
+X  		return (FALSE);
+X--- 982,989 ----
+X  	if (read(f, (char *) &fhdr, sizeof fhdr) < sizeof fhdr ||
+X  	    fhdr.frzinfo.frzedata != &edata ||
+X  	    fhdr.frzinfo.frzend != &end ||
+X! 	    strcmp(fhdr.frzinfo.frzver, Version) != 0 ||
+X! 	    strcmp(fhdr.frzinfo.frzdatecompiled, datecompiled) != 0)
+X  	{
+X  		(void) close(f);
+X  		return (FALSE);
+X***************
+X*** 1010,1016 ****
+X  
+X  	/* we can't communicate with our caller, so.... */
+X  	HoldErrs = TRUE;
+X! 	ErrorMode = EM_MAIL;
+X  	Verbose = FALSE;
+X  
+X  	/* all input from /dev/null */
+X--- 1050,1056 ----
+X  
+X  	/* we can't communicate with our caller, so.... */
+X  	HoldErrs = TRUE;
+X! 	setoption('e', "m", TRUE, TRUE);
+X  	Verbose = FALSE;
+X  
+X  	/* all input from /dev/null */
+END_OF_ida/patches/main.c.diff
+if test 8294 -ne `wc -c <ida/patches/main.c.diff`; then
+    echo shar: \"ida/patches/main.c.diff\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f ida/patches/recipient.c.diff -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"ida/patches/recipient.c.diff\"
+else
+echo shar: Extracting \"ida/patches/recipient.c.diff\" \(5359 characters\)
+sed "s/^X//" >ida/patches/recipient.c.diff <<'END_OF_ida/patches/recipient.c.diff'
+X*** recipient.c.orig	Mon Mar 14 05:31:54 1988
+X--- recipient.c	Wed Aug 24 16:44:19 1988
+X***************
+X*** 306,311 ****
+X--- 306,312 ----
+X  			if (pw == NULL)
+X  			{
+X  				a->q_flags |= QBADADDR;
+X+ 				errno = 0;	/* no special error */
+X  				giveresponse(EX_NOUSER, m, CurEnv);
+X  			}
+X  			else
+X***************
+X*** 351,356 ****
+X--- 352,360 ----
+X  **		may modify name.
+X  */
+X  
+X+ #define WORST_MATCH	-2		/* even worse than no match */
+X+ #define NO_UID		-999		/* any "impossible" uid will do */
+X+ 
+X  struct passwd *
+X  finduser(name)
+X  	char *name;
+X***************
+X*** 357,365 ****
+X--- 361,374 ----
+X  {
+X  	register struct passwd *pw;
+X  	register char *p;
+X+ 	int best_match = WORST_MATCH;
+X+ 	int best_uid = NO_UID;
+X  	extern struct passwd *getpwent();
+X  	extern struct passwd *getpwnam();
+X+ 	extern struct passwd *getpwuid();
+X  
+X+ 	errno = 0;
+X+ 
+X  	/* map upper => lower case */
+X  	for (p = name; *p != '\0'; p++)
+X  	{
+X***************
+X*** 367,395 ****
+X  			*p = tolower(*p);
+X  	}
+X  
+X  	/* look up this login name using fast path */
+X  	if ((pw = getpwnam(name)) != NULL)
+X  		return (pw);
+X  
+X! 	/* search for a matching full name instead */
+X! 	for (p = name; *p != '\0'; p++)
+X! 	{
+X! 		if (*p == (SpaceSub & 0177) || *p == '_')
+X! 			*p = ' ';
+X! 	}
+X  	(void) setpwent();
+X  	while ((pw = getpwent()) != NULL)
+X  	{
+X  		char buf[MAXNAME];
+X  
+X! 		buildfname(pw->pw_gecos, pw->pw_name, buf);
+X! 		if (index(buf, ' ') != NULL && !strcasecmp(buf, name))
+X! 		{
+X! 			message(Arpa_Info, "sending to login name %s", pw->pw_name);
+X! 			return (pw);
+X  		}
+X  	}
+X! 	return (NULL);
+X  }
+X  /*
+X  **  WRITABLE -- predicate returning if the file is writable.
+X--- 376,521 ----
+X  			*p = tolower(*p);
+X  	}
+X  
+X+ # ifdef DEBUG
+X+ 	if (tTd(26, 6))
+X+ 		printf("%s password entry for \"%s\"\n",
+X+ 		       getpwnam(name) ? "found" : "can't find", name);
+X+ # endif DEBUG
+X+ 
+X  	/* look up this login name using fast path */
+X  	if ((pw = getpwnam(name)) != NULL)
+X  		return (pw);
+X  
+X! # ifdef DEBUG
+X! 	if (tTd(26, 6))
+X! 		printf("looking for partial match to \"%s\"\n", name);
+X! # endif DEBUG
+X  	(void) setpwent();
+X  	while ((pw = getpwent()) != NULL)
+X  	{
+X  		char buf[MAXNAME];
+X+ 		register int this_match;
+X  
+X! 		if (strcasecmp(pw->pw_name, name) == 0) {
+X! # ifdef DEBUG
+X! 		    if (tTd(26, 6))
+X! 			printf("found password entry for \"%s\" as \"%s\"\n",
+X! 				   name, pw->pw_name);
+X! # endif DEBUG
+X! 		    return (pw);
+X  		}
+X+ 
+X+ 		buildfname(pw->pw_gecos, pw->pw_name, buf);
+X+ 		this_match = partialstring(buf, name);
+X+ # ifdef DEBUG
+X+ 		if (tTd(26, 6 && this_match >= 0))
+X+ 			printf("matched on level %d with \"%s\"\n",
+X+ 			       this_match, buf);
+X+ # endif DEBUG
+X+ 		if (this_match < best_match)
+X+ 			continue;
+X+ 		else if (this_match > best_match) {
+X+ 			best_match = this_match;
+X+ 			best_uid = pw->pw_uid;
+X+ 		} else if (best_uid != pw->pw_uid)
+X+ 			best_uid = NO_UID;
+X  	}
+X! # ifdef DEBUG
+X! 		if (tTd(26, 6))
+X! 			if (best_match == WORST_MATCH)
+X! 				printf("no match, failing...\n");
+X! 			else if (best_uid == NO_UID)
+X! 				printf("ambiguous match, failing...\n");
+X! 			else
+X! 				printf("succeding on level %d...\n",
+X! 				       best_match);
+X! # endif DEBUG
+X! 
+X! 	if (best_uid == NO_UID)
+X! 		return (NULL);
+X! 
+X! 	pw = getpwuid(best_uid);
+X! 	message(Arpa_Info, "sending to login name %s", pw->pw_name);
+X! 	return (pw);
+X! }
+X! /*
+X! **  PARTIALSTRING -- is one string of words contained by another?
+X! **
+X! **	See if one string of words can be found as part of
+X! **	another string of words.  All substrings delimited by
+X! **	one or more non-alphanumeric characters are considered
+X! **	"words", and a partial match is such that all the words
+X! **	of the pattern string are either full prefixes
+X! **	of the target string.  Upper or lower case letters are
+X! **	considered equal.
+X! **
+X! **	Parameters:
+X! **		target -- target string
+X! **		pattern -- pattern string
+X! **
+X! **	Returns:
+X! **		The number of fully matched words, or -1 if none.
+X! **
+X! **	Side Effects:
+X! **		None.
+X! **
+X! */
+X! 
+X! partialstring(target, pattern)
+X!     char *target;
+X!     char *pattern;
+X! {
+X!     register char *t, *p, *q;
+X!     int full_words = 0;
+X! 
+X!     /* skip initial delimiters */
+X!     for (t = target; *t != '\0' && !isalnum(*t); t++);
+X!     for (p = pattern; *p != '\0' && !isalnum(*p); p++);
+X!     q = p;
+X! 
+X!     while (*t != '\0' && *p != '\0') {
+X! 	/*
+X! 	 * if at end of pattern word, find next, remember it,
+X! 	 * and eat the current target word
+X! 	 */
+X! 	if (!isalnum(*p)) {
+X! 	    while (*p != '\0' && !isalnum(*p)) p++;
+X! 	    if (*p == '\0')
+X! 		continue;
+X! 	    q = p;
+X! 	    if (!isalnum(*t)) {
+X! 		full_words++;
+X! 	    }
+X! 	    while (*t != '\0' && isalnum(*t)) t++;
+X! 	    while (*t != '\0' && !isalnum(*t)) t++;
+X! 	    continue;
+X! 	}
+X! 
+X! 	/*
+X! 	 * if match, advance both pointers
+X! 	 */
+X! 	if ((isupper(*t) ? tolower(*t) : *t) ==
+X! 	    (isupper(*p) ? tolower(*p) : *p)) {
+X! 	    t++, p++;
+X! 	    continue;
+X! 	}
+X! 
+X! 	/*
+X! 	 * if no match, backtrack to last unmatched pattern word and
+X! 	 * eat current target word
+X! 	 */
+X! 	p = q;
+X! 	while (*t != '\0' && isalnum(*t)) t++;
+X! 	while (*t != '\0' && !isalnum(*t)) t++;
+X!     }
+X! 
+X!     /*
+X!      * now, the pattern should be fully consumed if there was a match
+X!      */
+X!     if (*p == '\0')
+X! 	return isalnum(*t) ? full_words : full_words + 1;
+X!     else
+X! 	return -1;
+X  }
+X  /*
+X  **  WRITABLE -- predicate returning if the file is writable.
+END_OF_ida/patches/recipient.c.diff
+if test 5359 -ne `wc -c <ida/patches/recipient.c.diff`; then
+    echo shar: \"ida/patches/recipient.c.diff\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+if test -f ida/patches/sendmail.h.diff -a "${1}" != "-c" ; then 
+  echo shar: Will not over-write existing file \"ida/patches/sendmail.h.diff\"
+else
+echo shar: Extracting \"ida/patches/sendmail.h.diff\" \(7004 characters\)
+sed "s/^X//" >ida/patches/sendmail.h.diff <<'END_OF_ida/patches/sendmail.h.diff'
+X*** sendmail.h.orig	Mon Mar 28 09:24:51 1988
+X--- sendmail.h	Fri Aug 26 03:59:10 1988
+X***************
+X*** 37,43 ****
+X  # include "useful.h"
+X  
+X  # ifdef LOG
+X! # include <sys/syslog.h>
+X  # endif LOG
+X  
+X  # ifdef DAEMON
+X--- 37,47 ----
+X  # include "useful.h"
+X  
+X  # ifdef LOG
+X! #  ifdef vax
+X! #   include <sys/syslog.h>
+X! #  else vax
+X! #   include <syslog.h>
+X! #  endif vax
+X  # endif LOG
+X  
+X  # ifdef DAEMON
+X***************
+X*** 126,133 ****
+X  	BITMAP	m_flags;	/* status flags, see below */
+X  	short	m_mno;		/* mailer number internally */
+X  	char	**m_argv;	/* template argument vector */
+X! 	short	m_s_rwset;	/* rewriting set for sender addresses */
+X! 	short	m_r_rwset;	/* rewriting set for recipient addresses */
+X  	char	*m_eol;		/* end of line string */
+X  	long	m_maxsize;	/* size limit on message to this mailer */
+X  };
+X--- 130,139 ----
+X  	BITMAP	m_flags;	/* status flags, see below */
+X  	short	m_mno;		/* mailer number internally */
+X  	char	**m_argv;	/* template argument vector */
+X! 	short	m_se_rwset;	/* rewriting ruleset for envelope senders */
+X! 	short	m_sh_rwset;	/* rewriting ruleset for header senders */
+X! 	short	m_re_rwset;	/* rewriting ruleset for envelope recipients */
+X! 	short	m_rh_rwset;	/* rewriting ruleset for header recipient */
+X  	char	*m_eol;		/* end of line string */
+X  	long	m_maxsize;	/* size limit on message to this mailer */
+X  };
+X***************
+X*** 135,140 ****
+X--- 141,147 ----
+X  typedef struct mailer	MAILER;
+X  
+X  /* bits for m_flags */
+X+ # define M_BSMTP	'B'	/* don't wait for SMTP responses */
+X  # define M_CANONICAL	'C'	/* make addresses canonical "u@dom" */
+X  # define M_EXPENSIVE	'e'	/* it costs to use this mailer.... */
+X  # define M_ESCFROM	'E'	/* escape From lines to >From */
+X***************
+X*** 152,157 ****
+X--- 159,165 ----
+X  # define M_RESTR	'S'	/* must be daemon to execute */
+X  # define M_USR_UPPER	'u'	/* preserve user case distinction */
+X  # define M_UGLYUUCP	'U'	/* this wants an ugly UUCP from line */
+X+ # define M_RELATIVIZE	'V'	/* !-relativize all addresses */
+X  # define M_XDOT		'X'	/* use hidden-dot algorithm */
+X  
+X  EXTERN MAILER	*Mailer[MAXMAILERS+1];
+X***************
+X*** 249,254 ****
+X--- 257,265 ----
+X  #define EF_RESPONSE	000200		/* this is an error or return receipt */
+X  #define EF_RESENT	000400		/* this message is being forwarded */
+X  
+X+ /* special shadowing null for e_macro's */
+X+ #define MACNULL		((char *) 1)	/* don't check parent's value */
+X+ 
+X  EXTERN ENVELOPE	*CurEnv;	/* envelope currently being processed */
+X  /*
+X  **  Message priority classes.
+X***************
+X*** 322,331 ****
+X  # define CONDELSE	'\033'	/* conditional else */
+X  # define CONDFI		'\034'	/* conditional fi */
+X  
+X! /* bracket characters for host name lookup */
+X  # define HOSTBEGIN	'\035'	/* hostname lookup begin */
+X  # define HOSTEND	'\036'	/* hostname lookup end */
+X  
+X  /* \001 is also reserved as the macro expansion character */
+X  /*
+X  **  Information about hosts that we have looked up recently.
+X--- 333,348 ----
+X  # define CONDELSE	'\033'	/* conditional else */
+X  # define CONDFI		'\034'	/* conditional fi */
+X  
+X! /* bracket characters for host name & database keyed lookup */
+X  # define HOSTBEGIN	'\035'	/* hostname lookup begin */
+X  # define HOSTEND	'\036'	/* hostname lookup end */
+X+ # define KEYBEGIN	'\037'	/* keyed lookup begin */
+X+ # define KEYEND		'\017'	/* keyed lookup end */
+X  
+X+ /* other miscellaneous */
+X+ # define MACVALUE	'\016'	/* delayed macro expansion $& */
+X+ # define QUOTE822	'\015'	/* quote next macro if RFC822 requires it */
+X+ 
+X  /* \001 is also reserved as the macro expansion character */
+X  /*
+X  **  Information about hosts that we have looked up recently.
+X***************
+X*** 384,389 ****
+X--- 401,411 ----
+X  # define ST_ALIAS	4	/* an alias */
+X  # define ST_HOST	5	/* host information */
+X  
+X+ /* s_host is defined is /usr/include/whatever on Suns */
+X+ # ifdef s_host
+X+ #  undef s_host
+X+ # endif
+X+ 
+X  # define s_class	s_value.sv_class
+X  # define s_address	s_value.sv_addr
+X  # define s_mailer	s_value.sv_mailer
+X***************
+X*** 446,451 ****
+X--- 468,474 ----
+X  
+X  
+X  EXTERN char	SendMode;	/* send mode, see below */
+X+ #define MD_BSMTP	'b'		/* batched smtp mode */
+X  
+X  #define SM_DELIVER	'i'		/* interactive delivery */
+X  #define SM_QUICKD	'j'		/* deliver w/o queueing */
+X***************
+X*** 470,475 ****
+X--- 493,537 ----
+X   */
+X  #define	MAX_ERRNO	100
+X  /*
+X+ **  Database ([n]dbm) definitions.
+X+ */
+X+ 
+X+ #ifdef DBM
+X+ 
+X+ typedef struct {
+X+ 	char	*dptr;
+X+ 	int	dsize;
+X+ } DATUM;
+X+ 
+X+ # define DB_DIREXT	".dir"
+X+ # define DB_PAGEXT	".pag"
+X+ 
+X+ # ifdef NDBM
+X+ 
+X+ #  undef DBM			/* while including ndbm.h */
+X+ #  include <ndbm.h>		/* DBM is typedef'ed here */
+X+ typedef DBM DBMFILE;		/* move typedef to DBMFILE */
+X+ #  define DBM			/* and restore DBM definition */
+X+ #  include <fcntl.h>		/* needed for dbm_open */
+X+ 
+X+ #  define DATUM datum		/* use the definition in ndbm.h */
+X+ 
+X+ struct dbm_table {
+X+   char *db_name;		/* database file name */
+X+   time_t db_mtime;		/* last modify time */
+X+   DBMFILE *db_dbm;		/* dbm file descriptor */
+X+ };
+X+ 
+X+ #  define DB_NOSUCHFILE	((DBMFILE *)  0) /* file could not be found */
+X+ #  define DB_NOTYETOPEN	((DBMFILE *) -1) /* file has not yet been opened */
+X+ 
+X+ #  define DB_ALIAS	'@'	/* "name" of aliases database */
+X+ #  define AliasFile	DbmTab[DB_ALIAS].db_name
+X+ #  define AliasDbm	DbmTab[DB_ALIAS].db_dbm
+X+ 
+X+ # endif NDBM
+X+ #endif DBM
+X+ /*
+X  **  Global variables.
+X  */
+X  
+X***************
+X*** 511,517 ****
+X--- 573,581 ----
+X  EXTERN int	RefuseLA;	/* load average refusing connections are */
+X  EXTERN int	QueueFactor;	/* slope of queue function */
+X  EXTERN time_t	QueueIntvl;	/* intervals between running the queue */
+X+ #ifndef NDBM
+X  EXTERN char	*AliasFile;	/* location of alias file */
+X+ #endif !NDBM
+X  EXTERN char	*HelpFile;	/* location of SMTP help file */
+X  EXTERN char	*StatFile;	/* location of statistics summary */
+X  EXTERN char	*QueueDir;	/* location of queue directory */
+X***************
+X*** 533,538 ****
+X--- 597,603 ----
+X  EXTERN int	CheckPointLimit;	/* deliveries before checkpointing */
+X  EXTERN int	Nmx;			/* number of MX RRs */
+X  EXTERN char	*PostMasterCopy;	/* address to get errs cc's */
+X+ EXTERN bool	SplitRewriting;	/* use split envelope/header rewriting */
+X  EXTERN char	*MxHosts[MAXMXHOSTS+1];	/* for MX RRs */
+X  EXTERN char	*TrustedUsers[MAXTRUST+1];	/* list of trusted users */
+X  EXTERN char	*UserEnviron[MAXUSERENVIRON+1];	/* saved user environment */
+X***************
+X*** 539,544 ****
+X--- 604,615 ----
+X  /*
+X  **  Trace information
+X  */
+X+ #ifdef NDBM
+X+ EXTERN struct dbm_table DbmTab[128];	/* keyed database table */
+X+ #ifdef YP
+X+ #define YPMARK	'%'			/* yellow pages indicator */
+X+ #endif YP
+X+ #endif NDBM
+X  
+X  /* trace vector and macros for debugging flags */
+X  EXTERN u_char	tTdvect[100];
+X***************
+X*** 579,581 ****
+X--- 650,664 ----
+X  extern char	*sfgets();
+X  extern char	*queuename();
+X  extern time_t	curtime();
+X+ 
+X+ /*
+X+ **  Metamacro definitions.
+X+ */
+X+ 
+X+ struct metamac
+X+ {
+X+ 	char	metaname;
+X+ 	char	metaval;
+X+ };
+X+ 
+X+ extern struct metamac	MetaMacros[];
+END_OF_ida/patches/sendmail.h.diff
+if test 7004 -ne `wc -c <ida/patches/sendmail.h.diff`; then
+    echo shar: \"ida/patches/sendmail.h.diff\" unpacked with wrong size!
+fi
+# end of overwriting check
+fi
+echo shar: End of archive 3 \(of 8\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 8 archives.
+    echo "See ida/README and ida/INSTALL for further directions."
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+

@@ -1,0 +1,1544 @@
+From: talcott!topaz!hedrick (Charles Hedrick)
+Subject: telnetd in the kernel
+Newsgroups: mod.sources
+Approved: jpn@panda.UUCP
+
+Mod.sources:  Volume 4, Issue 90
+Submitted by: talcott!topaz!hedrick (Charles Hedrick)
+
+[ I haven't tried any of this - you're on your own - mod ]
+
+This is a modified version of the posting a couple of weeks ago by
+nyit!rick.  The original one moved the performance-critical part of
+rlogin into the kernel.  My version handles both rlogin and telnet.
+Note however, that it handles only the server part.  In our
+environment, many users have lines connected to terminal servers that
+speak Telnet.  We would like to be able to have a machine all of whose
+users are coming in via Telnet.  I am much less concerned about
+outgoing Telnet.  (After all, we can just hit BREAK and open another
+sesssion.  Why run Telnet on a host?)  Tests on a Pyramid 90X suggest
+that typing a file at 9600 baud via telnet uses a large fraction of
+the CPU.  Not all of that shows up in ps, but in vmstat, some extra
+system overhead show up.  Not only does telnet eat your CPU, but it is
+also more sensitive to load than it might be.  That is, under heavy
+load, you not only have to worry about your Emacs getting paged out.
+Your telnetd will also get delayed.  By moving telnetd into the
+kernel, the CPU usage is dramatically decreased.  I haven't done any
+really careful tests, but it appears that typing a file at 9600 baud
+uses 20% of the CPU briefly while buffers get filled, and less than
+10% thereafter.  (I can't be sure.  It could be as low as 5%.)  More
+importantly, it makes your connection feel like a local terminal,
+assuming that your telnet user process is not adding any delay.
+
+Rick's original code was quite simple, because rlogin is quite simple.
+rlogind simply does a magic IOCTL which causes the kernel to
+crosspatch the incoming network connection to the pty.  It stays that
+way until the user logs out or the connection goes away.
+Unfortunately, it is not practical to implement Telnet entirely in the
+kernel.  Telnet has things called "negotiations".  These allow one end
+to ask the other to turn off echoing, go into binary mode, and any of
+a number of wierder options.  These, and a few other Telnet commands,
+are all preceeded by an IAC character (decimal 255).  If you actually
+type an IAC character on your terminal, your telnet process will send
+two IAC's, so that it doesn't look like a negotiation.  This means
+that telnetd must scan the network for IAC's.  When it finds one, it
+must interpret the resulting command.  It must also scan the terminal
+output from the pty.  If it finds any IAC's, it must add an extra IAC,
+so that the result is seen by the other end as an IAC character,
+rather than a command.  It is reasonable to do the output processing
+in the kernel.  But it is not reasonable to do the input processing.
+So when my code sees an IAC in incoming data, it simply breaks the
+link and returns from the IOCTL.  The daemon reads the command, does
+whatever it needs to do, and then returns to the kernel with the
+IOCTL.  The IOCTL used to pass fd's for the network and pty to be
+crosspatched.  I now add 8-bit modes in the high-order end of the
+argument, one for the input side and one for the output side.  0 gives
+you rlogin.  1 gives you normal telnet.  2 gives you telnet binary
+(which currently is implemented only for input, just as in 4.2
+telnetd).
+
+Some caveats about this code:
+  1) the kernel code is well tested.  So is rlogind.  telnetd is
+	not well tested.  It works with Unix, TOPS-20, and Bridge
+	terminal servers.  However none of those things is able
+	to generate certain of the telnet commands.  For example,
+	there is a Telnet protocol command to delete the previous
+	character.  Rather than send a rubout character, your
+	telnet user process can send a system-independent delete
+	character telnet command.  None of the systems we use do this.
+	We all just hit rubout, or whatever your delete character
+	is currently set to.  If there is a bug in this code, it
+	should be a fairly simple typo, and be easy enough to fix.
+  2) the telnetd code will work only with the modified kernel.
+	Rick's original rlogin was designed so it reverts to normal
+	code if you run it on a kernel without his patches.  The
+	changes to telnetd were more extensive, so I did not do it.
+	Presumably my version of telnetd will coredump if run on
+	kernel without these patches.
+  3) the kernel code is intended to be functionally identical to
+	the telnetd on which it is modelled.  In particular, I have
+	not fixed the bug involving bare CR's.  (According to the
+	telnet spec, if CR is not followed by LF, the server is
+	required to insert a NUL after the CR.  4.2 Telnet does
+	not do this.  Neither does my code.  All of the Telnet
+	user programs that we know about can handle CR's followed
+	by other things.  Implementing this would have taken more
+	time than I had to devote to the project.)
+  4) this code has been tested only on a Pyramid 90X.  It should work
+	unchanged with any release 3.0 Pyramid single-processor system.
+	The changes for a VAX should be fairly simple.  Actually, the
+	only one I know of is in nvs_output.  On the Pyramid, you
+	output something to the network by asking the network code
+	for some space, using sbnext.  This returns you a pointer.
+	You copy your data to the place pointed to.  You then do
+	tcp_usrreq(PRU_SEND ....  Apparently, on the VAX, things
+	work a bit differently.  You allocate an mbuf, copy the
+	data into the mbuf, and then pass the mbuf as an argument
+	to tcp_usrreq.  There are comments in nvs_output that suggest
+	what the code should probably look like, but I make no
+	guarantees.  To find it, search for the string "VAX" in
+	tty_nvs.c.  I believe that Pyramid operating system releases
+	older than 3.0 should be treated like a VAX.  To be sure,
+	find the code in tcp_usrreq that implements PRU_SEND.
+	(Just search for "case PRU_SEND" in ../netinet/tcp_usrreq.c.)
+	If that case contains a call to sbappend, then treat it like
+	a VAX.)
+  5) This code has not been symmetrized.  It will not run on a
+	Pyramid dual-processor system.  I think I know how to symmetrize
+	it.  But since I don't (yet) have a dual-processor machine, 
+	I have no way to test it.
+  6) in tty_nvs.c, set the flag NFS depending upon whether you have
+	Sun's NVS in your kernel.  Or if your compilation process
+	defines NFS externally, just remove the #define.
+
+Even if you are not using telnet, you might want to look at this
+code.  I have improved rick's code in two major ways:
+  1) the original code used "busy waits" in the output code.
+	That is, when the network had enough data, the code would
+	dismiss for N milliseconds.  Every N msec it would check
+	to see if it was ready for more data.  I have added a
+	hook into sbwakeup, so that the code gets awakened when
+	there is more space.  It doesn't have to keep reactivating
+	and checking.
+  2) the original code has a table which gives the associations
+	between pty's and network connections.  If you have a
+	network connection and need to find the pty it goes to,
+	it does a linear search of that table.  I have added
+	a short to the socket buffer, and put the table index
+	into it.  This eliminates the search.  If you are not
+	using a Pyramid, make sure that this change to socketvar.h
+	isn't going to change the struct in some disasterous way.
+	It happened that on the Pyramid, there was a free short
+	in the place where I added that field.  If your compiler
+	allocates fields differently, it may not be free for you.
+
+The rest of this posting consists of two pieces: a bunch of diffs to
+existing files, and a new file, tty_nvs.c.  If you have a Pyramid, you
+should modify .../conf/makefromsource (a simple makefile) to cause
+tty_nvs.c to be compiled and linked into the kernel.  I have no idea
+what you do on other machines.
+
+*** ../conf/conf.c.HOLD	Thu Feb  6 00:13:04 1986
+--- ../conf/conf.c	Sun Apr 20 01:24:41 1986
+***************
+*** 354,359
+  int	ptcopen(),ptcclose(),ptcread(),ptcwrite(),ptcselect();
+  int	ptyioctl(), ptsselect();
+  struct	tty pt_tty[];
+  #else
+  #define ptsopen		nodev
+  #define ptsclose	nodev
+
+--- 354,361 -----
+  int	ptcopen(),ptcclose(),ptcread(),ptcwrite(),ptcselect();
+  int	ptyioctl(), ptsselect();
+  struct	tty pt_tty[];
++ struct socket *ptynvsso[NPTY];
++ int ptyoutmode[NPTY];
+  #else
+  #define ptsopen		nodev
+  #define ptsclose	nodev
+*** tty_pty.c.HOLD	Tue Aug 27 01:46:18 1985
+--- tty_pty.c	Sun Apr 20 04:45:42 1986
+***************
+*** 26,31
+  extern int npty;	/* declared in conf.c */
+  extern struct	tty pt_tty[];
+  
+  /* NOTE: the following declaration is also make in conf.c
+  	 Keep the two in sync (should be put in a .h file somewhere) */
+  
+
+--- 26,35 -----
+  extern int npty;	/* declared in conf.c */
+  extern struct	tty pt_tty[];
+  
++ #include "../h/socketvar.h"
++ extern struct socket *ptynvsso[];   /* socket indexed by pty minor dev# */
++ 		    /* decl in conf.c, so no dependence on NPTYS here */
++ 
+  /* NOTE: the following declaration is also make in conf.c
+  	 Keep the two in sync (should be put in a .h file somewhere) */
+  
+***************
+*** 787,792
+  	}
+  	return (error);
+  }
+  
+  /*
+   * select routine for slave -- handles PF_REMOTE modes and PF_EOT states.
+
+--- 791,837 -----
+  	}
+  	return (error);
+  }
++ 
++ /*
++  * Transfer characters from NVS tty outq to associated socket
++  * (Simply a jacket because timeout() accepts only 1 argument).
++  *
++  * Called at or below network IPL
++  */
++ ptsnvsnet(tp)
++ 	struct tty *tp;
++ {
++ 	nvs_output(tp, &pt_ioctl[minor(tp->t_dev)].pt_send);
++ }
++ 
++ /*
++  * Alternate t_oproc routine used when the pty is operating as an NVS
++  */
++ ptsnvsstart(tp)
++ 	register struct tty *tp;
++ {
++ 	register int s;
++ 
++ 	s = spl5();
++ 	/*
++ 	 * TS_BUSY set means Ptsnvsnet() is either running or queued to run
++ 	 */
++ 	if ((tp->t_state & TS_BUSY) == 0) {
++ 		tp->t_state |= TS_BUSY;
++ 		/*
++ 		 * If at low IPL, can make output happen now;
++ 		 * otherwise must sequence it through softclock
++ 		 */
++ 		if (s == 0) {
++ 			(void) spl0();		/* reduce IPL */
++ 			nvs_output(tp, &pt_ioctl[minor(tp->t_dev)].pt_send);
++ 		}
++ 		else
++ 			timeout(ptsnvsnet, (caddr_t)tp, 0);
++ 	}
++ 	splx(s);
++ }
++ 
+  
+  /*
+   * select routine for slave -- handles PF_REMOTE modes and PF_EOT states.
+*** uipc_socket2.c.HOLD	Tue Dec 10 19:57:26 1985
+--- uipc_socket2.c	Sun Apr 20 23:58:22 1986
+***************
+*** 326,331
+  	register struct sockbuf *sb;
+  {
+  
+  	if (sb->sb_sel) {
+  		selwakeup(sb->sb_sel, sb->sb_flags & SB_COLL);
+  		sb->sb_sel = 0;
+
+--- 326,340 -----
+  	register struct sockbuf *sb;
+  {
+  
++ 	if (sb->sb_flags & SB_NVS) {
++ 		nvs_input(sb);
++ 		return;
++ 	}
++ 	if (sb->sb_flags & SB_NVS_WAIT) {
++ 	  if (sbspace(sb) >= sb->sb_lowat)
++ 	    nvs_output_wake(sb);
++ 	  return;
++ 	}
+  	if (sb->sb_sel) {
+  		selwakeup(sb->sb_sel, sb->sb_flags & SB_COLL);
+  		sb->sb_sel = 0;
+*** ../netinet/tcp_usrreq.c.HOLD	Sat Apr 19 02:13:50 1986
+--- ../netinet/tcp_usrreq.c	Sat Apr 19 03:25:37 1986
+***************
+*** 28,33
+  #include "../netinet/tcpip.h"
+  #include "../netinet/tcp_debug.h"
+  
+  /*
+   * TCP protocol interface to socket abstraction.
+   */
+
+--- 28,35 -----
+  #include "../netinet/tcpip.h"
+  #include "../netinet/tcp_debug.h"
+  
++ #include "../h/ioctl.h"
++ 
+  /*
+   * TCP protocol interface to socket abstraction.
+   */
+***************
+*** 220,225
+  
+  /* SOME AS YET UNIMPLEMENTED HOOKS */
+  	case PRU_CONTROL:
+  		error = EOPNOTSUPP;
+  		break;
+  
+
+--- 222,234 -----
+  
+  /* SOME AS YET UNIMPLEMENTED HOOKS */
+  	case PRU_CONTROL:
++ 		if ((int)m == SIOCJNVS) {
++ 			if (tp->t_state == TCPS_ESTABLISHED)
++ 				error = nvs_ioc_join(so, *(int *)nam);
++ 			else
++ 				error = ENOTCONN;
++ 			break;
++ 		}
+  		error = EOPNOTSUPP;
+  		break;
+  
+*** ioctl.h.HOLD	Thu Feb  6 01:03:11 1986
+--- ioctl.h	Thu Feb  6 01:03:11 1986
+***************
+*** 394,399
+  #define	SIOCATMARK	_IOR(s,  7, int)		/* at oob mark? */
+  #define	SIOCSPGRP	_IOW(s,  8, int)		/* set process group */
+  #define	SIOCGPGRP	_IOR(s,  9, int)		/* get process group */
+  
+  #define	SIOCADDRT	_IOW(r, 10, struct rtentry)	/* add route */
+  #define	SIOCDELRT	_IOW(r, 11, struct rtentry)	/* delete route */
+
+--- 394,400 -----
+  #define	SIOCATMARK	_IOR(s,  7, int)		/* at oob mark? */
+  #define	SIOCSPGRP	_IOW(s,  8, int)		/* set process group */
+  #define	SIOCGPGRP	_IOR(s,  9, int)		/* get process group */
++ #define SIOCJNVS	_IOW(s, 71, int)		/* join NVS pty&socket */
+  
+  #define	SIOCADDRT	_IOW(r, 10, struct rtentry)	/* add route */
+  #define	SIOCDELRT	_IOW(r, 11, struct rtentry)	/* delete route */
+*** socketvar.h.HOLD	Fri Dec  6 15:08:43 1985
+--- socketvar.h	Fri Dec  6 15:08:43 1985
+***************
+*** 45,50
+  		struct	mbuf *sb_mb;	/* the mbuf chain */
+  		struct	proc *sb_sel;	/* process selecting read/write */
+  		short	sb_flags;	/* flags, see below */
+  	} so_rcv, so_snd;
+  #define	SB_LOCK		0x01		/* lock on data queue (so_rcv only) */
+  #define	SB_WANT		0x02		/* someone is waiting to lock */
+
+--- 45,55 -----
+  		struct	mbuf *sb_mb;	/* the mbuf chain */
+  		struct	proc *sb_sel;	/* process selecting read/write */
+  		short	sb_flags;	/* flags, see below */
++ /*
++  * the following is gross, but if the comment above is right, we can't
++  * add real pointer because it would make the structure too long
++  */
++ 		short	sb_nvs_index;	/* index into nvs data */
+  	} so_rcv, so_snd;
+  #define	SB_LOCK		0x01		/* lock on data queue (so_rcv only) */
+  #define	SB_WANT		0x02		/* someone is waiting to lock */
+***************
+*** 53,58
+  #define	SB_COLL		0x10		/* collision selecting */
+  #define SB_WAIT_SINGLE  0x20		/* someone waiting to lock (but only 
+  					   wakeup 1 process when available) */
+  	short	so_timeo;		/* connection timeout */
+  	u_short	so_error;		/* error affecting connection */
+  	short	so_oobmark;		/* chars to oob mark */
+
+--- 58,65 -----
+  #define	SB_COLL		0x10		/* collision selecting */
+  #define SB_WAIT_SINGLE  0x20		/* someone waiting to lock (but only 
+  					   wakeup 1 process when available) */
++ #define SB_NVS		0x40		/* socket crossbarred to NVS pty */
++ #define SB_NVS_WAIT	0x80		/* waiting for output buffer space */
+  	short	so_timeo;		/* connection timeout */
+  	u_short	so_error;		/* error affecting connection */
+  	short	so_oobmark;		/* chars to oob mark */
+*** /src/usr.etc/in.telnetd.c.ORIG	Thu Oct 31 21:26:44 1985
+--- /src/usr.etc/in.telnetd.c	Sun Apr 20 06:06:04 1986
+***************
+*** 52,58
+   */
+  char	ptyibuf[BUFSIZ], *ptyip = ptyibuf;
+  char	ptyobuf[BUFSIZ], *pfrontp = ptyobuf, *pbackp = ptyobuf;
+! char	netibuf[BUFSIZ], *netip = netibuf;
+  char	netobuf[BUFSIZ], *nfrontp = netobuf, *nbackp = netobuf;
+  int	pcc, ncc;
+  
+
+--- 54,60 -----
+   */
+  char	ptyibuf[BUFSIZ], *ptyip = ptyibuf;
+  char	ptyobuf[BUFSIZ], *pfrontp = ptyobuf, *pbackp = ptyobuf;
+! unsigned char	netibuf[BUFSIZ], *netip = netibuf;
+  char	netobuf[BUFSIZ], *nfrontp = netobuf, *nbackp = netobuf;
+  int	pcc, ncc;
+  
+***************
+*** 62,67
+  extern	int errno;
+  char	line[] = "/dev/ptyp0";
+  int	childsid;
+  
+  main(argc, argv)
+  	char *argv[];
+
+--- 64,70 -----
+  extern	int errno;
+  char	line[] = "/dev/ptyp0";
+  int	childsid;
++ char	remotehost[256];
+  
+  main(argc, argv)
+  	char *argv[];
+***************
+*** 140,145
+  		host = hp->h_name;
+  	else
+  		host = ntoa(who->sin_addr);
+  
+  	/* We identify who this is from. All of our children will
+  	 * inherit this id from us.
+
+--- 143,149 -----
+  		host = hp->h_name;
+  	else
+  		host = ntoa(who->sin_addr);
++ 	strcpy(remotehost,host);
+  
+  	/* We identify who this is from. All of our children will
+  	 * inherit this id from us.
+***************
+*** 204,209
+  {
+  	int on = 1;
+  	char hostname[32];
+  
+  	net = f, pty = p;
+  	ioctl(f, FIONBIO, &on);
+
+--- 208,214 -----
+  {
+  	int on = 1;
+  	char hostname[32];
++ 	int arg;
+  
+  	net = f, pty = p;
+  	ioctl(f, FIONBIO, &on);
+***************
+*** 220,227
+  	 * Show banner that getty never gave.
+  	 */
+  	gethostname(hostname, sizeof (hostname));
+! 	sprintf(nfrontp, BANNER, hostname, "");
+! 	nfrontp += strlen(nfrontp);
+  	for (;;) {
+  		int ibits = 0, obits = 0;
+  		register int c;
+
+--- 225,233 -----
+  	 * Show banner that getty never gave.
+  	 */
+  	gethostname(hostname, sizeof (hostname));
+! 	sprintf(netobuf, BANNER, hostname, "");
+! 	write(net,netobuf,strlen(netobuf));
+! 
+  	for (;;) {
+  		register int c;
+  
+***************
+*** 223,229
+  	sprintf(nfrontp, BANNER, hostname, "");
+  	nfrontp += strlen(nfrontp);
+  	for (;;) {
+- 		int ibits = 0, obits = 0;
+  		register int c;
+  
+  		/*
+
+--- 229,234 -----
+  	write(net,netobuf,strlen(netobuf));
+  
+  	for (;;) {
+  		register int c;
+  
+  		if (myopts[TELOPT_BINARY])
+***************
+*** 226,237
+  		int ibits = 0, obits = 0;
+  		register int c;
+  
+! 		/*
+! 		 * Never look for input if there's still
+! 		 * stuff in the corresponding output buffer
+! 		 */
+! 		if (nfrontp - nbackp || pcc > 0)
+! 			obits |= (1 << f);
+  		else
+  			ibits |= (1 << p);
+  		if (pfrontp - pbackp || ncc > 0)
+
+--- 231,238 -----
+  	for (;;) {
+  		register int c;
+  
+! 		if (myopts[TELOPT_BINARY])
+! 		  arg = 2 << 24;
+  		else
+  		  arg = 1 << 24;
+  		arg |= 1 << 16;
+***************
+*** 233,250
+  		if (nfrontp - nbackp || pcc > 0)
+  			obits |= (1 << f);
+  		else
+! 			ibits |= (1 << p);
+! 		if (pfrontp - pbackp || ncc > 0)
+! 			obits |= (1 << p);
+! 		else
+! 			ibits |= (1 << f);
+! 		if (ncc < 0 && pcc < 0)
+! 			break;
+! 		select(16, &ibits, &obits, 0, 0);
+! 		if (ibits == 0 && obits == 0) {
+! 			sleep(5);
+! 			continue;
+! 		}
+  
+  		/*
+  		 * Something to read from the network...
+
+--- 234,242 -----
+  		if (myopts[TELOPT_BINARY])
+  		  arg = 2 << 24;
+  		else
+! 		  arg = 1 << 24;
+! 		arg |= 1 << 16;
+! 		arg |= p;
+  
+  		if (ioctl(f, SIOCJNVS, (char *)&arg) == -1)
+  		  cleanup();
+***************
+*** 246,264
+  			continue;
+  		}
+  
+! 		/*
+! 		 * Something to read from the network...
+! 		 */
+! 		if (ibits & (1 << f)) {
+! 			ncc = read(f, netibuf, BUFSIZ);
+! 			if (ncc < 0 && errno == EWOULDBLOCK)
+! 				ncc = 0;
+! 			else {
+! 				if (ncc <= 0)
+! 					break;
+! 				netip = netibuf;
+! 			}
+! 		}
+  
+  		/*
+  		 * Something to read from the pty...
+
+--- 238,245 -----
+  		arg |= 1 << 16;
+  		arg |= p;
+  
+! 		if (ioctl(f, SIOCJNVS, (char *)&arg) == -1)
+! 		  cleanup();
+  
+  		ncc = read(f, netibuf, BUFSIZ);
+  		if (ncc <= 0)
+***************
+*** 260,293
+  			}
+  		}
+  
+! 		/*
+! 		 * Something to read from the pty...
+! 		 */
+! 		if (ibits & (1 << p)) {
+! 			pcc = read(p, ptyibuf, BUFSIZ);
+! 			if (pcc < 0 && errno == EWOULDBLOCK)
+! 				pcc = 0;
+! 			else {
+! 				if (pcc <= 0)
+! 					break;
+! 				ptyip = ptyibuf;
+! 			}
+! 		}
+! 
+! 		while (pcc > 0) {
+! 			if ((&netobuf[BUFSIZ] - nfrontp) < 2)
+! 				break;
+! 			c = *ptyip++ & 0377, pcc--;
+! 			if (c == IAC)
+! 				*nfrontp++ = c;
+! 			*nfrontp++ = c;
+! 		}
+! 		if ((obits & (1 << f)) && (nfrontp - nbackp) > 0)
+! 			netflush();
+! 		if (ncc > 0)
+! 			telrcv();
+! 		if ((obits & (1 << p)) && (pfrontp - pbackp) > 0)
+! 			ptyflush();
+  	}
+  	cleanup();
+  }
+
+--- 241,252 -----
+  		if (ioctl(f, SIOCJNVS, (char *)&arg) == -1)
+  		  cleanup();
+  
+! 		ncc = read(f, netibuf, BUFSIZ);
+! 		if (ncc <= 0)
+! 		  {syslog(7,"in.telnetd ncc=%d, %d, %m",ncc,errno);
+! 		   break;
+! 		 }
+! 		telrcv();
+  	}
+  	syslog(7,"in.telnetd from %s terminated: %m",remotehost);
+  	cleanup();
+***************
+*** 289,294
+  		if ((obits & (1 << p)) && (pfrontp - pbackp) > 0)
+  			ptyflush();
+  	}
+  	cleanup();
+  }
+  	
+
+--- 248,254 -----
+  		 }
+  		telrcv();
+  	}
++ 	syslog(7,"in.telnetd from %s terminated: %m",remotehost);
+  	cleanup();
+  }
+  	
+***************
+*** 310,315
+  	register int c;
+  	static int state = TS_DATA;
+  	struct sgttyb b;
+  
+  	while (ncc > 0) {
+  		if ((&ptyobuf[BUFSIZ] - pfrontp) < 2)
+
+--- 270,276 -----
+  	register int c;
+  	static int state = TS_DATA;
+  	struct sgttyb b;
++ 	struct auxchars aux;
+  
+  	netip = netibuf;
+  	while (ncc > 0) {
+***************
+*** 311,316
+  	static int state = TS_DATA;
+  	struct sgttyb b;
+  
+  	while (ncc > 0) {
+  		if ((&ptyobuf[BUFSIZ] - pfrontp) < 2)
+  			return;
+
+--- 272,278 -----
+  	struct sgttyb b;
+  	struct auxchars aux;
+  
++ 	netip = netibuf;
+  	while (ncc > 0) {
+  		c = *netip++ & 0377, ncc--;
+  		switch (state) {
+***************
+*** 312,319
+  	struct sgttyb b;
+  
+  	while (ncc > 0) {
+- 		if ((&ptyobuf[BUFSIZ] - pfrontp) < 2)
+- 			return;
+  		c = *netip++ & 0377, ncc--;
+  		switch (state) {
+  
+
+--- 274,279 -----
+  
+  	netip = netibuf;
+  	while (ncc > 0) {
+  		c = *netip++ & 0377, ncc--;
+  		switch (state) {
+  
+***************
+*** 322,332
+  				state = TS_IAC;
+  				break;
+  			}
+! 			if (inter > 0)
+! 				break;
+! 			*pfrontp++ = c;
+! 			if (!myopts[TELOPT_BINARY] && c == '\r')
+! 				state = TS_CR;
+  			break;
+  
+  		case TS_CR:
+
+--- 282,289 -----
+  				state = TS_IAC;
+  				break;
+  			}
+! 			ptyobuf[0] = c;
+! 			write(pty,ptyobuf,1);
+  			break;
+  
+  		case TS_IAC:
+***************
+*** 329,340
+  				state = TS_CR;
+  			break;
+  
+- 		case TS_CR:
+- 			if (c && c != '\n')
+- 				*pfrontp++ = c;
+- 			state = TS_DATA;
+- 			break;
+- 
+  		case TS_IAC:
+  			switch (c) {
+  
+
+--- 286,291 -----
+  			write(pty,ptyobuf,1);
+  			break;
+  
+  		case TS_IAC:
+  			switch (c) {
+  
+***************
+*** 352,358
+  			 * Are You There?
+  			 */
+  			case AYT:
+! 				*nfrontp++ = BELL;
+  				break;
+  
+  			/*
+
+--- 303,311 -----
+  			 * Are You There?
+  			 */
+  			case AYT:
+!	/* This assumes the Maryland ^T code is installed.
+!	 * If not, you can following the original and
+!        * do ptyobuf[0] = BELL
+!        */
+! 				ioctl(pty, TIOCGAUXC, &aux);
+! 				ptyobuf[0] = aux.t_usest;
+! 				write(pty,ptyobuf,1);
+  				break;
+  
+  			/*
+***************
+*** 361,367
+  			 */
+  			case EC:
+  			case EL:
+- 				ptyflush();	/* half-hearted */
+  				ioctl(pty, TIOCGETP, &b);
+  				*pfrontp++ = (c == EC) ?
+  					b.sg_erase : b.sg_kill;
+
+--- 314,319 -----
+  			 */
+  			case EC:
+  			case EL:
+  				ioctl(pty, TIOCGETP, &b);
+  				ptyobuf[0] = (c == EC) ?
+  					b.sg_erase : b.sg_kill;
+***************
+*** 363,369
+  			case EL:
+  				ptyflush();	/* half-hearted */
+  				ioctl(pty, TIOCGETP, &b);
+! 				*pfrontp++ = (c == EC) ?
+  					b.sg_erase : b.sg_kill;
+  				break;
+  
+
+--- 315,321 -----
+  			case EC:
+  			case EL:
+  				ioctl(pty, TIOCGETP, &b);
+! 				ptyobuf[0] = (c == EC) ?
+  					b.sg_erase : b.sg_kill;
+  				write(pty,ptyobuf,1);
+  				break;
+***************
+*** 365,370
+  				ioctl(pty, TIOCGETP, &b);
+  				*pfrontp++ = (c == EC) ?
+  					b.sg_erase : b.sg_kill;
+  				break;
+  
+  			/*
+
+--- 317,323 -----
+  				ioctl(pty, TIOCGETP, &b);
+  				ptyobuf[0] = (c == EC) ?
+  					b.sg_erase : b.sg_kill;
++ 				write(pty,ptyobuf,1);
+  				break;
+  
+  			/*
+***************
+*** 388,394
+  				continue;
+  
+  			case IAC:
+! 				*pfrontp++ = c;
+  				break;
+  			}
+  			state = TS_DATA;
+
+--- 341,348 -----
+  				continue;
+  
+  			case IAC:
+! 				ptyobuf[0] = IAC;
+! 				write(pty,ptyobuf,1);
+  				break;
+  			}
+  			state = TS_DATA;
+***************
+*** 424,431
+  		case TS_DONT:
+  			if (myopts[c]) {
+  				myopts[c] = 0;
+! 				sprintf(nfrontp, wont, c);
+! 				nfrontp += sizeof (wont) - 2;
+  			}
+  			state = TS_DATA;
+  			continue;
+
+--- 378,385 -----
+  		case TS_DONT:
+  			if (myopts[c]) {
+  				myopts[c] = 0;
+! 				sprintf(netobuf, wont, c);
+! 				write(net,netobuf,sizeof (wont) - 2);
+  			}
+  			state = TS_DATA;
+  			continue;
+***************
+*** 434,439
+  			printf("telnetd: panic state=%d\n", state);
+  			exit(1);
+  		}
+  	}
+  }
+  
+
+--- 388,403 -----
+  			printf("telnetd: panic state=%d\n", state);
+  			exit(1);
+  		}
++ 	if ((state != TS_DATA) && (ncc <= 0)) {
++ 	  int ibits;
++ 
++ 	  ibits = 1 << net;
++ 	  select(1,&ibits,0,0,0);
++ 	  ncc = read(net, netibuf, BUFSIZ);
++ 	  if (ncc <= 0)
++ 	    {syslog(7,"in.telnetd ncc=%d, %d, %m",ncc,errno);
++ 	     cleanup();
++ 	   }
+  	}
+  	      }
+  }
+***************
+*** 435,440
+  			exit(1);
+  		}
+  	}
+  }
+  
+  willoption(option)
+
+--- 399,405 -----
+  	     cleanup();
+  	   }
+  	}
++ 	      }
+  }
+  
+  willoption(option)
+***************
+*** 466,472
+  		fmt = dont;
+  		break;
+  	}
+! 	sprintf(nfrontp, fmt, option);
+  	nfrontp += sizeof (dont) - 2;
+  }
+  
+
+--- 431,437 -----
+  		fmt = dont;
+  		break;
+  	}
+! 	sprintf(netobuf, fmt, option);
+  	nfrontp += sizeof (dont) - 2;
+  }
+  
+***************
+*** 527,533
+  		break;
+  	}
+  	sprintf(nfrontp, fmt, option);
+! 	nfrontp += sizeof (doopt) - 2;
+  }
+  
+  mode(on, off)
+
+--- 492,498 -----
+  		break;
+  	}
+  	sprintf(nfrontp, fmt, option);
+! 	write(net, nfrontp, sizeof (doopt) - 2);
+  }
+  
+  mode(on, off)
+*** /src/etc/in.rlogind.c.ORIG	Sat Aug  3 20:53:22 1985
+--- /src/etc/in.rlogind.c	Sat Apr 19 07:10:27 1986
+***************
+*** 148,153
+  		ioctl(p, TIOCPKT, &on);
+  		signal(SIGTSTP, SIG_IGN);
+  		signal(SIGCHLD, cleanup);
+  		for (;;) {
+  			int ibits = 0, obits = 0;
+  
+
+--- 150,170 -----
+  		ioctl(p, TIOCPKT, &on);
+  		signal(SIGTSTP, SIG_IGN);
+  		signal(SIGCHLD, cleanup);
++ 		/* BEGIN NVS support */
++ 		/*
++ 		 * If kernel supports high-performance NVS operation,
++ 		 * invoke it and sleep until connection is broken.
++ 		 * If remote end dies: ioctl() returns 0.
++ 		 * If local job exits: ioctl() returns -1 / EINTR.
++ 		 * Any other return from ioctl() is interpreted to mean
++ 		 * the kernel doesn't support high-performance NVS
++ 		 * operation, so do the job the standard Berkeley way.
++ 		 */
++ 		if (ioctl(f, SIOCJNVS, (char *)&p) == 0 ||
++ 		    errno == EINTR)
++ 			cleanup();
++ 		/* END NVS support */
+  		for (;;) {
+  			int ibits = 0, obits = 0;
+  
+
+****** new file: ../sys/tty_nvs.c ********
+
+/*
+ * Network virtual terminals via sockets - server end
+ *
+ *	Rick Ace
+ *	New York Institute of Technology
+ *	Computer Graphics Laboratory
+ *	Old Westbury, New York  11568
+ */
+
+/*
+ * The code in this module supports the NVS, or remote end of the connection
+ * (i.e., the link between the network and the pseudo-terminal).
+ * The purpose of this code is to emulate efficiently the character-
+ * shuffling functions performed by /etc/rlogind.  The rlogin on the other
+ * host will believe it is talking to rlogind, when it is in reality
+ * talking to the NVS kernel software herein.
+ *
+ * The NVS kernel software achieves performance improvements by handling
+ * incoming character traffic at interrupt level, eliminating the overhead
+ * and delays resulting from scheduling a user-mode process (rlogind).
+ * Outgoing character traffic is dumped directly into the socket by
+ * Ptsnvsstart() in tty_pty.c, further eliminating the need for service
+ * by a user-mode process.
+ *
+ * The implementation is broken into two main layers:
+ *	1)  high-level software, common to all NVSs (nvs_XXX subrs) 
+ *	2)  protocol-specific stuff (tcp_XXX, etc.) 
+ * Presently, there is only a TCP implementation for layer # 2.
+ */
+
+#define NFS 1
+
+#include "../h/param.h"
+#include "../h/conf.h"
+#include "../h/dir.h"
+#include "../h/user.h"
+#include "../h/proc.h"		/* for lint */
+#include "../h/file.h"
+#include "../h/tty.h"
+#include "../h/mbuf.h"
+#include "../h/protosw.h"
+#include "../h/socketvar.h"
+#ifdef NFS
+#include "../h/vnode.h"
+#include "../ufs/inode.h"
+#else NFS
+#include "../h/inode.h"
+#endif NFS
+
+#define nvs_emsg	printf
+
+#define MAXNVS	32		/* should be in a parameter file */
+
+/*
+ * tp-to-socket correspondence table.
+ *
+ * This table is searched linearly.  A highest-entry mark is maintained
+ * to keep search overhead low.  If there is a need to support large
+ * numbers of NVSs, the linear search should be replaced by hashing.
+ */
+struct nvsj {
+	struct tty	*nvs_tp;	/* tty/pty context, or 0 if free */
+	struct socket	*nvs_so;	/* socket context */
+	int		nvs_in_mode;	/* input side mode */
+} nvsj[MAXNVS + 1];
+
+/* in modes */
+
+#define IN_RLOGIN	0		/* no processing */
+#define IN_TELNET	1		/* telnet, normal */
+#define IN_BINARY	2		/* telnet binary */
+#define IN_CR		3		/* cr seen in nonbinary */
+
+/* out modes */
+
+#define OUT_RLOGIN	0		/* special urgent mode stuff */
+#define OUT_TELNET	1		/* special IAC processing */
+
+/* currently this is not implemented */
+
+#define IAC		255
+
+struct nvsj	*nvshij = &nvsj[0];	/* highest active entry */
+
+#ifndef lint
+int	nvsj_n = MAXNVS;		/* for kernel debug utilities */
+#endif
+
+int	nvsichz;
+
+extern struct socket *ptynvsso[ /* NPTY */ ]; /* socket indexed by pty minor */
+extern int ptyoutmode[ /* NPTY */ ];
+
+int	ptsstart(), ptsnvsstart(), ptsnvsnet();
+
+/*
+ * Mate a tty and a socket
+ *
+ * Returns UNIX error code
+ * Must be called at splimp
+ */
+nvs_add(tp, so, anvs, inmode, outmode)
+	struct tty *tp;
+	struct socket *so;
+	struct nvsj **anvs;	/* return addr of NVS context here */
+	int inmode, outmode;
+{
+	register struct nvsj *nvs, *nx;
+	extern int hz;				/* XXX */
+
+	if (nvsichz == 0) 
+		nvsichz = hz / 3;		/* XXX */
+	if (tp->t_oproc != ptsstart) 
+		return ENOTTY;		/* not a pty or not in right mode */
+	nvs = 0;
+	nx = &nvsj[MAXNVS - 1];
+	do {
+		if (nx->nvs_tp) {
+			if (nx->nvs_tp == tp || nx->nvs_so == so) {
+				return EBUSY; /* tty or socket already an NVS */
+			      }
+		}
+		else
+			nvs = nx;	/* remember lowest empty slot */
+	} while (--nx >= &nvsj[0]);
+	if (nvs == 0) {
+		return ENFILE;		/* all slots are in use */
+	      }
+	/*
+	 * All is clear, mate them
+	 */
+	if (nvs > nvshij) 
+		nvshij = nvs;		/* update highest active entry */
+	*anvs = nvs;			/* pass context pointer to caller */
+	nvs->nvs_so = so;
+	nvs->nvs_in_mode = inmode;
+	nvs->nvs_tp = tp;
+	so->so_rcv.sb_flags |= SB_NVS;
+	so->so_rcv.sb_nvs_index = nvs - nvsj;
+	so->so_snd.sb_nvs_index = nvs - nvsj;
+	tp->t_oproc = ptsnvsstart;
+	ptyoutmode[minor(tp->t_dev)] = outmode;
+	ptynvsso[minor(tp->t_dev)] = so;
+	sbwakeup(&so->so_rcv);		/* get characters flowing */
+	ptsnvsstart(tp);		/* ditto */
+	return 0;
+}
+
+/*
+ * Undo a tty/socket correspondence
+ *
+ * Must be called at splimp
+ */
+nvs_del(nvs)
+	struct nvsj *nvs;
+{
+	register struct tty *tp;
+
+	nvs->nvs_so->so_rcv.sb_flags &= ~SB_NVS;
+	tp = nvs->nvs_tp;
+	if (tp->t_oproc == ptsnvsstart) 
+		tp->t_oproc = ptsstart;
+	ptynvsso[minor(tp->t_dev)] = 0;
+	/*
+	 * Delete this entry and adjust Nvshij if necessary
+	 */
+	nvs->nvs_tp = 0;		/* mark entry as free */
+	if (nvshij == nvs) 
+		while (nvshij > &nvsj[0] && nvshij->nvs_tp == 0) 
+			nvshij--;
+}
+
+/*
+ * Called from sbwakeup() when NVS has incoming characters from the net,
+ * to transfer those characters from the socket to the tty's input queue
+ *
+ * Logic here is similar to that of soreceive() in uipc_socket.c
+ */
+nvs_input(sb)
+	struct sockbuf *sb;		/* so_rcv */
+{
+#define STRUCT_OFF(strnam, elem) \
+	((char *)&((struct strnam *)0)->elem - (char *)0) 
+	register struct socket *so;
+	register struct nvsj *nvs;
+	register struct tty *tp;
+	register struct mbuf *m;
+	register unsigned char *cp;
+	register int n;
+	struct mbuf *mz;
+	int nvsmode,xflags;
+	unsigned char inchar;
+
+	/*
+	 * Convert so_rcv address to socket address (a bit gross),
+	 * then search the active-connection table for that socket
+	 */
+	so = (struct socket *)((char *)sb - STRUCT_OFF(socket, so_rcv));
+	nvs = &nvsj[sb->sb_nvs_index];
+	if ((tp = nvs->nvs_tp) == 0) {
+	  nvs_emsg("nvs input no tp %x\n", so);
+	  return;
+	}
+	nvsmode = nvs->nvs_in_mode;  /* flags. use a register for speed */
+	xflags = tp->t_xflags;  /* Pyramid extra flags for ATT mode */
+	/*
+	 * Have located the tty, now pass it the data
+	 */
+	so->so_state &= ~SS_RCVATMARK;		/* ignore out-of-band data */
+	so->so_oobmark = 0;			/* ditto */
+	/*
+	 * Process each mbuf on the socket's rcv queue
+	 */
+	while (so->so_rcv.sb_cc > 0) {
+		m = so->so_rcv.sb_mb;
+		if (m == 0) 
+			panic("nvs_input");
+		cp = mtod(m, unsigned char *);
+		for (n = m->m_len; --n >= 0; ) {
+		  	inchar = *cp++;
+
+			switch (nvsmode) {
+			case IN_CR: 
+			  nvsmode = IN_TELNET;
+			  if ((inchar == 0) || (inchar == '\n'))
+			    break;
+			case IN_TELNET:
+			  if (inchar == '\r')
+			    nvsmode = IN_CR;
+			case IN_BINARY:
+			  if (inchar == IAC) {
+			    n = m->m_len - (n + 1);  /* chars read */
+			    m->m_off += n;
+			    so->so_rcv.sb_cc -= n;
+			    m->m_len -= n;
+			    so->so_rcv.sb_flags &= ~SB_NVS;
+			    wakeup((caddr_t)nvs);
+			    return;
+			  }
+			case IN_RLOGIN:
+/*
+ * The code from here to the call to linesw is Pyramid-specific, because
+ * of implementing ATT terminal handling
+ */
+			if (xflags&BTLON) {
+				inchar = inchar&0377;
+				
+				if (xflags&XISTRIP)
+					inchar &= 0177;
+				if ((inchar == '\n') && (xflags&XINLCR)) {
+					inchar = '\r';
+				} else if (inchar == '\r') {
+					if (xflags&XIGNCR) {
+						break;
+					} else if (xflags&XICRNL)
+						inchar = '\n';
+				}
+				if ((inchar >= 'A') &&
+				    (inchar <= 'Z') &&
+				    (xflags&XIUCLC))
+				    	inchar |= 040;
+			}
+			  (*linesw[tp->t_line].l_rint)(inchar, tp);
+			}
+		      }
+		sbfree(&so->so_rcv, m);
+		MFREE(m, mz);
+		so->so_rcv.sb_mb = m = mz;
+	}
+	nvs->nvs_in_mode = nvsmode;  /* put back possibly changed flags */
+	/*
+	 * Notify protocol that more space is available in the socket
+	 */
+	if ((so->so_state & SS_CANTRCVMORE) == 0 &&
+	    so->so_proto->pr_flags & PR_WANTRCVD &&
+	    so->so_pcb) 
+		(*so->so_proto->pr_usrreq)(so, PRU_RCVD,
+		    (struct mbuf *)0, (struct mbuf *)0, (struct mbuf *)0);
+	/*
+	 * If socket closes at remote end first (not the most common case),
+	 * wake up the agent process so it can exit.
+	 */
+	if (so->so_state & (SS_CANTRCVMORE | SS_CANTSENDMORE)) {
+		so->so_rcv.sb_flags &= ~SB_NVS;
+		wakeup((caddr_t)nvs);
+	}
+}
+
+/*
+ * Handle ioctl request on socket to join socket and pty, called
+ * from protocol ioctl logic.  Protocol-specific validation is
+ * done before you get here.
+ *
+ * If the connection was successfully established, sleep and wait
+ * until it is broken at the remote end, or until a signal is
+ * received on the local end.
+ *
+ * Returns
+ *	0 = remote NVT closed the connection
+ *	EINTR = interrupted by signal
+ *	Anything else = an error establishing the connection
+ */
+nvs_ioc_join(so, ptyfd)
+	struct socket *so;
+	int ptyfd;		/* pty file descriptor */
+{
+	register struct file *fp;
+	register struct inode *ip;
+	register struct tty *tp;
+	int error, s;
+	struct nvsj *nvsp;
+	int ptcopen();
+	int inmode, outmode;
+
+	outmode = (ptyfd >> 16) & 0xFF;
+	inmode = ptyfd >> 24;
+	ptyfd = ptyfd & 0xFFFF;
+
+	/*
+	 * Validate file descriptor and ensure it references a pty
+	 */
+	if ((unsigned)ptyfd >= NOFILE || (fp = u.u_ofile[ptyfd]) == 0) 
+		return EBADF;
+#ifdef NFS
+	{
+		register struct vnode *vp;
+
+		vp = (struct vnode *)fp->f_data;
+		if (fp->f_type != DTYPE_VNODE || vp->v_op != &ufs_vnodeops) 
+			return ENOTTY;
+		ip = VTOI(vp);
+		if ((ip->i_mode & IFMT) != IFCHR ||
+		    cdevsw[major(ip->i_rdev)].d_open != ptcopen) 
+			return ENOTTY;		/* really ENOTPTY :-) */
+	}
+#else NFS
+	ip = (struct inode *)fp->f_data;
+	if (fp->f_type != DTYPE_INODE ||
+	    (ip->i_mode & IFMT) != IFCHR ||
+	    cdevsw[major(ip->i_rdev)].d_open != ptcopen) 
+		return ENOTTY;		/* really ENOTPTY :-) */
+#endif NFS
+	/*
+	 * Argument socket and pty are valid, now join them and wait
+	 */
+	tp = cdevsw[major(ip->i_rdev)].d_ttys;
+	s = splimp();
+	if (error = nvs_add(tp + minor(ip->i_rdev), so, &nvsp, 
+			    inmode, outmode)) {
+		splx(s);
+		return error;
+	}
+	if (setjmp(&u.u_qsave)) {
+		/*
+		 * The process received a signal
+		 */
+		nvs_del(nvsp);		/* disassociate pty&socket */
+		splx(s);
+		return EINTR;
+	}
+	while (nvsp->nvs_so->so_rcv.sb_flags & SB_NVS)
+	  sleep((caddr_t)nvsp, PZERO + 1); /* wait for signal or disconnect */
+
+	/*
+	 * The remote disconnected.
+	 */
+	nvs_del(nvsp);			/* disassociate pty&socket */
+	splx(s);
+	return 0;
+}
+
+/*
+ * nvs_output_wake is called from sbwakeup when more space becomes
+ * available in the socket output buffer.  The code that clears
+ * SB_NVS_WAIT assumes that this is called at iplnet.  Let's hope
+ * it is.
+ */
+
+nvs_output_wake(sb)
+	struct sockbuf *sb;		/* so_snd */
+{
+	register struct socket *so;
+	register struct nvsj *nvs;
+	register struct tty *tp;
+
+	nvs = &nvsj[sb->sb_nvs_index];
+	if ((tp = nvs->nvs_tp) == 0) {
+	  nvs_emsg("nvs output wake no tp %x\n", sb);
+	  return;
+	}
+	sb->sb_flags &= ~(SB_NVS_WAIT | SB_WAIT);
+	ptsnvsnet(tp);  /* calls nvs_output immediately */
+      }
+
+/*
+ * Move characters from pty outq to network
+ * TS_BUSY is assumed to be set upon entry
+ *
+ * Must be called at or below net IPL
+ */
+/*ARGSUSED*/
+nvs_output(tp, urgentp)
+	struct tty *tp;
+	int *urgentp;		/* call by reference because I can zero it */
+{
+  	register struct mbuf *m;
+	register struct socket *so;
+	register int error, s, space;
+	unsigned char * dp;
+	int outmode;
+	int iacs,chars;
+
+	s = splnet();
+	if ((so = ptynvsso[minor(tp->t_dev)]) == 0) {	/* paranoid */
+		/*
+		 * no longer an NVS!
+		 */
+		statemask(tp,~TS_BUSY);
+		if (tp->t_oproc) 
+			(*tp->t_oproc)(tp);
+		goto rspl;
+	}
+	if (so->so_state & SS_CANTSENDMORE) {
+		while (getc(&tp->t_outq) >= 0) 
+			;
+		*urgentp = 0;
+	}
+	outmode = ptyoutmode[minor(tp->t_dev)];
+	/*
+	 * If there is urgent data to send, ship it now
+	 */
+	if (*urgentp && (outmode == OUT_RLOGIN)) {
+	  	MGET(m, M_DONTWAIT, MT_DATA);
+		if (m == 0) 
+		  goto out;
+
+		*mtod(m, unsigned char *) = *urgentp;
+		*urgentp = 0;
+		m->m_len = 1;
+		error = (*so->so_proto->pr_usrreq)(so,
+			PRU_SENDOOB, m, (struct mbuf *)0, (struct mbuf *)0);
+		if (error) 
+			nvs_emsg("nvs SENDOOB %d\n", error);
+		goto out;
+	}
+	else *urgentp = 0;
+	if ((tp->t_state & TS_TTSTOP) && (outmode != OUT_RLOGIN)) {
+	  spl5();
+	  statemask(tp,~TS_BUSY);
+	  goto out2;
+	}
+	while (tp->t_outq.c_cc > 0) {
+		/*
+		 * Send a chunk of character traffic that may be pending
+		 */
+	  /*
+	   * We check for space in the socket first, because the most
+	   * common wait is due to flow control from the other end.
+	   * Since we are using a form of busy wait, we want to detect
+	   * this as soon as possible
+	   */
+	  space = sbspace(&so->so_snd);
+	  if (space < so->so_snd.sb_lowat) { /* not enough space */
+	    so->so_snd.sb_flags |= SB_NVS_WAIT | SB_WAIT; /* wait till space */
+	    spl5();  /* needed at out2 */
+	    goto out2;  /* don't resched.  net code will call us when space */
+	  }
+	  /*
+	   * Each time through the loop we do one contiguous piece of
+	   * data from the character list.  We have to do it this way
+	   * in order to be able to check for iacs efficiently.
+	   */
+	  iacs = 0;
+	  chars = ndqb(&tp->t_outq,0);
+
+	  if (outmode != OUT_RLOGIN) { /* look for IAC's */
+	    int count;
+	    unsigned char * cp = (unsigned char *)tp->t_outq.c_cf;
+	    
+	    for (count = chars; count > 0; count--)
+	      if (*cp++ == IAC)
+		iacs++;
+	  }
+/*
+ * at this point chars is number of chars in first piece of buffer,
+ * and iacs is number of iacs in that 
+ */
+
+/*
+ *  The following code is specific to Pyramid release 3.0
+ *  We are trying to copy data from the pty buffer out to the
+ *  network.  On the Pyramid, sbnext is used to find where to
+ *  copy the data to.  It returns (in dp) a pointer into an
+ *  mbuf.  If there was already data on the queue, this is
+ *  a pointer into an existing mbuf.  If not, it allocates a
+ *  new one.  It returns the amount of space left in the mbuf.
+ *  It sets m_len in the mbuf assuming that you are actually
+ *  going to put that much data in.
+ *
+ *  On a VAX, things work differently.  Instead of calling
+ *  sbnext to find a place to put your data, you allocate
+ *  an mbuf yourself.  Then you copy the data into it as
+ *  below.  Further down, you will find a call to pr_usrreq.
+ *  On a VAX, the argument I have given as "1" would be the
+ *  mbuf.  The second line below, with sbnext in it, and the
+ *  following two lines, "if (space <= 0) goto out;", should
+ *  probably be replaced by
+ *	MGET(m, M_DONTWAIT, MT_DATA);
+ *	if (m == 0) 
+ *		goto out;
+ *	if (space > MLEN) 
+ *		space = MLEN;
+ *	dp = mtod(m, unsigned char *);
+ *  	m->m_len = space;
+ *  This effectively simulates sbnext, although in a somewhat
+ *  less intelligent way than Pyramid's actual code.
+ *  In the call to pr_usrreq below, you should probably change
+ *  the argument "1" to "m".
+ */
+	  space = MIN(space, chars + iacs);
+	  space = sbnext(&so->so_snd,&dp,space);
+	  if (space <= 0)
+	    goto out;  /* no mbufs. this does a busy wait until space */
+/*
+ * This is an optimization.  If there are no IAC's, we can just copy
+ * the data from the pty directly into the tcp mbuf.  If there are
+ * IAC's, we have to turn each single IAC into two IAC's.  We do
+ * this by copying one character at a time.  If we decide to turn bare
+ * CR into CR NUL, as required by the spec, we will have to do something
+ * similar when we find a bare CR.  We will also have to remember when
+ * the last character we process is a CR, for handling next time around.
+ */
+	  if (iacs == 0) {
+	    q_to_b(&tp->t_outq, dp, space);
+	    so->so_snd.sb_cc += space;
+	  }
+	  else {
+	    int count = space;
+	    while (count-- > 1) { /* leave one extra for iac */
+	      unsigned char outchar;
+	      outchar = getc(&tp->t_outq);
+	      *dp++ = outchar;
+	      if (outchar == IAC) {
+		*dp++ = outchar;
+		count--;
+	      }
+	    }
+	    so->so_snd.sb_mb->m_len -= count;  /* either 1 or 0 left over */
+	    so->so_snd.sb_cc += space - count;
+	  }
+
+	  error = (*so->so_proto->pr_usrreq)(so,
+		   PRU_SEND, 1, (struct mbuf *)0, (struct mbuf *)0);
+#ifdef lint
+		/* Same actuals as above, better information for lint */
+	  error = tcp_usrreq(so,
+		   PRU_SEND, 1, (struct mbuf *)0, (struct mbuf *)0);
+#endif
+	}
+
+
+out:	/*
+	 * Perpetuate myself if work remains
+	 */
+	(void) spl5();			/* block out tty activity */
+	if (tp->t_outq.c_cc > 0 || *urgentp)
+		timeout(ptsnvsnet, (caddr_t)tp, nvsichz); /* TS_BUSY remains set */
+	else
+		statemask(tp,~TS_BUSY);
+out2:	/*
+	 * Wake up sleepers
+	 */
+	if (tp->t_outq.c_cc <= TTLOWAT(tp)) {
+		if (tp->t_state&TS_ASLEEP) {
+			statemask(tp,~TS_ASLEEP);
+			wakeup((caddr_t)&tp->t_outq);
+		}
+		if (tp->t_wsel) {
+			selwakeup(tp->t_wsel, tp->t_state & TS_WCOLL);
+			tp->t_wsel = 0;
+			statemask(tp,~TS_WCOLL);
+		}
+	}
+rspl:	splx(s);
+}
+
+

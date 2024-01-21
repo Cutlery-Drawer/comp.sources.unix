@@ -1,0 +1,1291 @@
+Subject: v25i037: listserv5.31 - mailing list management system, Part03/06
+Newsgroups: comp.sources.unix
+Approved: vixie@pa.dec.com
+
+Submitted-By: tasos@cs.bu.edu
+Posting-Number: Volume 25, Issue 37
+Archive-Name: listserv5.31/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 6)."
+# Contents:  src/farch.c src/misc.c
+# Wrapped by vixie@cognition.pa.dec.com on Fri Dec 13 18:31:09 1991
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'src/farch.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/farch.c'\"
+else
+echo shar: Extracting \"'src/farch.c'\" \(14750 characters\)
+sed "s/^X//" >'src/farch.c' <<'END_OF_FILE'
+X/*
+X  ----------------------------------------------------------------------------
+X  |                	    FILE ARCHIVING UTILITY			     |
+X  |                                                                          |
+X  |                              Version 1.0                                 |
+X  |                                                                          |
+X  |                (or, when Computer Science gets to you)                   |
+X  |                                                                          |
+X  |                    Written by Anastasios Kotsikonas                      |
+X  |                           (tasos@cs.bu.edu)                              |
+X  |                                                                          |
+X  | AGREEMENT: This software can be used and distributed freely as long      |
+X  | as you do not remove or alter the Copyright notice in the file defs.h;   |
+X  | this notice is #define'd in the symbol VERSION. Although you may alter   |
+X  | the code provided, you may not alter the functions create_header()       |
+X  | and create_multi_recipient_header() in list.c and listserv.c.            |
+X  | By using this software you are bound by this agreement.                  |
+X  | This software comes with no warranties and cannot be sold for profit.    |
+X  | The AGREEMENT and COPYRIGHT notices should be included in all source     |
+X  | files when distributing this software.                                   |
+X  | COPYRIGHT: Copyright (c) 1991, Anastasios C. Kotsikonas                  |
+X  ----------------------------------------------------------------------------
+X
+X  farch archives files into the specified directories, possibly splitting
+X  them into smaller parts. It then updates the DIR file of the appropriate
+X  archive. Split files have numbers appended to their original names;
+X  non-split files have their names intact. Binary files are uuencoded before
+X  processed, and all output files are compressed.
+X
+X  COMMAND LINE OPTIONS:
+X    -n: Do not split input files.
+X    -t: Tar all input files.
+X    -b: Input files are binary; uuencode.
+X    -s: Set the maximum size of each of the split subparts in kilobytes.
+X    -a: Specify the archive where the input files will be archived.
+X    -d: Specify the actual directory that the archived files will reside.
+X
+X  WARNING: The program can also archive directory files, if these can be
+X  of any use.
+X
+X  Algorithm:
+X  {
+X    Process command line arguments; allocate buffer_size
+X    Open master archive; get path to specified archive
+X    Verify existsence of target directory -- create it if necessary
+X    Tar files, if so requested
+X    for (each input file) {
+X      open
+X      get filesize
+X      if (-b)
+X	uuencode file
+X      if (-n or filesize <= buffer_size) { -- Do not split --
+X	if (-b)
+X	  copy uuencoded file into target directory
+X	else if (file does not exist in target directory)
+X	  copy it to target directory
+X	  compress it
+X	update (archive's directory)
+X      }
+X      else split file {
+X	while (not eof) {
+X	  get unique output filename
+X	  fwrite (leftover bytes from previous chunk)
+X	  fread (new chunk)
+X	  if (! -b) {
+X	    locate nearest newline from the end of the buffer
+X	    copy those skipped bytes to leftover
+X	  }
+X	  fwrite (new modified chunk)
+X	  compress it
+X	}
+X	fwrite (any leftovers)
+X	compress part
+X	update (archive's directory)
+X      }
+X    }
+X  }
+X*/
+X
+X#include <stdio.h>
+X#include <malloc.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include "defs.h"
+X#include "struct.h"
+X#include "listserv.h"
+X
+X#define DEFAULT_SIZE    64 * 1024
+X#define UUE_FILE	"/tmp/uue"
+X
+extern char *extract_filename (char *);
+extern char *locase (char *);
+void   main (int , char **);
+void   uuencode (FILE **, char *, char *, struct stat *, BOOLEAN);
+void   update (char *, char *, int, char *);
+void   usage (void);
+void   do_archive (int, int, char **, char *, char *, char *, char *, long int,
+X                   BOOLEAN, BOOLEAN, BOOLEAN);
+int    get_archive (char **, char *);
+int    get_dir (char *, char **, char *);
+int    tar_files (int, int, char **, char *);
+X
+SYS sys; /* Bogus */
+COMMANDS commands [MAX_COMMANDS]; /* Bogus */
+X
+void main (int argc, char **argv)
+X{
+X  long int size = DEFAULT_SIZE;
+X  char *buf, *arch = NULL, *newdir = NULL, *dir, fullpath[256],
+X       *tarf, *options = "nbs:a:d:t:u";
+X  int c;
+X  BOOLEAN bin = FALSE, tar = FALSE, split = TRUE;
+X  extern char *optarg;
+X  extern int optopt, optind;
+X
+X  buf = (char *) malloc (size * sizeof (char));
+X  dir = (char *) malloc (sizeof (char));
+X  while ((c = getopt (argc, argv, options)) != EOF)
+X    switch ((char) c) {
+X    case 'n': split = 0; break;
+X    case 't': tar = TRUE; tarf = optarg;
+X    case 'b': bin = TRUE; break;
+X    case 's': size = (long) atol (optarg) * 1024;
+X      	      if (size <= 0)
+X                fprintf (stderr, "How am I supposed to allocate %ld bytes?\n",
+X                         size),
+X                exit (2);
+X              free ((char *) buf);
+X              if ((buf = (char *) malloc (size * sizeof (char))) == NULL)
+X                fprintf (stderr, "Size too big; not enough memory.\n"),
+X                exit (1);
+X              break;
+X    case 'a': arch = locase (optarg); break;
+X    case 'd': newdir = optarg;
+X              if (*newdir != '/')
+X                fprintf (stderr, "Must specify full path for the directory.\n"),
+X                exit (1);
+X              break;
+X    case 'u': usage ();
+X    case ':': fprintf (stderr, "Option '%c' requires an argument.\n", optopt);
+X              exit (2);
+X    case '?':
+X    default:
+X      fprintf (stderr, "Unrecognized option '%c'.\n", optopt);
+X      usage ();
+X    }
+X
+X  if (optind == argc)
+X    goto abort;
+X  if (get_archive (&arch, fullpath) && get_dir (newdir, &dir, fullpath)) {
+X    if (tar)
+X      if (tar_files (optind, argc, argv, tarf))
+X        argc = optind + 1;
+X      else 
+X	goto abort;
+X    do_archive (optind, argc, argv, buf, fullpath, arch, dir, size, bin,
+X		split, tar);
+X    if (tar)
+X      unlink (tarf);
+X  }
+X  abort:
+X  free ((char *) dir);
+X  free ((char *) buf);
+X}
+X
+X/*
+X  uuencode a file.
+X*/
+X
+void uuencode (FILE **fin, char *file, char *infile, struct stat *finbuf,
+X	       BOOLEAN tar)
+X{
+X  fclose (*fin);
+X  printf ("\t- uuencoding...\n");
+X  syscom ("uuencode %s %s%s > %s", file, infile, (tar ? ".tar" : ""),
+X	  UUE_FILE);
+X  *fin = fopen (UUE_FILE, "r");
+X  stat (UUE_FILE, finbuf);
+X}
+X
+X/*
+X  tar all input files into 'tarf'.
+X*/
+X
+int tar_files (int optind, int argc, char **argv, char *tarf)
+X{
+X  FILE *fin, *fout;
+X  char files[10000];
+X  int original = optind;
+X
+X  if ((fout = fopen (tarf, "w")) == NULL) {
+X    fprintf (stderr, "Cannot write to tar file %s\n", tarf);
+X    return 0;
+X  }
+X  unlink (tarf);
+X  printf ("tarring...\n");
+X  RESET (files);
+X  while (optind < argc) {
+X    if ((fin = fopen (argv[optind], "r")) == NULL) {
+X      fprintf (stderr, "Unable to open %s for reading.\n", argv[optind]);
+X      return 0;
+X    }
+X    fclose (fin);
+X    sprintf (files + strlen (files), "%s ", argv[optind++]);
+X  }
+X  syscom ("tar cf %s %s", tarf, files);
+X  argv[original] = tarf;
+X  return 1;
+X}
+X
+X/*
+X  Update the archive's directory.
+X*/
+X
+void update (char *path, char *file, int count, char *dir)
+X{
+X  char dirf[256];
+X  FILE *fout;
+X
+X  dirf[0] = EOS;
+X  sprintf (dirf, "%s/%s", path, DIR);
+X  if ((fout = fopen (dirf, "a")) == NULL) {
+X    fprintf (stderr, "Unable to open index %s for update.\nFile %s \
+not archived. Remove output file(s) from %s\n", dirf, file, dir);
+X    exit (1);
+X  }
+X  fprintf (fout, "%s %d %s\n", file, count, dir);
+X  fclose (fout);
+X}
+X
+void usage ()
+X{
+X  fprintf (stderr, "farch [-n] [-b] [-s size] [-a archive] [-d dir] \
+X[-t file] filename(s)\n");
+X  fprintf (stderr, "-n: do not split input file(s)\n\
+X-b: input files are binary: uuencode (on if -t specified)\n\
+X-s: maximum size of each output file (in kilobytes) -- default %ld\n\
+X-a: which archive index to update (subdir of %s)\n    -- \
+default %s\n\
+X-d: actual directory to put output file(s)\n    -- default %s/%s\n\
+X-t: tar all input files into 'file' and archive that\n",
+X(long) DEFAULT_SIZE / 1024, ARCHIVE_DIR, DEFAULT_ARCHIVE, ARCHIVE_DIR,
+DEFAULT_ARCHIVE);
+X  exit (2);
+X}
+X
+X/*
+X  Archive all files given in 'argv'.
+X*/
+X
+void do_archive (int optind, int argc, char **argv, char *buf, char *fullpath,
+X	         char *archive, char *dir, long int size, BOOLEAN bin,
+X		 BOOLEAN split, BOOLEAN tar)
+X{
+X  FILE *fin, *fout, *flast;
+X  long int count, nread, nchars, total;
+X  char *leftovers = NULL, *s, *infile = NULL, filename[256], compressed[256];
+X  struct stat sbuf, finbuf;
+X
+X  while (optind < argc) { /* Split and archive each file */
+X
+X    s = argv[optind] + strlen (argv[optind]) - 1;
+X    while (s != argv[optind] && *s == '/')  /* Remove trailing / */
+X      *(s--) = EOS;
+X
+X    if ((fin = fopen (argv[optind], "r")) == NULL) { /* Open file */
+X      fprintf (stderr, "Cannot open file %s for reading.\n", argv[optind]);
+X      goto abort;
+X    }
+X
+X    printf ("%s:\n", argv[optind]);
+X    count = 1;
+X    nchars = 0;
+X    stat (argv[optind], &finbuf); /* Get size of input file */
+X
+X    if (infile) /* free previous allocation */
+X      free ((char *) infile);
+X    infile = extract_filename (argv[optind]); /* get filename from path */
+X    locase (infile);
+X
+X    if (bin) /* uuencode */
+X      uuencode (&fin, argv[optind], infile, &finbuf, tar);
+X
+X    if (!split || finbuf.st_size <= size) { /* Not splitting;may have to copy */
+X      fclose (fin);
+X      sprintf (filename, "%s%s%s", (strcmp (dir, "/") ? dir : ""),
+X               ((strcmp (dir, infile) && strcmp (infile, "/")) ? "/" : ""),
+X               infile);
+X
+X      if (bin) { /* Copy UUE_FILE to target directory */
+X        if ((fout = fopen (filename, "w")) == NULL) { /* Test */
+X          fprintf (stderr, "Cannot write to directory %s; cannot \
+proceed with %s\n",
+X                   dir, argv[optind]);
+X          goto abort;
+X        }
+X        fclose (fout);
+X        syscom ("mv %s %s > /dev/null 2>&1", UUE_FILE, filename);
+X      }
+X      else if (stat (filename, &sbuf)) { /* File does not exist in target dir */
+X        if ((fout = fopen (filename, "w")) == NULL) {
+X          fprintf (stderr, "Cannot write to directory %s; cannot \
+proceed with %s\n",
+X                   dir, argv[optind]);
+X          goto abort;
+X        }
+X        fclose (fout);
+X        syscom ("cp %s %s > /dev/null 2>&1", argv[optind], filename);
+X      }
+X
+X      sprintf (compressed, "%s.Z", filename);
+X      if (!stat (compressed, &sbuf)) {
+X	fprintf (stderr, "Output file %s exists; cannot proceed with %s\n",
+X		 compressed, argv[optind]);
+X	goto abort;
+X      }
+X
+X      syscom ("compress %s > /dev/null 2>&1", filename);
+X      update (fullpath, infile, 1, dir);
+X      printf ("\t- file not split\n\t- archived in %s\n\t- directory: %s\n",
+X              archive, dir);
+X    }
+X    else { /* Split file */
+X      while (!feof (fin)) {
+X        sprintf (filename, "%s%s%s%d", (strcmp (dir, "/") ? dir : ""),
+X                 ((strcmp (dir, infile) && strcmp (infile, "/")) ? "/" : ""),
+X                 infile, count);
+X
+X        if (!stat (filename, &sbuf)) {
+X          fprintf (stderr, "Output file %s exists; cannot proceed with %s\n",
+X                   filename, argv[optind]);
+X          fout = (FILE *) -1;
+X          break;
+X        }
+X        if ((fout = fopen (filename, "w")) == NULL) {
+X          fprintf (stderr, "Cannot write to directory %s; cannot proceed \
+with %s\n",
+X                   dir, argv[optind]);
+X          fout = (FILE *) -1;
+X          break;
+X        }
+X
+X        total = 0;  /* Do the actual splitting */
+X        total += fwrite (leftovers, sizeof (char), nchars, fout);
+X        nread = fread (buf, sizeof (char), size - nchars, fin);
+X        if (nchars)
+X          free ((char *) leftovers);
+X        s = buf + nread - (nread > 0 ? 1 : 0);
+X        nchars = 0;
+X        while (s != buf && *s != '\n') /* Look for first \n from the end */
+X          ++nchars,
+X          --s;
+X        if (s == buf) /* No new line found; write as is */
+X          nchars = 0;
+X        nread -= nchars;
+X        leftovers = (char *) malloc (nchars * sizeof (char));
+X        strncpy (leftovers, ++s, nchars); /* Copy anything after \n */
+X        total += fwrite (buf, sizeof (char), nread, fout);
+X        fclose (fout);
+X
+X        if (total == 0)
+X          unlink (filename);
+X        else { /* OK, compress */
+X          sprintf (compressed, "%s.Z", filename);
+X          if (!stat (compressed, &sbuf)) {
+X            fprintf (stderr, "Output file %s exists; cannot proceed with %s\n",
+X                     compressed, argv[optind]);
+X	    unlink (filename);
+X            goto abort;
+X          }
+X          syscom ("compress %s > /dev/null 2>&1", filename),
+X          ++count;
+X	}
+X      }
+X
+X      fclose (fin);
+X      if (bin)
+X        unlink (UUE_FILE);
+X      if (nchars) /* write any leftovers */
+X        flast = fopen (filename, "a"),
+X        fwrite (leftovers, sizeof (char), nchars, flast),
+X        fclose (flast),
+X        free ((char *) leftovers);
+X
+X      if (fout != (FILE *) -1) { /* Splitting successful, update DIR file */
+X        update (fullpath, infile, count - 1, dir);
+X        printf ("\t- file split in %ld parts\n\t- archived in %s\n\t\
+X- directory: %s\n",
+X                (long) count - 1, archive, dir);
+X      }
+X    }
+X    abort:
+X    ++optind;
+X  }
+X}
+X
+X/*
+X  Get archive to update.
+X*/
+X
+int get_archive (char **arch, char *fullpath)
+X{
+X  FILE *master;
+X  char indexf[256], archiv[256], line[256];
+X  BOOLEAN found = FALSE;
+X
+X  if (!*arch)
+X    *arch = DEFAULT_ARCHIVE;
+X  sprintf (indexf, "%s/%s/%s", ARCHIVE_DIR, DEFAULT_ARCHIVE, INDEX);
+X  if ((master = fopen (indexf, "r")) == NULL) {
+X    fprintf (stderr, "Sorry, no master index found.\n");
+X    return 0;
+X  }
+X  while (!feof (master)) { /* Look at the master index for fullpath */
+X    fullpath[0] = archiv[0] = RESET (line);
+X    fgets (line, MAX_LINE - 2, master);
+X    if (line[0] != EOS) {
+X      sscanf (line, "%s %s\n", archiv, fullpath);
+X      locase (archiv);
+X      if (!strcmp (*arch, archiv)) {
+X        found = TRUE;
+X        break;
+X      }
+X    }
+X  }
+X  fclose (master);
+X  if (!found) {
+X    fprintf (stderr, "Archive %s not found.\n", *arch);
+X    return 0;
+X  }
+X  return 1;
+X}
+X
+X/*
+X  Get output directory.
+X*/
+X
+int get_dir (char *newdir, char **dir, char *fullpath)
+X{
+X  char *s;
+X  struct stat sbuf;
+X
+X  free ((char *) *dir);
+X  if (!newdir)
+X    *dir = (char *) malloc ((strlen (fullpath) + 1) * sizeof (char)),
+X    sprintf (*dir, "%s", fullpath);
+X  else {
+X    *dir = (char *) malloc ((strlen (newdir) + 1) * sizeof (char));
+X    sprintf (*dir, "%s", newdir);
+X    s = *dir + strlen (*dir) - 1;
+X    while (s != *dir && *s == '/')
+X      *(s--) = EOS;
+X  }
+X  if (stat (*dir, &sbuf)) {
+X    if (mkdir (*dir, 448)) {
+X      fprintf (stderr, "Unable to create new directory %s\n", *dir);
+X      return 0;
+X    }
+X    printf ("Creating new directory %s\n", *dir);
+X  }
+X  return 1;
+X}
+END_OF_FILE
+if test 14750 -ne `wc -c <'src/farch.c'`; then
+    echo shar: \"'src/farch.c'\" unpacked with wrong size!
+fi
+# end of 'src/farch.c'
+fi
+if test -f 'src/misc.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'src/misc.c'\"
+else
+echo shar: Extracting \"'src/misc.c'\" \(22380 characters\)
+sed "s/^X//" >'src/misc.c' <<'END_OF_FILE'
+X/*
+X  ----------------------------------------------------------------------------
+X  |                      GENERAL PURPOSE FUNCTIONS                           |
+X  |                                                                          |
+X  |                              Version 2.0                                 |
+X  |                                                                          |
+X  |                (or, when Computer Science gets to you)                   |
+X  |                                                                          |
+X  |                    Written by Anastasios Kotsikonas                      |
+X  |                           (tasos@cs.bu.edu)                              |
+X  |                                                                          |
+X  | AGREEMENT: This software can be used and distributed freely as long      |
+X  | as you do not remove or alter the Copyright notice in the file defs.h;   |
+X  | this notice is #define'd in the symbol VERSION. Although you may alter   |
+X  | the code provided, you may not alter the functions create_header()       |
+X  | and create_multi_recipient_header() in list.c and listserv.c.            |
+X  | By using this software you are bound by this agreement.                  |
+X  | This software comes with no warranties and cannot be sold for profit.    |
+X  | The AGREEMENT and COPYRIGHT notices should be included in all source     |
+X  | files when distributing this software.                                   |
+X  | COPYRIGHT: Copyright (c) 1991, Anastasios C. Kotsikonas                  |
+X  ----------------------------------------------------------------------------
+X*/
+X
+X#include <stdio.h>
+X#include <malloc.h>
+X#include <time.h>
+X#include <string.h>
+X#include <ctype.h>
+X#include <signal.h>
+X#include "defs.h"
+X#include "struct.h"
+X
+extern  COMMANDS commands[MAX_COMMANDS];
+X
+extern  int atoi (char *);
+extern  BOOLEAN subscribed (FILE *, char *, char *, char *, char *, char *);
+extern  void process_message (char *, char *, BOOLEAN);
+X#ifdef __STDC__
+X#include <stdarg.h>
+int 	syscom (char *, ...);
+X#else
+X#include <varargs.h>
+int     syscom ();
+X#endif
+int	sys_config (FILE *, SYS *);
+char    *locase (char *);
+char    *upcase (char *);
+void    report_progress (FILE *, char *, int);
+void    distribute (FILE *mail, void (*)(), FILE *, char *, char *, char *,
+X		    char *);
+BOOLEAN strinstr (char *, char *, char *);
+char    *extract_filename (char *);
+int     getopt (int, char **, char *);
+char    *cleanup_name (char *);
+void    cleanup_request (char *);
+void	get_list_name (char *, char *);
+int	get_list_id (char *, SYS *, int nlists);
+void	setup_string (char *, char *, char *);
+char	*_strstr (char *, char *);
+void    shrink (char *);
+BOOLEAN requested_part (char *, int);
+int	my_system (char *);
+X
+X/*
+X  Execute a system request.
+X*/
+X
+X#ifdef __STDC__
+int syscom (char *control, ...)
+X#else
+int syscom (control, va_alist)
+char *control;
+va_dcl
+X#endif
+X{
+X  char command [10240];
+X  extern SYS sys;
+X  extern BOOLEAN tty_echo;
+X  va_list ap;
+X  int status;
+X  FILE *f;
+X  long int time_is = 0;
+X  struct tm *t;
+X
+X#ifdef __STDC__
+X  va_start (ap, control);
+X#else
+X  va_start (ap);
+X#endif
+X  RESET (command);
+X  vsprintf (command, control, ap);
+X  va_end (ap);
+X  if ((sys.options & USE_MY_SYSTEM) == 0)
+X    status = system (command);
+X  else
+X    status = my_system (command);
+X  if (status) {
+X    if ((f = fopen (WARNING, "a")) != NULL)
+X      fprintf (f, "\nWARNING: System call exit status %d: %s\n",
+X	       status / 256, command),
+X      time (&time_is),
+X      t = localtime (&time_is),
+X      fprintf (f, "Time/Date: %2d:%.2d:%.2d, %2d/%.2d/%2d\n",
+X               t->tm_hour, t->tm_min, t->tm_sec, t->tm_mon + 1, t->tm_mday,
+X               t->tm_year),
+X      fclose (f);
+X    if (tty_echo)
+X      printf ("\nWARNING: System call exit status %d: %s\n", status / 256,
+X	      command);
+X  }
+X  return status;
+X}
+X
+X/*
+X  Initialize the 'sys' structure from the CONFIG file. It returns the number
+X  of lists in the system.
+X*/
+X
+int sys_config (FILE *report, SYS *sys)
+X{
+X  FILE *config;
+X  char cmd [MAX_LINE];
+X  char args [MAX_LINE];
+X  char error [MAX_LINE];
+X  char mail_prog [MAX_LINE];
+X  char env_var [MAX_LINE];
+X  char *comment, *cmdarg;
+X  int nlists = 0, i, j, k, id;
+X  BOOLEAN notok;
+X
+X  for (i = 0; i < MAX_LISTS; i++)
+X    sys->lists[i].disabled_commands = 0,
+X    RESET (sys->lists[i].alias),
+X    RESET (sys->lists[i].address),
+X    RESET (sys->lists[i].comment),
+X    RESET (sys->lists[i].cmdoptions);
+X  RESET (sys->server.address), RESET (sys->server.cmdoptions),
+X  RESET (sys->server.comment), RESET (sys->serverd_cmdoptions),
+X  RESET (sys->server.password), RESET (sys->arg), RESET (sys->manager),
+X  RESET (sys->organization), RESET (error);
+X  strcpy (sys->server.address, DEFAULT_SERVER_ADDRESS);
+X  strcpy (sys->server.cmdoptions, DEFAULT_SERVER_CMDOPTIONS);
+X  strcpy (sys->server.comment, DEFAULT_SERVER_COMMENT);
+X  strcpy (sys->manager, DEFAULT_MANAGER);
+X  sys->mail.method = BINMAIL;
+X  sys->options = 0;
+X  sys->users = 100;
+X  sys->frequency = 0;
+X  if ((config = fopen (CONFIG, "r")) == NULL)
+X    sprintf (error, "\nsys_config(): Could not open %s", CONFIG),
+X    report_progress (report, error, TRUE),
+X    exit (1);
+X  chmod (CONFIG, 384);
+X  while (! feof (config)) {
+X    args [0] = RESET (cmd);
+X    fscanf (config, "%s", cmd);
+X    if (cmd[0] == EOS)
+X      continue;
+X    fgets (args, MAX_LINE - 2, config);
+X    args [strlen (args) - 1] = EOS;
+X    if (cmd[0] == '#')
+X      continue;
+X    if (!strcmp (locase (cmd), "list")) {
+X      if (nlists >= MAX_LISTS) {
+X	sprintf (error, "\nsys_config(): List %s ignored: too many lists\n",
+X		 args);
+X	report_progress (report, error, FALSE);
+X	continue;
+X      }
+X      comment = strchr (args, '#');
+X      if (comment)
+X	*comment = EOS;
+X      sscanf (args, "%s%s", sys->lists [nlists].alias,
+X	      sys->lists [nlists].address);
+X      if (get_list_id (sys->lists [nlists].alias, sys, nlists) >= 0 &&
+X	  nlists > 0)
+X	sprintf (error, "\nsys_config(): Duplicate list %s in %s",
+X		 sys->lists [nlists].alias, CONFIG),
+X	report_progress (report, error, TRUE),
+X	exit (4);
+X      cmdarg = _strstr (args, " -");
+X      if (!cmdarg)
+X	cmdarg = _strstr (args, "\t-");
+X      if (cmdarg)
+X	strcat (sys->lists [nlists].cmdoptions, cmdarg);
+X      upcase (sys->lists [nlists].alias);
+X      locase (sys->lists [nlists].address);
+X      ++nlists;
+X    }
+X    else if (!strcmp (cmd, "server")) {
+X      comment = strchr (args, '#');
+X      if (comment)
+X        *comment = EOS;
+X      sscanf (args, "%s", sys->server.address);
+X      cmdarg = _strstr (args, " -");
+X      if (!cmdarg)
+X	cmdarg = _strstr (args, "\t-");
+X      if (cmdarg)
+X	strcat (sys->server.cmdoptions, cmdarg);
+X      locase (sys->server.address);
+X    }
+X    else if (!strcmp (cmd, "frequency")) {
+X      sscanf (args, "%d", &sys->frequency);
+X      if (sys->frequency < 0)
+X	sprintf (error, "\nsys_config(): Invalid 'frequency' argument %d in %s",
+X		 sys->frequency, CONFIG),
+X	report_progress (report, error, TRUE),
+X	exit (4);
+X    }
+X    else if (!strcmp (cmd, "limit")) {
+X      sscanf (args, "%s", sys->arg);
+X      if (!strcmp (locase (sys->arg), "message"))
+X	sys->options |= LIMIT_MSG,
+X        sscanf (args, "%s %ld", sys->arg, &sys->limits.msg);
+X      else
+X        sprintf (error, "\nsys_config(): Invalid argument %s to 'limit' in %s",
+X			  sys->arg, CONFIG),
+X 	report_progress (report, error, TRUE),
+X	exit (4);
+X    }
+X    else if (!strcmp (cmd, "option")) {
+X      sscanf (args, "%s", sys->arg);
+X      if (!strcmp (locase (sys->arg), "bsd_ps"))
+X	sys->options |= BSD_PS;
+X      else if (!strcmp (sys->arg, "sysv_ps"))
+X	sys->options |= SYSV_PS;
+X      else if (!strcmp (sys->arg, "bsd_mail"))
+X	sys->options |= BSD_MAIL;
+X      else if (!strcmp (sys->arg, "bad_telnet"))
+X	sys->options |= USE_MY_SYSTEM;
+X      else if (!strcmp (sys->arg, "post_mail"))
+X	sys->options |= POST_MAIL;
+X      else if (!strcmp (sys->arg, "gate_mail"))
+X	sys->options |= GATE_MAIL;
+X      else
+X	sprintf (error, "\nsys_config(): Invalid argument %s to 'option' in %s",
+X		 sys->arg, CONFIG),
+X	report_progress (report, error, TRUE),
+X	exit (4);
+X    }
+X    else if (!strcmp (cmd, "serverd")) {
+X      comment = strchr (args, '#');
+X      if (comment)
+X        *comment = EOS;
+X      cmdarg = strchr (args, '-');
+X      if (cmdarg)
+X	strcat (sys->serverd_cmdoptions, cmdarg);
+X    }
+X    else if (!strcmp (cmd, "organization")) {
+X      comment = strchr (args, '#');
+X      if (comment)
+X        *comment = EOS;
+X      strcpy (sys->organization, args + 1);
+X    }
+X    else if (!strcmp (cmd, "restriction"))
+X      sscanf (args, "%d", &sys->users);
+X    else if (!strcmp (cmd, "manager"))
+X      sscanf (args, "%s", sys->manager);
+X    else if (!strcmp (cmd, "password"))
+X      sscanf (args, "%s", sys->server.password),
+X      upcase (sys->server.password);
+X    else if (!strcmp (cmd, "disable")) {
+X      if (commands[0].name == NULL)  /* Array not initialized */
+X	continue;
+X      sscanf (args, "%s", sys->arg);
+X      upcase (sys->arg);
+X      id = get_list_id (sys->arg, sys, nlists);
+X      if (id < 0)
+X	sprintf (error, "sys_config(): Unrecognized list name %s for \
+X'disable' in %s", sys->arg, CONFIG),
+X	  report_progress (report, error, TRUE),
+X	  exit (4);
+X      sscanf (args, "%s %s", sys->arg, sys->arg); /* Get request to disable */
+X      upcase (sys->arg);
+X      notok = FALSE;
+X      k = 0;
+X      for (i = 0; i < MAX_COMMANDS; ++i) {
+X	notok &= (((j = strncmp (sys->arg, commands[i].name, strlen (sys->arg)))
+X		   != 0) ? 1 : 0);
+X	if (!j)
+X	  ++k,
+X	  sys->lists[id].disabled_commands |= commands[i].mask;
+X      }
+X      if (notok)
+X	sprintf (error, "sys_config(): Unrecognized request %s to 'disable' \
+for list %s in %s", sys->arg, sys->lists[id].alias, CONFIG),
+X	report_progress (report, error, TRUE),
+X	exit (4);
+X      if (k > 1)
+X	sprintf (error, "sys_config(): Ambiguous request %s to 'disable' \
+for list %s in %s", sys->arg, sys->lists[id].alias, CONFIG),
+X	report_progress (report, error, TRUE),
+X	exit (4);
+X    }
+X    else if (!strcmp (cmd, "comment")) {
+X      sscanf (args, "%s", sys->arg);
+X      if (!strcmp (locase (sys->arg), "server")) {
+X	comment = strchr (args, '#');
+X	if (comment == NULL)
+X	  sprintf (error, "\nsys_config(): Missing # for comment in %s",CONFIG),
+X          report_progress (report, error, TRUE),
+X          exit (4);
+X	RESET (sys->server.comment);
+X	strcat (sys->server.comment, comment + 1);
+X      }
+X      else {  /* Some list name was specified */
+X	upcase (sys->arg);
+X	id = get_list_id (sys->arg, sys, nlists);
+X	if (id < 0)
+X	  sprintf (error, "sys_config(): Unrecognized list name %s for \
+X'comment' in %s", sys->arg, CONFIG),
+X	  report_progress (report, error, TRUE),
+X	  exit (4);
+X	comment = strchr (args, '#');
+X	if (comment == NULL)
+X	  sprintf (error, "\nsys_config(): Missing # for comment in %s", CONFIG),
+X	  report_progress (report, error, TRUE),
+X	  exit (4);
+X	RESET (sys->lists[id].comment);
+X	strcat (sys->lists[id].comment, comment + 1);
+X      }
+X    }
+X    else if (!strcmp (cmd, "mailmethod")) {
+X      sscanf (args, "%s", sys->arg);
+X      if (!strcmp (locase (sys->arg), "telnet"))
+X	sys->mail.method = TELNET,
+X 	sys->options |= USE_TELNET;
+X      else if (!strcmp (locase (sys->arg), "system"))
+X	sys->options |= (USE_TELNET | USE_SYSMAIL);
+X      else if (!strcmp (sys->arg, "sendmail") || !strcmp (sys->arg, "rmail"))
+X	sys->mail.method = (char *) malloc (256 * sizeof (char)),
+X	sscanf (args, "%s %s", sys->arg, sys->mail.method),
+X	locase (sys->mail.method),
+X	strcat (sys->mail.method, " > /dev/null 2>&1");
+X      else if (!strcmp (sys->arg, "binmail"))
+X	sys->mail.method = BINMAIL;
+X      else if (!strcmp (sys->arg, "env_var"))
+X	sys->options |= USE_ENV_VAR,
+X	sscanf (args, "%s %s %s", sys->arg, sys->mail.env_var,
+X	        sys->mail.mail_prog),
+X	locase (sys->mail.mail_prog),
+X	upcase (sys->mail.env_var);
+X      else
+X	sprintf (error, "\nsys_config(): Unrecognized mail method %s in %s",
+X		 sys->arg, CONFIG),
+X	report_progress (report, error, TRUE),
+X	exit (4);
+X    }
+X    else
+X      sprintf (error, "\nUnrecognized command %s in %s", cmd, CONFIG),
+X      report_progress (report, error, TRUE),
+X      exit (4);
+X  }
+X  fclose (config);
+X  return nlists;
+X}
+X
+X/*
+X  Convert a string to lower case.
+X*/
+X
+char *locase (char *s)
+X{
+X  char *r = s;
+X  while (*s != EOS) {
+X    if (isupper (*s))
+X      *s = tolower (*s);
+X    ++s;
+X  }
+X  return r;
+X}
+X
+X/*
+X  Convert a string to upper case.
+X*/
+X
+char *upcase (char *s)
+X{
+X  char *r = s;
+X
+X  while (*s != EOS) {
+X    if (islower (*s))
+X      *s = toupper (*s);
+X    ++s;
+X  }
+X  return r;
+X}
+X
+X/*
+X  Write messages and times to REPORT_LIST and stdout. If 'report_time'
+X  is set to a negative value no leading newline is printed to 'report'.
+X  NOTE: Use strftime(), if possible.
+X*/
+X
+void report_progress (FILE *report, char *s, int report_time)
+X{
+X  extern BOOLEAN tty_echo;
+X  long int time_is = 0;
+X  struct tm *t;
+X
+X  fprintf (report, "%s", s);
+X  if (report_time) {
+X    time (&time_is);
+X    t = localtime (&time_is);
+X    if (report_time > 0)
+X      fprintf (report, "\n");
+X    fprintf (report, "Time/Date: %2d:%.2d:%.2d, %2d/%.2d/%2d\n",
+X             t->tm_hour, t->tm_min, t->tm_sec, t->tm_mon + 1, t->tm_mday,
+X             t->tm_year);
+X  }
+X  fflush (report);
+X  if (tty_echo) {
+X    printf ("%s", s);
+X    if (report_time)
+X      printf ("\n");
+X    fflush (stdout);
+X  }
+X}
+X
+X/*
+X  Start distribution. Call lower level routines; the algorithm is such that
+X  this routine always looks at the beginning of each message when reading
+X  into 'first_line', i.e. 'first_line' is always assigned a string of the form:
+X		'From emailaddress Date Time'
+X  which is the universal convention for the start of every message. It calls
+X  subscribed() to find out if the sender is subscribed and passes the
+X  result to process_message(). Since the call to extract_sender() alters
+X  'first_line' to contain only the sender's email address a 'linecopy' is used.
+X  When returning from process_message() we have already advanced to the
+X  beginning of the next message, and 'linecopy' contains a string of the 
+X  above form; therefore we need to copy that back to 'first_line'.
+X*/
+X
+void distribute (FILE *mail, void (*process_message)(), FILE *report,
+X		 char *subscribersf, char *newsf, char *peersf, char *aliasesf)
+X{
+X  char first_line[MAX_LINE], linecopy[MAX_LINE];
+X
+X  first_line[0] = RESET (linecopy);
+X  while (!feof (mail))
+X    if (first_line[0] != EOS)
+X      extract_sender (first_line),
+X      process_message ((char *) first_line, (char *) linecopy, (BOOLEAN)
+X		       subscribed (report, first_line, subscribersf, newsf,
+X				   peersf, aliasesf)),
+X      strcpy (first_line, linecopy);
+X    else /* Read the first line of the very first message */
+X      fgets (first_line, MAX_LINE - 2, mail), /* 'From email Date Time' */
+X      strcpy (linecopy, first_line);
+X}
+X
+X/*
+X  Look for occurence of 'string' in 'substr' and return either TRUE or FALSE.
+X  Look at the comments for defs.h for the syntax of 'substr'. A 'substr' of
+X  "*" matches everything.
+X*/
+X
+BOOLEAN strinstr (char *substr, char *string, char *sep)
+X{
+X  char *origstr = string, *tok, *substrcopy;
+X  int l;
+X
+X  if (*substr == '*')
+X    return TRUE;
+X  substrcopy = (char *) malloc ((strlen (substr) + 1) * sizeof (char));
+X  strcpy (substrcopy, substr);
+X  tok = strtok (substrcopy, sep); /* Get first token */
+X  while (tok) { /* For every token in substr, check if it's in 'string' */
+X    string = origstr;
+X    l = strlen (tok);
+X    if (strlen (string) < l) {
+X      tok = strtok (NULL, sep);  /* get next token */
+X      continue;
+X    }
+X    while (strlen (string) >= l)
+X      if (! strncmp (tok, string, l)) {
+X        free (substrcopy);
+X        return TRUE;
+X      }
+X      else
+X        ++string;
+X    tok = strtok (NULL, sep); /* failed with this token; get the next one */
+X  }
+X  free (substrcopy);
+X  return FALSE;
+X}
+X
+X/*
+X  Given a file path, extract the file name. In the process, any command line
+X  options or any characters separated from the filename are discarded.
+X*/
+X
+char *extract_filename (char *s)
+X{
+X  char *p, *r, *t = s, nchar = 0;
+X
+X  while (*t != EOS && *t != ' ' && *t != '\t') /* Get to delimiting char */
+X    ++t;
+X  while (t != s && *t != '/') /* Go back till / or the beginning of s */
+X    ++nchar,
+X    --t;
+X  if (t != s || (*t == '/' && *(t + 1) != EOS))
+X    --nchar,
+X    ++t;
+X  r = p = (char *) malloc ((nchar + 1) * sizeof (char));
+X  *p = EOS;
+X  while (*t != EOS && *t != ' ' && *t != '\t')
+X    *(p++) = *(t++);
+X  *p = EOS;
+X  return r;
+X}
+X
+X/*
+X  Recognize the command line parameters. It returns '?' on an unrecognized
+X  option, ':' if an option requires an argument and the argument is missing,
+X  or the recognized character itself. This code is a copyright of AT&T.
+X*/
+X
+X# define ERR(str, ch) if (opterr) \
+X                        fprintf (stderr, "%s%s%c\n", argv[0], str, ch);
+X
+int opterr = 0;
+int optind = 1;
+int optopt;
+char *optarg;
+X
+int getopt (int argc, char **argv, char *opts)
+X{
+X  static int sp = 1;
+X  register int c;
+X  register char *cp;
+X
+X  if (sp == 1)
+X    if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0')
+X      return EOF;
+X    else if (strcmp (argv[optind], "--") == NULL) {
+X      optind++;
+X      return EOF;
+X    }
+X    optopt = c = argv[optind][sp];
+X    if (c == ':' || (cp = strchr (opts, c)) == NULL) {
+X      ERR (": unknown option, -", c);
+X      if (argv[optind][++sp] == '\0')
+X        optind++,
+X        sp = 1;
+X      return '?';
+X    }
+X    if (*++cp == ':') {
+X      if (argv[optind][sp+1] != '\0')
+X        optarg = &argv[optind++][sp+1];
+X      else if (++optind >= argc) {
+X        ERR(": argument missing for -", c);
+X        sp = 1;
+X        return ':';
+X      }
+X      else
+X        optarg = argv[optind++];
+X      sp = 1;
+X    }
+X    else {
+X      if (argv[optind][++sp] == '\0')
+X        sp = 1,
+X        optind++;
+X      optarg = NULL;
+X    }
+X    return c;
+X}
+X
+X/*
+X  Remove any extraneous characters from a name and convert it to lower
+X  case with the first character of each word capitalized.
+X*/
+X
+char *cleanup_name (char *s)
+X{
+X  char *tok, *copy, *sep = " ", *line;
+X  int j, l;
+X
+X  if (s [strlen (s) - 1] == '\n')
+X    s [strlen (s) - 1] = EOS;
+X  line = (char *) malloc ((strlen (s) + 1) * sizeof (char));
+X  strcpy (line, s);
+X  *s = EOS;
+X  tok = strtok (line, sep);
+X  while (tok) {
+X    copy = tok;
+X    while (*copy != EOS) {  /* Remove extraneous characters */
+X      if (! isalpha (*copy) && ! isspace (*copy)) {
+X        for (j = 0, l = strlen (copy); j < l; copy[j] = copy[j+1], ++j);
+X        continue;
+X      }
+X      ++copy;
+X    }
+X    locase (tok);
+X    *tok = toupper (*tok);
+X    sprintf (s + strlen (s), " %s", tok);
+X    tok = strtok (NULL, sep);
+X  }
+X  free (line);
+X  return s;
+X}
+X
+X/*
+X  Remove leading blanks from a request.
+X*/
+X
+void cleanup_request (char *s)
+X{
+X  while (isspace (*s))
+X    sprintf (s, "%s", s + 1);
+X}
+X
+X/*
+X  Identify the list that the request refers to. Before doing so, remove
+X  any unnecessary blanks from the parameters. Also, check each parameter
+X  for proper syntax.
+X*/
+X
+void get_list_name (char *params, char *list_name)
+X{
+X  int i;
+X  char *s, *r, *t;
+X  char param [MAX_LINE];
+X
+X  r = s = (char *) malloc ((strlen (params) + 1) * sizeof (char));
+X  strcpy (s, params);
+X  RESET (params);
+X  RESET (param);
+X  for (i = 0; s[i] != EOS;)
+X    if (isspace (s[i]) && isspace (s[i + 1]))
+X      sprintf (s + i, "%s", s + i + 1);
+X    else
+X      i++;
+X  do {
+X    RESET (param);
+X    sscanf (s, "%s", param);
+X    s = s + strlen (param) + 1; /* Skip over space */
+X    t = strpbrk (param, "*?/");
+X    if (t != NULL) {
+X      if (t == param || (t != param && ! isalpha (*(t - 1)))) /* Invalid *,? */
+X	*t = '+';
+X      if (*t == '/') /* Invalid / */
+X	*t = '%';
+X    }
+X    sprintf (params + strlen (params), " %s", param);
+X  } while (param[0] != EOS);
+X  strcat (params, "\n");
+X  free (r);
+X  RESET (list_name);
+X  sscanf (params, "%s", list_name);
+X  upcase (list_name);
+X  sprintf (params, "%s", params + strlen (list_name) + 1);
+X}
+X
+X/*
+X  Given a list name, return its index in the array of known lists.
+X*/
+X
+int get_list_id (char *list_name, SYS *sys, int nlists)
+X{
+X  int i;
+X
+X  for (i = 0; i < nlists; i++)
+X    if (!strcmp (list_name, sys->lists[i].alias))
+X      return i;
+X  return -1;
+X}
+X
+void setup_string (char *s, char *alias, char *filename)
+X{
+X  RESET (s);
+X  sprintf (s, "%s/lists/%s/%s", PATH", alias, filename);
+X}
+X
+X/*
+X  Return the first occurence of 'sub' in 'src', or NULL if not found.
+X*/
+X
+char *_strstr (char *src, char *sub)
+X{
+X  if (src == NULL || sub == NULL)
+X    return NULL;
+X  while (*src != EOS) {
+X    if (!strncmp (src, sub, strlen (sub)))
+X      return src;
+X    ++src;
+X  }
+X  return NULL;
+X}
+X
+X/*
+X  Shrink a message-id file so that it contains a maximum of KEEP_MESSAGE_IDS
+X  entries in it.
+X*/
+X
+void shrink (char *s)
+X{
+X  syscom ("tail -%d %s > /tmp/.msg", KEEP_MESSAGE_IDS, s);
+X  syscom ("mv /tmp/.msg %s", s);
+X}
+X
+X/*
+X  Verify that 'i' is in 's'.
+X*/
+X
+BOOLEAN requested_part (char *s, int i)
+X{
+X  char buf [80];
+X  char copy [MAX_LINE];
+X
+X  strncpy (copy, s, MAX_LINE - 1);
+X  do {
+X    RESET (buf);
+X    sscanf (copy, "%s", buf);
+X    sprintf (copy, "%s", strchr (copy, buf[0]) + strlen (buf));
+X    if (atoi (buf) == i)
+X      return TRUE;
+X  } while (buf[0] != EOS);
+X  return FALSE;
+X}
+X
+X/*
+X  Use my_system() when either list and listserv use TELNET and there is
+X  an indication that the sessions do not exit.
+X*/
+X
+int my_system (char *s)
+X{
+X  FILE *f;
+X  int pid, status;
+X  char line [MAX_LINE], *r;
+X  extern SYS sys;
+X
+X  if (strcmp ((r = extract_filename (s)), "telnet")) {
+X    status = system (s);
+X    free ((char *) r);
+X    return status;
+X  }
+X  free ((char *) r);
+X  strcat (s, " &"); /* Only telnet runs in the background */
+X  status = system (s);
+X  if (status > 127)
+X    return status;
+X  sleep (5);
+X  if (sys.options & BSD_PS)
+X    system ("ps -gx | grep telnet | grep -v \"grep telnet\" \
+X	    | grep -v telnetd > ./telnet");
+X  else if (sys.options & SYSV_PS)
+X    system ("ps -ef | grep telnet | grep -v \"grep telnet\" \
+X	    | grep -v telnetd > ./telnet");
+X  if ((f = fopen ("./telnet", "r")) == NULL)
+X    return -1;
+X  while (! feof (f)) {
+X    RESET (line);
+X    fgets (line, MAX_LINE - 2, f);
+X    if (line[0] != EOS)
+X      sscanf (line, "%d", &pid),
+X      sleep (15),
+X      kill (pid, SIGHUP);
+X  }
+X  fclose (f);
+X  unlink ("./telnet");
+X  return status;
+X}
+X
+X/* Change history (by Bob Boyd)
+X21-Aug-1991   RLB     change parameter scanning for "list" lines in the
+X                      config file so that "-" characters in the list-alias
+X                      are ignored when looking for the beginning of the
+X                      list parameters [tasos: I defined my own strstr()]
+X*/
+END_OF_FILE
+if test 22380 -ne `wc -c <'src/misc.c'`; then
+    echo shar: \"'src/misc.c'\" unpacked with wrong size!
+fi
+# end of 'src/misc.c'
+fi
+echo shar: End of archive 3 \(of 6\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 5 6 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 6 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

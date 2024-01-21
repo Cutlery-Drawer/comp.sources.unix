@@ -1,0 +1,743 @@
+Subject:  v15i049:  Module to make postscript interpreter work under Suntools
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: Rick Lindsley <richl@penguin.uss.tek.com>
+Posting-number: Volume 15, Issue 49
+Archive-name: ps.sun.pch
+
+[  I haven't tried this.  --r$  ]
+
+The following is a file which can be added to the previously posted
+Postscript interpreter which will allow it to run under Suntools
+(instead of *over* Suntools :) ) The file pixwin.README describes how
+to add it into the package, and what special things need to be done
+to make it run.
+
+The previous version worked by simply blatting to the screen. This now
+runs in a window.
+
+Rick Lindsley
+richl@penguin.uss.tek.com
+
+# This is a shell archive.  Remove anything before this line, then
+# unpack it by saving it in a file and typing "sh file".  (Files
+# unpacked will be owned by you and have default permissions.)
+#
+# This archive contains:
+# pixwin.c pixwin.README ps.empty ps.full
+
+echo x - pixwin.c
+cat > "pixwin.c" << '//E*O*F pixwin.c//'
+/*
+ * Copyright (C) Rutherford Appleton Laboratory 1987, All Rights Reserved.
+ * 
+ * This source may be copied, distributed, altered or used, but not sold
+ * for profit or incorporated into a product except under licence from the
+ * author.
+ * It is not in the public domain.
+ * This notice should remain in the source unaltered, and any changes to
+ * the source made by persons other than the author should be marked as such.
+ * 
+ *	Crispin Goswell @ Rutherford Appleton Laboratory caag@uk.ac.rl.vd
+ */
+
+#include "main.h"
+#include "graphics.h"
+#include "canon.h"
+#include <pixrect/pixrect_hs.h>
+#include <suntool/sunview.h>
+#include <suntool/canvas.h>
+#include <suntool/frame.h>
+
+/*
+ * Major changes. Rick Lindsley, richl@tektronix.tek.com, 3/9/88.
+ * Disclaimers and restrictions as outlined above.
+ *
+ * Driver to work with(in) Suntools. Should produce black & white images
+ * just peachy. Anything with color or gray-scaling is untested.
+ *
+ * Note! To make this work properly, you must redefine showpage in your
+ * ~/.postscript file! The definition is thus:
+ *
+ * /showpage { copypage initgraphics flush erasepage } def
+ *
+ * Otherwise, every showpage will beep nastily at you and require
+ * response in TWO windows!
+ *
+ * Philosophy (for those who follow in my footsteps)
+ *
+ * Short version: Suntools is ok to work with from scratch, but it is a
+ *	royal PAIN to "hook in". It CAN be done; however, one needs to
+ *	read the "advanced" manuals.
+ *
+ * Long version: The trick is to set up a window, display it, and process
+ *	events that happen in that window, and do that asynchronously from
+ *	the PostScript interpreter that is running. It turns out that you
+ *	CAN'T do that (it would require two processes to provide two threads
+ *	of control), so the next best thing is to give it the APPEARANCE of
+ *	asynchronicity. This is accomplished by giving the Notifier, which
+ *	presents all window and input events to us, a nudge now and then.
+ *	(Because the documentation constantly gives me the impression that
+ *	it is non-conformist to not allow the Notifier to do the work for
+ *	us, and that the Notifier knows what is best, I've taken to calling
+ *	it Hal in the comments below.)
+ *
+ *	At times (see HardUpdate) we can allow the Notifier to behave almost
+ *	as a normal Suntool (taking control and calling our event procedures
+ *	when appropriate), because we are waiting on the user and are willing
+ *	to be event-driven, but most of the time we give it one shot, at times
+ *	of our convenience, to present us with events. Thus, in all the
+ *	hardware-specific routines listed here, DoDispatch is called once
+ *	in each function. DoDispatch checks for a few simple conditions
+ *	(like, was the window destroyed underneath us?) and then calls the
+ *	Notifier *once*. If there is a stretch in the Interpreter where no
+ *	hardware-specific routines are called, the window may appear to
+ *	"hang" or be sluggish at those points in the code because the Notifier
+ *	will not be poked to provide support for events. (They ARE queued,
+ *	though, and will occur, in sequence, when the Notifier is poked!)
+ *
+ *	Our event handler, STWinEvent, is fairly simple, because all it ever
+ *	cares about is mouse events, and only at fairly well-defined times.
+ *	All other events can be handled by the default actions Suntools
+ *	provides.
+ *
+ *	Two icons are provided as niceties. An empty scroll denotes the
+ *	page is being filled yet. A scroll with writing indicates the page
+ *	is full and the Interpreter is waiting for an ok to continue to
+ *	the next page. The frame label also indicates this change in
+ *	condition.
+ *
+ *	Numerous bells and whistles are possible, given this minimum. They
+ *	are left as an exercise for the reader.
+ *
+ *	This code based on pixrect.c, provided with the original software.
+ */
+
+static short wi_image[] = {
+#include "ps.empty"
+};
+DEFINE_ICON_FROM_IMAGE(working_icon,wi_image);
+
+static short fi_image[] = {
+#include "ps.full"
+};
+DEFINE_ICON_FROM_IMAGE(ready_icon,fi_image);
+
+#define PG_WAITING	0	/* still processing a page		*/
+#define PG_ADVANCE	1	/* page done; user ok'ed us to start on	*/
+				/* the next page			*/
+#define PG_DESTROYED	2	/* window is already destroyed! Data	*/
+				/* structures are probably meaningless.	*/
+				/* Exit at next opportunity.		*/
+
+int rop_map [] =
+ {
+ 	PIX_SRC & PIX_NOT (PIX_SRC),
+ 	PIX_SRC & PIX_DST,
+ 	PIX_SRC & PIX_NOT (PIX_DST),
+ 	PIX_SRC,
+ 	PIX_NOT (PIX_SRC) & PIX_DST,
+ 	PIX_DST,
+ 	PIX_SRC ^ PIX_DST,
+ 	PIX_SRC | PIX_DST,
+ 	PIX_NOT (PIX_SRC | PIX_DST),
+ 	PIX_NOT (PIX_SRC ^ PIX_DST),
+ 	PIX_NOT (PIX_DST),
+ 	PIX_SRC | PIX_NOT (PIX_DST),
+ 	PIX_NOT (PIX_SRC),
+ 	PIX_NOT (PIX_SRC) | PIX_DST,
+ 	PIX_NOT (PIX_SRC & PIX_DST),
+ 	PIX_SRC | PIX_NOT (PIX_SRC)
+ };
+
+/*
+ * Suntools global variables and routines were given names beginning with
+ * ST whenever possible, for ease in recognizing them.
+ */
+Frame	STFrame;
+Canvas	STCanvas;
+Pixwin*	STScreen;
+Menu	STPageMenu, STJustQuit;
+char	STPageStatus = PG_ADVANCE;
+
+
+char *malloc ();
+
+struct hardware *NewHardware ();
+
+struct hardware *InitHardware ()
+{
+    InitTransfer (80);	/* XXX */
+    return NULL;
+}
+
+/*
+ * NewWindowHardware() --	we take this opportunity to create our
+ *				window. By specifying WIN_SHOW to be true,
+ *				we can make it appear nearly immediately. To
+ *				be less alarming, it appears first as an icon.
+ */
+struct hardware *NewWindowHardware (width, height)
+int width, height;
+{
+    DevicePoint real_extent;
+    int STWinEvent();
+    Notify_value STDestroyEvent();
+    
+    STFrame = window_create(0,FRAME,
+	FRAME_LABEL, "Postscript display window",
+	FRAME_CLOSED, TRUE,
+	FRAME_ICON, &working_icon,
+	WIN_HEIGHT, height,
+	WIN_WIDTH, width,
+	WIN_SHOW, TRUE,
+	WIN_Y, 0,
+	0);
+    STCanvas = window_create(STFrame,CANVAS,
+	WIN_EVENT_PROC, STWinEvent,
+	0);
+    STScreen = canvas_pixwin(STCanvas);
+    STPageMenu = menu_create(MENU_STRINGS, "Next page", "Quit", 0, 0);
+    STJustQuit = menu_create(MENU_STRINGS, "Quit", 0, 0);
+    /*
+     * we will want to know if the user destroys the window
+     */
+    notify_interpose_destroy_func(STFrame,STDestroyEvent);
+
+    /*
+     * sigh. Suntools, somewhere, must do a TIOCSPGRP; that is, resets
+     * its process group. This causes all sorts of nasties to happen
+     * if the Interpreter wants to print error messages while this process
+     * is in the background, not the least of which is suddenly stopping
+     * with no way (short of ps(1)) to restart it. So, for now, this must
+     * ignore SIGTTOU signals, and blat right on the screen. (Or stderr
+     * must be redirected.)
+     */
+    (void) signal(SIGTTOU,SIG_IGN);		/* XXX SUNTOOLS HACK XXX */
+
+    real_extent = NewDevicePoint (width, height);
+    
+    return NewHardware (STScreen, real_extent, ISWIN);
+}
+
+struct hardware *NewBitmapHardware (width, height)
+int width, height;
+{
+    DevicePoint real_extent;
+    struct pixrect *bm;
+    
+    real_extent = NewDevicePoint (width, height);
+    
+    if ((bm = mem_create (width, height, 1)) == NULL) {
+	fprintf (stderr, "mem_create (%d, %d, 1)\n", width, height);
+	Panic ("failed to create bitmap");
+	}
+    
+    return NewHardware (bm, real_extent, 0);
+}
+
+/* 
+ * The hardware structure can contain pointers to pixrects, if they were
+ * created by NewBitmapHardware, or to a pixwin, if it was created by a
+ * new window. Why the difference? Pixwin routines will do clipping for
+ * us, if the window is covered or closed or whatever.
+ */
+#define Pixrect_addr(h)	((Pixrect *) ((h)->hard.addr))
+#define Pixwin_addr(h)	((Pixwin *) ((h)->hard.addr))
+
+static void DestroyHard (dev)
+struct hardware *dev;
+{
+    Pixrect *bm;
+    
+    if (dev->flags == ISWIN)
+	window_done(STFrame);
+    else if (bm) {
+	bm = Pixrect_addr (dev);
+	pr_destroy (bm);
+	}
+}
+
+void DestroyHardware (dev) struct hardware *dev;
+{
+    DoDispatch();
+    if (dev == NULL) return;
+    DestroyHard (dev);
+    if (dev->aux) DestroyHardware (dev->aux);
+    Free ((char *) dev);
+}
+
+static struct hardware *NewHardware (addr, extent, flags)
+struct pixrect *addr;
+DevicePoint extent;
+int flags;
+{
+    struct hardware *d = (struct hardware *) Malloc (sizeof (struct hardware));
+    
+    d->flags = flags;
+    d->hard.addr = (char *) addr;
+    d->aux = d->clip = NULL;
+    d->extent = extent;
+    DoDispatch();
+    
+    return d;
+}
+
+struct hardware *HardwareFromString (s, width, height)
+unsigned char *s;
+int width, height;
+{
+    int words = (width + 15) / 16;
+    Pixrect *pr = mem_create (width, height, 1);
+    short *d = mpr_d (pr)->md_image;
+    int odd = ((width + 7) / 8) & 1;
+    int i, j;
+
+    for (i = 0; i < height; i++) {
+	for (j = 0; j < words - odd; j++) {
+	    short word = *s++;
+
+	    *d++ = (word << 8) | *s++;
+	    }
+	if (odd) *d++ = *s++ << 8;
+	}
+    return NewHardware (pr, NewDevicePoint (width, height), 0);
+}
+
+char *StringFromHardware (h)
+struct hardware *h;
+{
+    int words = (h->extent.dx + 15) / 16;
+    char *string = malloc ((h->extent.dx + 7) / 8 * h->extent.dy), *s = string;
+    int i, j, odd = ((h->extent.dx + 7) / 8) & 1;
+    short *d;
+    
+    DoDispatch();
+    if (h->flags & ISWIN)
+	d = mpr_d (Pixwin_addr(h)->pw_prretained)->md_image;
+    else
+	d = mpr_d (Pixrect_addr (h))->md_image;
+    for (i = 0; i < h->extent.dy; i++) {
+	for (j = 0; j < words - odd; j++) {
+	    short word = *d++;
+
+	    *s++ = (word >> 8) & 0xFF;
+	    *s++ = word & 0xFF;
+	    }
+	if (odd) *s++ = (*d++ >> 8) & 0xFF;
+	}
+    return string;
+}
+
+void UpdateControl (h, flag) struct hardware *h; int flag;
+{
+}
+
+void RasterTile (from, to, toPoint, extent, rop)
+	struct hardware *from, *to;
+	DevicePoint toPoint, extent;
+	int rop;
+{
+    Pixrect *fr;
+    
+    DoDispatch();
+    if (to == NULL || extent.dx == 0 || extent.dy == 0) return;
+
+    if (from)
+	if (from->flags & ISWIN)
+	    fr = Pixwin_addr(from)->pw_prretained;
+	else
+	    fr = Pixrect_addr(from);
+    else
+	fr = NULL;
+    
+    if (to->flags & ISWIN)
+	pw_replrop (Pixwin_addr (to), toPoint.dx, toPoint.dy, extent.dx,
+	    extent.dy, rop_map [rop], fr, toPoint.dx, toPoint.dy);
+    else
+	pr_replrop (Pixrect_addr (to), toPoint.dx, toPoint.dy, extent.dx,
+	    extent.dy, rop_map [rop], fr, toPoint.dx, toPoint.dy);
+}
+
+void BitBlt (from, to, fromPoint, toPoint, extent, rop)
+struct hardware *from, *to;
+DevicePoint fromPoint, toPoint, extent;
+int rop;
+{
+    Pixrect *fr;
+    
+    DoDispatch();
+    if (to == NULL || extent.dx == 0 || extent.dy == 0) return;
+	    
+    if (from)
+	if (from->flags & ISWIN)
+	    fr = Pixwin_addr(from)->pw_prretained;
+	else
+	    fr = Pixrect_addr(from);
+    else {
+	fr = NULL;
+	rop = single_rop [rop];
+	}
+    
+    if (to->flags & ISWIN)
+	pw_rop (Pixwin_addr (to), toPoint.dx, toPoint.dy, extent.dx,
+	    extent.dy, rop_map [rop], fr, fromPoint.dx, fromPoint.dy);
+    else
+	pr_rop (Pixrect_addr (to), toPoint.dx, toPoint.dy, extent.dx,
+	    extent.dy, rop_map [rop], fr, fromPoint.dx, fromPoint.dy);
+}
+
+void BitBltLine (h, fromPoint, toPoint, rop) 
+struct hardware *h;
+DevicePoint fromPoint, toPoint;
+int rop;
+{
+    DoDispatch();
+    if (h == NULL)
+	    return;
+    
+    switch (single_rop [rop]) {
+	case ROP_FALSE:		rop = PIX_NOT (PIX_SET);	break;
+	case ROP_TRUE:		rop = PIX_SET;			break;
+	case ROP_NOTDEST:	rop = PIX_NOT (PIX_SRC);	break;
+	case ROP_DEST:		return;				break;
+	
+	default:	fprintf (stderr, "illegal rasterop\n"); exit (1);
+	}
+    
+    if (h->flags & ISWIN)
+	pw_vector (Pixwin_addr (h), fromPoint.dx, fromPoint.dy,
+	    toPoint.dx, toPoint.dy, rop, ~0);
+    else
+	pr_vector (Pixrect_addr (h), fromPoint.dx, fromPoint.dy,
+	    toPoint.dx, toPoint.dy, rop, ~0);
+}
+
+void BitBltBlob (to, top, height, left, right, rop)
+struct hardware *to;
+int top, height, *left, *right, rop;
+{
+    int i, op, offset = top;
+    Pixrect *bm;
+    
+    DoDispatch();
+    height += top;
+    switch (rop) {
+	case ROP_FALSE: 	op = PIX_NOT (PIX_SET);	break;
+	case ROP_DEST: 					return;
+	case ROP_NOTDEST: 	op = PIX_NOT (PIX_SRC);	break;
+	case ROP_TRUE: 		op = PIX_SET;		break;
+	}
+    rop = rop_map [rop];
+    UpdateControl (to, FALSE);
+    for (i = top; i < height; i++)
+	if (to->flags & ISWIN)
+	    pw_rop (Pixwin_addr(to), left[i - offset], i,
+		right[i - offset] - left[i - offset], 1, op, bm, 0, 0);
+	else
+	    pr_rop (Pixrect_addr(to), left[i - offset], i,
+		right[i - offset] - left[i - offset], 1, op, bm, 0, 0);
+    UpdateControl (to, TRUE);
+}
+
+void HardUpdate()
+
+{
+    window_set(STFrame,
+	FRAME_LABEL, "Postscript display window (new page ready)",
+	FRAME_ICON, &ready_icon,
+	0);
+    window_set(STCanvas,
+	WIN_CONSUME_PICK_EVENTS, WIN_MOUSE_BUTTONS, 0,
+	0);
+
+    STPageStatus = PG_WAITING;
+    do
+	/*
+	 * turn control over to Hal for a while
+	 */
+	notify_start();
+    while (STPageStatus == PG_WAITING);
+
+    window_set(STFrame,
+	FRAME_LABEL, "Postscript display window",
+	FRAME_ICON, &working_icon,
+	0);
+    /*
+     * poke Hal once more, so he'll update our frame label and icon
+     */
+    notify_dispatch();
+}
+
+STWinEvent(win,event,arg)
+Window win;
+Event *event;
+caddr_t arg;
+
+{
+    int selection;
+
+    if (win != STCanvas)
+	return;
+    
+    switch (event_id(event)) {
+	case MS_RIGHT:
+	    if (event_is_down(event)) {
+
+		if (STPageStatus == PG_WAITING)
+		    selection = (int) menu_show(STPageMenu,win,event,0);
+		else
+		    selection = (int) menu_show(STJustQuit,win,event,0);
+
+		/*
+		 * see the Suntools section on menus to learn the magic
+		 * of what menu_show() returns
+		 */
+
+		if ((selection == 1 && STPageStatus != PG_WAITING) ||
+		     (selection == 2 && STPageStatus == PG_WAITING)) {
+		    if (notify_die(DESTROY_CHECKING) == NOTIFY_OK) {
+			window_set(STFrame,FRAME_NO_CONFIRM,TRUE,0);
+			window_done(STFrame);
+			exit(0);
+			}
+		    }
+		else {
+		    if (STPageStatus == PG_WAITING && selection == 1) {
+			STPageStatus = PG_ADVANCE;
+			/*
+			 * You've done a nice job, Hal, but we will
+			 * take control again now, thank you
+			 */
+			notify_stop();
+			}
+		    }
+		}
+	    break;
+	default:
+	    window_default_event_proc(win,event,arg);
+	    break;
+	}
+}
+
+DoDispatch()
+{
+    if (STPageStatus == PG_DESTROYED)	/* take this opportunity to go away */
+	exit(0);
+    notify_dispatch();	/* gratuitous method of dispatching window events */
+}
+
+Notify_value STDestroyEvent(win,status)
+Frame win;
+Destroy_status status;
+{
+    if (win != STFrame)
+	return(NOTIFY_IGNORED);
+    if (status == DESTROY_CHECKING)
+	return(notify_next_destroy_func(STFrame,status));
+    else
+	STPageStatus = PG_DESTROYED;
+    return(NOTIFY_DONE);
+}
+    
+/*
+ * Because I needed to provide a version of HardUpdate(), the file canon.c
+ * from canon.a, minus HardUpdate, must be provided here.
+ */
+
+int pixels_per_inch;
+
+int single_rop [] =
+ {
+	ROP_FALSE, ROP_DEST, ROP_NOTDEST, ROP_TRUE,
+	ROP_FALSE, ROP_DEST, ROP_NOTDEST, ROP_TRUE,
+	ROP_FALSE, ROP_DEST, ROP_NOTDEST, ROP_TRUE,
+	ROP_FALSE, ROP_DEST, ROP_NOTDEST, ROP_TRUE
+ };
+
+/*ARGSUSED*/
+Matrix DeviceMatrix (width, height) int width, height;
+ {
+ 	return NewMatrix (pixels_per_inch / 72.0, 0.0, 0.0, -pixels_per_inch / 72.0, 0.0, (float) height);
+ }
+
+int IsWindowHardware (h) struct hardware *h;
+ {
+ 	return h->flags & ISWIN;
+ }
+
+DevicePoint HardwareExtent (h) struct hardware *h;
+ {
+ 	if (h)
+ 		return h->extent;
+ 	else
+ 		return NewDevicePoint (0, 0);
+ }
+
+void SetClipHardware (h, clip) struct hardware *h, *clip;
+ {
+ 	if (h)
+		h->clip = clip;
+ }
+//E*O*F pixwin.c//
+
+echo x - pixwin.README
+cat > "pixwin.README" << '//E*O*F pixwin.README//'
+The pixwin changes require some subtle knowledge to use effectively.
+
+To compile, edit the Makefile and replace each instance of pixrect.o
+with pixwin.o. Replace each instance of
+    -lpixrect
+with
+    -lsuntool -lsunwindow -lpixrect
+(Yes, the ordering is important.) Do a make depend. Do a make suntools.
+
+Next, to make this work properly, you must redefine showpage in your
+~/.postscript file. The definition is thus:
+
+/showpage { copypage initgraphics flush erasepage } def
+
+If you don't do this, the interpreter (either "postscript" or "sunPS")
+will beep nastily at you every time it encounters a showpage, and wait
+for a carriage return, thus requiring response in TWO windows!
+
+Execute "sunPS file.ps". Voila.
+
+It can be highly efficient to run the interpreter on one machine via
+rsh and the viewer on your Sun. However, suntools requires some
+environment variables be set for you to start up -- environment
+variables which your .cshrc or .profile will not provide. These are
+WINDOW_PARENT and WMGR_ENV_PLACEHOLDER.
+
+This example assumes that machine A and machine B have the rsh command
+available.
+
+Let us suppose that you wish to view the output on machine A, but run
+the interpreter on machine B. The following shell script, which should
+reside on machine A and which I call "rmtviewer", will provide the
+window information for suntools.
+
+-----
+#! /bin/sh
+# the following is the "most general" method. For quick 'n' dirty, comment
+# this out and uncomment the two lines following, which seem to work in
+# all the cases I've tried.
+eval `ps axeww | grep shelltool | awk '
+    BEGIN   {	done = 0 }
+    	    {	for (i=1;i<NF&&done != 2;i++)
+		if (index($i,"=")) {
+		    split($i,tmp,"=")
+		    if (tmp[1] == "WINDOW_PARENT" || \
+			tmp[1] == "WMGR_ENV_PLACEHOLDER") {
+			print $i
+			done++
+			}
+		    }
+	    }'`
+#WINDOW_PARENT=/dev/win0
+#WMGR_ENV_PLACEHOLDER=/dev/win1
+
+export WINDOW_PARENT; export WMGR_ENV_PLACEHOLDER
+
+exec sunviewer
+-----
+
+On machine B, you must have
+
+    POSTSCRIPTDEVICE="| rsh machineA rmtviewer"; export POSTSCRIPTDEVICE
+		-or-
+    setenv POSTSCRIPTDEVICE "| rsh machineA rmtviewer"
+
+in your .cshrc or .profile (as appropriate for your shell). Verify that
+your .postscript is set up as above. Then, still on machine B, execute
+
+    postscript myfile
+
+(where myfile contains postscript commands)
+
+The window should appear on machine A and (eventually) display your output.
+
+There is no reason you could not use rsh to run the postscript command on
+machine B from machine A, either.
+//E*O*F pixwin.README//
+
+echo x - ps.empty
+cat > "ps.empty" << '//E*O*F ps.empty//'
+/* Format_version=1, Width=64, Height=64, Depth=1, Valid_bits_per_item=16
+ */
+	0xFFFF,0xFFFF,0xFFFF,0xFFFF,0x8000,0x0000,0x0000,0x0001,
+	0x8000,0x0000,0x0000,0x0001,0x8000,0x0000,0x0000,0x0001,
+	0x80FC,0x0000,0x0000,0x0001,0x8387,0x0000,0x0000,0x0001,
+	0x8201,0x0000,0x0000,0x0001,0x8387,0x0000,0x0000,0x0001,
+	0x82FD,0x0000,0x7800,0x0001,0x8102,0x0000,0x8600,0x0001,
+	0x8084,0x0001,0x0100,0x0001,0x8084,0x0002,0x0260,0x0001,
+	0x8703,0x8004,0x02DC,0x0001,0x9800,0x6008,0x0586,0x0001,
+	0xA102,0x9010,0x0601,0x8001,0xA14B,0x1020,0x0000,0x2001,
+	0xA269,0x9040,0x0000,0x0E01,0xA259,0x5080,0x0000,0x0181,
+	0x9048,0x2180,0x0000,0x0071,0x8C00,0xC300,0x0000,0x0021,
+	0x8387,0x0200,0x0000,0x0009,0x8078,0x0200,0x0006,0x0079,
+	0x8000,0x0200,0x0003,0xC3C1,0x8000,0x0100,0x0001,0x3401,
+	0x8000,0x0100,0x0001,0x8801,0x8000,0x0100,0x0000,0xC001,
+	0x8000,0x3D00,0x0000,0x4001,0x8000,0x2700,0x0000,0x4001,
+	0x8000,0x4300,0x0000,0x8001,0x8000,0x4000,0x0001,0x0001,
+	0x80C0,0x8000,0x0001,0x0001,0x8738,0x8000,0x0003,0x0001,
+	0x8C07,0x0000,0x0002,0x0001,0x9001,0x8000,0x0004,0x0001,
+	0x9000,0x6000,0x0004,0x0001,0x9000,0x2000,0x0008,0x0001,
+	0xA000,0x1800,0x0008,0x0001,0x8000,0x0C00,0x0010,0x0001,
+	0xA000,0x0200,0x0030,0x0001,0xA000,0x0100,0x0060,0x0001,
+	0x9000,0x0180,0x0040,0x0001,0x9000,0x0080,0x0040,0x0001,
+	0x9800,0x0060,0x0080,0x0001,0x8800,0x0FE0,0x0180,0x0001,
+	0x8400,0x0AB0,0x7100,0x0001,0x8200,0x1558,0x4E00,0x0001,
+	0x8300,0x1AA8,0x4000,0x0001,0x8100,0x1D54,0x2000,0x0001,
+	0x80C0,0x17AC,0x3000,0x0001,0x8038,0x10D4,0x1800,0x0001,
+	0x800C,0x102C,0x0800,0x0001,0x8004,0x1000,0x0800,0x0001,
+	0x8002,0x1000,0x1800,0x0001,0x8001,0x1800,0x0000,0x0001,
+	0x8000,0xC800,0x2000,0x0001,0x8000,0x2C00,0x6000,0x0001,
+	0x8000,0x1E00,0x8000,0x0001,0x8000,0x0303,0x0000,0x0001,
+	0x8000,0x00FC,0x0000,0x0001,0x8000,0x0000,0x0000,0x0001,
+	0x8000,0x0000,0x0000,0x0001,0x8000,0x0000,0x0000,0x0001,
+	0x8000,0x0000,0x0000,0x0001,0xFFFF,0xFFFF,0xFFFF,0xFFFF
+//E*O*F ps.empty//
+
+echo x - ps.full
+cat > "ps.full" << '//E*O*F ps.full//'
+/* Format_version=1, Width=64, Height=64, Depth=1, Valid_bits_per_item=16
+ */
+	0xFFFF,0xFFFF,0xFFFF,0xFFFF,0x8000,0x0000,0x0000,0x0001,
+	0x8000,0x0000,0x0000,0x0001,0x8000,0x0000,0x0000,0x0001,
+	0x80FC,0x0000,0x0000,0x0001,0x8387,0x0000,0x0000,0x0001,
+	0x8201,0x0000,0x0000,0x0001,0x8387,0x0000,0x0000,0x0001,
+	0x82FD,0x0000,0x7800,0x0001,0x8102,0x0000,0x8600,0x0001,
+	0x8084,0x0001,0x0100,0x0001,0x8084,0x0002,0x0260,0x0001,
+	0x8703,0x8004,0x02DC,0x0001,0x9800,0x6008,0x0586,0x0001,
+	0xA102,0x9010,0x0601,0x8001,0xA14B,0x1020,0x0000,0x2001,
+	0xA269,0x9048,0x0800,0x0E01,0xA259,0x50B6,0x1800,0x0181,
+	0x9048,0x21A0,0x6800,0x0071,0x8C00,0xC321,0xD000,0x0021,
+	0x8387,0x021E,0x7000,0x0009,0x8078,0x0200,0x2006,0x0079,
+	0x8000,0x0200,0x2103,0xC3C1,0x8000,0x0100,0x20C1,0x3401,
+	0x8000,0x0100,0x2021,0x8801,0x8000,0x0118,0x0010,0xC001,
+	0x8000,0x3D0C,0x0018,0x4001,0x8000,0x2706,0x0308,0x4001,
+	0x8000,0x4301,0x8080,0x8001,0x8000,0x4000,0xC0E1,0x0001,
+	0x80C0,0x8000,0x3031,0x0001,0x8738,0x8020,0x0C03,0x0001,
+	0x8C07,0x0C30,0x0402,0x0001,0x9001,0x860C,0x0004,0x0001,
+	0x9000,0x6302,0x0004,0x0001,0x9000,0x2181,0x0008,0x0001,
+	0xA000,0x1840,0xC008,0x0001,0x8000,0x0C20,0x6010,0x0001,
+	0xA000,0x0208,0x1830,0x0001,0xA000,0x010C,0x0860,0x0001,
+	0x9000,0x0182,0x0040,0x0001,0x9000,0x0083,0x0040,0x0001,
+	0x9800,0x0060,0x0080,0x0001,0x8800,0x0FE0,0x0180,0x0001,
+	0x8400,0x0AB0,0x7100,0x0001,0x8200,0x1558,0x4E00,0x0001,
+	0x8300,0x1AA8,0x4000,0x0001,0x8100,0x1D54,0x2000,0x0001,
+	0x80C0,0x17AC,0x3000,0x0001,0x8038,0x10D5,0x1800,0x0001,
+	0x800C,0x1C2D,0x8800,0x0001,0x8004,0x1600,0xC800,0x0001,
+	0x8002,0x1300,0x7800,0x0001,0x8001,0x1980,0x2000,0x0001,
+	0x8000,0xC860,0x2000,0x0001,0x8000,0x2C00,0x6000,0x0001,
+	0x8000,0x1E00,0x8000,0x0001,0x8000,0x0303,0x0000,0x0001,
+	0x8000,0x00FC,0x0000,0x0001,0x8000,0x0000,0x0000,0x0001,
+	0x8000,0x0000,0x0000,0x0001,0x8000,0x0000,0x0000,0x0001,
+	0x8000,0x0000,0x0000,0x0001,0xFFFF,0xFFFF,0xFFFF,0xFFFF
+//E*O*F ps.full//
+
+exit 0
+

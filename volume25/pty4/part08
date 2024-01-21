@@ -1,0 +1,1333 @@
+Newsgroups: comp.sources.unix
+From: brnstnd@nyu.edu (Dan Bernstein)
+Subject: v25i134: Generalized interface to pseudo-tty devices, Part08/09
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: brnstnd@nyu.edu (Dan Bernstein)
+Posting-Number: Volume 25, Issue 134
+Archive-Name: pty4/part08
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 8 (of 9)."
+# Contents:  ptymaster.c radixsort.c
+# Wrapped by vixie@cognition.pa.dec.com on Wed Feb 19 13:35:06 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'ptymaster.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'ptymaster.c'\"
+else
+echo shar: Extracting \"'ptymaster.c'\" \(20275 characters\)
+sed "s/^X//" >'ptymaster.c' <<'END_OF_FILE'
+X#include <sys/types.h>
+X#include <sys/wait.h>
+X#include <sys/time.h>
+X#include <sys/resource.h>
+X#include <signal.h>
+X#include <errno.h>
+extern int errno;
+X#include "sigsched.h"
+X#include "ralloc.h"
+X#include "config/ttyopts.h"
+X#include "config/ptylongname.h"
+X#include "sesslog.h"
+X#include "sessconnlog.h"
+X#include "ptyget.h"
+X#include "ptymisc.h"
+X#include "ptyerr.h"
+X#include "ptytty.h"
+X#include "ptycomm.h"
+X#include "ptymaster.h"
+X
+X/*
+If you don't believe that sigsched makes this incredibly easy to write,
+try writing it without sigsched. Then try understanding what you wrote.
+X
+Apologies in advance to Billy Joel.
+X*/
+X
+X#define PTYBUFSIZE 16384
+X
+char inbuf[PTYBUFSIZE];
+static int inbufwrite = 0;
+static int inbufread = 0;
+char outbuf[PTYBUFSIZE];
+static int outbufwrite = 0;
+static int outbufread = 0;
+X
+static char longname[PTYLONGNAMELEN] = { 0 };
+X
+static struct sessconnlog scl;
+static int remotelen;
+static char remote[SESSCONNLOG_REMOTELEN];
+static char *musername;
+X
+static int mflagreading;
+static int mflagsession;
+static int mflagxflowctl;
+static int mfdcomm;
+static int mfdmty;
+static int mfdsty;
+static int muid = -1;
+static char mext[2];
+static int mslavepid = -1;
+X
+static int fdctrlr = -1;
+static int fdsigler;
+X/* to insure yourself you got to provide communication constantly... */
+static int fdsig2us;
+static int fdi;
+static int fdo;
+static int flagwatchchld;
+static int flagstopped;
+X
+static char recoext[2];
+X/* this is a violation of modularity, but even after the sigler */
+X/* knows what recoext is, we may have to report it to ctrlr, so we can't */
+X/* just forget about it XXX: or should we ask sigler dynamically? no! */
+X
+static int mfdpreco;
+static int flagpreco;
+X
+X/* This is a kludge to deal with fd passing bugs (particularly under SunOS). */
+X/* It's also a sanity check. */
+void closeallbut()
+X{
+X int i;
+X
+X i = getdtablesize();
+X while (i--)
+X  {
+X   if (
+X   (i != mfdcomm)
+X&& (i != mfdmty)
+X&& (i != mfdsty)
+X&& (i != fdctrlr)
+X&& (i != fdsigler)
+X&& (i != fdsig2us)
+X&& (i != fdi)
+X&& (i != fdo)
+X&& (i != mfdpreco)
+X      )
+X    {
+X     close(i);
+X    }
+X  }
+X}
+X
+X#define verbose 0,
+X
+static void saytasig(c0,c1,c2,c3) int c0; int c1; int c2; int c3;
+X{
+X char c[4]; c[0] = c0; c[1] = c1; c[2] = c2; c[3] = c3;
+X verbose("master telling sigler %c %d %d %d",c0,c1,c2,c3);
+X if (fdsigler == -1)
+X   return;
+X /* tell her all your crazy dreams... */
+X bwrite(fdsigler,c,4); /* XXX: error checks? */
+X}
+X
+static void childdead()
+X{
+X verbose("master entering childdead");
+X /* We could check specially for final output here, but since */
+X /* there's no way we can know when it's all done, we don't bother. */
+X if (fdsigler != -1)
+X   ; /* no need for further notification or explicit EOF */
+X if (mslavepid != -1)
+X  {
+X   struct sesslog sl;
+X   long t;
+X   t = now();
+X   sessconnlog_fill(&scl,mext,"",0,t);
+X   sesslog_fill(&sl,mext,musername,muid,0,t);
+X   if (fdsigler != -1)
+X     sessconnlog(&scl); /* XXX: failure? */
+X   sesslog(&sl); /* XXX: failure? */
+X   utmp_off(mext,"",t); /* XXX: failure? */
+X   wtmp_off(mext,"",t); /* XXX: failure? */
+X   ungetpty(mfdmty,mfdsty,mext); /* XXX: failure? */
+X   mslavepid = -1; /* JIC */
+X   if (mfdcomm != -1)
+X    {
+X     if (comm_unlink(mext,muid) == -1)
+X       ; /* if it fails, who cares? */
+X     close(mfdcomm); /* goodbye, cruel world */
+X     mfdcomm = -1;
+X    }
+X   ss_unforcewait();
+X  }
+X}
+X
+static void contchild()
+X{
+X if (mslavepid != -1)
+X  {
+X   if (kill(mslavepid,SIGCONT) == -1) /* XXX: when would this work? */
+X    {
+X     int pgrp;
+X     pgrp = getpgrp(mslavepid);
+X     if (pgrp > 0)
+X       killpg(pgrp,SIGCONT);
+X       /* XXX: errors? */
+X    }
+X  }
+X flagstopped = 0;
+X disp_flagstopped();
+X}
+X
+static void disconnect()
+X{
+X verbose("master disconnecting");
+X /* oh listen boy */
+X /* i'm sure you think you got it all under control... */
+X saytasig('d',0,0,0);
+X
+X if (fdsigler != -1)
+X  {
+X   long t;
+X   t = now();
+X   sessconnlog_fill(&scl,mext,"",1/*XXX*/,t);
+X   sessconnlog(&scl); /* XXX: failure? */
+X  }
+X
+X if (fdsigler != -1) { close(fdsigler); fdsigler = -1; }
+X if (fdsig2us != -1) { close(fdsig2us); fdsig2us = -1; }
+X if (fdi != -1) { close(fdi); fdi = -1; }
+X if (fdo != -1) { close(fdo); fdo = -1; }
+X flagwatchchld = 0;
+X recoext[0] = recoext[1] = 0;
+X disp_fdsigler();
+X disp_fdsig2us();
+X disp_flagwatchchld();
+X if (!mflagsession)
+X   childdead();
+X   /* ... and though you may not have done anything */
+X   /* will that be consolation when she's gone? ... */
+X closeallbut();
+X}
+X
+static int reconnect()
+X{
+X verbose("master starting reconnect");
+X
+X closeallbut();
+X /* assumes fdsigler, fdsig2us, fdi, fdo all -1 */
+X if ((fdsigler = comm_getfd(fdctrlr)) == -1)
+X  {
+X   verbose("master getting sigler failed");
+X   return -1; }
+X if ((fdsig2us = comm_getfd(fdctrlr)) == -1)
+X  {
+X   verbose("master getting fdsig2us failed");
+X   close(fdsigler); fdsigler = -1; return -1; }
+X if ((fdi = comm_getfd(fdctrlr)) == -1)
+X  {
+X   verbose("master getting fdi failed");
+X   close(fdsigler); close(fdsig2us); fdsigler = fdsig2us = -1; return -1; }
+X if ((fdo = comm_getfd(fdctrlr)) == -1)
+X  {
+X   verbose("master getting fdo failed");
+X   close(fdsigler); close(fdsig2us); close(fdi);
+X   fdsigler = fdsig2us = fdi = -1; return -1; }
+X
+X verbose("master okay fds on reconnect %d %d %d %d",fdsigler,fdsig2us,fdi,fdo);
+X if (bread(fdctrlr,(char *) &mflagreading,sizeof(int)) < sizeof(int))
+X  { close(fdsigler); close(fdsig2us); close(fdi); close(fdo);
+X   fdsigler = fdsig2us = fdi = fdo = -1; return -1; }
+X if (bread(fdctrlr,(char *) &remotelen,sizeof(int)) < sizeof(int)
+X    || (remotelen > SESSCONNLOG_REMOTELEN))
+X  { close(fdsigler); close(fdsig2us); close(fdi); close(fdo);
+X   fdsigler = fdsig2us = fdi = fdo = -1; return -1; }
+X if (bread(fdctrlr,remote,remotelen) < remotelen)
+X  { close(fdsigler); close(fdsig2us); close(fdi); close(fdo);
+X   fdsigler = fdsig2us = fdi = fdo = -1; return -1; }
+X
+X /* log stuff... */
+X sessconnlog_fill(&scl,mext,remote,-1/*XXX*/,now());
+X if (sessconnlog(&scl) == -1)
+X   ; /*XXX: sessconn write failed; do we care?*/
+X
+X closeallbut();
+X
+X verbose("master succeeded on reconnect %d",mflagreading);
+X contchild(); /* XXX */
+X flagwatchchld = 1;
+X disp_fdsigler();
+X disp_fdsig2us();
+X disp_flagwatchchld();
+X disp_mflagreading();
+X if (flagpreco) /* talk to me if you don't understand this */
+X  {
+X   flagpreco = 0;
+X   /* cause now and then she'll get to worrying */
+X   /* just because you haven't spoken for so long... */
+X   if (write(mfdpreco,"k",1) == -1)
+X     ; /* pipe might be broken if child has somehow been killed; */
+X       /* that's okay, we'll get SIGCHLD in a few moments */
+X   close(mfdpreco);
+X   mfdpreco = -1;
+X  }
+X return 0;
+X}
+X
+static void sigchld(n)
+int n;
+X{
+X int w;
+X int pid;
+X
+X verbose("master entering sigchld");
+X while ((pid = wait3(&w,WNOHANG | WUNTRACED,(struct rusage *) 0)) > 0)
+X   /* it'd be very weird if wait3 equalled 0 */ 
+X   if (pid == mslavepid)
+X    {
+X     verbose("master sees pid %d",pid);
+X#define PWIFSTOPPED(s) (((s) & 0177) == 0177)
+X#define PWSTOPSIG(s) ((s) >> 8) /* only defined if PWIFSTOPPED */
+X     if (PWIFSTOPPED(w))
+X      {
+X       flagstopped = 1;
+X       /* just a word or two that she gets from you */
+X       /* could be the difference that it makes... */
+X       saytasig('z',PWSTOPSIG(w),0,0);
+X       disp_flagstopped();
+X      }
+X     else
+X      {
+X#define PWIFEXITED(s) (!((s) & 0177))
+X#define PWEXITSTATUS(s) ((s) >> 8)
+X#define PWTERMSIG(s) ((s) & 0177)
+X#define PWCOREDUMP(s) ((s) & 0200)
+X       if (PWIFEXITED(w))
+X	 /* tell her about it... */
+X         saytasig('e',PWEXITSTATUS(w),0,0);
+X       else
+X	 /* tell her everything you feel... */
+X	 saytasig('s',PWTERMSIG(w),PWCOREDUMP(w),0);
+X       childdead();
+X      }
+X    }
+X}
+static int schedsigchld = 0;
+static void cksigchld()
+X{
+X if (!schedsigchld && flagwatchchld && !outbufread)
+X  { ss_sched(ss_signal(SIGCHLD),sigchld,0); schedsigchld = 1; return; }
+X if (schedsigchld && (!flagwatchchld || outbufread))
+X  { ss_unsched(ss_signal(SIGCHLD),sigchld,0); schedsigchld = 0; }
+X}
+X
+static void doacceptfdctrlr(n)
+int n;
+X{
+X fdctrlr = comm_accept(mfdcomm);
+X disp_fdctrlr();
+X}
+static int schedacceptfdctrlr = 0;
+static void ckacceptfdctrlr()
+X{
+X if (!schedacceptfdctrlr && (fdctrlr == -1))
+X  {
+X   ss_sched(ss_sigread(mfdcomm),doacceptfdctrlr,0); schedacceptfdctrlr = 1;
+X   return;
+X  }
+X if (schedacceptfdctrlr && (fdctrlr != -1))
+X  { ss_unsched(ss_sigread(mfdcomm),doacceptfdctrlr,0); schedacceptfdctrlr = 0; }
+X}
+X
+static void doreadfdctrlr(n)
+int n;
+X{
+X int r;
+X char mess[1];
+X int foo;
+X
+X verbose("master entering readfdctrlr");
+X r = read(fdctrlr,mess,1);
+X verbose("master readfdctrlr %d %c",r,mess[0]);
+X if (r <= 0) /* bye bye */
+X  {
+X   close(fdctrlr); fdctrlr = -1; disp_fdctrlr(); return;
+X  }
+X switch(mess[0]) /* XXX: we tacitly assume these writes will be atomic */
+X  {
+X   case 'a': /* are you there? */
+X     switch(mslavepid % 3)
+X      {
+X       case 0: bwrite(fdctrlr,"(nope)",6); break;
+X       case 1: bwrite(fdctrlr,"a_y_t?",6); break;
+X       default: bwrite(fdctrlr,"maybe.",6); break;
+X      }
+X     break;
+X   case 'e': /* short name? */
+X     bwrite(fdctrlr,mext,2);
+X     break;
+X   case 'l': /* long name? */
+X     bwrite(fdctrlr,"longnm",6);
+X     bwrite(fdctrlr,longname,sizeof(longname));
+X     break;
+X   case 'L': /* set long name to this: */
+X     bread(fdctrlr,longname,sizeof(longname)); /* XXX: error checking? */
+X     bwrite(fdctrlr,"thanks",6);
+X     break;
+X   case 'C': /* are you connected? */
+X     if (fdsigler == -1)
+X       bwrite(fdctrlr,"noaose",6);
+X     else
+X       bwrite(fdctrlr,"owuno?",6);
+X     break;
+X   case 'p': /* what's your pid? */
+X     foo = getpid();
+X     bwrite(fdctrlr,(char *) &foo,sizeof(foo));
+X     break;
+X   case 'P': /* what's your slave pid? */
+X     bwrite(fdctrlr,(char *) &mslavepid,sizeof(mslavepid));
+X     break;
+X   case 'D': /* do you allow disconnects? */
+X     bwrite(fdctrlr,(char *) &mflagsession,sizeof(mflagsession));
+X     break;
+X   case 'k': /* sesskill */
+X     saytasig('k',0,0,0);
+X     bwrite(fdctrlr,"<poof>",6);
+X     childdead();
+X     break;
+X   case 'd': /* disconnect */
+X     if (mflagsession)
+X       if (fdsigler != -1)
+X	{
+X	 disconnect();
+X	 bwrite(fdctrlr,"yessir",6);
+X	}
+X       else
+X	 bwrite(fdctrlr,"no-op!",6);
+X     else
+X       /* you're a big boy now and you'll never let her go */
+X       /* but that's just the kind of thing she ought to know... */
+X       bwrite(fdctrlr,"kinky!",6);
+X     break;
+X   case 'r': /* reconnect---including initial connection */
+X     if (fdsigler == -1)
+X      {
+X       /* let her know you need her */
+X       /* let her know how much she means... */
+X       bwrite(fdctrlr,"shrtng",6);
+X       if (reconnect() == -1)
+X	{
+X	 bwrite(fdctrlr,"damn! ",6); /*XXXXXXX*/
+X	 closeallbut();
+X	}
+X       else
+X         bwrite(fdctrlr,"phew! ",6);
+X      }
+X     else
+X       bwrite(fdctrlr,"no-go!",6);
+X     break;
+X   case 's': /* recoset */
+X     if (fdsigler != -1)
+X      {
+X       /* XXX: should ack first */
+X       bread(fdctrlr,recoext,2); /* XXX: error checks? */
+X       /* when she can't be with you tell her you wish you were there... */
+X       saytasig('r',recoext[0],recoext[1],0);
+X       bwrite(fdctrlr,"sglrok",6);
+X      }
+X     else
+X       bwrite(fdctrlr,"nosglr",6);
+X     break;
+X   case 'S': /* report latest recoset */
+X     bwrite(fdctrlr,"latest",6);
+X     bwrite(fdctrlr,recoext,2);
+X     break;
+X   case 'Z': /* suspend */
+X     /* XXXX: not supported yet; fall through */
+X   /* XXX: resume? */
+X   /* XXX: ioctl? particular ioctls? */
+X   default:
+X     bwrite(fdctrlr,"nosupp",6);
+X     break;
+X  }
+X verbose("master exiting readfdctrlr");
+X}
+static ss_sig *sigreadfdctrlr;
+static void ckreadfdctrlr()
+X{
+X if (!sigreadfdctrlr && (fdctrlr != -1))
+X  { ss_sched(sigreadfdctrlr = ss_sigread(fdctrlr),doreadfdctrlr,0); return; }
+X if (sigreadfdctrlr && (fdctrlr == -1))
+X  { ss_unsched(sigreadfdctrlr,doreadfdctrlr,0); sigreadfdctrlr = 0; }
+X}
+X
+static void doreadsig2us(n)
+int n;
+X{
+X int r;
+X char sigsez[1];
+X#ifdef TTY_WINDOWS
+X struct ttywin twi;
+X struct ttymodes tmoold;
+X struct ttymodes tmonew;
+X#endif
+X
+X verbose("master entering readsig2us");
+X /* every day before you leave */
+X /* pay her some attention */
+X /* give her something to believe... */
+X r = read(fdsig2us,sigsez,1);
+X verbose("master readsig2us %d %c",r,sigsez[0]);
+X if (r == -1)
+X   disconnect(); /*XXX: should we try to handle errors better? */
+X else if (!r)
+X   disconnect(); /* if it weren't for this, we'd never see sigler die! */
+X else
+X   switch(sigsez[0])
+X    {
+X     case 'H': /* hangup */
+X       disconnect();
+X       break;
+X     case 'C': /* continue */
+X       contchild();
+X       break;
+X     case 'W': /* WINCH */
+X#ifdef TTY_WINDOWS
+X       bread(fdsig2us,(char *) &twi,sizeof(twi)); /* XXX: error checks? */
+X       if (tty_getmodes(mfdsty,&tmoold) == 0)
+X	{
+X         /* XXX: race! race! race! */
+X         tty_copymodes(&tmonew,&tmoold);
+X         tty_win2modes(&twi,&tmonew);
+X         if (tty_modifymodes(mfdsty,&tmonew,&tmoold) == -1)
+X	   ; /* who cares? */
+X	}
+X#endif
+X       break;
+X     default:
+X       break; /* XXX: nothing we can reasonably do */
+X    }
+X verbose("master exiting readsig2us");
+X}
+static ss_sig *sigreadsig2us;
+static void ckreadsig2us()
+X{
+X if (!sigreadsig2us && (fdsig2us != -1))
+X  { ss_sched(sigreadsig2us = ss_sigread(fdsig2us),doreadsig2us,0); return; }
+X if (sigreadsig2us && (fdsig2us == -1))
+X  { ss_unsched(sigreadsig2us,doreadsig2us,0); sigreadsig2us = 0; }
+X}
+X
+static void doreadin(n)
+int n;
+X{
+X int r;
+X
+X verbose("master entering readin");
+X /* XXX: sanity checks, like !mflagreading? */
+X
+X /* XXX: Warning! We're manipulating an outside descriptor! */
+X r = read(fdi,inbuf + inbufread,sizeof(inbuf) - inbufread);
+X /* but a girl like that won't tell you what you should do... */
+X if (r == -1)
+X   switch(errno) { case EINTR: case EWOULDBLOCK: break;
+X     default: disconnect(); /*XXXX*/ }
+X else if (!r)
+X  {
+X   /* XXX: this EOF handling is all rather slimy */
+X   if (mflagsession)
+X     disconnect();
+X   else
+X    {
+X     mflagreading = 0;
+X     disp_mflagreading();
+X    }
+X  }
+X else { inbufread += r; disp_inbufread(); }
+X verbose("master exiting readin");
+X}
+static ss_sig *sigreadin = 0;
+static void ckreadin()
+X{
+X if (!sigreadin && (fdsigler != -1) && (inbufread < sizeof(inbuf))
+X   && mflagreading && !flagstopped)
+X  { ss_sched(sigreadin = ss_sigread(fdi),doreadin,0); return; }
+X if (sigreadin && ((fdsigler == -1) || (inbufread == sizeof(inbuf))
+X   || !mflagreading || flagstopped))
+X  { ss_unsched(sigreadin,doreadin,0); sigreadin = 0; }
+X}
+X
+static void dowritein(n)
+int n;
+X{
+X int w;
+X
+X verbose("master entering writein");
+X if (mflagxflowctl)
+X  {
+X   if (tty_spaceleft(mfdsty) < 128)
+X     return;
+X   /* XXX: this busy-loops! */
+X  }
+X if (mflagxflowctl && (inbufread - inbufwrite > 128))
+X   w = write(mfdmty,inbuf + inbufwrite,128);
+X else
+X   w = write(mfdmty,inbuf + inbufwrite,inbufread - inbufwrite);
+X if (w == -1)
+X   switch(errno) { case EINTR: case EWOULDBLOCK: break;
+X     default: ; /*XXXX*/ }
+X else
+X  {
+X   inbufwrite += w;
+X   if (inbufwrite == inbufread)
+X    { inbufwrite = inbufread = 0; disp_inbufread(); }
+X   disp_inbufwrite();
+X  }
+X verbose("master exiting writein");
+X}
+static ss_sig *sigwritein = 0;
+static void ckwritein()
+X{
+X if (!sigwritein && (mfdmty != -1) && (inbufwrite < inbufread))
+X  { ss_sched(sigwritein = ss_sigwrite(mfdmty),dowritein,0); return; }
+X if (sigwritein && ((mfdmty == -1) || (inbufwrite == inbufread)))
+X  { ss_unsched(sigwritein,dowritein,0); sigwritein = 0; }
+X}
+X
+static void doreadout(n)
+int n;
+X{
+X int r;
+X verbose("master entering doreadout");
+X
+X r = read(mfdmty,outbuf + outbufread,sizeof(outbuf) - outbufread);
+X verbose("master doreadout: %d",r);
+X if (r == -1)
+X   switch(errno) { case EINTR: case EWOULDBLOCK: break;
+X     default: ; /*XXXX*/ }
+X else if (!r)
+X   ; /* XXX: EOF on a pty? utterly impossible */
+X else { outbufread += r; disp_outbufread(); }
+X}
+static ss_sig *sigreadout = 0;
+static void ckreadout()
+X{
+X if (!sigreadout && (mfdmty != -1) && (outbufread < sizeof(outbuf)))
+X  { ss_sched(sigreadout = ss_sigread(mfdmty),doreadout,0); return; }
+X if (sigreadout && ((mfdmty == -1) || (outbufread == sizeof(outbuf))))
+X  { ss_unsched(sigreadout,doreadout,0); sigreadout = 0; }
+X}
+X
+static void dowriteout(n)
+int n;
+X{
+X int w;
+X verbose("master entering writeout");
+X /* XXX: Warning! We're manipulating an outside descriptor! */
+X w = write(fdo,outbuf + outbufwrite,outbufread - outbufwrite);
+X if (w == -1)
+X   switch(errno) { case EINTR: case EWOULDBLOCK: break;
+X   case EPIPE: disconnect(); /* ``the master treats PIPE like EOF'' */
+X   default: disconnect(); /*XXXX*/ }
+X else
+X  {
+X   outbufwrite += w;
+X   if (outbufwrite == outbufread)
+X    { outbufwrite = outbufread = 0; disp_outbufread(); }
+X   disp_outbufwrite();
+X  }
+X verbose("master exiting writeout");
+X}
+static ss_sig *sigwriteout = 0;
+static void ckwriteout()
+X{
+X if (!sigwriteout && (fdsigler != -1) && (outbufwrite < outbufread) && !flagstopped)
+X  { ss_sched(sigwriteout = ss_sigwrite(fdo),dowriteout,0); return; }
+X if (sigwriteout && ((fdsigler == -1) || (outbufwrite == outbufread) || flagstopped))
+X  { ss_unsched(sigwriteout,dowriteout,0); sigwriteout = 0; }
+X}
+X
+X/*
+We have ck{acceptfdctrlr,readfdctrlr,readin,writein,readout,writeout,
+readsig2us,sigchld}.
+When flagstopped changes, which ck*() have to be called?
+The dispatchers know. disp_flagstopped, for instance.
+It'd be interesting to see a programming language where these could
+be generated automatically---it was semi-automatic by hand.
+Of course, you could also look at this as an optimization problem...
+X*/
+X
+X/* these aren't void 'cause forward static declarations are unportable */
+static disp_mflagreading() { ckreadin(); }
+static disp_flagstopped() { ckreadin(); ckwriteout(); }
+static disp_flagwatchchld() { cksigchld(); }
+static disp_mfdmty() { ckwritein(); ckreadout(); } /* ever? */
+static disp_fdctrlr() { ckacceptfdctrlr(); ckreadfdctrlr(); }
+static disp_fdsigler() { ckreadin(); ckwriteout(); }
+static disp_fdsig2us() { ckreadsig2us(); }
+static disp_inbufread() { ckreadin(); ckwritein(); }
+static disp_inbufwrite() { ckwritein(); }
+static disp_outbufread() { ckreadout(); ckwriteout(); cksigchld(); }
+static disp_outbufwrite() { ckwriteout(); }
+X
+static void disp() { ckreadin(); ckwriteout(); ckreadout(); cksigchld();
+X  ckacceptfdctrlr(); ckreadfdctrlr(); ckwritein(); ckreadsig2us(); }
+X
+X/*
+Signal handling:
+X
+fdctrlr == -1 and mfdcomm readable: accept fdctrlr
+fdctrlr != -1 and fdctrlr readable: read command (or close)
+fdsig2us != -1 and fdsig2us readable: read stuff from sigler
+fdsigler != -1 and fdi readable and ibuf okay and reading and !stopped: read
+fdsigler != -1 and fdo readable and obuf nonempty and !stopped: write
+mfdmty != -1 and mfdmty readable and obuf okay: read from mfdmty into buffer
+mfdmty != -1 and mfdmty writable and ibuf nonempty: write
+X
+CHLD, while flagwatchchld: if exited, tell sigler exit status, and exit
+X  if stopped: if sigler, tell sigler to stop, else remember stop
+HUP, TSTP, TTIN, TTOU, WINCH, INT, QUIT: ignore
+PIPE: ignore (we handle EPIPE on write())
+X
+X*/
+X
+void master(fdcomm,fdmty,fdsty,ext,uid,pid,flagsession,fdpreco,username,flagxflowctl)
+int fdcomm;
+int fdmty;
+int fdsty;
+char *ext;
+int uid;
+int pid; /* pid of child */
+int flagsession;
+int fdpreco;
+char *username;
+int flagxflowctl;
+X{
+X musername = username;
+X mflagsession = flagsession;
+X mflagxflowctl = flagxflowctl;
+X mflagreading = 0; /* will change with flagsigler */
+X mfdcomm = fdcomm;
+X mfdmty = fdmty;
+X mfdsty = fdsty;
+X muid = uid;
+X mext[0] = ext[0];
+X mext[1] = ext[1];
+X mslavepid = pid;
+X flagstopped = 0;
+X fdsigler = -1;
+X fdsig2us = -1;
+X flagwatchchld = 0;
+X fdi = -1;
+X fdo = -1;
+X flagpreco = 1;
+X mfdpreco = fdpreco;
+X
+X recoext[0] = recoext[1] = 0;
+X
+X ss_forcewait(); /* to be turned off exactly once, namely when child exits */
+X
+X rallocneverfail(childdead); /* XXX: this is, arguably, suboptimal */
+X
+X disp(); /* starts up slave I/O and CHLD handler */
+X/*
+We're already ignoring HUP, INT, TSTP, TTOU, TTIN, WINCH, QUIT, PIPE.
+X
+Other signals to worry about: URG and IO are ignored by default; fine.
+USR1 and USR2 should never be generated.
+TERM should never be generated.
+X
+The user can arrange for XCPU, XFSZ, PROF, VTALRM, and ALRM to be sent:
+X*/
+X signal(SIGXCPU,SIG_IGN); /* XXX */
+X signal(SIGXFSZ,SIG_IGN); /* we'll get notice on write() */
+X signal(SIGALRM,SIG_IGN);
+X signal(SIGVTALRM,SIG_IGN);
+X signal(SIGPROF,SIG_IGN); /* and if we're being profiled, too bad! */
+X
+X signal(SIGTERM,SIG_IGN); /* XXX */
+X signal(SIGUSR1,SIG_IGN); /* XXX */
+X signal(SIGUSR2,SIG_IGN); /* XXX */
+X
+X closeallbut();
+X}
+END_OF_FILE
+if test 20275 -ne `wc -c <'ptymaster.c'`; then
+    echo shar: \"'ptymaster.c'\" unpacked with wrong size!
+fi
+# end of 'ptymaster.c'
+fi
+if test -f 'radixsort.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'radixsort.c'\"
+else
+echo shar: Extracting \"'radixsort.c'\" \(20057 characters\)
+sed "s/^X//" >'radixsort.c' <<'END_OF_FILE'
+X/* radixsort.c, radixsort.h: linear-per-byte in-memory string sort
+Daniel J. Bernstein, brnstnd@nyu.edu; Keith Bostic, bostic@ucbvax.berkeley.edu.
+No dependencies.
+Requires malloc, free, bcopy, bzero. Can use -DUCHAR_MAX.
+X10/5/91 DJB: Made c static, added ctr.
+X7/23/91 DJB: Baseline. radixsort/DJB 3.0. See bottom for BSD copyright.
+No known patent problems.
+X
+Documentation in radixsort.3, portions based on BSD documentation.
+X
+History: I discovered adaptive distribution sort in 1987. (I haven't
+published a paper on it---it's too trivial for that---though I did
+mention it in a letter to Knuth.) It grew out of a suggestion quoted in
+Knuth's section on quicksort et al., volume 3, page 128: ``John McCarthy
+has suggested setting K \approx (u + v)/2, if all keys are known to lie
+between u and v.'' What's the biggest problem with MSD radix sort? You
+can waste lots of time considering ranges of keys that don't even exist!
+In distribution sort, however, you usually start by finding the minimum
+and maximum keys. Here McCarthy's suggestion pops in. To sort a pile of
+floating-point numbers, find their minimum and maximum, divide the
+interval evenly into n subintervals, and split the numbers into piles by
+interval just as in MSD radix sort. Just as in quicksort, stop splitting
+when a pile can be sorted efficiently by a small-scale method. That's
+adaptive distribution sort, and it turns out to be hellishly fast for
+sorting floating-point data. The credit really belongs with McCarthy---I
+only generalized from 2 to n.
+X
+Adaptive distribution sort can be applied to strings, too: find the
+first character where two strings in the pile differ, and distribute on
+that character. There's no fine line between adaptive distribution sort
+and MSD radix sort, but in any case you get a big speed boost from
+sorting small piles by a small-scale method. See especially Knuth,
+exercise 5.2.5-10.
+X
+Computer scientists should note that this method is linear in the number
+of bytes being sorted. Sometime in 1989, as I recall, I saw a notice
+that someone had discovered an o(n log n) method of sorting n integers.
+The method depended on all sorts of weid bit manipulations and was
+utterly impractical. As the integers had to be short anyway, MSD radix
+sort worked in O(n) time. My guess is that most computer scientists
+don't learn about MSD radix sort (and hence don't know that sorting is
+linear-per-byte) because it's widely seen as having too big a constant
+factor to be practical. This radixsort() is a constructive proof that
+the opposite is true.
+X
+I ended up sending this code to Berkeley. Keith Bostic cleaned it up,
+fixed a few bugs, added a shell sort for the small case, and did several
+helpful optimizations. radixsort() will be part of BSD 4.4. I took back
+his version and modified it to what you see below. Among other things, I
+ported it from ANSI C back to the rest of the world, cleaned up some of
+the comments, added a proof that part of the method actually works,
+added the radixsort5(), radixsort7(), and radixsort3() variants,
+restored the original indentation, fixed an overly conservative estimate
+of the necessary stack size, and plugged a memory leak.
+X*/
+X
+X#define blob unsigned char /* technically, shouldn't be typedefed */
+X
+X/* KB says:
+X * __rspartition is the cutoff point for a further partitioning instead
+X * of a shellsort.  If it changes check __rsshell_increments.  Both of
+X * these are exported, as the best values are data dependent.
+X */
+X#ifndef NPARTITION
+X#define	NPARTITION 40
+X#endif
+int __rspartition = NPARTITION;
+int __rsshell_increments[] = { 4, 1, 0, 0, 0, 0, 0, 0 };
+X
+X/* KB says:
+X * Shellsort (diminishing increment sort) from Data Structures and
+X * Algorithms, Aho, Hopcraft and Ullman, 1983 Edition, page 290;
+X * see also Knuth Vol. 3, page 84. The increments are selected from
+X * formula (8), page 95. Roughly O(N^3/2).
+X */
+static void shellsort(p,index,n,tr)
+register blob **p;
+register blob *tr;
+register int index;
+register int n;
+X{
+X register blob ch;
+X register blob *s1;
+X register blob *s2;
+X register int incr;
+X register int *incrp;
+X register int t1;
+X register int t2;
+X
+X incrp = __rsshell_increments;
+X while (incr = *incrp++)
+X   for (t1 = incr;t1 < n;++t1)
+X     for (t2 = t1 - incr;t2 >= 0;)
+X      {
+X       s1 = p[t2] + index;
+X       s2 = p[t2 + incr] + index;
+X       while ((ch = tr[*s1++]) == tr[*s2] && ch)
+X         ++s2;
+X       if (ch > tr[*s2])
+X	{
+X         s1 = p[t2];
+X         p[t2] = p[t2 + incr];
+X         p[t2 + incr] = s1;
+X         t2 -= incr;
+X	}
+X       else
+X         break;
+X      }
+X}
+X
+X/* KB says:
+X * Stackp points to context structures, where each structure schedules a
+X * partitioning.  Radixsort exits when the stack is empty.
+X *
+X * If the buckets are placed on the stack randomly, the worst case is when
+X * all the buckets but one contain (npartitions + 1) elements and the bucket
+X * pushed on the stack last contains the rest of the elements.  In this case,
+X * stack growth is bounded by:
+X *
+X *	limit = (nelements / (npartitions + 1)) - 1;
+X *
+X * This is a very large number, 52,377,648 for the maximum 32-bit signed int.
+X *
+X * By forcing the largest bucket to be pushed on the stack first, the worst
+X * case is when all but two buckets each contain (npartitions + 1) elements,
+X * with the remaining elements split equally between the first and last
+X * buckets pushed on the stack.  In this case, stack growth is bounded when:
+X *
+X *	for (partition_cnt = 0; nelements > npartitions; ++partition_cnt)
+X *		nelements =
+X *		    (nelements - (npartitions + 1) * (nbuckets - 2)) / 2;
+X *
+X * The bound is:
+X *
+X *	limit = partition_cnt * (nbuckets - 1);
+X *
+X * This is a much smaller number, 4590 for the maximum 32-bit signed int.
+X
+Note inserted by DJB: About time I proved this... Fix the number of
+buckets, b. Any given pile of n elements is split into m stack piles and
+b - m small-scale piles which immediately disappear. We ignore the case
+where the pile is split into only one pile of its original size---any
+pile will be split into smaller piles eventually. Say the stack is left
+with piles of sizes p_1 ... p_m, each at least P + 1, none equal to n,
+while x elements, for some x from 0 to m'P, are in small-scale piles.
+X(Here P is the cutoff.) We must have p_1 + ... + p_m + x = n. Depending
+on the other (p,x) constraints chosen, we define s(n) as the maximum
+stack size for n elements. As the subpile distributions are independent,
+clearly
+X
+X  s(n) = max_m max_(p,x) max {s(p_1),s(p_2) + 1,...,s(p_m) + m - 1}
+X
+over all valid m and (p,x). In particular, if m > 0 then we must have
+n > p_1 >= P + 1, so if n <= P + 1 then the maximum is (vacuously) 0. So
+s(n) is monotone increasing for n <= P + 1. An easy induction shows that
+s(n) is in fact 0 for all n < 2P + 2.
+X
+Clearly s(n) is monotone: for n >= P + 2 we choose m = 1, p_1 = n - 1,
+and x = 0, and we see s(n) >= s(p_1) = s(n - 1). For m = 0, the maximum
+always equals 0, and for m = 1, the maximum always equals a previous
+s(p_1), so we have
+X
+X  s(n) = max { max_{k<n} s(k) , max_{m>=2} max_(p,x) max s(p_j) + j - 1 }.
+X
+XFor convenience we define t(n) = max_{m>=2} max_(p,x) max s(p_j) + j - 1.
+X
+XFix n. Fix m >= 2. Consider a (p,x) achieving the maximum value of
+max s(p_j) + j - 1. Since p_1 >= P + 1, we have p_2 <= n - P - 1. If x
+isn't 0, we can move an element from one of the small-scale piles to
+stack pile p_2, under either of the constraints in question. This
+increases p_2---hence does not decrease s(p_2)---without affecting the
+other s(p_j). Hence there is a (p,x) with smaller x also achieving the
+maximum.
+X
+So consider a (p,0) achieving the maximum, and say max s(p_j) + j - 1 is
+achieved at j = i. If we exchange p_i and p_j while meeting the
+constraints, we must not be at a higher maximum; in particular,
+s(p_i) + j - 1 <= s(p_i) + i - 1, so j <= i.
+X
+Restrict attention the the case without constraints, NC. The choice of j
+is unrestricted, so in particular m <= i and hence i = m. Thus t(n)
+equals max_{m>=2} s(p_m) + m - 1. Since all p_j are at least P + 1, we
+have
+X
+X  p_m + (P + 1)(m - 1) <= p_m + ... + p_1 = n
+X  p_m <= n - (P + 1)(m - 1)
+X  s(p_m) <= s(n - (P + 1)(m - 1))
+X  t(n) <= max_{m>=2} s(n - (P + 1)(m - 1)) + m - 1    (NC),
+X
+and it is easy to see that for n >= (P + 1)m, we can choose p_m as
+n - (P + 1)(m - 1) >= P + 1 and all other p_j = P + 1, so that the bound
+is achieved:
+X
+X  t(n) = max_{m>=2} s(n - (P + 1)(m - 1)) + m - 1  for  n/(P + 1) >= m.  (NC)
+X
+XFor 2 <= n/(P + 1) < b, we can choose m anywhere between 2 and
+f = floor(n/(P + 1)) inclusive. Now
+X
+X  s(n) = max { max s(k), max_{2<=m<f} s(n - (P + 1)(m - 1)) + m - 1 } (NC)
+X
+We claim inductively that s(n) = f - 1 for any n with floor(n/(P + 1)) =
+f. This is true for f = 1. For larger f, s(n - (P + 1)(m - 1)) =
+floor((n - (P + 1)(m - 1))/(P + 1)) - 1 = f - (m - 1) - 1 = f - m, so
+that
+X
+X  s(n) = max { max s(k), f - 1 }   (NC)
+X
+If n = (P + 1)f, then by inductive hypothesis s(k) <= f - 2, so that
+s(n) = f - 1 as desired. Otherwise, by (sub)induction on n, s(k) is
+still bounded by f - 1, so that s(n) = f - 1 always. Therefore:
+X
+X  s(n) = floor(n/(P + 1)) - 1,  n >= P + 1.     (NC)
+X
+Now consider the push-largest-pile-first constraint, FC. This requires
+that p_1 >= p_j for all j. Hence we cannot swap p_1 with p_i. However,
+if i is not 1 then we can swap p_j with p_i for all j > 1, hence j <= i
+for all j between 2 and m, hence i is m. Thus the maximum is achieved
+either at i = 1 or at i = m, and we have
+X
+X  t(n) = max_{m>=2} max_(p,0) max { s(p_m) + m - 1, s(p_1) }.   (FC)
+X
+Take a p vector achieving the maximum of max { s(p_m) + m - 1, s(p_1) },
+with m fixed. Suppose some p_j for j between 2 and m - 1 inclusive is
+larger than P + 1. (This is vacuous for m = 2.) Then we can subtract one
+from p_j and add one to p_1, preserving the constraint and not
+decreasing the maximum. Hence the maximum is achieved somewhere with all
+p_j = P + 1 for 2 <= j < m, i.e.,
+X
+X  p_1 + p_m + (P + 1)(m - 2) = n.   (FC)
+X
+XFurthermore, p_1 >= p_m. Hence 2p_1 >= n - (P + 1)(m - 2), and p_1 can
+range from ceiling((n - (P + 1)(m - 2))/2) up to n - (P + 1). Similarly,
+X2p_m <= n - (P + 1)(m - 2), so p_m can range from P + 1 up to
+floor((n - (P + 1)(m - 2))/2). The global maximum of these quantities
+simultaneously equals the global maximum of them individually, so if all
+bounds can be achieved then
+X
+X  t(n) = max_{m>=2} max { s(n - (P + 1)),
+X			  s(floor((n - (P + 1)(m - 2))/2)) + m - 1 }.  (FC)
+X
+This can be achieved if n - (P + 1) >= ceiling((n - (P + 1)(m - 2))/2)
+and, equivalently, P + 1 <= floor((n - (P + 1)(m - 2))/2), since in that
+case we can choose both p_1 and p_m as stated. These reduce after some
+simple manipulation to n >= (P + 1)m, i.e., m <= floor(n/(P + 1)). For
+other m it is not possible to choose any valid p_i (exercise).
+X
+We'd like to show inductively that for all n >= 2P + 2 we have
+X
+X  s(n) = u(n) with
+X  u(n) = max_{m>=2} s(floor((n - (P + 1)(m - 2))/2)) + m - 1.   (FC,*)
+X
+To do this we need only show that the other terms of the maximum do not
+X``get in the way,'' i.e., that u(n) >= s(n - (P + 1)) and u(n) >= s(k)
+for k < n. The second half is easy: s(k) = u(k), which is at most u(n)
+by monotonicity of s. The first half also follows from the induction:
+X
+X  s(n) = max_m s(floor((n - (P + 1)(m - 2))/2)) + m - 1
+X  s(n - (P + 1)) = u(n - (P + 1))
+X   = max_{m>=2} s(floor((n - (P + 1) - (P + 1)(m - 2))/2)) + m - 1
+X   <= max_{m>=2} s(floor((n - (P + 1)(m - 2))/2)) + m - 1
+X   = u(n)                    (FC)
+X
+again by the monotonicity of s. This proves (FC,*). For small n, i.e.,
+floor(n/(P + 1)) = f with 2 <= f <= b, we can choose m = f, so s(n) is
+at least s(floor((n - (P + 1)(f - 2))/2)) + f - 1. The floor term is at
+most P + 1, so s(n) >= f - 1. Furthermore, s in the constrained case is
+at most s in the unconstrained case, so s(n) = f - 1. For larger n, by
+similar logic, the maximum is attained at m = b, so we finally have
+X
+X  s(n) = floor(n/(P + 1)) - 1  for n < (b + 1)(P + 1)
+X  s(n) = s(floor((n - (P + 1)(b - 2))/2)) + b - 1  otherwise    (FC)
+X
+As in the first case s(n) is always bounded by b - 1, we can calculate
+a bound on s(n) by repeatedly setting n to floor(n - (P + 1)(b - 2))/2)
+until it is under 2P + 2 (so that s(n) = 0), counting the number of
+iterations necessary, and multiplying by b - 1. And that's what we
+wanted to prove.
+X*/
+X
+X#ifndef UCHAR_MAX /* XXX: we aren't even giving a chance for a definition! */
+X#define UCHAR_MAX 256
+X#endif
+X#define	NBUCKETS (UCHAR_MAX + 1)
+X
+typedef struct
+X {
+X  blob **bot;
+X  int index;
+X  int n;
+X }
+context;
+X
+X#define	STACKPUSH { \
+X  stackp->bot = p; \
+X  stackp->n = n; \
+X  stackp->index = index; \
+X  ++stackp; \
+X}
+X
+X#define	STACKPOP { \
+X  if (stackp == stack) \
+X    break; \
+X  --stackp; \
+X  bot = stackp->bot; \
+X  n = stackp->n; \
+X  index = stackp->index; \
+X}
+X
+X/* KB says:
+X * This uses a simple sort as soon as a bucket crosses a cutoff point,
+X * rather than sorting the entire list after partitioning is finished.
+X * This should be an advantage.
+X
+Note from DJB: The original comment read ``There is no strong evidence
+that this is an advantage.'' Depressing. Here's what I wrote in response:
+X
+X   Of course it's an advantage: it has to be, I coded it that way. :-)
+X   Seriously, I just coded the sort that way since I was following Knuth's
+X   description of MSD to the hilt. As you can imagine, though, doing the
+X   sort this way saves just a bit of paging of the index array. It also
+X   means that the simple sort doesn't have to worry about crossing past
+X   already-determined boundaries---for an average 2x gain. Trust me, it's
+X   an advantage.
+X*/
+X
+int radixsort7(l1,n,endchar,tab,indexstart,ralloc,rfree)
+blob **l1;
+register int n;
+unsigned int endchar; /* could use blob, but chars are unsafe with prototypes */
+blob *tab;
+int indexstart;
+char *(*ralloc)();
+void (*rfree)();
+X{
+X register int i;
+X register int index;
+X register int t1;
+X register int t2;
+X register blob **l2;
+X register blob **p;
+X register blob **bot;
+X register blob *tr;
+X context *stack;
+X context *stackp;
+X static int c[NBUCKETS + 1];
+X static int *ctr[NBUCKETS + 1];
+X int max;
+X blob ltab[NBUCKETS]; /* local (default) table */
+X
+X if (n <= 1)
+X   return 0;
+X
+X /* Allocate the stack. */
+X t1 = (__rspartition + 1) * (NBUCKETS - 2);
+X for (i = 0,t2 = n;t2 > __rspartition;i += NBUCKETS - 1)
+X   t2 = (t2 - t1)/2; /* could go negative! but that's okay */
+X if (!i)
+X   stack = stackp = 0;
+X else
+X   if (!(stack = stackp = (context *)ralloc(i * sizeof(context))))
+X     return -1;
+X
+X /* KB says:
+X  * There are two arrays, one provided by the user (l1), and the
+X  * temporary one (l2). The data is sorted to the temporary stack,
+X  * and then copied back. The speedup of using index to determine
+X  * which stack the data is on and simply swapping stacks back and
+X  * forth, thus avoiding the copy every iteration, turns out to not
+X  * be any faster than the current implementation.
+X  */
+X if (!(l2 = (blob **)ralloc(n * sizeof(blob *))))
+X  {
+X   rfree((char *)stackp);
+X   return -1;
+X  }
+X
+X /* KB says:
+X  * tr references a table of sort weights; multiple entries may
+X  * map to the same weight; EOS char must have the lowest weight.
+X  */
+X if (tab)
+X   tr = tab;
+X else
+X  {
+X   t2 = endchar;
+X   for (t1 = 0;t1 < t2;++t1)
+X     ltab[t1] = t1 + 1;
+X   ltab[t2] = 0;
+X   for (t1 = t2 + 1;t1 < NBUCKETS;++t1)
+X     ltab[t1] = t1;
+X   tr = ltab;
+X  }
+X
+X for (t1 = 0;t1 < NBUCKETS;++t1)
+X   ctr[t1] = c + tr[t1];
+X
+X /* First sort is entire pile. */
+X bot = l1;
+X index = indexstart;
+X
+X for (;;)
+X  {
+X   /* Clear the bucket count array. XXX: This isn't portable to */
+X   /* machines where the byte representation of int 0 isn't all */
+X   /* zeros. :-) */
+X   bzero((char *)c,sizeof(c));
+X
+X   /* Compute number of items that sort to the same bucket for this index. */
+X   p = bot;
+X   i = n;
+X   while (--i >= 0)
+X     ++*ctr[(*p++)[index]];
+X
+X   /* KB says:
+X    * Sum the number of characters into c, dividing the temp stack
+X    * into the right number of buckets for this bucket, this index.
+X    * c contains the cumulative total of keys before and included in
+X    * this bucket, and will later be used as an index to the bucket. 
+X    * c[NBUCKETS] contains the total number of elements, for determining
+X    * how many elements the last bucket contains. At the same time, we
+X    * find the largest bucket so it gets pushed first.
+X    */
+X   t2 = __rspartition;
+X   max = t1 = 0;
+X   for (i = 0;i <= NBUCKETS;++i)
+X    {
+X     if (c[i] > t2)
+X      {
+X       t2 = c[i];
+X       max = i;
+X      }
+X     t1 = c[i] += t1;
+X    }
+X
+X   /* Partition the elements into buckets; c decrements through the */
+X   /* bucket, and ends up pointing to the first element of the bucket. */
+X   i = n;
+X   while (--i >= 0)
+X    {
+X     --p;
+X     l2[--*ctr[(*p)[index]]] = *p;
+X    }
+X
+X   /* Copy the partitioned elements back to the user stack. */
+X   bcopy(l2,bot,n * sizeof(blob *));
+X
+X   ++index;
+X   /* KB says:
+X    * Sort buckets as necessary; don't sort c[0], it's the
+X    * EOS character bucket, and nothing can follow EOS.
+X    */
+X   for (i = max;i;--i)
+X    {
+X     if ((n = c[i + 1] - (t1 = c[i])) < 2)
+X       continue;
+X     p = bot + t1;
+X     if (n > __rspartition)
+X       STACKPUSH
+X     else
+X       shellsort(p,index,n,tr);
+X    }
+X   for (i = max + 1;i < NBUCKETS;++i)
+X    {
+X     if ((n = c[i + 1] - (t1 = c[i])) < 2)
+X       continue;
+X     p = bot + t1;
+X     if (n > __rspartition)
+X       STACKPUSH
+X     else
+X       shellsort(p,index,n,tr);
+X    }
+X   /* Break out when stack is empty */
+X   STACKPOP
+X  }
+X
+X rfree((char *)l2);
+X rfree((char *)stack);
+X return 0;
+X}
+X
+extern char *malloc();
+extern void free();
+X
+int radixsort5(l1,n,endchar,tab,indexstart)
+blob **l1; register int n; unsigned int endchar; blob *tab; int indexstart;
+X{
+X return radixsort7(l1,n,endchar,tab,indexstart,malloc,free);
+X}
+X
+int radixsort4(l1,n,endchar,tab)
+blob **l1; register int n; unsigned int endchar; blob *tab;
+X{
+X return radixsort7(l1,n,endchar,tab,0,malloc,free);
+X}
+X
+int radixsort(l1,n,tab,endchar)
+blob **l1; register int n; blob *tab; unsigned int endchar;
+X{
+X return radixsort7(l1,n,endchar,tab,0,malloc,free);
+X}
+X
+int radixsort3(l1,n,endchar)
+blob **l1; register int n; unsigned int endchar; 
+X{
+X return radixsort7(l1,n,endchar,(blob *) 0,0,malloc,free);
+X}
+X
+X/*- BSD copyright says:
+X * Copyright (c) 1990 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *    This product includes software developed by the University of
+X *    California, Berkeley and its contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X/* BSD sccs says:
+static char sccsid[] = "@(#)radixsort.c  5.7 (Berkeley) 2/23/91";
+X
+but this is (heavily) modified.
+X*/
+END_OF_FILE
+if test 20057 -ne `wc -c <'radixsort.c'`; then
+    echo shar: \"'radixsort.c'\" unpacked with wrong size!
+fi
+# end of 'radixsort.c'
+fi
+echo shar: End of archive 8 \(of 9\).
+cp /dev/null ark8isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 9 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

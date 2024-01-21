@@ -1,0 +1,2496 @@
+Subject:  v15i080:  ARC (PC compression program), v5.21, Part04/05
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: hyc@math.lsa.umich.edu
+Posting-number: Volume 15, Issue 80
+Archive-name: arc5.21/part04
+
+#--------------------------------CUT HERE-------------------------------------
+#! /bin/sh
+#
+# This is a shell archive.  Save this into a file, edit it
+# and delete all lines above this comment.  Then give this
+# file to sh by executing the command "sh file".  The files
+# will be extracted into the current directory owned by
+# you with default permissions.
+#
+# The files contained herein are:
+#
+# -rw-r--r--  1 hyc         22109 Jun  1 20:01 arclzw.c
+# -rw-r--r--  1 hyc          3026 Jun  1 19:41 arcmatch.c
+# -rw-r--r--  1 hyc          8418 Jun 13 14:17 arcmisc.c
+# -rw-r--r--  1 hyc          7376 Jun  2 16:27 arcpack.c
+# -rw-r--r--  1 hyc          3838 Jun  1 19:57 arcrun.c
+# -rw-r--r--  1 hyc          1645 Apr 17 18:53 arcs.h
+# -rw-------  1 hyc         14613 Jun  2 16:27 arcsq.c
+#
+echo 'x - arclzw.c'
+if test -f arclzw.c; then echo 'shar: not overwriting arclzw.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arclzw.c
+X/*
+X * $Header: arclzw.c,v 1.4 88/06/01 16:27:59 hyc Locked $
+X */
+X
+X/*
+X * ARC - Archive utility - ARCLZW
+X * 
+X * Version 2.03, created on 10/24/86 at 11:46:22
+X * 
+X * (C) COPYRIGHT 1985,86 by System Enhancement Associates; ALL RIGHTS RESERVED
+X * 
+X * By:  Thom Henderson
+X * 
+X * Description: This file contains the routines used to implement Lempel-Zev
+X * data compression, which calls for building a coding table on the fly.
+X * This form of compression is especially good for encoding files which
+X * contain repeated strings, and can often give dramatic improvements over
+X * traditional Huffman SQueezing.
+X * 
+X * Language: Computer Innovations Optimizing C86
+X * 
+X * Programming notes: In this section I am drawing heavily on the COMPRESS
+X * program from UNIX.  The basic method is taken from "A Technique for High
+X * Performance Data Compression", Terry A. Welch, IEEE Computer Vol 17, No 6
+X * (June 1984), pp 8-19.  Also see "Knuth's Fundamental Algorithms", Donald
+X * Knuth, Vol 3, Section 6.4.
+X * 
+X * As best as I can tell, this method works by tracing down a hash table of code
+X * strings where each entry has the property:
+X * 
+X * if <string> <char> is in the table then <string> is in the table.
+X */
+X#include <stdio.h>
+X#include "arc.h"
+X
+Xvoid	putc_pak(), abort(), putc_ncr();
+Xint	getc_unp();
+X#if	MSDOS
+Xchar	*setmem();
+X#else
+Xchar	*memset();
+X#endif
+X
+Xstatic void	putcode();
+X/* definitions for older style crunching */
+X
+X#define FALSE    0
+X#define TRUE     !FALSE
+X#define TABSIZE  4096
+X#define NO_PRED  0xFFFF
+X#define EMPTY    0xFFFF
+X#define NOT_FND  0xFFFF
+X
+Xstatic unsigned short inbuf;	/* partial input code storage */
+Xstatic int      sp;		/* current stack pointer */
+X
+Xstruct entry {		/* string table entry format */
+X	char            used;	/* true when this entry is in use */
+X	unsigned char   follower;	/* char following string */
+X	unsigned short  next;	/* ptr to next in collision list */
+X	unsigned short  predecessor;	/* code for preceeding string */
+X};            /* string_tab[TABSIZE];	/* the code string table */
+X
+X
+X/* definitions for the new dynamic Lempel-Zev crunching */
+X
+X#define BITS   12		/* maximum bits per code */
+X#define HSIZE  5003		/* 80% occupancy */
+X#define INIT_BITS 9		/* initial number of bits/code */
+X
+Xstatic int      n_bits;		/* number of bits/code */
+Xstatic int      maxcode;	/* maximum code, given n_bits */
+X#define MAXCODE(n)      ((1<<(n)) - 1)	/* maximum code calculation */
+Xstatic int      maxcodemax = 1 << BITS;	/* largest possible code (+1) */
+X
+Xstatic char     buf[BITS];	/* input/output buffer */
+X
+Xstatic unsigned char lmask[9] =	/* left side masks */
+X{
+X 0xff, 0xfe, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x80, 0x00
+X};
+Xstatic unsigned char rmask[9] =	/* right side masks */
+X{
+X 0x00, 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff
+X};
+X
+Xstatic int      offset;		/* byte offset for code output */
+Xstatic long     in_count;	/* length of input */
+Xstatic long     bytes_out;	/* length of compressed output */
+Xstatic long     bytes_ref;	/* output quality reference */
+Xstatic long     bytes_last;	/* output size at last checkpoint */
+Xstatic unsigned short ent;
+X
+X/*
+X * To save much memory (which we badly need at this point), we overlay the
+X * table used by the previous version of Lempel-Zev with those used by the
+X * new version.  Since no two of these routines will be used together, we can
+X * safely do this.
+X */
+X
+Xextern long     htab[HSIZE];		/* hash code table   (crunch) */
+Xextern unsigned short codetab[HSIZE];	/* string code table (crunch) */
+Xstatic struct	entry *string_tab=(struct entry *)htab;	/* old crunch string table */
+X
+Xstatic unsigned short *prefix=codetab;	/* prefix code table (uncrunch) */
+Xstatic unsigned char *suffix=(unsigned char *)htab;	/* suffix table (uncrunch) */
+X
+Xstatic int      free_ent;	/* first unused entry */
+Xstatic int      firstcmp;	/* true at start of compression */
+Xextern unsigned char stack[HSIZE];	/* local push/pop stack */
+X
+X/*
+X * block compression parameters -- after all codes are used up, and
+X * compression rate changes, start over.
+X */
+X
+Xstatic int      clear_flg;
+X#define CHECK_GAP 2048		/* ratio check interval */
+Xstatic long     checkpoint;
+Xvoid            upd_tab();
+X
+X/*
+X * the next two codes should not be changed lightly, as they must not lie
+X * within the contiguous general code space.
+X */
+X#define FIRST   257		/* first free entry */
+X#define CLEAR   256		/* table clear output code */
+X
+X/*
+X * The cl_block() routine is called at each checkpoint to determine if
+X * compression would likely improve by resetting the code table.  The method
+X * chosen to determine this is based on empirical observation that, in
+X * general, every 2k of input data should compress at least as well as the
+X * first 2k of input.
+X */
+X
+Xstatic          void
+Xcl_block(t)			/* table clear for block compress */
+X	FILE           *t;	/* our output file */
+X{
+X	checkpoint = in_count + CHECK_GAP;
+X
+X	if (bytes_ref) {
+X		if (bytes_out - bytes_last > bytes_ref) {
+X			setmem(htab, HSIZE * sizeof(long), 0xff);
+X			free_ent = FIRST;
+X			clear_flg = 1;
+X			putcode(CLEAR, t);
+X			bytes_ref = 0;
+X		}
+X	} else
+X		bytes_ref = bytes_out - bytes_last;
+X
+X	bytes_last = bytes_out;	/* remember where we were */
+X}
+X
+X/*****************************************************************
+X *
+X * Output a given code.
+X * Inputs:
+X *      code:   A n_bits-bit integer.  If == -1, then EOF.  This assumes
+X *              that n_bits =< (LONG)wordsize - 1.
+X * Outputs:
+X *      Outputs code to the file.
+X * Assumptions:
+X *      Chars are 8 bits long.
+X * Algorithm:
+X *      Maintain a BITS character long buffer (so that 8 codes will
+X * fit in it exactly).  When the buffer fills up empty it and start over.
+X */
+X
+Xstatic          void
+Xputcode(code, t)		/* output a code */
+X	int             code;	/* code to output */
+X	FILE           *t;	/* where to put it */
+X{
+X	int             r_off = offset;	/* right offset */
+X	int             bits = n_bits;	/* bits to go */
+X	char           *bp = buf;	/* buffer pointer */
+X	int             n;	/* index */
+X
+X	register int	ztmp;
+X
+X	if (code >= 0) {	/* if a real code *//* Get to the first byte. */
+X		bp += (r_off >> 3);
+X		r_off &= 7;
+X
+X		/*
+X		 * Since code is always >= 8 bits, only need to mask the
+X		 * first hunk on the left. 
+X		 */
+X		ztmp = (code << r_off) & lmask[r_off];
+X		*bp = (*bp & rmask[r_off]) | ztmp;
+X		bp++;
+X		bits -= (8 - r_off);
+X		code >>= (8 - r_off);
+X
+X		/* Get any 8 bit parts in the middle (<=1 for up to 16 bits). */
+X		if (bits >= 8) {
+X			*bp++ = code;
+X			code >>= 8;
+X			bits -= 8;
+X		}
+X		/* Last bits. */
+X		if (bits)
+X			*bp = code;
+X		offset += n_bits;
+X
+X		if (offset == (n_bits << 3)) {
+X			bp = buf;
+X			bits = n_bits;
+X			bytes_out += bits;
+X			do
+X				putc_pak(*bp++, t);
+X			while (--bits);
+X			offset = 0;
+X		}
+X		/*
+X		 * If the next entry is going to be too big for the code
+X		 * size, then increase it, if possible. 
+X		 */
+X		if (free_ent > maxcode || clear_flg > 0) {
+X			/*
+X			 * Write the whole buffer, because the input side
+X			 * won't discover the size increase until after
+X			 * it has read it. 
+X			 */
+X			if (offset > 0) {
+X				bp = buf;	/* reset pointer for writing */
+X				bytes_out += n = n_bits;
+X				while (n--)
+X					putc_pak(*bp++, t);
+X			}
+X			offset = 0;
+X
+X			if (clear_flg) {	/* reset if clearing */
+X				maxcode = MAXCODE(n_bits = INIT_BITS);
+X				clear_flg = 0;
+X			} else {/* else use more bits */
+X				n_bits++;
+X				if (n_bits == BITS)
+X					maxcode = maxcodemax;
+X				else
+X					maxcode = MAXCODE(n_bits);
+X			}
+X		}
+X	} else {		/* dump the buffer on EOF */
+X		bytes_out += n = (offset + 7) / 8;
+X
+X		if (offset > 0)
+X			while (n--)
+X				putc_pak(*bp++, t);
+X		offset = 0;
+X	}
+X}
+X
+X/*****************************************************************
+X *
+X * Read one code from the standard input.  If EOF, return -1.
+X * Inputs:
+X *      cmpin
+X * Outputs:
+X *      code or -1 is returned.
+X */
+X
+Xstatic          int
+Xgetcode(f)			/* get a code */
+X	FILE           *f;	/* file to get from */
+X{
+X	int             code;
+X	static int      offset = 0, size = 0;
+X	int             r_off, bits;
+X	unsigned char  *bp = (unsigned char *) buf;
+X
+X	if (clear_flg > 0 || offset >= size || free_ent > maxcode) {
+X		/*
+X		 * If the next entry will be too big for the current code
+X		 * size, then we must increase the size. This implies
+X		 * reading a new buffer full, too. 
+X		 */
+X		if (free_ent > maxcode) {
+X			n_bits++;
+X			if (n_bits == BITS)
+X				maxcode = maxcodemax;	/* won't get any bigger
+X							 * now */
+X			else
+X				maxcode = MAXCODE(n_bits);
+X		}
+X		if (clear_flg > 0) {
+X			maxcode = MAXCODE(n_bits = INIT_BITS);
+X			clear_flg = 0;
+X		}
+X		for (size = 0; size < n_bits; size++) {
+X			if ((code = getc_unp(f)) == EOF)
+X				break;
+X			else
+X				buf[size] = (char) code;
+X		}
+X		if (size <= 0)
+X			return -1;	/* end of file */
+X
+X		offset = 0;
+X		/* Round size down to integral number of codes */
+X		size = (size << 3) - (n_bits - 1);
+X	}
+X	r_off = offset;
+X	bits = n_bits;
+X
+X	/*
+X	 * Get to the first byte. 
+X	 */
+X	bp += (r_off >> 3);
+X	r_off &= 7;
+X
+X	/* Get first part (low order bits) */
+X	code = (*bp++ >> r_off);
+X	bits -= 8 - r_off;
+X	r_off = 8 - r_off;	/* now, offset into code word */
+X
+X	/* Get any 8 bit parts in the middle (<=1 for up to 16 bits). */
+X	if (bits >= 8) {
+X		code |= *bp++ << r_off;
+X		r_off += 8;
+X		bits -= 8;
+X	}
+X	/* high order bits. */
+X	code |= (*bp & rmask[bits]) << r_off;
+X	offset += n_bits;
+X
+X	return code & MAXCODE(BITS);
+X}
+X
+X/*
+X * compress a file
+X * 
+X * Algorithm:  use open addressing double hashing (no chaining) on the prefix
+X * code / next character combination.  We do a variant of Knuth's algorithm D
+X * (vol. 3, sec. 6.4) along with G. Knott's relatively-prime secondary probe.
+X * Here, the modular division first probe is gives way to a faster
+X * exclusive-or manipulation.  Also do block compression with an adaptive
+X * reset, where the code table is cleared when the compression ratio
+X * decreases, but after the table fills.  The variable-length output codes
+X * are re-sized at this point, and a special CLEAR code is generated for the
+X * decompressor.
+X */
+X
+Xvoid
+Xinit_cm(t)			/* initialize for compression */
+X	FILE           *t;	/* where compressed file goes */
+X{
+X	offset = 0;
+X	bytes_out = bytes_last = 1;
+X	bytes_ref = 0;
+X	clear_flg = 0;
+X	in_count = 1;
+X	checkpoint = CHECK_GAP;
+X	maxcode = MAXCODE(n_bits = INIT_BITS);
+X	free_ent = FIRST;
+X	setmem(htab, HSIZE * sizeof(long), 0xff);
+X	n_bits = INIT_BITS;	/* set starting code size */
+X
+X	putc_pak(BITS, t);	/* note our max code length */
+X
+X	firstcmp = 1;		/* next byte will be first */
+X}
+X
+Xvoid
+Xputc_cm(c, t)			/* compress a character */
+X	unsigned char   c;	/* character to compress */
+X	FILE           *t;	/* where to put it */
+X{
+X	static long     fcode;
+X	static int      hshift;
+X	int             i;
+X	int             disp;
+X
+X	if (firstcmp) {		/* special case for first byte */
+X		ent = c;	/* remember first byte */
+X
+X		hshift = 0;
+X		for (fcode = (long) HSIZE; fcode < 65536L; fcode *= 2L)
+X			hshift++;
+X		hshift = 8 - hshift;	/* set hash code range bound */
+X
+X		firstcmp = 0;	/* no longer first */
+X		return;
+X	}
+X	in_count++;
+X
+X	fcode = (long) (((long) c << BITS) + ent);
+X	i = (c << hshift) ^ ent;/* xor hashing */
+X
+X	if (htab[i] == fcode) {
+X		ent = codetab[i];
+X		return;
+X	} else if (htab[i] < 0)	/* empty slot */
+X		goto nomatch;
+X	disp = HSIZE - i;	/* secondary hash (after G.Knott) */
+X	if (i == 0)
+X		disp = 1;
+X
+Xprobe:
+X	if ((i -= disp) < 0)
+X		i += HSIZE;
+X
+X	if (htab[i] == fcode) {
+X		ent = codetab[i];
+X		return;
+X	}
+X	if (htab[i] > 0)
+X		goto probe;
+X
+Xnomatch:
+X	putcode(ent, t);
+X	ent = c;
+X	if (free_ent < maxcodemax) {
+X		codetab[i] = free_ent++;	/* code -> hashtable */
+X		htab[i] = fcode;
+X	}
+X	if (in_count >= checkpoint)
+X		cl_block(t);	/* check for adaptive reset */
+X}
+X
+Xlong
+Xpred_cm(t)			/* finish compressing a file */
+X	FILE           *t;	/* where to put it */
+X{
+X	putcode(ent, t);	/* put out the final code */
+X	putcode(-1, t);		/* tell output we are done */
+X
+X	return bytes_out;	/* say how big it got */
+X}
+X
+X/*
+X * Decompress a file.  This routine adapts to the codes in the file building
+X * the string table on-the-fly; requiring no table to be stored in the
+X * compressed file.  The tables used herein are shared with those of the
+X * compress() routine.  See the definitions above.
+X */
+X
+Xvoid
+Xdecomp(f, t)			/* decompress a file */
+X	FILE           *f;	/* file to read codes from */
+X	FILE           *t;	/* file to write text to */
+X{
+X	unsigned char  *stackp;
+X	int             finchar;
+X	int             code, oldcode, incode;
+X
+X	if ((code = getc_unp(f)) != BITS)
+X		abort("File packed with %d bits, I can only handle %d", code, BITS);
+X
+X	n_bits = INIT_BITS;	/* set starting code size */
+X	clear_flg = 0;
+X
+X	/*
+X	 * As above, initialize the first 256 entries in the table. 
+X	 */
+X	maxcode = MAXCODE(n_bits = INIT_BITS);
+X	setmem(prefix, 256 * sizeof(short), 0);	/* reset decode string table */
+X	for (code = 255; code >= 0; code--)
+X		suffix[code] = (unsigned char) code;
+X
+X	free_ent = FIRST;
+X
+X	finchar = oldcode = getcode(f);
+X	if (oldcode == -1)	/* EOF already? */
+X		return;		/* Get out of here */
+X	putc_ncr((unsigned char) finchar, t);	/* first code must be 8 bits=char */
+X	stackp = stack;
+X
+X	while ((code = getcode(f)) > -1) {
+X		if (code == CLEAR) {	/* reset string table */
+X			setmem(prefix, 256 * sizeof(short), 0);
+X			clear_flg = 1;
+X			free_ent = FIRST - 1;
+X			if ((code = getcode(f)) == -1)	/* O, untimely death! */
+X				break;
+X		}
+X		incode = code;
+X		/*
+X		 * Special case for KwKwK string. 
+X		 */
+X		if (code >= free_ent) {
+X			if (code > free_ent) {
+X				if (warn) {
+X					printf("Corrupted compressed file.\n");
+X					printf("Invalid code %d when max is %d.\n",
+X						code, free_ent);
+X				}
+X				nerrs++;
+X				return;
+X			}
+X			*stackp++ = finchar;
+X			code = oldcode;
+X		}
+X		/*
+X		 * Generate output characters in reverse order 
+X		 */
+X		while (code >= 256) {
+X			*stackp++ = suffix[code];
+X			code = prefix[code];
+X		}
+X		*stackp++ = finchar = suffix[code];
+X
+X		/*
+X		 * And put them out in forward order 
+X		 */
+X		do
+X			putc_ncr(*--stackp, t);
+X		while (stackp > stack);
+X
+X		/*
+X		 * Generate the new entry. 
+X		 */
+X		if ((code = free_ent) < maxcodemax) {
+X			prefix[code] = (unsigned short) oldcode;
+X			suffix[code] = finchar;
+X			free_ent = code + 1;
+X		}
+X		/*
+X		 * Remember previous code. 
+X		 */
+X		oldcode = incode;
+X	}
+X}
+X
+X
+X/*************************************************************************
+X * Please note how much trouble it can be to maintain upwards            *
+X * compatibility.  All that follows is for the sole purpose of unpacking *
+X * files which were packed using an older method.                        *
+X *************************************************************************/
+X
+X
+X/*
+X * The h() pointer points to the routine to use for calculating a hash value.
+X * It is set in the init routines to point to either of oldh() or newh().
+X * 
+X * oldh() calculates a hash value by taking the middle twelve bits of the square
+X * of the key.
+X * 
+X * newh() works somewhat differently, and was tried because it makes ARC about
+X * 23% faster.  This approach was abandoned because dynamic Lempel-Zev
+X * (above) works as well, and packs smaller also.  However, inadvertent
+X * release of a developmental copy forces us to leave this in.
+X */
+X
+Xstatic unsigned short(*h) ();	/* pointer to hash function */
+X
+Xstatic unsigned short
+Xoldh(pred, foll)		/* old hash function */
+X	unsigned short  pred;	/* code for preceeding string */
+X	unsigned char   foll;	/* value of following char */
+X{
+X	long            local;	/* local hash value */
+X
+X	local = ((pred + foll) | 0x0800) & 0xFFFF; /* create the hash key */
+X	local *= local;		/* square it */
+X	return (local >> 6) & 0x0FFF;	/* return the middle 12 bits */
+X}
+X
+Xstatic unsigned short
+Xnewh(pred, foll)		/* new hash function */
+X	unsigned short  pred;	/* code for preceeding string */
+X	unsigned char   foll;	/* value of following char */
+X{
+X	return (((pred + foll) & 0xFFFF) * 15073) & 0xFFF; /* faster hash */
+X}
+X
+X/*
+X * The eolist() function is used to trace down a list of entries with
+X * duplicate keys until the last duplicate is found.
+X */
+X
+Xstatic unsigned short
+Xeolist(index)			/* find last duplicate */
+X	unsigned short  index;
+X{
+X	int             temp;
+X
+X	while (temp = string_tab[index].next)	/* while more duplicates */
+X		index = temp;
+X
+X	return index;
+X}
+X
+X/*
+X * The hash() routine is used to find a spot in the hash table for a new
+X * entry.  It performs a "hash and linear probe" lookup, using h() to
+X * calculate the starting hash value and eolist() to perform the linear
+X * probe.  This routine DOES NOT detect a table full condition.  That MUST be
+X * checked for elsewhere.
+X */
+X
+Xstatic unsigned short
+Xhash(pred, foll)		/* find spot in the string table */
+X	unsigned short  pred;	/* code for preceeding string */
+X	unsigned char   foll;	/* char following string */
+X{
+X	unsigned short  local, tempnext;	/* scratch storage */
+X	struct entry   *ep;	/* allows faster table handling */
+X
+X	local = (*h) (pred, foll);	/* get initial hash value */
+X
+X	if (!string_tab[local].used)	/* if that spot is free */
+X		return local;	/* then that's all we need */
+X
+X	else {			/* else a collision has occured */
+X		local = eolist(local);	/* move to last duplicate */
+X
+X		/*
+X		 * We must find an empty spot. We start looking 101 places
+X		 * down the table from the last duplicate. 
+X		 */
+X
+X		tempnext = (local + 101) & 0x0FFF;
+X		ep = &string_tab[tempnext];	/* initialize pointer */
+X
+X		while (ep->used) {	/* while empty spot not found */
+X			if (++tempnext == TABSIZE) {	/* if we are at the end */
+X				tempnext = 0;	/* wrap to beginning of table */
+X				ep = string_tab;
+X			} else
+X				++ep;	/* point to next element in table */
+X		}
+X
+X		/*
+X		 * local still has the pointer to the last duplicate, while
+X		 * tempnext has the pointer to the spot we found.  We use
+X		 * this to maintain the chain of pointers to duplicates. 
+X		 */
+X
+X		string_tab[local].next = tempnext;
+X
+X		return tempnext;
+X	}
+X}
+X
+X/*
+X * The init_tab() routine is used to initialize our hash table. You realize,
+X * of course, that "initialize" is a complete misnomer.
+X */
+X
+Xstatic          void
+Xinit_tab()
+X{				/* set ground state in hash table */
+X	unsigned int    i;	/* table index */
+X
+X	setmem((char *) string_tab, sizeof(string_tab), 0);
+X
+X	for (i = 0; i < 256; i++)	/* list all single byte strings */
+X		upd_tab(NO_PRED, i);
+X
+X	inbuf = EMPTY;		/* nothing is in our buffer */
+X}
+X
+X/*
+X * The upd_tab routine is used to add a new entry to the string table. As
+X * previously stated, no checks are made to ensure that the table has any
+X * room.  This must be done elsewhere.
+X */
+X
+Xvoid
+Xupd_tab(pred, foll)		/* add an entry to the table */
+X	unsigned short  pred;	/* code for preceeding string */
+X	unsigned short  foll;	/* character which follows string */
+X{
+X	struct entry   *ep;	/* pointer to current entry */
+X
+X	/* calculate offset just once */
+X
+X	ep = &string_tab[hash(pred, foll)];
+X
+X	ep->used = TRUE;	/* this spot is now in use */
+X	ep->next = 0;		/* no duplicates after this yet */
+X	ep->predecessor = pred;	/* note code of preceeding string */
+X	ep->follower = foll;	/* note char after string */
+X}
+X
+X/*
+X * This algorithm encoded a file into twelve bit strings (three nybbles). The
+X * gocode() routine is used to read these strings a byte (or two) at a time.
+X */
+X
+Xstatic          int
+Xgocode(fd)			/* read in a twelve bit code */
+X	FILE           *fd;	/* file to get code from */
+X{
+X	unsigned short  localbuf, returnval;
+X	int             temp;
+X
+X	if (inbuf == EMPTY) {	/* if on a code boundary */
+X		if ((temp = getc_unp(fd)) == EOF)	/* get start of next
+X							 * code */
+X			return EOF;	/* pass back end of file status */
+X		localbuf = temp & 0xFF;	/* mask down to true byte value */
+X		if ((temp = getc_unp(fd)) == EOF)
+X			/* get end of code, * start of next */
+X			return EOF;	/* this should never happen */
+X		inbuf = temp & 0xFF;	/* mask down to true byte value */
+X
+X		returnval = ((localbuf << 4) & 0xFF0) + ((inbuf >> 4) & 0x00F);
+X		inbuf &= 0x000F;/* leave partial code pending */
+X	} else {		/* buffer contains first nybble */
+X		if ((temp = getc_unp(fd)) == EOF)
+X			return EOF;
+X		localbuf = temp & 0xFF;
+X
+X		returnval = localbuf + ((inbuf << 8) & 0xF00);
+X		inbuf = EMPTY;	/* note no hanging nybbles */
+X	}
+X	return returnval;	/* pass back assembled code */
+X}
+X
+Xstatic          void
+Xpush(c)				/* push char onto stack */
+X	int             c;	/* character to push */
+X{
+X	stack[sp] = ((char) c);	/* coerce integer into a char */
+X
+X	if (++sp >= TABSIZE)
+X		abort("Stack overflow\n");
+X}
+X
+Xstatic          int
+Xpop()
+X{				/* pop character from stack */
+X	if (sp > 0)
+X		return ((int) stack[--sp]);	/* leave ptr at next empty
+X						 * slot */
+X
+X	else
+X		return EMPTY;
+X}
+X
+X/***** LEMPEL-ZEV DECOMPRESSION *****/
+X
+Xstatic int      code_count;	/* needed to detect table full */
+Xstatic int      firstc;		/* true only on first character */
+X
+Xvoid
+Xinit_ucr(new)			/* get set for uncrunching */
+X	int             new;	/* true to use new hash function */
+X{
+X	if (new)		/* set proper hash function */
+X		h = newh;
+X	else
+X		h = oldh;
+X
+X	sp = 0;			/* clear out the stack */
+X	init_tab();		/* set up atomic code definitions */
+X	code_count = TABSIZE - 256;	/* note space left in table */
+X	firstc = 1;		/* true only on first code */
+X}
+X
+Xint
+Xgetc_ucr(f)			/* get next uncrunched byte */
+X	FILE           *f;	/* file containing crunched data */
+X{
+X	int             code, newcode;
+X	static int      oldcode, finchar;
+X	struct entry   *ep;	/* allows faster table handling */
+X
+X	if (firstc) {		/* first code is always known */
+X		firstc = FALSE;	/* but next will not be first */
+X		oldcode = gocode(f);
+X		return finchar = string_tab[oldcode].follower;
+X	}
+X	if (!sp) {		/* if stack is empty */
+X		if ((code = newcode = gocode(f)) == EOF)
+X			return EOF;
+X
+X		ep = &string_tab[code];	/* initialize pointer */
+X
+X		if (!ep->used) {/* if code isn't known */
+X			code = oldcode;
+X			ep = &string_tab[code];	/* re-initialize pointer */
+X			push(finchar);
+X		}
+X		while (ep->predecessor != NO_PRED) {
+X			push(ep->follower);	/* decode string backwards */
+X			code = ep->predecessor;
+X			ep = &string_tab[code];
+X		}
+X
+X		push(finchar = ep->follower);	/* save first character also */
+X
+X		/*
+X		 * The above loop will terminate, one way or another, with
+X		 * string_tab[code].follower equal to the first character in
+X		 * the string. 
+X		 */
+X
+X		if (code_count) {	/* if room left in string table */
+X			upd_tab(oldcode, finchar);
+X			--code_count;
+X		}
+X		oldcode = newcode;
+X	}
+X	return pop();		/* return saved character */
+X}
+________This_Is_The_END________
+if test `wc -c < arclzw.c` -ne    22109; then
+	echo 'shar: arclzw.c was damaged during transit (should have been    22109 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcmatch.c'
+if test -f arcmatch.c; then echo 'shar: not overwriting arcmatch.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcmatch.c
+X/*
+X * $Header: arcmatch.c,v 1.5 88/06/01 19:41:08 hyc Locked $
+X */
+X
+X/*
+X * ARC - Archive utility - ARCMATCH
+X * 
+X * Version 2.17, created on 12/17/85 at 20:32:18
+X * 
+X * (C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+X * 
+X * By:  Thom Henderson
+X * 
+X * Description: This file contains service routines needed to maintain an
+X * archive.
+X * 
+X * Language: Computer Innovations Optimizing C86
+X */
+X#include <stdio.h>
+X#include "arc.h"
+X
+Xint	strcmp(), strlen();
+Xvoid	abort();
+Xchar	*strcpy();
+X
+Xint
+Xmatch(n, t)			/* test name against template */
+X	char           *n;	/* name to test */
+X	char           *t;	/* template to test against */
+X{
+X#if	MTS
+X	fortran         patbuild(), patmatch(), patfree();
+X	static int      patlen = (-1);
+X	static int      patwork = 0;
+X	static int      patswch = 0;
+X	char            patccid[4];
+X	static char     patchar[2] = "?";
+X	static char     oldtemp[16] = 0;
+X	int             namlen, RETCODE;
+X
+X	if (strcmp(t, oldtemp)) {
+X		if (patwork)
+X			patfree(&patwork);
+X		strcpy(oldtemp, t);
+X		patlen = strlen(oldtemp);
+X		patbuild(oldtemp, &patlen, &patwork, &patswch, patccid, patchar, _retcode RETCODE);
+X		if (RETCODE > 8) {
+X			printf("MTS: patbuild returned %d\n", RETCODE);
+X			abort("bad wildcard in filename");
+X		}
+X	}
+X	namlen = strlen(n);
+X	patmatch(n, &namlen, &patwork, _retcode RETCODE);
+X	switch (RETCODE) {
+X	case 0:
+X		return (1);
+X	case 4:
+X		return (0);
+X	default:
+X		abort("wildcard pattern match failed");
+X	}
+X}
+X
+X#else
+X#if	!UNIX
+X	upper(n);
+X	upper(t);		/* avoid case problems */
+X#endif	/* UNIX */
+X#if	GEMDOS
+X	return(pnmatch(n, t, 0));
+X#else
+X	/* first match name part */
+X
+X	while ((*n && *n != '.') || (*t && *t != '.')) {
+X		if (*n != *t && *t != '?') {	/* match fail? */
+X			if (*t != '*')	/* wildcard fail? */
+X				return 0;	/* then no match */
+X			else {	/* else jump over wildcard */
+X				while (*n && *n != '.')
+X					n++;
+X				while (*t && *t != '.')
+X					t++;
+X				break;	/* name part matches wildcard */
+X			}
+X		} else {	/* match good for this char */
+X			n++;	/* advance to next char */
+X			t++;
+X		}
+X	}
+X
+X	if (*n && *n == '.')
+X		n++;		/* skip extension delimiters */
+X	if (*t && *t == '.')
+X		t++;
+X
+X	/* now match name part */
+X
+X	while (*n || *t) {
+X		if (*n != *t && *t != '?') {	/* match fail? */
+X			if (*t != '*')	/* wildcard fail? */
+X				return 0;	/* then no match */
+X			else
+X				return 1;	/* else good enough */
+X		} else {	/* match good for this char */
+X			n++;	/* advance to next char */
+X			t++;
+X		}
+X	}
+X
+X	return 1;		/* match worked */
+X#endif	/* GEMDOS */
+X}
+X#endif
+X
+Xvoid
+Xrempath(nargs, arg)		/* remove paths from filenames */
+X	int             nargs;	/* number of names */
+X	char           *arg[];	/* pointers to names */
+X{
+X	char           *i, *rindex();	/* string index, reverse indexer */
+X	int             n;	/* index */
+X
+X	for (n = 0; n < nargs; n++) {	/* for each supplied name */
+X		if (!(i = rindex(arg[n], '\\')))	/* search for end of
+X							 * path */
+X			if (!(i = rindex(arg[n], '/')))
+X				i = rindex(arg[n], ':');
+X		if (i)		/* if path was found */
+X			arg[n] = i + 1;	/* then skip it */
+X	}
+X}
+________This_Is_The_END________
+if test `wc -c < arcmatch.c` -ne     3026; then
+	echo 'shar: arcmatch.c was damaged during transit (should have been     3026 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcmisc.c'
+if test -f arcmisc.c; then echo 'shar: not overwriting arcmisc.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcmisc.c
+X/*
+X * Miscellaneous routines to get ARC running on non-MSDOS systems...
+X * $Header: arcmisc.c,v 1.7 88/06/12 19:23:13 hyc Locked $ 
+X */
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include "arc.h"
+X
+X#if	MSDOS
+X#include <dir.h>
+X#include <stat.h>
+X#endif
+X
+X#if	GEMDOS
+X#include <osbind.h>
+X#include <stat.h>
+Xchar           *index(), *rindex();
+X
+Xvoid 
+Xexitpause()
+X{
+X	while (Cconis())
+X		Cnecin();
+X	fprintf(stderr, "Press any key to continue: ");
+X	fflush(stderr);
+X	Cnecin();
+X	fprintf(stderr, "\n");
+X}
+X
+Xint
+Xchdir(dirname)
+X	char           *dirname;
+X{
+X	char           *i;
+X	int             drv;
+X
+X	i = dirname;
+X	if ((i = index(dirname, ':')) != NULL) {
+X		drv = i[-1];
+X		i++;		/* Move past device spec */
+X		if (drv > '\'')
+X			drv -= 'a';
+X		else
+X			drv -= 'A';
+X		if (drv >= 0 && drv < 16)
+X			Dsetdrv(drv);
+X	}
+X	if (*i != '\0')
+X		return (Dsetpath(i));
+X}
+X#endif
+X
+X#if	UNIX
+X#include <sys/types.h>
+X#include <sys/dir.h>
+X#include <sys/stat.h>
+X	int	rename();
+X#endif
+X
+X#if	SYSV
+X#include <dirent.h>
+X#define DIRECT dirent
+X#else
+X#define DIRECT direct
+X#endif
+X
+Xchar           *strcpy(), *strcat(), *malloc();
+Xint             strlen();
+X
+Xint
+Xmove(oldnam, newnam)
+X	char           *oldnam, *newnam;
+X{
+X	FILE           *fopen(), *old, *new;
+X	struct stat     oldstat;
+X	char           *strcpy();
+X	void		filecopy();
+X#if	GEMDOS
+X	if (Frename(0, oldnam, newnam))
+X#else
+X	if (rename(oldnam, newnam))
+X#endif
+X	{
+X		if (stat(oldnam, &oldstat))	/* different partition? */
+X			return (-1);
+X		old = fopen(oldnam, "rb");
+X		if (old == NULL)
+X			return (-1);
+X		new = fopen(newnam, "wb");
+X		if (new == NULL)
+X			return (-1);
+X		filecopy(old, new, oldstat.st_size);
+X		unlink(oldnam);
+X	}
+X	return 0;
+X}
+X
+Xstatic void
+X_makefn(source, dest)
+X	char           *source;
+X	char           *dest;
+X{
+X	int             j;
+X#if	MSDOS
+X	char	       *setmem();
+X#else
+X	char	       *memset();
+X#endif
+X
+X	setmem(dest, 17, 0);	/* clear result field */
+X	for (j = 0; *source && *source != '.'; ++source)
+X		if (j < 8)
+X			dest[j++] = *source;
+X	for (j = 9; *source; ++source)
+X		if (j < 13)
+X			dest[j++] = *source;
+X}
+X/*
+X * make a file name using a template 
+X */
+X
+Xchar           *
+Xmakefnam(rawfn, template, result)
+X	char           *rawfn;	/* the original file name */
+X	char           *template;	/* the template data */
+X	char           *result;	/* where to place the result */
+X{
+X	char            et[17], er[17], rawbuf[STRLEN], *i, *rindex();
+X
+X	*rawbuf = 0;
+X	strcpy(rawbuf, rawfn);
+X#if	MTS
+X	i = rawbuf;
+X	if (rawbuf[0] == tmpchr[0]) {
+X		i++;
+X		strcpy(rawfn, i);
+X	} else
+X#endif
+X	if ((i = rindex(rawbuf, CUTOFF))) {
+X		i++;
+X		strcpy(rawfn, i);
+X	}
+X#if	DOS
+X	else if ((i = rindex(rawbuf, ':'))) {
+X		i++;
+X		strcpy(rawfn, i);
+X	}
+X#endif
+X	if (i)
+X		*i = 0;
+X	else
+X		*rawbuf = 0;
+X
+X	_makefn(template, et);
+X	_makefn(rawfn, er);
+X	*result = 0;		/* assure no data */
+X	strcat(result, rawbuf);
+X	strcat(result, er[0] ? er : et);
+X	strcat(result, er[9] ? er + 9 : et + 9);
+X	return ((char *) &result[0]);
+X}
+X
+X#if	MSDOS || SYSV
+X
+Xint
+Xalphasort(dirptr1, dirptr2)
+X	struct DIRECT **dirptr1, **dirptr2;
+X{
+X	return (strcmp((*dirptr1)->d_name, (*dirptr2)->d_name));
+X}
+X
+X#endif
+X
+Xvoid
+Xupper(string)
+X	char           *string;
+X{
+X	char           *p;
+X
+X	for (p = string; *p; p++)
+X		if (islower(*p))
+X			*p = toupper(*p);
+X}
+X/* VARARGS1 */
+Xvoid
+Xabort(s, arg1, arg2, arg3)
+X	char           *s;
+X{
+X	fprintf(stderr, "ARC: ");
+X	fprintf(stderr, s, arg1, arg2, arg3);
+X	fprintf(stderr, "\n");
+X#if	UNIX
+X	perror("UNIX");
+X#endif
+X#if	GEMDOS
+X	exitpause();
+X#endif
+X	exit(1);
+X}
+X
+X#if	!MTS
+X
+Xchar           *
+Xgcdir(dirname)
+X	char           *dirname;
+X
+X{
+X	char           *getwd();
+X#if	GEMDOS
+X	int             drv;
+X	char           *buf;
+X#endif
+X	if (dirname == NULL || strlen(dirname) == 0)
+X		dirname = (char *) malloc(1024);
+X
+X#if	!GEMDOS
+X	getwd(dirname);
+X#else
+X	buf = dirname;
+X	*buf++ = (drv = Dgetdrv()) + 'A';
+X	*buf++ = ':';
+X	Dgetpath(buf, 0);
+X#endif
+X	return (dirname);
+X}
+X
+X#if	UNIX
+Xchar           *pattern;	/* global so that fmatch can use it */
+X#endif
+X
+Xchar           *
+Xdir(filename)		/* get files, one by one */
+X	char           *filename;	/* template, or NULL */
+X{
+X#if	GEMDOS
+X	static int      Nnum = 0;
+X	static DMABUFFER dbuf, *saved;
+X	char           *name;
+X
+X	if (Nnum == 0) {	/* first call */
+X		saved = (DMABUFFER *) Fgetdta();
+X		Fsetdta(&dbuf);
+X		if (Fsfirst(filename, 0) == 0) {
+X			name = malloc(FNLEN);
+X			strcpy(name, dbuf.d_fname);
+X			Nnum++;
+X			return (name);
+X		} else {
+X			Fsetdta(saved);
+X			return (NULL);
+X		}
+X	} else {
+X		if (Fsnext() == 0) {
+X			name = malloc(FNLEN);
+X			strcpy(name, dbuf.d_fname);
+X			return (name);
+X		} else {
+X			Nnum = 0;
+X			Fsetdta(saved);
+X			return (NULL);
+X		}
+X	}
+X}
+X#else
+X	static struct DIRECT **namelist;
+X	static char   **NameList;
+X	static char	namecopy[STRLEN], *dirname;
+X#if	UNIX
+X	int             alphasort();
+X	int             scandir();
+X#endif				/* UNIX */
+X	int             fmatch();
+X	static int      Nnum = 0, ii;
+X	char		*rindex();
+X
+X
+X	if (Nnum == 0) {	/* first call */
+X		strcpy(namecopy,filename);
+X		if(pattern=rindex(namecopy,CUTOFF)) {
+X			*pattern = 0;
+X			pattern++;
+X			dirname = namecopy;
+X		} else {
+X			pattern = filename;
+X			dirname = ".";
+X		}
+X		Nnum = scandir(dirname, &namelist, fmatch, alphasort);
+X		NameList = (char **) malloc(Nnum * sizeof(char *));
+X		for (ii = 0; ii < Nnum; ii++) {
+X			(NameList)[ii] = malloc(strlen(namelist[ii]->d_name) + 1);
+X			strcpy((NameList)[ii], namelist[ii]->d_name);
+X		}
+X		ii = 0;
+X	}
+X	if (ii >= Nnum) {	/* all out of files */
+X		if (Nnum) {	/* there were some files found */
+X			for (ii = 0; ii < Nnum; ii++)
+X				free(namelist[ii]);
+X			free(namelist);
+X		}
+X		Nnum = 0;
+X		return (NULL);
+X	} else {
+X		return ((NameList)[ii++]);
+X	}
+X}
+X
+X/*
+X * Filename match - here, * matches everything 
+X */
+X
+Xint
+Xfmatch(direntry)
+X	struct DIRECT  *direntry;
+X{
+X	char           *string;
+X
+X	string = direntry->d_name;
+X
+X	if (!strcmp(pattern, "") || !strcmp(pattern, "*.*") || !strcmp(pattern, "*"))
+X		return (1);
+X	return (match(string, pattern));
+X}
+X#endif				/* GEMDOS */
+X#else
+X/* dir code for MTS under Bell Labs C... */
+X
+Xchar           *
+Xdir(filepattern)
+X	char           *filepattern;	/* template or NULL */
+X{
+X	char           *malloc(), *index();
+X#if	USECATSCAN
+X	fortran void    catscan(), fileinfo();
+X
+X	struct catname {
+X		short           len;
+X		char            name[257];
+X	}               pattern;
+X
+X	struct catval {
+X		int             maxlen;
+X		int             actlen;
+X		char            name[257];
+X	}               catreturn;
+X
+X	char           *i;
+X	int             j, RETCODE;
+X
+X	static int      catptr = 0;
+X	static int      catflag = 0x200;
+X	static int      cattype = 1;
+X	static int      patflag = 0;
+X
+X	catreturn.maxlen = 256;
+X
+X	if (patflag) {
+X		patflag = 0;
+X		catptr = 0;
+X		return (NULL);
+X	}
+X	if (filepattern) {
+X		strcpy(pattern.name, filepattern);
+X		pattern.len = strlen(filepattern);
+X		if (!index(filepattern, '?'))
+X			patflag = 1;
+X	}
+X	if (patflag) {
+X		fileinfo(&pattern, &cattype, "CINAME  ", &catreturn, _retcode RETCODE);
+X		catptr = RETCODE ? 0 : 1;
+X	} else
+X		catscan(&pattern, &catflag, &cattype, &catreturn, &catptr);
+X
+X	if (!catptr)
+X		return (NULL);
+X	else {
+X		char           *k;
+X
+X		k = index(catreturn.name, ' ');
+X		if (k)
+X			*k = 0;
+X		else {
+X			j = catreturn.actlen;
+X			catreturn.name[j] = 0;
+X		}
+X		k = catreturn.name;
+X		if (catreturn.name[0] == tmpchr[0])
+X			k++;
+X		else if ((k = index(catreturn.name, sepchr[0])))
+X			k++;
+X		else
+X			k = catreturn.name;
+X		j = strlen(k);
+X		i = malloc(++j);
+X		strcpy(i, k);
+X		return (i);
+X	}
+X#else
+X	fortran void    gfinfo();
+X	static char     gfname[24];
+X	static char     pattern[20];
+X	static int      gfdummy[2] = {
+X				      0, 0
+X	},              gfflags;
+X	int             i, RETCODE;
+X	char           *j, *k;
+X
+X	if (filepattern) {
+X		strcpy(pattern, filepattern);
+X		strcat(pattern, " ");
+X		for (i = 20; i < 24; i++)
+X			gfname[i] = '\0';
+X		if (index(pattern, '?'))
+X			gfflags = 0x0C;
+X		else
+X			gfflags = 0x09;
+X	} else if (gfflags == 0x09)
+X		return (NULL);
+X
+X	gfinfo(pattern, gfname, &gfflags, gfdummy, gfdummy, gfdummy, _retcode RETCODE);
+X	if (RETCODE)
+X		return (NULL);
+X	else {
+X		k = index(gfname, ' ');
+X		*k = '\0';
+X		k = gfname;
+X		if (gfname[0] == tmpchr[0])
+X			k++;
+X		else if ((k = index(gfname, sepchr[0])))
+X			k++;
+X		else
+X			k = gfname;
+X		i = strlen(k);
+X		j = malloc(++i);
+X		strcpy(j, k);
+X		return (j);
+X	}
+X#endif
+X}
+X
+Xint
+Xunlink(path)
+X	char           *path;	/* name of file to delete */
+X{
+X	fortran void    destroy();
+X	int             RETCODE;
+X
+X	char            name[258];
+X
+X	strcpy(name, path);
+X	strcat(name, " ");
+X	destroy(name, _retcode RETCODE);
+X	if (RETCODE)
+X		return (-1);
+X	else
+X		return (0);
+X}
+X#endif
+________This_Is_The_END________
+if test `wc -c < arcmisc.c` -ne     8418; then
+	echo 'shar: arcmisc.c was damaged during transit (should have been     8418 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcpack.c'
+if test -f arcpack.c; then echo 'shar: not overwriting arcpack.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcpack.c
+X/*
+X * $Header: arcpack.c,v 1.9 88/06/02 16:27:36 hyc Locked $
+X */
+X
+X/*  ARC - Archive utility - ARCPACK
+X
+X    Version 3.49, created on 04/21/87 at 11:26:51
+X
+X(C) COPYRIGHT 1985-87 by System Enhancement Associates; ALL RIGHTS RESERVED
+X
+X    By:	 Thom Henderson
+X
+X    Description:
+X	 This file contains the routines used to compress a file
+X	 when placing it in an archive.
+X
+X    Language:
+X	 Computer Innovations Optimizing C86
+X*/
+X#include <stdio.h>
+X#include "arc.h"
+X#if	MTS
+X#include <ctype.h>
+X#endif
+X
+Xvoid	setcode(), sqinit_cm(), sqputc_cm(), init_cm(), putc_cm();
+Xvoid	filecopy(), abort(), putc_tst();
+Xint	getch(), addcrc();
+X
+X/* stuff for non-repeat packing */
+X
+X#define DLE 0x90		/* repeat sequence marker */
+X
+Xstatic unsigned char state;	/* current packing state */
+X
+X/* non-repeat packing states */
+X
+X#define NOHIST  0		/* don't consider previous input */
+X#define SENTCHAR 1		/* lastchar set, no lookahead yet */
+X#define SENDNEWC 2		/* run over, send new char next */
+X#define SENDCNT 3		/* newchar set, send count next */
+X
+X/* packing results */
+X
+Xstatic long     stdlen;		/* length for standard packing */
+Xstatic short    crcval;		/* CRC check value */
+X
+Xvoid
+Xpack(f, t, hdr)			/* pack file into an archive */
+X	FILE           *f, *t;	/* source, destination */
+X	struct heads   *hdr;	/* pointer to header data */
+X{
+X	int             c;	/* one character of stream */
+X	long            ncrlen;	/* length after packing */
+X	long		huflen;	/* length after squeezing */
+X	long            lzwlen;	/* length after crunching */
+X	long		pred_sq(), file_sq();	/* stuff for squeezing */
+X	long            pred_cm(), sqpred_cm();	/* dynamic crunching cleanup */
+X	long            tloc, ftell();	/* start of output */
+X	int		getch();
+X	int             getc_ncr();
+X	void            putc_pak();
+X
+X	/* first pass - see which method is best */
+X
+X	tloc = ftell(t);	/* note start of output */
+X
+X	if (!nocomp) {		/* if storage kludge not active */
+X		if (note) {
+X			printf(" analyzing, ");
+X			fflush(stdout);
+X		}
+X		state = NOHIST;	/* initialize ncr packing */
+X		stdlen = ncrlen = 0;	/* reset size counters */
+X		crcval = 0;	/* initialize CRC check value */
+X		setcode();	/* initialize encryption */
+X		init_sq();	/* initialize for squeeze scan */
+X
+X		if (dosquash) {
+X			sqinit_cm();
+X			while ((c = getch(f)) != EOF) {	/* for each byte of file */
+X				ncrlen++;	/* one more packed byte */
+X				scan_sq(c);	/* see what squeezing can do */
+X				sqputc_cm(c, t);	/* see what squashing
+X							 * can do */
+X			}
+X			lzwlen = sqpred_cm(t);
+X		} else {
+X			init_cm(t);	/* initialize for crunching */
+X	
+X			while ((c = getc_ncr(f)) != EOF) {	/* for each byte of file */
+X				ncrlen++;	/* one more packed byte */
+X				scan_sq(c);	/* see what squeezing can do */
+X				putc_cm(c, t);	/* see what crunching can do */
+X			}
+X			lzwlen = pred_cm(t);	/* finish up after crunching */
+X		}
+X		huflen = pred_sq();	/* finish up after squeezing */
+X	} else {		/* else kludge the method */
+X		stdlen = 0;	/* make standard look best */
+X		ncrlen = huflen = lzwlen = 1;
+X	}
+X
+X	/* standard set-ups common to all methods */
+X
+X	fseek(f, 0L, 0);	/* rewind input */
+X	hdr->crc = crcval;	/* note CRC check value */
+X	hdr->length = stdlen;	/* set actual file length */
+X	state = NOHIST;		/* reinitialize ncr packing */
+X	setcode();		/* reinitialize encryption */
+X
+X	/* choose and use the shortest method */
+X
+X	if (kludge && note)
+X		printf("\n\tS:%ld  P:%ld  S:%ld  C:%ld,\t ",
+X			stdlen, ncrlen, huflen, lzwlen);
+X
+X	if (stdlen <= ncrlen && stdlen <= huflen && stdlen <= lzwlen) {
+X		if (note) {
+X			printf("storing, ");	/* store without compression */
+X			fflush(stdout);
+X		}
+X		hdrver = 2;	/* note packing method */
+X		fseek(t, tloc, 0);	/* reset output for new method */
+X		stdlen = crcval = 0;	/* recalc these for kludge */
+X		while ((c = getch(f)) != EOF)	/* store it straight */
+X			putc_pak(c, t);
+X		hdr->crc = crcval;
+X		hdr->length = hdr->size = stdlen;
+X	} else if (ncrlen < lzwlen && ncrlen < huflen) {
+X		if (note) {
+X			printf("packing, ");	/* pack with repeat
+X			fflush(stdout);		 * suppression */
+X		}
+X		hdrver = 3;	/* note packing method */
+X		hdr->size = ncrlen;	/* set data length */
+X		fseek(t, tloc, 0);	/* reset output for new method */
+X		while ((c = getc_ncr(f)) != EOF)
+X			putc_pak(c, t);
+X	} else if (huflen < lzwlen) {
+X		if (note) {
+X			printf("squeezing, ");
+X			fflush(stdout);
+X		}
+X		hdrver = 4;	/* note packing method */
+X		fseek(t, tloc, 0);	/* reset output for new method */
+X		hdr->size = file_sq(f, t);	/* note final size */
+X	} else {
+X		if (note)
+X			printf(dosquash ? "squashed, " : "crunched, ");
+X		hdrver = dosquash ? 9 : 8;
+X		hdr->size = lzwlen;	/* size should not change */
+X	}
+X
+X	/* standard cleanups common to all methods */
+X
+X	if (note)
+X		printf("done. (%ld%%)\n",100L - (100L*hdr->size)/hdr->length);
+X}
+X
+X/*
+X * Non-repeat compression - text is passed through normally, except that a
+X * run of more than two is encoded as:
+X * 
+X * <char> <DLE> <count>
+X * 
+X * Special case: a count of zero indicates that the DLE is really a DLE, not a
+X * repeat marker.
+X */
+X
+Xint
+Xgetc_ncr(f)			/* get bytes with collapsed runs */
+X	FILE           *f;	/* file to get from */
+X{
+X	static int      lastc;	/* value returned on last call */
+X	static int      repcnt;	/* repetition counter */
+X	static int      c;	/* latest value seen */
+X
+X	switch (state) {	/* depends on our state */
+X	case NOHIST:		/* no relevant history */
+X		state = SENTCHAR;
+X		return lastc = getch(f);	/* remember the value next
+X						 * time */
+X
+X	case SENTCHAR:		/* char was sent. look ahead */
+X		switch (lastc) {/* action depends on char */
+X		case DLE:	/* if we sent a real DLE */
+X			state = NOHIST;	/* then start over again */
+X			return 0;	/* but note that the DLE was real */
+X
+X		case EOF:	/* EOF is always a special case */
+X			return EOF;
+X
+X		default:	/* else test for a repeat */
+X			for (repcnt = 1; (c = getch(f)) == lastc && repcnt < 255; repcnt++);
+X			/* find end of run */
+X
+X			switch (repcnt) {	/* action depends on run size */
+X			case 1:/* not a repeat */
+X				return lastc = c;	/* but remember value
+X							 * next time */
+X
+X			case 2:/* a repeat, but too short */
+X				state = SENDNEWC;	/* send the second one
+X							 * next time */
+X				return lastc;
+X
+X			default:	/* a run - compress it */
+X				state = SENDCNT;	/* send repeat count
+X							 * next time */
+X				return DLE;	/* send repeat marker this
+X						 * time */
+X			}
+X		}
+X
+X	case SENDNEWC:		/* send second char of short run */
+X		state = SENTCHAR;
+X		return lastc = c;
+X
+X	case SENDCNT:		/* sent DLE, now send count */
+X		state = SENDNEWC;
+X		return repcnt;
+X
+X	default:
+X		abort("Bug - bad ncr state\n");
+X	}
+X}
+X
+Xint
+Xgetch(f)			/* special get char for packing */
+X	FILE           *f;	/* file to get from */
+X{
+X	int		c;	/* a char from the file */
+X#if	!DOS
+X	static int      cr = 0;	/* add \r before \n ? */
+X
+X	if (cr) {
+X		c = '\n';
+X#if	MTS
+X		c = toascii(c);
+X#endif
+X		crcval = addcrc(crcval, c);
+X		stdlen++;
+X		cr = 0;
+X		return (c);
+X	}
+X#endif
+X
+X	if ((c = fgetc(f)) != EOF) {	/* if not the end of file */
+X#if	!DOS
+X		if (!image && (c == '\n')) {
+X			c = '\r';
+X			cr = 1;
+X		}
+X#endif
+X#if	MTS
+X		if (!image)
+X			c = toascii(c);
+X#endif
+X		crcval = addcrc(crcval, c);	/* then update CRC check
+X						 * value */
+X		stdlen++;	/* and bump length counter */
+X	}
+X	return c;
+X}
+X
+Xvoid
+Xputc_pak(c, f)			/* put a packed byte into archive */
+X	char            c;	/* byte to put */
+X	FILE           *f;	/* archive to put it in */
+X{
+X	unsigned char		code();
+X	putc_tst(code(c), f);	/* put encoded byte, with checks */
+X}
+________This_Is_The_END________
+if test `wc -c < arcpack.c` -ne     7376; then
+	echo 'shar: arcpack.c was damaged during transit (should have been     7376 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcrun.c'
+if test -f arcrun.c; then echo 'shar: not overwriting arcrun.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcrun.c
+X/*
+X * $Header: arcrun.c,v 1.3 88/06/01 19:57:16 hyc Locked $
+X */
+X
+X/*
+X * ARC - Archive utility - ARCRUN
+X * 
+X * Version 1.20, created on 03/24/86 at 19:34:31
+X * 
+X * (C) COPYRIGHT 1985,85 by System Enhancement Associates; ALL RIGHTS RESERVED
+X * 
+X * By:  Thom Henderson
+X * 
+X * Description: This file contains the routines used to "run" a file which is
+X * stored in an archive.  At present, all we really do is (a) extract a
+X * temporary file, (b) give its name as a system command, and then (c) delete
+X * the file.
+X * 
+X * Language: Computer Innovations Optimizing C86
+X */
+X#include <stdio.h>
+X#include "arc.h"
+X
+Xvoid	rempath(), openarc(), closearc(), abort();
+Xchar	*strcat();
+X
+Xvoid
+Xrunarc(num, arg)		/* run file from archive */
+X	int             num;	/* number of arguments */
+X	char           *arg[];	/* pointers to arguments */
+X{
+X	struct heads    hdr;	/* file header */
+X	char           *makefnam();	/* filename fixer */
+X	char            buf[STRLEN];	/* filename buffer */
+X	FILE           *fopen();/* file opener */
+X	int             runfile();
+X	char	       *dummy[2];
+X
+X	dummy[0]="dummy";
+X	dummy[1]=NULL;
+X	rempath(num, arg);	/* strip off paths */
+X
+X	openarc(0);		/* open archive for reading */
+X
+X	if (num) {		/* if files were named */
+X		while (readhdr(&hdr, arc)) {	/* while more files to check */
+X			if (match(hdr.name, makefnam(arg[0], ".*", buf)))
+X				runfile(&hdr, num, arg);
+X			else
+X				fseek(arc, hdr.size, 1);
+X		}
+X	} else
+X		while (readhdr(&hdr, arc))	/* else run all files */
+X			runfile(&hdr, 1, dummy);
+X
+X	closearc(0);		/* close archive after changes */
+X}
+X
+Xstatic          int
+Xrunfile(hdr, num, arg)		/* run a file */
+X	struct heads   *hdr;	/* pointer to header data */
+X	int             num;	/* number of arguments */
+X	char           *arg[];	/* pointers to arguments */
+X{
+X	FILE           *tmp, *fopen();	/* temporary file */
+X	char           *dir, *gcdir();	/* directory stuff */
+X	char            buf[STRLEN], *makefnam();	/* temp file name, fixer */
+X#if	DOS
+X	char		nbuf[64], *i, *rindex();
+X#endif
+X#if	!GEMDOS
+X	int             n;	/* index */
+X	char            sys[STRLEN];	/* invocation command buffer */
+X#endif
+X
+X	/* makefnam("$ARCTEMP",hdr->name,buf); */
+X#if	UNIX
+X	sprintf(buf, "%s.RUN", arctemp);
+X	strcpy(sys, buf);
+X#else
+X	strcpy(nbuf, arctemp);
+X	makefnam(nbuf,hdr->name,buf);
+X	i = rindex(buf,'.');
+X#endif
+X#if	MSDOS
+X	if (!strcmp(i, ".BAS")) {
+X		strcpy(sys, "BASICA ");
+X		strcat(sys, buf);
+X	}
+X	else if (!strcmp(i, ".BAT")
+X		 || !strcmp(i, ".COM")
+X		 || !strcmp(i, ".EXE"))
+X		strcpy(sys, buf);
+X
+X	else {
+X		if (warn) {
+X			printf("File %s is not a .BAS, .BAT, .COM, or .EXE\n",
+X			       hdr->name);
+X			nerrs++;
+X		}
+X		fseek(arc, hdr->size, 1);	/* skip this file */
+X		return;
+X	}
+X#endif
+X#if	GEMDOS
+X      if (strcmp(i, ".PRG")
+X              && strcmp(i, ".TTP")
+X              && strcmp(i, ".TOS"))
+X      {
+X              if (warn) {
+X                      printf("File %s is not a .PRG, .TOS, or .TTP\n",
+X                              hdr->name);
+X                      nerrs++;
+X              }
+X              fseek(arc, hdr->size, 1);       /* skip this file */
+X              return;
+X      }
+X#endif
+X
+X	if (warn)
+X		if (tmp = fopen(buf, "r"))
+X			abort("Temporary file %s already exists", buf);
+X	if (!(tmp = fopen(buf, "wb")))
+X		abort("Unable to create temporary file %s", buf);
+X
+X	if (note)
+X		printf("Invoking file: %s\n", hdr->name);
+X
+X	dir = gcdir("");	/* see where we are */
+X	unpack(arc, tmp, hdr);	/* unpack the entry */
+X	fclose(tmp);		/* release the file */
+X	chmod(buf, "700");	/* make it executable */
+X#if	GEMDOS
+X	execve(buf, arg, NULL);
+X#else
+X	for (n = 1; n < num; n++) {	/* add command line arguments */
+X		strcat(sys, " ");
+X		strcat(sys, arg[n]);
+X	}
+X	system(buf);		/* try to invoke it */
+X#endif
+X	chdir(dir);
+X	free(dir);		/* return to whence we started */
+X	if (unlink(buf) && warn) {
+X		printf("Cannot unsave temporary file %s\n", buf);
+X		nerrs++;
+X	}
+X}
+________This_Is_The_END________
+if test `wc -c < arcrun.c` -ne     3838; then
+	echo 'shar: arcrun.c was damaged during transit (should have been     3838 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcs.h'
+if test -f arcs.h; then echo 'shar: not overwriting arcs.h'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcs.h
+X/*
+X * $Header: arcs.h,v 1.2 88/04/17 18:53:19 hyc Exp $
+X */
+X
+X/*
+X * ARC - Archive utility - Archive file header format
+X * 
+X * Version 2.12, created on 12/17/85 at 14:40:26
+X * 
+X * (C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED
+X * 
+X * By:  Thom Henderson
+X * 
+X * Description: This file defines the format of an archive file header,
+X * excluding the archive marker and the header version number.
+X * 
+X * Each entry in an archive begins with a one byte archive marker, which is set
+X * to 26.  The marker is followed by a one byte header type code, from zero
+X * to 7.
+X * 
+X * If the header type code is zero, then it is an end marker, and no more data
+X * should be read from the archive.
+X * 
+X * If the header type code is in the range 2 to 7, then it is followed by a
+X * standard archive header, which is defined below.
+X * 
+X * If the header type code is one, then it is followed by an older format
+X * archive header.  The older format header does not contain the true length.
+X * A header should be read for a length of sizeof(struct heads)-sizeof(long).
+X * Then set length equal to size and change the header version to 2.
+X * 
+X * Programming note: The crc value given in the header is based on the unpacked
+X * data.
+X * 
+X * Language: Computer Innovations Optimizing C86
+X */
+X
+Xstruct heads {			/* archive entry header format */
+X    char    name[FNLEN];		/* file name */
+X            long size;		/* size of file, in bytes */
+X    unsigned    short date;	/* creation date */
+X    unsigned    short time;	/* creation time */
+X                short crc;	/* cyclic redundancy check */
+X                long length;	/* true file length */
+X};
+________This_Is_The_END________
+if test `wc -c < arcs.h` -ne     1645; then
+	echo 'shar: arcs.h was damaged during transit (should have been     1645 bytes)'
+fi
+fi		; : end of overwriting check
+echo 'x - arcsq.c'
+if test -f arcsq.c; then echo 'shar: not overwriting arcsq.c'; else
+sed 's/^X//' << '________This_Is_The_END________' > arcsq.c
+X/*
+X * $Header: arcsq.c,v 1.2 88/06/02 16:27:38 hyc Locked $
+X */
+X
+X/*
+X * ARC - Archive utility - ARCSQ 
+X *
+X * Version 3.10, created on 01/30/86 at 20:10:46
+X *
+X * (C) COPYRIGHT 1985 by System Enhancement Associates; ALL RIGHTS RESERVED 
+X *
+X * By:  Thom Henderson 
+X *
+X * Description: This file contains the routines used to squeeze a file when
+X * placing it in an archive. 
+X *
+X * Language: Computer Innovations Optimizing C86 
+X *
+X * Programming notes: Most of the routines used for the Huffman squeezing
+X * algorithm were lifted from the SQ program by Dick Greenlaw, as adapted to
+X * CI-C86 by Robert J. Beilstein. 
+X */
+X#include <stdio.h>
+X#include "arc.h"
+X
+X/* stuff for Huffman squeezing */
+X
+X#define TRUE 1
+X#define FALSE 0
+X#define ERROR (-1)
+X#define SPEOF 256		/* special endfile token */
+X#define NOCHILD (-1)		/* marks end of path through tree */
+X#define NUMVALS 257		/* 256 data values plus SPEOF */
+X#define NUMNODES (NUMVALS+NUMVALS-1)	/* number of nodes */
+X#define MAXCOUNT (unsigned short) 65535	/* biggest unsigned integer */
+X
+X/*
+X * The following array of structures are the nodes of the binary trees. The
+X * first NUMVALS nodes become the leaves of the final tree and represent the
+X * values of the data bytes being encoded and the special endfile, SPEOF. The
+X * remaining nodes become the internal nodes of the final tree. 
+X */
+X
+Xstruct nd {			/* shared by unsqueezer */
+X	unsigned short	weight;	/* number of appearances */
+X	short		tdepth;	/* length on longest path in tree */
+X	short		lchild, rchild;	/* indices to next level */
+X}               node[NUMNODES];	/* use large buffer */
+X
+Xstatic int      dctreehd;	/* index to head of final tree */
+X
+X/*
+X * This is the encoding table: The bit strings have first bit in low bit.
+X * Note that counts were scaled so code fits unsigned integer. 
+X */
+X
+Xstatic int      codelen[NUMVALS];	/* number of bits in code */
+Xstatic unsigned short code[NUMVALS];	/* code itself, right adjusted */
+Xstatic unsigned short tcode;	/* temporary code value */
+Xstatic long     valcount[NUMVALS];	/* actual count of times seen */
+X
+X/* Variables used by encoding process */
+X
+Xstatic int      curin;		/* value currently being encoded */
+Xstatic int      cbitsrem;	/* # of code string bits left */
+Xstatic unsigned short ccode;	/* current code right justified */
+X
+Xint 
+Xinit_sq()
+X{				/* prepare for scanning pass */
+X	int             i;	/* node index */
+X
+X	/*
+X	 * Initialize all nodes to single element binary trees with zero
+X	 * weight and depth. 
+X	 */
+X
+X	for (i = 0; i < NUMNODES; ++i) {
+X		node[i].weight = 0;
+X		node[i].tdepth = 0;
+X		node[i].lchild = NOCHILD;
+X		node[i].rchild = NOCHILD;
+X	}
+X
+X	for (i = 0; i < NUMVALS; i++)
+X		valcount[i] = 0;
+X}
+X
+Xint 
+Xscan_sq(c)			/* add a byte to the tables */
+X	int             c;	/* byte to add */
+X{
+X	unsigned short *wp;	/* speeds up weight counting */
+X
+X	/* Build frequency info in tree */
+X
+X	if (c == EOF)		/* it's traditional */
+X		c = SPEOF;	/* dumb, but traditional */
+X
+X	if (*(wp = &node[c].weight) != MAXCOUNT)
+X		++(*wp);	/* bump weight counter */
+X
+X	valcount[c]++;		/* bump byte counter */
+X}
+X
+Xlong 
+Xpred_sq()
+X{				/* predict size of squeezed file */
+X	int             i;
+X	int             btlist[NUMVALS];	/* list of intermediate
+X						 * b-trees */
+X	int             listlen;/* length of btlist */
+X	unsigned short	ceiling;/* limit for scaling */
+X	long            size = 0;	/* predicted size */
+X	int             numnodes;	/* # of nodes in simplified tree */
+X	int             scale();
+X	int             heap();
+X	int             bld_tree();
+X	int             buildenc();
+X	int             init_enc();
+X
+X	scan_sq(EOF);		/* signal end of input */
+X
+X	ceiling = MAXCOUNT;
+X
+X	/* Keep trying to scale and encode */
+X
+X	do {
+X		scale(ceiling);
+X		ceiling /= 2;	/* in case we rescale */
+X
+X		/*
+X		 * Build list of single node binary trees having leaves for
+X		 * the input values with non-zero counts 
+X		 */
+X
+X		for (i = listlen = 0; i < NUMVALS; ++i) {
+X			if (node[i].weight != 0) {
+X				node[i].tdepth = 0;
+X				btlist[listlen++] = i;
+X			}
+X		}
+X
+X		/*
+X		 * Arrange list of trees into a heap with the entry indexing
+X		 * the node with the least weight at the top. 
+X		 */
+X
+X		heap(btlist, listlen);
+X
+X		/* Convert the list of trees to a single decoding tree */
+X
+X		bld_tree(btlist, listlen);
+X
+X		/* Initialize the encoding table */
+X
+X		init_enc();
+X
+X		/*
+X		 * Try to build encoding table. Fail if any code is > 16 bits
+X		 * long. 
+X		 */
+X	} while (buildenc(0, dctreehd) == ERROR);
+X
+X	/* Initialize encoding variables */
+X
+X	cbitsrem = 0;		/* force initial read */
+X	curin = 0;		/* anything but endfile */
+X
+X	for (i = 0; i < NUMVALS; i++)	/* add bits for each code */
+X		size += valcount[i] * codelen[i];
+X
+X	size = (size + 7) / 8;	/* reduce to number of bytes */
+X
+X	numnodes = dctreehd < NUMVALS ? 0 : dctreehd - (NUMVALS - 1);
+X
+X	size += sizeof(short) + 2 * numnodes * sizeof(short);
+X
+X	return size;
+X}
+X
+X/*
+X * The count of number of occurrances of each input value have already been
+X * prevented from exceeding MAXCOUNT. Now we must scale them so that their
+X * sum doesn't exceed ceiling and yet no non-zero count can become zero. This
+X * scaling prevents errors in the weights of the interior nodes of the
+X * Huffman tree and also ensures that the codes will fit in an unsigned
+X * integer. Rescaling is used if necessary to limit the code length. 
+X */
+X
+Xstatic int 
+Xscale(ceil)
+X	unsigned short	ceil;	/* upper limit on total weight */
+X{
+X	register int    i;
+X	int             ovflw, divisor;
+X	unsigned short	w, sum;
+X	unsigned char   increased;	/* flag */
+X
+X	do {
+X		for (i = sum = ovflw = 0; i < NUMVALS; ++i) {
+X			if (node[i].weight > (ceil - sum))
+X				++ovflw;
+X			sum += node[i].weight;
+X		}
+X
+X		divisor = ovflw + 1;
+X
+X		/* Ensure no non-zero values are lost */
+X
+X		increased = FALSE;
+X		for (i = 0; i < NUMVALS; ++i) {
+X			w = node[i].weight;
+X			if (w < divisor && w != 0) {	/* Don't fail to provide
+X							 * a code if it's used
+X							 * at all */
+X
+X				node[i].weight = divisor;
+X				increased = TRUE;
+X			}
+X		}
+X	} while (increased);
+X
+X	/* Scaling factor chosen, now scale */
+X
+X	if (divisor > 1)
+X		for (i = 0; i < NUMVALS; ++i)
+X			node[i].weight /= divisor;
+X}
+X
+X/*
+X * heap() and adjust() maintain a list of binary trees as a heap with the top
+X * indexing the binary tree on the list which has the least weight or, in
+X * case of equal weights, least depth in its longest path. The depth part is
+X * not strictly necessary, but tends to avoid long codes which might provoke
+X * rescaling. 
+X */
+X
+Xstatic int 
+Xheap(list, length)
+X	int             list[], length;
+X{
+X	register int    i;
+X	int             adjust();
+X
+X	for (i = (length - 2) / 2; i >= 0; --i)
+X		adjust(list, i, length - 1);
+X}
+X
+X/* Make a heap from a heap with a new top */
+X
+Xstatic int 
+Xadjust(list, top, bottom)
+X	int             list[], top, bottom;
+X{
+X	register int    k, temp;
+X	int             cmptrees();
+X
+X	k = 2 * top + 1;	/* left child of top */
+X	temp = list[top];	/* remember root node of top tree */
+X
+X	if (k <= bottom) {
+X		if (k < bottom && cmptrees(list[k], list[k + 1]))
+X			++k;
+X
+X		/* k indexes "smaller" child (in heap of trees) of top */
+X		/* now make top index "smaller" of old top and smallest child */
+X
+X		if (cmptrees(temp, list[k])) {
+X			list[top] = list[k];
+X			list[k] = temp;
+X
+X			/* Make the changed list a heap */
+X
+X			adjust(list, k, bottom);	/* recursive */
+X		}
+X	}
+X}
+X
+X/*
+X * Compare two trees, if a > b return true, else return false. Note
+X * comparison rules in previous comments. 
+X */
+X
+Xstatic int 
+Xcmptrees(a, b)
+X	int             a, b;	/* root nodes of trees */
+X{
+X	if (node[a].weight > node[b].weight)
+X		return TRUE;
+X	if (node[a].weight == node[b].weight)
+X		if (node[a].tdepth > node[b].tdepth)
+X			return TRUE;
+X	return FALSE;
+X}
+X
+X/*
+X * HUFFMAN ALGORITHM: develops the single element trees into a single binary
+X * tree by forming subtrees rooted in interior nodes having weights equal to
+X * the sum of weights of all their descendents and having depth counts
+X * indicating the depth of their longest paths. 
+X *
+X * When all trees have been formed into a single tree satisfying the heap
+X * property (on weight, with depth as a tie breaker) then the binary code
+X * assigned to a leaf (value to be encoded) is then the series of left (0)
+X * and right (1) paths leading from the root to the leaf. Note that trees are
+X * removed from the heaped list by moving the last element over the top
+X * element and reheaping the shorter list. 
+X */
+X
+Xstatic int 
+Xbld_tree(list, len)
+X	int             list[];
+Xint             len;
+X{
+X	register int    freenode;	/* next free node in tree */
+X	register struct nd *frnp;	/* free node pointer */
+X	int             lch, rch;	/* temps for left, right children */
+X	int             maxchar();
+X
+X	/*
+X	 * Initialize index to next available (non-leaf) node. Lower numbered
+X	 * nodes correspond to leaves (data values). 
+X	 */
+X
+X	freenode = NUMVALS;
+X
+X	while (len > 1) {	/* Take from list two btrees with least
+X				 * weight and build an interior node pointing
+X				 * to them. This forms a new tree. */
+X
+X		lch = list[0];	/* This one will be left child */
+X
+X		/* delete top (least) tree from the list of trees */
+X
+X		list[0] = list[--len];
+X		adjust(list, 0, len - 1);
+X
+X		/* Take new top (least) tree. Reuse list slot later */
+X
+X		rch = list[0];	/* This one will be right child */
+X
+X		/*
+X		 * Form new tree from the two least trees using a free node
+X		 * as root. Put the new tree in the list. 
+X		 */
+X
+X		frnp = &node[freenode];	/* address of next free node */
+X		list[0] = freenode++;	/* put at top for now */
+X		frnp->lchild = lch;
+X		frnp->rchild = rch;
+X		frnp->weight = node[lch].weight + node[rch].weight;
+X		frnp->tdepth = 1 + maxchar(node[lch].tdepth, node[rch].tdepth);
+X
+X		/* reheap list  to get least tree at top */
+X
+X		adjust(list, 0, len - 1);
+X	}
+X	dctreehd = list[0];	/* head of final tree */
+X}
+X
+Xstatic int 
+Xmaxchar(a, b)
+X{
+X	return a > b ? a : b;
+X}
+X
+Xstatic int 
+Xinit_enc()
+X{
+X	register int    i;
+X
+X	/* Initialize encoding table */
+X
+X	for (i = 0; i < NUMVALS; ++i)
+X		codelen[i] = 0;
+X}
+X
+X/*
+X * Recursive routine to walk the indicated subtree and level and maintain the
+X * current path code in bstree. When a leaf is found the entire code string
+X * and length are put into the encoding table entry for the leaf's data value
+X * . 
+X *
+X * Returns ERROR if codes are too long. 
+X */
+X
+Xstatic int 
+Xbuildenc(level, root)
+X	int             level;	/* level of tree being examined, from zero */
+X	int             root;	/* root of subtree is also data value if leaf */
+X{
+X	register int    l, r;
+X
+X	l = node[root].lchild;
+X	r = node[root].rchild;
+X
+X	if (l == NOCHILD && r == NOCHILD) {	/* Leaf. Previous path
+X						 * determines bit string code
+X						 * of length level (bits 0 to
+X						 * level - 1). Ensures unused
+X						 * code bits are zero. */
+X
+X		codelen[root] = level;
+X		code[root] = tcode & (((unsigned short	) ~0) >> (16 - level));
+X		return (level > 16) ? ERROR : 0;
+X	} else {
+X		if (l != NOCHILD) {	/* Clear path bit and continue deeper */
+X
+X			tcode &= ~(1 << level);
+X			if (buildenc(level + 1, l) == ERROR)
+X				return ERROR;	/* pass back bad statuses */
+X		}
+X		if (r != NOCHILD) {	/* Set path bit and continue deeper */
+X
+X			tcode |= 1 << level;
+X			if (buildenc(level + 1, r) == ERROR)
+X				return ERROR;	/* pass back bad statuses */
+X		}
+X	}
+X	return NULL;		/* it worked if we reach here */
+X}
+X
+Xstatic int 
+Xput_int(n, f)			/* output an integer */
+X	short		n;	/* integer to output */
+X	FILE           *f;	/* file to put it to */
+X{
+X	putc_pak(n & 0xff, f);	/* first the low byte */
+X	putc_pak(n >> 8, f);	/* then the high byte */
+X}
+X
+X/* Write out the header of the compressed file */
+X
+Xstatic long 
+Xwrt_head(ob)
+X	FILE           *ob;
+X{
+X	register int    l, r;
+X	int             i, k;
+X	int             numnodes;	/* # of nodes in simplified tree */
+X
+X	/*
+X	 * Write out a simplified decoding tree. Only the interior nodes are
+X	 * written. When a child is a leaf index (representing a data value)
+X	 * it is recoded as -(index + 1) to distinguish it from interior
+X	 * indexes which are recoded as positive indexes in the new tree. 
+X	 *
+X	 * Note that this tree will be empty for an empty file. 
+X	 */
+X
+X	numnodes = dctreehd < NUMVALS ? 0 : dctreehd - (NUMVALS - 1);
+X	put_int(numnodes, ob);
+X
+X	for (k = 0, i = dctreehd; k < numnodes; ++k, --i) {
+X		l = node[i].lchild;
+X		r = node[i].rchild;
+X		l = l < NUMVALS ? -(l + 1) : dctreehd - l;
+X		r = r < NUMVALS ? -(r + 1) : dctreehd - r;
+X		put_int(l, ob);
+X		put_int(r, ob);
+X	}
+X
+X	return sizeof(short) + numnodes * 2 * sizeof(short);
+X}
+X
+X/*
+X * Get an encoded byte or EOF. Reads from specified stream AS NEEDED. 
+X *
+X * There are two unsynchronized bit-byte relationships here. The input stream
+X * bytes are converted to bit strings of various lengths via the static
+X * variables named c... These bit strings are concatenated without padding to
+X * become the stream of encoded result bytes, which this function returns one
+X * at a time. The EOF (end of file) is converted to SPEOF for convenience and
+X * encoded like any other input value. True EOF is returned after that. 
+X */
+X
+Xstatic int 
+Xgethuff(ib)			/* Returns bytes except for EOF */
+X	FILE           *ib;
+X{
+X	int             rbyte;	/* Result byte value */
+X	int             need;	/* number of bits */
+X
+X	rbyte = 0;
+X	need = 8;		/* build one byte per call */
+X
+X	/*
+X	 * Loop to build a byte of encoded data. Initialization forces read
+X	 * the first time. 
+X	 */
+X
+Xloop:
+X	if (cbitsrem >= need) {	/* if current code is big enough */
+X		if (need == 0)
+X			return rbyte;
+X
+X		rbyte |= ccode << (8 - need);	/* take what we need */
+X		ccode >>= need;	/* and leave the rest */
+X		cbitsrem -= need;
+X		return rbyte & 0xff;
+X	}
+X	/* We need more than current code */
+X
+X	if (cbitsrem > 0) {
+X		rbyte |= ccode << (8 - need);	/* take what there is */
+X		need -= cbitsrem;
+X	}
+X	/* No more bits in current code string */
+X
+X	if (curin == SPEOF) {	/* The end of file token has been encoded. If
+X				 * result byte has data return it and do EOF
+X				 * next time. */
+X
+X		cbitsrem = 0;
+X		return (need == 8) ? EOF : rbyte + 0;
+X	}
+X	/* Get an input byte */
+X
+X	if ((curin = getc_ncr(ib)) == EOF)
+X		curin = SPEOF;	/* convenient for encoding */
+X
+X	ccode = code[curin];	/* get the new byte's code */
+X	cbitsrem = codelen[curin];
+X
+X	goto loop;
+X}
+X
+X/*
+X * This routine is used to perform the actual squeeze operation.  It can only
+X * be called after the file has been scanned.  It returns the true length of
+X * the squeezed entry. 
+X */
+X
+Xlong 
+Xfile_sq(f, t)			/* squeeze a file into an archive */
+X	FILE           *f;	/* file to squeeze */
+X	FILE           *t;	/* archive to receive file */
+X{
+X	int             c;	/* one byte of squeezed data */
+X	long            size;	/* size after squeezing */
+X
+X	size = wrt_head(t);	/* write out the decode tree */
+X
+X	while ((c = gethuff(f)) != EOF) {
+X		putc_pak(c, t);
+X		size++;
+X	}
+X
+X	return size;		/* report true size */
+X}
+________This_Is_The_END________
+if test `wc -c < arcsq.c` -ne    14613; then
+	echo 'shar: arcsq.c was damaged during transit (should have been    14613 bytes)'
+fi
+fi		; : end of overwriting check
+exit 0
+

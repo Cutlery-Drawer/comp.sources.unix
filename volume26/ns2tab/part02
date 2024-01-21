@@ -1,0 +1,2028 @@
+Newsgroups: comp.sources.unix
+From: i3558@newsie.dc.dk (Soeren Michael Roug)
+Subject: v26i093: ns2tab - Increasing the usefullnes of the nameserver, Part02/03
+Sender: unix-sources-moderator@vix.com
+Approved: paul@vix.com
+
+Submitted-By: i3558@newsie.dc.dk (Soeren Michael Roug)
+Posting-Number: Volume 26, Issue 93
+Archive-Name: ns2tab/part02
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 3)."
+# Contents:  getinfo.c hash.c main.c
+# Wrapped by i3558@ulrik.dc.dk on Fri Mar 26 15:05:34 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'getinfo.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'getinfo.c'\"
+else
+echo shar: Extracting \"'getinfo.c'\" \(20155 characters\)
+sed "s/^X//" >'getinfo.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1985,1989 Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms are permitted provided
+X * that: (1) source distributions retain this entire copyright notice and
+X * comment, and (2) distributions including binaries display the following
+X * acknowledgement:  ``This product includes software developed by the
+X * University of California, Berkeley and its contributors'' in the
+X * documentation or other materials provided with the distribution and in
+X * all advertising materials mentioning features or use of this software.
+X * Neither the name of the University nor the names of its contributors may
+X * be used to endorse or promote products derived from this software without
+X * specific prior written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR IMPLIED
+X * WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
+X * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X */
+X
+X#ifndef lint
+Xstatic char sccsid[] = "@(#)getinfo.c	5.22 (Berkeley) 6/1/90";
+X#endif /* not lint */
+X
+X/*
+X *******************************************************************************
+X *
+X *  getinfo.c --
+X *
+X *	Routines to create requests to name servers
+X *	and interpret the answers.
+X *
+X *	Adapted from 4.3BSD BIND gethostnamadr.c
+X *
+X *******************************************************************************
+X */
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <arpa/nameser.h>
+X#include <arpa/inet.h>
+X#include <resolv.h>
+X#include "res.h"
+X
+Xextern char *_res_resultcodes[];
+Xextern char *res_skip();
+X
+X#define	MAXALIASES	35
+X#define MAXADDRS	35
+X#define MAXDOMAINS	35
+X#define MAXSERVERS	10
+X
+Xstatic char *addr_list[MAXADDRS + 1];
+X
+Xstatic char *host_aliases[MAXALIASES];
+Xstatic int   host_aliases_len[MAXALIASES];
+Xstatic char  hostbuf[BUFSIZ+1];
+X
+Xtypedef struct {
+X    char *name;
+X    char *domain[MAXDOMAINS];
+X    int   numDomains;
+X    char *address[MAXADDRS];
+X    int   numAddresses;
+X} ServerTable;
+X
+XServerTable server[MAXSERVERS];
+X
+Xtypedef union {
+X    HEADER qb1;
+X    char qb2[PACKETSZ];
+X} querybuf;
+X
+Xtypedef union {
+X    long al;
+X    char ac;
+X} align;
+X
+X#define GetShort(cp)	_getshort(cp); cp += sizeof(unsigned short);
+X
+X
+X/*
+X *******************************************************************************
+X *
+X *  GetAnswer --
+X *
+X *	Interprets an answer packet and retrieves the following
+X *	information:
+X *
+X *  Results:
+X *      SUCCESS         the info was retrieved.
+X *      NO_INFO         the packet did not contain an answer.
+X *	NONAUTH		non-authoritative information was found.
+X *      ERROR           the answer was malformed.
+X *      Other errors    returned in the packet header.
+X *
+X *******************************************************************************
+X */
+X
+Xstatic int
+XGetAnswer(nsAddrPtr, queryType, msg, msglen, iquery, hostPtr, isServer)
+X    struct in_addr	*nsAddrPtr;
+X    char		*msg;
+X    int			queryType;
+X    int			msglen;
+X    Boolean		iquery;
+X    register HostInfo	*hostPtr;
+X    Boolean		isServer;
+X{
+X    register HEADER	*headerPtr;
+X    register char	*cp;
+X    querybuf		answer;
+X    char		*eom, *bp, **aliasPtr;
+X    char		**addrPtr;
+X    char		*namePtr;
+X    char		*dnamePtr;
+X    int			type, qclass;
+X    int			qdcount, ancount, arcount, nscount, buflen;
+X    int			origClass;
+X    int			numAliases = 0;
+X    int			numAddresses = 0;
+X    int			n, i, j;
+X    int			len;
+X    int			dlen;
+X    int			status;
+X    int			numServers;
+X    Boolean		haveAnswer;
+X    Boolean		printedAnswers = FALSE;
+X
+X
+X    /*
+X     *  If the hostPtr was used before, free up the calloc'd areas.
+X     */
+X    FreeHostInfoPtr(hostPtr);
+X
+X    status = SendRequest(nsAddrPtr, msg, msglen, (char *) &answer,
+X			    sizeof(answer), &n);
+X
+X    if (status != SUCCESS) {
+X	    if (_res.options & RES_DEBUG2)
+X		    printf("SendRequest failed\n");
+X	    return (status);
+X    }
+X    eom = (char *) &answer + n;
+X
+X    headerPtr = (HEADER *) &answer;
+X
+X    if (headerPtr->rcode != NOERROR) {
+X	return (headerPtr->rcode);
+X    }
+X
+X    qdcount = ntohs(headerPtr->qdcount);
+X    ancount = ntohs(headerPtr->ancount);
+X    arcount = ntohs(headerPtr->arcount);
+X    nscount = ntohs(headerPtr->nscount);
+X
+X    /*
+X     * If there are no answer, n.s. or additional records
+X     * then return with an error.
+X     */
+X    if (ancount == 0 && nscount == 0 && arcount == 0) {
+X	return (NO_INFO);
+X    }
+X
+X
+X    bp	   = hostbuf;
+X    buflen = sizeof(hostbuf);
+X    cp	   = (char *) &answer + sizeof(HEADER);
+X
+X    /* Skip over question section. */
+X    while (qdcount-- > 0) {
+X	cp += dn_skipname(cp, eom) + QFIXEDSZ;
+X    }
+X
+X    aliasPtr	= host_aliases;
+X    addrPtr	= addr_list;
+X    haveAnswer	= FALSE;
+X
+X    /*
+X     * Scan through the answer resource records.
+X     * Answers for address query types are saved.
+X     * Other query type answers are just printed.
+X     */
+X    if (ancount != 0) {
+X	if (!isServer && !headerPtr->aa) {
+X	    printf("Non-authoritative answer:\n");
+X	}
+X
+X	if (queryType != T_A && !(iquery && queryType == T_PTR)) {
+X	    while (--ancount >= 0 && cp < eom) {
+X		if ((cp = Print_rr(cp, (char *)&answer, eom, stdout)) == NULL) {
+X		    return(ERROR);
+X		}
+X	    }
+X	    printedAnswers = TRUE;
+X	} else {
+X	    while (--ancount >= 0 && cp < eom) {
+X		if ((n = dn_expand((char *)&answer, eom, cp, bp, buflen)) < 0) {
+X		    return(ERROR);
+X		}
+X		cp   += n;
+X		type  = GetShort(cp);
+X		qclass = GetShort(cp);
+X		cp   += sizeof(u_long);	/* skip TTL */
+X		dlen  = GetShort(cp);
+X		if (type == T_CNAME) {
+X		    /*
+X		     * Found an alias.
+X		     */
+X		    cp += dlen;
+X		    if (aliasPtr >= &host_aliases[MAXALIASES-1]) {
+X			continue;
+X		    }
+X		    *aliasPtr++ = bp;
+X		    n = strlen(bp) + 1;
+X		    host_aliases_len[numAliases] = n;
+X		    numAliases++;
+X		    bp += n;
+X		    buflen -= n;
+X		    continue;
+X		} else if (type == T_PTR) {
+X		    /*
+X		     *  Found a "pointer" to the real name.
+X		     */
+X		    if((n=dn_expand((char *)&answer, eom, cp, bp,buflen)) < 0) {
+X			cp += n;
+X			continue;
+X		    }
+X		    cp += n;
+X		    len = strlen(bp) + 1;
+X		    hostPtr->name = calloc(1, len);
+X		    bcopy(bp, hostPtr->name, len);
+X		    haveAnswer = TRUE;
+X		    break;
+X		} else if (type != T_A) {
+X		    cp += dlen;
+X		    continue;
+X		}
+X		if (haveAnswer) {
+X		    /*
+X		     * If we've already got 1 address, we aren't interested
+X		     * in addresses with a different length or class.
+X		     */
+X		    if (dlen != hostPtr->addrLen) {
+X			cp += dlen;
+X			continue;
+X		    }
+X		    if (qclass != origClass) {
+X			cp += dlen;
+X			continue;
+X		    }
+X		} else {
+X		    /*
+X		     * First address: record its length and class so we
+X		     * only save additonal ones with the same attributes.
+X		     */
+X		    hostPtr->addrLen = dlen;
+X		    origClass = qclass;
+X		    hostPtr->addrType = (qclass == C_IN) ? AF_INET : AF_UNSPEC;
+X		    len = strlen(bp) + 1;
+X		    hostPtr->name = calloc(1, len);
+X		    bcopy(bp, hostPtr->name, len);
+X		}
+X		bp += (((u_long)bp) % sizeof(align));
+X
+X		if (bp + dlen >= &hostbuf[sizeof(hostbuf)]) {
+X		    if (_res.options & RES_DEBUG) {
+X			printf("Size (%d) too big\n", dlen);
+X		    }
+X		    break;
+X		}
+X		bcopy(cp, *addrPtr++ = bp, dlen);
+X		bp +=dlen;
+X		cp += dlen;
+X		numAddresses++;
+X		haveAnswer = TRUE;
+X	    }
+X	}
+X    }
+X
+X    if ((queryType == T_A || queryType == T_PTR) && haveAnswer) {
+X
+X	/*
+X	 *  Go through the alias and address lists and return them
+X	 *  in the hostPtr variable.
+X	 */
+X
+X	if (numAliases > 0) {
+X	    hostPtr->aliases = (char **) calloc(1 + numAliases, sizeof(char *));
+X	    for (i = 0; i < numAliases; i++) {
+X		hostPtr->aliases[i] = calloc(1, host_aliases_len[i]);
+X		bcopy(host_aliases[i], hostPtr->aliases[i],host_aliases_len[i]);
+X	    }
+X	    hostPtr->aliases[i] = NULL;
+X	}
+X	if (numAddresses > 0) {
+X	    hostPtr->addrList = (char **)calloc(1+numAddresses, sizeof(char *));
+X	    for (i = 0; i < numAddresses; i++) {
+X		hostPtr->addrList[i] = calloc(1, hostPtr->addrLen);
+X		bcopy(addr_list[i], hostPtr->addrList[i], hostPtr->addrLen);
+X	    }
+X	    hostPtr->addrList[i] = NULL;
+X	}
+X#ifdef verbose
+X	if (headerPtr->aa || nscount == 0) {
+X	    hostPtr->servers = NULL;
+X	    return (SUCCESS);
+X	}
+X#else
+X	hostPtr->servers = NULL;
+X	return (SUCCESS);
+X#endif
+X    }
+X
+X    /*
+X     * At this point, for the T_A query type, only empty answers remain.
+X     * For other query types, additional information might be found
+X     * in the additional resource records part.
+X     */
+X
+X    if (!headerPtr->aa && (queryType != T_A) && (nscount > 0 || arcount > 0)) {
+X	if (printedAnswers) {
+X	    putchar('\n');
+X	}
+X	printf("Authoritative answers can be found from:\n");
+X    }
+X
+X    cp = res_skip((char *) &answer, 2, eom);
+X
+X    numServers = 0;
+X    if (queryType != T_A) {
+X	/*
+X	 * If we don't need to save the record, just print it.
+X	 */
+X	while (--nscount >= 0 && cp < eom) {
+X	    if ((cp = Print_rr(cp, (char *) &answer, eom, stdout)) == NULL) {
+X		return(ERROR);
+X	    }
+X	}
+X    } else {
+X	while (--nscount >= 0 && cp < eom) {
+X	    /*
+X	     *  Go through the NS records and retrieve the names of hosts
+X	     *  that serve the requested domain.
+X	     */
+X
+X	    if ((n = dn_expand((char *) &answer, eom, cp, bp, buflen)) < 0) {
+X		return(ERROR);
+X	    }
+X	    cp += n;
+X	    len = strlen(bp) + 1;
+X	    dnamePtr = calloc(1, len);   /* domain name */
+X	    bcopy(bp, dnamePtr, len);
+X
+X	    type  = GetShort(cp);
+X	    qclass = GetShort(cp);
+X	    cp   += sizeof(u_long);	/* skip TTL */
+X	    dlen  = GetShort(cp);
+X
+X	    if (type != T_NS) {
+X		cp += dlen;
+X	    } else {
+X		Boolean	found;
+X
+X		if ((n = dn_expand((char *) &answer, eom, cp, bp, buflen)) < 0){
+X		    return(ERROR);
+X		}
+X		cp += n;
+X		len = strlen(bp) + 1;
+X		namePtr = calloc(1, len); /* server host name */
+X		bcopy(bp, namePtr, len);
+X
+X		/*
+X		 * Store the information keyed by the server host name.
+X		 */
+X		found = FALSE;
+X		for (j = 0; j < numServers; j++) {
+X		    if (strcmp(namePtr, server[j].name) == 0) {
+X			found = TRUE;
+X			free(namePtr);
+X			break;
+X		    }
+X		}
+X		if (found) {
+X		    server[j].numDomains++;
+X		    if (server[j].numDomains <= MAXDOMAINS) {
+X			server[j].domain[server[j].numDomains-1] = dnamePtr;
+X		    }
+X		} else {
+X		    if (numServers >= MAXSERVERS) {
+X			break;
+X		    }
+X		    server[numServers].name = namePtr;
+X		    server[numServers].domain[0] = dnamePtr;
+X		    server[numServers].numDomains = 1;
+X		    server[numServers].numAddresses = 0;
+X		    numServers++;
+X		}
+X	    }
+X	}
+X    }
+X
+X    /*
+X     * Additional resource records contain addresses of servers.
+X     */
+X    cp = res_skip((char *) &answer, 3, eom);
+X
+X    if (queryType != T_A) {
+X	/*
+X	 * If we don't need to save the record, just print it.
+X	 */
+X	while (--arcount >= 0 && cp < eom) {
+X	    if ((cp = Print_rr(cp, (char *) &answer, eom, stdout)) == NULL) {
+X		return(ERROR);
+X	    }
+X	}
+X    } else {
+X	while (--arcount >= 0 && cp < eom) {
+X	    if ((n = dn_expand((char *) &answer, eom, cp, bp, buflen)) < 0) {
+X		break;
+X	    }
+X	    cp   += n;
+X	    type  = GetShort(cp);
+X	    qclass = GetShort(cp);
+X	    cp   += sizeof(u_long);	/* skip TTL */
+X	    dlen  = GetShort(cp);
+X
+X	    if (type != T_A)  {
+X		cp += dlen;
+X		continue;
+X	    } else {
+X		for (j = 0; j < numServers; j++) {
+X		    if (strcmp(bp, server[j].name) == 0) {
+X			server[j].numAddresses++;
+X			if (server[j].numAddresses <= MAXADDRS) {
+X			    server[j].address[server[j].numAddresses-1] = 
+X				    				calloc(1,dlen);
+X			    bcopy(cp,
+X			      server[j].address[server[j].numAddresses-1],dlen);
+X			    break;
+X			}
+X		    }
+X		}
+X		cp += dlen;
+X	    }
+X	}
+X    }
+X
+X    /*
+X     * If we are returning name server info, transfer it to the hostPtr.
+X     */
+X    if (numServers > 0) {
+X	hostPtr->servers = (ServerInfo **)
+X				calloc(numServers+1, sizeof(ServerInfo *));
+X
+X	for (i = 0; i < numServers; i++) {
+X	    hostPtr->servers[i] = (ServerInfo *) calloc(1, sizeof(ServerInfo));
+X	    hostPtr->servers[i]->name = server[i].name;
+X
+X
+X	    hostPtr->servers[i]->domains = (char **)
+X				calloc(server[i].numDomains+1,sizeof(char *));
+X	    for (j = 0; j < server[i].numDomains; j++) {
+X		hostPtr->servers[i]->domains[j] = server[i].domain[j];
+X	    }
+X	    hostPtr->servers[i]->domains[j] = NULL;
+X
+X
+X	    hostPtr->servers[i]->addrList = (char **)
+X				calloc(server[i].numAddresses+1,sizeof(char *));
+X	    for (j = 0; j < server[i].numAddresses; j++) {
+X		hostPtr->servers[i]->addrList[j] = server[i].address[j];
+X	    }
+X	    hostPtr->servers[i]->addrList[j] = NULL;
+X
+X	}
+X	hostPtr->servers[i] = NULL;
+X    }
+X
+X    switch (queryType) {
+X	case T_A:
+X		return NONAUTH;
+X	case T_PTR:
+X		if (iquery)
+X			return NO_INFO;
+X		/* fall through */
+X	default:
+X		return SUCCESS;
+X    }
+X}
+X
+X/*
+X*******************************************************************************
+X*
+X*  GetHostInfo --
+X*
+X*	Retrieves host name, address and alias information
+X*	for a domain.
+X*
+X*	Algorithm from res_search().
+X*
+X*  Results:
+X*	ERROR		- res_mkquery failed.
+X*	+ return values from GetAnswer()
+X*
+X*******************************************************************************
+X*/
+X
+Xint
+XGetHostInfoByName(nsAddrPtr, queryClass, queryType, name, hostPtr, isServer)
+X    struct in_addr	*nsAddrPtr;
+X    int			queryClass;
+X    int			queryType;
+X    char		*name;
+X    HostInfo		*hostPtr;
+X    Boolean		isServer;
+X{
+X    int			n;
+X    register int	result;
+X    register char	*cp, **domain;
+X    extern char		*hostalias();
+X    Boolean		got_nodata = FALSE;
+X    unsigned long	ina;
+X
+X    /* Catch explicit addresses */
+X    if ((queryType == T_A) && IsAddr(name, &ina)) {
+X	hostPtr->name = calloc(strlen(name)+3, 1);
+X	(void)sprintf(hostPtr->name,"[%s]",name);
+X	hostPtr->aliases = NULL;
+X	hostPtr->servers = NULL;
+X	hostPtr->addrType = AF_INET;
+X	hostPtr->addrLen = sizeof(struct in_addr);
+X	hostPtr->addrList = (char **)calloc(2, sizeof(char *));
+X	hostPtr->addrList[0] = calloc(sizeof(long), sizeof(char));
+X	bcopy((char *)&ina, hostPtr->addrList[0], sizeof(ina));
+X	hostPtr->addrList[1] = NULL;
+X	return(SUCCESS);
+X    }
+X
+X    result = NXDOMAIN;
+X    for (cp = name, n = 0; *cp; cp++)
+X	    if (*cp == '.')
+X		    n++;
+X    if (n == 0 && (cp = hostalias(name))) {
+X	    printf("Aliased to \"%s\"\n\n", cp);
+X	    return (GetHostDomain(nsAddrPtr, queryClass, queryType,
+X		    cp, (char *)NULL, hostPtr, isServer));
+X    }
+X    /*
+X     * We do at least one level of search if
+X     *	- there is no dot and RES_DEFNAME is set, or
+X     *	- there is at least one dot, there is no trailing dot,
+X     *	  and RES_DNSRCH is set.
+X     */
+X    if ((n == 0 && _res.options & RES_DEFNAMES) ||
+X       (n != 0 && *--cp != '.' && _res.options & RES_DNSRCH))
+X	 for (domain = _res.dnsrch; *domain; domain++) {
+X	    result = GetHostDomain(nsAddrPtr, queryClass, queryType,
+X		    name, *domain, hostPtr, isServer);
+X	    /*
+X	     * If no server present, give up.
+X	     * If name isn't found in this domain,
+X	     * keep trying higher domains in the search list
+X	     * (if that's enabled).
+X	     * On a NO_INFO error, keep trying, otherwise
+X	     * a wildcard entry of another type could keep us
+X	     * from finding this entry higher in the domain.
+X	     * If we get some other error (negative answer or
+X	     * server failure), then stop searching up,
+X	     * but try the input name below in case it's fully-qualified.
+X	     */
+X	    if (result == SUCCESS || result == NO_RESPONSE)
+X		    return result;
+X	    if (result == NO_INFO)
+X		    got_nodata++;
+X	    if ((result != NXDOMAIN && result != NO_INFO) ||
+X		(_res.options & RES_DNSRCH) == 0)
+X		    break;
+X    }
+X    /*
+X     * If the search/default failed, try the name as fully-qualified,
+X     * but only if it contained at least one dot (even trailing).
+X     * This is purely a heuristic; we assume that any reasonable query
+X     * about a top-level domain (for servers, SOA, etc) will not use
+X     * res_search.
+X     */
+X    if (n && (result = GetHostDomain(nsAddrPtr, queryClass, queryType,
+X		    name, (char *)NULL, hostPtr, isServer)) == SUCCESS)
+X	    return result;
+X    if (got_nodata)
+X	result = NO_INFO;
+X    return (result);
+X}
+X
+X/*
+X * Perform a query on the concatenation of name and domain,
+X * removing a trailing dot from name if domain is NULL.
+X */
+XGetHostDomain(nsAddrPtr, queryClass, queryType, name, domain, hostPtr, isServer)
+X    struct in_addr	*nsAddrPtr;
+X    int			queryClass;
+X    int			queryType;
+X    char		*name, *domain;
+X    HostInfo		*hostPtr;
+X    Boolean		isServer;
+X{
+X    querybuf buf;
+X    char nbuf[2*MAXDNAME+2];
+X    char *longname = nbuf;
+X    int n;
+X
+X    if (domain == NULL) {
+X	    /*
+X	     * Check for trailing '.';
+X	     * copy without '.' if present.
+X	     */
+X	    n = strlen(name) - 1;
+X	    if (name[n] == '.' && n < sizeof(nbuf) - 1) {
+X		    bcopy(name, nbuf, n);
+X		    nbuf[n] = '\0';
+X	    } else
+X		    longname = name;
+X    } else {
+X	    (void)sprintf(nbuf, "%.*s.%.*s",
+X		    MAXDNAME, name, MAXDNAME, domain);
+X	    longname = nbuf;
+X    }
+X    n = res_mkquery(QUERY, longname, queryClass, queryType,
+X		    (char *)0, 0, (char *)0, (char *) &buf, sizeof(buf));
+X    if (n < 0) {
+X	if (_res.options & RES_DEBUG) {
+X	    printf("Res_mkquery failed\n");
+X	}
+X	return (ERROR);
+X    }
+X
+X    n = GetAnswer(nsAddrPtr, queryType, (char *)&buf, n, 0, hostPtr, isServer);
+X
+X    /*
+X     * GetAnswer didn't find a name, so set it to the specified one.
+X     */
+X    if (n == NONAUTH) {
+X	if (hostPtr->name == NULL) {
+X	    int len = strlen(longname) + 1;
+X	    hostPtr->name = calloc(len, sizeof(char));
+X	    bcopy(longname, hostPtr->name, len);
+X	}
+X    }
+X    return(n);
+X}
+X
+X
+X/*
+X*******************************************************************************
+X*
+X*  GetHostInfoByAddr --
+X*
+X*	Performs an inverse query to find the host name
+X*	that corresponds to the given address.
+X*
+X*  Results:
+X*	ERROR		- res_mkquery failed.
+X*	+ return values from GetAnswer()
+X*
+X*******************************************************************************
+X*/
+X
+Xint
+XGetHostInfoByAddr(nsAddrPtr, address, hostPtr)
+X    struct in_addr	*nsAddrPtr;
+X    struct in_addr	*address;
+X    HostInfo		*hostPtr;
+X{
+X    int		n;
+X    querybuf	buf;
+X    char	qbuf[MAXDNAME];
+X    char	*p = (char *) &address->s_addr;
+X
+X    (void)sprintf(qbuf, "%u.%u.%u.%u.in-addr.arpa",
+X	    ((unsigned)p[3] & 0xff),
+X	    ((unsigned)p[2] & 0xff),
+X	    ((unsigned)p[1] & 0xff),
+X	    ((unsigned)p[0] & 0xff));
+X    n = res_mkquery(QUERY, qbuf, C_IN, T_PTR,
+X	    NULL,  0, NULL, (char *) &buf, sizeof(buf));
+X    if (n < 0) {
+X	if (_res.options & RES_DEBUG) {
+X	    printf("res_mkquery() failed\n");
+X	}
+X	return (ERROR);
+X    }
+X    n = GetAnswer(nsAddrPtr, T_PTR, (char *) &buf, n, 1, hostPtr, 1);
+X    if (n == SUCCESS) {
+X	hostPtr->addrType = AF_INET;
+X	hostPtr->addrLen = 4;
+X	hostPtr->addrList = (char **)calloc(2, sizeof(char *));
+X	hostPtr->addrList[0] = calloc(sizeof(long), sizeof(char));
+X	bcopy((char *)p, hostPtr->addrList[0], sizeof(struct in_addr));
+X	hostPtr->addrList[1] = NULL;
+X    }
+X    return n;
+X}
+X
+X/*
+X*******************************************************************************
+X*
+X*  FreeHostInfoPtr --
+X*
+X*	Deallocates all the calloc'd areas for a HostInfo variable.
+X*
+X*******************************************************************************
+X*/
+X
+Xvoid
+XFreeHostInfoPtr(hostPtr)
+X    register HostInfo *hostPtr;
+X{
+X    int i, j;
+X
+X    if (hostPtr->name != NULL) {
+X	free(hostPtr->name);
+X	hostPtr->name = NULL;
+X    }
+X
+X    if (hostPtr->aliases != NULL) {
+X	i = 0;
+X	while (hostPtr->aliases[i] != NULL) {
+X	    free(hostPtr->aliases[i]);
+X	    i++;
+X	}
+X	free((char *)hostPtr->aliases);
+X	hostPtr->aliases = NULL;
+X    }
+X
+X    if (hostPtr->addrList != NULL) {
+X	i = 0;
+X	while (hostPtr->addrList[i] != NULL) {
+X	    free(hostPtr->addrList[i]);
+X	    i++;
+X	}
+X	free((char *)hostPtr->addrList);
+X	hostPtr->addrList = NULL;
+X    }
+X
+X    if (hostPtr->servers != NULL) {
+X	i = 0;
+X	while (hostPtr->servers[i] != NULL) {
+X
+X	    if (hostPtr->servers[i]->name != NULL) {
+X		free(hostPtr->servers[i]->name);
+X	    }
+X
+X	    if (hostPtr->servers[i]->domains != NULL) {
+X		j = 0;
+X		while (hostPtr->servers[i]->domains[j] != NULL) {
+X		    free(hostPtr->servers[i]->domains[j]);
+X		    j++;
+X		}
+X		free((char *)hostPtr->servers[i]->domains);
+X	    }
+X
+X	    if (hostPtr->servers[i]->addrList != NULL) {
+X		j = 0;
+X		while (hostPtr->servers[i]->addrList[j] != NULL) {
+X		    free(hostPtr->servers[i]->addrList[j]);
+X		    j++;
+X		}
+X		free((char *)hostPtr->servers[i]->addrList);
+X	    }
+X	    free((char *)hostPtr->servers[i]);
+X	    i++;
+X	}
+X	free((char *)hostPtr->servers);
+X	hostPtr->servers = NULL;
+X    }
+X}
+END_OF_FILE
+if test 20155 -ne `wc -c <'getinfo.c'`; then
+    echo shar: \"'getinfo.c'\" unpacked with wrong size!
+fi
+# end of 'getinfo.c'
+fi
+if test -f 'hash.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'hash.c'\"
+else
+echo shar: Extracting \"'hash.c'\" \(11587 characters\)
+sed "s/^X//" >'hash.c' <<'END_OF_FILE'
+X#include <stdio.h>
+X
+X/*
+X**
+X**	Copyright (c) 1987, Robert L. McQueer
+X**		All Rights Reserved
+X**
+X** Permission granted for use, modification and redistribution of this
+X** software provided that no use is made for commercial gain without the
+X** written consent of the author, that all copyright notices remain intact,
+X** and that all changes are clearly documented.  No warranty of any kind
+X** concerning any use which may be made of this software is offered or implied.
+X**
+X*/
+X
+X/*
+X** generic hash table routines.
+X**
+X**	htab_init - initialize a new hash table
+X**	htab_free - destroy a hash table, freeing associated memory
+X**	htab_clear - remove all hash table entries
+X**	htab_find - find entry
+X**	htab_del - delete entry
+X**	htab_enter - enter item into table
+X**	htab_list - scan hash table entries.
+X**
+X** Multiple hash tables may be used.  Caller may provide key comparison
+X** and hash routines, or use defaults.
+X*/
+X
+X/*
+X** HASHMAGIC define may be used to compile a version of these routines
+X** which will catch bad context blocks passed in by client routines
+X** through a magic number check.  If defined, HASHMAGIC should be the
+X** actual number to use for a magic number.  Configurable so that you
+X** may avoid the overhead of checking it all the time in these routines
+X** which may have high entry rates.
+X*/
+X
+X/*
+X** allocation: nodes are allocated starting with a block of ALLOCINIT,
+X** doubling the size for the next allocation as long as the size is strictly
+X** less than ALLOCLIMIT.  If you make ALLOCLIMIT a value encountered by
+X** successive doubling of ALLOCINIT, that will be the final size, otherwise the
+X** next doubling larger.
+X**
+X** The idea of this stunt is that we don't know whether the caller is going
+X** to make a lot of entries, or just a few.  So we start out allocating
+X** just a few nodes at a crack, and as the caller makes more and more
+X** entries, allocate bigger bunches.  For memory-restrictive environments
+X** like MS-DOS, one could set ALLOCLIMIT low & simply pay the penalty for
+X** lots of malloc calls.
+X*/
+X#define ALLOCINIT 25
+X#define ALLOCLIMIT 800
+X
+X#define MAGCHECK(T,N) if (T->magic != HASHMAGIC) fatal(Merr,N)
+X
+Xtypedef struct _htab
+X{
+X	struct _htab *next;
+X	char *key;
+X	char *data;
+X} HASHTAB;
+X
+Xtypedef struct _faddr
+X{
+X	struct _faddr *next;
+X} FADDR;
+X
+X/*
+X** fpool, tpool - tpool is the pool of available nodes.  Every time
+X** a new block is allocated, one FADDR is allocated along with it.
+X** The address allocated is coerced into the FADDR and placed on fpool
+X** to facilitate freeing.
+X*/
+X
+Xtypedef struct
+X{
+X#ifdef HASHMAGIC
+X	int magic;
+X#endif
+X	HASHTAB **tab;		/* hash table */
+X	HASHTAB *tpool;		/* available nodes */
+X	HASHTAB *srch;		/* current search pointer for htab_list */
+X	FADDR *fpool;		/* alloc pointers for htab_free */
+X	int (*afail)();		/* allocation error handler */
+X	int (*compare)();	/* comparison routine */
+X	int (*hashfunc)();	/* hash function */
+X	int size;		/* size of table (length of tab item) */
+X	int ablock;		/* current allocation block size */
+X	int srchidx;		/* current table index for htab_list */
+X} CONTEXT;
+X#ifdef __STDC__
+X#include <stdlib.h>
+X#else
+Xextern char *malloc();
+X#endif
+Xstatic HASHTAB * get_node(CONTEXT *);
+Xstatic int hash(register char *,int);
+Xstatic int def_afail();
+X
+X#ifdef HASHMAGIC
+Xstatic char *Merr = "Bad magic number in hash table context block, %s()";
+X#endif
+X
+X/*
+X** free hash table.  tab is pointer returned by htab_init.
+X*/
+Xhtab_free(void *tab)
+X{
+X	register FADDR *ptr, *next;
+X	int i;
+X	register CONTEXT *cb;
+X
+X	cb = (CONTEXT *) tab;
+X
+X#ifdef HASHMAGIC
+X	MAGCHECK(cb,"htab_free");
+X	++(cb->magic);
+X#endif
+X
+X	for (ptr = cb->fpool; ptr != NULL; ptr = next)
+X	{
+X		next = ptr->next;
+X		free ((char *) ptr);
+X	}
+X
+X	free (tab);
+X}
+X
+X/*
+X** remove all hash table entries.  Does not free memory, simply restores
+X** empty table, as if one had called htab_delete on all the keys.  tab is
+X** pointer returned by htab_init.
+X*/
+Xhtab_clear(void *tab)
+X{
+X	register CONTEXT *cb;
+X	register HASHTAB **tptr;
+X	register HASHTAB *nptr;
+X	int i;
+X
+X	cb = (CONTEXT *) tab;
+X
+X#ifdef HASHMAGIC
+X	MAGCHECK(cb,"htab_clear");
+X#endif
+X
+X	tptr = cb->tab;
+X
+X	for (i=0; i < cb->size; ++i,++tptr)
+X	{
+X		nptr = *tptr;
+X		if (nptr == NULL)
+X			continue;
+X		while (nptr->next != NULL)
+X			nptr = nptr->next;
+X		nptr->next = cb->tpool;
+X		cb->tpool = *tptr;
+X		*tptr = NULL;
+X	}
+X
+X	/* force any open htab_list's to return empty */
+X	cb->srch = NULL;
+X	cb->srchidx = cb->size;
+X}
+X
+X/*
+X** initialize a hash table.  Returns a pointer to be used with other
+X** calls, NULL for failure.
+X**
+X** The hash table will be maintained as a linked list for each node,
+X** so any number of entries can be made to it, whatever the value for
+X** size (>100% density is perfectly OK).
+X**
+X**	size - size of table.  If hfunc is NULL, will be incremented
+X**		up to a prime size to suit the type of hash function
+X**		used by default.  Caller may find out the actual size
+X**		by calling next_prime().
+X**
+X**	allocfail - routine to call in case of memory allocation failure.
+X**		If NULL, allocation failure will make a call to fatal().
+X**
+X**	comp - routine used to compare keys.  returns 0 if equal, non-zero
+X**		otherwise.  If NULL, strcmp() will be used.  Your own will
+X**		have to be provided if your keys are something other than
+X**		strings.  These routines will always call this with the
+X**		comparison key as the first argument, and the one in the
+X**		table already as a second argument.  This fact is most
+X**		useful for making comparisons up to the length of the entered
+X**		key, for instance.
+X**
+X**	hfunc - hash function.  called as (*hfunc)(key, size).  size argument
+X**		may be ignored if function was written for a specific size.
+X**		Must return an integer between 0 and size-1.  If NULL, the
+X**		default hash function is the typical "string-divided-modulo
+X**		-table-size" algorithm.
+X*/
+Xvoid *
+Xhtab_init(size,allocfail,comp,hfunc)
+Xint size;
+Xint (*allocfail)();
+Xint (*comp)();
+Xint (*hfunc)();
+X{
+X	int def_afail();
+X	int strcmp();
+X	int i;
+X	CONTEXT *cb;
+X
+X	if (allocfail == NULL)
+X		allocfail = def_afail;
+X
+X	if (comp == NULL)
+X		comp = strcmp;
+X
+X	if (hfunc == NULL)
+X	{
+X		size = next_prime(size);
+X		hfunc = hash;
+X	}
+X
+X	i = sizeof(CONTEXT) + size * sizeof(HASHTAB *);
+X
+X	if ((cb = (CONTEXT *) malloc(i)) == NULL)
+X	{
+X		(*allocfail)();
+X		return (NULL);
+X	}
+X
+X#ifdef HASHMAGIC
+X	cb->magic = HASHMAGIC;
+X#endif
+X
+X	cb->afail = allocfail;
+X	cb->compare = comp;
+X	cb->hashfunc = hfunc;
+X	cb->size = size;
+X	cb->tab = (HASHTAB **)(cb+1);
+X
+X	for (i=0; i < cb->size; ++i)
+X		(cb->tab)[i] = NULL;
+X	cb->tpool = NULL;
+X	cb->fpool = NULL;
+X	cb->ablock = ALLOCINIT;
+X
+X	/* safety, in case somebody calls htab_list wrong */
+X	cb->srch = NULL;
+X	cb->srchidx = size;
+X
+X	return ((char *) cb);
+X}
+X
+X
+X/*
+X** find an entry in hash table.  The pointer returned is NULL for
+X** failure, or the data pointer associated with the key in htab_enter.
+X**
+X**	tab - table pointer returned by htab_init.
+X**	s - search key.
+X*/
+Xchar *
+Xhtab_find(void *tab,void *s)
+X{
+X	register HASHTAB *ptr;
+X	register CONTEXT *cb;
+X
+X	cb = (CONTEXT *) tab;
+X
+X#ifdef HASHMAGIC
+X	MAGCHECK(cb,"htab_find");
+X#endif
+X
+X	for (ptr = (cb->tab)[(*(cb->hashfunc))(s,cb->size)];
+X					ptr != NULL; ptr = ptr->next)
+X	{
+X		if ((*(cb->compare))(s,ptr->key) == 0)
+X			return (ptr->data);
+X	}
+X
+X	return (NULL);
+X}
+X
+X/*
+X** delete a hash table entry.  Returns 0 for success, <0 for no entry.
+X**
+X**	tab - table pointer returned by htab_init.
+X**	s - search key.
+X*/
+Xhtab_del(void *tab,void *s)
+X{
+X	register HASHTAB *ptr;
+X	register CONTEXT *cb;
+X	register HASHTAB *pred;
+X	int idx;
+X
+X	cb = (CONTEXT *) tab;
+X
+X#ifdef HASHMAGIC
+X	MAGCHECK(cb,"htab_del");
+X#endif
+X
+X	pred = NULL;
+X	for (ptr = (cb->tab)[idx = (*(cb->hashfunc))(s,cb->size)];
+X						ptr != NULL; ptr = ptr->next)
+X	{
+X		if ((*(cb->compare))(s,ptr->key) == 0)
+X			break;
+X		pred = ptr;
+X	}
+X
+X	if (ptr == NULL)
+X		return (-1);
+X
+X	/*
+X	** if we're deleting the current search index in the middle
+X	** of an htab_list, go to next item.
+X	*/
+X	if (ptr == cb->srch)
+X		cb->srch = ptr->next;
+X
+X	if (pred == NULL)
+X		(cb->tab)[idx] = ptr->next;
+X	else
+X		pred->next = ptr->next;
+X	ptr->next = cb->tpool;
+X	cb->tpool = ptr;
+X
+X	return (0);
+X}
+X
+X/*
+X** enter new item into hash table:
+X**
+X**	tab - table pointer from htab_init.
+X**	s - key.
+X**	data - data to associate with key.  In most cases, will probably
+X**		actually be a pointer to some sort of structure known
+X**		to the caller.
+X**
+X**	both s and data should point to storage valid for the entire life of
+X**	the table.  htab_enter can not allocate copies of either of these
+X**	things since it does not know their structure (if you provided 
+X**	comparison & hash routines, the key may not actually be a string).
+X**	htab_enter WILL allocate actual table nodes.  Returns 0 for success,
+X**	-1 for failure.  Failure return is possible only if allocation
+X**	failure occurs, and was not set up as fatal in htab_init().
+X*/
+Xhtab_enter(void *tab,void *s,void *data)
+X{
+X	register HASHTAB *ptr;
+X	register CONTEXT *cb;
+X	int i;
+X
+X	cb = (CONTEXT *) tab;
+X
+X#ifdef HASHMAGIC
+X	MAGCHECK(cb,"htab_enter");
+X#endif
+X
+X	if ((ptr = get_node(cb)) == NULL)
+X		return (-1);
+X
+X	ptr->next = (cb->tab)[i = (*(cb->hashfunc))(s,cb->size)];
+X	(cb->tab)[i] = ptr;
+X	ptr->key = s;
+X	ptr->data = data;
+X	return (0);
+X}
+X
+X/*
+X** Routine to scan all hash table entries through successive calls.
+X** Returns 1 if an entry found, 0 for no more entries.  Will not
+X** be returned in any particular order comprehensible to the
+X** calling program (hash table order).
+X**
+X**	tab - table pointer from htab_init
+X**	first - 1 to start scan, 0 on succesive calls.
+X**	data, key - returned data and key.
+X**
+X** Precautions have been taken to allow interleave of this routine with
+X** htab_del and htab_clear, but the only interleave that truly makes
+X** sense is to selectively htab_del() entries on some basis as they
+X** come back from htab_list().  htab_enter()'s in mid list scan may be
+X** done, but they may or may not show up on following calls, dependent
+X** on where they were entered in relation to the current list pointer.
+X**
+X** This routine sets a global variable on all successful calls:
+X**
+X**	int Htab_Index; hash table index entry was found at.
+X**
+X** By examining this while scanning the list of entries, a caller may
+X** obtain statistics on table distribution.  The value will increase
+X** monotonically as the search proceeds, skipping across indices
+X** with no entries.
+X*/
+X
+Xint Htab_Index;
+X
+Xhtab_list(void *tab,int first,void **data,void **key)
+X{
+X	register CONTEXT *cb;
+X
+X	cb = (CONTEXT *) tab;
+X
+X#ifdef HASHMAGIC
+X	MAGCHECK(cb,"htab_list");
+X#endif
+X
+X	if (first)
+X	{
+X		cb->srch = NULL;
+X		cb->srchidx = -1;
+X	}
+X
+X	while (cb->srch == NULL)
+X	{
+X		++(cb->srchidx);
+X		if (cb->srchidx >= cb->size)
+X			return (0);
+X		cb->srch = (cb->tab)[cb->srchidx];
+X	}
+X
+X	Htab_Index = cb->srchidx;
+X
+X	*data = (cb->srch)->data;
+X	*key = (cb->srch)->key;
+X
+X	cb->srch = (cb->srch)->next;
+X	return(1);
+X}
+X
+Xstatic HASHTAB *
+Xget_node(CONTEXT *cb)
+X{
+X	char *addr;
+X	HASHTAB *ptr;
+X	int i;
+X
+X	if (cb->tpool == NULL)
+X	{
+X		addr = malloc((cb->ablock)*sizeof(HASHTAB)+sizeof(FADDR));
+X		if (addr == NULL)
+X		{
+X			(*(cb->afail))();
+X			return (NULL);
+X		}
+X
+X		((FADDR *) addr)->next = cb->fpool;
+X		cb->fpool = (FADDR *) addr;
+X		addr += sizeof(FADDR);
+X		cb->tpool = (HASHTAB *) addr;
+X		for (i=1; i < cb->ablock; ++i)
+X			(cb->tpool)[i-1].next = cb->tpool + i;
+X		(cb->tpool)[i-1].next = NULL;
+X
+X		if (cb->ablock < ALLOCLIMIT)
+X			cb->ablock *= 2;
+X	}
+X
+X	ptr = cb->tpool;
+X	cb->tpool = (cb->tpool)->next;
+X	return (ptr);
+X}
+X
+Xstatic int
+Xhash(register char *s,int size)
+X{
+X	register long rem;
+X
+X	for (rem = 0; *s != '\0'; ++s)
+X		rem = (rem * 128 + *s) % size;
+X	return(rem);
+X}
+X
+Xstatic int
+Xdef_afail()
+X{
+X	fprintf(stderr,"Memory allocation failure in hash table routines\n");
+X	exit(1);
+X}
+END_OF_FILE
+if test 11587 -ne `wc -c <'hash.c'`; then
+    echo shar: \"'hash.c'\" unpacked with wrong size!
+fi
+# end of 'hash.c'
+fi
+if test -f 'main.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'main.c'\"
+else
+echo shar: Extracting \"'main.c'\" \(17249 characters\)
+sed "s/^X//" >'main.c' <<'END_OF_FILE'
+X#ifndef lint
+Xchar copyright[] =
+X"@(#) Portions Copyright (c) 1985,1989\n\
+XRegents of the University of California.\n\
+X All rights reserved.\n";
+X#endif /* not lint */
+X
+X/*
+X *******************************************************************************
+X *  
+X *   main.c --
+X *  
+X *	Main routine and some action routines for the name server
+X *	lookup program.
+X *
+X *	Andrew Cherenson
+X *	U.C. Berkeley Computer Science Div.
+X *	CS298-26, Fall 1985
+X *  
+X *******************************************************************************
+X */
+X
+X#include <sys/types.h>
+X#include <sys/param.h>
+X#include <netdb.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <stdio.h>
+X#include <arpa/nameser.h>
+X#include <arpa/inet.h>
+X#include <resolv.h>
+X#include <signal.h>
+X#include <setjmp.h>
+X#include <ctype.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include "res.h"
+X
+X#ifdef ultrix
+X#define nsaddr_list(i)  ns_list[(i)].addr
+X#else
+X#define nsaddr_list(i)  nsaddr_list[(i)]
+X#endif
+X/*
+X *  Default Internet address of the current host.
+X */
+X
+X#if BSD < 43
+X#define LOCALHOST "127.0.0.1"
+X#endif
+X
+X
+X/*
+X * Name of a top-level name server. Can be changed with 
+X * the "set root" command.
+X */
+X
+X#ifndef ROOT_SERVER
+X#define		ROOT_SERVER "ns.nic.ddn.mil."
+X#endif
+Xchar		rootServerName[NAME_LEN] = ROOT_SERVER;
+X
+X
+X/*
+X *  Import the state information from the resolver library.
+X */
+X
+Xextern struct state _res;
+X
+X
+X/*
+X *  Info about the most recently queried host.
+X */
+X
+XHostInfo	curHostInfo;
+X
+X
+X/*
+X *  Info about the default name server.
+X */
+X
+XHostInfo	*defaultPtr = NULL;
+Xchar		defaultServer[NAME_LEN];
+Xstruct in_addr	defaultAddr;
+X
+Xint hasprinted = 0;
+Xint hasloaded = 0;
+Xint explicitserver = 0;
+Xchar *vdomain;
+X/*
+X *  Initial name server query type is Address.
+X */
+X
+Xint		queryType = T_ANY;
+Xint		queryClass = C_IN;
+X
+X/*
+X * Stuff for Interrupt (control-C) signal handler.
+X */
+X
+XFILE		*filePtr = stdout;
+X
+Xstatic void CvtAddrToPtr();
+X
+X
+X/*
+X *******************************************************************************
+X *
+X *  main --
+X *
+X *	Initializes the resolver library and determines the address
+X *	of the initial name server.
+X *
+X *******************************************************************************
+X */
+X
+Xmain(argc, argv)
+X    int		argc;
+X    char	**argv;
+X{
+X    char	*wantedHost = NULL;
+X    int		result;
+X    int		i;
+X    extern int	h_errno;
+X
+X    /*
+X     *  Initialize the resolver library routines.
+X     */
+X
+X    if (res_init() == -1) {
+X	fprintf(stderr,"*** Can't initialize resolver.\n");
+X	exit(1);
+X    }
+X
+X    /*
+X     *  Allocate space for the default server's host info and
+X     *  find the server's address and name. If the resolver library
+X     *  already has some addresses for a potential name server,
+X     *  then use them. Otherwise, see if the current host has a server.
+X     *  Command line arguments may override the choice of initial server. 
+X     */
+X
+X    defaultPtr = (HostInfo *) calloc(1, sizeof(HostInfo));
+X
+X    ++argv; --argc;		/* skip prog name */
+X
+X
+X    if (_res.nscount == 0) {
+X	LocalServer(defaultPtr);
+X    } else {
+X	for (i = 0; i < _res.nscount; i++) {
+X	    if (_res.nsaddr_list(i).sin_addr.s_addr == INADDR_ANY) {
+X	        LocalServer(defaultPtr);
+X		break;
+X	    } else {
+X		result = GetHostInfoByAddr(&(_res.nsaddr_list(i).sin_addr), 
+X				    &(_res.nsaddr_list(i).sin_addr), 
+X				    defaultPtr);
+X		if (result != SUCCESS) {
+X		    fprintf(stderr,
+X		    "*** Can't find server name for address %s: %s\n", 
+X		       inet_ntoa(_res.nsaddr_list(i).sin_addr), 
+X		       DecodeError(result));
+X		} else {
+X		    defaultAddr = _res.nsaddr_list(i).sin_addr;
+X		    break;
+X		}
+X	    }
+X	}
+X
+X	/*
+X	 *  If we have exhausted the list, tell the user about the
+X	 *  command line argument to specify an address.
+X	 */
+X
+X	if (i == _res.nscount) {
+X	    fprintf(stderr, "*** Default servers are not available\n");
+X	    exit(1);
+X	}
+X
+X    }
+X    strcpy(defaultServer, defaultPtr->name);
+X
+X
+X#ifdef DEBUG
+X#ifdef DEBUG2
+X    _res.options |= RES_DEBUG2;
+X#endif
+X    _res.options |= RES_DEBUG;
+X    _res.retry    = 2;
+X#endif
+X	
+X    (void)InitTables();
+X    vdomain = _res.defdname;
+X
+X    while (argc)
+X    {
+X	(void) DoCommand (*argv);
+X	++argv; --argc;
+X    }
+X    if(!hasprinted)
+X	DoCommand("print");
+X
+X    exit(0);
+X}
+X
+X
+XLocalServer(defaultPtr)
+X    HostInfo *defaultPtr;
+X{
+X    char	hostName[NAME_LEN];
+X#if BSD < 43
+X    int		result;
+X#endif
+X
+X    gethostname(hostName, sizeof(hostName));
+X
+X#if BSD < 43
+X    defaultAddr.s_addr = inet_addr(LOCALHOST);
+X    result = GetHostInfoByName(&defaultAddr, C_IN, T_A, 
+X		hostName, defaultPtr, 1);
+X    if (result != SUCCESS) {
+X	fprintf(stderr,
+X	"*** Can't find initialize address for server %s: %s\n",
+X			defaultServer, DecodeError(result));
+X	exit(1);
+X    }
+X#else
+X    defaultAddr.s_addr = htonl(INADDR_ANY);
+X    (void) GetHostInfoByName(&defaultAddr, C_IN, T_A, "0.0.0.0", defaultPtr, 1);
+X    free(defaultPtr->name);
+X    defaultPtr->name = calloc(1, sizeof(hostName)+1);
+X    strcpy(defaultPtr->name, hostName);
+X#endif
+X}
+X
+X
+X/*
+X *******************************************************************************
+X *
+X *  Usage --
+X *
+X *	Lists the proper methods to run the program and exits.
+X *
+X *******************************************************************************
+X */
+X
+XUsage()
+X{
+X    fprintf(stderr, "Usage:\n");
+X    fprintf(stderr,
+X"   ns2tab [style={aliases,elm,group,hosts,lelm,nrgroup,pwupd}] [domain=...]\n");
+X    fprintf(stderr,
+X"              [load] [print]\n");
+X    exit(1);
+X}
+X
+X/*
+X *******************************************************************************
+X *
+X * IsAddr --
+X *
+X *	Returns TRUE if the string looks like an Internet address.
+X *	A string with a trailing dot is not an address, even if it looks
+X *	like one.
+X *
+X *	XXX doesn't treat 255.255.255.255 as an address.
+X *
+X *******************************************************************************
+X */
+X
+XBoolean
+XIsAddr(host, addrPtr)
+X    char *host;
+X    unsigned long *addrPtr;	/* If return TRUE, contains IP address */
+X{
+X    register char *cp;
+X    unsigned long addr;
+X
+X    if (isdigit(host[0])) {
+X	    /* Make sure it has only digits and dots. */
+X	    for (cp = host; *cp; ++cp) {
+X		if (!isdigit(*cp) && *cp != '.') 
+X		    return FALSE;
+X	    }
+X	    /* If it has a trailing dot, don't treat it as an address. */
+X	    if (*--cp != '.') { 
+X		if ((addr = inet_addr(host)) != (unsigned long) -1) {
+X		    *addrPtr = addr;
+X		    return TRUE;
+X#if 0
+X		} else {
+X		    /* XXX Check for 255.255.255.255 case */
+X#endif
+X		}
+X	    }
+X    }
+X    return FALSE;
+X}
+X
+X
+X/*
+X *******************************************************************************
+X *
+X *  DOCommand -- 
+X *
+X *	This routine is used to change the state information
+X *	that affect the lookups. The command format is
+X *	   keyword[=value]
+X *	Most keywords can be abbreviated. Parsing is very simplistic--
+X *	A value must not be separated from its keyword by white space.
+X *
+X *	Valid keywords:		Meaning:
+X *	[no]d2			turn on/off extra debugging mode.
+X *	[no]debug		turn on/off debugging mode.
+X *	[no]defname		use/don't use default domain name.
+X *	[no]search		use/don't use domain search list.
+X *	domain=NAME		set default domain name to NAME.
+X *	[no]ignore		ignore/don't ignore trunc. errors.
+X *	query=value		set default query type to value,
+X *				value is one of the query types in RFC883
+X *				without the leading T_.	(e.g., A, HINFO)
+X *	[no]recurse		use/don't use recursive lookup.
+X *	retry=#			set number of retries to #.
+X *	root=NAME		change root server to NAME.
+X *	time=#			set timeout length to #.
+X *	[no]vc			use/don't use virtual circuit.
+X *	port			TCP/UDP port to server.
+X *
+X * 	Deprecated:
+X *	[no]primary		use/don't use primary server.
+X *
+X *  Results:
+X *	SUCCESS		the command was parsed correctly.
+X *	ERROR		the command was not parsed correctly.
+X *
+X *******************************************************************************
+X */
+X
+Xint
+XDoCommand(option)
+X    register char *option;
+X{
+X    char	type[NAME_LEN];
+X    char	*ptr;
+X    int		tmp;
+X
+X    if (*option == 0) {
+X	fprintf(stderr, "*** Invalid flag\n");
+X	return(ERROR);
+X    } else {
+X	if (strncmp(option, "out", 3) == 0) {
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		if(filePtr != stdout) fclose(filePtr);
+X		if(!(filePtr = fopen(++ptr,"w")))
+X		   filePtr = stdout;
+X	    }
+X	} else if (strncmp(option, "ser", 3) == 0) {
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		SetDefaultServer(++ptr,1);
+X		explicitserver = 0;
+X	    }
+X	} else if (strncmp(option, "expli", 3) == 0) {
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		SetDefaultServer(++ptr,1);
+X		explicitserver = 1;
+X	    }
+X	} else if (strncmp(option, "d2", 2) == 0) {	/* d2 (more debug) */
+X	    _res.options |= (RES_DEBUG | RES_DEBUG2);
+X	} else if (strncmp(option, "nod2", 4) == 0) {
+X	    _res.options &= ~RES_DEBUG2;
+X	    printf("d2 mode disabled; still in debug mode\n");
+X	} else if (strncmp(option, "def", 3) == 0) {	/* defname */
+X	    _res.options |= RES_DEFNAMES;
+X	} else if (strncmp(option, "nodef", 5) == 0) {
+X	    _res.options &= ~RES_DEFNAMES;
+X	} else if (strncmp(option, "domain", 3) == 0) {	/* domain */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		sscanf(++ptr, "%s", _res.defdname);
+X		res_re_init();
+X		vdomain = _res.defdname;
+X		hasloaded = 0;
+X#if 0
+X		DoCommand("load");
+X#endif
+X	    }
+X	} else if (strncmp(option, "suffix", 3) == 0) {	/* domain */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		vdomain = ++ptr;
+X	    }
+X	} else if (strncmp(option, "loa", 3) == 0) {	/* load! */
+X		LoadHosts(_res.defdname);
+X		hasloaded = 1;
+X	} else if (strncmp(option, "prin", 4) == 0) {	/* print! */
+X	    if(!hasloaded)
+X		DoCommand("load");
+X	    PrintStyle(filePtr);
+X	} else if (strncmp(option, "sty", 3) == 0) {	/* style */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL)
+X	    {
+X		SetStyle(++ptr);
+X	    } /* if */
+X	} else if (strncmp(option, "deb", 1) == 0) {	/* debug */
+X	    _res.options |= RES_DEBUG;
+X	} else if (strncmp(option, "nodeb", 5) == 0) {
+X	    _res.options &= ~(RES_DEBUG | RES_DEBUG2);
+X	} else if (strncmp(option, "ig", 2) == 0) {	/* ignore */
+X	    _res.options |= RES_IGNTC;
+X	} else if (strncmp(option, "noig", 4) == 0) {
+X	    _res.options &= ~RES_IGNTC;
+X#ifdef deprecated
+X	} else if (strncmp(option, "pri", 3) == 0) {	/* primary */
+X	    _res.options |= RES_PRIMARY;
+X	} else if (strncmp(option, "nopri", 5) == 0) {
+X	    _res.options &= ~RES_PRIMARY;
+X#endif
+X	} else if (strncmp(option, "cl", 2) == 0) {	/* query class */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		sscanf(++ptr, "%s", type);
+X		queryClass = StringToClass(type, queryClass);
+X	    }
+X	} else if (strncmp(option, "rec", 3) == 0) {	/* recurse */
+X	    _res.options |= RES_RECURSE;
+X	} else if (strncmp(option, "norec", 5) == 0) {
+X	    _res.options &= ~RES_RECURSE;
+X	} else if (strncmp(option, "ret", 3) == 0) {	/* retry */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		sscanf(++ptr, "%d", &tmp);
+X		if (tmp >= 0) {
+X		    _res.retry = tmp;
+X		}
+X	    }
+X	} else if (strncmp(option, "ro", 2) == 0) {	/* root */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		sscanf(++ptr, "%s", rootServerName);
+X	    }
+X	} else if (strncmp(option, "sea", 3) == 0) {	/* search list */
+X	    _res.options |= RES_DNSRCH;
+X	} else if (strncmp(option, "nosea", 5) == 0) {
+X	    _res.options &= ~RES_DNSRCH;
+X	} else if (strncmp(option, "srchl", 5) == 0) {	/* domain search list */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		res_dnsrch(++ptr);
+X	    }
+X	} else if (strncmp(option, "ti", 2) == 0) {	/* timeout */
+X	    ptr = strchr(option, '=');
+X	    if (ptr != NULL) {
+X		sscanf(++ptr, "%d", &tmp);
+X		if (tmp >= 0) {
+X		    _res.retrans = tmp;
+X		}
+X	    }
+X	} else {
+X	    fprintf(stderr, "*** Invalid option: %s\n",  option);
+X	    return(ERROR);
+X	}
+X    }
+X    return(SUCCESS);
+X}
+X
+X#ifndef MAXDFLSRCH 
+X#define MAXDFLSRCH 3
+X#endif
+X/*
+X * Fake a reinitialization when the domain is changed.
+X */
+Xres_re_init()
+X{
+X    register char *cp, **pp;
+X    int n;
+X
+X    /* find components of local domain that might be searched */
+X    pp = _res.dnsrch;
+X    *pp++ = _res.defdname;
+X    for (cp = _res.defdname, n = 0; *cp; cp++)
+X	if (*cp == '.')
+X	    n++;
+X    cp = _res.defdname;
+X    for (; n >= LOCALDOMAINPARTS && pp < _res.dnsrch + MAXDFLSRCH; n--) {
+X	cp = strchr(cp, '.');
+X	*pp++ = ++cp;
+X    }
+X    *pp = 0;
+X    _res.options |= RES_INIT;
+X}
+X
+X#define SRCHLIST_SEP '/'
+X
+Xres_dnsrch(cp)
+X    register char *cp;
+X{
+X    register char **pp;
+X    int n;
+X
+X    (void)strncpy(_res.defdname, cp, sizeof(_res.defdname) - 1);
+X    if ((cp = strchr(_res.defdname, '\n')) != NULL)
+X	    *cp = '\0';
+X    /*
+X     * Set search list to be blank-separated strings
+X     * on rest of line.
+X     */
+X    cp = _res.defdname;
+X    pp = _res.dnsrch;
+X    *pp++ = cp;
+X    for (n = 0; *cp && pp < _res.dnsrch + MAXDNSRCH; cp++) {
+X	    if (*cp == SRCHLIST_SEP) {
+X		    *cp = '\0';
+X		    n = 1;
+X	    } else if (n) {
+X		    *pp++ = cp;
+X		    n = 0;
+X	    }
+X    }
+X    if ((cp = strchr(pp[-1], SRCHLIST_SEP)) != NULL) {
+X	*cp = '\0';
+X    }
+X    *pp = NULL;
+X}
+X
+X#undef SRCHLIST_SEP
+X
+X/*
+X *******************************************************************************
+X *
+X * CvtAddrToPtr --
+X *
+X *	Convert a dotted-decimal Internet address into the standard
+X *	PTR format (reversed address with .in-arpa. suffix).
+X *
+X *	Assumes the argument buffer is large enougth to hold the result.
+X *
+X *******************************************************************************
+X */
+X
+Xstatic void
+XCvtAddrToPtr(name)
+X    char *name;
+X{
+X    char *p;
+X    int ip[4];
+X    struct in_addr addr;
+X
+X    if (IsAddr(name, &addr.s_addr)) {
+X	p = inet_ntoa(addr);
+X	if (sscanf(p, "%d.%d.%d.%d", &ip[0], &ip[1], &ip[2], &ip[3]) == 4) {
+X	    sprintf(name, "%d.%d.%d.%d.in-addr.arpa.", 
+X		ip[3], ip[2], ip[1], ip[0]);
+X	}
+X    }
+X}
+X
+X#if 0
+Xint
+XSetServer(serv)
+X   char *serv;
+X{
+X    int i;
+X    struct in_addr addr;
+X    struct hostent *hp;
+X
+X    /*
+X     * Use an explicit name server. If the hostname lookup fails,
+X     * default to the server(s) in resolv.conf.
+X     */ 
+X
+X    addr.s_addr = inet_addr(serv);
+X    if (addr.s_addr != (unsigned long)-1) {
+X	_res.nscount = 1;
+X	_res.nsaddr.sin_addr = addr;
+X    } else {
+X	hp = gethostbyname(serv);
+X	if (hp == NULL) {
+X	    fprintf(stderr, "*** Can't find server address for '%s': ", 
+X		    serv);
+X	    herror((char *)NULL);
+X	    fputc('\n', stderr);
+X	    return 0;
+X	}
+X	else
+X	{
+X#if BSD < 43
+X	    bcopy(hp->h_addr, (char *)&_res.nsaddr.sin_addr, hp->h_length);
+X	    _res.nscount = 1;
+X#else
+X	    for (i = 0; i < MAXNS && hp->h_addr_list[i] != NULL; i++) {
+X		bcopy(hp->h_addr_list[i], 
+X			(char *)&_res.nsaddr_list(i).sin_addr, 
+X			hp->h_length);
+X	    }
+X	    _res.nscount = i;
+X#endif
+X	} 
+X    }
+X    return 1;
+X}
+X#endif
+X/*
+X *******************************************************************************
+X *
+X *  SetDefaultServer --
+X *
+X *	Changes the default name server to the one specified by
+X *	the first argument. The command "server name" uses the current 
+X *	default server to lookup the info for "name". The command
+X *	"lserver name" uses the original server to lookup "name".
+X *
+X *  Side effects:
+X *	This routine will cause a core dump if the allocation requests fail.
+X *
+X *  Results:
+X *	SUCCESS		The default server was changed successfully.
+X *	NONAUTH		The server was changed but addresses of
+X *			other servers who know about the requested server
+X *			were returned.
+X *	Errors		No info about the new server was found or
+X *			requests to the current server timed-out.
+X *
+X *******************************************************************************
+X */
+X
+Xint
+XSetDefaultServer(string, local)
+X    char	*string;
+X    Boolean	local;
+X{
+X    register HostInfo	*newDefPtr;
+X    struct in_addr	*servAddrPtr;
+X    struct in_addr	addr;
+X    char		newServer[NAME_LEN];
+X    int			result;
+X    int			i;
+X
+X    strcpy(newServer,string);
+X    /*
+X     * Allocate space for a HostInfo variable for the new server. Don't
+X     * overwrite the old HostInfo struct because info about the new server
+X     * might not be found and we need to have valid default server info.
+X     */
+X
+X    newDefPtr = (HostInfo *) calloc(1, sizeof(HostInfo));
+X
+X
+X    /*
+X     *	A 'local' lookup uses the original server that the program was
+X     *  initialized with.
+X     *
+X     *  Check to see if we have the address of the server or the
+X     *  address of a server who knows about this domain.
+X     *  XXX For now, just use the first address in the list.
+X     */
+X
+X    if (local) {
+X	servAddrPtr = &defaultAddr;
+X    } else if (defaultPtr->addrList != NULL) {
+X	servAddrPtr = (struct in_addr *) defaultPtr->addrList[0];
+X    } else {
+X	servAddrPtr = (struct in_addr *) defaultPtr->servers[0]->addrList[0];
+X    }
+X
+X    result = ERROR;
+X    if (IsAddr(newServer, &addr.s_addr)) {
+X	result = GetHostInfoByAddr(servAddrPtr, &addr, newDefPtr);
+X	/* If we can't get the name, fall through... */
+X    } 
+X    if (result != SUCCESS && result != NONAUTH) {
+X	result = GetHostInfoByName(servAddrPtr, C_IN, T_A, 
+X			newServer, newDefPtr, 1);
+X    }
+X
+X    if (result == SUCCESS || result == NONAUTH) {
+X	    /*
+X	     *  Found info about the new server. Free the resources for
+X	     *  the old server.
+X	     */
+X
+X	    FreeHostInfoPtr(defaultPtr);
+X	    free((char *)defaultPtr);
+X	    defaultPtr = newDefPtr;
+X	    strcpy(defaultServer, defaultPtr->name);
+X	    return(SUCCESS);
+X    } else {
+X	    fprintf(stderr, "*** Can't find address for server %s: %s\n",
+X		    newServer, DecodeError(result));
+X	    free((char *)newDefPtr);
+X
+X	    return(result);
+X    }
+X}
+END_OF_FILE
+if test 17249 -ne `wc -c <'main.c'`; then
+    echo shar: \"'main.c'\" unpacked with wrong size!
+fi
+# end of 'main.c'
+fi
+echo shar: End of archive 2 \(of 3\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

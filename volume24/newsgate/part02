@@ -1,0 +1,2137 @@
+Subject:  v24i052:  News/mail gateway package, Part02/04
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: f0b53f6c 640ad9a2 bb6caa7a 10f9b3ef
+
+Submitted-by: Rich $alz <rsalz@bbn.com>
+Posting-number: Volume 24, Issue 52
+Archive-name: newsgate/part02
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then feed it
+# into a shell via "sh file" or similar.  To overwrite existing files,
+# type "sh file -c".
+# The tool that generated this appeared in the comp.sources.unix newsgroup;
+# send mail to comp-sources-unix@uunet.uu.net if you want that tool.
+# Contents:  mail2news.c mkmailpost.sh news2mail.c regex.3 rfc822.c
+# Wrapped by rsalz@litchi.bbn.com on Fri Mar 15 16:42:26 1991
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+echo If this archive is complete, you will see the following message:
+echo '          "shar: End of archive 2 (of 4)."'
+if test -f 'mail2news.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mail2news.c'\"
+else
+  echo shar: Extracting \"'mail2news.c'\" \(14113 characters\)
+  sed "s/^X//" >'mail2news.c' <<'END_OF_FILE'
+X/*
+X**  MAIL2NEWS
+X**  Gateway mail messages into netnews.  Usage:
+X**	mail2news [inews flags] -o Organization
+X**  In order to do this, there are a number of interesting transformations
+X**  that need to be made on the headers...
+X**
+X**  This program is descended from:  @(#)recnews.c 2.10 4/16/85.
+X*/
+X#include "gate.h"
+X#include <signal.h>
+X#include <sys/file.h>
+X#ifdef	RCSID
+Xstatic char RCS[] =
+X	"$Header: /nfs/papaya/u2/rsalz/src/newsgate/src/RCS/mail2news.c,v 1.13 91/03/13 15:57:32 rsalz Exp $";
+X#endif	/* RCSID */
+X
+X
+X#define	WAIT_CORED(s)		(s & 0200)
+X#define	WAIT_EXITSIG(s)		(s & 0177)
+X#define	WAIT_EXITCODE(s)	((s >> 8) & 0377)
+X
+X/* For those who don't have this in <sys/file.h>. */
+X#ifndef	R_OK
+X#define	R_OK			4
+X#endif	/* R_OK */
+X
+X/* Stuff for pipe(2). */
+X#define STDIN			0
+X#define	PIPE_READER		0
+X#define	PIPE_WRITER		1
+X
+X
+X/* Global variables. */
+XSTATIC int	Debugging;
+XSTATIC int	ChildPid = -1;
+Xchar		*Pname;
+X
+X
+X
+X/*
+X**  Go down to the absolute minimum.
+X*/
+XSTATIC void
+XTrimEnvironment()
+X{
+X    environ = NULL;
+X}
+X
+X
+X/*
+X**  Quickie hack to see of a mail message is a "please drop me" request.
+X**  Reads the message on the input file, and returns NULL if it should
+X**  be ignored, or a FILE handle if we should process it.
+X**
+X**  The original stand-alone program written was Russ Nelson,
+X**  <nelson@clutx.clarkson.edu>.  I hacked on it, and made it into a
+X**  subroutine.  Perhaps a better way to test is to make the test less
+X**  conservative, and see what "real" articles get caught, and make
+X**  adjustments then?  Comments solicited.
+X*/
+XSTATIC FILE *
+XIsSubRequest(F)
+X    register FILE	*F;
+X{
+X    register FILE	*Out;
+X    register char	*p;
+X    register int	c;
+X    register int	drop_or_add;
+X    register int	from_or_to;
+X    register int	mail_word;
+X    register int	count;
+X    char		word[SM_SIZE];
+X    char		buff[SM_SIZE];
+X
+X    /* Create temp file; if we can't let the message through. */
+X    if ((Out = fopen(mktemp(strcpy(buff, TEMPFILE)), "w")) == NULL)
+X	return F;
+X
+X    /* Clear counts. */
+X    drop_or_add = 0;
+X    from_or_to = 0;
+X    mail_word = 0;
+X    count = 0;
+X
+X    /* Read input a word at a time. */
+X    for (p = word; (c = getc(F)) != EOF; ) {
+X	(void)putc(c, Out);
+X	if (!isalpha(c)) {
+X	    *p = '\0';
+X	    if (p > word)
+X		count++;
+X	    p = word;
+X
+X	    if (EQ(word, "remove") || EQ(word, "drop") || EQ(word, "off")
+X	     || EQ(word, "subscribe") || EQ(word, "get") || EQ(word, "add"))
+X		drop_or_add++;
+X	    else if (EQ(word, "from") || EQ(word, "to"))
+X		from_or_to++;
+X	    else if (EQ(word, "mail") || EQ(word, "mailing")
+X		  || EQ(word, "list") || EQ(word, "dl"))
+X		mail_word++;
+X	}
+X	else if (p < &word[sizeof word - 1])
+X	    *p++ = isupper(c) ? tolower(c) : c;
+X    }
+X
+X    (void)fclose(F);
+X    (void)fclose(Out);
+X
+X    /* Use fancy-shmancy AI techniques to determine what the message is. */
+X    c = count < 25 && drop_or_add && from_or_to && mail_word;
+X    F = c ? NULL : fopen(buff, "r");
+X
+X    (void)unlink(buff);
+X    return F;
+X}
+X
+X
+X/*
+X**  Modify the Newsgroups: as directed by the command string.
+X*/
+XSTATIC void
+XDoCommand(hp, command, group)
+X    register HBUF		*hp;
+X    char			*command;
+X    char			*group;
+X{
+X    register char		*p;
+X    register int		i;
+X    register int		n;
+X    register int		nng;
+X    char			**tokens;
+X    char			**ng;
+X    char			buff[BUFSIZ];
+X
+X    if ((n = Split(command, &tokens, '\0')) == 0) {
+X	SplitFree(&tokens);
+X	return;
+X    }
+X
+X    nng = Split(hp->nbuf, &ng, NGDELIM);
+X    p = hp->nbuf;
+X    switch (tokens[0][0]) {
+X    case 'a':				/* Add		*/
+X	if (n > 1)
+X	    for (p += strlen(p), i = 1; i < n; i++) {
+X		*p++ = NGDELIM;
+X		p += APPEND(p, tokens[i]);
+X	    }
+X	break;
+X    case 'd':				/* Delete	*/
+X	for (i = 0; i < nng; i++)
+X	    if (!EQ(ng[i], group)) {
+X		if (p > hp->nbuf)
+X		    *p++ = NGDELIM;
+X		p += APPEND(p, ng[i]);
+X	    }
+X	if (p == hp->nbuf)
+X	    Strcpy(hp->nbuf, "junk");
+X	break;
+X    case 'k':				/* Kill		*/
+X	Fprintf(stderr, "%s:  Your posting to %s was killed by %s.\n",
+X	    Pname, hp->nbuf, n > 1 ? tokens[1] : group);
+X	exit(EX_NOPERM);
+X	/* NOTREACHED */
+X    case 'm':				/* Move		*/
+X	if (n > 1)
+X	    if (nng == 1)
+X		Strcpy(hp->nbuf, tokens[1]);
+X	    else
+X		for (i = 0; i < nng; i++) {
+X		    if (p > hp->nbuf)
+X			*p++ = NGDELIM;
+X		    p += APPEND(p, EQ(ng[i], group) ? tokens[1] : ng[i]);
+X		}
+X	break;
+X    case 'q':				/* Quiet kill	*/
+X	if (Debugging) {
+X	    (void)printf("Quiet kill (ignored for debugging).\n");
+X	    break;
+X	}
+X	/* Eat the message up, and pretend we delivered it. */
+X	while (fgets(buff, sizeof buff, stdin))
+X	    ;
+X	exit(EX_OK);
+X	/* NOTREACHED */
+X    }
+X
+X    SplitFree(&tokens);
+X    SplitFree(&ng);
+X}
+X
+X
+X/*
+X**  Split a line that looks like XpatternXcommandX into the pattern and
+X**  the command.  Initialize the RE matcher with the pattern, and return
+X**  the command.
+X*/
+XSTATIC char *
+XParsePattern(p, lineno)
+X    register char	*p;
+X    int			lineno;
+X{
+X    register char	*cp;
+X    register char	*command;
+X    register char	delim;
+X    char		*RE;
+X
+X    /* Ignore comments and blank lines. */
+X    if (*p == '#' || *p == '\0')
+X	return NULL;
+X
+X    for (delim = *p++, RE = cp = p, command = NULL; *cp; *p++ = *cp++)
+X	if (*cp == '\\' && cp[1] == delim)
+X	    cp++;
+X	else if (*cp == delim) {
+X	    /* Found delimiter; mark command, terminate RE. */
+X	    command = ++cp;
+X	    *p = '\0';
+X	    break;
+X	}
+X
+X    if (command == NULL || *command == '\0')
+X	Fprintf(stderr, "%s:  Incomplete regular expression, line %d.\n",
+X	    Pname, lineno);
+X    else if (cp = re_comp(RE))
+X	Fprintf(stderr, "%s:  Bad regular expression, line %d: %s.\n",
+X	    Pname, lineno, cp);
+X    else
+X	return command;
+X
+X#ifdef	lint
+X    /* My, my, aren't we anal. */
+X    (void)re_subs("", "");
+X    re_modw("");
+X#endif	/* lint */
+X
+X    return NULL;
+X}
+X
+X
+X/*
+X**  Convert string to lower case, return a new copy.
+X*/
+XSTATIC char *
+XMakeLowerCopy(s)
+X    register char	*s;
+X{
+X    register char	*p;
+X
+X    for (p = s = COPY(s); *p; p++)
+X	if (isupper(*p))
+X	    *p = tolower(*p);
+X    return s;
+X}
+X
+X
+X/*
+X**  Change newsgroups if the Subject:, Keywords:, or Summary: match a
+X**  pattern found in the newsgroup remap file.
+X*/
+XSTATIC void
+XEditnewsgroups(hp)
+X    register HBUF		*hp;
+X{
+X    register char		*p;
+X    register int		n;
+X    register int		i;
+X    register int		j;
+X    register int		t;
+X    char			**groups;
+X    char			**mapline;
+X    char			*hdrline[4];
+X    char			buff[LG_SIZE];
+X
+X    /* Copy some headers, but if nothing's there, give up. */
+X    i = 0;
+X    if (hp->title)
+X	hdrline[i++] = MakeLowerCopy(hp->title);
+X    if (hp->keywords)
+X	hdrline[i++] = MakeLowerCopy(hp->keywords);
+X    if (hp->summary)
+X	hdrline[i++] = MakeLowerCopy(hp->summary);
+X    if (i == 0)
+X	return;
+X    hdrline[i] = NULL;
+X
+X    /* For all the newsgroups, see if there's a mapping file. */
+X    for (n = Split(hp->nbuf, &groups, NGDELIM), i = 0; i < n; i++) {
+X	if (groups[i] == NULL || groups[i][0] == '\0')
+X	    continue;
+X
+X	/* Gate the name of the mapping file. */
+X#ifdef	IN_ONEPLACE
+X	Strcpy(buff, IN_ONEPLACE);
+X#endif	/* IN_ONEPLACE */
+X#ifdef	IN_SPOOLDIR
+X	{
+X	    register char	*q;
+X
+X	    for (p = buff + APPEND(buff, IN_SPOOLDIR), q = groups[i]; *q; q++)
+X		*p++ = *q == '.' ? '/' : *q;
+X	    Strcpy(p, "/recnews.cmd");
+X	}
+X#endif	/* IN_SPOOLDIR */
+X#ifdef	IN_CMDDIR
+X	Sprintf(buff, "%s/%s", IN_CMDDIR, groups[i]);
+X#endif	/* IN_CMDDIR */
+X
+X	if (access(buff, R_OK) >= 0 && (mapline = ReadFile(buff))) {
+X	    /* For all lines in the file, if there's a command and the
+X	     * pattern matches, execute the command. */
+X	    for (j = 0; mapline[j]; j++)
+X		if (p = ParsePattern(mapline[j], j))
+X		    for (t = 0; hdrline[t]; t++)
+X			if (re_exec(hdrline[t]) == 1) {
+X			    DoCommand(hp, p, groups[i]);
+X			    break;
+X			}
+X	    FreeFile(mapline);
+X	}
+X    }
+X
+X    /* Free dynamic space. */
+X    for (i = 0; hdrline[i]; i++)
+X	free(hdrline[i]);
+X    SplitFree(&groups);
+X}
+X
+X
+X/*
+X**  Signal-catcher and child-reapers.
+X*/
+X
+X
+X/*
+X**  Exit such that sendmail will again later.
+X*/
+XSTATIC CATCHER
+XSig_tempfail()
+X{
+X    exit(EX_TEMPFAIL);
+X}
+X
+X
+X/*
+X**  Reap the inews child properly, and exit with his exit code, so that
+X**  ultimate success or failure rests with inews.
+X*/
+XSTATIC CATCHER
+Xchildgone()
+X{
+X    register int	pid;
+X    int			W;
+X
+X    if ((pid = wait(&W)) != ChildPid || pid == -1)
+X	exit(EX_OSERR);
+X    
+X    /* Was it a good death? */
+X    if (WAIT_EXITSIG(W)) {
+X	Fprintf(stderr, "%s:  Child %d killed by signal %d.\n",
+X	    Pname, pid, WAIT_EXITSIG(W));
+X	if (WAIT_CORED(W))
+X	    Fprintf(stderr, "%s:  Child %d dumped core.\n", Pname, pid);
+X	exit(EX_SOFTWARE);
+X    }
+X
+X#ifdef	MMDF
+X    /* We need a way to tell temporary errors from permanent ones.  Inews
+X     * will reject messages because of too much quoting, for example,
+X     * so the message will sit in the queue forever.  Until then we'll
+X     * have to lose messages on any error. */
+X    exit(0);
+X#else
+X    exit(WAIT_EXITCODE(W));
+X#endif	/* MMDF */
+X}
+X
+X
+X
+X/*
+X**  Convert the characters following dots to upper case, if they're
+X**  lower case.  Two dots in a row will leave one dot in their place.
+X**  Modifies the argument.
+X*/
+XSTATIC char *
+XHackPeriods(string)
+X    char		*string;
+X{
+X    register char	*s;
+X    register char	*p;
+X
+X    if (string) {
+X	for (p = s = string; *p; *s++ = *p++)
+X	    if (*p == '.') {
+X		if (*++p == '\0') {
+X		    *s++ = '.';
+X		    break;
+X		}
+X		if (islower(*p))
+X		    *p = toupper(*p);
+X	    }
+X	*s = '\0';
+X    }
+X    return string;
+X}
+X
+X
+X
+Xmain(ac, av)
+X    register int	ac;
+X    register char	*av[];
+X{
+X    register char	**vec;
+X    register char	*p;
+X    register FILE	*F;
+X    register FILE	*Infile;
+X    HBUF		H;
+X    char		**iv;
+X    char		buff[BUFSIZ];
+X    int			fd[2];
+X    int			FlushSubRequests;
+X    int			SubjectRequired;
+X    int			GotEquals;
+X
+X    Pname = ((Pname = RDX(av[0], '/')) ? Pname + 1 : av[0]);
+X    Infile = stdin;
+X
+X    /* Remove any trace of who we are. */
+X    TrimEnvironment();
+X
+X    /* So that cores will actually drop... */
+X    if (chdir("/tmp") < 0) {
+X	Fprintf(stderr, "%s:  Can't chdir(/tmp), %s.\n", Pname,
+X	    strerror(errno));
+X	exit(EX_TEMPFAIL);
+X    }
+X
+X    /* If someone wants to shut down the system, tell sendmail to
+X     * try again later. */
+X    Signal(SIGTERM, Sig_tempfail);
+X
+X#ifdef	SENDMAIL
+X    /* First read should fetch us the UNIX From_ line.  Not done in MMDF. */
+X    if (fgets(buff, sizeof buff, Infile) == NULL)
+X	exit(EX_NOINPUT);
+X
+X    if (!EQn(buff, "From ", 5)) {
+X	Fprintf(stderr, "%s:  Input didn't start with UNIX From line:\n",
+X	    Pname);
+X	Fprintf(stderr,"\t%s.\n", buff);
+X	exit(EX_DATAERR);
+X    }
+X#endif	/* SENDMAIL */
+X
+X    /* Read the mail header. */
+X    rfc822read(&H, Infile, buff, sizeof buff);
+X
+X    /* Process the argument list, copying anything that we don't recognize
+X     * over to the inews argument list and changing things as we see fit. */
+X    FlushSubRequests = FALSE;
+X    GotEquals = FALSE;
+X    SubjectRequired = TRUE;
+X    iv = NEW(char*, ac+ 2);
+X    iv[0] = INEWS;
+X    iv[1] = "-h";
+X    for (vec = iv + 2; p = *++av; )
+X	if (p[0] != '-')
+X	    *vec++ = p;
+X	 else
+X	    switch(p[1]) {
+X	    case 'x':
+X		SubjectRequired = FALSE;
+X		/* FALLTHROUGH */
+X	    default:
+X		*vec++ = p;
+X		break;
+X	    case '=':
+X		if (!GotEquals)
+X		    iv++;
+X		iv[0] = p[2] ? &p[2] : *++av;
+X		GotEquals++;
+X		break;
+X	    case '.':
+X		Debugging++;
+X		break;
+X	    case 'n':
+X		/* Newsgroup this messages goes to. */
+X		Strcpy(H.nbuf, p[2] ? &p[2] : *++av);
+X		break;
+X	    case 'o':
+X		/* Default organization. */
+X		if (H.organization[0] == '\0')
+X		    Strcpy(H.organization, HackPeriods(p[2] ? &p[2] : *++av));
+X		else if (p[2] == '\0')
+X		    av++;
+X		SubjectRequired = FALSE;
+X		break;
+X	    case 'F':
+X		FlushSubRequests = TRUE;
+X		break;
+X	    }
+X    *vec++ = NULL;
+X
+X    /* Bash on the mail header. */
+X    if (p = HackHeader(&H, SubjectRequired)) {
+X	Fprintf(stderr, "%s:  Rejected by netnews because:\n", Pname);
+X	Fprintf(stderr, "\t%s.\n", p);
+X	if (H.nbuf[0])
+X	    Fprintf(stderr, "\tIt was going into the newsgroup%s %s.\n",
+X		IDX(H.nbuf, NGDELIM) ? "s" : "", H.nbuf);
+X	exit(EX_DATAERR);
+X    }
+X    Editnewsgroups(&H);
+X
+X    if (Debugging) {
+X	for (vec = iv; *vec; vec++)
+X	    (void)printf(" |%s| ", *vec);
+X	(void)printf("\n");
+X	if (!rfc822write(&H, stdout))
+X	    Fprintf(stderr, "%s:  Can't write header, %s.\n",
+X		Pname, strerror(errno));
+X	while (fgets(buff, sizeof buff, Infile))
+X	    Fputs(buff, stdout);
+X	exit(EX_OK);
+X    }
+X
+X    if (FlushSubRequests && (Infile = IsSubRequest(Infile)) == NULL) {
+X	Fprintf(stderr, "%s:  Rejected by netnews becase:\n", Pname);
+X	Fprintf(stderr, "\tIt seems like a subscription request.\n");
+X	exit(EX_DATAERR);
+X    }
+X
+X    /* Get ready to spawn an inews. */
+X    if (pipe(fd) < 0) {
+X	Fprintf(stderr, "%s:  Can't pipe, %s.\n", Pname, strerror(errno));
+X	exit(EX_TEMPFAIL);
+X    }
+X    Fflush(stderr);
+X    Fflush(stdout);
+X#ifdef	SIGCHLD
+X    Signal(SIGCHLD, childgone);
+X#endif	/* SIGCHLD */
+X#ifdef	SIGCLD
+X    Signal(SIGCLD, childgone);
+X#endif	/* SIGCLD */
+X
+X    if ((ChildPid = fork()) < 0) {
+X	Fprintf(stderr,"%s:  Can't fork, %s.\n", Pname, strerror(errno));
+X	exit(EX_TEMPFAIL);
+X    }
+X    if (ChildPid == 0) {
+X	/* Redirect I/O; it's unlikely the test below will fail. */
+X	if (fd[PIPE_READER] != STDIN) {
+X	    Close(STDIN);
+X	    if (dup(fd[PIPE_READER]) != STDIN)
+X		Fprintf(stderr, "%s:  Can't redirect input, %s.\n",
+X		    Pname, strerror(errno));
+X	}
+X	Close(fd[PIPE_READER]);
+X	Close(fd[PIPE_WRITER]);
+X	(void)execv(iv[0], iv);
+X	Fprintf(stderr, "%s:  Can't exec %s, %s.\n",
+X	    Pname, iv[0], strerror(errno));
+X	exit(EX_OSERR);
+X    }
+X
+X    /* Set things up after the fork. */
+X    Close(fd[PIPE_READER]);
+X    Signal(SIGPIPE, childgone);
+X    if ((F = fdopen(fd[PIPE_WRITER], "w")) == NULL)
+X	exit(EX_OSERR);
+X
+X    /* Stuff the header. */
+X    if (!rfc822write(&H, F)) {
+X	Fprintf(stderr, "%s:  Can't write header, %s.\n",
+X	    Pname, strerror(errno));
+X	exit(EX_IOERR);
+X    }
+X
+X    /* Write the rest of the message. */
+X    while (fgets(buff, sizeof buff, Infile)) {
+X	Fputs(buff, F);
+X	if (ferror(F))
+X	    break;
+X    }
+X
+X    /* Close down the pipe. */
+X    Fflush(F);
+X    if (ferror(F)) {
+X	Fprintf(stderr, "%s:  Error flushing pipe to news, %s.\n",
+X	    Pname, strerror(errno));
+X	exit(EX_IOERR);
+X    }
+X    if (fclose(F) == EOF)
+X	Fprintf(stderr, "%s:  Error closing pipe to news, %s.\n",
+X	    Pname, strerror(errno));
+X
+X    /* Wait for inews, and exit as it does. */
+X    childgone();
+X    /* NOTREACHED */
+X}
+END_OF_FILE
+  if test 14113 -ne `wc -c <'mail2news.c'`; then
+    echo shar: \"'mail2news.c'\" unpacked with wrong size!
+  fi
+  # end of 'mail2news.c'
+fi
+if test -f 'mkmailpost.sh' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'mkmailpost.sh'\"
+else
+  echo shar: Extracting \"'mkmailpost.sh'\" \(1206 characters\)
+  sed "s/^X//" >'mkmailpost.sh' <<'END_OF_FILE'
+X#! /bin/sh
+X##  $Header: /nfs/papaya/u2/rsalz/src/newsgate/src/RCS/mkmailpost.sh,v 1.4 91/02/12 14:49:26 rsalz Exp $
+X##  Script to make a set of "mailpost" commands for all groups in
+X##  the news active file.
+X##  Usage:
+X##	makemailpost [news active file [mail2newspath] ]
+X
+Xcase $# in
+X[012])
+X    ;;
+X*)
+X    echo "Usage: `basename $0` [activefile [mail2newspath] ]" 1>&2
+X    exit 1
+X    ;;
+Xesac
+X
+XACTIVE=${1-/usr/lib/news/active}
+Xif [ ! -f ${ACTIVE} ] ; then
+X    echo "`basename $0`:  Can't read input ${ACTIVE}." 1>&2
+X    exit 1
+Xfi
+X
+X##  Write the prolog.
+Xecho "/*"
+Xecho "**  Generated from ${ACTIVE}"
+Xecho "**  by `whoami` on `date`"
+Xecho "*/"
+Xif [ "$2" != "" ] ; then
+X    echo 'default mail2news "'$2'";'
+Xfi
+X
+Xtrap "rm -f /tmp/mmp$$ ; exit 1" 1 2 3 15
+X
+X##  Create the sed temporary file and run it
+Xcat >/tmp/mmp$$ <<\EOF
+X# Delete moderated groups
+X/m$/d
+X# Trim anything after the first field
+Xs/ .*$//
+X# Delete control, junk, site-specific
+X/^control$/d
+X/^junk$/d
+X/^to\./d
+X# Delete test groups and announce, assuming the latter is moderated
+X/\<test\>/d
+X/\<announce\>/d
+X# Turn the line "foo" into "mailpost foo;"
+Xs/^.*$/mailpost &;/
+XEOF
+X
+X##  Run sed, clean up.
+Xsed -f /tmp/mmp$$ <${ACTIVE} | sort
+X
+Xrm -f /tmp/mmp$$
+END_OF_FILE
+  if test 1206 -ne `wc -c <'mkmailpost.sh'`; then
+    echo shar: \"'mkmailpost.sh'\" unpacked with wrong size!
+  fi
+  # end of 'mkmailpost.sh'
+fi
+if test -f 'news2mail.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'news2mail.c'\"
+else
+  echo shar: Extracting \"'news2mail.c'\" \(12785 characters\)
+  sed "s/^X//" >'news2mail.c' <<'END_OF_FILE'
+X/*
+X**  NEWS2MAIL
+X**  Read a news article on standard input, and send it to the mailing
+X**  list as directed by the command-line arguments.  It does some
+X**  parsing and converting of news headers into mail headers.
+X**
+X**  This program wants to lie to sendmail, so it should be setuid to
+X**  one of the "trusted" users as listed in your sendmail.cf file.
+X**
+X*/
+X#include "gate.h"
+X#include <sys/stat.h>
+X#ifdef	RCSID
+Xstatic char RCS[] =
+X	"$Header: /nfs/papaya/u2/rsalz/src/newsgate/src/RCS/news2mail.c,v 1.10 91/02/12 14:50:11 rsalz Exp $";
+X#endif	/* RCSID */
+X
+X
+X/* Flags for special header lines. */
+Xtypedef enum _HEADERTYPE {
+X    HDR_NORM,
+X    HDR_SUBJ,
+X    HDR_CTRL,
+X    HDR_REFS,
+X    HDR_PATH,
+X    HDR_FROM
+X} HEADERTYPE;
+X
+X
+X/* Header-cracking datatype. */
+Xtypedef struct _HEADER {
+X    char		*Tag;
+X    int			Length;
+X    HEADERTYPE		Flag;
+X    char		Value[SM_SIZE];
+X} HEADER;
+X
+XSTATIC int	Debugging;
+Xchar		*Pname;
+X
+X/* The headers we care about. */
+XSTATIC HEADER	Table[] = {
+X    {	"Control",	 7,	 HDR_CTRL	},
+X    {	"Date",		 4,	 HDR_NORM	},
+X    {	"From",		 4,	 HDR_FROM	},
+X    {	"Message-ID",	10,	 HDR_NORM	},
+X    {	"Organization",	12,	 HDR_NORM	},
+X    {	"Path",		 4,	 HDR_PATH	},
+X    {	"References",	10,	 HDR_REFS	},
+X    {	"Reply-To",	 8,	 HDR_NORM	},
+X    {	"Subject",	 7,	 HDR_SUBJ	},
+X};
+X
+X
+X/*
+X**  Figure out the return address, by doing some optimization on the
+X**  path.  If we find an Internet host or a UUCP neighbor, remove all
+X**  hosts before that one from the path.
+X*/
+XSTATIC char *
+XEditPath(path, Host)
+X    register char	*path;
+X    char		*Host;
+X{
+X    static char		**Hinet;
+X    static char		**Huucp;
+X    static char		**Lsys;
+X    static char		buff[SM_SIZE];
+X    register char	*p;
+X    register char	*q;
+X    register char	**V;
+X    register int	ac;
+X    register int	i;
+X    register int	uucppal;
+X    register int	inetpal;
+X    FILE		*F;
+X    FILE		*P;
+X    struct stat		Sb1;
+X    struct stat		Sb2;
+X    char		**av;
+X    char		*Inetsite;
+X
+X    if ((ac = Split(path, &av, '!')) == 2) {
+X	/* Simple case:  "site!user" */
+X	Strcpy(buff, av[1]);
+X	SplitFree(&av);
+X	return buff;
+X    }
+X
+X    /* Initialize.  This is silly for now, but eventually we might want
+X     * to be able to handle a batched feed. */
+X#ifdef	UUNAME
+X    if (Lsys == NULL) {
+X	p = UUNAME;
+X	/* If someone diddled L.sys, rebuild uuname output. */
+X	if (stat(L_SYS, &Sb1) < 0 || stat(p, &Sb2) < 0
+X	  || Sb1.st_mtime >= Sb2.st_mtime)
+X	    if ((F = fopen(p, "w"))  == NULL)
+X		Fprintf(stderr, "%s:  Can't create %s, %s.\n",
+X			Pname, p, strerror(errno));
+X	    else {
+X		if ((P = popen("exec uuname", "r")) == NULL)
+X		    Fprintf(stderr, "%s:  popen failed, %s.\n",
+X			    Pname, strerror(errno));
+X		else {
+X		    while (fgets(buff, sizeof buff, P))
+X			Fputs(buff, F);
+X		    if (pclose(P))
+X			Fprintf(stderr, "%s:  pclose failed, %s.\n",
+X				Pname, strerror(errno));
+X		}
+X		if (fclose(F) == EOF)
+X		    Fprintf(stderr, "%s:  Error closing %s, %s.\n",
+X			    Pname, p, strerror(errno));
+X	    }
+X
+X	/* Slurp up names of UUCP hosts we talk to. */
+X	Lsys = ReadFile(p);
+X
+X#ifdef	UUCP_INET
+X	/* Slurp up the UUCP->Internet name mappings. */
+X	for (Huucp = ReadFile(UUCP_INET), i = 1; Huucp[i]; i++)
+X	    ;
+X	for (Hinet = NEW(char*, i), i = 0; p = Huucp[i]; i++) {
+X	    while (*p && !WHITE(*p))
+X		p++;
+X	    if (*p)
+X		for (*p++ = '\0'; *p && WHITE(*p); p++)
+X		    ;
+X	    Hinet[i] = p;
+X	}
+X#endif	/* UUCP_INET */
+X    }
+X#endif	/* UUNAME */
+X
+X    /* Scan the path, noting if we find a UUCP or Internet neighbor. */
+X    for (uucppal = 1, inetpal = 0, i = 0; i < ac; i++) {
+X	for (V = Lsys; *V; V++)
+X	    if (EQ(av[i], *V))
+X		uucppal = i;
+X	for (V = Huucp; *V; V++)
+X	    if (EQ(av[i], *V)) {
+X		inetpal = i;
+X		Inetsite = Hinet[V - Huucp];
+X	    }
+X    }
+X
+X    if (inetpal < uucppal) {
+X	/* No Internet site found, turn a!b!c into a!b!c@this-host */
+X	for (p = buff + APPEND(buff, av[uucppal]); ++uucppal < ac; ) {
+X	    *p++ = '!';
+X	    p += APPEND(p, av[uucppal]);
+X	}
+X	*p++ = '@';
+X	Strcpy(p, Host);
+X    }
+X    else if (inetpal == ac - 1)
+X	/* Turn a!b!inet!user into user@inet.domain.name */
+X	Sprintf(buff, "%s@%s", av[ac], Inetsite);
+X    else {
+X	/* Turn a!inet!b!user into b!user@inet.domain.name */
+X	for (p = buff + APPEND(buff, av[++inetpal]); ++inetpal < ac; ) {
+X	    *p++ = '!';
+X	    p += APPEND(p, av[inetpal]);
+X	}
+X	*p++ = '@';
+X	Strcpy(p, Inetsite);
+X    }
+X
+X    /* Convert all but the last "@" to "%" (fie on decwrl and psuecl!). */
+X    if (p = IDX(buff, '@'))
+X	for ( ; q = IDX(p + 1, '@'); p = q)
+X	    *p = '%';
+X
+X    SplitFree(&av);
+X    return buff;
+X}
+X
+X
+X/*
+X**  Hack up the references, taking only the last three.
+X*/
+XSTATIC char *
+XTrimReferences(refs)
+X    char		 *refs;
+X{
+X    static char		buff[SM_SIZE];
+X    register char	*p;
+X    register int	i;
+X    register int	ac;
+X    char		**av;
+X
+X    if (ac = Split(refs, &av, '\0')) {
+X	/* Tricky.  If there are five references, we want subscripts 2,3,4. */
+X	i = ac < 3 ? 0 : ac - 3;
+X	for (p = buff + APPEND(buff, av[i]); ++i < ac; ) {
+X	    *p++ = ',';
+X	    *p++ = ' ';
+X	    p += APPEND(p, av[i]);
+X	}
+X	SplitFree(&av);
+X    }
+X    else
+X	buff[0] = '\0';
+X    return buff;
+X}
+X
+X
+X#ifndef	HAVE_PUTENV
+X/*
+X**  A brute-forced implementation of putenv.  Wastes memory.  Consider
+X**  it incentive to install the free BSD version...
+X*/
+Xint
+Xputenv(val)
+X    char	*val;
+X{
+X    char	**new;
+X    int		i;
+X    int		length;
+X    int		found;
+X    char	*p;
+X
+X    /* See if the value is already in the environment. */
+X    found = -1;
+X    if (p = IDX(val, '=')) {
+X	for (length = ++p - val, i = 0; environ[i]; i++)
+X	    if (EQn(val, environ[i], length)) {
+X		found = i;
+X		break;
+X	    }
+X    }
+X
+X    /* Get the size, and space for the new environment. */
+X    for (i = 0; environ[i]; i++)
+X	;
+X    i += 2;
+X    new = NEW(char*, i);
+X    new[0] = val;
+X
+X    /* Copy the old to the new. */
+X    for (i = 0; environ[i]; i++)
+X	if (i != found)
+X	    new[i + 1] = environ[i];
+X    new[i + 1] = NULL;
+X    environ = new;
+X    return 0;
+X}
+X#endif	/* HAVE_PUTENV */
+X
+X
+X/*
+X**  Print a usage message and exit.
+X*/
+XSTATIC void
+XUsage()
+X{
+X    Fprintf(stderr, "Usage:\n\t%s %s %s\n",
+X	Pname,
+X	"[-.] [-e var=val]",
+X	"listname listaddr listadmin host [article]");
+X    exit(EX_USAGE);
+X}
+X
+X
+Xmain(ac, av)
+X    int			ac;
+X    register char	*av[];
+X{
+X    static char		tmp[sizeof TEMPFILE];
+X    register FILE	*F;
+X    register HEADER	*hp;
+X    register char	*p;
+X    char		*sv[10];
+X    char		buff[BUFSIZ];
+X    char		SenderAddr[SM_SIZE];
+X    char		ToAddr[SM_SIZE];
+X    char		Host[SM_SIZE];
+X    char		Fullname[SM_SIZE];
+X    int			i;
+X    int			HadEflag;
+X    char		*Listname;
+X    char		*Listaddr;
+X    char		*Listadmin;
+X    char		*Listhost;
+X    char		*Article;
+X
+X    /* Set defaults. */
+X    Pname = (Pname = RDX(av[0], '/')) ? Pname + 1 : av[0];
+X    HadEflag = FALSE;
+X
+X    /* Parse JCL. */
+X    while ((i = getopt(ac, av, "E:.")) != EOF)
+X	switch (i) {
+X	default:
+X	    Usage();
+X	    /* NOTREACHED */
+X	case '.':
+X	    Debugging = TRUE;
+X	    break;
+X	case 'E':
+X	    if (putenv(COPY(optarg))) {
+X		Fprintf(stderr, "%s:  Can't add to environment, %s.\n",
+X		    Pname, strerror(errno));
+X		exit(EX_TEMPFAIL);
+X	    }
+X	    HadEflag = TRUE;
+X	    break;
+X	}
+X    ac -= optind;
+X    av += optind;
+X    if (ac != 4 && ac != 5)
+X	Usage();
+X
+X    /* Parse the positional parameters. */
+X    Listname = av[0];
+X    Listaddr = av[1];
+X    Listadmin = av[2];
+X    Listhost = av[3];
+X    Article = av[4];
+X
+X    /* Arrange for logging. */
+X    if (!Debugging && freopen(ERR_LOG, "a", stderr) == NULL)
+X	/* Sigh; error in error handler.... */
+X	(void)freopen("/dev/console", "w", stderr);
+X
+X    if (Article && freopen(Article, "r", stdin) == NULL) {
+X	Fprintf(stderr, "%s:  Can't open %s, %s.\n",
+X	    Pname, Article, strerror(errno));
+X	exit(EX_NOINPUT);
+X    }
+X
+X    /* Who are we? */
+X    if (gethostname(Host, sizeof Host) < 0) {
+X	Fprintf(stderr, "%s:  Can't get hostname, %s.\n",
+X	    Pname, strerror(errno));
+X	exit(EX_TEMPFAIL);
+X    }
+X
+X    /* Read headers, storing the ones we want. */
+X    while (fgets(buff, sizeof buff, stdin)) {
+X	if (p = IDX(buff, '\n'))
+X	    *p = '\0';
+X	else
+X	    Fprintf(stderr, "%s:  Header line too long (%d bytes max)\n\t%s\n",
+X		Pname, sizeof buff, buff);
+X	if (p == buff)
+X	    /* Blank line means end of headers. */
+X	    break;
+X
+X	for (hp = Table; hp < ENDOF(Table); hp++)
+X	    if (buff[hp->Length] == ':' && EQn(hp->Tag, buff, hp->Length)) {
+X		/* Skip whitespace. */
+X		for (p = &buff[hp->Length]; *p && WHITE(*p); p++)
+X		    ;
+X		switch (hp->Flag) {
+X		case HDR_SUBJ:
+X		    if (!EQn(p, "cmsg ", 5)) {
+X			Strcpy(hp->Value, p);
+X			break;
+X		    }
+X		    /* FALLTHROUGH */
+X		case HDR_CTRL:
+X		    /* Eat rest of message. */
+X		    while (fgets(buff, sizeof buff, stdin))
+X			;
+X		    exit(EX_OK);
+X		    /* NOTREACHED */
+X		case HDR_NORM:
+X		    Strcpy(hp->Value, p);
+X		    break;
+X		case HDR_FROM:
+X		    /* Turn "joe@site.uucp (My Name)" into "(My Name)" */
+X		    if ((p = IDX(p, ' ')) && p[1] == '(')
+X			Strcpy(Fullname, ++p);
+X		    else
+X			Fullname[0] = '\0';
+X		    break;
+X		case HDR_REFS:
+X		    Strcpy(hp->Value, TrimReferences(p));
+X		    break;
+X		case HDR_PATH:
+X		    Strcpy(hp->Value, EditPath(p, Host));
+X		    break;
+X		}
+X	}
+X    }
+X
+X    /* Set up temp output. */
+X    if ((F = fopen(mktemp(strcpy(tmp, TEMPFILE)), "w")) == NULL) {
+X	Fprintf(stderr, "%s:  Can't create %s, %s.\n", tmp, strerror(errno));
+X	exit(EX_CANTCREAT);
+X    }
+X
+X    if (IDX(Listadmin, '@'))
+X	Strcpy(SenderAddr, Listadmin);
+X    else
+X	Sprintf(SenderAddr, "%s@%s", Listadmin, Listhost);
+X    if (IDX(Listaddr, '@'))
+X	Strcpy(ToAddr, Listaddr);
+X    else
+X	Sprintf(ToAddr, "%s@%s", Listaddr, Listhost);
+X
+X    /* Print out a sanitized header for mail. */
+X    if (IDX(Listname, '@'))
+X	Strcpy(buff, Listname);
+X    else
+X	Sprintf(buff, "%s@%s", Listname, Listhost);
+X    Fprintf(F, "Received: from USENET by %s with netnews\n", Host);
+X    Fprintf(F, "\tfor %s (%s);\n", ToAddr, buff);
+X    Fprintf(F, "\tcontact usenet@%s if you have questions.\n", Host);
+X    Fprintf(F, "To: %s\n", buff);
+X    for (hp = Table; hp < ENDOF(Table); hp++)
+X	if (hp->Flag == HDR_PATH) {
+X	    Fprintf(F, "From: %s %s\n", hp->Value, Fullname);
+X	    Fprintf(F, "Sender: %s\n", SenderAddr);
+X	}
+X	else if (hp->Value[0])
+X	    Fprintf(F, "%s %s\n", hp->Tag, hp->Value);
+X    Fprintf(F, "\n");
+X
+X    /* Dump the body of the message. */
+X    while (fgets(buff, sizeof buff, stdin))
+X	Fputs(buff, F);
+X    if (fclose(F) == EOF)
+X	Fprintf(stderr, "%s:  Error closing %s, %s.\n",
+X	    Pname, tmp, strerror(errno));
+X
+X    /* Set I/O correctly.  Stderr is going to the log, stdin should be the
+X     * message we created.  Easiest thing is to unlink an open file. */
+X    if (freopen(tmp, "r", stdin) == NULL) {
+X	Fprintf(stderr, "%s:  Can't open %s for reading, %s.\n",
+X	    Pname, tmp, strerror(errno));
+X	exit(EX_OSERR);
+X    }
+X    if (unlink(tmp) < 0)
+X	Fprintf(stderr, "%s:  Can't unlink %s, %s.\n",
+X	    Pname, tmp, strerror(errno));
+X
+X    /* Common code for all argument vectors. */
+X    i = 0;
+X
+X#ifdef	MAILSCRIPT
+X    /* Build the MAILSCRIPT argument vector. */
+X    sv[i++] = MAILSCRIPT;
+X    /* Headers are inline. */
+X    sv[i++] = "-ASIS";
+X    /* Set the logical sender/from address. */
+X    sv[i++] = "-From";
+X    sv[i++] = SenderAddr;
+X    /* Set the recipient. */
+X    sv[i++] = "-recip";
+X    sv[i++] = ToAddr;
+X#endif	/* MAILSCRIPT */
+X
+X#ifdef	SENDMAIL
+X    /* Build of the SENDMAIL argument vector. */
+X    sv[i++] = SENDMAIL;
+X    /* Ignore periods as message terminator (same as -oi). */
+X    sv[i++] = "-i";
+X    /* Queued delivery. */
+X    sv[i++] = "-odq";
+X    /* Set the "From:" address. */
+X    sv[i++] = "-f";
+X    sv[i++] = SenderAddr;
+X    /* Set the recipient. */
+X    sv[i++] = ToAddr;
+X#endif	/* SENDMAIL */
+X
+X#ifdef	MMDF
+X    /* Build of the MMDF argument vector. */
+X    sv[i++] = MMDF;
+X    /* Deliver to mailbox (m), deliver all mail now (ln), trust me (t), send
+X     * no warnings (z), return to "Sender:" (s), get recipients from the
+X     * "To:" address (xto*). */
+X    sv[i++] = "-mlntzsxto*";
+X    /* Set the From: address. */
+X    sv[i++] = SenderAddr;
+X#endif	/* MMDF */
+X
+X    /* Null-terminate the vector. */
+X    sv[i] = NULL;
+X
+X    if (Debugging) {
+X	for (i = 0; sv[i]; i++)
+X	    (void)printf(" |%s| ", sv[i]);
+X	(void)printf("\n");
+X	if (HadEflag) {
+X	    for (i = 0; sv[i]; i++)
+X		(void)printf(" [%s] ", sv[i]);
+X	    (void)printf("\n");
+X	}
+X	while (fgets(buff, sizeof buff, stdin))
+X	    Fputs(buff, stdout);
+X	exit(EX_OK);
+X    }
+X
+X    /* Try to setuid, if desired.  Could "factor out" the execv from the
+X     * #ifdef, but I hate the way the resultant "dangling else" looks. */
+X#ifdef	TRUSTED
+X    if (setuid(TRUSTED) < 0)
+X	Fprintf(stderr, "%s:  Can't setuid to %d, %s.\n",
+X		Pname, TRUSTED, strerror(errno));
+X    else
+X	(void)execv(sv[0], sv);
+X#else
+X    (void)execv(sv[0], sv);
+X#endif	/* TRUSTED */
+X
+X    /* Something failed; dump the message and quit */
+X    Fprintf(stderr, "%s:  Can't execv %s, %s.\n",
+X	Pname, sv[0], strerror(errno));
+X    while (fgets(buff, sizeof buff, stdin))
+X	Fputs(buff, stdout);
+X    exit(EX_OSERR);
+X    /* NOTREACHED */
+X}
+END_OF_FILE
+  if test 12785 -ne `wc -c <'news2mail.c'`; then
+    echo shar: \"'news2mail.c'\" unpacked with wrong size!
+  fi
+  # end of 'news2mail.c'
+fi
+if test -f 'regex.3' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'regex.3'\"
+else
+  echo shar: Extracting \"'regex.3'\" \(7421 characters\)
+  sed "s/^X//" >'regex.3' <<'END_OF_FILE'
+X.\" $Header: /nfs/papaya/u2/rsalz/src/newsgate/src/RCS/regex.3,v 1.4 91/02/12 14:50:56 rsalz Exp $
+X.TH REGEX 3 LOCAL
+X.SH NAME
+Xre_comp, re_exec, re_subs, re_modw, re_fail \- regular expression handling
+X.SH SYNOPSIS
+X.nf
+X.B "char *re_comp(pat)"
+X.B "char *pat;"
+X.sp
+X.B "re_exec(str)"
+X.B "char *str;"
+X.sp
+X.B "re_subs(src, dst)"
+X.B "char *src;"
+X.B "char *dst;"
+X.sp
+X.B "void re_fail(msg, op)"
+X.B "char *msg;"
+X.B "char op;"
+X.sp
+X.B "void re_modw(str)"
+X.B "char *str;"
+X.fi
+X.SH DESCRIPTION
+XThese functions implement
+X.IR ed (1)\-style
+Xpartial regular expressions and supporting facilities.
+X.PP
+X.I Re_comp
+Xcompiles a pattern string into an internal form (a deterministic finite\-state
+Xautomaton) to be executed by
+X.I re_exec
+Xfor pattern matching.
+X.I Re_comp
+Xreturns zero if the pattern is compiled successfully, otherwise it returns an
+Xerror message string.
+XIf
+X.I re_comp
+Xis called with a null pointer or a pointer to an empty string, it returns
+Xwithout changing the currently compiled regular expression.
+X.PP
+X.I Re_comp
+Xsupports the same limited set of
+X.I "regular expressions"
+Xfound in
+X.I ed
+Xand Berkeley
+X.IR regex (3)
+Xroutines:
+X.in +1i
+X.de Ti
+X.sp
+X.ti -1i
+X.ta 0.5i +0.5i +0.5i
+X..
+X.Ti
+X[1]	\fIchar\fP	Matches itself, unless it is a special
+Xcharacter (meta\-character): \fB. \e [ ] * + ^ $\fP
+X.Ti
+X[2]	\fB.\fP	Matches \fIany\fP character.
+X.Ti
+X[3]	\fB\e\fP	Matches the character following it, except
+Xwhen followed by a digit, \fB(\fP, \fB)\fP, \fB<\fP or \fB>\fP
+X(see [7], [8] and [9]).
+XIt is used as an escape character for all other meta\-characters, and itself.
+XWhen used in a set ([4]), it is treated as an ordinary character.
+X.Ti
+X[4]	\fB[\fP\fIset\fP\fB]\fP	Matches one of the characters in the set.
+XIf the first character in the set is \fB^\fP, it matches a character \fInot\fP
+Xin the set.
+Xthe shorthand
+X.IR S \- E
+Xspecifies the set of characters
+X.I S
+Xthrough
+X.IR E ,
+Xinclusive.
+XThe special characters \fB]\fP and \fB\-\fP have no special meaning if they
+Xappear as the first characters in the set.
+X.nf
+X.ta \w'[a\-zA\-Z0\-9]    'u
+XExamples	Match
+X[a\-z]		any lowercase alpha
+X[^]\-]		any char except ] and \-
+X[^A\-Z]		any char except uppercase alpha
+X[a\-zA\-Z0\-9]	any alphanumeric
+X.fi
+X.Ti
+X[5]	\fB*\fP	Any regular expression form [1] to [4], followed by the
+Xclosure character (*) matches zero or more matches of that form.
+X.Ti
+X[6]	\fB+\fP	Same as [5], except it matches one or more.
+X.Ti
+X[7]	\e\|( \e)	A regular expression in the form [1] to [10], enclosed
+Xas \e\|(\fIform\fP\e) matches what form matches.
+XThe enclosure creates a set of tags, used for [8] and for pattern
+Xsubstitution in
+X.IR re_subs .
+XThe tagged forms are numbered starting from one.
+X.Ti
+X[8]	\ed	A \e followed by a digit matches whatever a previously tagged
+Xregular expression ([7]) matched.
+X.Ti
+X[9]	\fB\e<\fP	Matches the beginning of a \fIword\fP; that is,
+Xan empty string followed by a letter, digit, or _ and not preceded by a
+Xletter, digit, or _ .
+X.Ti
+X	\fB\e>\fP	Matches the end of a \fIword\fP; that is, an empty
+Xstring preceded by a letter, digit, or _ , and not followed by a letter,
+Xdigit, or _ .
+X.Ti
+X[10]		A composite regular expression \fIxy\fP where \fIx\fP and
+X\fIy\fP are in the form of [1] to [10] matches the longest match of \fIx\fP
+Xfollowed by a match for \fIy\fP.
+X.Ti
+X[11]	\fB^ $\fP	A regular expression starting with a \fB^\fP character
+Xand/or ending with a \fB$\fP character, restricts the pattern matching to the
+Xbeginning of the line, and/or the end of line (anchors).
+XElsewhere in the pattern, \fB^\fP and \fB$\fP are treated as ordinary
+Xcharacters.
+X.in -1i
+X.PP
+X.I Re_exec
+Xexecutes the internal form produced by
+X.I re_comp
+Xand searches the argument string for the regular expression described
+Xby the internal form.
+X.I Re_exec
+Xreturns 1 if the last regular expression pattern is matched within the string,
+X0 if no match is found.
+XIn case of an internal error (corrupted internal form),
+X.I re_exec
+Xcalls the user\-supplied
+X.I re_fail
+Xand returns 0.
+X.PP
+XThe strings passed to both
+X.I re_comp
+Xand
+X.I re_exec
+Xmay have trailing or embedded newline characters, but must be properly
+Xterminated with a NUL.
+X.PP
+X.I Re_subs
+Xdoes
+X.IR ed \-style
+Xpattern substitution, after a successful match is found by
+X.I re_exec.
+XThe source string parameter to
+X.I re_subs
+Xis copied to the destination string with the following interpretation:
+X.sp
+X.in +1i
+X.Ti
+X[1]	&	Substitute the entire matched string in the destination.
+X.Ti
+X[2]	\e\fId\fP	Substitute the substring matched by a tagged subpattern
+Xnumbered \fId\fP, where \fId\fP is between 1 and 9, inclusive.
+X.Ti
+X[3]	\e\fIc\fP	Treat the next character literally, unless the
+Xcharacter is a digit ([2]).
+X.in -1i
+X.PP
+XIf the copy operation with the substitutions is successful,
+X.I re_subs
+Xreturns 1.
+XIf the source string is corrupted, or the last call to
+X.I re_exec
+Xfails, it returns 0.
+X.PP
+X.I Re_modw
+Xis used to
+Xadd new characters into an internal table to
+Xchange the re_exec's understanding of what
+Xa \fIword\fP should look like, when matching with \fB\e<\fP and \fB\e>\fP
+Xconstructs. If the string parameter is 0 or null string,
+Xthe table is reset back to the default, which contains \fBA\-Z a\-z 0\-9 _\fP .
+X.PP
+X.I Re_fail
+Xis a user\-supplied routine to handle internal errors.
+X.I Re_exec
+Xcalls
+X.I re_fail
+Xwith an error message string, and the opcode character that caused the error.
+XThe default
+X.I re_fail
+Xroutine simply prints the message and the opcode character to the standard
+Xerror and calls
+X.IR exit (2).
+X.SH EXAMPLES
+XFor additional details, refer to the sources.
+X.PP
+X.RS
+X.nf
+X.ta \w'\e\|(foo\e)[1\-3]\e1    'u
+Xfoo*.*	fo foo fooo foobar fobar foxx ...
+X
+Xfo[ob]a[rz]	fobar fooar fobaz fooaz
+X
+Xfoo\e\e+	foo\e foo\e\e foo\e\e\e  ...
+X
+X\e\|(foo\e)[1\-3]\e1	foo1foo foo2foo foo3foo
+X(This is the same as \fIfoo[1\-3]foo\fP, but it takes less internal space.)
+X
+X\e\|(fo.*\e)\-\e1	foo\-foo fo\-fo fob\-fob foobar\-foobar ...
+X.fi
+X.RE
+X.SH DIAGNOSTICS
+X.I Re_comp
+Xreturns one of the following strings if an error occurs:
+X.RS
+X.nf
+X.I "No previous regular expression"
+X.I "Empty closure"
+X.I "Illegal closure"
+X.I "Cyclical reference"
+X.I "Undetermined reference"
+X.I "Unmatched \e\|("
+X.I "Missing ]"
+X.I "Null pattern inside \e\|(\e)"
+X.I "Null pattern inside \e<\e>"
+X.I "Too many \e\|(\e) pairs"
+X.I "Unmatched \e)"
+X.fi
+X.RE
+X.SH REFERENCES
+X.nf
+X.IR "Software tools" ", Kernighan & Plauger."
+X.IR "Software tools in Pascal" ", Kernighan & Plauger."
+X.IR "Grep sources [rsx\-11 C dist]" ", David Conroy."
+X.IR "Ed \- text editor" ", Unix Programmer's Manual."
+X.IR "Advanced editing on Unix" ", B. W. Kernighan."
+X.IR "RegExp sources" ", Henry Spencer."
+X.fi
+X.SH "HISTORY AND NOTES"
+XThese routines are
+X.IR Public Domain ,
+Xyou can get them in source.
+XThey are derived from various implementations found in the
+X.I "Software Tools"
+Xbooks, and David Conroy's
+X.IR grep .
+XThey are NOT derived from licensed/restricted software.
+XFor more interesting/academic/complicated implementations, see Henry Spencer's
+X.I regexp
+Xroutines, or the
+X.I "GNU Emacs"
+Xpattern
+Xmatching module.
+X.PP
+X.I Re_comp
+Xand
+X.I re_exec
+Xgenerally perform at least as well as their licensed counterparts.
+XIn a very few instances, they are about 10% to 15% slower.
+X.SH AUTHOR
+XOzan S. Yigit <yunexus!oz>.
+X.br
+XThis manual page was edited from the original by Rich $alz <rsalz@bbn.com>.
+X.SH BUGS
+XThe internal buffer for the compiled pattern is not checked for overflow;
+Xthe size is currently 1024 bytes.
+X.br
+XThere are no doubt other bugs, too.
+X.SH "SEE ALSO"
+Xed(1), egrep(1), fgrep(1), grep(1)
+END_OF_FILE
+  if test 7421 -ne `wc -c <'regex.3'`; then
+    echo shar: \"'regex.3'\" unpacked with wrong size!
+  fi
+  # end of 'regex.3'
+fi
+if test -f 'rfc822.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'rfc822.c'\"
+else
+  echo shar: Extracting \"'rfc822.c'\" \(13942 characters\)
+  sed "s/^X//" >'rfc822.c' <<'END_OF_FILE'
+X/*
+X**  Routines to read and write mail and news headers.  The code here
+X**  is gross and complicated, and it would be nice if somebody rewrote
+X**  it to be clean and simple, especially the CrackFrom routine.
+X*/
+X#include "gate.h"
+X#include <time.h>
+X#ifdef	RCSID
+Xstatic char RCS[] =
+X	"$Header: /nfs/papaya/u2/rsalz/src/newsgate/src/RCS/rfc822.c,v 1.5 91/02/12 14:54:00 rsalz Exp $";
+X#endif	/* RCSID */
+X
+X#ifdef	HAVE_TIMEB
+X#include <sys/timeb.h>
+X#else
+Xstruct timeb {
+X    time_t		time;
+X    unsigned short	millitm;
+X    short		timezone;
+X    short		dstflag;
+X};
+X#endif	/* HAVE_TIMEB */
+X
+Xextern time_t		time();
+Xextern char		*asctime();
+Xextern struct tm	*gmtime();
+X
+X#define HDR_OTHER		-1
+X#define HDR_END			FALSE
+X#define HDR_APPROVED		 1
+X#define HDR_CONTROL		 2
+X#define HDR_DATE		 3
+X#define HDR_DISTRIBUTION	 4
+X#define HDR_EXPIRE		 5
+X#define HDR_FOLLOWTO		 6
+X#define HDR_FROM 		 7
+X#define HDR_KEYWORDS		 8
+X#define HDR_MESSAGEID		 9
+X#define HDR_NEWSGROUP 		10
+X#define HDR_ORGANIZATION	11
+X#define HDR_REFERENCES		12
+X#define HDR_REPLYTO		13
+X#define HDR_SENDER		14
+X#define HDR_SUMMARY		15
+X#define HDR_TITLE 		16
+X
+X
+X/*
+X**  The list of headers we recognize; all others are stripped.
+X*/
+Xtypedef struct _HTYPE {
+X    char	*Name;
+X    int		Type;
+X} HTYPE;
+X
+XSTATIC HTYPE	HeaderList[] = {
+X    {	"Approved:",		HDR_APPROVED		},
+X    {	"Control:",		HDR_CONTROL		},
+X    {	"Date:",		HDR_DATE		},
+X    {	"Posted:",		HDR_DATE		},
+X    {	"Distribution:",	HDR_DISTRIBUTION	},
+X    {	"Expires:",		HDR_EXPIRE		},
+X    {	"Followup-To:",		HDR_FOLLOWTO		},
+X    {	"From:",		HDR_FROM		},
+X    {	"Keywords:",		HDR_KEYWORDS		},
+X    {	"Message-ID:",		HDR_MESSAGEID		},
+X    {	"Newsgroups:",		HDR_NEWSGROUP		},
+X    {	"Organization:",	HDR_ORGANIZATION	},
+X    {	"In-Reply-To:",		HDR_REFERENCES		},
+X    {	"References:",		HDR_REFERENCES		},
+X    {	"Reply-To:",		HDR_REPLYTO		},
+X    {	"Sender:",		HDR_SENDER		},
+X    {	"Summary:",		HDR_SUMMARY		},
+X    {	"Subject:",		HDR_TITLE		},
+X    {	"Title:",		HDR_TITLE		},
+X};
+X
+X
+X
+X/*
+X**  Getline is like fgets, but deals with continuation lines.  It also
+X**  ensures that even if a line that is too long is received, the
+X**  remainder of the line is thrown away instead of treated like a second
+X**  line.
+X*/
+XSTATIC char *
+XGetline(buf, len, fp)
+X    char		*buf;
+X    int			len;
+X    FILE		*fp;
+X{
+X    register char	*cp;
+X    register int	c;
+X    register int	n;
+X
+X    for (n = 0, cp = buf; n < len && (c = getc(fp)) != EOF && c != '\n'; )
+X	if (!iscntrl(c) || c == '\b' || c == '\t') {
+X	    *cp++ = c;
+X	    n++;
+X	}
+X    if (c == EOF && cp == buf)
+X	return NULL;
+X    *cp = '\0';
+X
+X    if (c != '\n')
+X	/* Line too long - part read didn't fit into a newline */
+X	while ((c = getc(fp)) != '\n' && c != EOF)
+X	    ;
+X    else if (cp == buf) {
+X	/* Don't look for continuation of blank lines */
+X	*cp++ = '\n';
+X	*cp = '\0';
+X	return buf;
+X    }
+X
+X    while ((c = getc(fp)) == ' ' || c == '\t') {
+X	/* Continuation line. */
+X	if ((n += 2) < len) {
+X	    *cp++ = '\n';
+X	    *cp++ = c;
+X	}
+X	while ((c = getc(fp)) != '\n' && c != EOF)
+X	    if ((!iscntrl(c) || c == '\b' || c == '\t') && n++ < len)
+X		*cp++ = c;
+X    }
+X    if (n >= len - 1)
+X	cp = buf + len - 2;
+X    *cp++ = '\n';
+X    *cp = '\0';
+X    if (c != EOF)
+X	/* push back first char of next header */
+X	(void)ungetc(c, fp);
+X    return buf;
+X}
+X
+X
+X/*
+X**  I guess this is basically strncasecmp
+X*/
+XSTATIC int
+Xprefix(full, pref)
+X    register char	*full;
+X    register char	*pref;
+X{
+X    register char	fc;
+X    register char	pc;
+X
+X    while (pc = *pref++) {
+X	fc = *full++;
+X	if (isupper(fc))
+X	    fc = tolower(fc);
+X	if (isupper(pc))
+X	    pc = tolower(pc);
+X	if (fc != pc)
+X	    return FALSE;
+X    }
+X    return TRUE;
+X}
+X
+X
+XSTATIC int
+XHeaderType(p)
+X    register char	*p;
+X{
+X    static int		save = HDR_END;
+X    register HTYPE	*hp;
+X    char		*colon;
+X    char		*space;
+X
+X    /* some consistency checks (i.e. is this really a header line?) */
+X    if (p == NULL || !isascii(*p) || *p == '\n')
+X	return save = HDR_END;
+X
+X    if (WHITE(*p))
+X	/* Continuation line. */
+X	return save;
+X
+X    /* If we don't get a "<no space> <colon> <space>", it's not a header. */
+X    if ((colon = IDX(p, ':')) == NULL
+X     || ((space = IDX(p, ' ')) && space < colon))
+X	return save = HDR_END;
+X
+X    for (hp = HeaderList; hp < ENDOF(HeaderList); hp++)
+X	if (prefix(p, hp->Name))
+X	    return save = hp->Type;
+X    return save = HDR_OTHER;
+X}
+X
+X
+X/*
+X**  Get the contents of the field of the header line, appending it, with a
+X**  space delimeter if it's a continuation line.  If there is already
+X**  something in the header storage, skip this header line and the
+X**  continuations.
+X*/
+XSTATIC void
+Xgetfield(src, dest, size)
+X    register char	*src;
+X    register char	*dest;
+X    register int	size;
+X{
+X    static int		skip = FALSE;
+X    register char	*p;
+X
+X    if (src == NULL || dest == NULL)
+X	return;
+X
+X    if (WHITE(*src)) {
+X	/* Continuation line.  If skipping or no room, ignore. */
+X	if (skip || (size -= strlen(dest)) <= 0)
+X	    return;
+X	/* Munch all but one whitespace, append it to header. */
+X	while (*src && WHITE(*src))
+X	    src++;
+X	*--src = ' ';
+X	(void)strncat(dest, src, size - 1);
+X    }
+X    else {
+X	skip = FALSE;
+X	if (*dest) {
+X	    /* Already got a value, so mark this as one to skip. */
+X	    skip = TRUE;
+X	    return;
+X	}
+X	if ((src = IDX(src, ':')) == NULL)
+X	    /* Can't happen! */
+X	    return;
+X	/* Skip colon, eat whitespace. */
+X	for (src++; *src && WHITE(*src); )
+X	    src++;
+X	(void)strncpy(dest, src, size - 1);
+X    }
+X
+X    /* Munch trailing whitespace. */
+X    for (p = dest + strlen(dest); --p >= dest && (*p == '\n' || WHITE(*p)); )
+X	;
+X    p[1] = '\0';
+X}
+X
+X
+XSTATIC time_t
+Xcgtdate(datestr)
+X    char		*datestr;
+X{
+X    static time_t	lasttime;
+X    static char		save[SM_SIZE];
+X    char		junk[40];
+X    char		month[40];
+X    char		day[30];
+X    char		tod[60];
+X    char		year[50];
+X    char		buf[SM_SIZE];
+X    extern time_t	getdate();
+X
+X    if (save[0] && EQ(datestr, save))
+X	return lasttime;
+X    lasttime = getdate(datestr, (struct timeb *)NULL);
+X    if (lasttime < 0 &&
+X      sscanf(datestr, "%s %s %s %s %s", junk, month, day, tod, year) == 5) {
+X	(void)sprintf(buf, "%s %s, %s %s", month, day, year, tod);
+X	lasttime = getdate(buf, (struct timeb *)NULL);
+X    }
+X    (void)strncpy(save, datestr, sizeof save);
+X    return lasttime;
+X}
+X
+X
+X/*
+X**  Print the date in ARPA format, not ctime(3) format.
+X*/
+XSTATIC void
+XDoDate(fp, ud)
+X    FILE		*fp;
+X    register char	*ud;
+X{
+X    register char	*p;
+X    register char	*q;
+X    register int	i;
+X    char		buff[SM_SIZE];
+X
+X    q = buff;
+X
+X#if	0
+X    /* until every site installs the fix to getdate.y, the day
+X     * of the week can cause time warps */
+X    /* "Mon, " */
+X    p = &ud[0]; *q++ = *p++; *q++ = *p++; *q++ = *p++; *q++ = ','; *q++ = ' ';
+X#endif	/* 0 */
+X
+X    /* "16" */
+X    p = &ud[8];
+X    if (*p == ' ')
+X	p++;
+X    else
+X	*q++ = *p++;
+X    *q++ = *p++; *q++ = ' ';
+X
+X    /* "Sep " */
+X    p = &ud[4]; *q++ = *p++; *q++ = *p++; *q++ = *p++; *q++ = ' ';
+X
+X    /* "79 " */
+X    p = &ud[22]; *q++ = *p++; *q++ = *p++; *q++ = ' ';
+X
+X    /* "01:03:52" */
+X    for (p = &ud[11], i = 8; i > 0; i--)
+X	*q++ = *p++;
+X
+X    /* " GMT" */
+X    *q++ = ' '; *q++ = 'G'; *q++ = 'M'; *q++ = 'T'; *q = '\0';
+X
+X    Fprintf(fp, "Date: %s\n", buff);
+X}
+X
+X
+X/*
+X**  Strip leading and trailing spaces; returns pointer to first non-space.
+X*/
+XSTATIC char *
+XStripSpaces(s)
+X    register char	*s;
+X{
+X    register char	*cp;
+X
+X    if (s == NULL || *s == '\0')
+X	return s;
+X
+X    /* Skip leading spaces. */
+X    while (*s && isspace(*s))
+X	s++;
+X
+X    /* zap trailing spaces */
+X    for (cp = &s[strlen(s) - 1]; cp > s && isspace(*cp); )
+X	cp--;
+X    cp[1] = '\0';
+X    return s;
+X}
+X
+X
+X/*
+X**  Crack an RFC822 from header field into address and fullname.  We do
+X**  this to make sure we write things out in official form.  "Be liberal
+X**  in what you accept, conservative in what you generate."  Anyhow, we
+X**  read things into three buffers, one for all <...> text, one for all
+X**  (...) text, and a third for stuff not in either.  Either the first or
+X**  third buffer will be the real address, depending on whether there is
+X**  anything in buffer two or not.
+X*/
+Xint
+XCrackFrom(addr, name, p)
+X    char		*addr;
+X    char		*name;
+X    char		*p;
+X{
+X    register char	*ap;
+X    register char	*cp;
+X    register int	flag;
+X    register int	comment;
+X    register int	address;
+X    register int	addrfound;
+X    char		*comm;
+X    char		commbuf[LG_SIZE];
+X    char		addrbuf[LG_SIZE];
+X
+X    /* Just to make sure. */
+X    *name = '\0';
+X    *addr = '\0';
+X
+X    if (p == NULL)
+X	return FALSE;
+X
+X    /* Eat leading white space. */
+X    while (*p && isspace(*p))
+X	p++;
+X
+X    /* Set defaults.  Start with an allocated copy of a comment string. */
+X    comm = COPY("");
+X    ap = addrbuf;
+X    comment = 0;
+X    addrfound = 0;
+X    address = 0;
+X    for (flag = 0; *p; p++) {
+X	switch (*p) {
+X	case '"':
+X	    if (flag) {
+X		flag--;
+X		goto EndComment;
+X	    }
+X	    flag++;
+X	    /* FALLTHROUGH */
+X	case '(':
+X	    if (comment == 0) {
+X		cp = commbuf;
+X		*cp = '\0';
+X	    }
+X	    comment++;
+X	    break;
+X	case ')':
+X    EndComment:
+X	    if (comment > 0 && --comment == 0) {
+X		if (*p != ')' && *p != '"')
+X		    *cp++ = *p;		/* Copy the comment-closer */
+X		*cp = '\0';
+X		if (*comm == '\0') {
+X		    free(comm);
+X		    comm = COPY(&commbuf[1]);
+X		}
+X		else {
+X		    cp = NEW(char, strlen(comm) + 2 + strlen(&commbuf[1]) + 1);
+X		    (void)sprintf(cp, "%s, %s", comm, &commbuf[1]);
+X		    free(comm);
+X		    comm = cp;
+X		}
+X		cp = NULL;
+X		continue;
+X	    }
+X	    break;
+X	case '<':
+X	    if (address) {
+X		free(comm);
+X		return FALSE;	/* AWK! Abort! */
+X	    }
+X	    if (!comment) {
+X		address++;
+X		*ap = '\0';
+X		ap = addr;
+X	    }
+X	    break;
+X	case '>':
+X	    if (!comment && address) {
+X		address--;
+X		addrfound++;
+X		*ap = '\0';
+X		ap = &addrbuf[strlen(addrbuf)];
+X		p++;	/* skip the `>' */
+X	    }
+X	    break;
+X	}
+X
+X	if (comment)
+X	    *cp++ = *p;
+X	else if (!address || *p != '<')
+X	    *ap++ = *p;
+X	if (*p == '\0')
+X	    break;
+X    }
+X
+X    *ap++ = '\0';
+X
+X    if (addrfound) {
+X	Strcpy(name, StripSpaces(addrbuf));
+X	Strcpy(addr, strcpy(commbuf, StripSpaces(addr)));
+X    }
+X    else {
+X	(void)strcpy(addr, StripSpaces(addrbuf));
+X	*name = '\0';
+X    }
+X    /* Just to be sure that we got the full name, we'll take all of
+X     * the comments. */
+X    if (*comm) {
+X	if (*name)
+X	    Strcat(name, ", ");
+X	Strcat(name, comm);
+X    }
+X    free(comm);
+X    return TRUE;
+X}
+X
+X
+X/*
+X**  Write out an RFC822 header, paying no attention to line limits.
+X**  Ideally, we should do continuations in here...
+X*/
+Xint
+Xrfc822write(hp, fp)
+X    register HBUF	*hp;
+X    register FILE	*fp;
+X{
+X    time_t		t;
+X
+X    if (hp->path[0])
+X	Fprintf(fp, "Path: %s\n", hp->path);
+X    if (hp->from[0])
+X	Fprintf(fp, "From: %s\n", hp->from);
+X    if (hp->nbuf[0])
+X	Fprintf(fp, "Newsgroups: %s\n", hp->nbuf);
+X    if (hp->title[0])
+X	Fprintf(fp, "Subject: %s\n", hp->title);
+X    if (hp->ident[0])
+X	Fprintf(fp, "Message-ID: %s\n", hp->ident);
+X    /* Get current time. This will be used resolve the timezone. */
+X    t = hp->subdate[0] ? cgtdate(hp->subdate) : time((time_t *)NULL);
+X    DoDate(fp, asctime(gmtime(&t)));
+X    if (hp->expdate[0])
+X	Fprintf(fp, "Expires: %s\n", hp->expdate);
+X    if (hp->followid[0])
+X	Fprintf(fp, "References: %s\n", hp->followid);
+X    if (hp->ctlmsg[0])
+X	Fprintf(fp, "Control: %s\n", hp->ctlmsg);
+X    if (hp->sender[0])
+X	Fprintf(fp, "Sender: %s\n", hp->sender);
+X    if (hp->replyto[0])
+X	Fprintf(fp, "Reply-To: %s\n", hp->replyto);
+X    if (hp->followto[0])
+X	Fprintf(fp, "Followup-To: %s\n", hp->followto);
+X    if (hp->distribution[0])
+X	Fprintf(fp, "Distribution: %s\n", hp->distribution);
+X    if (hp->organization[0])
+X	Fprintf(fp, "Organization: %s\n", hp->organization);
+X    if (hp->keywords[0])
+X	Fprintf(fp, "Keywords: %s\n", hp->keywords);
+X    if (hp->summary[0])
+X	Fprintf(fp, "Summary: %s\n", hp->summary);
+X    if (hp->approved[0])
+X	Fprintf(fp, "Approved: %s\n", hp->approved);
+X    Fprintf(fp, "\n");
+X    return !ferror(fp);
+X}
+X
+X
+Xrfc822read(hp, fp, buff, buffsize)
+X    register HBUF	*hp;
+X    register FILE	*fp;
+X    char		*buff;
+X    int			buffsize;
+X{
+X    register int	i;
+X    long		curpos;
+X
+X    /* Zap out the headers. */
+X    hp->approved[0] = '\0';
+X    hp->ctlmsg[0] = '\0';
+X    hp->subdate[0] = '\0';
+X    hp->distribution[0] = '\0';
+X    hp->expdate[0] = '\0';
+X    hp->followto[0] = '\0';
+X    hp->from[0] = '\0';
+X    hp->followid[0] = '\0';
+X    hp->keywords[0] = '\0';
+X    hp->ident[0] = '\0';
+X    hp->nbuf[0] = '\0';
+X    hp->organization[0] = '\0';
+X    hp->title[0] = '\0';
+X    hp->replyto[0] = '\0';
+X    hp->summary[0] = '\0';
+X    hp->path[0] = '\0';
+X    hp->sender[0] = '\0';
+X
+X    i = HeaderType(buff);
+X    do {
+X	curpos = ftell(fp);
+X	switch (i) {
+X	case HDR_APPROVED:
+X	    getfield(buff, hp->approved, sizeof hp->approved);
+X	    break;
+X	case HDR_CONTROL:
+X	    getfield(buff, hp->ctlmsg, sizeof hp->ctlmsg);
+X	    break;
+X	case HDR_DATE:
+X	    getfield(buff, hp->subdate, sizeof hp->subdate);
+X	    break;
+X	case HDR_DISTRIBUTION:
+X	    getfield(buff, hp->distribution, sizeof hp->distribution);
+X	    break;
+X	case HDR_EXPIRE:
+X	    getfield(buff, hp->expdate, sizeof hp->expdate);
+X	    break;
+X	case HDR_FOLLOWTO:
+X	    getfield(buff, hp->followto, sizeof hp->followto);
+X	    break;
+X	case HDR_FROM:
+X	    getfield(buff, hp->from, sizeof hp->from);
+X	    break;
+X	case HDR_KEYWORDS:
+X	    getfield(buff, hp->keywords, sizeof hp->keywords);
+X	    break;
+X	case HDR_MESSAGEID:
+X	    getfield(buff, hp->ident, sizeof hp->ident);
+X	    break;
+X	case HDR_NEWSGROUP:
+X	    getfield(buff, hp->nbuf, sizeof hp->nbuf);
+X	    break;
+X	case HDR_ORGANIZATION:
+X	    getfield(buff, hp->organization, sizeof hp->organization);
+X	    break;
+X	case HDR_REFERENCES:
+X	    getfield(buff, hp->followid, sizeof hp->followid);
+X	    break;
+X	case HDR_REPLYTO:
+X	    getfield(buff, hp->replyto, sizeof hp->replyto);
+X	    break;
+X	case HDR_SENDER:
+X	    getfield(buff, hp->sender, sizeof hp->sender);
+X	    break;
+X	case HDR_SUMMARY:
+X	    getfield(buff, hp->summary, sizeof hp->summary);
+X	    break;
+X	case HDR_TITLE:
+X	    getfield(buff, hp->title, sizeof hp->title);
+X	    break;
+X	}
+X    } while ((i = HeaderType(Getline(buff, buffsize, fp))) != HDR_END);
+X
+X    if (*buff != '\n')
+X	(void)fseek(fp, curpos, 0);
+X}
+END_OF_FILE
+  if test 13942 -ne `wc -c <'rfc822.c'`; then
+    echo shar: \"'rfc822.c'\" unpacked with wrong size!
+  fi
+  # end of 'rfc822.c'
+fi
+echo shar: End of archive 2 \(of 4\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 4 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 4 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still must unpack the following archives:
+    echo "        " ${MISSING}
+fi
+exit 0
+exit 0 # Just in case...

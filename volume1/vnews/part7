@@ -1,0 +1,2656 @@
+From: decvax!vax135!hou3c!ka
+Date: Mon, 21 Jan 85 22:39:59 est
+Newsgroups: mod.sources
+Subject: Vnews part 7
+
+# Welcome to vnews release 2.11-B 1/17/85.
+# This is part 7 out of 7.
+# Feed me into sh (NOT csh).
+
+if test ! -d vnews
+then	mkdir vnews
+fi
+
+cat > vnews/virtterm.c <<\!E!O!F!
+/*
+ *  Virtual terminal handler
+ *  Written by Kenneth Almquist, AGS Computers  (HO 4C601, X7105).
+ *  Modified by Stephen Hemminger, to use TERMCAP (without curses)
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+
+#define ANSI	/* support multiple line insert/delete */
+#define MAXPLEN 24
+#define MAXLLEN 80
+#define BOTLINE (ROWS - 1)
+#define DIRTY 01
+
+/* terminal escape sequences from termcap */
+#define HO _tstr[0]		/* home */
+#define CL _tstr[1]		/* clear screen */
+#define CD _tstr[2]		/* clear to end of screen */
+#define CE _tstr[3]		/* clear to end of line */
+#define xUP _tstr[4]		/* up one line */
+#define DO _tstr[5]		/* down one line */
+#define US _tstr[6]		/* underline */
+#define UE _tstr[7]		/* underline end */
+#define BT _tstr[8]		/* backtab */
+#define xBC _tstr[9]		/* backspace */
+#define AL _tstr[10]		/* insert line */
+#define DL _tstr[11]		/* delete line */
+#define CM _tstr[12]		/* cursor move */
+#define CH _tstr[13]		/* cursor horizontal move */
+#define CV _tstr[14]		/* cursor vertical move */
+#define CS _tstr[15]		/* scrolling region */
+#define SF _tstr[16]		/* scroll forwards */
+#define SR _tstr[17]		/* scroll backwards */
+#define TI _tstr[18]		/* start cursor mode */
+#define TE _tstr[19]		/* end cursor mode */
+#define TA _tstr[20]		/* tab char (if not \t) */
+#define CR _tstr[21]		/* carriage return (if not \r) */
+#define xPC _tstr[22]		/* for reading pad character */
+#ifdef ANSI
+#define ALC _tstr[23]		/* insert multiple lines */
+#define DLC _tstr[24]		/* delete multiple lines */
+#endif
+char PC;			/* pad character */
+char *BC, *UP;			/* external variables for tgoto */
+
+#ifdef ANSI
+static char sname[] = "hoclcdceupdousuebtbcaldlcmchcvcssfsrtitetacrpcALDL";
+char *_tstr[25];
+#else
+static char sname[] = "hoclcdceupdousuebtbcaldlcmchcvcssfsrtitetacrpc";
+char *_tstr[23];
+#endif
+int     HOlen;			/* length of HO string */
+
+
+/* terminal flags */
+#define BS _tflg[0]		/* can backspace */
+#define AM _tflg[1]		/* has auto margins */
+#define XN _tflg[2]		/* no newline after wrap */
+#define RET !_tflg[3]		/* has carriage return */
+#define NS _tflg[4]		/* has SF (scroll forward) */
+#define PT _tflg[5]		/* has tabs */
+#define XT _tflg[6]		/* tabs are destructive */
+int	GT = 1;			/* tab stops on terminal are set */
+
+static char bname[] = "bsamxnncnsptxt";
+char _tflg[7];
+
+
+extern char *tgoto(), *tgetstr();
+extern char *getenv(), *strcpy();
+
+#define ULINE 0200
+#define CURSEEN 1
+
+/* Constants accessable by user */
+int     hasscroll;		/* scrolling type, 0 == no scrolling */
+int     ROWS;			/* number of lines on screen */
+int     COLS;			/* width of screen */
+int	needbeep;		/* user sets this to generate beep */
+
+struct line {
+	char    len;
+	char    flags;
+	char    l[MAXLLEN];
+};
+
+int     _row, _col;
+int     _srow, _scol;
+struct line _virt[MAXPLEN], _actual[MAXPLEN];
+int     _uline = 0;
+int     _junked = 1;
+int     _curjunked;
+int	_partupd;
+int     _dir = 1;
+int	_shifttop, _shiftbot;
+int	_shift;
+int	_scratched;
+int     vputc();
+
+
+
+/*
+ * Tell refresh to shift lines in region upwards count lines.  Count
+ * may be negative.  The virtual image is not shifted; this may change
+ * later.  The variable _scratched is set to supress all attempts to
+ * shift.
+ */
+
+ushift(top, bot, count) {
+	if (_scratched)
+		return;
+	if (_shift != 0 && (_shifttop != top || _shiftbot != bot)) {
+		_scratched++;
+		return;
+	}
+	_shifttop = top;
+	_shiftbot = bot;
+	_shift += count;
+}
+
+
+
+/*
+ * generate a beep on the terminal
+ */
+
+beep() {
+	vputc('\7');
+}
+
+/*
+ * Move to one line below the bottom of the screen.
+ */
+
+botscreen() {
+	_amove(BOTLINE, 0);
+	vputc('\n');
+	vflush();
+}
+
+
+
+move(row, col) {
+	if (row < 0 || row >= ROWS || col < 0 || col >= COLS)
+		return;
+	_row = row;
+	_col = col;
+}
+
+
+
+/*
+ * Output string at specified location.
+ */
+
+mvaddstr(row, col, str)
+	char *str;
+	{
+	move(row, col);
+	addstr(str);
+}
+
+
+addstr(s)
+char   *s;
+{
+	register char  *p;
+	register struct line   *lp;
+	register int    col = _col;
+
+	lp = &_virt[_row];
+	if (lp->len < col) {
+		p = &lp->l[lp->len];
+		while (lp->len < col) {
+			*p++ = ' ';
+			lp->len++;
+		}
+	}
+	for (p = s; *p != '\0'; p++) {
+		if (*p == '\n') {
+			lp->len = col;
+			lp->flags |= DIRTY;
+			col = 0;
+			if (++_row >= ROWS)
+				_row = 0;
+			lp = &_virt[_row];
+		}
+		else {
+			lp->l[col] = *p;
+			lp->flags |= DIRTY;
+			if (++col >= COLS) {
+				lp->len = COLS;
+				col = 0;
+				if (++_row >= ROWS)
+					_row = 0;
+				lp = &_virt[_row];
+			}
+		}
+	}
+	if (lp->len <= col)
+		lp->len = col;
+	_col = col;
+}
+
+
+
+addch (c) {
+	register struct line   *lp;
+	register char  *p;
+
+	lp = &_virt[_row];
+	if (lp->len < _col) {
+		p = &lp->l[lp->len];
+		while (lp->len < _col) {
+			*p++ = ' ';
+			lp->len++;
+		}
+	}
+	lp->l[_col] = c;
+	if (lp->len == _col)
+		lp->len++;
+	if (++_col >= COLS) {
+		_col = 0;
+		if (++_row >= ROWS)
+			_row = 0;
+	}
+	lp->flags |= DIRTY;
+}
+
+
+
+clrtoeol() {
+	register struct line   *lp;
+
+	lp = &_virt[_row];
+	if (lp->len > _col) {
+		lp->len = _col;
+		lp->flags |= DIRTY;
+	}
+}
+
+
+/*
+ * Clear an entire line.
+ */
+
+clrline(row) {
+	register struct line   *lp;
+
+	lp = &_virt[row];
+	if (lp->len > 0) {
+		lp->len = 0;
+		lp->flags |= DIRTY;
+	}
+}
+
+
+
+clear() {
+	erase();
+	_junked++;
+}
+
+
+
+erase() {
+	register    i;
+
+	for (i = 0; i < ROWS; i++) {
+		_virt[i].len = 0;
+		_virt[i].flags |= DIRTY;
+	}
+}
+
+
+
+/*
+ * Leave lines as they are on the screen.
+ */
+
+nochange(line1, line2) {
+	while (line1 <= line2) {
+		_virt[line1] = _actual[line1] ;
+		if (_junked)
+			clrline(line1) ;
+		line1++ ;
+	}
+}
+
+
+
+refresh() {
+	register int i;
+	register int j;
+	int len;
+	int needchk;
+	register char *p, *q;
+
+/*
+	if (checkin())
+		return;
+*/
+	needchk = 0;
+	i = 1;
+	if (_junked) {
+		_sclear();
+		_junked = 0;
+	} else if (! _scratched) {
+		if (_shift) {
+			needchk++;
+			if (_shift > 0)
+			_ushift(_shifttop, _shiftbot, _shift);
+			else
+			i = _dshift(_shifttop, _shiftbot, -_shift);
+		} else {
+			i = _dir;
+		}
+	}
+	_dir = i;
+	_dir = 1;		/* forget about _dir stuff */
+	_shift = 0;
+	_partupd = 1;
+	if (needchk && checkin())
+		return;
+	_scratched = 0;
+	_fixlines();
+	for (i = _dir > 0 ? 0 : BOTLINE; i >= 0 && i < ROWS; i += _dir) {
+		if ((_virt[i].flags & DIRTY) == 0)
+			continue;
+		_ckclrlin(i);		/* decide whether to do a clear line */
+					/* probably should consider cd as well */
+		len = _virt[i].len;
+		if (_actual[i].len < len)
+			len = _actual[i].len;
+		p = _virt[i].l;
+		q = _actual[i].l;
+		for (j = 0; j < len; j++) {
+			if (*p != *q) {
+				_amove(i, j);
+				_aputc(*p);
+				*q = *p;
+			}
+			p++, q++;
+		}
+		len = _virt[i].len;
+		if (_actual[i].len > len) {
+			_clrtoeol(i, len);
+		}
+		else {
+			for (; j < len; j++) {
+				if (*p != ' ') {
+					_amove(i, j);
+					_aputc(*p);
+				}
+				*q++ = *p++;
+			}
+			_actual[i].len = len;
+		}
+		if (checkin())
+			return;
+	}
+	_dir = 1;
+	if (needbeep) {
+		beep();
+		needbeep = 0;
+	}
+	if (CURSEEN)
+		_amove(_row, _col);
+	vflush();			/* flush output buffer */
+	_partupd = 0;
+}
+
+
+#define badshift(i, count) (_actual[i].len != _virt[i+count].len || strncmp(_actual[i].l, _virt[i+count].l, _actual[i].len) != 0)
+
+_dshift(top, bot, count) {
+	register    i;
+
+	if (count >= bot - top || hasscroll < 4) {  /* must have CS or AL/DL */
+		_scratched++;
+		return 1;
+	}
+	for (i = bot - count; _actual[i].len == 0 || _partupd && badshift(i, count); i--)
+		if (i == top)
+			return 1;
+	for (i = top; i <= bot; i++)
+		_virt[i].flags |= DIRTY;
+	for (i = bot; i >= top + count; i--)
+		_actual[i] = _actual[i - count];
+	for (; i >= top; i--)
+		_actual[i].len = 0;
+
+	if (hasscroll != 5) {		/* can we define scrolling region, and scroll back */
+		tputs(tgoto(CS, bot, top), 1, vputc);/* define scroll region */
+		_curjunked = 1;
+		_amove(top, 0);
+		for (i = count; --i >= 0;)
+			tputs(SR, 1, vputc);/* scroll back */
+		tputs(tgoto(CS, BOTLINE, 0), 1, vputc);
+		_curjunked = 1;
+	} else {
+		_amove(bot - count + 1, 0);
+		if (CD && bot == BOTLINE)
+			tputs(CD, 1, vputc);
+		else {
+#ifdef ANSI
+			if (DLC && count > 1)
+				tputs(tgoto(DLC, count, count), 0, vputc);
+			else
+#endif
+			for (i = count; --i >= 0;)
+				tputs(DL, ROWS - _srow, vputc);
+		}
+		_amove(top, 0);
+#ifdef ANSI
+		if (count > 1 && ALC)
+			tputs(tgoto(ALC, count, count), 0, vputc), count=0;
+#endif
+		for (i = count; --i >= 0;)
+			tputs(AL, ROWS - _srow, vputc);
+	}
+	return -1;
+}
+
+
+_ushift(top, bot, count) {
+	register    i;
+
+	if (count >= bot - top || hasscroll == 0) {
+		return;
+	}
+	for (i = top + count; _actual[i].len == 0 || _partupd && badshift(i, -count); i++)
+		if (i == bot)
+			return;
+	if (hasscroll == 1 || hasscroll == 3) {
+		/* we cheat and shift the entire screen */
+		/* be sure we are shifting more lines into than out of position */
+		if ((bot - top + 1) - count <= ROWS - (bot - top + 1))
+			return;
+		top = 0, bot = BOTLINE;
+	}
+	for (i = top; i <= bot; i++)
+		_virt[i].flags |= DIRTY;
+	for (i = top; i <= bot - count; i++)
+		_actual[i] = _actual[i + count];
+	for (; i <= bot; i++)
+		_actual[i].len = 0;
+
+	if (hasscroll != 5) {
+		if (top != 0 || bot != BOTLINE) {
+			tputs(tgoto(CS, bot, top), 0, vputc);
+			_curjunked = 1;
+		}
+		_amove(bot, 0);	/* move to bottom */
+		for (i = 0; i < count; i++) {
+			if (SF)		/* scroll forward */
+				tputs(SF, 1, vputc);
+			else
+				vputc('\n');
+		}
+		if (top != 0 || bot != BOTLINE) {
+			tputs(tgoto(CS, BOTLINE, 0), 0, vputc);
+			_curjunked = 1;
+		}
+	} else {
+		_amove(top, 0);
+#ifdef ANSI
+		if (DLC && count > 1)
+			tputs(tgoto(DLC, count, count), 0, vputc);
+		else
+#endif
+		for (i = count; --i >= 0;)
+			tputs(DL, ROWS - _srow, vputc);
+		if (bot < BOTLINE) {
+			_amove(bot - count + 1, 0);
+#ifdef ANSI
+			if (ALC && count > 1)
+				tputs(tgoto(ALC, count, count), 0, vputc), count=0;
+#endif
+			for (i = count; --i >= 0;)
+				tputs(AL, ROWS - _srow, vputc);
+		}
+	}
+}
+
+
+_sclear() {
+	register struct line   *lp;
+
+	tputs(CL, 0, vputc);
+	_srow = _scol = 0;
+	for (lp = _actual; lp < &_actual[ROWS]; lp++) {
+		lp->len = 0;
+	}
+	for (lp = _virt; lp < &_virt[ROWS]; lp++) {
+		if (lp->len != 0)
+			lp->flags |= DIRTY;
+	}
+}
+
+
+_clrtoeol(row, col) {
+	register struct line *lp = &_actual[row];
+	register i;
+
+	if (CE && lp->len > col + 1) {
+		_amove(row, col);
+		tputs(CE, 1, vputc);
+	} else {
+		for (i = col ; i < lp->len ; i++) {
+			if (lp->l[i] != ' ') {
+				_amove(row, i);
+				_aputc(' ');
+			}
+		}
+	}
+	lp->len = col;
+}
+
+
+_fixlines() {
+	register struct line   *lp;
+	register char  *p;
+	register int    i;
+
+	for (i = 0; i < ROWS; i++) {
+		lp = &_virt[i];
+		if (lp->flags & DIRTY) {
+			lp = &_virt[i];
+			for (p = &lp->l[lp->len]; --p >= lp->l && *p == ' ';);
+			lp->len = (int)(p - lp->l) + 1;
+			if (lp->len == _actual[i].len && strncmp(lp->l, _actual[i].l, lp->len) == 0)
+				lp->flags &= ~DIRTY;
+		}
+	}
+}
+
+
+/*
+ * Consider clearing the line before overwriting it.
+ * We always clear a line if it has underlined characters in it
+ * because these can cause problems.  Otherwise decide whether
+ * that will decrease the number of characters to change.  This
+ * routine could probably be simplified with no great loss.
+ */
+
+_ckclrlin(i) {
+	int     eval;
+	int     len;
+	int     first;
+	register struct line   *vp, *ap;
+	register int    j;
+
+	if (!CE)
+		return;
+	ap = &_actual[i];
+	vp = &_virt[i];
+	len = ap->len;
+	eval = -strlen(CE);
+	if (len > vp->len) {
+		len = vp->len;
+		eval = 0;
+	}
+	for (j = 0; j < len && vp->l[j] == ap->l[j]; j++);
+	if (j == len)
+		return;
+	first = j;
+	while (j < len) {
+		if (vp->l[j] == ' ') {
+			if (ap->l[j] != ' ') {
+				while (++j < len && vp->l[j] == ' ' && ap->l[j] != ' ') {
+					eval++;
+				}
+				if (j == len)
+					eval++;
+				continue;
+			}
+		}
+		else {
+			if (vp->l[j] == ap->l[j]) {
+				while (++j < len && vp->l[j] == ap->l[j]) {
+					eval--;
+				}
+				continue;
+			}
+		}
+		j++;
+	}
+	if (US) {
+		for (j = 0 ; j < ap->len ; j++) {
+			if (ap->l[j] & ULINE) {
+				eval = 999;
+				if (first > j)
+					first = j;
+				break;
+			}
+		}
+	}
+	for (j = first; --j >= 0;)
+		if (vp->l[j] != ' ')
+			break;
+	if (j < 0)
+		first = 0;
+	if (eval > 0) {
+		_amove(i, first);
+		tputs(CE, 0, vputc);
+		_actual[i].len = first;
+	}
+}
+
+
+
+/*
+ * Move routine
+ * 	first compute direct cursor address string and cost
+ *	then relative motion string and cost,
+ *	then home then relative and cost
+ *	choose smallest and do it.
+ *
+ *	The plod stuff is to build the strings (with padding) then decide
+ */
+static char *plodstr;		/* current location in relmove string */
+
+plodput(c) { *plodstr++ = c; }
+
+_amove(row, col) {
+	char direct[20];
+	char rel[4 * MAXPLEN + 3 * MAXLLEN];
+	char ho[3 * MAXPLEN + 3 * MAXLLEN];
+	int cost, newcost;
+	register char *movstr;
+
+	if (row == _srow && col == _scol && _curjunked == 0)
+		return;
+	_setul(0);
+
+	cost = 999;
+	if (CM) {
+		plodstr = direct;
+		tputs(tgoto(CM, col, row), 0, plodput);
+		*plodstr = '\0';
+		cost = plodstr - direct;
+		movstr = direct;
+	}
+	if (_curjunked == 0) {
+		plodstr = rel;
+		if (_vmove(_srow, row) >= 0
+		 && plodstr - rel < cost
+		 && _hmove(_scol, col, row) >= 0
+		 && (newcost = plodstr - rel) < cost) {
+			*plodstr = '\0';
+			cost = newcost;
+			movstr = rel;
+		}
+	}
+	if (cost > HOlen) {	/* is it worth calculating */
+		plodstr = ho;
+		tputs(HO, 0, plodput);
+		if (_vmove(0, row) >= 0
+		 && plodstr - rel < cost
+		 && _hmove(0, col, row) >= 0
+		 && (newcost = plodstr - ho) < cost) {
+			*plodstr = '\0';
+			cost = newcost;
+			movstr = ho;
+		}
+	}
+
+	while (--cost >= 0) {
+		vputc(*movstr++);
+	}
+	_srow = row, _scol = col;
+	_curjunked = 0;
+}
+
+
+_vmove(orow, nrow) {
+	char direct[64];
+	char *saveplod = plodstr;
+
+	if (CV) {
+		plodstr = direct;
+		tputs(tgoto(CV, nrow, nrow), 0, plodput);
+		*plodstr = '\0';
+		plodstr = saveplod;
+	}
+	if (orow > nrow) {		/* cursor up */
+		if (! UP)
+			return -1;
+		while (orow > nrow) {
+			tputs(UP, 1, plodput);
+			orow--;
+		}
+	}
+	while (orow < nrow) {		/* cursor down */
+		if (DO)
+			tputs(DO, 1, plodput);
+		else
+			*plodstr++ = '\n';
+		orow++;
+	}
+	if (CV && plodstr - saveplod >= strlen(direct)) {
+		register char *p;
+		plodstr = saveplod;
+		for (p = direct ; *plodstr = *p++ ; plodstr++);
+	}
+	return 0;
+}
+
+
+_hmove(ocol, ncol, row) {
+	char direct[64];
+	char ret[3 * MAXLLEN];
+	char *saveplod = plodstr;
+	char *movstr;
+	int cost, newcost;
+
+	cost = 999;
+	if (CH) {
+		plodstr = direct;
+		tputs(tgoto(CH, ncol, ncol), 0, plodput);
+		cost = plodstr - direct;
+		movstr = direct;
+		plodstr = saveplod;
+	}
+	if (RET && ocol > ncol) {	/* consider doing carriage return */
+		plodstr = ret;
+		if (CR)
+			tputs(CR, 1, plodput);
+		else
+			*plodstr++ = '\r';
+		if (_relhmove(0, ncol, row) >= 0
+		 && (newcost = plodstr - ret) < cost) {
+			cost = newcost;
+			movstr = ret;
+		}
+		plodstr = saveplod;
+	}
+	if (_relhmove(ocol, ncol, row) < 0) {
+		if (cost == 999)
+			return -1;
+		goto copy;
+	}
+	if (plodstr - saveplod > cost) {
+copy:		plodstr = saveplod;
+		while (--cost >= 0)
+			*plodstr++ = *movstr++;
+	}
+	return 0;
+}
+
+
+
+_relhmove(ocol, ncol, row) {
+	int tab;
+
+	if (ocol < ncol && PT && GT) {	/* tab (nondestructive) */
+		while ((tab = (ocol + 8) & ~07) <= ncol) {
+			if (TA)
+				tputs(TA, 1, plodput);
+			else
+				*plodstr++ = '\t';
+			ocol = tab;
+		}
+		if (tab < COLS && tab - ncol < ncol - ocol) {
+			if (TA)
+				tputs(TA, 1, plodput);
+			else
+				*plodstr++ = '\t';
+			ocol = tab;
+		}
+	} else if (BT && GT && ocol > ncol) {	/* backwards tab */
+		while ((tab = (ocol - 1) &~ 07) >= ncol) {
+			if (BS && tab == ocol - 1) {
+				if (BC)
+					tputs(BC, 1, plodput);
+				else
+					*plodstr++ = '\b';
+			} else
+				tputs(BT, 1, plodput);
+			ocol = tab;
+		}
+		if (ncol - tab + 1 < ocol - ncol) {
+			tputs(BT, 1, plodput);
+			ocol = tab;
+		}
+	}
+	if (ocol > ncol) {			/* cursor left */
+		if (! BS)
+			return -1;
+		while (ocol > ncol) {
+			if (BC != NULL)
+				tputs(BC, 1, plodput);
+			else
+				*plodstr++ = '\b';
+			ocol--;
+		}
+	}
+	if (ocol < ncol) {			/* cursor right */
+		register struct line *lp = &_actual[row];
+		/*
+		 * This code doesn't move over underlined characters properly,
+		 * but in practice this doesn't seem to matter.
+		 */
+		while (ocol < ncol) {
+			if (ocol < lp->len)
+				*plodstr++ = lp->l[ocol];
+			else
+				*plodstr++ = ' ';
+			ocol++;
+		}
+	}
+	return 0;
+}
+
+
+
+_aputc(c) {
+	if (AM && _scol == COLS - 1 && _srow == ROWS - 1)
+		return;
+	_setul(c & ULINE);
+	vputc(c & ~ULINE);
+	if (++_scol >= COLS) {
+		if (! AM) {
+			_scol--;
+		} else  if (XN) {
+			_curjunked++;
+		} else {
+			_scol = 0;
+			++_srow;
+		}
+	}
+}
+
+
+_setul(on) {
+	if (on) {
+		if (_uline == 0 && US != NULL) {
+			tputs(US, 1, vputc);
+			_uline = 1;
+		}
+	}
+	else {
+		if (_uline != 0 && UE != NULL) {
+			tputs(UE, 1, vputc);
+			_uline = 0;
+		}
+	}
+}
+
+
+/*
+ * Initialize termcap strings for later use.
+ */
+initterm() {
+	static char tcbuf[1024];	/* termcap buffer */
+	register char  *cp;
+
+	if ((cp = getenv("TERM")) == NULL)
+		xerror("TERM not set in environment");
+
+	switch (tgetent(tcbuf, cp)) {
+		case 0:
+			xerror("Terminal not found in TERMCAP");
+		case -1:
+			xerror("Can't open /etc/termcap");
+		case 1:
+			break;
+	}
+
+	if ((ROWS = tgetnum("li")) == -1
+	 || (COLS = tgetnum("co")) == -1)
+		xerror("Can't get screen size");
+	_zap();
+
+	if (CL == NULL)
+		xerror ("No clear screen defined");
+
+	if (HO == NULL && CM == NULL)
+		xerror("No home or cursor addressing");
+	if (HO)
+		HOlen = strlen(HO);
+	else
+		HOlen = 999;
+
+	PC = xPC ? xPC[0] : 0;
+	BC = xBC;
+	UP = xUP;
+
+	if (tgetnum("ug") > 0)
+		US = UE = NULL;
+
+	if (XT)				/* Destructive tab code not included */
+		PT = 0;			/* to keep things simple */
+
+	if (ROWS > MAXPLEN)
+		ROWS = MAXPLEN;
+	if (COLS > MAXLLEN) {
+		COLS = MAXLLEN;
+		AM = XN = 1;
+	}
+
+	/* Select article scrolling algorithm.  We prefer scrolling region
+	   over insert/delete line because it's faster on the HP */
+	hasscroll = 0;
+	if (!NS) {
+		hasscroll = 1;
+		if (SR)
+			hasscroll = 3;
+		if (CS)
+			hasscroll++;
+	}
+	if (AL && DL && hasscroll != 4)
+		hasscroll = 5;
+}
+
+
+rawterm() {
+	if (TI != NULL)
+		tputs(TI, 0, vputc);
+}
+
+
+cookedterm() {
+	if (TE != NULL) {
+		tputs(TE, 0, vputc);
+		vflush() ;
+	}
+}
+
+
+/* get strings from termcap */
+_zap() {
+	static char tstrbuf[1024];
+	static char *tp;
+	register char  *namp, **sp, *bp;
+
+	tp = tstrbuf;
+	sp = _tstr;
+	for (namp = sname; *namp; namp += 2) {
+		*sp++ = tgetstr(namp, &tp);
+	}
+	bp = _tflg;
+	for (namp = bname; *namp; namp += 2) {
+		*bp++ = tgetflag(namp, &tp);
+	}
+}
+!E!O!F!
+
+cat > vnews/virtterm.doc <<\!E!O!F!
+.. Run this file through nroff (no macro packages required).
+.ll 72
+.na
+.hy
+The new virtterm.c uses termcap.  This makes it larger, but not excessively
+so.
+The cursor motion commands are longer for the HP and VT100 terminals
+due to the inability of termcap to completely describe these terminals,
+but this doesn't make a big difference.
+Virtterm handles both insert/delete line and VT100 style scrolling regions.
+It also handles terminals with sticky underlining (like some HP terminals).
+
+The following is the list of the terminal capabilities virtterm uses:
+.nf
+
+	bc, bs		Cursor left
+	do		Cursor down
+	up		Cursor up
+	ta, pt		Nondestructive tab
+	bt		Backwards tab
+	ho		Cursor home
+	cr, nc		Carriage return
+	cm		Cursor to specified location
+	ch, cv		Cursor to specified column or row
+	am, xn		Terminal wrap-around
+	al, dl		Insert and delete line
+	AL, DL		Insert and delete multiple lines
+	cs, sr		Scrolling region (a al VT100)
+	sf, ns		Scroll entire screen
+	ce		Clear to end of line
+	cl		Clear screen and move cursor home
+	us, ue		Underscore mode
+	ti, te		Turn visual mode on/off
+
+.fi
+In order to run with virtterm, the terminal *must* have:
+.in 11
+.ti -3
+1)\ Clear screen.
+.ti -3
+2)\ Non-relative cursor motion (either cm or ho).
+.ti -3
+3)\ Cursor down (linefeed will be used if do is not specified).
+.ti -3
+4)\ Us and ue, otherwise no underlining will be done.
+.ti -3
+5)\ Tabstops set every 8 columns if terminal has tabs.
+Virtterm doesn't bother to set the tabs; it assumes they are already set.
+.in 0
+
+The new virtterm can't do its job very well if capabilities are missing
+from the termcap entry.
+For example, in our version of /etc/termcap, us and ue entries
+were not specified the HP-2621.
+!E!O!F!
+
+cat > vnews/vnews.1 <<\!E!O!F!
+.TH VNEWS 1
+.SH NAME
+vnews \- read news articles
+.SH SYNOPSIS
+.BR vnews " [ " \-a
+.IR date " ] [ "
+.B \-n
+.IR newsgroups " ] [ "
+.B \-t
+.IR titles " ] [ "
+.BR \-rxhfuA " ] [ "
+.BR \-c " ]"
+.PP
+.B "vnews \-s"
+.SH DESCRIPTION
+.SS "Overview"
+.. .RS 5
+.B Vnews
+is a program for reading USENET news.
+It is based on
+.BR readnews (1)
+but has a CRT oriented user interface.
+The command line options are identical,
+but only the options listed in the synopsis are supported.
+The effect of the
+.B -c
+option is different in vnews than in readnews; it
+causes vnews to display the entire first page of an article
+immediately rather than initially showing only the header.
+The
+.B -A
+option causes the newsgroup index to be displayed each time
+a new group is entered.
+The list of available commands is quite similar, although since
+.B vnews
+is a "visual" interface, most
+.B vnews
+commands do not have to be terminated by a newline.
+.B Vnews
+is somewhat less friendly than
+.BR readnews ,
+so new users should probably start out with readnews.
+.. .P
+.. .B Vnews
+.. is an experiment in writing a good user interface.
+.. The only way I can tell how successful I have been is by the responses I
+.. receive, so please send you comments, good or bad, to
+.. {harpo|ihnp4|burl|ucbvax!mhtsa}!spanky!ka.
+.. (Bug reports should be sent to the same address.)
+.P
+.B Vnews
+uses
+all except the last two
+.. all except the first two
+lines of the screen to display the current article.
+The second to the bottom line
+.. Line 2
+is the secondary prompt line, and is used to input string arguments
+to commands.
+The bottom line
+.. Line 1
+contains several fields.
+.. The first field is the prompt field.
+.. If
+.. .B vnews
+.. is at the end of an article, the prompt is "next?"; otherwise the prompt is
+.. "more?".
+The first field contains an approximation of the percentage of the
+article that has been read.  It will be 100% if and only if the entire
+article has been read.
+.. [This is a more informative (and cryptic) replacement for the
+.. more/next indication.]  \
+..
+The second field is the newsgroup field, which displays the current
+newsgroup, the number of the current article, and the number of the last
+article in the newsgroup.
+The third field contains the current time, and the last field contains the
+word "mail" if you have mail.
+When you receive new mail, the bell on the terminal is rung and the
+word "MAIL"
+appears in capital letters for 30 seconds.
+.RE
+.P
+.SS "Differences from Readnews"
+.. .RS 5
+Most of the readnews commands have
+.B vnews
+counterparts and vice versa.
+Commands are not present in
+.B Vnews
+include:
+.TP 10
+.B d
+The digest command is not yet implemented.
+.TP 10
+.B K
+You can get the same effect by using the
+.B n
+command with a huge count.
+.TP 10
+.B P
+Use "N-".
+.TP 10
+.B X
+This should be a separate program.
+.P
+.B Vnews
+has commands for moving around in the article which readnews does not have
+since they aren't applicable.
+It also has a
+.I parent
+command which will go to the article that the current article is a followup
+to, and a
+.I write
+command that writes out the body of an article without the header.
+.P
+You can refer to the current article from the shell or while writing a
+followup as $A.
+.P
+You can use the
+.B n
+command to delete articles while looking at the index page.
+.. .P
+.. The
+.. .I decrypt
+.. command always does rotation 13.
+.. .P
+.. The algorithm for handling articles posted to multiple groups is different;
+.. .B vnews
+.. attempts to show you these articles only once even if you quit in the
+.. middle of running
+.. .B vnews
+.. and resume it later.
+.. .P
+.P
+.SS "Article selection algorithm"
+.P
+Newsgroups are shown in the order that they appear in the .newsrc file.
+Any newsgroups which contain articles but do not appear in the .newsrc
+file are appended to the .newsrc file in the order in which they appear
+in the groupfile file.  (This means that if the -x option is specified
+you will be shown newsgroups in the order in which they appear in the
+groupfile file.)
+.P
+Vnews has a newsgroup stack which allows the commands
+.BR N ,
+.BR p ,
+and
+.B <
+to save the current newsgroup.
+Only real newsgroups are pushed; not single articles fetched using the
+.B p
+and
+.B <
+commands.
+The phrase "advance to the next newsgroup" always means
+"pop the newsgroup stack if it is nonempty; otherwise go to the next
+newsgroup in the .newsrc file."
+.P
+Within a newsgroup, articles are grouped by discussion.  Within a
+discussion, articles are sorted by posting date.  Discussions are
+sorted by the posting date of the first new article in the discussion.
+.P
+Articles within a newsgroup are numbered by
+.B vnews
+so that you can refer to them.
+These numbers are not related to the names of the files containing the
+articles.
+.P
+An article is normally considered to be read if you have
+seen the end of it.
+The
+.B n
+and
+.B e
+commands allow you to explicitly mark an article as read or unread.
+.P
+When an article has been posted to multiple group, vnews will show
+the article only in the leftmost newsgroup in the newsgroup list that
+you subscribe to.
+.P
+.SS "Commands"
+.P
+Each
+.B vnews
+command may be preceded by a \fIcount\fR.
+Some commands use the \fIcount\fR; others ignore it.
+If the \fIcount\fR is omitted, it defaults to one.
+Some commands prompt for an argument on the secondary prompt line.
+The argument is terminated by a return.
+Standard
+.SM UNIX
+erase and kill processing is performed on commands being entered.
+An interrupt (delete or break) or a CONTROL-G
+gets you out of any partially entered command.
+.P
+The following commands exist:
+.TP 10
+.B SP
+A space scrolls forward.
+.. [Normally space advances an entire page, but if there are
+.. only one or two more lines left in the current article,
+.. space will simply advance the article the one or two lines
+.. required to show the rest of the article.]  \
+..
+If you are at the end of a article, it advances to the next article.
+If you are at the end of the index, it leaves the index and displays
+the current article.
+.TP 10
+.B "^B"
+A CONTROL-B goes backwards \fIcount\fR pages.
+.TP 10
+.B "^D"
+Go forward \fIcount\fR half pages.
+.TP 10
+.BR "^N" " or " "^Y"
+Go forwards \fIcount\fR lines.
+.TP 10
+.BR "^P" " or " "^Z"
+Go backwards \fIcount\fR lines.
+.TP 10
+.B "^U"
+Go backwards \fIcount\fR half pages.
+.TP 10
+.B a
+Switch the display between the index and the current article.
+The index is identical to that produced by the
+.I readnews
+.B a
+command except that articles which have been read are marked with "D".
+All
+.I vnews
+commands except
+.B D
+are functional on the index; the article scrolling commands
+scroll the index and all other commands apply to the current article.
+[In particular, you can type a sequence of
+.BR n 's
+and
+.BR e 's
+on the index page to quickly get rid of uninteresting articles.]
+.TP 10
+.BR "b" " or " "-"
+Subtract \fIcount\fR from the current article number.
+If the result would be less than one, an error message is printed.
+.. [It would be nice to have a command which
+.. always go back to the previous article like the 'b' command in 2.10.]
+.TP 10
+.B c
+Cancel the current article.
+.B Vnews
+prompts for confirmation before canceling the article.
+Carriage return or 'y' means yes; anything else means no.
+.TP 10
+.B "D"
+Decrypts a joke.
+It only handles rot 13 jokes.
+The
+.B D
+command is a toggle; typing another D re-encrypts the joke.
+.TP 10
+.B e
+Mark the current article as not read and advance \fIcount\fR unread articles.
+If there are fewer than \fIcount\fR unread articles left in the
+newsgroup, advance to the next newsgroup.
+.TP 10
+.B h
+Go back to the top of the article and display only the header.
+.TP 10
+.B H
+Show the complete header.
+Typing
+.B l
+(or almost any command)
+will restore the original display.
+.. [I'm still not convinced of the value of this command,
+.. but other people seem to be...]
+.TP 10
+.BR "l" " or " "d"
+Causes the current article to be displayed.
+Display of the current article is turned off by commands which scramble the
+screen
+.RB "(" "!" ","
+.BR "f" ","
+and
+.BR "r" ")."
+.. My feeling here is that the user frequently wants to respond to an article
+.. and then go on to the next article; she/he shouldn't be forced to wait while
+.. the current article is rewritten to the screen.
+The
+.B l
+command will also redisplay the article if the help message
+or detailed header is currently
+displayed.
+The (feeble) mnemonic significance of
+.B l
+is that is similar to control-L, which redraws the screen.
+.. [Blanking out the article display has been of rather questionable value
+.. since release 2.10, when checks for pending input were added.
+.. However, the 3B20 hardware buffers about 256 characters of output,
+.. and some versions of UNIX may not support checks for pending input,
+.. so I have left it in.  It is straightforward enough if you are used to
+.. it.]
+.TP 10
+.B n
+Mark the current article as read.
+Then advance by \fIcount\fR unread articles, marking the skipped articles as
+read.  If there are fewer than \fIcount\fR unread articles left in the
+newsgroup, mark the unread articles as read and advance to the next
+newsgroup.
+.TP 10
+.B N
+Go to a different newsgroup.
+You are prompted for a newsgroup name.
+.IP "" 10
+There are two special cases.
+A null newsgroup name 
+it advances to the next group.
+The name "\-" pops everything off the newsgroup stack and then backs
+up to the previous group in the .newsrc file.
+[This isn't implemented properly yet; the
+current code backs up to the previous group that contains articles,
+just like in 2.10.
+It should restore the previously read group.]
+.IP "" 10
+Otherwise, the
+.B N
+command
+.. discards everything on the newsgroup stack,
+pushes the current group onto the stack and goes to the specified group.
+Both read and unread articles are included in the index.
+However, the
+.B n
+and
+.B e
+commands will skip over the articles that have been already read.
+.TP 10
+.B p
+Gets you the parent article (the article that the current article is a
+followup to).
+If no
+.B References:
+line exists for the current article then the title of the article will
+be used to guess the parent; of course this guess may be wrong.
+.TP 10
+.B "q"
+Quit. The .newsrc file is updated.
+.TP 10
+.B r
+Reply to the author of the article.
+See the
+.B f
+command for details.
+.TP 10
+.B f
+Post a followup article.
+No warning messages are printed.
+[I despise them, and so far nobody has asked for them.]
+If the article was posted to a moderated group, the followup is mailed to the
+sender of the article.
+.IP "" 10
+Both \fIreply\fR and \fIfollowup\fR work similarly.
+A file containing a header is created and an editor is invoked on the file.
+You can modify the header as well as enter the body of the article.
+The environment variable
+.B "$A"
+is set to the current article in case you want to refer to it or quote it in
+your response.
+.B "$A"
+will also be passed as an argument to the editor.
+.IP "" 10
+If you plan to quote extensively from the article you are writing a followup
+to, you may find it easiest to include the entire body of the parent article
+and delete the parts you don't want.  If you use EMACS (either Gosling's
+or Warren Montgomery's), there is a macro called gparent (get parent article)
+which is normally bound to ^X^Y
+that reads in the body of the parent article, prefacing each line with a
+.BR > .
+If you use a different editor, such as
+.BR ed (1),
+there is a shell procedure which will accomplish the same task if your
+editor has the ability to capture the output of a command.  In
+.BR ed ,
+type
+.BR "r\ !gparent" .
+.. The second argument to the editor is
+.. .IR "$A" ,
+.. so that if you run Gosling's Emacs, the article will automaticly appear in
+.. the second window.
+.IP "" 10
+If you change your mind about replying or posting a followup article, exit
+the editor without changing the file.
+.. [A message will appear on the screen to inform you that the response was not
+.. mailed/posted.]
+If you change your mind about whether you should have used an
+.B f
+or
+.B r
+command, edit the first line of the followup.
+.. .IP "" 10
+.. [Vnews forks off a process to deliver the reply or followup.
+.. In order to avoid messing up the screen, errors are reported by mail.]
+.TP 10
+.B s
+Prompts for a filename and writes the article to the file.
+Depending on how the netnews administrator set up your system, the article
+may have a "From " line in front of it to allow the file to be read using
+your mail program.
+.IP "" 10
+The
+.I save
+and
+.I write
+commands normally append to the specified file,
+but if
+.I count
+is zero any existing file is overwritten.
+.IP "" 10
+If the filename does not begin with a slash
+vnews runs through the following list of kludges.
+If the filename is omitted, it defaults to "Articles".
+A leading "~/" on the filename is replaced by the name of your login directory.
+Finally, if the filename is does not begin with a slash and the environment
+variable $NEWSBOX is set, then any "%s" in $NEWSBOX replaced
+by the current newsgroup and the result is prepended to the filename.
+.. Users frequently set $NEWSBOX to the name of their login directly.
+.TP 10
+.BR "s|" ", " "w|"
+Read a command and pipe the article into it.
+The article is formated identically to the
+.B s
+and
+.B w
+commands.
+.TP 10
+.B ud
+Unsubscribe to the current discussion.
+[This command is still somewhat experimental.
+In particular, if you unsubscribe to very may groups reading and writing
+the .newsrc file becomes very slow.]
+.TP 10
+.BR ug " or " un
+If \fIcount\fR is nonzero, unsubscribe to the current group and advance
+to the next group.
+The group will no longer be shown to you unless you specificly ask for
+it with the
+.B N
+command.
+If \fIcount\fR is zero, resubscribe to the current group.
+.. [This is a two character command to ensure that it is not typed accidentally
+.. and to leave room for other types of unsubscribes (e. g. unsubscribe to
+.. discussion).]
+.TP 10
+.B v
+Print netnews version.
+.TP 10
+.B w
+Like
+.B s
+except that the article header is not written.
+.TP 10
+.B "+"
+Add \fIcount\fR to the current article number.
+If this would go beyond the end of the current newsgroup an error
+message is printed.
+.TP 10
+.B "^\e"
+When sent a quit signal,
+.B vnews
+terminates without updating .newsrc.
+Depending on how your system administrator set up vnews
+it may or may not generate a core dump.
+[This command is intentionally hard to type.]
+.TP 10
+.B "!"
+Prompts for a
+.SM UNIX
+command and passes it to the shell.
+The environment variable
+.I $A
+is set to the name of the file containing the current article.
+If the last character of the command is a "&", then the "&" is deleted and
+the command is run in the background with stdin, stdout and stderr redirected
+to /dev/null.
+If the command is missing, the shell is invoked.
+Use the
+.B l
+command (or essentially any other command) to turn on the display after the
+program terminates.
+.. .TP 10
+.. .B "#"
+.. Prints the numbers of the current article and the last article in the current
+.. newsgroup.
+.TP 10
+.B "^L"
+Redraws the screen.
+CONTROL-L is not a real command; it may be typed while in the middle of
+entering another command.
+.TP 10
+.B "<"
+Prompts for an article ID or the rest of a message ID,
+and displays the article if it exists.
+.TP 10
+.B CR
+Carriage return goes to the article numbered \fIcount\fR in the current
+newsgroup if count is specified.
+If count is omitted, then a carriage return is treated like a space.
+.TP 10
+.B "?"
+Displays a synopsis of commands.
+The synopsis will be removed from the screen when the next command is
+executed.
+If you want to remove the synopsis without doing anything else, use the
+.B l
+command.
+.SH AUTHOR
+Kenneth Almquist
+.br
+{harpo, ihnp4, burl, akgua}!hou3c!ka.
+.SH BUGS
+Netnews release 2.10.2 stores dates in GMT, which is probably not
+what the user expects.
+.P
+As with other visual interfaces,
+.B vnews
+does not handle typing errors gracefully.
+Perhaps there should be an "undo" command.
+.P
+No "digest" command is provided.
+.P
+The
+.I save
+and
+.I write
+commands should create nonexistent directories.
+!E!O!F!
+
+cat > vnews/vnews.h <<\!E!O!F!
+#ifndef EXTERN
+#define EXTERN extern
+#endif
+
+#ifdef HCURSES		/* Mark Horton's version of curses */
+#define CURSES
+#endif
+#ifdef ACURSES		/* Ken Arnold's version of curses */
+#define CURSES
+#endif
+#ifdef CURSES
+#include <curses.h>
+#define ROWS LINES
+int hasscroll = 0;
+#else
+#endif CURSES
+
+#include <errno.h>
+#include "rparams.h"
+#include "artfile.h"
+#include "newsrc.h"
+
+#ifdef CURSES
+#undef LINES
+#endif
+
+#define ARTWLEN	(ROWS-2)/* number of lines used to display article */
+#ifdef STATTOP
+#define SECPRLEN 81	/* length of secondary prompter */
+#else
+#define SECPRLEN 100	/* length of secondary prompter */
+#endif
+#define INTR	'\7'	/* interrupt character */
+/* prun flags */
+#define CWAIT	0001	/* type "continue?" and wait for return */
+#define BKGRND	0002	/* run process in the background */
+/* values of curflag */
+#define CURP1	1	/* cursor after prompt */
+#define CURP2	2	/* cursor after secondary prompt */
+#define CURHOME	3	/* cursor at home position */
+/* types of article lists */
+#define SVNEWSGROUP 0	/* a newsgroup was saved (must be zero) */
+#define SVARTICLE   1	/* a sigle article was saved */
+#if BSDREL >= 42
+#define sigset signal
+#endif
+
+struct window {
+	int w_artlin;			/* line to appear at top of window */
+	int w_svartlin;			/* line currently at top of window */
+	int (*w_dump)();		/* routine to dump window to screen */
+	int w_force;			/* set to force window update */
+};
+
+
+struct svartlist {
+	int al_type;			/* type of article list */
+	int al_tfoffset;			/* offset into temp file where saved */
+};
+
+struct artinfo {
+	ARTNO i_artnum;		/* number in spool directory */
+	long  i_subtime;	/* date/time article posted, in internal GMT */
+	long  i_basetime;	/* subtime of base article */
+	DPTR  i_dptr;		/* artfile entry */
+	long  i_nlines;		/* lines: header (number of lines) */
+	char  i_title[37];	/* subject */
+	char  i_from[31];	/* sender of message */
+};
+
+extern int errno;
+
+/* terminal handler stuff */
+extern int _junked;
+#define clearok(xxx, flag) _junked = flag
+extern int COLS;
+extern int ROWS;
+extern int hasscroll;
+extern int needbeep;
+
+EXTERN int ngrp;			/* set on entry to new group	*/
+EXTERN char filename[BUFLEN];		/* file containing current art	*/
+
+EXTERN FILE *tfp;			/* temporary file */
+EXTERN long artbody;			/* offset of body into article */
+EXTERN long artlength;			/* article length in bytes */
+EXTERN int quitflg;			/* if set, then quit */
+EXTERN int hupflag;			/* set when hangup signal received */
+EXTERN int erased;			/* current article has been erased */
+EXTERN int artlines;			/* # lines in article body */
+EXTERN int artread;			/* entire article has been read */
+EXTERN int hdrstart;			/* beginning of header */
+EXTERN int hdrend;			/* end of header */
+EXTERN int lastlin;			/* number of lines in tempfile */
+EXTERN int tflinno;			/* next line in tempfile */
+EXTERN int tfoffset;			/* offset of article in temp file */
+EXTERN char secpr[SECPRLEN];		/* secondary prompt */
+EXTERN char prompt[30];			/* prompter */
+EXTERN short hdronly;			/* if set, only print article header */
+EXTERN short curflag;			/* where to locate cursor */
+EXTERN char timestr[20];		/* current time */
+EXTERN int ismail;			/* true if user has mail */
+EXTERN char *mailf;			/* user's mail file */
+EXTERN int atend;			/* set if at end of article */
+EXTERN char cerase;			/* erase character */
+EXTERN char ckill;			/* kill character */
+EXTERN int ospeed;			/* terminal speed */
+EXTERN int pstatus;			/* status return from process */
+EXTERN int indexpg;			/* set if on index page */
+EXTERN struct window *curwin;		/* current window */
+EXTERN struct window *nextwin;		/* new window */
+#ifdef DIGPAGE
+EXTERN int endsuba;			/* end of sub-article in digest */
+#endif
+#ifdef MYDEBUG
+EXTERN FILE *debugf;			/* file to write debugging info on */
+#endif
+extern struct window artwin;		/* window displaying article */
+extern struct window indexwin;		/* window containing article index */
+extern struct window helpwin;		/* help windown */
+extern struct window emptywin;		/* blank screen */
+extern struct window hdrwin;		/* window containing header */
+
+EXTERN struct artinfo *thisng;		/* articles in this newsgroup */
+EXTERN int numthisng;			/* # of articles in above array */
+EXTERN int curind;			/* how far we've gotten into thisng */
+EXTERN struct artinfo *curart;		/* how far we've gotten into thisng */
+
+
+EXTERN long pngsize;			/* Printing ngsize		*/
+EXTERN int  news;
+EXTERN struct arthead h;		/* header of current article	*/
+EXTERN int dgest;
+EXTERN FILE *fp;			/* current article to be printed*/
+EXTERN int debugging;			/* debugging turned on */
+!E!O!F!
+
+cat > vnews/vnews.help <<\!E!O!F!
+Vnews commands:    (each may be preceded by a non-negative count)
+
+SP  Next page or article                D   Decrypt a rot 13 joke
+n   Go to next article                  CR  Go to article numbered count
+e   Mark current article as unread      <   Go to article with given ID
++   Go forwards count articles          p   Go to parent article
+b   Go to previous article              ug  Unsubscribe to this group
+^B  Go backwards count pages            ud  Unsubscribe to discussion
+^N  Go forward count lines              ^L  Redraw screen
+^P  Go backwards count lines            v   Print netnews version
+^D  Go forward half a page              c   Cancel the current article
+a   Switch to/from article index        q   Quit
+H   Display article header              ^\  Quit without updating .newsrc
+!   Escape to shell
+r   Reply to article
+f   Post a followup article
+l   Display article (use after !, r, f, or ?)
+s   Save article in file
+w   Save without header
+N   Go to newsgroup (next is default)
+
+[Press l to see article again]
+!E!O!F!
+
+cat > vnews/vreadr.c <<\!E!O!F!
+/*
+ * Readr - visual news interface.
+ */
+
+#define EXTERN
+#include "vnews.h"
+
+#define PIPECHAR '|'	/* indicate save command should pipe to program */
+#define META	0200	/* meta chatacter bit (as in emacs) */
+#define UNSUB	0400	/* unsubscribe bit (indicates 'u' command) */
+/* flags for vsave routine */
+#define SVHEAD	01	/* write out article header */
+#define OVWRITE	02	/* overwrite the file if it already exists */
+
+char *getmailname();
+int onint(), onquit(), onhup();
+int onstop();
+
+static char tfname[] = "/tmp/vnXXXXXX";	/* name of temp file */
+static char prbuf[SECPRLEN+1];		/* buf for getting command args */
+static int errclean;			/* clean up on error		*/
+static char *bptr;			/* temp pointer.		*/
+extern struct svartlist *alptr;		/* article list stack		*/
+
+
+readr()
+{
+#ifdef	SIGCONT
+	int (*ocont)();
+#endif
+	FILE *popen();
+
+#ifdef MYDEBUG
+	debugf = fopen("DEBUG", "w");
+	setbuf(debugf, NULL);
+#endif
+
+/*
+	fp = popen("pwd", "r");
+	if (fp == NULL)
+		xerror("Cannot fork/exec/popen pwd!\n");
+	fgets(curdir, sizeof curdir, fp);
+	pclose(fp);
+	nstrip(curdir);
+*/
+
+	mktemp(tfname);
+	if ((tfp = fopen(tfname, "w+")) == NULL)
+		xerror("Can't create temp file");
+	unlink(tfname);
+	mailf = getmailname();
+
+	/* loop reading articles. */
+	fp = NULL;
+	curwin = Aflag? &indexwin : &artwin;
+	if (getnxtng(FORWARD)) {
+		fprintf(stderr, "No news.\n");
+		return;
+	}
+
+	ttysave();
+	signal(SIGINT, onint);
+	signal(SIGQUIT, onquit);
+	signal(SIGHUP, onhup);
+	ttyraw();
+	errclean = 1;
+	timer();
+
+	quitflg = 0;
+	while (quitflg == 0) {		/* command loop */
+		if (hupflag) {
+			errclean = 0;
+			return;
+		}
+		if (!indexpg)
+			openart();
+		vcmd();
+	}
+	errclean = 0;
+	botscreen();
+	ttycooked();
+}
+
+/*
+ * Read and execute a command.
+ */
+
+vcmd() {
+	register c;
+	register char *p, *q;
+	char *promptp;
+	char *cmdp;
+	char cmd[20];
+	int count;
+	int countset;
+
+	if (indexpg) {
+		atend = numthisng + 2 <= indexwin.w_artlin + ARTWLEN;
+	} else {
+		appfile(fp, artwin.w_artlin + ARTWLEN + 1);
+		atend = artlines <= artwin.w_artlin + ARTWLEN
+		     && (! hdronly || artlines <= hdrend);
+	}
+	setprompt();
+	if (atend && ! indexpg && ! erased)
+		setnew(0);		/* article read */
+	curflag = CURP1;
+	promptp = prompt + strlen(prompt);
+	cmdp = cmd;
+	do {
+		c = vgetc();
+		if (c == cerase) {
+			if (cmdp > cmd)
+				cmdp--;
+		} else if (c == ckill) {
+			cmdp = cmd;
+		} else {
+			if (c == '\\') {
+				strcat(prompt, "\\");
+				c = vgetc();
+			}
+			if (c == INTR) {
+				secpr[0] = '\0';
+				cmdp = cmd;
+			} else {
+				*cmdp++ = c;
+			}
+		}
+		*cmdp = '\0';
+
+		p = cmd;
+		q = promptp;
+		countset = 0;
+		count = 0;
+		while ((c = *p) >= '0' && c <= '9') {
+			if (p > cmd + 5)
+				*--cmdp = '\0';		/* limit to 5 digits */
+			else
+				*q++ = c;
+			count = (count * 10) + (c - '0');
+			countset = 1;
+			p++;
+		}
+		c = 0;
+		if (*p == 'u') {
+			c = UNSUB;
+			*q++ = 'u';
+			p++;
+		}
+		if (*p == '\033') {			/* escape */
+			c |= META;
+			*q++ = 'M';
+			*q++ = '-';
+			p++;
+		}
+		*q = '\0';
+		c |= *p;
+	} while (p >= cmdp);
+
+	secpr[0] = '\0';
+	if (countset == 0)
+		count = 1;
+	nextwin = NULL;
+	docmd(c, count, countset);
+	if (nextwin != NULL)
+		curwin = nextwin;
+	else if (indexpg)
+		curwin = &indexwin;
+	else
+		curwin = &artwin;
+	if (artwin.w_artlin > hdrstart && hdronly)
+		hdronly = 0, artwin.w_force |= 1;
+}
+
+
+/*
+ * Generate the prompt (percentage of article read).
+ */
+setprompt() {
+	int percent;
+
+	if (atend)
+		strcpy(prompt, "100% ");
+	else if (hdronly && ! indexpg)
+		strcpy(prompt, "0% ");
+	else {
+		if (indexpg) {
+			percent = (800L * (indexwin.w_artlin + ARTWLEN))
+				/ (numthisng + 2);
+		} else {
+			percent = ((800 * (ftell(fp) - artbody)) / (artlength - artbody)
+				* (artwin.w_artlin + ARTWLEN)) / lastlin;
+		}
+		percent = (percent + 4) >> 3;
+		if (percent > 99)
+			percent = 99;
+		strcpy(prompt, "00% ");
+		prompt[0] = percent / 10 + '0';
+		prompt[1] = percent % 10 + '0';
+	}
+}		
+
+
+/*
+ * Process one command, which has already been typed in.
+ */
+docmd(c, count, countset)
+{
+	int i;
+	char *ptr1;
+	char *findhist();
+
+	switch (c) {
+
+	/* Turn on/off debugging. */
+	case 'z':
+		debugging = count;
+		msg("debugging level %d", debugging);
+		break;
+
+	/* No/Next.  Go on to next article. */
+	case 'n':
+		setnew(0);
+		nextart(count, 1);
+		break;
+
+	/* go to specific article, or treat like space */
+	case '\n':
+		if (countset) {
+			setartno(count);
+			break;
+		}
+		/* else fall through */
+
+	/* Show more of current article, or advance to next article */
+	case ' ':
+		if (indexpg) {
+			if (atend)
+				indexwin.w_artlin = 0, indexpg = 0;
+			else if (hasscroll && numthisng - indexwin.w_artlin <= ARTWLEN)
+				scroll(numthisng + 2 - indexwin.w_artlin - ARTWLEN);
+			else
+				scroll(ARTWLEN);
+		} else {
+			if (atend)
+				nextart(1, 1);
+			else if (hdronly) {
+				hdronly = 0;
+				artwin.w_force |= 1;
+				if (hasscroll)
+					scroll(hdrstart - artwin.w_artlin);}
+			else if ((appfile(fp, artwin.w_artlin + 2 * ARTWLEN), artread)
+			 && hasscroll && artlines - artwin.w_artlin <= ARTWLEN + 2)
+				scroll(artlines - artwin.w_artlin - ARTWLEN);
+			else
+				scroll(ARTWLEN);
+		}
+		break;
+
+
+	/* All headers: show headers for this newsgroup */
+	case 'a':
+		indexpg = ! indexpg;
+		break;
+
+	/* Back up count pages */
+	case META|'v':
+	case '\2':	/* Control-B */
+		scroll(-ARTWLEN * count);
+		break;
+
+	/* forward half a page */
+	case '\4':	/* Control-D, as in vi */
+		scroll(ARTWLEN/2 * count);
+		break;
+
+	/* backward half a page */
+	case '\25':	/* Control-U */
+		scroll(-ARTWLEN/2 * count);
+		break;
+
+	/* forward count lines */
+	case '\16':	/* Control-N */
+	case '\32':	/* Control-Z */
+		scroll(count);
+		break;
+
+	/* bakcwards count lines */
+	case '\20':	/* Control-P */
+	case '\31':	/* Control-Y */
+		scroll(-count);
+		break;
+
+	/* Turn displaying of article back on */
+	case 'l':
+	case 'd':
+		/* this now happens automaticly */
+		break;
+
+	/* display header */
+	case 'h':
+		scroll(hdrstart - curwin->w_artlin);
+		hdronly = 1;
+		artwin.w_force |= 1;
+		break;
+
+	/*
+	 * Unsubscribe to the newsgroup and go on to next group
+	 */
+	case UNSUB|'g':
+	case UNSUB|'n':
+		if (count) {
+			curng->ng_unsub = 1;
+			if (getnxtng(FORWARD))
+				quitflg++;
+		} else /* resubscribe */
+			curng->ng_unsub = 0;
+		break;
+
+		/* unsubscribe to the current discussion */
+	case UNSUB|'d':
+		ud_command();
+		break;
+
+	case UNSUB|'a': ptr1 = "author";     goto badusub;
+	case UNSUB|'s': ptr1 = "site";       goto badusub;
+badusub:	msg("Unsubscribing to this %s: not implemented", ptr1);
+		break;
+
+		/* Print the current version of news */
+	case 'v':
+		msg("News version: %s", news_version);
+		nextwin = curwin;
+		break;
+
+
+		/* decrypt joke */
+	case 'D': 
+		if (indexpg)
+			goto illegal;
+		appfile(fp, 32767);
+		for (i = hdrend ; i < artlines ; i++) {
+			register char c, *p;
+			tfget(bfr, i);
+			for (p = bfr ; (c = *p) != '\0' ; p++) {
+				if (c >= 'a' && c <= 'z')
+					*p = (c - 'a' + 13) % 26 + 'a';
+				else if (c >= 'A' && c <= 'Z')
+					*p = (c - 'A' + 13) % 26 + 'A';
+			}
+			tfput(bfr, i);
+		}
+		artwin.w_force |= 1;
+		hdronly = 0;
+		break;
+
+		/* write out the article someplace */
+	case 's':
+	case 'w':
+		{
+		int wflags;
+
+		nextwin = curwin;
+		if (openart())
+			break;
+		wflags = 0;
+		if (c == 's')
+			wflags |= SVHEAD;
+		if (count != 1)
+			wflags |= OVWRITE;
+		msg("file: ");
+		curflag = CURP2;
+		while ((c = vgetc()) == ' ');
+		if (c == INTR) {
+			secpr[0] = '\0';
+			break;
+		}
+		if (c == '|') {
+			prbuf[0] = PIPECHAR;
+			if (prget("| ", prbuf+1))
+				break;
+		} else {
+			pushback(c);
+			if (prget("file: ", prbuf))
+				break;
+		}
+		bptr = prbuf;
+		if (*bptr != PIPECHAR && *bptr != '/') {
+			char	hetyped[BUFLEN];
+			char	*boxptr;
+			strcpy(hetyped, bptr);
+			if (boxptr = getenv("NEWSBOX"))
+				if (index(boxptr, '%'))
+					sprintf(bptr, boxptr, curng->ng_name);
+				else
+					strcpy(bptr, boxptr);
+			else if (hetyped[0] == '~' && hetyped[1] == '/') {
+				strcpy(hetyped, bptr+2);
+				strcpy(bptr, userhome);
+			} else
+				bptr[0] = '\0';
+			if (bptr[0])
+				strcat(bptr, "/");
+			if (hetyped[0] != '\0')
+				strcat(bptr, hetyped);
+			else
+				strcat(bptr, "Articles");
+		}
+		vsave(bptr, wflags);
+		}
+		break;
+
+		/* back up  */
+	case '-':
+	case 'b':
+		if (curind <= count) {
+			msg("Can't back across newsgroup boundary.");
+			break;
+		}
+		setartno(curind - count);
+		break;
+
+		/* skip forwards */
+	case '+':
+		/* this may not be what we want */
+		setartno(curind + count);
+		break;
+
+	/* exit - time updated to that of most recently read article */
+	case 'q':
+		quitflg = 1;
+		break;
+
+	/* cancel the article. */
+	case 'c':
+		strcpy(prompt, "cancel? ");	/* be sure not a typo */
+		if ((c = vgetc()) != '\n' && c != 'y')
+			break;
+		cancel_command();
+		break;
+
+	/* escape to shell */
+	case '!':
+		{
+		register char *p;
+		int flags;
+
+		nextwin = curwin;
+		if (prget("!", prbuf))
+			break;
+		p = prbuf;
+		flags = CWAIT;
+		if (*p == '\0') {
+			strcpy(prbuf, SHELL);
+			flags = 0;
+		}
+		while (*p) p++;
+		while (p > prbuf && p[-1] == ' ')
+			p--;
+		if (*--p == '&') {
+			*p = '\0';
+			flags = BKGRND;
+			strcpy(bfr, prbuf);
+		} else if (*p == '|') {
+			*p = '\0';
+			sprintf(bfr, "(%s)2>&1|mail '%s'", prbuf, username);
+			flags |= BKGRND;
+		} else {
+			nextwin = &emptywin;
+			strcpy(bfr, prbuf);
+		}
+		shcmd(bfr, flags);
+		}
+		break;
+
+	/* reply/followup */
+	case 'r':
+	case 'f':
+	{
+		static char *arg[3] = {bfr, bfr + FPATHLEN, NULL};
+
+#ifdef REPLYPROG
+		strcpy(bfr, REPLYPROG);
+#else
+		sprintf(bfr, "%s/postreply", LIB);
+#endif
+		sprintf(bfr + FPATHLEN, "-v%c%s", c, filename);
+		prun(arg, 0);
+		if (pstatus != 0) {
+			msg("reply/followup %s", pstatus == 22<<8? "suppressed" : "command failed");
+		}
+		nextwin = &emptywin;
+		break;
+	}
+
+	/* next newsgroup */
+	case 'N':
+		if (next_ng_command())
+			quitflg = 1;
+		break;
+
+	/* display parent article */
+	case 'p':
+		parent_command() ;
+		break;
+
+	/* specific message ID. */
+	case '<':
+		if (prget("<", prbuf))
+			break;
+		goto_id(prbuf);
+		break;
+
+	/* erase - pretend we haven't seen this article. */
+	case 'e':
+		erased = 1;
+		setnew(1);
+		nextart(count, 0);
+		break;
+
+	case 'H':
+		if (openart())
+			break;
+		nextwin = &hdrwin;
+		break;
+
+	case '#':
+		msg("Article %d of %d (#%d of max %ld)",
+			curind, numthisng, curart->i_artnum,
+			pngsize);
+		nextwin = curwin;
+		break;
+
+		/* error */
+	case '?':
+		nextwin = &helpwin;
+		break;
+
+	illegal:
+	default:
+		beep();
+		nextwin = curwin;
+		break;
+	}
+
+	return FALSE;
+}
+
+cancel_command()
+{
+	struct arthead *hptr = &h;
+	char *ptr1;
+	int i;
+
+	if (openart())
+		return;
+	strcpy(bfr, hptr->h_path);
+	ptr1 = index(bfr, ' ');
+	if (ptr1)
+		*ptr1 = 0;
+	i = strcmp(username, bfr);
+	if (i != 0) {
+		if (isadmin())
+			msg("Cancelling locally only");
+		else {
+			msg("Can't cancel what you didn't write.");
+			return;
+		}
+	}
+	if (!cancel(stderr, hptr, i) && hptr == &h) {
+		nextart(1, 1);
+	}
+}
+
+
+
+next_ng_command()
+{
+	struct ngentry *ngp;
+
+	if (prget("group? ", bptr = prbuf))
+		return FALSE;
+	if (!*bptr || *bptr == '-') {
+		return getnxtng(*bptr? BACKWARD : FORWARD);
+	}
+	while (isspace(*bptr))
+		bptr++;
+	if ((ngp = findgroup(bptr)) == NULL) {
+		msg("No such group: %s.", bptr);
+		return FALSE;
+	}
+	switchng(ngp);
+	return FALSE;
+}
+
+
+/*
+ * Find parent of article.
+ */
+parent_command() {
+	struct artrec a;
+	DPTR dp;
+
+	readrec(curart->i_dptr, &a);
+	if (a.a_parent == DNULL) {
+		msg("no parent");
+		nextwin = curwin;
+		return;
+	}
+	readrec(dp = a.a_parent, &a);
+	if (a.a_flags & A_NOFILE) {
+		msg("parent not on system");
+		nextwin = curwin;
+		return;
+	}
+	spclgrp(dp, &a);
+}
+
+
+/*
+ * display an article with a particular article or message ID.
+ */
+goto_id(ident)
+	char *ident;
+	{
+	struct artrec a;
+	DPTR dp;
+	char *ptr1, *ptr2;
+	char id[NAMELEN];
+
+	bfr[0] = '<';
+	strcpy(bfr+1, ident);
+	if (index(bfr, '@') == NULL && index(bfr, '>') == NULL) {
+		ptr1 = bfr;
+		if (*ptr1 == '<')
+			ptr1++;
+		ptr2 = index(ptr1, '.');
+		if (ptr2 != NULL) {
+			*ptr2++ = '\0';
+			sprintf(prbuf, "<%s@%s.UUCP>", ptr2, ptr1);
+			strcpy(bfr, prbuf);
+		}
+	}
+	if (index(bfr, '>') == NULL)
+		strcat(bfr, ">");
+	scopyn(bfr, id, NAMELEN);
+	if ((dp = lookart(id, &a)) == DNULL) {
+		msg("%s not found", ident);
+		nextwin = curwin;
+		return;
+	}
+	spclgrp(dp, &a);
+}
+
+
+
+/*
+ * Unsubscribe to a discussion.
+ */
+ud_command() {
+	struct artrec a;
+	DPTR dp;
+	register int i ;
+
+	if (ndunsub >= MAXUNSUB) {
+		msg("Unsubscribed to too many discussions");
+		return;
+	}
+	dp = curart->i_dptr;
+	readrec(dp, &a);
+	while (a.a_parent != DNULL) {
+		readrec(dp = a.a_parent, &a);
+	}
+	dunsub[ndunsub++] = dp;
+	msg("unsubscribed to discussion %s", a.a_ident);
+
+	/* Mark any articles in the discussion as read. */
+	for (i = 0 ; i < numthisng ; i++) {
+		if (thisng[i].i_basetime == a.a_subtime)
+			if (alptr->al_type == SVNEWSGROUP)
+				clrunread(thisng[i].i_artnum) ;
+	}
+	nextart(1, 1) ;
+}
+
+/*
+ * Execute a shell command.
+ */
+
+shcmd(cmd, flags)
+	char *cmd;
+	{
+	char *arg[4];
+
+	arg[0] = SHELL, arg[1] = "-c", arg[2] = cmd, arg[3] = NULL;
+	prun(arg, flags);
+}
+
+
+prun(args, flags)
+	char **args;
+	{
+	int pid;
+	int i;
+	int (*savequit)();
+	char *env[100], **envp;
+	char a[BUFLEN + 2];
+	extern char **environ;
+
+	if (!(flags & BKGRND)) {
+		botscreen();
+		ttycooked();
+	}
+	while ((pid = fork()) == -1)
+		sleep(1);		/* must not clear alarm */
+	if (pid == 0) {
+		for (i = 3 ; i < 20 ; i++)
+			close(i);
+		if (flags & BKGRND) {
+			signal(SIGINT, SIG_IGN);
+			signal(SIGQUIT, SIG_IGN);
+			close(0), close(1), close(2);
+			open("/dev/null", 2);
+			dup(0), dup(0);
+		}
+		/* set $A */
+		sprintf(a, "A=%s", filename);
+		env[0] = a;
+		for (envp = env + 1 ; *environ != NULL && envp < env + 98 ; environ++)
+			if ((*environ)[0] != 'A' || (*environ)[1] != '=')
+				*envp++ = *environ;
+		*envp = NULL;
+
+		execve(args[0], args, env);
+		fprintf(stderr, "%s: not found\n", args[0]);
+		exit(20);
+	}
+	if (!(flags & BKGRND)) {
+		savequit = signal(SIGQUIT, SIG_IGN);
+		while ((i = wait(&pstatus)) != pid && (i != -1 || errno == EINTR));
+		if (flags & CWAIT) {
+			fprintf(stderr, "continue? ");
+			while ((errno = 0, i = getchar()) != '\n'
+				&& (i != EOF || errno == EINTR))
+#ifdef old_version /* never worked under BSD */
+					if (intflag && i == EOF) {
+						fprintf(stderr, "\ncontinue? ");
+						intflag = 0;
+					}
+#else
+					;
+#endif
+		}
+		signal(SIGQUIT, savequit);
+		ttyraw();
+		clearok(curscr, 1);
+	}
+}
+
+#ifdef DIGPAGE
+
+
+/*
+ * Find end of current subarticle in digets.
+ */
+
+findend(l) {
+	register i;
+	register char *p;
+
+	for (i = l ; i < l + ARTWLEN && i < lastlin ; i++) {
+		tfget(bfr, i);
+		for (p = bfr ; *p == '-' ; p++);
+		if (p > bfr + 24)
+			return i + 1;
+	}
+	return 0;
+}
+
+#endif
+
+
+char *
+getmailname() {
+	char mailname[FPATHLEN];
+	register char *p;
+
+	if( (p = getenv("MAIL")) != NULL)
+		return p;
+#if BSDREL > 7
+	sprintf(mailname, "/usr/spool/mail/%s", username);
+#else
+	sprintf(mailname, "/usr/mail/%s", username);
+#endif
+	return savestr(mailname);
+}
+
+
+
+/*** stolen from rfuncs2.c and modified ***/
+
+vsave(to, flags)
+register char *to;
+{
+	register FILE *ufp;
+	int	isprogram = 0;
+	int	isnew = 1;
+	long	saveoff;
+	char	temp[20];
+	char	*fname;
+	char	prog[BUFLEN + 24];
+
+#define hh h
+#define hfp fp
+	saveoff = ftell(fp);
+	fname = to;
+	if (*to == PIPECHAR) {
+		isprogram++;
+		if (strlen(to) > BUFLEN) {
+			msg("Command name too long");
+			goto out;
+		}
+		flags |= OVWRITE;
+		strcpy(temp, "/tmp/vnXXXXXX");
+		mktemp(temp);
+		fname = temp;
+		_amove(ROWS - 1, 0);
+		vflush();
+	}
+	if ((flags & OVWRITE) == 0) {
+		ufp = fopen(fname, "r");
+		if (ufp != NULL) {
+			fclose(ufp);
+			isnew = 0;
+		}
+	}
+	if ((ufp = fopen(fname, (flags & OVWRITE) == 0? "a" : "w")) == NULL) {
+		msg("Cannot open %s", fname);
+		goto out;
+	}
+	/*
+	 * V7MAIL code is here to conform to V7 mail format.
+	 * If you need a different format to be able to
+	 * use your local mail command (such as four ^A's
+	 * on the end of articles) substitute it here.
+	 */
+	if (flags & SVHEAD) {
+#ifdef V7MAIL
+		fprintf(ufp, "From %s %s",
+#ifdef INTERNET
+				hh.h_from,
+#else
+				hh.h_path,
+#endif
+					ctime(&curart->i_subtime));
+#endif
+#ifdef V7MAIL
+		fseek(fp, 0L, 0);
+		while (fgets(bfr, LBUFLEN, fp) != NULL) {
+			if (prefix(bfr, "From "))
+				putc('>', ufp);
+			fputs(bfr, ufp);
+		}
+		putc('\n', ufp);	/* force blank line at end (ugh) */
+#else
+		fseek(fp, artbody, 0);
+		while (fgets(bfr, LBUFLEN, fp) != NULL) {
+			fputs(bfr, ufp);
+		}
+#endif
+	} else {
+		fseek(fp, artbody, 0);
+		while (fgets(bfr, LBUFLEN, fp) != NULL) {
+			fputs(bfr, ufp);
+		}
+	}
+
+	fclose(ufp);
+	if (isprogram) {
+		sprintf(prog, "(%s)<%s", to + 1, fname);
+		shcmd(prog, CWAIT);
+		nextwin = &emptywin;
+	} else {
+		if ((flags & OVWRITE) == 0)
+			msg("file: %s %s", to, isnew ? "created" : "appended");
+		else
+			msg("file: %s written", to);
+	}
+
+out:
+	if (isprogram) {
+		unlink(fname);
+	}
+	fseek(fp, saveoff, 0);
+}
+
+
+
+/*** routines originally in rfuncs.c ***/
+
+
+xerror(fmt, a1, a2, a3, a4)
+char	*fmt;
+{
+	int clean = errclean;
+
+	errclean = 0;
+	fflush(stdout);
+	if (clean) {
+		botscreen();
+		ttycooked();
+	}
+	fprintf(stderr, "vnews: ");
+	fprintf(stderr, fmt, a1, a2, a3, a4);
+	fprintf(stderr, ".\n");
+	if (clean)
+		writeoutrc();
+	xxit(1);
+}
+
+
+
+xxit(status)
+int	status;
+{
+	exit(status);
+}
+!E!O!F!
+
+echo Part 7 of 7 extracted.
+
+

@@ -1,0 +1,800 @@
+Newsgroups: comp.sources.unix
+From: panos@cs.colorado.edu (Panos Tsirigotis)
+Subject: v26i271: xinetd-2.1.1 - inetd replacement with access control and logging, Part27/31
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: panos@cs.colorado.edu (Panos Tsirigotis)
+Posting-Number: Volume 26, Issue 271
+Archive-Name: xinetd-2.1.1/part27
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 27 (of 31)."
+# Contents:  xinetd/service.c
+# Wrapped by panos@mystique on Mon Jun 21 14:51:28 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'xinetd/service.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xinetd/service.c'\"
+else
+echo shar: Extracting \"'xinetd/service.c'\" \(17419 characters\)
+sed "s/^X//" >'xinetd/service.c' <<'END_OF_FILE'
+X/*
+X * (c) Copyright 1992 by Panagiotis Tsirigotis
+X * All rights reserved.  The file named COPYRIGHT specifies the terms 
+X * and conditions for redistribution.
+X */
+X
+Xstatic char RCSid[] = "$Id: service.c,v 6.12 1993/06/13 01:46:35 panos Exp $" ;
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <netinet/in.h>
+X#include <netdb.h>
+X#include <syslog.h>
+X#include <fcntl.h>
+X
+X#include "sio.h"
+X
+X#include "options.h"
+X
+X#include "access.h"
+X#include "attr.h"
+X#include "service.h"
+X#include "server.h"
+X#include "state.h"
+X#include "config.h"
+X#include "connection.h"
+X
+X#define NEW_SVC()					NEW( struct service )
+X#define FREE_SVC( sp )			FREE( sp )
+X
+X#define SUSPEND( sp )			(sp)->svc_state = SVC_SUSPENDED
+X#define RESUME( sp )				(sp)->svc_state = SVC_ACTIVE
+X#define DISABLE( sp )			(sp)->svc_state = SVC_DISABLED
+X
+X
+Xvoid msg() ;
+Xvoid out_of_memory() ;
+X
+Xtime_t time() ;
+Xchar *malloc() ;
+X
+Xstatic struct name_value service_states[] =
+X   {
+X      { "Not started",        (int) SVC_NOT_STARTED   },
+X      { "Active",             (int) SVC_ACTIVE        },
+X      { "Disabled",           (int) SVC_DISABLED      },
+X		{ "Suspended",				(int) SVC_SUSPENDED		},
+X      { NULL,                 1                       },
+X		{ "BAD STATE",				0								}
+X   } ;
+X
+X
+X
+X/*
+X * Allocate a new struct service and initialize it from scp 
+X */
+Xstruct service *svc_new( scp )
+X	struct service_config *scp ;
+X{
+X	struct service *sp ;
+X	char *func = "svc_new" ;
+X
+X	sp = NEW_SVC() ;
+X   if ( sp == NULL )
+X   {
+X      out_of_memory( func ) ;
+X      return( NULL ) ;
+X   }
+X	CLEAR( *sp ) ;
+X
+X	sp->svc_conf = scp ;
+X	return( sp ) ;
+X}
+X
+X
+Xstruct service *svc_make_special( scp, handler )
+X	struct service_config	*scp ;
+X	statfunc						handler ;
+X{
+X	struct service		*sp ;
+X	char					*func = "svc_make_special" ;
+X
+X	if ( ( sp = svc_new( scp ) ) == NULL )
+X	{
+X		out_of_memory( func ) ;
+X		return( NULL ) ;
+X	}
+X
+X	sp->svc_handler_func = handler ;
+X	sp->svc_log = ps.rws.program_log ;
+X
+X	sp->svc_ref_count = 1 ;
+X	sp->svc_state = SVC_ACTIVE ;
+X	return( sp ) ;
+X}
+X
+X
+Xvoid svc_free( sp )
+X   struct service *sp ;
+X{
+X   sc_free( sp->svc_conf ) ;
+X	FREE_SVC( sp ) ;
+X}
+X
+X
+X/*
+X * Currently, address control works by looking at the fields 
+X * only_from/no_access of struct service.
+X * In order to enable address control, we copy to these fields either
+X * the explicitly specified values (which come from the service_config)
+X * or the default ones (if there are any).
+X */
+Xvoid svc_setup_address_control( sp )
+X	register struct service *sp ;
+X{
+X	register struct service_config *scp = SVC_CONF( sp ) ;
+X
+X	if ( SC_IS_PRESENT( scp, A_ONLY_FROM ) )
+X		sp->svc_only_from = SC_ONLY_FROM( scp ) ;
+X	else if ( SC_SPECIFIED( DEFAULTS( ps ), A_ONLY_FROM ) )
+X		sp->svc_only_from = SC_ONLY_FROM( DEFAULTS( ps ) ) ;
+X	else
+X		sp->svc_only_from = NULL ;
+X
+X	if ( SC_IS_PRESENT( scp, A_NO_ACCESS ) )
+X		sp->svc_no_access = SC_NO_ACCESS( scp ) ;
+X	else if ( SC_SPECIFIED( DEFAULTS( ps ), A_NO_ACCESS ) )
+X		sp->svc_no_access = SC_NO_ACCESS( DEFAULTS( ps ) ) ;
+X	else
+X		sp->svc_no_access = NULL ;
+X}
+X
+X
+XPRIVATE status_e set_fd_modes( sp )
+X	register struct service *sp ;
+X{
+X	int sd = SVC_FD( sp ) ;
+X	char *func = "set_fd_modes" ;
+X
+X   /*
+X    * There is a possibility of blocking on a send/write if
+X    *
+X	 *		the service does not require forking (==> is internal) AND
+X    *    it does not accept connections
+X    *
+X    * To avoid this, we put the descriptor in FNDELAY mode.
+X    * (if the service accepts connections, we still need to put the
+X    * 'accepted' connection in FNDELAY mode but this is done elsewhere)
+X    */
+X	if ( ! SVC_FORKS( sp ) && ! SVC_ACCEPTS_CONNECTIONS( sp ) &&
+X                              fcntl( sd, F_SETFL, FNDELAY ) == -1 )
+X   {
+X      msg( LOG_ERR, func,
+X         "fcntl failed (%m) for FNDELAY. service = %s", SVC_ID( sp ) ) ;
+X		return( FAILED ) ;
+X   }
+X
+X   /*
+X    * Always set the close-on-exec flag
+X    */
+X   if ( fcntl( sd, F_SETFD, 1 ) == -1 )
+X   {
+X      msg( LOG_ERR, func,
+X         "fcntl failed (%m) for close-on-exec. service = %s", SVC_ID( sp ) ) ;
+X      return( FAILED ) ;
+X   }
+X	return( OK ) ;
+X}
+X
+X
+X#ifndef NO_RPC
+X
+XPRIVATE status_e activate_rpc( sp )
+X   register struct service *sp ;
+X{
+X	struct sockaddr_in		sin ;
+X	int							sin_len ;
+X	unsigned long				vers ;
+X	struct service_config	*scp						= SVC_CONF( sp ) ;
+X	struct rpc_data			*rdp						= SC_RPCDATA( scp ) ;
+X	char							*sid						= SC_ID( scp ) ;
+X	unsigned						registered_versions	= 0 ;
+X	int							sd							= SVC_FD( sp ) ;
+X	char							*func						= "activate_rpc" ;
+X
+X	CLEAR( sin ) ;
+X
+X	sin.sin_family = AF_INET ;
+X	sin.sin_addr.s_addr = htonl( INADDR_ANY ) ;
+X	sin.sin_port = 0 ;         /* let the system give us a port */
+X	if ( bind( sd, SA( &sin ), sizeof( sin ) ) == -1 )
+X	{
+X		msg( LOG_ERR, func, "bind failed (%m). service = %s", sid ) ;
+X		return( FAILED ) ;
+X	}
+X
+X	/*
+X	 * Find the port number that was assigned to the socket
+X	 */
+X	sin_len = sizeof( sin ) ;
+X	if ( getsockname( sd, SA( &sin ), &sin_len ) == -1 )
+X	{
+X		msg( LOG_ERR, func,
+X				"getsockname failed (%m). service = %s", sid ) ;
+X		return( FAILED ) ;
+X	}
+X	sc_set_port( scp, ntohs( sin.sin_port ) ) ;
+X
+X	/*
+X	 * Try to register as many versions as possible
+X	 */
+X	for ( vers = RD_MINVERS( rdp ) ; vers <= RD_MAXVERS( rdp ) ; vers++ )
+X		if ( pmap_set( RD_PROGNUM( rdp ), vers,
+X										SC_PROTOVAL( scp ), SC_PORT( scp ) ) )
+X			registered_versions++ ;
+X		else
+X			msg( LOG_ERR, func,
+X				"pmap_set failed. service=%s program=%ld version=%ld",
+X					sid, RD_PROGNUM( rdp ), vers ) ;
+X
+X	if ( debug.on )
+X		msg( LOG_DEBUG, func,
+X				"Registered %d versions of %s", registered_versions, sid ) ;
+X
+X	return( ( registered_versions == 0 ) ? FAILED : OK ) ;
+X}
+X
+X#endif	/* ! NO_RPC */
+X
+X
+XPRIVATE status_e activate_normal( sp )
+X   register struct service *sp ;
+X{
+X	struct sockaddr_in		sin ;
+X	int							sd					= SVC_FD( sp ) ;
+X	struct service_config	*scp				= SVC_CONF( sp ) ;
+X	unsigned short				service_port	= SC_PORT( scp ) ;
+X	char							*sid				= SC_ID( scp ) ;
+X	char							*func				= "activate_normal" ;
+X
+X	CLEAR( sin ) ;
+X
+X	sin.sin_family = AF_INET ;
+X	sin.sin_addr.s_addr = htonl( INADDR_ANY ) ;
+X	sin.sin_port = htons( service_port ) ;
+X
+X	if ( reuse_option || SC_REUSE_ADDRESS( scp ) )
+X	{
+X		int on = 1 ;
+X
+X		if ( setsockopt( sd, SOL_SOCKET,
+X						SO_REUSEADDR, (char *) &on, sizeof( on ) ) == -1 )
+X			msg( LOG_WARNING, func,
+X			 "setsockopt SO_REUSEADDR failed (%m). service = %s", sid ) ;
+X	}
+X
+X	if ( bind( sd, SA( &sin ), sizeof( sin ) ) == -1 )
+X	{
+X		msg( LOG_ERR, func, "bind failed (%m). service = %s", sid ) ;
+X		return( FAILED ) ;
+X	}
+X	return( OK ) ;
+X}
+X
+X
+X/*
+X * Activate a service. 
+X */
+Xstatus_e svc_activate( sp )
+X   register struct service *sp ;
+X{
+X	struct service_config	*scp = SVC_CONF( sp ) ;
+X	status_e						status ;
+X   char							*func = "svc_activate" ;
+X	voidfunc						get_shutdown_by_name() ;
+X	PRIVATE status_e			svc_generic_handler() ;
+X	PRIVATE void				deactivate() ;
+X
+X	sp->svc_fd = socket( AF_INET, 
+X								SC_SOCKET_TYPE( scp ), SC_PROTOVAL( scp ) ) ;
+X
+X   if ( sp->svc_fd == -1 )
+X   {
+X      msg( LOG_ERR, func,
+X						"socket creation failed (%m). service = %s", SC_ID( scp ) ) ;
+X		return( FAILED ) ;
+X   }
+X
+X	if ( set_fd_modes( sp ) == FAILED )
+X	{
+X		(void) close( sp->svc_fd ) ;
+X		return( FAILED ) ;
+X	}
+X
+X#ifndef NO_RPC
+X   if ( SC_IS_RPC( scp ) )
+X		status = activate_rpc( sp ) ;
+X   else
+X#endif   /* ! NO_RPC */
+X		status = activate_normal( sp ) ;
+X	
+X	if ( status == FAILED )
+X	{
+X		(void) close( sp->svc_fd ) ;
+X		return( FAILED ) ;
+X	}
+X
+X	if ( log_start( sp, &sp->svc_log ) == FAILED )
+X	{
+X		deactivate( sp ) ;
+X		return( FAILED ) ;
+X	}
+X
+X	/*
+X	 * Initialize the service data
+X	 */
+X	sp->svc_running_servers	= sp->svc_retry_servers = 0 ;
+X	sp->svc_shutdown_func	= get_shutdown_by_name( SC_NAME( scp ) ) ;
+X	sp->svc_handler_func		= svc_generic_handler ;
+X	svc_setup_address_control( sp ) ;
+X
+X   if ( SC_MUST_LISTEN( scp ) )
+X      (void) listen( sp->svc_fd, LISTEN_BACKLOG ) ;
+X
+X   ps.rws.descriptors_free-- ;
+X
+X	sp->svc_state = SVC_ACTIVE ;
+X
+X	FD_SET( sp->svc_fd, &ps.rws.socket_mask ) ;
+X	if ( sp->svc_fd > ps.rws.mask_max )
+X		ps.rws.mask_max = sp->svc_fd ;
+X
+X	ps.rws.active_services++ ;
+X	ps.rws.available_services++ ;
+X
+X   return( OK ) ;
+X}
+X
+X
+XPRIVATE void deactivate( sp )
+X	register struct service *sp ;
+X{
+X	(void) close( SVC_FD( sp ) ) ;
+X
+X#ifndef NO_RPC
+X	if ( SC_IS_RPC( SVC_CONF( sp ) ) )
+X	{
+X		register unsigned long vers ;
+X		register struct rpc_data *rdp = SC_RPCDATA( SVC_CONF( sp ) ) ;
+X
+X		for ( vers = RD_MINVERS( rdp ) ; vers <= RD_MAXVERS( rdp ) ; vers++ )
+X			(void) pmap_unset( RD_PROGNUM( rdp ), vers ) ;
+X	}
+X#endif	/* ! NO_RPC */
+X}
+X
+X
+X/*
+X * Close the service descriptor.
+X * If this is an RPC service, deregister it.
+X * Close the log.
+X */
+Xvoid svc_deactivate( sp )
+X   register struct service *sp ;
+X{
+X	if ( ! SVC_IS_AVAILABLE( sp ) )
+X		return ;
+X
+X	deactivate( sp ) ;
+X   ps.rws.descriptors_free++ ;
+X
+X	if ( sp->svc_log )
+X		log_end( SC_LOG( SVC_CONF( sp ) ), sp->svc_log ) ;
+X
+X	if ( SVC_IS_ACTIVE( sp ) )
+X	{
+X		FD_CLR( SVC_FD( sp ), &ps.rws.socket_mask ) ;
+X		ps.rws.active_services-- ;
+X	}
+X
+X	ps.rws.available_services-- ;
+X
+X	DISABLE( sp ) ;
+X}
+X
+X
+X
+X/*
+X * Suspend a service
+X */
+Xvoid svc_suspend( sp )
+X	register struct service *sp ;
+X{
+X	char *func = "svc_suspend" ;
+X
+X	if ( ! SVC_IS_ACTIVE( sp ) )
+X	{
+X		msg( LOG_ERR, func, "service %s is not active", SVC_ID( sp ) ) ;
+X		return ;
+X	}
+X
+X	FD_CLR( SVC_FD( sp ), &ps.rws.socket_mask ) ;
+X	ps.rws.active_services-- ;
+X	if ( debug.on )
+X		msg( LOG_DEBUG, func, "Suspended service %s", SVC_ID( sp ) ) ;
+X	
+X	SUSPEND( sp ) ;
+X}
+X
+X
+X/*
+X * Resume a suspended service.
+X */
+Xvoid svc_resume( sp )
+X	register struct service *sp ;
+X{
+X	char *func = "svc_resume" ;
+X
+X	FD_SET( SVC_FD( sp ), &ps.rws.socket_mask ) ;
+X	ps.rws.active_services++ ;
+X	if ( debug.on )
+X		msg( LOG_DEBUG, func, "Resumed service %s", SVC_ID( sp ) ) ;
+X	RESUME( sp ) ;
+X}
+X
+X
+X/*
+X * Steps:
+X *		1. Deactivate the service
+X *		2. Free all memory used by the service and free the service itself
+X *
+X * Since this function may free all memory associated with the service as
+X * well as the memory pointed by sp, only the value of sp should be used
+X * after this call if the return value is 0 (i.e. no dereferencing of sp).
+X *
+X * Special services are never deactivated.
+X */
+Xint svc_release( sp )
+X   register struct service *sp ;
+X{
+X	char *sid = SVC_ID( sp ) ;
+X	char *func = "svc_release" ;
+X
+X	if ( sp->svc_ref_count == 0 )
+X	{
+X		msg( LOG_ERR, func, "%s: svc_release with 0 count", sid ) ;
+X		return( 0 ) ;
+X	}
+X	
+X	sp->svc_ref_count-- ;
+X	if ( sp->svc_ref_count == 0 )
+X	{
+X		if ( debug.on )
+X			msg( LOG_DEBUG, func, "ref count of service %s dropped to 0", sid ) ;
+X		if ( ! SC_IS_SPECIAL( SVC_CONF( sp ) ) )
+X		{
+X			svc_deactivate( sp ) ;
+X			svc_free( sp ) ;
+X		}
+X		else		/* this shouldn't happen */
+X			msg( LOG_WARNING, func,
+X				"ref count of special service %s dropped to 0", sid ) ;
+X		return( 0 ) ;
+X	}
+X	else
+X		return( sp->svc_ref_count ) ;
+X}
+X
+X
+X
+Xvoid svc_dump( sp, fd )
+X	register struct service *sp ;
+X	int fd ;
+X{
+X	char *get_shutdown_by_addr() ;
+X	void tabprint() ;
+X
+X	tabprint( fd, 0, "Service = %s\n", SC_NAME( SVC_CONF( sp ) ) ) ;
+X	tabprint( fd, 1, "State = %s\n",
+X								nv_get_name( service_states, (int) sp->svc_state ) ) ;
+X
+X	sc_dump( SVC_CONF( sp ), fd, 1, FALSE ) ;
+X
+X	if ( sp->svc_state == SVC_ACTIVE )
+X	{
+X		tabprint( fd, 1, "running servers = %d\n", sp->svc_running_servers ) ;
+X		tabprint( fd, 1, "retry servers = %d\n", sp->svc_retry_servers ) ;
+X		tabprint( fd, 1, "attempts = %d\n", sp->svc_attempts ) ;
+X		tabprint( fd, 1, "service fd = %d\n", sp->svc_fd ) ;
+X		tabprint( fd, 1, "shutdown function = %s\n",
+X							get_shutdown_by_addr( sp->svc_shutdown_func ) ) ;
+X	}
+X	Sputchar( fd, '\n' ) ;
+X}
+X
+X
+X/*
+X * Returns TRUE if the server instantiation rate is over the limit
+X */
+Xbool_int svc_looping( sp )
+X	register struct service *sp ;
+X{
+X	time_t				current_time ;
+X	register time_t	time_diff ;
+X	char					*func = "svc_looping" ;
+X
+X	(void) time( &current_time ) ;
+X
+X	if ( sp->svc_attempts == 0 )
+X	{
+X		sp->svc_attempts++ ;
+X		sp->svc_start_time = current_time ;
+X		return( FALSE ) ;
+X	}
+X
+X	time_diff = current_time - sp->svc_start_time ;
+X	if ( time_diff <= LOOP_INTERVAL )
+X	{
+X		sp->svc_attempts++ ;
+X		if ( time_diff == 0 )
+X			time_diff = 1 ;
+X		if ( sp->svc_attempts/time_diff > ps.ros.loop_rate )
+X		{
+X			FD_CLR( SVC_FD( sp ), &ps.rws.socket_mask ) ;
+X			svc_deactivate( sp ) ;
+X			msg( LOG_ERR, func,
+X				"%s service was deactivated because of looping", SVC_ID( sp ) ) ;
+X			return( TRUE ) ;
+X		}
+X	}
+X	else
+X	{
+X		sp->svc_start_time = current_time ;
+X		sp->svc_attempts = 1 ;
+X	}
+X	return( FALSE ) ;
+X}
+X
+X
+X
+Xvoid svc_request( sp )
+X	register struct service *sp ;
+X{
+X	register connection_s *cp ;
+X
+X	cp = conn_new( sp ) ;
+X	if ( cp == CONN_NULL )
+X		return ;
+X
+X	if ( svc_handle( sp, cp ) == OK )
+X		return ;
+X	else
+X	{
+X		conn_cleanup( cp ) ;
+X		if ( conn_start_alternative( cp ) == FAILED )
+X			conn_free( cp ) ;
+X	}
+X}
+X
+X
+X
+XPRIVATE status_e svc_generic_handler( sp, cp )
+X	register struct service		*sp ;
+X	register connection_s		*cp ;
+X{
+X	register struct service_config *scp = SVC_CONF( sp ) ;
+X
+X   /*
+X    * There is no loop check for services that accept connections because
+X    * the connections are accepted by xinetd, therefore the queue will get
+X    * empty eventually even if the server is faulty.
+X    * Services for which no fork(2) occurs are not checked because
+X    *    a) they are internal and we assume they are not faulty
+X    *    b) we have no way of determining if something is going wrong
+X    *       for example, UDP discard can do its job very quickly
+X    */
+X	if ( !SC_ACCEPTS_CONNECTIONS( scp ) && SVC_FORKS( sp ) && svc_looping( sp ) )
+X		return( FAILED ) ;
+X
+X	if ( svc_access_control( sp, cp ) == OK )
+X		return( server_run( sp, cp ) ) ;
+X
+X	/*
+X	 * Add alternative services to handle the connection attempt.
+X	 * The services must be added in the proper order because they
+X	 * are invoked in that order:
+X	 *			logging
+X	 *			shutdown
+X	 */
+X
+X	if ( SVC_LOGS_USERID_ON_FAILURE( sp ) )
+X		(void) conn_add_alternative( cp, LOG_SERVICE( ps ) ) ;
+X
+X	if ( sp->svc_shutdown_func != NULL )
+X	{
+X		if ( ! SVC_RECORDS( sp ) || 
+X					conn_add_alternative( cp, SHUTDOWN_SERVICE( ps ) ) == FAILED )
+X			conn_shutdown( cp ) ;
+X	}
+X
+X	return( FAILED ) ;
+X}
+X
+X
+Xstatus_e svc_access_control( sp, cp )
+X	register struct service		*sp ;
+X	connection_s					*cp ;
+X{
+X	access_e result ;
+X
+X	result = access_control( sp, cp, MASK_NULL ) ;
+X	if ( result != AC_OK )
+X	{
+X		bool_int report_failure = TRUE ;
+X
+X		/*
+X		 * Try to avoid reporting multiple times a failed attempt to access
+X		 * a datagram-based service from a bad address. We do this because
+X		 * the clients of such services usually send multiple datagrams 
+X		 * before reporting a timeout (we have no way of telling them that
+X		 * their request has been denied).
+X		 */
+X		if ( result == AC_ADDRESS && SVC_SOCKET_TYPE( sp ) == SOCK_DGRAM )
+X		{
+X			register struct sockaddr_in *sinp = conn_address( cp ) ;
+X			register struct sockaddr_in *last = &sp->svc_last_dgram_addr ;
+X			time_t current_time ;
+X
+X			(void) time( &current_time ) ;
+X
+X			if ( sinp->sin_addr.s_addr == last->sin_addr.s_addr &&
+X														sinp->sin_port == last->sin_port )
+X			{
+X				if ( current_time - sp->svc_last_dgram_time <= DGRAM_IGNORE_TIME )
+X					report_failure = FALSE ;
+X				else
+X					sp->svc_last_dgram_time = current_time ;
+X			}
+X			else
+X			{
+X				sp->svc_last_dgram_addr = *sinp ;
+X				sp->svc_last_dgram_time = current_time ;
+X			}
+X		}
+X
+X		if ( report_failure )
+X			svc_log_failure( sp, cp, result ) ;
+X		return( FAILED ) ;
+X	}
+X	return( OK ) ;
+X}
+X
+X
+X/*
+X * Implement shutdown protocol (usually sends an error indication).
+X */
+Xvoid svc_shutdown( sp, cp, msgp )
+X	register struct service		*sp ;
+X	register connection_s		*cp ;
+X	char								**msgp ;
+X{
+X	int						old_flags ;
+X	register bool_int		no_block ;
+X	int						fd		= CONN_DESCRIPTOR( cp ) ;
+X	char						*func = "svc_shutdown" ;
+X
+X#ifdef DEBUG
+X	if ( sp != CONN_SERVICE( cp ) )
+X	{
+X		msg( LOG_CRIT, func, "service = %s, service of connection = %s",
+X			SVC_ID( sp ), SVC_ID( CONN_SERVICE( cp ) ) ) ;
+X		return ;
+X	}
+X#endif
+X
+X	if ( sp->svc_shutdown_func == NULL )
+X		return ;
+X
+X	no_block = ( msgp == NULL ) ;
+X
+X	/*
+X	 * Ensure that we won't block in the shutdown function
+X	 */
+X	if ( no_block )
+X	{
+X		if ( ( old_flags = fcntl( fd, F_GETFL, 0 ) ) == -1 )
+X		{
+X			msg( LOG_ERR, func, "fcntl-getflags failed: %m" ) ;
+X			return ;
+X		}
+X
+X		if ( fcntl( fd, F_SETFL, FNDELAY ) == -1 )
+X		{
+X			msg( LOG_ERR, func, "fcntl-setflags failed: %m" ) ;
+X			return ;
+X		}
+X	}
+X
+X	(*sp->svc_shutdown_func)( fd, msgp ) ;
+X
+X	/*
+X	 * Don't bother with restoring the flags if this is a new descriptor
+X	 */
+X	if ( no_block && SC_ACCEPTS_CONNECTIONS( SVC_CONF( sp ) ) )
+X		(void) fcntl( fd, F_SETFL, old_flags ) ;
+X}
+X
+X
+X/*
+X * Invoked when a server of the specified service dies
+X */
+Xvoid svc_postmortem( sp, serp )
+X	register struct service		*sp ;
+X	register struct server		*serp ;
+X{
+X	struct service				*co_sp	= SERVER_CONNSERVICE( serp ) ;
+X	register connection_s	*cp		= SERVER_CONNECTION( serp ) ;
+X	char							*func		= "svc_postmortem" ;
+X
+X	svc_dec_running_servers( sp ) ;
+X
+X	/*
+X	 * Log information about the server that died
+X	 */
+X	if ( SVC_IS_LOGGING( sp ) )
+X	{
+X		if ( serp->svr_writes_to_log )
+X		{
+X			if ( debug.on )
+X				msg( LOG_DEBUG, func,
+X								"Checking log size of %s service", SVC_ID( sp ) ) ;
+X			xlog_control( SVC_LOG( sp ), XLOG_SIZECHECK ) ;
+X		}
+X		svc_log_exit( sp, serp ) ;
+X	}
+X
+X	/*
+X	 * Check for alternative services to handle this connection
+X	 */
+X	if ( conn_start_alternative( cp ) == OK )
+X		return ;
+X	
+X	/*
+X	 * Now check if we have to check the log size of the service that owns
+X	 * the connection
+X	 */
+X	if ( co_sp != sp && SVC_IS_LOGGING( co_sp ) )
+X		xlog_control( SVC_LOG( co_sp ), XLOG_SIZECHECK ) ;
+X
+X	conn_free( cp ) ;
+X}
+X
+END_OF_FILE
+if test 17419 -ne `wc -c <'xinetd/service.c'`; then
+    echo shar: \"'xinetd/service.c'\" unpacked with wrong size!
+fi
+# end of 'xinetd/service.c'
+fi
+echo shar: End of archive 27 \(of 31\).
+cp /dev/null ark27isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 31 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

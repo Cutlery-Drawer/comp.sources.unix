@@ -1,0 +1,2618 @@
+Newsgroups: comp.sources.unix
+From: gwr@mc.com (Gordon W. Ross)
+Subject: v28i117: bootp-2.4.0 - RFC 1048,1533 "bootp" server (updates V27I63), Part03/04
+References: <1.777611200.751@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: gwr@mc.com (Gordon W. Ross)
+Posting-Number: Volume 28, Issue 117
+Archive-Name: bootp-2.4.0/part03
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 3 (of 4)."
+# Contents:  bootpd.c bootpgw.c print-bootp.c
+# Wrapped by vixie@gw.home.vix.com on Mon Aug 22 20:04:22 1994
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'bootpd.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'bootpd.c'\"
+else
+echo shar: Extracting \"'bootpd.c'\" \(33311 characters\)
+sed "s/^X//" >'bootpd.c' <<'END_OF_FILE'
+X/************************************************************************
+X          Copyright 1988, 1991 by Carnegie Mellon University
+X
+X                          All Rights Reserved
+X
+XPermission to use, copy, modify, and distribute this software and its
+Xdocumentation for any purpose and without fee is hereby granted, provided
+Xthat the above copyright notice appear in all copies and that both that
+Xcopyright notice and this permission notice appear in supporting
+Xdocumentation, and that the name of Carnegie Mellon University not be used
+Xin advertising or publicity pertaining to distribution of the software
+Xwithout specific, written prior permission.
+X
+XCARNEGIE MELLON UNIVERSITY DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+XSOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS.
+XIN NO EVENT SHALL CMU BE LIABLE FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL
+XDAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+XPROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+XACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
+XSOFTWARE.
+X************************************************************************/
+X
+X#ifndef lint
+Xstatic char rcsid[] = "$Id: bootpd.c $";
+X#endif
+X
+X/*
+X * BOOTP (bootstrap protocol) server daemon.
+X *
+X * Answers BOOTP request packets from booting client machines.
+X * See [SRI-NIC]<RFC>RFC951.TXT for a description of the protocol.
+X * See [SRI-NIC]<RFC>RFC1048.TXT for vendor-information extensions.
+X * See RFC 1395 for option tags 14-17.
+X * See accompanying man page -- bootpd.8
+X *
+X * HISTORY
+X *	See ./Changes
+X *
+X * BUGS
+X *	See ./ToDo
+X */
+X
+X
+X
+X#include <sys/types.h>
+X#include <sys/param.h>
+X#include <sys/socket.h>
+X#include <sys/ioctl.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+X#include <sys/stat.h>
+X
+X#include <net/if.h>
+X#include <netinet/in.h>
+X#include <arpa/inet.h>	/* inet_ntoa */
+X
+X#ifndef	NO_UNISTD
+X#include <unistd.h>
+X#endif
+X#include <stdlib.h>
+X#include <signal.h>
+X#include <stdio.h>
+X#include <string.h>
+X#include <errno.h>
+X#include <ctype.h>
+X#include <netdb.h>
+X#include <syslog.h>
+X#include <assert.h>
+X
+X#ifdef	NO_SETSID
+X# include <fcntl.h>		/* for O_RDONLY, etc */
+X#endif
+X
+X#ifdef	SVR4
+X/* Using sigset() avoids the need to re-arm each time. */
+X#define signal sigset
+X#endif
+X
+X#ifndef	USE_BFUNCS
+X# include <memory.h>
+X/* Yes, memcpy is OK here (no overlapped copies). */
+X# define bcopy(a,b,c)    memcpy(b,a,c)
+X# define bzero(p,l)      memset(p,0,l)
+X# define bcmp(a,b,c)     memcmp(a,b,c)
+X#endif
+X
+X#include "bootp.h"
+X#include "hash.h"
+X#include "hwaddr.h"
+X#include "bootpd.h"
+X#include "dovend.h"
+X#include "getif.h"
+X#include "readfile.h"
+X#include "report.h"
+X#include "tzone.h"
+X#include "patchlevel.h"
+X
+X#ifndef CONFIG_FILE
+X#define CONFIG_FILE		"/etc/bootptab"
+X#endif
+X#ifndef DUMPTAB_FILE
+X#define DUMPTAB_FILE		"/tmp/bootpd.dump"
+X#endif
+X
+X
+X
+X/*
+X * Externals, forward declarations, and global variables
+X */
+X
+X#ifdef	__STDC__
+X#define P(args) args
+X#else
+X#define P(args) ()
+X#endif
+X
+Xextern void dumptab P((char *));
+X
+XPRIVATE void catcher P((int));
+XPRIVATE int chk_access P((char *, int32 *));
+X#ifdef VEND_CMU
+XPRIVATE void dovend_cmu P((struct bootp *, struct host *));
+X#endif
+XPRIVATE void dovend_rfc1048 P((struct bootp *, struct host *, int32));
+XPRIVATE void handle_reply P((void));
+XPRIVATE void handle_request P((void));
+XPRIVATE void sendreply P((int forward, int32 dest_override));
+XPRIVATE void usage P((void));
+X
+X#undef	P
+X
+X/*
+X * IP port numbers for client and server obtained from /etc/services
+X */
+X
+Xu_short bootps_port, bootpc_port;
+X
+X
+X/*
+X * Internet socket and interface config structures
+X */
+X
+Xstruct sockaddr_in bind_addr;	/* Listening */
+Xstruct sockaddr_in recv_addr;	/* Packet source */
+Xstruct sockaddr_in send_addr;	/*  destination */
+X
+X
+X/*
+X * option defaults
+X */
+Xint debug = 0;					/* Debugging flag (level) */
+Xstruct timeval actualtimeout =
+X{								/* fifteen minutes */
+X	15 * 60L,					/* tv_sec */
+X	0							/* tv_usec */
+X};
+X
+X/*
+X * General
+X */
+X
+Xint s;							/* Socket file descriptor */
+Xchar *pktbuf;					/* Receive packet buffer */
+Xint pktlen;
+Xchar *progname;
+Xchar *chdir_path;
+Xchar hostname[MAXHOSTNAMELEN];	/* System host name */
+Xstruct in_addr my_ip_addr;
+X
+X/* Flags set by signal catcher. */
+XPRIVATE int do_readtab = 0;
+XPRIVATE int do_dumptab = 0;
+X
+X/*
+X * Globals below are associated with the bootp database file (bootptab).
+X */
+X
+Xchar *bootptab = CONFIG_FILE;
+Xchar *bootpd_dump = DUMPTAB_FILE;
+X
+X
+X
+X/*
+X * Initialization such as command-line processing is done and then the
+X * main server loop is started.
+X */
+X
+Xvoid
+Xmain(argc, argv)
+X	int argc;
+X	char **argv;
+X{
+X	struct timeval *timeout;
+X	struct bootp *bp;
+X	struct servent *servp;
+X	struct hostent *hep;
+X	char *stmp;
+X	int n, ba_len, ra_len;
+X	int nfound, readfds;
+X	int standalone;
+X
+X	progname = strrchr(argv[0], '/');
+X	if (progname) progname++;
+X	else progname = argv[0];
+X
+X	/*
+X	 * Initialize logging.
+X	 */
+X	report_init(0);				/* uses progname */
+X
+X	/*
+X	 * Log startup
+X	 */
+X	report(LOG_INFO, "version %s.%d", VERSION, PATCHLEVEL);
+X
+X	/* Debugging for compilers with struct padding. */
+X	assert(sizeof(struct bootp) == BP_MINPKTSZ);
+X
+X	/* Get space for receiving packets and composing replies. */
+X	pktbuf = malloc(MAX_MSG_SIZE);
+X	if (!pktbuf) {
+X		report(LOG_ERR, "malloc failed");
+X		exit(1);
+X	}
+X	bp = (struct bootp *) pktbuf;
+X
+X	/*
+X	 * Check to see if a socket was passed to us from inetd.
+X	 *
+X	 * Use getsockname() to determine if descriptor 0 is indeed a socket
+X	 * (and thus we are probably a child of inetd) or if it is instead
+X	 * something else and we are running standalone.
+X	 */
+X	s = 0;
+X	ba_len = sizeof(bind_addr);
+X	bzero((char *) &bind_addr, ba_len);
+X	errno = 0;
+X	standalone = TRUE;
+X	if (getsockname(s, (struct sockaddr *) &bind_addr, &ba_len) == 0) {
+X		/*
+X		 * Descriptor 0 is a socket.  Assume we are a child of inetd.
+X		 */
+X		if (bind_addr.sin_family == AF_INET) {
+X			standalone = FALSE;
+X			bootps_port = ntohs(bind_addr.sin_port);
+X		} else {
+X			/* Some other type of socket? */
+X			report(LOG_ERR, "getsockname: not an INET socket");
+X		}
+X	}
+X
+X	/*
+X	 * Set defaults that might be changed by option switches.
+X	 */
+X	stmp = NULL;
+X	timeout = &actualtimeout;
+X
+X	/*
+X	 * Read switches.
+X	 */
+X	for (argc--, argv++; argc > 0; argc--, argv++) {
+X		if (argv[0][0] != '-')
+X			break;
+X		switch (argv[0][1]) {
+X
+X		case 'c':				/* chdir_path */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp || (stmp[0] != '/')) {
+X				fprintf(stderr,
+X						"bootpd: invalid chdir specification\n");
+X				break;
+X			}
+X			chdir_path = stmp;
+X			break;
+X
+X		case 'd':				/* debug level */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else if (argv[1] && argv[1][0] == '-') {
+X				/*
+X				 * Backwards-compatible behavior:
+X				 * no parameter, so just increment the debug flag.
+X				 */
+X				debug++;
+X				break;
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp || (sscanf(stmp, "%d", &n) != 1) || (n < 0)) {
+X				fprintf(stderr,
+X						"%s: invalid debug level\n", progname);
+X				break;
+X			}
+X			debug = n;
+X			break;
+X
+X		case 'h':				/* override hostname */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp) {
+X				fprintf(stderr,
+X						"bootpd: missing hostname\n");
+X				break;
+X			}
+X			strncpy(hostname, stmp, sizeof(hostname)-1);
+X			break;
+X
+X		case 'i':				/* inetd mode */
+X			standalone = FALSE;
+X			break;
+X
+X		case 's':				/* standalone mode */
+X			standalone = TRUE;
+X			break;
+X
+X		case 't':				/* timeout */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp || (sscanf(stmp, "%d", &n) != 1) || (n < 0)) {
+X				fprintf(stderr,
+X						"%s: invalid timeout specification\n", progname);
+X				break;
+X			}
+X			actualtimeout.tv_sec = (int32) (60 * n);
+X			/*
+X			 * If the actual timeout is zero, pass a NULL pointer
+X			 * to select so it blocks indefinitely, otherwise,
+X			 * point to the actual timeout value.
+X			 */
+X			timeout = (n > 0) ? &actualtimeout : NULL;
+X			break;
+X
+X		default:
+X			fprintf(stderr, "%s: unknown switch: -%c\n",
+X					progname, argv[0][1]);
+X			usage();
+X			break;
+X
+X		} /* switch */
+X	} /* for args */
+X
+X	/*
+X	 * Override default file names if specified on the command line.
+X	 */
+X	if (argc > 0)
+X		bootptab = argv[0];
+X
+X	if (argc > 1)
+X		bootpd_dump = argv[1];
+X
+X	/*
+X	 * Get my hostname and IP address.
+X	 */
+X	if (hostname[0] == '\0') {
+X		if (gethostname(hostname, sizeof(hostname)) == -1) {
+X			fprintf(stderr, "bootpd: can't get hostname\n");
+X			exit(1);
+X		}
+X	}
+X	hep = gethostbyname(hostname);
+X	if (!hep) {
+X		fprintf(stderr, "Can not get my IP address\n");
+X		exit(1);
+X	}
+X	bcopy(hep->h_addr, (char *)&my_ip_addr, sizeof(my_ip_addr));
+X
+X	if (standalone) {
+X		/*
+X		 * Go into background and disassociate from controlling terminal.
+X		 */
+X		if (debug < 3) {
+X			if (fork())
+X				exit(0);
+X#ifdef	NO_SETSID
+X			setpgrp(0,0);
+X#ifdef TIOCNOTTY
+X			n = open("/dev/tty", O_RDWR);
+X			if (n >= 0) {
+X				ioctl(n, TIOCNOTTY, (char *) 0);
+X				(void) close(n);
+X			}
+X#endif	/* TIOCNOTTY */
+X#else	/* SETSID */
+X			if (setsid() < 0)
+X				perror("setsid");
+X#endif	/* SETSID */
+X		} /* if debug < 3 */
+X
+X		/*
+X		 * Nuke any timeout value
+X		 */
+X		timeout = NULL;
+X
+X	} /* if standalone (1st) */
+X
+X	/* Set the cwd (i.e. to /tftpboot) */
+X	if (chdir_path) {
+X		if (chdir(chdir_path) < 0)
+X			report(LOG_ERR, "%s: chdir failed", chdir_path);
+X	}
+X
+X	/* Get the timezone. */
+X	tzone_init();
+X
+X	/* Allocate hash tables. */
+X	rdtab_init();
+X
+X	/*
+X	 * Read the bootptab file.
+X	 */
+X	readtab(1);					/* force read */
+X
+X	if (standalone) {
+X
+X		/*
+X		 * Create a socket.
+X		 */
+X		if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+X			report(LOG_ERR, "socket: %s", get_network_errmsg());
+X			exit(1);
+X		}
+X
+X		/*
+X		 * Get server's listening port number
+X		 */
+X		servp = getservbyname("bootps", "udp");
+X		if (servp) {
+X			bootps_port = ntohs((u_short) servp->s_port);
+X		} else {
+X			bootps_port = (u_short) IPPORT_BOOTPS;
+X			report(LOG_ERR,
+X				   "udp/bootps: unknown service -- assuming port %d",
+X				   bootps_port);
+X		}
+X
+X		/*
+X		 * Bind socket to BOOTPS port.
+X		 */
+X		bind_addr.sin_family = AF_INET;
+X		bind_addr.sin_addr.s_addr = INADDR_ANY;
+X		bind_addr.sin_port = htons(bootps_port);
+X		if (bind(s, (struct sockaddr *) &bind_addr,
+X				 sizeof(bind_addr)) < 0)
+X		{
+X			report(LOG_ERR, "bind: %s", get_network_errmsg());
+X			exit(1);
+X		}
+X	} /* if standalone (2nd)*/
+X
+X	/*
+X	 * Get destination port number so we can reply to client
+X	 */
+X	servp = getservbyname("bootpc", "udp");
+X	if (servp) {
+X		bootpc_port = ntohs(servp->s_port);
+X	} else {
+X		report(LOG_ERR,
+X			   "udp/bootpc: unknown service -- assuming port %d",
+X			   IPPORT_BOOTPC);
+X		bootpc_port = (u_short) IPPORT_BOOTPC;
+X	}
+X
+X	/*
+X	 * Set up signals to read or dump the table.
+X	 */
+X	if ((int) signal(SIGHUP, catcher) < 0) {
+X		report(LOG_ERR, "signal: %s", get_errmsg());
+X		exit(1);
+X	}
+X	if ((int) signal(SIGUSR1, catcher) < 0) {
+X		report(LOG_ERR, "signal: %s", get_errmsg());
+X		exit(1);
+X	}
+X
+X	/*
+X	 * Process incoming requests.
+X	 */
+X	for (;;) {
+X		readfds = 1 << s;
+X		nfound = select(s + 1, (fd_set *)&readfds, NULL, NULL, timeout);
+X		if (nfound < 0) {
+X			if (errno != EINTR) {
+X				report(LOG_ERR, "select: %s", get_errmsg());
+X			}
+X			/*
+X			 * Call readtab() or dumptab() here to avoid the
+X			 * dangers of doing I/O from a signal handler.
+X			 */
+X			if (do_readtab) {
+X				do_readtab = 0;
+X				readtab(1);		/* force read */
+X			}
+X			if (do_dumptab) {
+X				do_dumptab = 0;
+X				dumptab(bootpd_dump);
+X			}
+X			continue;
+X		}
+X		if (!(readfds & (1 << s))) {
+X			if (debug > 1)
+X				report(LOG_INFO, "exiting after %ld minutes of inactivity",
+X					   actualtimeout.tv_sec / 60);
+X			exit(0);
+X		}
+X		ra_len = sizeof(recv_addr);
+X		n = recvfrom(s, pktbuf, MAX_MSG_SIZE, 0,
+X					 (struct sockaddr *) &recv_addr, &ra_len);
+X		if (n <= 0) {
+X			continue;
+X		}
+X		if (debug > 1) {
+X			report(LOG_INFO, "recvd pkt from IP addr %s",
+X				   inet_ntoa(recv_addr.sin_addr));
+X		}
+X		if (n < sizeof(struct bootp)) {
+X			if (debug) {
+X				report(LOG_INFO, "received short packet");
+X			}
+X			continue;
+X		}
+X		pktlen = n;
+X
+X		readtab(0);				/* maybe re-read bootptab */
+X
+X		switch (bp->bp_op) {
+X		case BOOTREQUEST:
+X			handle_request();
+X			break;
+X		case BOOTREPLY:
+X			handle_reply();
+X			break;
+X		}
+X	}
+X}
+X
+X
+X
+X
+X/*
+X * Print "usage" message and exit
+X */
+X
+XPRIVATE void
+Xusage()
+X{
+X	fprintf(stderr,
+X			"usage:  bootpd [-d level] [-i] [-s] [-t timeout] [configfile [dumpfile]]\n");
+X	fprintf(stderr, "\t -c n\tset current directory\n");
+X	fprintf(stderr, "\t -d n\tset debug level\n");
+X	fprintf(stderr, "\t -i\tforce inetd mode (run as child of inetd)\n");
+X	fprintf(stderr, "\t -s\tforce standalone mode (run without inetd)\n");
+X	fprintf(stderr, "\t -t n\tset inetd exit timeout to n minutes\n");
+X	exit(1);
+X}
+X
+X/* Signal catchers */
+XPRIVATE void
+Xcatcher(sig)
+X	int sig;
+X{
+X	if (sig == SIGHUP)
+X		do_readtab = 1;
+X	if (sig == SIGUSR1)
+X		do_dumptab = 1;
+X#ifdef	SYSV
+X	/* For older "System V" derivatives with no sigset(). */
+X	/* XXX - Should just do it the POSIX way (sigaction). */
+X	signal(sig, catcher);
+X#endif
+X}
+X
+X
+X
+X/*
+X * Process BOOTREQUEST packet.
+X *
+X * Note:  This version of the bootpd.c server never forwards
+X * a request to another server.  That is the job of a gateway
+X * program such as the "bootpgw" program included here.
+X *
+X * (Also this version does not interpret the hostname field of
+X * the request packet;  it COULD do a name->address lookup and
+X * forward the request there.)
+X */
+XPRIVATE void
+Xhandle_request()
+X{
+X	struct bootp *bp = (struct bootp *) pktbuf;
+X	struct host *hp = NULL;
+X	struct host dummyhost;
+X	int32 bootsize = 0;
+X	unsigned hlen, hashcode;
+X	int32 dest;
+X	char realpath[1024];
+X	char *clntpath;
+X	char *homedir, *bootfile;
+X	int n;
+X
+X	/* XXX - SLIP init: Set bp_ciaddr = recv_addr here? */
+X
+X	/*
+X	 * If the servername field is set, compare it against us.
+X	 * If we're not being addressed, ignore this request.
+X	 * If the server name field is null, throw in our name.
+X	 */
+X	if (strlen(bp->bp_sname)) {
+X		if (strcmp(bp->bp_sname, hostname)) {
+X			if (debug)
+X				report(LOG_INFO, "\
+Xignoring request for server %s from client at %s address %s",
+X					   bp->bp_sname, netname(bp->bp_htype),
+X					   haddrtoa(bp->bp_chaddr, bp->bp_hlen));
+X			/* XXX - Is it correct to ignore such a request? -gwr */
+X			return;
+X		}
+X	} else {
+X		strcpy(bp->bp_sname, hostname);
+X	}
+X
+X	/* Convert the request into a reply. */
+X	bp->bp_op = BOOTREPLY;
+X	if (bp->bp_ciaddr.s_addr == 0) {
+X		/*
+X		 * client doesnt know his IP address,
+X		 * search by hardware address.
+X		 */
+X		if (debug > 1) {
+X			report(LOG_INFO, "request from %s address %s",
+X				   netname(bp->bp_htype),
+X				   haddrtoa(bp->bp_chaddr, bp->bp_hlen));
+X		}
+X		hlen = haddrlength(bp->bp_htype);
+X		if (hlen != bp->bp_hlen) {
+X			report(LOG_NOTICE, "bad addr len from from %s address %s",
+X				   netname(bp->bp_htype),
+X				   haddrtoa(bp->bp_chaddr, hlen));
+X		}
+X		dummyhost.htype = bp->bp_htype;
+X		bcopy(bp->bp_chaddr, dummyhost.haddr, hlen);
+X		hashcode = hash_HashFunction(bp->bp_chaddr, hlen);
+X		hp = (struct host *) hash_Lookup(hwhashtable, hashcode, hwlookcmp,
+X										 &dummyhost);
+X		if (hp == NULL &&
+X			bp->bp_htype == HTYPE_IEEE802)
+X		{
+X			/* Try again with address in "canonical" form. */
+X			haddr_conv802(bp->bp_chaddr, dummyhost.haddr, hlen);
+X			if (debug > 1) {
+X				report(LOG_INFO, "\
+XHW addr type is IEEE 802.  convert to %s and check again\n",
+X					   haddrtoa(dummyhost.haddr, bp->bp_hlen));
+X			}
+X			hashcode = hash_HashFunction(dummyhost.haddr, hlen);
+X			hp = (struct host *) hash_Lookup(hwhashtable, hashcode,
+X											 hwlookcmp, &dummyhost);
+X		}
+X		if (hp == NULL) {
+X			/*
+X			 * XXX - Add dynamic IP address assignment?
+X			 */
+X			if (debug > 1)
+X				report(LOG_INFO, "unknown client %s address %s",
+X					   netname(bp->bp_htype),
+X					   haddrtoa(bp->bp_chaddr, bp->bp_hlen));
+X			return; /* not found */
+X		}
+X		(bp->bp_yiaddr).s_addr = hp->iaddr.s_addr;
+X
+X	} else {
+X
+X		/*
+X		 * search by IP address.
+X		 */
+X		if (debug > 1) {
+X			report(LOG_INFO, "request from IP addr %s",
+X				   inet_ntoa(bp->bp_ciaddr));
+X		}
+X		dummyhost.iaddr.s_addr = bp->bp_ciaddr.s_addr;
+X		hashcode = hash_HashFunction((u_char *) &(bp->bp_ciaddr.s_addr), 4);
+X		hp = (struct host *) hash_Lookup(iphashtable, hashcode, iplookcmp,
+X										 &dummyhost);
+X		if (hp == NULL) {
+X			if (debug > 1) {
+X				report(LOG_NOTICE, "IP address not found: %s",
+X					   inet_ntoa(bp->bp_ciaddr));
+X			}
+X			return;
+X		}
+X	}
+X
+X	if (debug) {
+X		report(LOG_INFO, "found %s (%s)", inet_ntoa(hp->iaddr),
+X			   hp->hostname->string);
+X	}
+X
+X	/*
+X	 * If there is a response delay threshold, ignore requests
+X	 * with a timestamp lower than the threshold.
+X	 */
+X	if (hp->flags.min_wait) {
+X		u_int32 t = (u_int32) ntohs(bp->bp_secs);
+X		if (t < hp->min_wait) {
+X			if (debug > 1)
+X				report(LOG_INFO,
+X					   "ignoring request due to timestamp (%d < %d)",
+X					   t, hp->min_wait);
+X			return;
+X		}
+X	}
+X
+X#ifdef	YORK_EX_OPTION
+X	/*
+X	 * The need for the "ex" tag arose out of the need to empty
+X	 * shared networked drives on diskless PCs.  This solution is
+X	 * not very clean but it does work fairly well.
+X	 * Written by Edmund J. Sutcliffe <edmund@york.ac.uk>
+X	 *
+X	 * XXX - This could compromise security if a non-trusted user
+X	 * managed to write an entry in the bootptab with :ex=trojan:
+X	 * so I would leave this turned off unless you need it. -gwr
+X	 */
+X	/* Run a program, passing the client name as a parameter. */
+X	if (hp->flags.exec_file) {
+X		char tst[100];
+X		/* XXX - Check string lengths? -gwr */
+X		strcpy (tst, hp->exec_file->string);
+X		strcat (tst, " ");
+X		strcat (tst, hp->hostname->string);
+X		strcat (tst, " &");
+X		if (debug)
+X			report(LOG_INFO, "executing %s", tst);
+X		system(tst);	/* Hope this finishes soon... */
+X	}
+X#endif	/* YORK_EX_OPTION */
+X
+X	/*
+X	 * If a specific TFTP server address was specified in the bootptab file,
+X	 * fill it in, otherwise zero it.
+X	 * XXX - Rather than zero it, should it be the bootpd address? -gwr
+X	 */
+X	(bp->bp_siaddr).s_addr = (hp->flags.bootserver) ?
+X		hp->bootserver.s_addr : 0L;
+X
+X#ifdef	STANFORD_PROM_COMPAT
+X	/*
+X	 * Stanford bootp PROMs (for a Sun?) have no way to leave
+X	 * the boot file name field blank (because the boot file
+X	 * name is automatically generated from some index).
+X	 * As a work-around, this little hack allows those PROMs to
+X	 * specify "sunboot14" with the same effect as a NULL name.
+X	 * (The user specifies boot device 14 or some such magic.)
+X	 */
+X	if (strcmp(bp->bp_file, "sunboot14") == 0)
+X		bp->bp_file[0] = '\0';	/* treat it as unspecified */
+X#endif
+X
+X	/*
+X	 * Fill in the client's proper bootfile.
+X	 *
+X	 * If the client specifies an absolute path, try that file with a
+X	 * ".host" suffix and then without.  If the file cannot be found, no
+X	 * reply is made at all.
+X	 *
+X	 * If the client specifies a null or relative file, use the following
+X	 * table to determine the appropriate action:
+X	 *
+X	 *  Homedir      Bootfile    Client's file
+X	 * specified?   specified?   specification   Action
+X	 * -------------------------------------------------------------------
+X	 *      No          No          Null         Send null filename
+X	 *      No          No          Relative     Discard request
+X	 *      No          Yes         Null         Send if absolute else null
+X	 *      No          Yes         Relative     Discard request     *XXX
+X	 *      Yes         No          Null         Send null filename
+X	 *      Yes         No          Relative     Lookup with ".host"
+X	 *      Yes         Yes         Null         Send home/boot or bootfile
+X	 *      Yes         Yes         Relative     Lookup with ".host" *XXX
+X	 *
+X	 */
+X
+X	/*
+X	 * XXX - I don't like the policy of ignoring a client when the
+X	 * boot file is not accessible.  The TFTP server might not be
+X	 * running on the same machine as the BOOTP server, in which
+X	 * case checking accessibility of the boot file is pointless.
+X	 *
+X	 * Therefore, file accessibility is now demanded ONLY if you
+X	 * define CHECK_FILE_ACCESS in the Makefile options. -gwr
+X	 */
+X
+X	/*
+X	 * The "real" path is as seen by the BOOTP daemon on this
+X	 * machine, while the client path is relative to the TFTP
+X	 * daemon chroot directory (i.e. /tftpboot).
+X	 */
+X	if (hp->flags.tftpdir) {
+X		strcpy(realpath, hp->tftpdir->string);
+X		clntpath = &realpath[strlen(realpath)];
+X	} else {
+X		clntpath = realpath;
+X	}
+X
+X	/*
+X	 * Determine client's requested homedir and bootfile.
+X	 */
+X	homedir = NULL;
+X	bootfile = NULL;
+X	if (bp->bp_file[0]) {
+X		homedir = bp->bp_file;
+X		bootfile = strrchr(homedir, '/');
+X		if (bootfile) {
+X			if (homedir == bootfile)
+X				homedir = NULL;
+X			*bootfile++ = '\0';
+X		} else {
+X			/* no "/" in the string */
+X			bootfile = homedir;
+X			homedir = NULL;
+X		}
+X		if (debug > 2) {
+X			report(LOG_INFO, "requested path=\"%s\"  file=\"%s\"",
+X				   (homedir) ? homedir : "",
+X				   (bootfile) ? bootfile : "");
+X		}
+X	}
+X
+X	/*
+X	 * Specifications in bootptab override client requested values.
+X	 */
+X	if (hp->flags.homedir)
+X		homedir = hp->homedir->string;
+X	if (hp->flags.bootfile)
+X		bootfile = hp->bootfile->string;
+X
+X	/*
+X	 * Construct bootfile path.
+X	 */
+X	if (homedir) {
+X		if (homedir[0] != '/')
+X			strcat(clntpath, "/");
+X		strcat(clntpath, homedir);
+X		homedir = NULL;
+X	}
+X	if (bootfile) {
+X		if (bootfile[0] != '/')
+X			strcat(clntpath, "/");
+X		strcat(clntpath, bootfile);
+X		bootfile = NULL;
+X	}
+X
+X	/*
+X	 * First try to find the file with a ".host" suffix
+X	 */
+X	n = strlen(clntpath);
+X	strcat(clntpath, ".");
+X	strcat(clntpath, hp->hostname->string);
+X	if (chk_access(realpath, &bootsize) < 0) {
+X		clntpath[n] = 0;			/* Try it without the suffix */
+X		if (chk_access(realpath, &bootsize) < 0) {
+X			/* neither "file.host" nor "file" was found */
+X#ifdef	CHECK_FILE_ACCESS
+X
+X			if (bp->bp_file[0]) {
+X				/*
+X				 * Client wanted specific file
+X				 * and we didn't have it.
+X				 */
+X				report(LOG_NOTICE,
+X					   "requested file not found: \"%s\"", clntpath);
+X				return;
+X			}
+X			/*
+X			 * Client didn't ask for a specific file and we couldn't
+X			 * access the default file, so just zero-out the bootfile
+X			 * field in the packet and continue processing the reply.
+X			 */
+X			bzero(bp->bp_file, sizeof(bp->bp_file));
+X			goto null_file_name;
+X
+X#else	/* CHECK_FILE_ACCESS */
+X
+X			/* Complain only if boot file size was needed. */
+X			if (hp->flags.bootsize_auto) {
+X				report(LOG_ERR, "can not determine size of file \"%s\"",
+X					   clntpath);
+X			}
+X
+X#endif	/* CHECK_FILE_ACCESS */
+X		}
+X	}
+X	strncpy(bp->bp_file, clntpath, BP_FILE_LEN);
+X	if (debug > 2)
+X		report(LOG_INFO, "bootfile=\"%s\"", clntpath);
+X
+Xnull_file_name:
+X
+X
+X	/*
+X	 * Handle vendor options based on magic number.
+X	 */
+X
+X	if (debug > 1) {
+X		report(LOG_INFO, "vendor magic field is %d.%d.%d.%d",
+X			   (int) ((bp->bp_vend)[0]),
+X			   (int) ((bp->bp_vend)[1]),
+X			   (int) ((bp->bp_vend)[2]),
+X			   (int) ((bp->bp_vend)[3]));
+X	}
+X	/*
+X	 * If this host isn't set for automatic vendor info then copy the
+X	 * specific cookie into the bootp packet, thus forcing a certain
+X	 * reply format.  Only force reply format if user specified it.
+X	 */
+X	if (hp->flags.vm_cookie) {
+X		/* Slam in the user specified magic number. */
+X		bcopy(hp->vm_cookie, bp->bp_vend, 4);
+X	}
+X	/*
+X	 * Figure out the format for the vendor-specific info.
+X	 * Note that bp->bp_vend may have been set above.
+X	 */
+X	if (!bcmp(bp->bp_vend, vm_rfc1048, 4)) {
+X		/* RFC1048 conformant bootp client */
+X		dovend_rfc1048(bp, hp, bootsize);
+X		if (debug > 1) {
+X			report(LOG_INFO, "sending reply (with RFC1048 options)");
+X		}
+X	}
+X#ifdef VEND_CMU
+X	else if (!bcmp(bp->bp_vend, vm_cmu, 4)) {
+X		dovend_cmu(bp, hp);
+X		if (debug > 1) {
+X			report(LOG_INFO, "sending reply (with CMU options)");
+X		}
+X	}
+X#endif
+X	else {
+X		if (debug > 1) {
+X			report(LOG_INFO, "sending reply (with no options)");
+X		}
+X	}
+X
+X	dest = (hp->flags.reply_addr) ?
+X		hp->reply_addr.s_addr : 0L;
+X
+X	/* not forwarded */
+X	sendreply(0, dest);
+X}
+X
+X
+X/*
+X * Process BOOTREPLY packet.
+X */
+XPRIVATE void
+Xhandle_reply()
+X{
+X	if (debug) {
+X		report(LOG_INFO, "processing boot reply");
+X	}
+X	/* forwarded, no destination override */
+X	sendreply(1, 0);
+X}
+X
+X
+X/*
+X * Send a reply packet to the client.  'forward' flag is set if we are
+X * not the originator of this reply packet.
+X */
+XPRIVATE void
+Xsendreply(forward, dst_override)
+X	int forward;
+X	int32 dst_override;
+X{
+X	struct bootp *bp = (struct bootp *) pktbuf;
+X	struct in_addr dst;
+X	u_short port = bootpc_port;
+X	unsigned char *ha;
+X	int len;
+X
+X	/*
+X	 * XXX - Should honor bp_flags "broadcast" bit here.
+X	 * Temporary workaround: use the :ra=ADDR: option to
+X	 * set the reply address to the broadcast address.
+X	 */
+X
+X	/*
+X	 * If the destination address was specified explicitly
+X	 * (i.e. the broadcast address for HP compatiblity)
+X	 * then send the response to that address.  Otherwise,
+X	 * act in accordance with RFC951:
+X	 *   If the client IP address is specified, use that
+X	 * else if gateway IP address is specified, use that
+X	 * else make a temporary arp cache entry for the client's
+X	 * NEW IP/hardware address and use that.
+X	 */
+X	if (dst_override) {
+X		dst.s_addr = dst_override;
+X		if (debug > 1) {
+X			report(LOG_INFO, "reply address override: %s",
+X				   inet_ntoa(dst));
+X		}
+X	} else if (bp->bp_ciaddr.s_addr) {
+X		dst = bp->bp_ciaddr;
+X	} else if (bp->bp_giaddr.s_addr && forward == 0) {
+X		dst = bp->bp_giaddr;
+X		port = bootps_port;
+X		if (debug > 1) {
+X			report(LOG_INFO, "sending reply to gateway %s",
+X				   inet_ntoa(dst));
+X		}
+X	} else {
+X		dst = bp->bp_yiaddr;
+X		ha = bp->bp_chaddr;
+X		len = bp->bp_hlen;
+X		if (len > MAXHADDRLEN)
+X			len = MAXHADDRLEN;
+X
+X		if (debug > 1)
+X			report(LOG_INFO, "setarp %s - %s",
+X				   inet_ntoa(dst), haddrtoa(ha, len));
+X		setarp(s, &dst, ha, len);
+X	}
+X
+X	if ((forward == 0) &&
+X		(bp->bp_siaddr.s_addr == 0))
+X	{
+X		struct ifreq *ifr;
+X		struct in_addr siaddr;
+X		/*
+X		 * If we are originating this reply, we
+X		 * need to find our own interface address to
+X		 * put in the bp_siaddr field of the reply.
+X		 * If this server is multi-homed, pick the
+X		 * 'best' interface (the one on the same net
+X		 * as the client).  Of course, the client may
+X		 * be on the other side of a BOOTP gateway...
+X		 */
+X		ifr = getif(s, &dst);
+X		if (ifr) {
+X			struct sockaddr_in *sip;
+X			sip = (struct sockaddr_in *) &(ifr->ifr_addr);
+X			siaddr = sip->sin_addr;
+X		} else {
+X			/* Just use my "official" IP address. */
+X			siaddr = my_ip_addr;
+X		}
+X
+X		/* XXX - No need to set bp_giaddr here. */
+X
+X		/* Finally, set the server address field. */
+X		bp->bp_siaddr = siaddr;
+X	}
+X	/* Set up socket address for send. */
+X	send_addr.sin_family = AF_INET;
+X	send_addr.sin_port = htons(port);
+X	send_addr.sin_addr = dst;
+X
+X	/* Send reply with same size packet as request used. */
+X	if (sendto(s, pktbuf, pktlen, 0,
+X			   (struct sockaddr *) &send_addr,
+X			   sizeof(send_addr)) < 0)
+X	{
+X		report(LOG_ERR, "sendto: %s", get_network_errmsg());
+X	}
+X} /* sendreply */
+X
+X
+X/* nmatch() - now in getif.c */
+X/* setarp() - now in hwaddr.c */
+X
+X
+X/*
+X * This call checks read access to a file.  It returns 0 if the file given
+X * by "path" exists and is publically readable.  A value of -1 is returned if
+X * access is not permitted or an error occurs.  Successful calls also
+X * return the file size in bytes using the long pointer "filesize".
+X *
+X * The read permission bit for "other" users is checked.  This bit must be
+X * set for tftpd(8) to allow clients to read the file.
+X */
+X
+XPRIVATE int
+Xchk_access(path, filesize)
+X	char *path;
+X	int32 *filesize;
+X{
+X	struct stat st;
+X
+X	if ((stat(path, &st) == 0) && (st.st_mode & (S_IREAD >> 6))) {
+X		*filesize = (int32) st.st_size;
+X		return 0;
+X	} else {
+X		return -1;
+X	}
+X}
+X
+X
+X/*
+X * Now in dumptab.c :
+X *	dumptab()
+X *	dump_host()
+X *	list_ipaddresses()
+X */
+X
+X#ifdef VEND_CMU
+X
+X/*
+X * Insert the CMU "vendor" data for the host pointed to by "hp" into the
+X * bootp packet pointed to by "bp".
+X */
+X
+XPRIVATE void
+Xdovend_cmu(bp, hp)
+X	struct bootp *bp;
+X	struct host *hp;
+X{
+X	struct cmu_vend *vendp;
+X	struct in_addr_list *taddr;
+X
+X	/*
+X	 * Initialize the entire vendor field to zeroes.
+X	 */
+X	bzero(bp->bp_vend, sizeof(bp->bp_vend));
+X
+X	/*
+X	 * Fill in vendor information. Subnet mask, default gateway,
+X	 * domain name server, ien name server, time server
+X	 */
+X	vendp = (struct cmu_vend *) bp->bp_vend;
+X	strcpy(vendp->v_magic, (char *)vm_cmu);
+X	if (hp->flags.subnet_mask) {
+X		(vendp->v_smask).s_addr = hp->subnet_mask.s_addr;
+X		(vendp->v_flags) |= VF_SMASK;
+X		if (hp->flags.gateway) {
+X			(vendp->v_dgate).s_addr = hp->gateway->addr->s_addr;
+X		}
+X	}
+X	if (hp->flags.domain_server) {
+X		taddr = hp->domain_server;
+X		if (taddr->addrcount > 0) {
+X			(vendp->v_dns1).s_addr = (taddr->addr)[0].s_addr;
+X			if (taddr->addrcount > 1) {
+X				(vendp->v_dns2).s_addr = (taddr->addr)[1].s_addr;
+X			}
+X		}
+X	}
+X	if (hp->flags.name_server) {
+X		taddr = hp->name_server;
+X		if (taddr->addrcount > 0) {
+X			(vendp->v_ins1).s_addr = (taddr->addr)[0].s_addr;
+X			if (taddr->addrcount > 1) {
+X				(vendp->v_ins2).s_addr = (taddr->addr)[1].s_addr;
+X			}
+X		}
+X	}
+X	if (hp->flags.time_server) {
+X		taddr = hp->time_server;
+X		if (taddr->addrcount > 0) {
+X			(vendp->v_ts1).s_addr = (taddr->addr)[0].s_addr;
+X			if (taddr->addrcount > 1) {
+X				(vendp->v_ts2).s_addr = (taddr->addr)[1].s_addr;
+X			}
+X		}
+X	}
+X	/* Log message now done by caller. */
+X} /* dovend_cmu */
+X
+X#endif /* VEND_CMU */
+X
+X
+X
+X/*
+X * Insert the RFC1048 vendor data for the host pointed to by "hp" into the
+X * bootp packet pointed to by "bp".
+X */
+X#define	NEED(LEN, MSG) do \
+X	if (bytesleft < (LEN)) { \
+X		report(LOG_NOTICE, noroom, \
+X			   hp->hostname->string, MSG); \
+X		return; \
+X	} while (0)
+XPRIVATE void
+Xdovend_rfc1048(bp, hp, bootsize)
+X	struct bootp *bp;
+X	struct host *hp;
+X	int32 bootsize;
+X{
+X	int bytesleft, len;
+X	byte *vp;
+X	char *tmpstr;
+X
+X	static char noroom[] = "%s: No room for \"%s\" option";
+X
+X	vp = bp->bp_vend;
+X
+X	if (hp->flags.msg_size) {
+X		pktlen = hp->msg_size;
+X	} else {
+X		/*
+X		 * If the request was longer than the official length, build
+X		 * a response of that same length where the additional length
+X		 * is assumed to be part of the bp_vend (options) area.
+X		 */
+X		if (pktlen > sizeof(*bp)) {
+X			if (debug > 1)
+X				report(LOG_INFO, "request message length=%d", pktlen);
+X		}
+X		/*
+X		 * Check whether the request contains the option:
+X		 * Maximum DHCP Message Size (RFC1533 sec. 9.8)
+X		 * and if so, override the response length with its value.
+X		 * This request must lie within the first BP_VEND_LEN
+X		 * bytes of the option space.
+X		 */
+X		{
+X			byte *p, *ep;
+X			byte tag, len;
+X			short msgsz = 0;
+X			
+X			p = vp + 4;
+X			ep = p + BP_VEND_LEN - 4;
+X			while (p < ep) {
+X				tag = *p++;
+X				/* Check for tags with no data first. */
+X				if (tag == TAG_PAD)
+X					continue;
+X				if (tag == TAG_END)
+X					break;
+X				/* Now scan the length byte. */
+X				len = *p++;
+X				switch (tag) {
+X				case TAG_MAX_MSGSZ:
+X					if (len == 2) {
+X						bcopy(p, (char*)&msgsz, 2);
+X						msgsz = ntohs(msgsz);
+X					}
+X					break;
+X				case TAG_SUBNET_MASK:
+X					/* XXX - Should preserve this if given... */
+X					break;
+X				} /* swtich */
+X				p += len;
+X			}
+X
+X			if (msgsz > sizeof(*bp)) {
+X				if (debug > 1)
+X					report(LOG_INFO, "request has DHCP msglen=%d", msgsz);
+X				pktlen = msgsz;
+X			}
+X		}
+X	}
+X
+X	if (pktlen < sizeof(*bp)) {
+X		report(LOG_ERR, "invalid response length=%d", pktlen);
+X		pktlen = sizeof(*bp);
+X	}
+X	bytesleft = ((byte*)bp + pktlen) - vp;
+X	if (pktlen > sizeof(*bp)) {
+X		if (debug > 1)
+X			report(LOG_INFO, "extended reply, length=%d, options=%d",
+X				   pktlen, bytesleft);
+X	}
+X
+X	/* Copy in the magic cookie */
+X	bcopy(vm_rfc1048, vp, 4);
+X	vp += 4;
+X	bytesleft -= 4;
+X
+X	if (hp->flags.subnet_mask) {
+X		/* always enough room here. */
+X		*vp++ = TAG_SUBNET_MASK;/* -1 byte  */
+X		*vp++ = 4;				/* -1 byte  */
+X		insert_u_long(hp->subnet_mask.s_addr, &vp);	/* -4 bytes */
+X		bytesleft -= 6;			/* Fix real count */
+X		if (hp->flags.gateway) {
+X			(void) insert_ip(TAG_GATEWAY,
+X							 hp->gateway,
+X							 &vp, &bytesleft);
+X		}
+X	}
+X	if (hp->flags.bootsize) {
+X		/* always enough room here */
+X		bootsize = (hp->flags.bootsize_auto) ?
+X			((bootsize + 511) / 512) : (hp->bootsize);	/* Round up */
+X		*vp++ = TAG_BOOT_SIZE;
+X		*vp++ = 2;
+X		*vp++ = (byte) ((bootsize >> 8) & 0xFF);
+X		*vp++ = (byte) (bootsize & 0xFF);
+X		bytesleft -= 4;			/* Tag, length, and 16 bit blocksize */
+X	}
+X	/*
+X	 * This one is special: Remaining options go in the ext file.
+X	 * Only the subnet_mask, bootsize, and gateway should precede.
+X	 */
+X	if (hp->flags.exten_file) {
+X		/*
+X		 * Check for room for exten_file.  Add 3 to account for
+X		 * TAG_EXTEN_FILE, length, and TAG_END.
+X		 */
+X		len = strlen(hp->exten_file->string);
+X		NEED((len + 3), "ef");
+X		*vp++ = TAG_EXTEN_FILE;
+X		*vp++ = (byte) (len & 0xFF);
+X		bcopy(hp->exten_file->string, vp, len);
+X		vp += len;
+X		*vp++ = TAG_END;
+X		bytesleft -= len + 3;
+X		return;					/* no more options here. */
+X	}
+X	/*
+X	 * The remaining options are inserted by the following
+X	 * function (which is shared with bootpef.c).
+X	 * Keep back one byte for the TAG_END.
+X	 */
+X	len = dovend_rfc1497(hp, vp, bytesleft - 1);
+X	vp += len;
+X	bytesleft -= len;
+X
+X	/* There should be at least one byte left. */
+X	NEED(1, "(end)");
+X	*vp++ = TAG_END;
+X	bytesleft--;
+X
+X	/* Log message done by caller. */
+X	if (bytesleft > 0) {
+X		/*
+X		 * Zero out any remaining part of the vendor area.
+X		 */
+X		bzero(vp, bytesleft);
+X	}
+X} /* dovend_rfc1048 */
+X#undef	NEED
+X
+X
+X/*
+X * Now in readfile.c:
+X * 	hwlookcmp()
+X *	iplookcmp()
+X */
+X
+X/* haddrtoa() - now in hwaddr.c */
+X/*
+X * Now in dovend.c:
+X * insert_ip()
+X * insert_generic()
+X * insert_u_long()
+X */
+X
+X/* get_errmsg() - now in report.c */
+X
+X/*
+X * Local Variables:
+X * tab-width: 4
+X * c-indent-level: 4
+X * c-argdecl-indent: 4
+X * c-continued-statement-offset: 4
+X * c-continued-brace-offset: -4
+X * c-label-offset: -4
+X * c-brace-offset: 0
+X * End:
+X */
+END_OF_FILE
+if test 33311 -ne `wc -c <'bootpd.c'`; then
+    echo shar: \"'bootpd.c'\" unpacked with wrong size!
+fi
+# end of 'bootpd.c'
+fi
+if test -f 'bootpgw.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'bootpgw.c'\"
+else
+echo shar: Extracting \"'bootpgw.c'\" \(16032 characters\)
+sed "s/^X//" >'bootpgw.c' <<'END_OF_FILE'
+X/*
+X * bootpgw.c - BOOTP GateWay
+X * This program forwards BOOTP Request packets to a BOOTP server.
+X */
+X
+X/************************************************************************
+X          Copyright 1988, 1991 by Carnegie Mellon University
+X
+X                          All Rights Reserved
+X
+XPermission to use, copy, modify, and distribute this software and its
+Xdocumentation for any purpose and without fee is hereby granted, provided
+Xthat the above copyright notice appear in all copies and that both that
+Xcopyright notice and this permission notice appear in supporting
+Xdocumentation, and that the name of Carnegie Mellon University not be used
+Xin advertising or publicity pertaining to distribution of the software
+Xwithout specific, written prior permission.
+X
+XCARNEGIE MELLON UNIVERSITY DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+XSOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS.
+XIN NO EVENT SHALL CMU BE LIABLE FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL
+XDAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+XPROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+XACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
+XSOFTWARE.
+X************************************************************************/
+X
+X#ifndef lint
+Xstatic char rcsid[] = "$Id: bootpgw.c $";
+X#endif
+X
+X/*
+X * BOOTPGW is typically used to forward BOOTP client requests from
+X * one subnet to a BOOTP server on a different subnet.
+X */
+X
+X#include <sys/types.h>
+X#include <sys/param.h>
+X#include <sys/socket.h>
+X#include <sys/ioctl.h>
+X#include <sys/file.h>
+X#include <sys/time.h>
+X#include <sys/stat.h>
+X
+X#include <net/if.h>
+X#include <netinet/in.h>
+X#include <arpa/inet.h>			/* inet_ntoa */
+X
+X#ifndef	NO_UNISTD
+X#include <unistd.h>
+X#endif
+X#include <stdlib.h>
+X#include <signal.h>
+X#include <stdio.h>
+X#include <string.h>
+X#include <errno.h>
+X#include <ctype.h>
+X#include <netdb.h>
+X#include <syslog.h>
+X#include <assert.h>
+X
+X#ifdef	NO_SETSID
+X# include <fcntl.h>		/* for O_RDONLY, etc */
+X#endif
+X
+X#ifndef	USE_BFUNCS
+X# include <memory.h>
+X/* Yes, memcpy is OK here (no overlapped copies). */
+X# define bcopy(a,b,c)    memcpy(b,a,c)
+X# define bzero(p,l)      memset(p,0,l)
+X# define bcmp(a,b,c)     memcmp(a,b,c)
+X#endif
+X
+X#include "bootp.h"
+X#include "getif.h"
+X#include "hwaddr.h"
+X#include "report.h"
+X#include "patchlevel.h"
+X
+X/* Local definitions: */
+X#define MAX_MSG_SIZE			(3*512)	/* Maximum packet size */
+X#define TRUE 1
+X#define FALSE 0
+X#define get_network_errmsg get_errmsg
+X
+X
+X
+X/*
+X * Externals, forward declarations, and global variables
+X */
+X
+X#ifdef	__STDC__
+X#define P(args) args
+X#else
+X#define P(args) ()
+X#endif
+X
+Xstatic void usage P((void));
+Xstatic void handle_reply P((void));
+Xstatic void handle_request P((void));
+X
+X#undef	P
+X
+X/*
+X * IP port numbers for client and server obtained from /etc/services
+X */
+X
+Xu_short bootps_port, bootpc_port;
+X
+X
+X/*
+X * Internet socket and interface config structures
+X */
+X
+Xstruct sockaddr_in bind_addr;	/* Listening */
+Xstruct sockaddr_in recv_addr;	/* Packet source */
+Xstruct sockaddr_in send_addr;	/*  destination */
+X
+X
+X/*
+X * option defaults
+X */
+Xint debug = 0;					/* Debugging flag (level) */
+Xstruct timeval actualtimeout =
+X{								/* fifteen minutes */
+X	15 * 60L,					/* tv_sec */
+X	0							/* tv_usec */
+X};
+Xu_int maxhops = 4;				/* Number of hops allowed for requests. */
+Xu_int minwait = 3;				/* Number of seconds client must wait before
+X						   its bootrequest packets are forwarded. */
+X
+X/*
+X * General
+X */
+X
+Xint s;							/* Socket file descriptor */
+Xchar *pktbuf;					/* Receive packet buffer */
+Xint pktlen;
+Xchar *progname;
+Xchar *servername;
+Xint32 server_ipa;				/* Real server IP address, network order. */
+X
+Xchar myhostname[64];
+Xstruct in_addr my_ip_addr;
+X
+X
+X
+X
+X/*
+X * Initialization such as command-line processing is done and then the
+X * main server loop is started.
+X */
+X
+Xvoid
+Xmain(argc, argv)
+X	int argc;
+X	char **argv;
+X{
+X	struct timeval *timeout;
+X	struct bootp *bp;
+X	struct servent *servp;
+X	struct hostent *hep;
+X	char *stmp;
+X	int n, ba_len, ra_len;
+X	int nfound, readfds;
+X	int standalone;
+X
+X	progname = strrchr(argv[0], '/');
+X	if (progname) progname++;
+X	else progname = argv[0];
+X
+X	/*
+X	 * Initialize logging.
+X	 */
+X	report_init(0);				/* uses progname */
+X
+X	/*
+X	 * Log startup
+X	 */
+X	report(LOG_INFO, "version %s.%d", VERSION, PATCHLEVEL);
+X
+X	/* Debugging for compilers with struct padding. */
+X	assert(sizeof(struct bootp) == BP_MINPKTSZ);
+X
+X	/* Get space for receiving packets and composing replies. */
+X	pktbuf = malloc(MAX_MSG_SIZE);
+X	if (!pktbuf) {
+X		report(LOG_ERR, "malloc failed");
+X		exit(1);
+X	}
+X	bp = (struct bootp *) pktbuf;
+X
+X	/*
+X	 * Check to see if a socket was passed to us from inetd.
+X	 *
+X	 * Use getsockname() to determine if descriptor 0 is indeed a socket
+X	 * (and thus we are probably a child of inetd) or if it is instead
+X	 * something else and we are running standalone.
+X	 */
+X	s = 0;
+X	ba_len = sizeof(bind_addr);
+X	bzero((char *) &bind_addr, ba_len);
+X	errno = 0;
+X	standalone = TRUE;
+X	if (getsockname(s, (struct sockaddr *) &bind_addr, &ba_len) == 0) {
+X		/*
+X		 * Descriptor 0 is a socket.  Assume we are a child of inetd.
+X		 */
+X		if (bind_addr.sin_family == AF_INET) {
+X			standalone = FALSE;
+X			bootps_port = ntohs(bind_addr.sin_port);
+X		} else {
+X			/* Some other type of socket? */
+X			report(LOG_INFO, "getsockname: not an INET socket");
+X		}
+X	}
+X	/*
+X	 * Set defaults that might be changed by option switches.
+X	 */
+X	stmp = NULL;
+X	timeout = &actualtimeout;
+X	gethostname(myhostname, sizeof(myhostname));
+X	hep = gethostbyname(myhostname);
+X	if (!hep) {
+X		printf("Can not get my IP address\n");
+X		exit(1);
+X	}
+X	bcopy(hep->h_addr, (char *)&my_ip_addr, sizeof(my_ip_addr));
+X
+X	/*
+X	 * Read switches.
+X	 */
+X	for (argc--, argv++; argc > 0; argc--, argv++) {
+X		if (argv[0][0] != '-')
+X			break;
+X		switch (argv[0][1]) {
+X
+X		case 'd':				/* debug level */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else if (argv[1] && argv[1][0] == '-') {
+X				/*
+X				 * Backwards-compatible behavior:
+X				 * no parameter, so just increment the debug flag.
+X				 */
+X				debug++;
+X				break;
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp || (sscanf(stmp, "%d", &n) != 1) || (n < 0)) {
+X				fprintf(stderr,
+X						"%s: invalid debug level\n", progname);
+X				break;
+X			}
+X			debug = n;
+X			break;
+X
+X		case 'h':				/* hop count limit */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp || (sscanf(stmp, "%d", &n) != 1) ||
+X				(n < 0) || (n > 16))
+X			{
+X				fprintf(stderr,
+X						"bootpgw: invalid hop count limit\n");
+X				break;
+X			}
+X			maxhops = (u_int)n;
+X			break;
+X
+X		case 'i':				/* inetd mode */
+X			standalone = FALSE;
+X			break;
+X
+X		case 's':				/* standalone mode */
+X			standalone = TRUE;
+X			break;
+X
+X		case 't':				/* timeout */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp || (sscanf(stmp, "%d", &n) != 1) || (n < 0)) {
+X				fprintf(stderr,
+X						"%s: invalid timeout specification\n", progname);
+X				break;
+X			}
+X			actualtimeout.tv_sec = (int32) (60 * n);
+X			/*
+X			 * If the actual timeout is zero, pass a NULL pointer
+X			 * to select so it blocks indefinitely, otherwise,
+X			 * point to the actual timeout value.
+X			 */
+X			timeout = (n > 0) ? &actualtimeout : NULL;
+X			break;
+X
+X		case 'w':				/* wait time */
+X			if (argv[0][2]) {
+X				stmp = &(argv[0][2]);
+X			} else {
+X				argc--;
+X				argv++;
+X				stmp = argv[0];
+X			}
+X			if (!stmp || (sscanf(stmp, "%d", &n) != 1) ||
+X				(n < 0) || (n > 60))
+X			{
+X				fprintf(stderr,
+X						"bootpgw: invalid wait time\n");
+X				break;
+X			}
+X			minwait = (u_int)n;
+X			break;
+X
+X		default:
+X			fprintf(stderr, "%s: unknown switch: -%c\n",
+X					progname, argv[0][1]);
+X			usage();
+X			break;
+X
+X		} /* switch */
+X	} /* for args */
+X
+X	/* Make sure server name argument is suplied. */
+X	servername = argv[0];
+X	if (!servername) {
+X		fprintf(stderr, "bootpgw: missing server name\n");
+X		usage();
+X	}
+X	/*
+X	 * Get address of real bootp server.
+X	 */
+X	if (isdigit(servername[0]))
+X		server_ipa = inet_addr(servername);
+X	else {
+X		hep = gethostbyname(servername);
+X		if (!hep) {
+X			fprintf(stderr, "bootpgw: can't get addr for %s\n", servername);
+X			exit(1);
+X		}
+X		bcopy(hep->h_addr, (char *)&server_ipa, sizeof(server_ipa));
+X	}
+X
+X	if (standalone) {
+X		/*
+X		 * Go into background and disassociate from controlling terminal.
+X		 * XXX - This is not the POSIX way (Should use setsid). -gwr
+X		 */
+X		if (debug < 3) {
+X			if (fork())
+X				exit(0);
+X#ifdef	NO_SETSID
+X			setpgrp(0,0);
+X#ifdef TIOCNOTTY
+X			n = open("/dev/tty", O_RDWR);
+X			if (n >= 0) {
+X				ioctl(n, TIOCNOTTY, (char *) 0);
+X				(void) close(n);
+X			}
+X#endif	/* TIOCNOTTY */
+X#else	/* SETSID */
+X			if (setsid() < 0)
+X				perror("setsid");
+X#endif	/* SETSID */
+X		} /* if debug < 3 */
+X		/*
+X		 * Nuke any timeout value
+X		 */
+X		timeout = NULL;
+X
+X		/*
+X		 * Here, bootpd would do:
+X		 *	chdir
+X		 *	tzone_init
+X		 *	rdtab_init
+X		 *	readtab
+X		 */
+X
+X		/*
+X		 * Create a socket.
+X		 */
+X		if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+X			report(LOG_ERR, "socket: %s", get_network_errmsg());
+X			exit(1);
+X		}
+X		/*
+X		 * Get server's listening port number
+X		 */
+X		servp = getservbyname("bootps", "udp");
+X		if (servp) {
+X			bootps_port = ntohs((u_short) servp->s_port);
+X		} else {
+X			bootps_port = (u_short) IPPORT_BOOTPS;
+X			report(LOG_ERR,
+X				   "udp/bootps: unknown service -- assuming port %d",
+X				   bootps_port);
+X		}
+X
+X		/*
+X		 * Bind socket to BOOTPS port.
+X		 */
+X		bind_addr.sin_family = AF_INET;
+X		bind_addr.sin_port = htons(bootps_port);
+X		bind_addr.sin_addr.s_addr = INADDR_ANY;
+X		if (bind(s, (struct sockaddr *) &bind_addr,
+X				 sizeof(bind_addr)) < 0)
+X		{
+X			report(LOG_ERR, "bind: %s", get_network_errmsg());
+X			exit(1);
+X		}
+X	} /* if standalone */
+X	/*
+X	 * Get destination port number so we can reply to client
+X	 */
+X	servp = getservbyname("bootpc", "udp");
+X	if (servp) {
+X		bootpc_port = ntohs(servp->s_port);
+X	} else {
+X		report(LOG_ERR,
+X			   "udp/bootpc: unknown service -- assuming port %d",
+X			   IPPORT_BOOTPC);
+X		bootpc_port = (u_short) IPPORT_BOOTPC;
+X	}
+X
+X	/* no signal catchers */
+X
+X	/*
+X	 * Process incoming requests.
+X	 */
+X	for (;;) {
+X		readfds = 1 << s;
+X		nfound = select(s + 1, (fd_set *)&readfds, NULL, NULL, timeout);
+X		if (nfound < 0) {
+X			if (errno != EINTR) {
+X				report(LOG_ERR, "select: %s", get_errmsg());
+X			}
+X			continue;
+X		}
+X		if (!(readfds & (1 << s))) {
+X			report(LOG_INFO, "exiting after %ld minutes of inactivity",
+X				   actualtimeout.tv_sec / 60);
+X			exit(0);
+X		}
+X		ra_len = sizeof(recv_addr);
+X		n = recvfrom(s, pktbuf, MAX_MSG_SIZE, 0,
+X					 (struct sockaddr *) &recv_addr, &ra_len);
+X		if (n <= 0) {
+X			continue;
+X		}
+X		if (debug > 3) {
+X			report(LOG_INFO, "recvd pkt from IP addr %s",
+X				   inet_ntoa(recv_addr.sin_addr));
+X		}
+X		if (n < sizeof(struct bootp)) {
+X			if (debug) {
+X				report(LOG_INFO, "received short packet");
+X			}
+X			continue;
+X		}
+X		pktlen = n;
+X
+X		switch (bp->bp_op) {
+X		case BOOTREQUEST:
+X			handle_request();
+X			break;
+X		case BOOTREPLY:
+X			handle_reply();
+X			break;
+X		}
+X	}
+X}
+X
+X
+X
+X
+X/*
+X * Print "usage" message and exit
+X */
+X
+Xstatic void
+Xusage()
+X{
+X	fprintf(stderr,
+X			"usage:  bootpgw [-d level] [-i] [-s] [-t timeout] server\n");
+X	fprintf(stderr, "\t -d n\tset debug level\n");
+X	fprintf(stderr, "\t -h n\tset max hop count\n");
+X	fprintf(stderr, "\t -i\tforce inetd mode (run as child of inetd)\n");
+X	fprintf(stderr, "\t -s\tforce standalone mode (run without inetd)\n");
+X	fprintf(stderr, "\t -t n\tset inetd exit timeout to n minutes\n");
+X	fprintf(stderr, "\t -w n\tset min wait time (secs)\n");
+X	exit(1);
+X}
+X
+X
+X
+X/*
+X * Process BOOTREQUEST packet.
+X *
+X * Note, this just forwards the request to a real server.
+X */
+Xstatic void
+Xhandle_request()
+X{
+X	struct bootp *bp = (struct bootp *) pktbuf;
+X	struct ifreq *ifr;
+X	u_short secs, hops;
+X
+X	/* XXX - SLIP init: Set bp_ciaddr = recv_addr here? */
+X
+X	if (debug) {
+X		report(LOG_INFO, "request from %s",
+X			   inet_ntoa(recv_addr.sin_addr));
+X	}
+X	/* Has the client been waiting long enough? */
+X	secs = ntohs(bp->bp_secs);
+X	if (secs < minwait)
+X		return;
+X
+X	/* Has this packet hopped too many times? */
+X	hops = ntohs(bp->bp_hops);
+X	if (++hops > maxhops) {
+X		report(LOG_NOTICE, "reqest from %s reached hop limit",
+X			   inet_ntoa(recv_addr.sin_addr));
+X		return;
+X	}
+X	bp->bp_hops = htons(hops);
+X
+X	/*
+X	 * Here one might discard a request from the same subnet as the
+X	 * real server, but we can assume that the real server will send
+X	 * a reply to the client before it waits for minwait seconds.
+X	 */
+X
+X	/* If gateway address is not set, put in local interface addr. */
+X	if (bp->bp_giaddr.s_addr == 0) {
+X#if 0	/* BUG */
+X		struct sockaddr_in *sip;
+X		/*
+X		 * XXX - This picks the wrong interface when the receive addr
+X		 * is the broadcast address.  There is no  portable way to
+X		 * find out which interface a broadcast was received on. -gwr
+X		 * (Thanks to <walker@zk3.dec.com> for finding this bug!)
+X		 */
+X		ifr = getif(s, &recv_addr.sin_addr);
+X		if (!ifr) {
+X			report(LOG_NOTICE, "no interface for request from %s",
+X				   inet_ntoa(recv_addr.sin_addr));
+X			return;
+X		}
+X		sip = (struct sockaddr_in *) &(ifr->ifr_addr);
+X		bp->bp_giaddr = sip->sin_addr;
+X#else	/* BUG */
+X		/*
+X		 * XXX - Just set "giaddr" to our "official" IP address.
+X		 * RFC 1532 says giaddr MUST be set to the address of the
+X		 * interface on which the request was received.  Setting
+X		 * it to our "default" IP address is not strictly correct,
+X		 * but is good enough to allow the real BOOTP server to
+X		 * get the reply back here.  Then, before we forward the
+X		 * reply to the client, the giaddr field is corrected.
+X		 * (In case the client uses giaddr, which it should not.)
+X		 * See handle_reply()
+X		 */
+X		bp->bp_giaddr = my_ip_addr;
+X#endif	/* BUG */
+X
+X		/*
+X		 * XXX - DHCP says to insert a subnet mask option into the
+X		 * options area of the request (if vendor magic == std).
+X		 */
+X	}
+X	/* Set up socket address for send. */
+X	send_addr.sin_family = AF_INET;
+X	send_addr.sin_port = htons(bootps_port);
+X	send_addr.sin_addr.s_addr = server_ipa;
+X
+X	/* Send reply with same size packet as request used. */
+X	if (sendto(s, pktbuf, pktlen, 0,
+X			   (struct sockaddr *) &send_addr,
+X			   sizeof(send_addr)) < 0)
+X	{
+X		report(LOG_ERR, "sendto: %s", get_network_errmsg());
+X	}
+X}
+X
+X
+X
+X/*
+X * Process BOOTREPLY packet.
+X */
+Xstatic void
+Xhandle_reply()
+X{
+X	struct bootp *bp = (struct bootp *) pktbuf;
+X	struct ifreq *ifr;
+X	struct sockaddr_in *sip;
+X	u_char canon_haddr[MAXHADDRLEN];
+X	unsigned char *ha;
+X	int len;
+X
+X	if (debug) {
+X		report(LOG_INFO, "   reply for %s",
+X			   inet_ntoa(bp->bp_yiaddr));
+X	}
+X	/* Make sure client is directly accessible. */
+X	ifr = getif(s, &(bp->bp_yiaddr));
+X	if (!ifr) {
+X		report(LOG_NOTICE, "no interface for reply to %s",
+X			   inet_ntoa(bp->bp_yiaddr));
+X		return;
+X	}
+X#if 1	/* Experimental (see BUG above) */
+X/* #ifdef CATER_TO_OLD_CLIENTS ? */
+X	/*
+X	 * The giaddr field has been set to our "default" IP address
+X	 * which might not be on the same interface as the client.
+X	 * In case the client looks at giaddr, (which it should not)
+X	 * giaddr is now set to the address of the correct interface.
+X	 */
+X	sip = (struct sockaddr_in *) &(ifr->ifr_addr);
+X	bp->bp_giaddr = sip->sin_addr;
+X#endif
+X
+X	/* Set up socket address for send to client. */
+X	send_addr.sin_family = AF_INET;
+X	send_addr.sin_addr = bp->bp_yiaddr;
+X	send_addr.sin_port = htons(bootpc_port);
+X
+X	/* Create an ARP cache entry for the client. */
+X	ha = bp->bp_chaddr;
+X	len = bp->bp_hlen;
+X	if (len > MAXHADDRLEN)
+X		len = MAXHADDRLEN;
+X	if (bp->bp_htype == HTYPE_IEEE802) {
+X		haddr_conv802(ha, canon_haddr, len);
+X		ha = canon_haddr;
+X	}
+X	if (debug > 1)
+X		report(LOG_INFO, "setarp %s - %s",
+X			   inet_ntoa(bp->bp_yiaddr), haddrtoa(ha, len));
+X	setarp(s, &bp->bp_yiaddr, ha, len);
+X
+X	/* Send reply with same size packet as request used. */
+X	if (sendto(s, pktbuf, pktlen, 0,
+X			   (struct sockaddr *) &send_addr,
+X			   sizeof(send_addr)) < 0)
+X	{
+X		report(LOG_ERR, "sendto: %s", get_network_errmsg());
+X	}
+X}
+X
+X/*
+X * Local Variables:
+X * tab-width: 4
+X * c-indent-level: 4
+X * c-argdecl-indent: 4
+X * c-continued-statement-offset: 4
+X * c-continued-brace-offset: -4
+X * c-label-offset: -4
+X * c-brace-offset: 0
+X * End:
+X */
+END_OF_FILE
+if test 16032 -ne `wc -c <'bootpgw.c'`; then
+    echo shar: \"'bootpgw.c'\" unpacked with wrong size!
+fi
+# end of 'bootpgw.c'
+fi
+if test -f 'print-bootp.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'print-bootp.c'\"
+else
+echo shar: Extracting \"'print-bootp.c'\" \(12540 characters\)
+sed "s/^X//" >'print-bootp.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1988-1990 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that: (1) source code distributions
+X * retain the above copyright notice and this paragraph in its entirety, (2)
+X * distributions including binary code include the above copyright notice and
+X * this paragraph in its entirety in the documentation or other materials
+X * provided with the distribution, and (3) all advertising materials mentioning
+X * features or use of this software display the following acknowledgement:
+X * ``This product includes software developed by the University of California,
+X * Lawrence Berkeley Laboratory and its contributors.'' Neither the name of
+X * the University nor the names of its contributors may be used to endorse
+X * or promote products derived from this software without specific prior
+X * written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR IMPLIED
+X * WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
+X * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X *
+X * Format and print bootp packets.
+X *
+X * This file was copied from tcpdump-2.1.1 and modified.
+X * There is an e-mail list for tcpdump: <tcpdump@ee.lbl.gov>
+X */
+X#ifndef lint
+Xstatic char rcsid[] = "$Id: print-bootp.c $";
+X/* 93/10/10 <gwr@mc.com> New data-driven option print routine. */
+X#endif
+X
+X#include <stdio.h>
+X
+X#include <sys/param.h>
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <net/if.h>
+X#include <netinet/in.h>
+X#include <string.h>
+X#include <ctype.h>
+X
+X#include "bootp.h"
+X#include "bootptest.h"
+X
+X/* These decode the vendor data. */
+Xstatic void rfc1048_print();
+Xstatic void cmu_print();
+Xstatic void other_print();
+Xstatic void dump_hex();
+X
+X/*
+X * Print bootp requests
+X */
+Xvoid
+Xbootp_print(bp, length, sport, dport)
+X	struct bootp *bp;
+X	int length;
+X	u_short sport, dport;
+X{
+X	static char tstr[] = " [|bootp]";
+X	static unsigned char vm_cmu[4] = VM_CMU;
+X	static unsigned char vm_rfc1048[4] = VM_RFC1048;
+X	u_char *ep;
+X	int vdlen;
+X
+X#define TCHECK(var, l) if ((u_char *)&(var) > ep - l) goto trunc
+X
+X	/* Note funny sized packets */
+X	if (length != sizeof(struct bootp))
+X		(void) printf(" [len=%d]", length);
+X
+X	/* 'ep' points to the end of avaible data. */
+X	ep = (u_char *) snapend;
+X
+X	switch (bp->bp_op) {
+X
+X	case BOOTREQUEST:
+X		/* Usually, a request goes from a client to a server */
+X		if (sport != IPPORT_BOOTPC || dport != IPPORT_BOOTPS)
+X			printf(" (request)");
+X		break;
+X
+X	case BOOTREPLY:
+X		/* Usually, a reply goes from a server to a client */
+X		if (sport != IPPORT_BOOTPS || dport != IPPORT_BOOTPC)
+X			printf(" (reply)");
+X		break;
+X
+X	default:
+X		printf(" bootp-#%d", bp->bp_op);
+X	}
+X
+X	/* The usual hardware address type is 1 (10Mb Ethernet) */
+X	if (bp->bp_htype != 1)
+X		printf(" htype:%d", bp->bp_htype);
+X
+X	/* The usual length for 10Mb Ethernet address is 6 bytes */
+X	if (bp->bp_hlen != 6)
+X		printf(" hlen:%d", bp->bp_hlen);
+X
+X	/* Client's Hardware address */
+X	if (bp->bp_hlen) {
+X		register struct ether_header *eh;
+X		register char *e;
+X
+X		TCHECK(bp->bp_chaddr[0], 6);
+X		eh = (struct ether_header *) packetp;
+X		if (bp->bp_op == BOOTREQUEST)
+X			e = (char *) ESRC(eh);
+X		else if (bp->bp_op == BOOTREPLY)
+X			e = (char *) EDST(eh);
+X		else
+X			e = 0;
+X		if (e == 0 || bcmp((char *) bp->bp_chaddr, e, 6))
+X			dump_hex(bp->bp_chaddr, bp->bp_hlen);
+X	}
+X	/* Only print interesting fields */
+X	if (bp->bp_hops)
+X		printf(" hops:%d", bp->bp_hops);
+X
+X	if (bp->bp_xid)
+X		printf(" xid:%d", ntohl(bp->bp_xid));
+X
+X	if (bp->bp_secs)
+X		printf(" secs:%d", ntohs(bp->bp_secs));
+X
+X	/* Client's ip address */
+X	TCHECK(bp->bp_ciaddr, sizeof(bp->bp_ciaddr));
+X	if (bp->bp_ciaddr.s_addr)
+X		printf(" C:%s", ipaddr_string(&bp->bp_ciaddr));
+X
+X	/* 'your' ip address (bootp client) */
+X	TCHECK(bp->bp_yiaddr, sizeof(bp->bp_yiaddr));
+X	if (bp->bp_yiaddr.s_addr)
+X		printf(" Y:%s", ipaddr_string(&bp->bp_yiaddr));
+X
+X	/* Server's ip address */
+X	TCHECK(bp->bp_siaddr, sizeof(bp->bp_siaddr));
+X	if (bp->bp_siaddr.s_addr)
+X		printf(" S:%s", ipaddr_string(&bp->bp_siaddr));
+X
+X	/* Gateway's ip address */
+X	TCHECK(bp->bp_giaddr, sizeof(bp->bp_giaddr));
+X	if (bp->bp_giaddr.s_addr)
+X		printf(" G:%s", ipaddr_string(&bp->bp_giaddr));
+X
+X	TCHECK(bp->bp_sname[0], sizeof(bp->bp_sname));
+X	if (*bp->bp_sname) {
+X		printf(" sname:");
+X		if (printfn(bp->bp_sname, ep)) {
+X			fputs(tstr + 1, stdout);
+X			return;
+X		}
+X	}
+X	TCHECK(bp->bp_file[0], sizeof(bp->bp_file));
+X	if (*bp->bp_file) {
+X		printf(" file:");
+X		if (printfn(bp->bp_file, ep)) {
+X			fputs(tstr + 1, stdout);
+X			return;
+X		}
+X	}
+X	/* Don't try to decode the vendor buffer unless we're verbose */
+X	if (vflag <= 0)
+X		return;
+X
+X	vdlen = sizeof(bp->bp_vend);
+X	/* Vendor data can extend to the end of the packet. */
+X	if (vdlen < (ep - bp->bp_vend))
+X		vdlen = (ep - bp->bp_vend);
+X
+X	TCHECK(bp->bp_vend[0], vdlen);
+X	printf(" vend");
+X	if (!bcmp(bp->bp_vend, vm_rfc1048, sizeof(u_int32)))
+X		rfc1048_print(bp->bp_vend, vdlen);
+X	else if (!bcmp(bp->bp_vend, vm_cmu, sizeof(u_int32)))
+X		cmu_print(bp->bp_vend, vdlen);
+X	else
+X		other_print(bp->bp_vend, vdlen);
+X
+X	return;
+X trunc:
+X	fputs(tstr, stdout);
+X#undef TCHECK
+X}
+X
+X/*
+X * Option description data follows.
+X * These are decribed in: RFC-1048, RFC-1395, RFC-1497, RFC-1533
+X *
+X * The first char of each option string encodes the data format:
+X * ?: unknown
+X * a: ASCII
+X * b: byte (8-bit)
+X * i: inet address
+X * l: int32
+X * s: short (16-bit)
+X */
+Xchar *
+Xrfc1048_opts[] = {
+X	/* Originally from RFC-1048: */
+X	"?PAD",				/*  0: Padding - special, no data. */
+X	"iSM",				/*  1: subnet mask (RFC950)*/
+X	"lTZ",				/*  2: time offset, seconds from UTC */
+X	"iGW",				/*  3: gateways (or routers) */
+X	"iTS",				/*  4: time servers (RFC868) */
+X	"iINS",				/*  5: IEN name servers (IEN116) */
+X	"iDNS",				/*  6: domain name servers (RFC1035)(1034?) */
+X	"iLOG",				/*  7: MIT log servers */
+X	"iCS",				/*  8: cookie servers (RFC865) */
+X	"iLPR",				/*  9: lpr server (RFC1179) */
+X	"iIPS",				/* 10: impress servers (Imagen) */
+X	"iRLP",				/* 11: resource location servers (RFC887) */
+X	"aHN",				/* 12: host name (ASCII) */
+X	"sBFS",				/* 13: boot file size (in 512 byte blocks) */
+X
+X	/* Added by RFC-1395: */
+X	"aDUMP",			/* 14: Merit Dump File */
+X	"aDNAM",			/* 15: Domain Name (for DNS) */
+X	"iSWAP",			/* 16: Swap Server */
+X	"aROOT",			/* 17: Root Path */
+X
+X	/* Added by RFC-1497: */
+X	"aEXTF",			/* 18: Extensions Path (more options) */
+X
+X	/* Added by RFC-1533: (many, many options...) */
+X#if 1	/* These might not be worth recognizing by name. */
+X
+X	/* IP Layer Parameters, per-host (RFC-1533, sect. 4) */
+X	"bIP-forward",		/* 19: IP Forwarding flag */
+X	"bIP-srcroute",		/* 20: IP Source Routing Enable flag */
+X	"iIP-filters",		/* 21: IP Policy Filter (addr pairs) */
+X	"sIP-maxudp",		/* 22: IP Max-UDP reassembly size */
+X	"bIP-ttlive",		/* 23: IP Time to Live */
+X	"lIP-pmtuage",		/* 24: IP Path MTU aging timeout */
+X	"sIP-pmtutab",		/* 25: IP Path MTU plateau table */
+X
+X	/* IP parameters, per-interface (RFC-1533, sect. 5) */
+X	"sIP-mtu-sz",		/* 26: IP MTU size */
+X	"bIP-mtu-sl",		/* 27: IP MTU all subnets local */
+X	"bIP-bcast1",		/* 28: IP Broadcast Addr ones flag */
+X	"bIP-mask-d",		/* 29: IP do mask discovery */
+X	"bIP-mask-s",		/* 30: IP do mask supplier */
+X	"bIP-rt-dsc",		/* 31: IP do router discovery */
+X	"iIP-rt-sa",		/* 32: IP router solicitation addr */
+X	"iIP-routes",		/* 33: IP static routes (dst,router) */
+X
+X	/* Link Layer parameters, per-interface (RFC-1533, sect. 6) */
+X	"bLL-trailer",		/* 34: do tralier encapsulation */
+X	"lLL-arp-tmo",		/* 35: ARP cache timeout */
+X	"bLL-ether2",		/* 36: Ethernet version 2 (IEEE 802.3) */
+X
+X	/* TCP parameters (RFC-1533, sect. 7) */
+X	"bTCP-def-ttl",		/* 37: default time to live */
+X	"lTCP-KA-tmo",		/* 38: keepalive time interval */
+X	"bTCP-KA-junk",		/* 39: keepalive sends extra junk */
+X
+X	/* Application and Service Parameters (RFC-1533, sect. 8) */
+X	"aNISDOM",			/* 40: NIS Domain (Sun YP) */
+X	"iNISSRV",			/* 41: NIS Servers */
+X	"iNTPSRV",			/* 42: NTP (time) Servers (RFC 1129) */
+X	"?VSINFO",			/* 43: Vendor Specific Info (encapsulated) */
+X	"iNBiosNS",			/* 44: NetBIOS Name Server (RFC-1001,1..2) */
+X	"iNBiosDD",			/* 45: NetBIOS Datagram Dist. Server. */
+X	"bNBiosNT",			/* 46: NetBIOS Note Type */
+X	"?NBiosS",			/* 47: NetBIOS Scope */
+X	"iXW-FS",			/* 48: X Window System Font Servers */
+X	"iXW-DM",			/* 49: X Window System Display Managers */
+X
+X	/* DHCP extensions (RFC-1533, sect. 9) */
+X#endif
+X};
+X#define	KNOWN_OPTIONS (sizeof(rfc1048_opts) / sizeof(rfc1048_opts[0]))
+X
+Xstatic void print_string();
+X
+Xstatic void
+Xrfc1048_print(bp, length)
+X	register u_char *bp;
+X	int length;
+X{
+X	u_char tag;
+X	u_char *ep;
+X	register int len, j;
+X	u_int32 ul;
+X	u_short us;
+X	struct in_addr ia;
+X	char *optstr;
+X
+X	printf("-rfc1395");
+X
+X	/* Step over magic cookie */
+X	bp += sizeof(int32);
+X	/* Setup end pointer */
+X	ep = bp + length;
+X	while (bp < ep) {
+X		tag = *bp++;
+X		/* Check for tags with no data first. */
+X		if (tag == TAG_PAD)
+X			continue;
+X		if (tag == TAG_END)
+X			return;
+X		if (tag < KNOWN_OPTIONS) {
+X			optstr = rfc1048_opts[tag];
+X			printf(" %s:", optstr + 1);
+X		} else {
+X			printf(" T%d:", tag);
+X			optstr = "?";
+X		}
+X		/* Now scan the length byte. */
+X		len = *bp++;
+X		if (bp + len > ep) {
+X			/* truncated option */
+X			printf(" |(%d>%d)", len, ep - bp);
+X			return;
+X		}
+X		/* Print the option value(s). */
+X		switch (optstr[0]) {
+X
+X		case 'a':				/* ASCII string */
+X			printfn(bp, bp + len);
+X			bp += len;
+X			len = 0;
+X			break;
+X
+X		case 's':				/* Word formats */
+X			while (len >= 2) {
+X				bcopy((char *) bp, (char *) &us, 2);
+X				printf("%d", ntohs(us));
+X				bp += 2;
+X				len -= 2;
+X				if (len) printf(",");
+X			}
+X			if (len) printf("(junk=%d)", len);
+X			break;
+X
+X		case 'l':				/* Long words */
+X			while (len >= 4) {
+X				bcopy((char *) bp, (char *) &ul, 4);
+X				printf("%d", ntohl(ul));
+X				bp += 4;
+X				len -= 4;
+X				if (len) printf(",");
+X			}
+X			if (len) printf("(junk=%d)", len);
+X			break;
+X
+X		case 'i':				/* INET addresses */
+X			while (len >= 4) {
+X				bcopy((char *) bp, (char *) &ia, 4);
+X				printf("%s", ipaddr_string(&ia));
+X				bp += 4;
+X				len -= 4;
+X				if (len) printf(",");
+X			}
+X			if (len) printf("(junk=%d)", len);
+X			break;
+X
+X		case 'b':
+X		default:
+X			break;
+X
+X		}						/* switch */
+X
+X		/* Print as characters, if appropriate. */
+X		if (len) {
+X			dump_hex(bp, len);
+X			if (isascii(*bp) && isprint(*bp)) {
+X				printf("(");
+X				printfn(bp, bp + len);
+X				printf(")");
+X			}
+X			bp += len;
+X			len = 0;
+X		}
+X	} /* while bp < ep */
+X}
+X
+Xstatic void
+Xcmu_print(bp, length)
+X	register u_char *bp;
+X	int length;
+X{
+X	struct cmu_vend *v;
+X	u_char *ep;
+X
+X	printf("-cmu");
+X
+X	v = (struct cmu_vend *) bp;
+X	if (length < sizeof(*v)) {
+X		printf(" |L=%d", length);
+X		return;
+X	}
+X	/* Setup end pointer */
+X	ep = bp + length;
+X
+X	/* Subnet mask */
+X	if (v->v_flags & VF_SMASK) {
+X		printf(" SM:%s", ipaddr_string(&v->v_smask));
+X	}
+X	/* Default gateway */
+X	if (v->v_dgate.s_addr)
+X		printf(" GW:%s", ipaddr_string(&v->v_dgate));
+X
+X	/* Domain name servers */
+X	if (v->v_dns1.s_addr)
+X		printf(" DNS1:%s", ipaddr_string(&v->v_dns1));
+X	if (v->v_dns2.s_addr)
+X		printf(" DNS2:%s", ipaddr_string(&v->v_dns2));
+X
+X	/* IEN-116 name servers */
+X	if (v->v_ins1.s_addr)
+X		printf(" INS1:%s", ipaddr_string(&v->v_ins1));
+X	if (v->v_ins2.s_addr)
+X		printf(" INS2:%s", ipaddr_string(&v->v_ins2));
+X
+X	/* Time servers */
+X	if (v->v_ts1.s_addr)
+X		printf(" TS1:%s", ipaddr_string(&v->v_ts1));
+X	if (v->v_ts2.s_addr)
+X		printf(" TS2:%s", ipaddr_string(&v->v_ts2));
+X
+X}
+X
+X
+X/*
+X * Print out arbitrary, unknown vendor data.
+X */
+X
+Xstatic void
+Xother_print(bp, length)
+X	register u_char *bp;
+X	int length;
+X{
+X	u_char *ep;					/* end pointer */
+X	u_char *zp;					/* points one past last non-zero byte */
+X	register int i, j;
+X
+X	/* Setup end pointer */
+X	ep = bp + length;
+X
+X	/* Find the last non-zero byte. */
+X	for (zp = ep; zp > bp; zp--) {
+X		if (zp[-1] != 0)
+X			break;
+X	}
+X
+X	/* Print the all-zero case in a compact representation. */
+X	if (zp == bp) {
+X		printf("-all-zero");
+X		return;
+X	}
+X	printf("-unknown");
+X
+X	/* Are there enough trailing zeros to make "00..." worthwhile? */
+X	if (zp + 2 > ep)
+X		zp = ep;				/* print them all normally */
+X
+X	/* Now just print all the non-zero data. */
+X	while (bp < zp) {
+X		printf(".%02X", *bp);
+X		bp++;
+X	}
+X
+X	if (zp < ep)
+X		printf(".00...");
+X
+X	return;
+X}
+X
+Xstatic void
+Xdump_hex(bp, len)
+X	u_char *bp;
+X	int len;
+X{
+X	while (len > 0) {
+X		printf("%02X", *bp);
+X		bp++;
+X		len--;
+X		if (len) printf(".");
+X	}
+X}
+X
+X/*
+X * Local Variables:
+X * tab-width: 4
+X * c-indent-level: 4
+X * c-argdecl-indent: 4
+X * c-continued-statement-offset: 4
+X * c-continued-brace-offset: -4
+X * c-label-offset: -4
+X * c-brace-offset: 0
+X * End:
+X */
+END_OF_FILE
+if test 12540 -ne `wc -c <'print-bootp.c'`; then
+    echo shar: \"'print-bootp.c'\" unpacked with wrong size!
+fi
+# end of 'print-bootp.c'
+fi
+echo shar: End of archive 3 \(of 4\).
+cp /dev/null ark3isdone
+MISSING=""
+for I in 1 2 3 4 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 4 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

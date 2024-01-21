@@ -1,0 +1,2677 @@
+Newsgroups: comp.sources.unix
+From: seiwald@vix.com (Christopher Seiwald)
+Subject: v27i082: jam - just another make, Part02/05
+References: <1.753385306.22859@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: seiwald@vix.com (Christopher Seiwald)
+Posting-Number: Volume 27, Issue 82
+Archive-Name: jam/part02
+
+Submitted-by: seiwald@vix.com
+Archive-name: jam - make(1) redux/part02
+
+#!/bin/sh
+# This is part 02 of jam - make(1) redux
+# ============= compile.c ==============
+if test -f 'compile.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping compile.c (File already exists)'
+else
+echo 'x - extracting compile.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'compile.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X
+X# include "lists.h"
+X# include "parse.h"
+X# include "compile.h"
+X# include "variable.h"
+X# include "rules.h"
+X# include "newstr.h"
+X# include "make.h"
+X
+X/*
+X * compile.c - compile parsed jam statements
+X *
+X * External routines:
+X *
+X *	compile_foreach() - compile the "for x in y" statement
+X *	compile_if() - compile 'if' rule
+X *	compile_include() - support for 'include' - call include() on file
+X *	compile_rule() - compile a single user defined rule
+X *	compile_rules() - compile a chain of rules
+X *	compile_set() - compile the "set variable" statement
+X *	compile_setcomp() - support for `compiles` - save parse tree 
+X *	compile_setexec() - support for `executes` - save execution string 
+X *	compile_settings() - compile the "on =" (set variable on exec) statement
+X *	compile_switch() - compile 'switch' rule
+X *
+X * Internal routines:
+X *
+X *	evaluate_if() - evaluate if to determine which leg to compile
+X *
+X *	builtin_depends() - DEPENDS rule
+X *	builtin_echo() - ECHO rule
+X *	builtin_includes() - INCLUDES rule
+X *	builtin_flags() - NOCARE, NOTIME, TEMPORARY rule
+X */
+X
+Xstatic int evaluate_if();
+X
+Xstatic void builtin_depends();
+Xstatic void builtin_echo();
+Xstatic void builtin_includes();
+Xstatic void builtin_flags();
+X
+X
+X
+X/*
+X * compile_builtin() - define builtin rules
+X */
+X
+X# define P0 (PARSE *)0
+X# define L0 (LIST *)0
+X# define C0 (char *)0
+X
+Xvoid
+Xcompile_builtins()
+X{
+X	bindrule( "DEPENDS" )->procedure = 
+X	    parse_make( builtin_depends, P0, P0, C0, C0, L0, L0, 0 );
+X	bindrule( "ECHO" )->procedure = 
+X	    parse_make( builtin_echo, P0, P0, C0, C0, L0, L0, 0 );
+X	bindrule( "INCLUDES" )->procedure = 
+X	    parse_make( builtin_includes, P0, P0, C0, C0, L0, L0, 0 );
+X
+X	bindrule( "NOCARE" )->procedure = 
+X	    parse_make( builtin_flags, P0, P0, C0, C0, L0, L0, T_FLAG_NOCARE );
+X	bindrule( "NOTIME" )->procedure = 
+X	    parse_make( builtin_flags, P0, P0, C0, C0, L0, L0, T_FLAG_NOTIME );
+X	bindrule( "TEMPORARY" )->procedure = 
+X	    parse_make( builtin_flags, P0, P0, C0, C0, L0, L0, T_FLAG_TEMP );
+X}
+X
+X/*
+X * compile_foreach() - compile the "for x in y" statement
+X *
+X * Compile_foreach() resets the given variable name to each specified
+X * value, executing the commands enclosed in braces for each iteration.
+X *
+X *	parse->string	index variable
+X *	parse->left	rule to compile
+X *	parse->llist	variable values
+X */
+X
+Xvoid
+Xcompile_foreach( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST	*nv = var_list( parse->llist, targets, sources );
+X	LIST	*l;
+X
+X	/* Call var_set to reset $(parse->string) for each val. */
+X
+X	for( l = nv; l; l = list_next( l ) )
+X	{
+X	    LIST *val = list_new( (LIST *)0, copystr( l->string ) );
+X
+X	    var_set( parse->string, val );
+X
+X	    (*parse->left->func)( parse->left, targets, sources );
+X	}
+X
+X	list_free( nv );
+X}
+X
+X/*
+X * compile_if() - compile 'if' rule
+X *
+X *	parse->left		condition tree
+X *	parse->right->left	then tree
+X *	parse->right->right	else tree
+X */
+X
+Xvoid
+Xcompile_if( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	PARSE	*then = parse->right;
+X
+X	if( evaluate_if( parse->left, targets, sources ) )
+X	    (*then->left->func)( then->left, targets, sources );
+X	else if( then->right )
+X	    (*then->right->func)( then->right, targets, sources );
+X}
+X
+X/*
+X * evaluate_if() - evaluate if to determine which leg to compile
+X *
+X * Returns:
+X *	!0	if expression true - compile 'then' clause
+X *	0	if expression false - compile 'else' clause
+X */
+X
+Xstatic int
+Xevaluate_if( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	int	status;
+X
+X	if( parse->num <= COND_OR )
+X	{
+X	    /* Handle one of the logical operators */
+X
+X	    switch( parse->num )
+X	    {
+X	    case COND_NOT:
+X		status = !evaluate_if( parse->left, targets, sources );
+X		break;
+X
+X	    case COND_AND:
+X		status = evaluate_if( parse->left, targets, sources ) &&
+X			 evaluate_if( parse->right, targets, sources );
+X		break;
+X
+X	    case COND_OR:
+X		status = evaluate_if( parse->left, targets, sources ) ||
+X			 evaluate_if( parse->right, targets, sources );
+X		break;
+X	    }
+X	}
+X	else
+X	{
+X	    /* Handle one of the comparison operators */
+X
+X	    LIST	*nt;
+X	    LIST	*ns;
+X	    char	*st;
+X	    char	*ss;
+X
+X	    /* Expand targets and sources */
+X
+X	    st = ss = "";
+X
+X	    if( nt = var_list( parse->llist, targets, sources ) )
+X		st = nt->string;
+X
+X	    if( ns = var_list( parse->rlist, targets, sources ) )
+X		ss = ns->string;
+X
+X	    status = strcmp( st, ss );
+X
+X	    if( DEBUG_IF )
+X		printf( "if '%s' (%d) '%s'\n", st, status, ss );
+X
+X	    list_free( nt );
+X	    list_free( ns );
+X
+X	    switch( parse->num )
+X	    {
+X	    case COND_EXISTS:	status = status > 0 ; break;
+X	    case COND_EQUALS:	status = !status; break;
+X	    case COND_NOTEQ:	status = status != 0; break;
+X	    case COND_LESS:	status = status < 0; break;
+X	    case COND_LESSEQ:	status = status <= 0; break;
+X	    case COND_MORE:	status = status > 0; break;
+X	    case COND_MOREEQ:	status = status >= 0; break;
+X	    }
+X	}
+X
+X	return status;
+X}
+X
+X/*
+X * compile_include() - support for 'include' - call include() on file
+X *
+X * 	parse->llist	list of files to include (can only do 1)
+X */
+X
+Xvoid
+Xcompile_include( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST	*nt = var_list( parse->llist, targets, sources );
+X
+X	if( DEBUG_COMPILE )
+X	{
+X	    printf( "include " );
+X	    list_print( nt );
+X	    printf( "\n" );
+X	}
+X
+X	if( nt )
+X	    yyfparse( nt->string );
+X
+X	list_free( nt );
+X}
+X
+X/*
+X * compile_rule() - compile a single user defined rule
+X *
+X *	parse->string	name of user defined rule
+X *	parse->llist	target of rule
+X *	parse->rlist	sources of rule
+X */
+X
+Xvoid
+Xcompile_rule( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST 	*nt = var_list( parse->llist, targets, sources );
+X	LIST 	*ns = var_list( parse->rlist, targets, sources );
+X	RULE	*rule = bindrule( parse->string );
+X
+X	if( DEBUG_COMPILE )
+X	{
+X	    printf( ">>> %s ", parse->string );
+X	    list_print( nt );
+X	    printf( " : " );
+X	    list_print( ns );
+X	    printf( "\n" );
+X	}
+X
+X	if( !rule->actions && !rule->procedure )
+X	    printf( "warning: unknown rule %s\n", rule->name );
+X
+X	/* If this rule will be executed for updating the targets */
+X	/* then construct the action for make(). */
+X
+X	if( rule->actions )
+X	{
+X	    ACTION	*action;
+X
+X	    /* The action is associated with this instance of this rule */
+X
+X	    action = (ACTION *)malloc( sizeof( ACTION ) );
+X	    memset( (char *)action, '\0', sizeof( *action ) );
+X
+X	    action->rule = rule;
+X	    action->targets = targetlist( (TARGETS *)0, nt );
+X	    action->sources = targetlist( (TARGETS *)0, ns );
+X
+X	    /* Append this action to the actions of each target */
+X
+X	    actionlist( action->targets, action );
+X	}
+X
+X	/* Now recursively compile any parse tree associated with this rule */
+X
+X	if( rule->procedure )
+X	    (*rule->procedure->func)( rule->procedure, nt, ns );
+X
+X	list_free( nt );
+X	list_free( ns );
+X
+X	if( DEBUG_COMPILE )
+X	    printf( "<<< done\n" );
+X}
+X
+X/*
+X * compile_rules() - compile a chain of rules
+X *
+X *	parse->left	more compile_rules() by left-recursion
+X *	parse->right	single rule
+X */
+X
+Xvoid
+Xcompile_rules( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	if( parse->left )
+X	    (*parse->left->func)( parse->left, targets, sources );
+X
+X	if( parse->right )
+X	    (*parse->right->func)( parse->right, targets, sources );
+X}
+X
+X/*
+X * compile_set() - compile the "set variable" statement
+X *
+X *	parse->llist	variable names
+X *	parse->rlist	variable values
+X */
+X
+Xvoid
+Xcompile_set( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST	*nt = var_list( parse->llist, targets, sources );
+X	LIST	*ns = var_list( parse->rlist, targets, sources );
+X	LIST	*l;
+X	int	count = 0;
+X
+X	if( DEBUG_COMPILE )
+X	{
+X	    printf( ">>> set " );
+X	    list_print( nt );
+X	    printf( " = " );
+X	    list_print( ns );
+X	    printf( "\n" );
+X	}
+X
+X	/* Call var_set to set variable */
+X	/* var_set keeps ns, so need to copy it */
+X
+X	for( l = nt; l; l = list_next( l ) )
+X	    var_set( l->string, count++ ? list_copy( (LIST*)0, ns ) : ns );
+X
+X	if( !count )
+X	    list_free( ns );
+X
+X	list_free( nt );
+X}
+X
+X/*
+X * compile_setcomp() - support for `rule` - save parse tree 
+X *
+X *	parse->string	rule name
+X *	parse->left	rules for rule
+X */
+X
+Xvoid
+Xcompile_setcomp( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	RULE	*rule = bindrule( parse->string );
+X
+X	/* Free old one, if present */
+X
+X	if( rule->procedure )
+X	    parse_free( rule->procedure );
+X
+X	rule->procedure = parse->left;
+X
+X	/* we now own this parse tree */
+X	/* don't let parse_free() release it */
+X
+X	parse->left = 0;	
+X}
+X
+X/*
+X * compile_setdefault() - compile the "variable default =" statement
+X *
+X *	parse->llist	variable names
+X *	parse->rlist	variable values
+X */
+X
+Xvoid
+Xcompile_setdefault( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST	*nt = var_list( parse->llist, targets, sources );
+X	LIST	*ns = var_list( parse->rlist, targets, sources );
+X	LIST	*l;
+X	int	count = 0;
+X
+X	if( DEBUG_COMPILE )
+X	{
+X	    printf( ">>> set " );
+X	    list_print( nt );
+X	    printf( " default = " );
+X	    list_print( ns );
+X	    printf( "\n" );
+X	}
+X
+X	/* Skip if variable already set */
+X	/* Call var_set to set variable */
+X	/* var_set keeps ns, so need to copy it */
+X
+X	for( l = nt; l; l = list_next( l ) )
+X	    if( !var_get( l->string ) )
+X	{
+X	    var_set( l->string, count++ ? list_copy( (LIST*)0, ns ) : ns );
+X	}
+X
+X	if( !count )
+X	    list_free( ns );
+X
+X	list_free( nt );
+X}
+X
+X/*
+X * compile_setexec() - support for `actions` - save execution string 
+X *
+X *	parse->string	rule name
+X *	parse->string1	OS command string
+X *	parse->num	flags
+X *
+X * Note that the parse flags (as defined in compile.h) are transfered
+X * directly to the rule flags (as defined in rules.h).
+X */
+X
+Xvoid
+Xcompile_setexec( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	RULE	*rule = bindrule( parse->string );
+X	
+X	/* Free old one, if present */
+X
+X	if( rule->actions )
+X	    freestr( rule->actions );
+X
+X	rule->actions = copystr( parse->string1 );
+X	rule->flags |= parse->num; /* XXX */
+X}
+X
+X/*
+X * compile_settings() - compile the "on :=" (set variable on exec) statement
+X *
+X *	parse->llist		target names
+X *	parse->left->llist	variable names
+X *	parse->left->rlist	variable values
+X */
+X
+Xvoid
+Xcompile_settings( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST	*nt = var_list( parse->left->llist, targets, sources );
+X	LIST	*ns = var_list( parse->left->rlist, targets, sources );
+X	LIST	*ts;
+X	int	count = 0;
+X
+X	/* Reset targets */
+X
+X	targets = var_list( parse->llist, targets, sources );
+X
+X	if( DEBUG_COMPILE )
+X	{
+X	    printf( ">>> settings " );
+X	    list_print( nt );
+X	    printf( "on " );
+X	    list_print( targets );
+X	    printf( " = " );
+X	    list_print( ns );
+X	    printf( "\n" );
+X	}
+X
+X	/* Call addsettings to save variable setting */
+X	/* addsettings keeps ns, so need to copy it */
+X
+X	for( ts = targets; ts; ts = list_next( ts ) )
+X	{
+X	    TARGET 	*t = bindtarget( ts->string );
+X	    LIST	*l;
+X
+X	    for( l = nt; l; l = list_next( l ), count++ )
+X		t->settings = addsettings( t->settings, l->string, 
+X				count ? list_copy( (LIST*)0, ns ) : ns );
+X	}
+X
+X	if( !count )
+X	    list_free( ns );
+X
+X	list_free( nt );
+X	list_free( targets );
+X}
+X
+X/*
+X * compile_switch() - compile 'switch' rule
+X *
+X *	parse->llist	switch value (only 1st used)
+X *	parse->left	cases
+X *
+X *	cases->left	1st case
+X *	cases->right	next cases
+X *
+X *	case->string	argument to match
+X *	case->left	parse tree to execute
+X */
+X
+Xvoid
+Xcompile_switch( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST	*nt;
+X
+X	nt = var_list( parse->llist, targets, sources );
+X
+X	if( DEBUG_COMPILE )
+X	{
+X	    printf( ">>> switch " );
+X	    list_print( nt );
+X	    printf( "\n" );
+X	}
+X
+X	/* Step through cases */
+X
+X	for( parse = parse->left; parse; parse = parse->right )
+X	{
+X	    if( nt && 
+X		!strcmp( parse->left->string, nt->string ) ||
+X		!strcmp( parse->left->string, "*" ) )
+X	    {
+X		/* Get & exec parse tree for this case */
+X		parse = parse->left->left;
+X		(*parse->func)( parse, targets, sources );
+X		break;
+X	    }
+X	}
+X
+X	list_free( nt );
+X}
+X
+X
+X
+X/*
+X * builtin_depends() - DEPENDS rule
+X *
+X * The DEPENDS builtin rule appends each of the listed sources on the 
+X * dependency list of each of the listed targets.  It binds both the 
+X * targets and sources as TARGETs.
+X */
+X
+Xstatic void
+Xbuiltin_depends( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST *l;
+X
+X	for( l = targets; l; l = list_next( l ) )
+X	{
+X	    TARGET *t = bindtarget( l->string );
+X	    t->deps = targetlist( t->deps, sources );
+X	}
+X}
+X
+X/*
+X * builtin_echo() - ECHO rule
+X *
+X * The ECHO builtin rule echoes the targets to the user.  No other 
+X * actions are taken.
+X */
+X
+Xstatic void
+Xbuiltin_echo( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	list_print( targets );
+X	printf( "\n" );
+X}
+X
+X/*
+X * builtin_includes() - INCLUDES rule
+X *
+X * The INCLUDES builtin rule appends each of the listed sources on the 
+X * headers list of each of the listed targets.  It binds both the 
+X * targets and sources as TARGETs.
+X */
+X
+Xstatic void
+Xbuiltin_includes( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST *l;
+X
+X	for( l = targets; l; l = list_next( l ) )
+X	{
+X	    TARGET *t = bindtarget( l->string );
+X	    t->headers = targetlist( t->headers, sources );
+X	}
+X}
+X
+X/*
+X * builtin_flags() - NOCARE, NOTIME, TEMPORARY rule
+X *
+X * Builtin_flags() marks the target with the appropriate flag, for use
+X * by make0().  It binds each target as a TARGET.
+X */
+X
+Xstatic void
+Xbuiltin_flags( parse, targets, sources )
+XPARSE		*parse;
+XLIST		*targets;
+XLIST		*sources;
+X{
+X	LIST *l;
+X
+X	for( l = targets; l; l = list_next( l ) )
+X	    bindtarget( l->string )->flags |= parse->num;
+X}
+SHAR_EOF
+chmod 0444 compile.c ||
+echo 'restore of compile.c failed'
+Wc_c="`wc -c < 'compile.c'`"
+test 13686 -eq "$Wc_c" ||
+	echo 'compile.c: original size 13686, current size' "$Wc_c"
+fi
+# ============= compile.h ==============
+if test -f 'compile.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping compile.h (File already exists)'
+else
+echo 'x - extracting compile.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'compile.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * compile.h - compile parsed jam statements
+X */
+X
+Xvoid compile_builtins();
+Xvoid compile_foreach();
+Xvoid compile_if();
+Xvoid compile_include();
+Xvoid compile_rule();
+Xvoid compile_rules();
+Xvoid compile_set();
+Xvoid compile_setcomp();
+Xvoid compile_setdefault();
+Xvoid compile_setexec();
+Xvoid compile_settings();
+Xvoid compile_switch();
+X
+X/* Flags for compile_setexec() */
+X
+X# define EXEC_UPDATED	0x01	/* executes updated */
+X# define EXEC_TOGETHER	0x02	/* executes together */
+X# define EXEC_IGNORE	0x04	/* executes ignore */
+X# define EXEC_QUIETLY	0x08	/* executes quietly */
+X# define EXEC_PIECEMEAL	0x10	/* executes piecemeal */
+X
+X/* Conditions for compile_if() */
+X
+X# define COND_NOT	0	/* ! cond */
+X# define COND_AND	1	/* cond && cond */
+X# define COND_OR	2	/* cond || cond */
+X
+X# define COND_EXISTS	3	/* arg */
+X# define COND_EQUALS	4	/* arg = arg */
+X# define COND_NOTEQ	5	/* arg != arg */
+X# define COND_LESS	6	/* arg < arg  */
+X# define COND_LESSEQ	7	/* arg <= arg */
+X# define COND_MORE	8	/* arg > arg  */
+X# define COND_MOREEQ	9	/* arg >= arg */
+SHAR_EOF
+chmod 0444 compile.h ||
+echo 'restore of compile.h failed'
+Wc_c="`wc -c < 'compile.h'`"
+test 1082 -eq "$Wc_c" ||
+	echo 'compile.h: original size 1082, current size' "$Wc_c"
+fi
+# ============= execcmd.h ==============
+if test -f 'execcmd.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping execcmd.h (File already exists)'
+else
+echo 'x - extracting execcmd.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'execcmd.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * execcmd.h - execute a shell script
+X */
+X
+Xint execcmd();
+X
+X# define EXEC_CMD_OK	0
+X# define EXEC_CMD_FAIL	1
+X# define EXEC_CMD_INTR	2
+SHAR_EOF
+chmod 0444 execcmd.h ||
+echo 'restore of execcmd.h failed'
+Wc_c="`wc -c < 'execcmd.h'`"
+test 182 -eq "$Wc_c" ||
+	echo 'execcmd.h: original size 182, current size' "$Wc_c"
+fi
+# ============= execunix.c ==============
+if test -f 'execunix.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping execunix.c (File already exists)'
+else
+echo 'x - extracting execunix.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'execunix.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# ifndef VMS
+X
+X# include "jam.h"
+X# include "execcmd.h"
+X
+X# if defined(__sgi)
+X# define vfork() fork()
+X# endif
+X
+X/*
+X * execunix.c - execute a shell script on UNIX
+X *
+X * Sets "interrupted" if the command was interrupted.
+X */
+X
+Xstatic int intr = 0;
+X
+Xvoid
+Xonintr()
+X{
+X	intr++;
+X}
+X	
+Xint
+Xexeccmd( string )
+Xchar *string;
+X{
+X	int status, pid, w, rstat;
+X	void (*istat)();
+X
+X	intr = 0;
+X
+X	if ((pid = vfork()) == 0) {
+X		execl("/bin/sh", "sh", "-c", string, 0);
+X		_exit(127);
+X	}
+X
+X	istat = signal( SIGINT, onintr );
+X	while ((w = wait(&status)) != pid && w != -1)
+X		;
+X	signal( SIGINT, istat );
+X
+X	if( intr )
+X	    return EXEC_CMD_INTR;
+X	else if( w == -1 || status != 0 )
+X	    return EXEC_CMD_FAIL;
+X	else
+X	    return EXEC_CMD_OK;
+X}
+X
+X# endif /* UNIX */
+SHAR_EOF
+chmod 0444 execunix.c ||
+echo 'restore of execunix.c failed'
+Wc_c="`wc -c < 'execunix.c'`"
+test 772 -eq "$Wc_c" ||
+	echo 'execunix.c: original size 772, current size' "$Wc_c"
+fi
+# ============= execvms.c ==============
+if test -f 'execvms.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping execvms.c (File already exists)'
+else
+echo 'x - extracting execvms.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'execvms.c' &&
+X/* 
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# ifdef VMS
+X
+X# include "jam.h"
+X# include "execcmd.h"
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <stdlib.h>
+X#include <iodef.h>
+X#include <ssdef.h>
+X#include <descrip.h>
+X#include <dvidef.h>
+X#include <clidef.h>
+X
+X/*
+X * execvms.c - execute a shell script, ala VMS
+X */
+X
+X#define WRTLEN 240
+X
+X#define MIN( a, b )	((a) < (b) ? (a) : (b))
+X
+X    /* macros to allocate and initialize VMS descriptors
+X     */
+X#define DESCALLOC( name ) struct dsc$descriptor_s \
+X	(name) = { 0, DSC$K_DTYPE_T, DSC$K_CLASS_D, NULL }
+X
+X
+Xint
+Xexeccmd( string )
+Xchar *string;
+X{
+X    /* Split string at newlines, and don't execute empty lines */
+X    /* Bail if any lines fail. */
+X
+X    while( *string )
+X    {
+X	char *s;
+X	char *os = string;
+X	int something = 0;
+X
+X	for( s = string; *s && *s != '\n'; s++ )
+X	    if( !isspace( *s ) )
+X		something++;
+X
+X	string = *s ? s + 1 : s ;
+X
+X	if( something )
+X	{
+X	    int status;
+X	    int len;
+X
+X	    *s = '\0';
+X
+X	    if( ( len = strlen( os ) ) < WRTLEN )
+X	    {
+X		status = system( os ) & 0x07;
+X	    }
+X	    else
+X	    {
+X		FILE *f = fopen( "sys$scratch:jam.com", "w" );
+X
+X		if( !f )
+X		{
+X		    printf( "can't open command file\n" );
+X		    return EXEC_CMD_FAIL;
+X		}
+X
+X	        fputc( '$', f );
+X
+X		while( len > 0 )
+X		{
+X		    int l = MIN( len, WRTLEN );
+X
+X		    fwrite( os, l, 1, f );
+X
+X		    if( l < len )
+X			fputc( '-', f );
+X
+X		    fputc( '\n', f );
+X
+X		    len -= l;
+X		    os += l;
+X		}
+X
+X		fclose( f );
+X
+X		status = system( "@sys$scratch:jam.com" ) & 0x07;
+X
+X		unlink( "sys$scratch:jam.com" );
+X
+X	    }		
+X
+X	    /* Fail for error or fatal error */
+X	    /* OK on OK, warning, or info exit */
+X
+X	    if( status == 2 || status == 4 )
+X		return EXEC_CMD_FAIL;
+X	}
+X    }
+X
+X    return EXEC_CMD_OK;
+X}
+X
+X# endif /* VMS */
+SHAR_EOF
+chmod 0444 execvms.c ||
+echo 'restore of execvms.c failed'
+Wc_c="`wc -c < 'execvms.c'`"
+test 1733 -eq "$Wc_c" ||
+	echo 'execvms.c: original size 1733, current size' "$Wc_c"
+fi
+# ============= expand.c ==============
+if test -f 'expand.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping expand.c (File already exists)'
+else
+echo 'x - extracting expand.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'expand.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "lists.h"
+X# include "variable.h"
+X# include "expand.h"
+X# include "filesys.h"
+X# include "newstr.h"
+X
+X/*
+X * expand.c - expand a buffer, given variable values
+X *
+X * External routines:
+X *
+X *     var_expand() - variable-expand input string into list of strings
+X *
+X * Internal routines:
+X *
+X *     var_edit() - copy input target name to output, performing : modifiers
+X *     var_mods() - parse : modifiers into FILENAME structure
+X */
+X
+Xstatic void	var_edit();
+Xstatic void	var_mods();
+X
+X# define MAGIC_COLON	'\001'
+X
+X/*
+X * var_expand() - variable-expand input string into list of strings
+X *
+X * Would just copy input to output, performing variable expansion, 
+X * except that since variables can contain multiple values the result
+X * of variable expansion may contain multiple values (a list).  Properly
+X * performs "product" operations that occur in "$(var1)xxx$(var2)" or
+X * even "$($(var2))".
+X *
+X * Returns a newly created list.
+X */
+X
+XLIST *
+Xvar_expand( l, in, end, targets, sources )
+XLIST	*l;
+Xchar	*in;
+Xchar	*end;
+XLIST	*targets;
+XLIST	*sources;
+X{
+X	char out_buf[ MAXSYM ];
+X	char *out = out_buf;
+X	char *ov;		/* for temp copy of variable in outbuf */
+X	int depth;
+X
+X	if( DEBUG_VAREXP )
+X	    printf( "expand '%.*s'\n", end - in, in );
+X
+X	/* Just try simple copy of in to out. */
+X
+X	while( in < end )
+X	    if( ( *out++ = *in++ ) == '$' && *in == '(' ) 
+X		goto expand;
+X
+X	/* No variables expanded - just add copy of input string to list. */
+X
+X	*out = '\0';
+X
+X	return list_new( l, newstr( out_buf ) );
+X
+X    expand:
+X	/*
+X	 * Input so far (ignore blanks):
+X	 *
+X	 *	stuff-in-outbuf $(variable) remainder
+X	 *			 ^	             ^
+X	 *			 in		     end
+X	 * Output so far:
+X	 *
+X	 *	stuff-in-outbuf $
+X	 *	^	         ^
+X	 *	out_buf          out
+X	 *
+X	 *
+X	 * We just copied the $ of $(...), so back up one on the output.
+X	 * We now find the matching close paren, copying the variable and
+X	 * modifiers between the $( and ) temporarily into out_buf, so that
+X	 * we can replace :'s with MAGIC_COLON.  This is necessary to avoid
+X	 * being confused by modifier values that are variables containing
+X	 * :'s.  Ugly.
+X	 */
+X
+X	depth = 1;
+X	out--, in++;
+X	ov = out;
+X
+X	while( in < end && depth )
+X	{
+X	    switch( *ov++ = *in++ )
+X	    {
+X	    case '(': depth++; break;
+X	    case ')': depth--; break;
+X	    case ':': ov[-1] = MAGIC_COLON;
+X	    }
+X	}
+X
+X	/* Copied ) - back up. */
+X
+X	ov--;
+X
+X	/*
+X	 * Input so far (ignore blanks):
+X	 *
+X	 *	stuff-in-outbuf $(variable) remainder
+X	 *			            ^        ^
+X	 *			            in       end
+X	 * Output so far:
+X	 *
+X	 *	stuff-in-outbuf variable
+X	 *	^	        ^       ^
+X	 *	out_buf         out	ov
+X	 *
+X	 * Later we will overwrite 'variable' in out_buf, but we'll be
+X	 * done with it by then.  'variable' may be a multi-element list, 
+X	 * so may each value for '$(variable element)', and so may 'remainder'.
+X	 * Thus we produce a product of three lists.
+X	 */
+X
+X	{
+X	    LIST *variables = 0;
+X	    LIST *remainder = 0;
+X	    LIST *vars;
+X
+X	    /* Recursively expand variable name & rest of input */
+X
+X	    if( out < ov )
+X		variables = var_expand( (LIST *)0, out, ov, targets, sources );
+X	    if( in < end )
+X		remainder = var_expand( (LIST *)0, in, end, targets, sources );
+X
+X	    /* Now produce the result chain */
+X
+X	    /* For each variable name */
+X
+X	    for( vars = variables; vars; vars = list_next( vars ) )
+X	    {
+X		LIST *value;
+X		char *colon;
+X		char *bracket;
+X		char varname[ MAXSYM ];
+X		int i, sub1, sub2;
+X
+X		/* Look for a : modifier in the variable name */
+X		/* Must copy into varname so we can modify it */
+X
+X		strcpy( varname, vars->string );
+X
+X		if( colon = strchr( varname, MAGIC_COLON ) )
+X		    *colon = '\0';
+X
+X		if( bracket = strchr( varname, '[' ) )
+X		{
+X		    char *dash;
+X
+X		    if( dash = strchr( bracket + 1, '-' ) )
+X		    {
+X			*dash = '\0';
+X			sub1 = atoi( bracket + 1 );
+X			sub2 = atoi( dash + 1 );
+X		    }
+X		    else
+X		    {
+X			sub1 = sub2 = atoi( bracket + 1 );
+X		    }
+X
+X		    *bracket = '\0';
+X		}
+X
+X		/* Get variable value, specially handling $(<) and $(>) */
+X		
+X		if( !strcmp( varname, "<" ) )
+X		    value = targets;
+X		else if( !strcmp( varname, ">" ) )
+X		    value = sources;
+X		else 
+X		    value = var_get( varname );
+X
+X		/* The fast path: $(x) - just copy the variable value. */
+X
+X		if( out == out_buf && !bracket && !colon && !remainder )
+X		{
+X		    l = list_copy( l, value );
+X		    continue;
+X		}
+X
+X		/* For each variable value */
+X
+X		for( i = 1; value; i++, value = list_next( value ) )
+X		{
+X		    LIST *rem;
+X		    char *out1;
+X
+X		    /* Skip members not in subscript */
+X
+X		    if( bracket && ( i < sub1 || sub2 && i > sub2 ) )
+X			continue;
+X
+X		    /* Apply : mods, if present */
+X
+X		    if( colon )
+X			var_edit( value->string, colon + 1, out );
+X		    else
+X			strcpy( out, value->string );
+X
+X		    /* If no remainder, append result to output chain. */
+X
+X		    if( in == end )
+X		    {
+X			l = list_new( l, newstr( out_buf ) );
+X			continue;
+X		    }
+X
+X		    /* Remember the end of the variable expansion so */
+X		    /* we can just tack on each instance of 'remainder' */
+X
+X		    out1 = out + strlen( out );
+X
+X		    /* For each remainder, or just once if no remainder, */
+X		    /* append the complete string to the output chain */
+X
+X		    for( rem = remainder; rem; rem = list_next( rem ) )
+X		    {
+X			strcpy( out1, rem->string );
+X			l = list_new( l, newstr( out_buf ) );
+X		    }
+X		}
+X	    }
+X
+X	    /* variables & remainder were gifts from var_expand */
+X	    /* and must be freed */
+X
+X	    if( variables )
+X		list_free( variables );
+X	    if( remainder)
+X		list_free( remainder );
+X
+X	    if( DEBUG_VAREXP )
+X	    {
+X		printf( "expanded to " );
+X		list_print( l );
+X		printf( "\n" );
+X	    }
+X
+X	    return l;
+X	}
+X}
+X
+X/*
+X * var_edit() - copy input target name to output, performing : modifiers
+X */
+X
+Xstatic void
+Xvar_edit( in, mods, out )
+Xchar	*in;
+Xchar	*mods;
+Xchar	*out;
+X{
+X	FILENAME old, new;
+X
+X	/* Parse apart original filename, putting parts into "old" */
+X
+X	file_parse( in, &old );
+X
+X	/* Parse apart modifiers, putting them into "new" */
+X
+X	var_mods( mods, &new );
+X
+X	/* Replace any old with new */
+X
+X	if( new.f_grist.ptr )
+X	    old.f_grist = new.f_grist;
+X
+X	if( new.f_root.ptr )
+X	    old.f_root = new.f_root;
+X
+X	if( new.f_dir.ptr )
+X	    old.f_dir = new.f_dir;
+X
+X	if( new.f_base.ptr )
+X	    old.f_base = new.f_base;
+X
+X	if( new.f_suffix.ptr )
+X	    old.f_suffix = new.f_suffix;
+X
+X	if( new.f_member.ptr )
+X	    old.f_member = new.f_member;
+X
+X	/* Put filename back together */
+X
+X	file_build( &old, out );
+X}
+X
+X
+X/*
+X * var_mods() - parse : modifiers into FILENAME structure
+X *
+X * The : modifiers in a $(varname:modifier) currently support replacing
+X * or omitting elements of a filename, and so they are parsed into a 
+X * FILENAME structure (which contains pointers into the original string).
+X *
+X * Modifiers of the form "X=value" replace the component X with
+X * the given value.  Modifiers without the "=value" cause everything 
+X * but the component X to be omitted.  X is one of:
+X *
+X *	G <grist>
+X *	D directory name
+X *	B base name
+X *	S .suffix
+X *	M (member)
+X *	R root directory - prepended to whole path
+X *
+X * This routine sets:
+X *
+X *	f->f_xxx.ptr = 0
+X *	f->f_xxx.len = 0
+X *		-> leave the original component xxx
+X *
+X *	f->f_xxx.ptr = string
+X *	f->f_xxx.len = strlen( string )
+X *		-> replace component xxx with string
+X *
+X *	f->f_xxx.ptr = ""
+X *	f->f_xxx.len = 0
+X *		-> omit component xxx
+X *
+X * var_edit() above and file_build() obligingly follow this convention.
+X */
+X
+Xstatic void
+Xvar_mods( mods, f )
+Xchar		*mods;
+XFILENAME	*f;
+X{
+X	char *flags = "GRDBSM";
+X	int havezeroed = 0;
+X	memset( (char *)f, 0, sizeof( *f ) );
+X
+X	while( *mods )
+X	{
+X	    char *fl;
+X	    struct filepart *fp;
+X
+X	    if( !( fl = strchr( flags, *mods++ ) ) )
+X		break;	/* should complain, but so what... */
+X
+X	    fp = &f->part[ fl - flags ];
+X
+X	    if( *mods++ != '=' )
+X	    {
+X		/* :X - turn everything but X off */
+X
+X		int i;
+X
+X		mods--;
+X
+X		if( !havezeroed++ )
+X		    for( i = 0; i < 6; i++ )
+X		{
+X		    f->part[ i ].len = 0;
+X		    f->part[ i ].ptr = "";
+X		}
+X
+X		fp->ptr = 0;
+X	    }
+X	    else
+X	    {
+X		/* :X=value - set X to value */
+X
+X		char *p;
+X
+X		if( p = strchr( mods, MAGIC_COLON ) )
+X		{
+X		    fp->ptr = mods;
+X		    fp->len = p - mods;
+X		    mods = p + 1;
+X		}
+X		else
+X		{
+X		    fp->ptr = mods;
+X		    fp->len = strlen( mods );
+X		    mods += fp->len;
+X		}
+X	    }
+X	}
+X}
+SHAR_EOF
+chmod 0444 expand.c ||
+echo 'restore of expand.c failed'
+Wc_c="`wc -c < 'expand.c'`"
+test 8227 -eq "$Wc_c" ||
+	echo 'expand.c: original size 8227, current size' "$Wc_c"
+fi
+# ============= expand.h ==============
+if test -f 'expand.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping expand.h (File already exists)'
+else
+echo 'x - extracting expand.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'expand.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * expand.h - expand a buffer, given variable values
+X */
+X
+XLIST *var_expand();
+SHAR_EOF
+chmod 0444 expand.h ||
+echo 'restore of expand.h failed'
+Wc_c="`wc -c < 'expand.h'`"
+test 128 -eq "$Wc_c" ||
+	echo 'expand.h: original size 128, current size' "$Wc_c"
+fi
+# ============= filesys.h ==============
+if test -f 'filesys.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping filesys.h (File already exists)'
+else
+echo 'x - extracting filesys.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'filesys.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * filesys.h - FILENAME struct and OS specific file routines 
+X */
+X
+X/*
+X * FILENAME - a name of a file, broken into <grist>dir/base/suffix(member)
+X *
+X * <grist> is salt to distinguish between targets that otherwise would
+X * have the same name:  it never appears in the bound name of a target.
+X * (member) is an archive member name: the syntax is arbitrary, but must 
+X * agree in file_parse(), file_build() and the Jambase.
+X */
+X
+Xtypedef struct _filename FILENAME;
+X
+Xstruct _filename {
+X	struct filepart {
+X		char	*ptr;
+X		int	len;
+X	} part[6];
+X# define f_grist	part[0]
+X# define f_root		part[1]
+X# define f_dir		part[2]
+X# define f_base		part[3]
+X# define f_suffix	part[4]
+X# define f_member	part[5]
+X} ;
+X
+Xvoid file_parse();
+Xvoid file_build();
+X
+Xvoid file_archscan();
+Xvoid file_dirscan();
+X
+Xint file_time();
+SHAR_EOF
+chmod 0444 filesys.h ||
+echo 'restore of filesys.h failed'
+Wc_c="`wc -c < 'filesys.h'`"
+test 842 -eq "$Wc_c" ||
+	echo 'filesys.h: original size 842, current size' "$Wc_c"
+fi
+# ============= fileunix.c ==============
+if test -f 'fileunix.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping fileunix.c (File already exists)'
+else
+echo 'x - extracting fileunix.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'fileunix.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# ifndef VMS
+X
+X# include "jam.h"
+X# include "filesys.h"
+X
+X# if defined(_SEQUENT_) || defined(__DGUX__)
+X# define PORTAR 1
+X# endif
+X
+X# include <dirent.h>
+X# include <ar.h>
+X
+X/*
+X * fileunix.c - manipulate file names and scan directories on UNIX
+X *
+X * External routines:
+X *
+X *	file_parse() - split a file name into dir/base/suffix/member
+X *	file_build() - build a filename given dir/base/suffix/member
+X *	file_dirscan() - scan a directory for files
+X *	file_time() - get timestamp of file, if not done by file_dirscan()
+X *	file_archscan() - scan an archive for files
+X *
+X * File_parse() and file_build() just manipuate a string and a structure;
+X * they do not make system calls.
+X *
+X * File_dirscan() and file_archscan() call back a caller provided function
+X * for each file found.  A flag to this callback function lets file_dirscan()
+X * and file_archscan() indicate that a timestamp is being provided with the
+X * file.   If file_dirscan() or file_archscan() do not provide the file's
+X * timestamp, interested parties may later call file_time().
+X */
+X
+X/*
+X * file_parse() - split a file name into dir/base/suffix/member
+X */
+X
+Xvoid
+Xfile_parse( file, f )
+Xchar		*file;
+XFILENAME	*f;
+X{
+X	char *p; 
+X	char *end;
+X	
+X	memset( (char *)f, 0, sizeof( *f ) );
+X
+X	/* Look for <grist> */
+X
+X	if( file[0] == '<' && ( p = strchr( file, '>' ) ) )
+X	{
+X	    f->f_grist.ptr = file + 1;
+X	    f->f_grist.len = p - file - 1;
+X	    file = p + 1;
+X	}
+X
+X	/* Look for dir/ */
+X
+X	if( p = strrchr( file, '/' ) )
+X	{
+X	    f->f_dir.ptr = file;
+X	    f->f_dir.len = p - file;
+X	    file = p + 1;
+X	}
+X
+X	end = file + strlen( file );
+X
+X	/* Look for (member) */
+X
+X	if( ( p = strchr( file, '(' ) ) && end[-1] == ')' )
+X	{
+X	    f->f_member.ptr = p + 1;
+X	    f->f_member.len = end - p - 2;
+X	    end = p;
+X	} 
+X
+X	/* Look for .suffix */
+X
+X	if( ( p = strchr( file, '.' ) ) && p < end )
+X	{
+X	    f->f_suffix.ptr = p;
+X	    f->f_suffix.len = end - p;
+X	    end = p;
+X	}
+X
+X	/* Leaves base */
+X
+X	f->f_base.ptr = file;
+X	f->f_base.len = end - file;
+X}
+X
+X/*
+X * file_build() - build a filename given dir/base/suffix/member
+X */
+X
+Xvoid
+Xfile_build( f, file )
+XFILENAME	*f;
+Xchar		*file;
+X{
+X	if( f->f_grist.len )
+X	{
+X	    *file++ = '<';
+X	    memcpy( file, f->f_grist.ptr, f->f_grist.len );
+X	    file += f->f_grist.len;
+X	    *file++ = '>';
+X	}
+X
+X	/* Don't prepend root if it's . or directory is rooted */
+X
+X	if( f->f_root.len 
+X	    && !( f->f_root.len == 1 && f->f_root.ptr[0] == '.' )
+X	    && !( f->f_dir.len && f->f_dir.ptr[0] == '/' ) )
+X	{
+X	    memcpy( file, f->f_root.ptr, f->f_root.len );
+X	    file += f->f_root.len;
+X	    *file++ = '/';
+X	}
+X	    
+X	if( f->f_dir.len )
+X	{
+X	    memcpy( file, f->f_dir.ptr, f->f_dir.len );
+X	    file += f->f_dir.len;
+X	}
+X
+X	if( f->f_dir.len && f->f_base.len )
+X	    *file++ = '/';
+X
+X	if( f->f_base.len )
+X	{
+X	    memcpy( file, f->f_base.ptr, f->f_base.len );
+X	    file += f->f_base.len;
+X	}
+X
+X	if( f->f_suffix.len )
+X	{
+X	    memcpy( file, f->f_suffix.ptr, f->f_suffix.len );
+X	    file += f->f_suffix.len;
+X	}
+X
+X	if( f->f_member.len )
+X	{
+X	    *file++ = '(';
+X	    memcpy( file, f->f_member.ptr, f->f_member.len );
+X	    file += f->f_member.len;
+X	    *file++ = ')';
+X	}
+X	*file = 0;
+X}
+X
+X/*
+X * file_dirscan() - scan a directory for files
+X */
+X
+Xvoid
+Xfile_dirscan( dir, func )
+Xchar	*dir;
+Xvoid	(*func)();
+X{
+X	FILENAME f;
+X	DIR *d;
+X	struct dirent *dirent;
+X	char filename[ MAXPATH ];
+X	struct stat statbuf;
+X
+X	/* First enter directory itself */
+X
+X	memset( (char *)&f, '\0', sizeof( f ) );
+X
+X	f.f_dir.ptr = dir;
+X	f.f_dir.len = strlen(dir);
+X
+X	dir = *dir ? dir : ".";
+X
+X	/* Now enter contents of directory */
+X
+X	if( !( d = opendir( dir ) ) )
+X	    return;
+X
+X	if( DEBUG_BINDSCAN )
+X	    printf( "scan directory %s\n", dir );
+X
+X	while( dirent = readdir( d ) )
+X	{
+X	    f.f_base.ptr = dirent->d_name;
+X	    f.f_base.len = strlen( dirent->d_name );
+X
+X	    file_build( &f, filename );
+X
+X	    (*func)( filename, 0 /* not stat()'ed */, (time_t)0 );
+X	}
+X
+X	closedir( d );
+X}
+X
+X/*
+X * file_time() - get timestamp of file, if not done by file_dirscan()
+X */
+X
+Xint
+Xfile_time( filename, time )
+Xchar	*filename;
+Xtime_t	*time;
+X{
+X	struct stat statbuf;
+X
+X	if( stat( filename, &statbuf ) < 0 )
+X	    return -1;
+X
+X	*time = statbuf.st_mtime;
+X	return 0;
+X}
+X
+X/*
+X * file_archscan() - scan an archive for files
+X */
+X
+X# ifndef AIAMAG	/* God-fearing UNIX */
+X
+X# define SARFMAG 2
+X# define SARHDR sizeof( struct ar_hdr )
+X
+Xvoid
+Xfile_archscan( archive, func )
+Xchar *archive;
+Xvoid (*func)();
+X{
+X	struct ar_hdr ar_hdr;
+X	char buf[ MAXPATH ];
+X	long offset;
+X	int fd;
+X
+X	if( ( fd = open( archive, O_RDONLY, 0 ) ) < 0 )
+X	    return;
+X
+X	if( read( fd, buf, SARMAG ) != SARMAG ||
+X	    strncmp( ARMAG, buf, SARMAG ) )
+X	{
+X	    close( fd );
+X	    return;
+X	}
+X
+X	offset = SARMAG;
+X
+X	if( DEBUG_BINDSCAN )
+X	    printf( "scan archive %s\n", archive );
+X
+X	while( read( fd, &ar_hdr, SARHDR ) == SARHDR &&
+X	       !memcmp( ar_hdr.ar_fmag, ARFMAG, SARFMAG ) )
+X	{
+X	    char    lar_name[16];
+X	    long    lar_date;
+X	    long    lar_size;
+X	    char *c;
+X
+X	    strncpy( lar_name, ar_hdr.ar_name, sizeof(ar_hdr.ar_name) );
+X	    c = lar_name + sizeof( lar_name );
+X	    while( *--c == ' ' || *c == '/' )
+X		    ;
+X	    *++c = '\0';
+X
+X	    sscanf( ar_hdr.ar_date, "%ld", &lar_date );
+X	    sscanf( ar_hdr.ar_size, "%ld", &lar_size );
+X
+X	    sprintf( buf, "%s(%s)", archive, lar_name );
+X
+X	    (*func)( buf, 1 /* time valid */, (time_t)lar_date );
+X
+X	    offset += SARHDR + ( ( lar_size + 1 ) & ~1 );
+X	    lseek( fd, offset, 0 );
+X	}
+X
+X	close( fd );
+X}
+X
+X# else /* AIAMAG - RS6000 AIX */
+X
+Xvoid
+Xfile_archscan( archive, func )
+Xchar *archive;
+Xvoid (*func)();
+X{
+X	struct fl_hdr fl_hdr;
+X
+X	struct {
+X		struct ar_hdr hdr;
+X		char pad[ 256 ];
+X	} ar_hdr ;
+X
+X	char buf[ MAXPATH ];
+X	long offset;
+X	int fd;
+X
+X	if( ( fd = open( archive, O_RDONLY, 0 ) ) < 0 )
+X	    return;
+X
+X	if( read( fd, (char *)&fl_hdr, FL_HSZ ) != FL_HSZ ||
+X	    strncmp( AIAMAG, fl_hdr.fl_magic, SAIAMAG ) )
+X	{
+X	    close( fd );
+X	    return;
+X	}
+X
+X	sscanf( fl_hdr.fl_fstmoff, "%ld", &offset );
+X
+X	if( DEBUG_BINDSCAN )
+X	    printf( "scan archive %s\n", archive );
+X
+X	while( offset > 0 &&
+X	       lseek( fd, offset, 0 ) >= 0 &&
+X	       read( fd, &ar_hdr, sizeof( ar_hdr ) ) >= sizeof( ar_hdr.hdr ) )
+X	{
+X	    long    lar_date;
+X	    int	    lar_namlen;
+X
+X	    sscanf( ar_hdr.hdr.ar_namlen, "%d", &lar_namlen );
+X	    sscanf( ar_hdr.hdr.ar_date, "%ld", &lar_date );
+X	    sscanf( ar_hdr.hdr.ar_nxtmem, "%ld", &offset );
+X
+X	    if( !lar_namlen )
+X		continue;
+X
+X	    ar_hdr.hdr._ar_name.ar_name[ lar_namlen ] = '\0';
+X
+X	    sprintf( buf, "%s(%s)", archive, ar_hdr.hdr._ar_name.ar_name );
+X
+X	    (*func)( buf, 1 /* time valid */, (time_t)lar_date );
+X	}
+X
+X	close( fd );
+X}
+X
+X# endif /* AIAMAG - RS6000 AIX */
+X
+X# endif /* UNIX */
+SHAR_EOF
+chmod 0444 fileunix.c ||
+echo 'restore of fileunix.c failed'
+Wc_c="`wc -c < 'fileunix.c'`"
+test 6593 -eq "$Wc_c" ||
+	echo 'fileunix.c: original size 6593, current size' "$Wc_c"
+fi
+# ============= filevms.c ==============
+if test -f 'filevms.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping filevms.c (File already exists)'
+else
+echo 'x - extracting filevms.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'filevms.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# ifdef VMS
+X
+X/*
+X * filevms.c - manipulate file names and scan directories on VMS
+X */
+X
+X# include <rms.h>
+X# include <iodef.h>
+X# include <ssdef.h>
+X# include <string.h>
+X# include <stdlib.h>
+X# include <ctype.h>
+X# include <stdio.h>
+X# include <descrip.h>
+X
+X#include <lbrdef.h>
+X#include <credef.h>
+X#include <mhddef.h>
+X#include <lhidef.h>
+X
+X# include "jam.h"
+X# include "filesys.h"
+X
+X/*
+X * unlink() - remove a file
+X */
+X
+Xunlink( f )
+Xchar *f;
+X{
+X	remove( f );
+X}
+X
+X/*
+X * file_parse() - split a file name into dir/base/suffix/member
+X */
+X
+Xvoid
+Xfile_parse( file, f )
+Xchar		*file;
+XFILENAME	*f;
+X{
+X	char *p; 
+X	char *end;
+X	
+X	memset( (char *)f, 0, sizeof( *f ) );
+X
+X	/* Look for <grist> */
+X
+X	if( file[0] == '<' && ( p = strchr( file, '>' ) ) )
+X	{
+X	    f->f_grist.ptr = file + 1;
+X	    f->f_grist.len = p - file - 1;
+X	    file = p + 1;
+X	}
+X
+X	/* Look for dev:[dir] or dev: */
+X
+X	if( ( p = strchr( file, ']' ) ) || ( p = strchr( file, ':' ) ) )
+X	{
+X	    f->f_dir.ptr = file;
+X	    f->f_dir.len = p + 1 - file;
+X	    file = p + 1;
+X	}
+X
+X	end = file + strlen( file );
+X
+X	/* Look for (member) */
+X
+X	if( ( p = strchr( file, '(' ) ) && end[-1] == ')' )
+X	{
+X	    f->f_member.ptr = p + 1;
+X	    f->f_member.len = end - p - 2;
+X	    end = p;
+X	} 
+X
+X	/* Look for .suffix */
+X
+X	if( ( p = strchr( file, '.' ) ) && p < end )
+X	{
+X	    f->f_suffix.ptr = p;
+X	    f->f_suffix.len = end - p;
+X	    end = p;
+X	}
+X
+X	/* Leaves base */
+X
+X	f->f_base.ptr = file;
+X	f->f_base.len = end - file;
+X}
+X
+X/*
+X * file_flags() - find out what's in a directory name
+X *
+X * VMS directories get complicated.  Valid combinations of root
+X * and dir are:
+X *
+X *	root		dir		result
+X *	----		---		------
+X *					
+X *	 		[dir]		[dir]
+X *	dev				dev:
+X *	dev		[dir]		dev:[dir]
+X *	dev:				dev:
+X *	dev:		[dir]		dev:[dir]
+X *	[dir]				[dir]
+X *	[dir]		[dir]		[dir.dir]
+X *	dev:[dir]			dev:[dir]
+X *	dev:[dir]	[dir]		dev:[dir.dir]
+X *
+X *	*		dev		dev
+X *	*		dev:		dev:
+X *	*		dev:[dir]	dev:[dir]
+X *
+X */
+X
+X# define HAS_NOTHING	0
+X# define HAS_DEV	0x01
+X# define HAS_DIR	0x02
+X# define HAS_COLON	0x04
+X
+Xstatic int
+Xfile_flags( buf, len )
+Xchar	*buf;
+Xint	len;
+X{
+X	int flags = 0;
+X
+X	if( len && *buf != '[' )
+X	    flags |= HAS_DEV;
+X
+X	while( len-- )
+X	    switch( *buf++ )
+X	{
+X	case ':':	flags |= HAS_COLON; break;
+X	case '[':	flags |= HAS_DIR; break;
+X	}
+X
+X	return flags;
+X}
+X
+X/*
+X * file_build() - build a filename given dir/base/suffix/member
+X */
+X
+Xvoid
+Xfile_build( f, file )
+XFILENAME	*f;
+Xchar		*file;
+X{
+X
+X	int dir_flags = HAS_DEV;
+X	int root_flags = 0;
+X
+X	if( f->f_grist.len )
+X	{
+X	    *file++ = '<';
+X	    memcpy( file, f->f_grist.ptr, f->f_grist.len );
+X	    file += f->f_grist.len;
+X	    *file++ = '>';
+X	}
+X
+X	if( f->f_root.len )
+X	{
+X	    root_flags = file_flags( f->f_root.ptr, f->f_root.len );
+X	    dir_flags = file_flags( f->f_dir.ptr, f->f_dir.len );
+X	}
+X
+X	switch( dir_flags & 0x03 )
+X	{
+X	case HAS_DIR:
+X	case HAS_NOTHING:
+X	    switch( root_flags & 0x03 )
+X	    {
+X	    case HAS_NOTHING:
+X		break;
+X
+X	    case HAS_DEV:
+X		memcpy( file, f->f_root.ptr, f->f_root.len );
+X		file += f->f_root.len;
+X		if( !( root_flags & HAS_COLON ) )
+X		    *file++ = ':';
+X		break;
+X		
+X	    case HAS_DIR:
+X	    case HAS_DEV|HAS_DIR:
+X		memcpy( file, f->f_root.ptr, f->f_root.len );
+X		file += f->f_root.len;
+X		break;
+X	    }
+X
+X	    if( dir_flags & HAS_DIR )
+X	    {
+X		if( root_flags & HAS_DIR )
+X		{
+X		    file[-1] = '.';
+X		    memcpy( file, f->f_dir.ptr + 1, f->f_dir.len - 1 );
+X		    file += f->f_root.len - 1;
+X		}
+X		else
+X		{
+X		    memcpy( file, f->f_dir.ptr, f->f_dir.len );
+X		    file += f->f_dir.len;
+X		}
+X	    }
+X
+X	    break;
+X
+X	case HAS_DEV:
+X	case HAS_DEV|HAS_DIR:
+X	    memcpy( file, f->f_dir.ptr, f->f_dir.len );
+X	    file += f->f_dir.len;
+X	    break;
+X	}
+X
+X	if( f->f_base.len )
+X	{
+X	    memcpy( file, f->f_base.ptr, f->f_base.len );
+X	    file += f->f_base.len;
+X	}
+X
+X	if( f->f_suffix.len )
+X	{
+X	    memcpy( file, f->f_suffix.ptr, f->f_suffix.len );
+X	    file += f->f_suffix.len;
+X	}
+X
+X	if( f->f_member.len )
+X	{
+X	    *file++ = '(';
+X	    memcpy( file, f->f_member.ptr, f->f_member.len );
+X	    file += f->f_member.len;
+X	    *file++ = ')';
+X	}
+X	*file = 0;
+X}
+X
+Xstatic void
+Xfile_cvttime( curtime, unixtime )
+Xunsigned int *curtime;
+Xtime_t *unixtime;
+X{
+X    static const size_t divisor = 10000000;
+X    static unsigned int bastim[2] = { 0x4BEB4000, 0x007C9567 }; /* 1/1/1970 */
+X    int delta[2], remainder;
+X
+X    LIB$SUBX( curtime, bastim, delta );
+X    LIB$EDIV( &divisor, delta, unixtime, &remainder );
+X}
+X
+X# define DEFAULT_FILE_SPECIFICATION "[]*.*;0"
+X
+X# define min( a,b ) ((a)<(b)?(a):(b))
+X
+Xvoid
+Xfile_dirscan( char *dir, void (*func)() )
+X{
+X    size_t SYS$PARSE( );
+X    size_t SYS$SEARCH( );
+X    size_t LIB$SIGNAL( );
+X
+X    struct FAB xfab;
+X    struct NAM xnam;
+X    struct XABDAT xab;
+X    char esa[256];
+X    char filename[256];
+X    char filename2[256];
+X    register status;
+X    FILENAME f;
+X
+X    memset( (char *)&f, '\0', sizeof( f ) );
+X
+X    f.f_dir.ptr = dir;
+X    f.f_dir.len = strlen( dir );
+X
+X	/* get the input file specification
+X	 */
+X    xnam = cc$rms_nam;
+X    xnam.nam$l_esa = esa;
+X    xnam.nam$b_ess = sizeof( esa ) - 1;
+X    xnam.nam$l_rsa = filename;
+X    xnam.nam$b_rss = min( sizeof( filename ) - 1, NAM$C_MAXRSS );
+X
+X    xab = cc$rms_xabdat;                /* initialize extended attributes */
+X    xab.xab$b_cod = XAB$C_DAT;		/* ask for date */
+X    xab.xab$l_nxt = NULL;               /* terminate XAB chain      */
+X
+X    xfab = cc$rms_fab;
+X    xfab.fab$l_dna = DEFAULT_FILE_SPECIFICATION;
+X    xfab.fab$b_dns = sizeof( DEFAULT_FILE_SPECIFICATION ) - 1;
+X    xfab.fab$l_fop = FAB$M_NAM;
+X    xfab.fab$l_fna = dir;			/* address of file name	    */
+X    xfab.fab$b_fns = strlen( dir );		/* length of file name	    */
+X    xfab.fab$l_nam = &xnam;			/* address of NAB block	    */
+X    xfab.fab$l_xab = (char *)&xab;       /* address of XAB block     */
+X
+X
+X    status = SYS$PARSE( &xfab );
+X
+X    if( DEBUG_BINDSCAN )
+X	printf( "scan directory %s\n", dir );
+X
+X    if ( !( status & 1 ) )
+X	return;
+X
+X    while ( (status = SYS$SEARCH( &xfab )) & 1 )
+X    {
+X	char *s;
+X	time_t time;
+X
+X	/* "I think that might work" - eml */
+X
+X	sys$open( &xfab );
+X	sys$close( &xfab );
+X
+X	filename[xnam.nam$b_rsl] = '\0';
+X	for( s = xnam.nam$l_name; *s; s++ )
+X	    if( isupper( *s ) )
+X		*s = tolower( *s );
+X
+X	f.f_base.ptr = xnam.nam$l_name;
+X	f.f_base.len = xnam.nam$b_name;
+X	f.f_suffix.ptr = xnam.nam$l_type;
+X	f.f_suffix.len = xnam.nam$b_type;
+X
+X	file_build( &f, filename2 );
+X
+X	file_cvttime( &xab.xab$q_rdt, &time );
+X
+X	(*func)( filename2, 1 /* time valid */, time );
+X    }
+X
+X    if ( status != RMS$_NMF && status != RMS$_FNF )
+X	LIB$SIGNAL( xfab.fab$l_sts, xfab.fab$l_stv );
+X}    
+X
+Xint
+Xfile_time( filename, time )
+Xchar	*filename;
+Xtime_t	*time;
+X{
+X	/* This should never be called, as all files are */
+X	/* timestampped in file_dirscan() and file_archscan() */
+X	return -1;
+X}
+X
+Xstatic char *VMS_archive = 0;
+Xstatic void (*VMS_func)() = 0;
+Xstatic void *context;
+X
+Xstatic int
+Xfile_archmember( module, rfa )
+Xstruct dsc$descriptor_s *module;
+Xunsigned long *rfa;
+X{
+X    static struct dsc$descriptor_s bufdsc =
+X		  {0, DSC$K_DTYPE_T, DSC$K_CLASS_S, NULL};
+X
+X    struct mhddef *mhd;
+X    char filename[128];
+X    char buf[ MAXPATH ];
+X
+X    int library_date, status;
+X
+X    register int i;
+X    register char *p;
+X
+X    bufdsc.dsc$a_pointer = filename;
+X    bufdsc.dsc$w_length = sizeof( filename );
+X    status = LBR$SET_MODULE( &context, rfa, &bufdsc,
+X			     &bufdsc.dsc$w_length, NULL );
+X    if ( !(status & 1) )
+X	return ( 1 );
+X
+X    mhd = (struct mhddef *)filename;
+X
+X    file_cvttime( &mhd->mhd$l_datim, &library_date );
+X
+X    for ( i = 0, p = module->dsc$a_pointer; i < module->dsc$w_length; i++, p++ )
+X	filename[i] = _tolower( *p );
+X
+X    filename[i] = '\0';
+X
+X    sprintf( buf, "%s(%s.obj)", VMS_archive, filename );
+X
+X    (*VMS_func)( buf, 1 /* time valid */, (time_t)library_date );
+X
+X    return ( 1 );
+X}
+X
+Xvoid
+Xfile_archscan( archive, func )
+Xchar *archive;
+Xvoid (*func)();
+X{
+X    static struct dsc$descriptor_s library =
+X		  {0, DSC$K_DTYPE_T, DSC$K_CLASS_S, NULL};
+X
+X    unsigned long lfunc = LBR$C_READ;
+X    unsigned long typ = LBR$C_TYP_UNK;
+X    unsigned long index = 1;
+X
+X    register status;
+X
+X    VMS_archive = archive;
+X    VMS_func = func;
+X
+X    status = LBR$INI_CONTROL( &context, &lfunc, &typ, NULL );
+X    if ( !( status & 1 ) )
+X	return;
+X
+X    library.dsc$a_pointer = archive;
+X    library.dsc$w_length = strlen( archive );
+X
+X    status = LBR$OPEN( &context, &library, NULL, NULL, NULL, NULL, NULL );
+X    if ( !( status & 1 ) )
+X	return;
+X
+X    (void) LBR$GET_INDEX( &context, &index, file_archmember, NULL );
+X
+X    (void) LBR$CLOSE( &context );
+X}
+X
+X# endif /* VMS */
+X
+SHAR_EOF
+chmod 0444 filevms.c ||
+echo 'restore of filevms.c failed'
+Wc_c="`wc -c < 'filevms.c'`"
+test 8453 -eq "$Wc_c" ||
+	echo 'filevms.c: original size 8453, current size' "$Wc_c"
+fi
+# ============= hash.c ==============
+if test -f 'hash.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping hash.c (File already exists)'
+else
+echo 'x - extracting hash.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'hash.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "hash.h"
+X
+X/* 
+X * hash.c - simple in-memory hashing routines 
+X *
+X * External routines:
+X *
+X *     hashinit() - initialize a hash table, returning a handle
+X *     hashitem() - find a record in the table, and optionally enter a new one
+X *     hashdone() - free a hash table, given its handle
+X *
+X * Internal routines:
+X *
+X *     hashrehash() - resize and rebuild hp->tab, the hash table
+X *
+X * 4/29/93 - ensure ITEM's are aligned
+X */
+X
+Xchar 	*hashsccssid="@(#)hash.c	1.14  ()  6/20/88";
+X
+X/* Header attached to all data items entered into a hash table. */
+X
+Xstruct hashhdr {
+X	struct item *next;
+X	int keyval;			/* for quick comparisons */
+X} ;
+X
+X/* This structure overlays the one handed to hashenter(). */
+X/* It's actual size is given to hashinit(). */
+X
+Xstruct hashdata {
+X	char	*key;
+X	/* rest of user data */
+X} ;
+X
+Xtypedef struct item {
+X	struct hashhdr hdr;
+X	struct hashdata data;
+X} ITEM ;
+X
+X# define MAX_LISTS 32
+X
+Xstruct hash 
+X{
+X	/*
+X	 * the hash table, just an array of item pointers
+X	 */
+X	struct {
+X		int nel;
+X		ITEM **base;
+X	} tab;
+X
+X	int bloat;	/* tab.nel / items.nel */
+X	int inel; 	/* initial number of elements */
+X
+X	/*
+X	 * the array of records, maintained by these routines
+X	 * essentially a microallocator
+X	 */ 
+X	struct {
+X		int more;	/* how many more ITEMs fit in lists[ list ] */
+X		char *next;	/* where to put more ITEMs in lists[ list ] */
+X		int datalen;	/* length of records in this hash table */
+X		int size;	/* sizeof( ITEM ) + aligned datalen */
+X		int nel;	/* total ITEMs held by all lists[] */
+X		int list;	/* index into lists[] */
+X
+X		struct {
+X			int nel;	/* total ITEMs held by this list */
+X			char *base;	/* base of ITEMs array */
+X		} lists[ MAX_LISTS ];
+X	} items;
+X
+X	char *name;	/* just for hashstats() */
+X} ;
+X
+Xstatic hashrehash();
+X
+X/*
+X * hashitem() - find a record in the table, and optionally enter a new one
+X */
+X
+Xint
+Xhashitem( hp, data, enter )
+Xregister struct hash *hp;
+XHASHDATA **data;
+X{
+X	ITEM **base;
+X	register ITEM *i;
+X	char *b = (*data)->key;
+X	int keyval = 0;
+X
+X	if( enter && !hp->items.more )
+X	    hashrehash( hp );
+X
+X	if( !enter && !hp->items.nel )
+X	    return 0;
+X
+X	while( *b )
+X		keyval = ( ( keyval << 7 ) + ( keyval >> 25 ) ) + *b++;
+X	keyval &= 0x7FFFFFFF;
+X
+X	base = hp->tab.base + ( keyval % hp->tab.nel );
+X
+X	for( i = *base; i; i = i->hdr.next )
+X	    if( keyval == i->hdr.keyval && 
+X		!strcmp( i->data.key, (*data)->key ) )
+X	{
+X		*data = &i->data;
+X		return !0;
+X	}
+X
+X	if( enter ) 
+X	{
+X		i = (ITEM *)hp->items.next;
+X		hp->items.next += hp->items.size;
+X		hp->items.more--;
+X		memcpy( (char *)&i->data, (char *)*data, hp->items.datalen );
+X		i->hdr.keyval = keyval;
+X		i->hdr.next = *base;
+X		*base = i;
+X		*data = &i->data;
+X	}
+X
+X	return 0;
+X}
+X
+X/*
+X * hashrehash() - resize and rebuild hp->tab, the hash table
+X */
+X
+Xstatic hashrehash( hp )
+Xregister struct hash *hp;
+X{
+X	int i = ++hp->items.list;
+X
+X	hp->items.more = i ? 2 * hp->items.nel : hp->inel;
+X	hp->items.next = (char *)malloc( hp->items.more * hp->items.size );
+X
+X	hp->items.lists[i].nel = hp->items.more;
+X	hp->items.lists[i].base = hp->items.next;
+X	hp->items.nel += hp->items.more;
+X
+X	if( hp->tab.base )
+X		free( (char *)hp->tab.base );
+X
+X	hp->tab.nel = hp->items.nel * hp->bloat;
+X	hp->tab.base = (ITEM **)malloc( hp->tab.nel * sizeof(ITEM **) );
+X
+X	memset( (char *)hp->tab.base, '\0', hp->tab.nel * sizeof( ITEM * ) );
+X
+X	for( i = 0; i < hp->items.list; i++ )
+X	{
+X		int nel = hp->items.lists[i].nel;
+X		char *next = hp->items.lists[i].base;
+X
+X		for( ; nel--; next += hp->items.size )
+X		{
+X			register ITEM *i = (ITEM *)next;
+X			ITEM **ip = hp->tab.base + i->hdr.keyval % hp->tab.nel;
+X
+X			i->hdr.next = *ip;
+X			*ip = i;
+X		}
+X	}
+X}
+X
+X/* --- */
+X
+X# define ALIGNED(x) ( ( x + sizeof( ITEM ) - 1 ) & ~( sizeof( ITEM ) - 1 ) )
+X
+X/*
+X * hashinit() - initialize a hash table, returning a handle
+X */
+X
+Xstruct hash *
+Xhashinit( datalen, name )
+Xchar *name;
+X{
+X	struct hash *hp = (struct hash *)malloc( sizeof( *hp ) );
+X
+X	hp->bloat = 3;
+X	hp->tab.nel = 0;
+X	hp->tab.base = (ITEM **)0;
+X	hp->items.more = 0;
+X	hp->items.datalen = datalen;
+X	hp->items.size = sizeof( struct hashhdr ) + ALIGNED( datalen );
+X	hp->items.list = -1;
+X	hp->items.nel = 0;
+X	hp->inel = 11;
+X	hp->name = name;
+X
+X	return hp;
+X}
+X
+X/*
+X * hashdone() - free a hash table, given its handle
+X */
+X
+Xvoid
+Xhashdone( hp )
+Xstruct hash *hp;
+X{
+X	int i;
+X
+X	if( !hp )
+X	    return;
+X
+X	if( DEBUG_MEM )
+X	    hashstat( hp );
+X
+X	if( hp->tab.base )
+X		free( (char *)hp->tab.base );
+X	for( i = 0; i <= hp->items.list; i++ )
+X		free( hp->items.lists[i].base );
+X	free( (char *)hp );
+X}
+X
+X/* ---- */
+X
+Xhashstat( hp )
+Xstruct hash *hp;
+X{
+X	ITEM **tab = hp->tab.base;
+X	int nel = hp->tab.nel;
+X	int count = 0;
+X	int sets = 0;
+X	int run = ( tab[ nel - 1 ] != (ITEM *)0 );
+X	int i, here;
+X
+X	for( i = nel; i > 0; i-- )
+X	{
+X		if( here = ( *tab++ != (ITEM *)0 ) )
+X			count++;
+X		if( here && !run )
+X			sets++;
+X		run = here;
+X	}
+X
+X	printf( "%s table: %d+%d+%d (%dK+%dK) items+table+hash, %f density\n",
+X		hp->name, 
+X		count, 
+X		hp->items.nel,
+X		hp->tab.nel,
+X		hp->items.nel * hp->items.size / 1024,
+X		hp->tab.nel * sizeof( ITEM ** ) / 1024,
+X		(float)count / (float)sets );
+X}
+SHAR_EOF
+chmod 0444 hash.c ||
+echo 'restore of hash.c failed'
+Wc_c="`wc -c < 'hash.c'`"
+test 5071 -eq "$Wc_c" ||
+	echo 'hash.c: original size 5071, current size' "$Wc_c"
+fi
+# ============= hash.h ==============
+if test -f 'hash.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping hash.h (File already exists)'
+else
+echo 'x - extracting hash.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'hash.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * hash.h - simple in-memory hashing routines 
+X */
+X
+Xtypedef struct hashdata HASHDATA;
+X
+Xstruct hash *	hashinit();
+Xint		hashitem();
+Xvoid		hashdone();
+X
+X# define	hashenter( hp, data ) !hashitem( hp, data, !0 )
+X# define	hashcheck( hp, data ) hashitem( hp, data, 0 )
+SHAR_EOF
+chmod 0444 hash.h ||
+echo 'restore of hash.h failed'
+Wc_c="`wc -c < 'hash.h'`"
+test 311 -eq "$Wc_c" ||
+	echo 'hash.h: original size 311, current size' "$Wc_c"
+fi
+# ============= headers.c ==============
+if test -f 'headers.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping headers.c (File already exists)'
+else
+echo 'x - extracting headers.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'headers.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "lists.h"
+X# include "parse.h"
+X# include "compile.h"
+X# include "rules.h"
+X# include "variable.h"
+X# include "regexp.h"
+X# include "headers.h"
+X
+X/*
+X * headers.c - handle #includes in source files
+X *
+X * Using regular expressions provided as the variable $(HDRSCAN), 
+X * headers() searches a file for #include files and phonies up a
+X * rule invocation:
+X * 
+X *	$(HDRRULE) <target> : <include files> ;
+X *
+X * External routines:
+X *    headers() - scan a target for include files and call HDRRULE
+X *
+X * Internal routines:
+X *    headers1() - using regexp, scan a file and build include LIST
+X */
+X
+Xstatic LIST *headers1();
+X
+X/*
+X * headers() - scan a target for include files and call HDRRULE
+X */
+X
+X# define MAXINC 10
+X
+Xvoid
+Xheaders( t )
+XTARGET *t;
+X{
+X	LIST	*hdrscan;
+X	LIST	*hdrrule;
+X	LIST	*headlist = 0;
+X	PARSE	p[1];
+X	regexp	*re[ MAXINC ];
+X	int	rec = 0;
+X	char	*fname = t->boundname ? t->boundname : t->name;
+X
+X	if( !( hdrscan = var_get( "HDRSCAN" ) ) || 
+X	    !( hdrrule = var_get( "HDRRULE" ) ) )
+X	        return;
+X
+X	if( DEBUG_HEADER )
+X	    printf( "header scan %s\n", t->name );
+X
+X	/* Compile all regular expressions in HDRSCAN */
+X
+X	while( rec < MAXINC && hdrscan )
+X	{
+X	    re[rec++] = regcomp( hdrscan->string );
+X	    hdrscan = list_next( hdrscan );
+X	}
+X
+X	/* Doctor up call to HDRRULE rule */
+X	/* Call headers1() to get LIST of included files. */
+X
+X	p->llist = list_new( (LIST *)0, t->name );
+X	p->rlist = headers1( headlist, fname, rec, re );
+X	p->string = hdrrule->string;
+X
+X	if( p->rlist )
+X	    compile_rule( p, (LIST *)0, (LIST *)0 );
+X
+X	/* Clean up */
+X
+X	list_free( p->llist );
+X	list_free( p->rlist );
+X
+X	while( rec )
+X	    free( (char *)re[--rec] );
+X}
+X
+X/*
+X * headers1() - using regexp, scan a file and build include LIST
+X */
+X
+Xstatic LIST *
+Xheaders1( l, file, rec, re )
+XLIST	*l;
+Xchar	*file;
+Xint	rec;
+Xregexp	*re[];
+X{
+X    FILE	*f;
+X    char	buf[ 1024 ];
+X    int		i;
+X
+X    if( !( f = fopen( file, "r" ) ) )
+X	return l;
+X
+X    while( fgets( buf, sizeof( buf ), f ) )
+X    {
+X	for( i = 0; i < rec; i++ )
+X	    if( regexec( re[i], buf ) && re[i]->startp[1] )
+X	{
+X	    re[i]->endp[1][0] = '\0';
+X
+X	    if( DEBUG_HEADER )
+X		printf( "header found: %s\n", re[i]->startp[1] );
+X
+X	    l = list_new( l, newstr( re[i]->startp[1] ) );
+X	}
+X    }
+X
+X    fclose( f );
+X
+X    return l;
+X}
+X
+Xvoid
+Xregerror( s )
+Xchar *s;
+X{
+X	printf( "re error %s\n", s );
+X}
+SHAR_EOF
+chmod 0444 headers.c ||
+echo 'restore of headers.c failed'
+Wc_c="`wc -c < 'headers.c'`"
+test 2368 -eq "$Wc_c" ||
+	echo 'headers.c: original size 2368, current size' "$Wc_c"
+fi
+# ============= headers.h ==============
+if test -f 'headers.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping headers.h (File already exists)'
+else
+echo 'x - extracting headers.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'headers.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * headers.h - handle #includes in source files
+X */
+X
+Xvoid headers();
+SHAR_EOF
+chmod 0444 headers.h ||
+echo 'restore of headers.h failed'
+Wc_c="`wc -c < 'headers.h'`"
+test 119 -eq "$Wc_c" ||
+	echo 'headers.h: original size 119, current size' "$Wc_c"
+fi
+true || echo 'restore of lists.c failed'
+echo End of part 2, continue with part 3
+exit 0

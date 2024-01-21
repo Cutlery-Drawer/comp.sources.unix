@@ -1,0 +1,1157 @@
+Newsgroups: comp.sources.unix
+From: panos@cs.colorado.edu (Panos Tsirigotis)
+Subject: v26i275: xinetd-2.1.1 - inetd replacement with access control and logging, Part31/31
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: panos@cs.colorado.edu (Panos Tsirigotis)
+Posting-Number: Volume 26, Issue 275
+Archive-Name: xinetd-2.1.1/part31
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 31 (of 31)."
+# Contents:  libs/src/sio/siosup.c
+# Wrapped by panos@mystique on Mon Jun 21 14:51:29 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'libs/src/sio/siosup.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libs/src/sio/siosup.c'\"
+else
+echo shar: Extracting \"'libs/src/sio/siosup.c'\" \(24088 characters\)
+sed "s/^X//" >'libs/src/sio/siosup.c' <<'END_OF_FILE'
+X/*
+X * (c) Copyright 1992, 1993 by Panagiotis Tsirigotis
+X * All rights reserved.  The file named COPYRIGHT specifies the terms 
+X * and conditions for redistribution.
+X */
+X
+Xstatic char RCSid[] = "$Id: siosup.c,v 8.4 1993/03/17 07:35:24 panos Exp $" ;
+X
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <fcntl.h>
+X
+X#include "impl.h"
+X#include "sio.h"
+X
+X#ifdef EVENTS
+X#include "events.h"
+X#endif
+X
+Xchar *malloc() ;
+Xchar *realloc() ;
+X
+X
+Xstatic __sio_descriptor_t static_descriptor_array[ N_SIO_DESCRIPTORS ] ;
+Xstatic int n_descriptors = N_SIO_DESCRIPTORS ;
+X__sio_descriptor_t *__sio_descriptors = static_descriptor_array ;
+X
+X#ifdef EVENTS
+Xstatic events_s static___sio_events[ N_SIO_DESCRIPTORS ] ;
+Xevents_s *__sio_events = static___sio_events ;
+X#endif
+X
+X
+X/*
+X * Code for finalization
+X */
+X#ifdef HAS_FINALIZATION_FUNCTION
+Xstatic int finalizer_installed ;
+X
+XSIO_DEFINE_FIN( sio_cleanup )
+X{
+X   (void) Sflush( SIO_FLUSH_ALL ) ;
+X}
+X#endif /* HAS_FINALIZATION_FUNCTION */
+X
+X
+X
+X#ifdef HAS_MMAP
+X
+X#define CHAR_NULL				((char *)0)
+X
+X/*
+X * PAGES_MAPPED gives the size of each map unit in pages
+X */
+X#define PAGES_MAPPED				2
+X
+Xstatic size_t map_unit_size = 0 ;			/* bytes */
+Xstatic size_t page_size = 0 ;					/* bytes */
+X
+Xstatic mapd_s static_mapd_array[ N_SIO_DESCRIPTORS ] ;
+Xstatic mapd_s *mmap_descriptors = static_mapd_array ;
+X
+X#define MDP( fd )				( mmap_descriptors + (fd) )
+X
+X
+X/*
+X * NOTES ON MEMORY MAPPING:
+X *
+X * 	1. Memory mapping works only for file descriptors opened for input
+X *		2. Mapping an object to a part of the address space where another
+X *			object is mapped will cause the old mapping to disappear (i.e. mmap
+X *			will not fail)
+X *
+X * Memory mapping interface:
+X *		SIO_MMAP : maps a file into a portion of the address space.
+X *		SIO_MUNMAP: unmap a portion of the address space
+X *		SIO_MNEED: indicate to the OS that we will need a portion of
+X *						 our address space.
+X *
+X * The map_unit_size variable defines how much of the file is mapped at
+X * a time. It is a multiple of the operating system page size. It is
+X * not less than SIO_BUFFER_SIZE unless SIO_BUFFER_SIZE is not a
+X * multiple of the page size (so the SIO_BUFFER_SIZE overrides
+X * PAGES_MAPPED).
+X *
+X * NOTE: All memory mapping code is in this file only
+X */
+X
+X
+X/*
+X * Macros used by the memory mapping code
+X */
+X#define FIRST_TIME( dp )					( dp->buf == NULL )
+X#define FATAL_ERROR( msg )					perror( msg ), exit( 1 )
+X
+X/*
+X * Functions to support memory mapping:
+X *
+X *			try_memory_mapping
+X *			buffer_setup
+X *			__sio_switch
+X *			initial_map
+X *			map_unit
+X */
+X
+X/*
+X * try_memory_mapping attempts to setup the specified descriptor
+X * for memory mapping. 
+X * It returns FAILURE if it fails and SUCCESS if it is successful.
+X * If HAS_MMAP is not defined, the function is defined to be FAILURE.
+X *
+X * Sets fields:
+X *		memory_mapped:			 TRUE or FALSE
+X *		
+X * Also sets the following fields if memory_mapped is TRUE:
+X *    file_offset, file_size, buffer_size
+X *
+X */
+XPRIVATE status_e try_memory_mapping( fd, idp, stp )
+X	int fd ;
+X	register __sio_id_t *idp ;
+X	struct stat *stp ;
+X{
+X	int access ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_TRY_MEMORY_MAPPING ) ;
+X#endif
+X
+X	/*
+X	 * Do not try memory mapping if:
+X	 *		1) The file is not a regular file
+X	 *		2) The file is a regular file but has zero-length
+X	 *		3) The file pointer is not positioned at the beginning of the file
+X	 *		4) The fcntl to obtain the file descriptor flags fails
+X	 *		5) The access mode is not O_RDONLY or O_RDWR
+X	 *
+X	 * The operations are done in this order to avoid the system calls
+X	 * if possible.
+X	 */
+X	if ( ( ( stp->st_mode & S_IFMT ) != S_IFREG ) ||
+X		  ( stp->st_size == 0 ) ||
+X		  ( lseek( fd, (long)0, 1 ) != 0 ) ||
+X		  ( ( access = fcntl( fd, F_GETFL, 0 ) ) == -1 ) ||
+X		  ( ( access &= 0x3 ) != O_RDONLY && access != O_RDWR ) )
+X	{
+X		idp->memory_mapped = FALSE ;
+X		return( FAILURE ) ;
+X	}
+X
+X	/*
+X	 * Determine page_size and map_unit_size.
+X	 * Note that the code works even if PAGES_MAPPED is 0.
+X	 */
+X	if ( page_size == 0 )
+X	{
+X		page_size = getpagesize() ;
+X		map_unit_size = page_size * PAGES_MAPPED ;
+X		if ( map_unit_size < SIO_BUFFER_SIZE )
+X			if ( map_unit_size > 0 && SIO_BUFFER_SIZE % map_unit_size == 0 )
+X				map_unit_size = SIO_BUFFER_SIZE ;
+X			else
+X				map_unit_size = page_size ;
+X	}
+X	
+X	MDP(fd)->file_offset = 0 ;
+X	MDP(fd)->file_size = stp->st_size ;
+X	idp->buffer_size = map_unit_size ;
+X	idp->buf = CHAR_NULL ;
+X	idp->memory_mapped = TRUE ;
+X
+X	return( SUCCESS ) ;
+X}
+X
+X
+X/*
+X * Copy the current_unit to the primary buffer
+X *
+X * Sets fields: start, end, nextb
+X * Also sets the file pointer
+X */
+XPRIVATE void buffer_setup( idp, fd, mu_cur, mu_next )
+X	__sio_id_t *idp ;
+X	int fd ;
+X	struct map_unit *mu_cur ;
+X	struct map_unit *mu_next ;
+X{
+X	off_t new_offset ;
+X
+X	sio_memcopy( mu_cur->addr, idp->buf, mu_cur->valid_bytes ) ;
+X	idp->start = idp->buf ;
+X	idp->end = idp->buf + mu_cur->valid_bytes ;
+X	idp->nextb = idp->buf + ( idp->nextb - mu_cur->addr ) ;
+X
+X	if ( mu_next->addr != CHAR_NULL )
+X		new_offset = MDP(fd)->file_offset - mu_next->valid_bytes ;
+X	else
+X		new_offset = MDP(fd)->file_offset ;
+X	(void) lseek( fd, new_offset, 0 ) ;
+X}
+X
+X
+X/*
+X * Switch from memory mapping to buffered I/O
+X * If any mapping has occured, then the current unit is
+X * copied into the buffer that is allocated.
+X * Any data in the next unit is ignored.
+X * We rely on idp->buf to identify the current unit (so it
+X * better be equal to the address of one of the units).
+X *
+X * Sets fields:
+X *			start, end, nextb
+X */
+Xstatus_e __sio_switch( idp, fd )
+X	register __sio_id_t *idp ;
+X	int fd ;
+X{
+X	register mapd_s *mdp = MDP( fd ) ;
+X	struct map_unit *mu_cur, *mu_next ;
+X	unsigned buffer_size = idp->buffer_size ;
+X	char *buf_addr = idp->buf ;
+X	int first_time = FIRST_TIME( idp ) ;
+X	void buffer_setup() ;
+X	status_e setup_read_buffer() ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_SIO_SWITCH ) ;
+X#endif
+X
+X	/*
+X	 * Initialize stream for buffering
+X	 */
+X	if ( setup_read_buffer( idp, buffer_size ) == FAILURE )
+X		return( FAILURE ) ;
+X
+X	if ( ! first_time )
+X	{
+X		/*
+X		 * Find current, next unit
+X		 */
+X		if ( buf_addr == mdp->first_unit.addr )
+X		{
+X			mu_cur = &mdp->first_unit ;
+X			mu_next = &mdp->second_unit ;
+X		}
+X		else
+X		{
+X			mu_cur = &mdp->second_unit ;
+X			mu_next = &mdp->first_unit ;
+X		}
+X
+X		buffer_setup( idp, fd, mu_cur, mu_next ) ;
+X		/*
+X		 * Destroy all mappings
+X		 */
+X		(void) SIO_MUNMAP( mu_cur->addr, mu_cur->mapped_bytes ) ;
+X		if ( mu_next->addr != NULL )
+X			(void) SIO_MUNMAP( mu_next->addr, mu_next->mapped_bytes ) ;
+X	}
+X	else
+X		idp->start = idp->end = idp->nextb = idp->buf ;
+X
+X	idp->memory_mapped = FALSE ;
+X	return( SUCCESS ) ;
+X}
+X
+X
+X/*
+X * initial_map does the first memory map on the file descriptor.
+X * It attempts to map both units.
+X * The mapping always starts at file offset 0.
+X *
+X * SETS FIELDS:
+X *			first_unit.*, second_unit.*
+X *			file_offset
+X *
+X * Returns: 
+X *			number of bytes mapped in first_unit
+X *    or
+X *			0 to indicate that mmap failed.
+X */
+XPRIVATE int initial_map( mdp, fd )
+X	register mapd_s *mdp ;
+X	int fd ;
+X{
+X	register caddr_t addr ;
+X	register size_t requested_length = 2 * map_unit_size ;
+X	register size_t mapped_length = MIN( mdp->file_size, requested_length ) ;
+X	size_t bytes_left ;
+X	register size_t bytes_in_unit ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_INITIAL_MAP ) ;
+X#endif
+X
+X	addr = SIO_MMAP( CHAR_NULL, mapped_length, fd, 0 ) ;
+X	if ( (int) addr == -1 )
+X		return( 0 ) ;
+X
+X	SIO_MNEED( addr, mapped_length ) ;
+X
+X	/*
+X	 * Map as much as possible in the first unit
+X	 */
+X	bytes_in_unit = MIN( mapped_length, map_unit_size ) ;
+X	mdp->first_unit.addr 			= addr ;
+X	mdp->first_unit.mapped_bytes 	= bytes_in_unit ;
+X	mdp->first_unit.valid_bytes 	= bytes_in_unit ;
+X
+X	/*
+X	 * If there is more, map it in the second unit.
+X	 */
+X	bytes_left = mapped_length - bytes_in_unit ;
+X	if ( bytes_left > 0 )
+X	{
+X		mdp->second_unit.addr 			= addr + bytes_in_unit ;
+X		mdp->second_unit.mapped_bytes = bytes_left ;
+X		mdp->second_unit.valid_bytes 	= bytes_left ;
+X	}
+X	else
+X		mdp->second_unit.addr 			= CHAR_NULL ;
+X
+X	mdp->file_offset = mapped_length ;
+X
+X	return( mdp->first_unit.valid_bytes ) ;
+X}
+X
+X
+X/*
+X * ALGORITHM:
+X *
+X *		if ( there are more bytes in the file )
+X *		{
+X *			map them at the given unit
+X *			update offset
+X *			issue SIO_MNEED()
+X *		}
+X *		else
+X *			unmap the unit
+X */
+XPRIVATE status_e map_unit( mdp, fd, mup )
+X	register mapd_s *mdp ;
+X	int fd ;
+X	register struct map_unit *mup ;
+X{
+X	register size_t bytes_left = mdp->file_size - mdp->file_offset ;
+X	register size_t bytes_to_map = MIN( bytes_left, map_unit_size ) ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_MAP_UNIT ) ;
+X#endif
+X
+X	if ( bytes_to_map > 0 )
+X	{
+X		if ( (int) SIO_MMAP( mup->addr, bytes_to_map,
+X															fd, mdp->file_offset ) == -1 )
+X			return( FAILURE ) ;			/* XXX: need to do more ? */
+X		
+X		mup->valid_bytes = bytes_to_map ;
+X		ASSERT( mup->valid_bytes <= mup->mapped_bytes ) ;
+X		mdp->file_offset += bytes_to_map ;
+X		SIO_MNEED( mup->addr, mup->valid_bytes ) ;
+X	}
+X	else
+X	{
+X		(void) SIO_MUNMAP( mup->addr, mup->mapped_bytes ) ;
+X		mup->addr = CHAR_NULL ;
+X	}
+X	return( SUCCESS ) ;
+X}
+X
+X#else
+X
+X#define try_memory_mapping( x, y, z )				FAILURE
+X
+X#endif /* HAS_MMAP */
+X
+X
+XPRIVATE status_e setup_read_buffer( idp, buf_size )
+X	register __sio_id_t *idp ;
+X	unsigned buf_size ;
+X{
+X	register char *buf ;
+X
+X	/*
+X	 * First allocate space for 2 buffers: primary and auxiliary
+X	 */
+X	buf = malloc( buf_size * 2 ) ;
+X	if ( buf == NULL )
+X		return( FAILURE ) ;
+X
+X	/*
+X	 * The descriptor buf field should point to the start of the main buffer
+X	 */
+X	idp->buf = buf + buf_size ;
+X	idp->buffer_size = buf_size ;
+X	return( SUCCESS ) ;
+X}
+X
+X
+XPRIVATE status_e init_input_stream( idp, fd, stp )
+X	register __sio_id_t *idp ;
+X	int fd ;
+X	struct stat *stp ;
+X{
+X#ifdef EVENTS
+X	EVENT( fd, EV_INIT_INPUT_STREAM ) ;
+X#endif
+X
+X	/*
+X	 * First initialize the fields relevant to buffering: buf, buffer_size
+X	 */
+X	if ( try_memory_mapping( fd, idp, stp ) == FAILURE )
+X	{
+X		/*
+X		 * Try to use normal buffering
+X		 */
+X		unsigned buf_size = (unsigned)
+X							( stp->st_blksize ? stp->st_blksize : SIO_BUFFER_SIZE ) ;
+X		
+X		if ( setup_read_buffer( idp, buf_size ) == FAILURE )
+X			return( FAILURE ) ;
+X	}
+X
+X 	/*
+X	 * Initialize remaining descriptor fields
+X	 */
+X	idp->max_line_length = 2 * idp->buffer_size - 1 ;
+X	idp->start = idp->end = idp->nextb = idp->buf ;
+X	idp->tied_fd = SIO_NO_TIED_FD ;
+X
+X	return( SUCCESS ) ;
+X}
+X
+X
+XPRIVATE status_e init_output_stream( odp, fd, stp )
+X	register __sio_od_t *odp ;
+X	int fd ;
+X	struct stat *stp ;
+X{
+X	register unsigned buf_size ;
+X	register char *buf ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_INIT_OUTPUT_STREAM ) ;
+X#endif
+X
+X	buf_size = (unsigned)
+X						( stp->st_blksize ? stp->st_blksize : SIO_BUFFER_SIZE ) ;
+X	buf = malloc( buf_size ) ;
+X	if ( buf == NULL )
+X		return( FAILURE ) ;
+X	
+X	/*
+X	 * Initialize buffering fields
+X	 */
+X	odp->buf = buf ;
+X	odp->buffer_size = buf_size ;
+X	odp->buf_end = odp->buf + buf_size ;
+X
+X	/*
+X	 * Initialize remaining fields
+X	 */
+X	odp->start = odp->nextb = odp->buf ;
+X	if ( isatty( fd ) )
+X		odp->buftype = SIO_LINEBUF ;
+X
+X	if ( fd == 2 )
+X		odp->buftype = SIO_NOBUF ;
+X
+X	return( SUCCESS ) ;
+X}
+X
+X
+X#ifndef HAS_ISATTY
+X
+X#ifdef HAS_SYSVTTY
+X
+X#include <termio.h>
+X
+XPRIVATE int isatty( fd )
+X	int fd ;
+X{
+X	struct termio t ;
+X
+X	if ( ioctl( fd, TCGETA, &t ) == -1 && errno == ENOTTY )
+X		return( FALSE ) ;
+X	else
+X		return( TRUE ) ;
+X}
+X#endif	/* HAS_SYSVTTY */
+X
+X#ifdef HAS_BSDTTY
+X
+X#include <sgtty.h>
+X
+XPRIVATE int isatty( fd )
+X	int fd ;
+X{
+X	struct sgttyb s ;
+X
+X	if ( ioctl( fd, TIOCGETP, &s ) == -1 && errno == ENOTTY )
+X		return( FALSE ) ;
+X	else
+X		return( TRUE ) ;
+X}
+X#endif	/* HAS_BSDTTY */
+X
+X#endif	/* ! HAS_ISATTY */
+X
+X
+X/*
+X * Initialize stream I/O for a file descriptor.
+X *
+X * Arguments:
+X *		fd:				file descriptor
+X *		dp:				descriptor pointer
+X *		stream_type: 	either __SIO_INPUT_STREAM or __SIO_OUTPUT_STREAM
+X *
+X * Returns
+X *		0 			if successful
+X *	  SIO_ERR	if the file descriptor is not valid (sets errno)
+X *   exits		if stream_type is not __SIO_INPUT_STREAM or __SIO_OUTPUT_STREAM
+X */
+Xint __sio_init( dp, fd, stream_type )
+X	register __sio_descriptor_t *dp ;
+X	int fd ;
+X	enum __sio_stream stream_type ;
+X{
+X	struct stat st ;
+X	void terminate() ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_SIO_INIT ) ;
+X#endif
+X
+X	if ( fstat( fd, &st ) == -1 )
+X		return( SIO_ERR ) ;
+X
+X	switch ( stream_type )
+X	{
+X		case __SIO_INPUT_STREAM:
+X			if ( init_input_stream( IDP( dp ), fd, &st ) == FAILURE )
+X				return( SIO_ERR ) ;
+X			break ;
+X
+X		case __SIO_OUTPUT_STREAM:
+X			if ( init_output_stream( ODP( dp ), fd, &st ) == FAILURE )
+X				return( SIO_ERR ) ;
+X			break ;
+X			
+X		default:
+X			terminate( "SIO __sio_init: bad stream type (internal error).\n" ) ;
+X			/* NOTREACHED */
+X	}
+X	dp->stream_type = stream_type ;
+X	dp->initialized = TRUE ;
+X
+X#ifdef HAS_FINALIZATION_FUNCTION
+X	if ( ! finalizer_installed )
+X	{
+X		if ( ! SIO_FINALIZE( sio_cleanup ) )
+X		{
+X			char *s = "SIO __sio_init: finalizer installation failed\n" ;
+X
+X			(void) write( 2, s, strlen( s ) ) ;
+X		}
+X		else
+X			finalizer_installed = TRUE ;
+X	}
+X#endif /* HAS_FINALIZATION_FUNCTION */
+X
+X	return( 0 ) ;
+X}
+X
+X
+X/*
+X * __sio_writef writes the data in the buffer to the file descriptor.
+X *
+X * It tries to write as much data as possible until either all data
+X * are written or an error occurs. EINTR is the only error that is
+X * ignored.
+X * In case an error occurs but some data were written, that number
+X * is returned instead of SIO_ERR.
+X *
+X * Fields modified:
+X *		When successful: start, nextb
+X *		When not successful: start
+X *
+X * Return value:
+X *		Number of bytes written
+X *		SIO_ERR, if write(2) fails and no data were written
+X */ 
+Xint __sio_writef( odp, fd )
+X	register __sio_od_t *odp ;
+X	int fd ;
+X{
+X	register int b_in_buffer ;
+X	register int cc_total = 0 ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_SIO_WRITEF ) ;
+X#endif
+X
+X	/*
+X	 * Make sure we don't exceed the buffer limits
+X	 *	Maybe we should log this ?			XXX
+X	 */
+X	if ( odp->nextb > odp->buf_end )
+X		odp->nextb = odp->buf_end ;
+X
+X	b_in_buffer = odp->nextb - odp->start ;
+X
+X	if ( b_in_buffer == 0 )
+X		return( 0 ) ;
+X	
+X	for ( ;; )
+X	{
+X		register int cc ;
+X
+X		cc = write( fd, odp->start, b_in_buffer ) ;
+X		if ( cc == b_in_buffer )
+X		{
+X			odp->start = odp->nextb = odp->buf ;
+X			cc_total += cc ;
+X			break ;
+X		}
+X		else if ( cc == -1 )
+X		{
+X			if ( errno == EINTR )
+X				continue ;
+X			else
+X				/*
+X				 * If some bytes were written, return that number, otherwise
+X				 * return SIO_ERR
+X				 */
+X				return( ( cc_total != 0 ) ? cc_total : SIO_ERR ) ;
+X		}
+X		else			/* some bytes were written */
+X		{
+X			odp->start += cc ;			/* advance start of buffer */
+X			b_in_buffer -= cc ;			/* decrease number bytes left in buffer */
+X			cc_total += cc ;				/* count the bytes that were written */
+X		}
+X	}
+X	return( cc_total ) ;
+X}
+X
+X
+X/*
+X * __sio_readf reads data from the file descriptor into the buffer.
+X * Unlike __sio_writef it does NOT try to read as much data as will fit
+X * in the buffer. It ignores EINTR.
+X *
+X * Returns: # of bytes read or SIO_ERR
+X *
+X * Fields set:
+X * 		If it does not return SIO_ERR, it sets start, nextb, end
+X *			If it returns SIO_ERR, it does not change anything
+X */
+Xint __sio_readf( idp, fd )
+X	register __sio_id_t *idp ;
+X	int fd ;
+X{
+X	register int cc ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_SIO_READF ) ;
+X#endif
+X
+X	/*
+X	 * First check for a tied fd and flush the stream if necessary
+X	 *
+X	 * 		XXX	the return value of __sio_writef is not checked.
+X	 *					Is that right ?
+X	 */
+X	if ( idp->tied_fd != SIO_NO_TIED_FD )
+X		(void) __sio_writef( &__SIO_OD( idp->tied_fd ), idp->tied_fd ) ;
+X
+X#ifdef HAS_MMAP
+X	if ( idp->memory_mapped )
+X	{
+X		register mapd_s *mdp = MDP( fd ) ;
+X
+X		/*
+X		 * The functions initial_map and map_unit may fail.
+X		 * In either case, we switch to buffered I/O.
+X		 * If initial_map fails, we have read no data, so we
+X		 * should perform a read(2).
+X		 * If map_unit fails (for the next unit), we still have
+X		 * the data in the current unit, so we can return.
+X		 */
+X		if ( FIRST_TIME( idp ) )
+X		{
+X			cc = initial_map( mdp, fd ) ;
+X			if ( cc > 0 )
+X				idp->buf = mdp->first_unit.addr ;
+X			else
+X			{
+X				if ( __sio_switch( idp, fd ) == FAILURE )
+X					return( SIO_ERR ) ;
+X				cc = -1 ;
+X			}
+X		}
+X		else
+X		{
+X			register struct map_unit *mu_cur, *mu_next ;
+X
+X			if ( idp->buf == mdp->first_unit.addr )
+X			{
+X				mu_cur = &mdp->first_unit ;
+X				mu_next = &mdp->second_unit ;
+X			}
+X			else
+X			{
+X				mu_cur = &mdp->second_unit ;
+X				mu_next = &mdp->first_unit ;
+X			}
+X
+X			if ( mu_next->addr != NULL )
+X			{
+X				idp->buf = mu_next->addr ;
+X				cc = mu_next->valid_bytes ;
+X				/*
+X				 * XXX:  Here we may return SIO_ERR even though there
+X				 *		   are data in the current unit because the switch
+X				 *		   fails (possibly because malloc failed).
+X				 */
+X				if ( map_unit( mdp, fd, mu_cur ) == FAILURE &&
+X										__sio_switch( idp, fd ) == FAILURE )
+X					return( SIO_ERR ) ;
+X			}
+X			else
+X				cc = 0 ;
+X		}
+X		if ( cc >= 0 )
+X		{
+X			idp->end = idp->buf + cc ;
+X			idp->start = idp->nextb = idp->buf ;
+X			return( cc ) ;
+X		}
+X	}
+X#endif /* HAS_MMAP */
+X
+X	for ( ;; )
+X	{
+X		cc = read( fd, idp->buf, (int) idp->buffer_size ) ;
+X		if ( cc == -1 )
+X			if ( errno == EINTR )
+X				continue ;
+X			else
+X				return( SIO_ERR ) ;
+X		else
+X			break ;
+X	}
+X
+X	idp->end = idp->buf + cc ;
+X	idp->start = idp->nextb = idp->buf ;
+X	return( cc ) ;
+X}
+X
+X
+X/*
+X * __sio_extend_buffer is used by Srdline to extend the buffer
+X * If successful, it returns the number of bytes that have been read.
+X * If it fails (because of end-of-file or I/O error), it returns 0 or -1.
+X *
+X * Fields modified:
+X * 	idp->start points to the start of the buffer area (which is in the
+X * 	auxiliary buffer)
+X *		Also, if successful, idp->nextb is set to idp->buf, idp->end is modified.
+X */
+Xint __sio_extend_buffer( idp, fd, b_left )
+X	register __sio_id_t *idp ;
+X	int fd ;
+X	register int b_left ;
+X{
+X	register int b_read ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_SIO_EXTEND_BUFFER ) ;
+X#endif
+X
+X	/*
+X	 * copy to auxiliary buffer
+X	 */
+X	if ( b_left )
+X		sio_memcopy( idp->nextb, idp->buf - b_left, b_left ) ;
+X	b_read = __sio_readf( idp, fd ) ;
+X	idp->start = idp->buf - b_left ;
+X	return( b_read ) ;
+X}
+X
+X
+X/*
+X * __sio_more tries to read more data from the given file descriptor iff
+X * there is free space in the buffer.
+X * __sio_more is used only by Srdline and only AFTER __sio_extend_buffer
+X * has been called. This implies that 
+X *		a) this is not a memory mapped file
+X *		b) __sio_readf has been called (so we don't need to check for tied fd's
+X *
+X * Fields modified (only if successful):
+X *			idp->end
+X *
+X * Return value: the number of bytes read.
+X */
+Xint __sio_more( idp, fd )
+X	register __sio_id_t *idp ;
+X	int fd ;
+X{
+X	register int b_left = &idp->buf[ idp->buffer_size ] - idp->end ;
+X	register int cc ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_SIO_MORE ) ;
+X#endif
+X
+X	if ( b_left <= 0 )
+X		return( 0 ) ;
+X	
+X	for ( ;; )
+X	{
+X		cc = read( fd, idp->end, b_left ) ;
+X		if ( cc >= 0 )
+X		{
+X			idp->end += cc ;
+X			return( cc ) ;
+X		}
+X		else
+X			if ( errno == EINTR )
+X				continue ;
+X			else
+X				return( SIO_ERR ) ;
+X	}
+X}
+X
+X
+X/*
+X * Finalize a buffer by unmapping the file or freeing the malloc'ed memory
+X */
+Xint Sdone( fd )
+X	int fd ;
+X{
+X	register __sio_descriptor_t *dp = &__sio_descriptors[ fd ] ;
+X
+X#ifdef EVENTS
+X	EVENT( fd, EV_SDONE ) ;
+X#endif
+X
+X	if ( ! DESCRIPTOR_INITIALIZED( dp ) )
+X	{
+X		errno = EBADF ;
+X		return( SIO_ERR ) ;
+X	}
+X
+X	switch ( dp->stream_type )
+X	{
+X		case __SIO_INPUT_STREAM:
+X			{
+X				register __sio_id_t *idp = IDP( dp ) ;
+X
+X#ifdef HAS_MMAP
+X				if ( idp->memory_mapped )
+X				{
+X					register mapd_s *mdp = MDP( fd ) ;
+X
+X					if ( mdp->first_unit.addr != CHAR_NULL )
+X						(void) SIO_MUNMAP( mdp->first_unit.addr,
+X														mdp->first_unit.mapped_bytes ) ;
+X					if ( mdp->second_unit.addr != CHAR_NULL )
+X						(void) SIO_MUNMAP( mdp->second_unit.addr,
+X														mdp->second_unit.mapped_bytes ) ;
+X					idp->memory_mapped = FALSE ;
+X				}
+X				else
+X#endif	/* HAS_MMAP */
+X					free( idp->buf - idp->buffer_size ) ;
+X					idp->nextb = idp->end = NULL ;
+X			}
+X			break ;
+X		
+X		case __SIO_OUTPUT_STREAM:
+X			{
+X				register __sio_od_t *odp = ODP( dp ) ;
+X
+X				if ( Sflush( fd ) == SIO_ERR )
+X					return( SIO_ERR ) ;
+X				free( odp->buf ) ;
+X				odp->nextb = odp->buf_end = NULL ;
+X			}
+X			break ;
+X		
+X		default:
+X			terminate( "SIO Sdone: bad stream type\n" ) ;
+X	}
+X
+X	dp->initialized = FALSE ;
+X	return( 0 ) ;
+X}
+X
+X
+XPRIVATE char *expand( area, old_size, new_size, is_static )
+X	char *area ;
+X	unsigned old_size, new_size ;
+X	int is_static ;
+X{
+X	char *new_area ;
+X
+X	if ( is_static )
+X	{
+X		if ( ( new_area = malloc( new_size ) ) == NULL )
+X			return( NULL ) ;
+X		sio_memcopy( area, new_area, old_size ) ;
+X	}
+X	else
+X		if ( ( new_area = realloc( area, new_size ) ) == NULL )
+X			return( NULL ) ;
+X	return( new_area ) ;
+X}
+X
+X
+X#include <sys/time.h>
+X#include <sys/resource.h>
+X
+XPRIVATE int get_fd_limit()
+X{
+X#ifdef RLIMIT_NOFILE
+X
+X	struct rlimit rl ;
+X
+X	(void) getrlimit( RLIMIT_NOFILE, &rl ) ;
+X	return( rl.rlim_cur ) ;
+X
+X#else
+X
+X	return( N_SIO_DESCRIPTORS ) ;
+X
+X#endif
+X}
+X
+X/*
+X * Expand the descriptor array (and if we use memory mapping the
+X * memory mapping descriptors). We first expand the memory mapping
+X * descriptors.
+X * There is no problem if the expansion of the SIO descriptors fails
+X * (i.e. there is no need to undo anything).
+X */
+Xint Smorefds()
+X{
+X	char *p ;
+X	int is_static ;
+X	unsigned new_size, old_size ;
+X	int n_fds = get_fd_limit() ;
+X
+X	if ( n_fds <= n_descriptors )
+X		return( 0 ) ;
+X
+X#ifdef EVENTS
+X	old_size = n_descriptors * sizeof( events_s ) ;
+X	new_size = n_fds * sizeof( events_s ) ;
+X	is_static = ( __sio_events == static___sio_events ) ;
+X	p = expand( (char *)__sio_events, old_size, new_size, is_static ) ;
+X	if ( p == NULL )
+X		return( SIO_ERR ) ;
+X	__sio_events = (events_s *) p ;
+X
+X	/*
+X	 * Clear the codes field of the extra events structs.
+X	 * We have to do this because a non-null codes field implies that
+X	 * events recording is on for that fd
+X	 */
+X	{
+X		int i ;
+X
+X		for ( i = n_descriptors ; i < n_fds ; i++ )
+X			__sio_events[i].codes = NULL ;
+X	}
+X#endif	/* EVENTS */
+X
+X#ifdef HAS_MMAP
+X	old_size = n_descriptors * sizeof( mapd_s ) ;
+X	new_size = n_fds * sizeof( mapd_s ) ;
+X	is_static = ( mmap_descriptors == static_mapd_array ) ;
+X	p = expand( (char *)mmap_descriptors, old_size, new_size, is_static ) ;
+X	if ( p == NULL )
+X		return( SIO_ERR ) ;
+X	mmap_descriptors = (mapd_s *) p ;
+X#endif	/* HAS_MMAP */
+X	
+X	old_size = n_descriptors * sizeof( __sio_descriptor_t ) ;
+X	new_size = n_fds * sizeof( __sio_descriptor_t ) ;
+X	is_static =  ( __sio_descriptors == static_descriptor_array ) ;
+X	p = expand( (char *)__sio_descriptors, old_size, new_size, is_static ) ;
+X	if ( p == NULL )
+X		return( SIO_ERR ) ;
+X	__sio_descriptors = (__sio_descriptor_t *) p ;
+X
+X	n_descriptors = n_fds ;
+X	return( 0 ) ;
+X}
+X
+X
+X#ifdef EVENTS
+X
+X/*
+X * Enable recording of events for the specified file descriptor
+X */
+Xint __sio_enable_events( fd )
+X	int fd ;
+X{
+X	char *p = malloc( EVENT_ENTRIES * sizeof( short ) ) ;
+X
+X	if ( p == NULL )
+X		return( SIO_ERR ) ;
+X
+X	__sio_events[ fd ].codes = (short *) p ;
+X	return( 0 ) ;
+X}
+X
+X
+X/*
+X * Disable recording of events for the specified file descriptor
+X */
+Xvoid __sio_disable_events( fd )
+X	int fd ;
+X{
+X	if ( __sio_events[ fd ].codes != NULL )
+X	{
+X		free( (char *) __sio_events[ fd ].codes ) ;
+X		__sio_events[ fd ].codes = NULL ;
+X	}
+X}
+X
+X
+X/*
+X * Move stored events to buf
+X */
+Xint __sio_get_events( fd, buf, size )
+X	int fd ;
+X	char *buf ;
+X	int size ;
+X{
+X	events_s *evp = &__sio_events[ fd ] ;
+X	int bufentries ;
+X	int range1, range2 ;
+X	int diff ;
+X	char *p ;
+X	int cc ;
+X	int cc_total ;
+X	int move_entries ;
+X
+X	if ( evp->codes == NULL )
+X		return( 0 ) ;
+X	
+X	diff = evp->next - evp->start ;
+X	if ( diff == 0 )
+X		return( 0 ) ;
+X
+X	if ( diff > 0 )
+X	{
+X		range1 = diff ;
+X		range2 = 0 ;
+X	}
+X	else
+X	{
+X		range1 = EVENT_ENTRIES - evp->start ;
+X		range2 = evp->next ;
+X	}
+X
+X	bufentries = size / sizeof( short ) ;
+X	p = buf ;
+X	cc_total = 0 ;
+X
+X	move_entries = MIN( range1, bufentries ) ;
+X	cc = move_entries * sizeof( short ) ;
+X	sio_memcopy( (char *) &evp->codes[ evp->start ], p, cc ) ;
+X	cc_total += cc ;
+X	p += cc ;
+X	bufentries -= range1 ;
+X	ADD( evp->start, move_entries ) ;
+X
+X	if ( bufentries == 0 || range2 == 0 )
+X		return( cc_total ) ;
+X
+X	move_entries = MIN( range2, bufentries ) ;
+X	cc = move_entries * sizeof( short ) ;
+X	sio_memcopy(  (char *) &evp->codes[ evp->start ], p, cc ) ;
+X	cc_total += cc ;
+X	ADD( evp->start, move_entries ) ;
+X
+X	return( cc_total ) ;
+X}
+X
+X#endif 	/* EVENTS */
+X
+X
+X/*
+X * Simple function that prints the string s at stderr and then calls
+X * exit
+X */
+XPRIVATE void terminate( s )
+X	char *s ;
+X{
+X	(void) write( 2, s, strlen( s ) ) ;
+X	(void) abort() ;
+X	exit( 1 ) ;				/* in case abort fails */
+X}
+X
+END_OF_FILE
+if test 24088 -ne `wc -c <'libs/src/sio/siosup.c'`; then
+    echo shar: \"'libs/src/sio/siosup.c'\" unpacked with wrong size!
+fi
+# end of 'libs/src/sio/siosup.c'
+fi
+echo shar: End of archive 31 \(of 31\).
+cp /dev/null ark31isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 31 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

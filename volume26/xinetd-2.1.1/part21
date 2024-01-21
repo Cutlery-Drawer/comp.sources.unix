@@ -1,0 +1,993 @@
+Newsgroups: comp.sources.unix
+From: panos@cs.colorado.edu (Panos Tsirigotis)
+Subject: v26i265: xinetd-2.1.1 - inetd replacement with access control and logging, Part21/31
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: panos@cs.colorado.edu (Panos Tsirigotis)
+Posting-Number: Volume 26, Issue 265
+Archive-Name: xinetd-2.1.1/part21
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 21 (of 31)."
+# Contents:  libs/src/timer/ostimer.c xinetd/reconfig.c
+# Wrapped by panos@mystique on Mon Jun 21 14:51:26 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'libs/src/timer/ostimer.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'libs/src/timer/ostimer.c'\"
+else
+echo shar: Extracting \"'libs/src/timer/ostimer.c'\" \(11927 characters\)
+sed "s/^X//" >'libs/src/timer/ostimer.c' <<'END_OF_FILE'
+X/*
+X * (c) Copyright 1993 by Panagiotis Tsirigotis
+X * All rights reserved.  The file named COPYRIGHT specifies the terms 
+X * and conditions for redistribution.
+X */
+X
+Xstatic char RCSid[] = "$Id: ostimer.c,v 4.2 1993/05/06 06:46:14 panos Exp $" ;
+X
+X#include <stdio.h>
+X#include <varargs.h>
+X
+Xextern int errno ;
+X
+X#include "timemacros.h"
+X#include "defs.h"
+X#include "impl.h"
+X#include "ostimer.h"
+X
+X
+X/*
+X * Case 1: DEBUG defined
+X *		SET_OSTIMER checks for zero interval and terminates in case of setitimer
+X *		error
+X * Case 2: DEBUG undefined, NO_TERMINATION undefined
+X *		SET_OSTIMER terminates in case of setitimer error
+X * Case 3: DEBUG undefined, NO_TERMINATION undefined
+X *		SET_OSTIMER ignores setitimer error
+X */
+X#ifdef DEBUG
+X#undef NO_TERMINATION
+X#define CHECK_INTERVAL( func, itv ) 												\
+X						if ( TV_ISZERO( (itv).it_value ) )							\
+X							terminate( "TIMER %s: zero interval\n", func ) ;
+X#else
+X#define CHECK_INTERVAL( func, itv )
+X#endif
+X
+X#ifndef NO_TERMINATION
+X#define OSTIMER_SET( func, otp, itv )														\
+X		if ( setitimer( (otp)->ost_systype, &(itv), ITIMERVAL_NULL ) == -1 )		\
+X			terminate( "TIMER %s: setitimer failed. errno = %d\n", func, errno )
+X#else
+X#define OSTIMER_SET( func, otp, itv )														\
+X      	(void) setitimer( (otp)->ost_systype, &(itv), ITIMERVAL_NULL )
+X#endif
+X
+X#define SET_OSTIMER( otp, itv, func )			CHECK_INTERVAL( func, itv ) 	\
+X															OSTIMER_SET( func, otp, itv )
+X
+X
+X#ifndef NO_TERMINATION
+X
+XPRIVATE void terminate( fmt, va_alist )
+X   char *fmt ;
+X   va_dcl
+X{
+X   va_list ap ;
+X
+X   va_start( ap ) ;
+X   (void) vfprintf( stderr, fmt, ap ) ;
+X   abort() ;
+X   _exit( 1 ) ;
+X}
+X
+X#endif   /* ! NO_TERMINATION */
+X
+X 
+X/*
+X * Initialize the fields of struct timer that are used by the ostimer code
+X */
+Xint __ostimer_newtimer( tp, type )
+X	timer_s				*tp ;
+X	enum timer_types	type ;
+X{
+X	ostimer_s			*otp = __ostimer_init( tp, type ) ;
+X
+X	if ( otp == OSTIMER_NULL )
+X		return( TIMER_ERR ) ;
+X
+X	tp->t_ostimer = otp ;
+X	TV_ZERO( tp->t_expiration ) ;
+X	TV_ZERO( tp->t_interval ) ;
+X	tp->t_count = 0 ;
+X	return( TIMER_OK ) ;
+X}
+X
+X
+X
+X
+X/*
+X * The following variables are used to handle the following scenario:
+X *
+X *		1. INTERRUPT happens ==> ostimer_interrupt called
+X *		2. Timers A and B expire.
+X *		3. The function associated with A is invoked and running
+X *		4. INTERRUPT happens ==> ostimer_interrupt called
+X *		5. Timer C expires.
+X *		6. Function of timer C invoked and returns with a jmp_buf.
+X *
+X * If we longjmp to the jmp_buf returned by the function of timer C the 
+X * function of timer B will never be called and the function of timer A 
+X * will never finish.
+X * What we do instead is have ostimer_interrupt check the call_level
+X * and if greater than 1, then just save the jmp_buf returned by the
+X * function of timer C (only if there is no other ret_env) and simply return.
+X *
+X * Notice that there can be only one ret_env (since there is only 1 control 
+X * flow).
+X *
+X * XXX:  this complexity stems from the fact that we allow interrupts while
+X *			the timer functions are running. Is there a good reason for this ?
+X *			(probably because we have to allow interrupts of other timer types).
+X */
+Xstatic int call_level ;
+Xstatic int have_env ;
+Xstatic jmp_buf ret_env ;
+X
+X#define MAX_EXPIRED					20
+X
+X/*
+X * ostimer_interrupt invokes the functions of the timers that expired.
+X * Since we don't know in advance how many timers expired, we follow a
+X * two-step procedure:
+X *
+X *		Step 1: collect all expired timers
+X *		Step 2: invoke timer actions
+X *
+X * The expired timers are collected in an array stored on the stack.
+X * If the array overflows, we arrange for another timer interrupt as
+X * soon as possible to service remaining timers. The reason we don't
+X * allocate the array using malloc is that malloc is not guaranteed
+X * to be reentrant and tracking timing-related dynamic memory allocation 
+X * problems is guaranteed to be a nightmare.
+X *
+X * Notice that *all* timer interrupts are blocked during step 1.
+X */
+Xvoid __ostimer_interrupt( otp )
+X	register ostimer_s *otp ;
+X{
+X	struct timeval		current_time ;
+X	register timer_s	*tp ;
+X	timer_s				*expired_timers[ MAX_EXPIRED ] ;
+X	unsigned				n_expired = 0 ;
+X	int					i ;
+X
+X	if ( timer_pq_head( otp->ost_timerq.tq_handle ) == TIMER_NULL )
+X		return ;
+X	
+X	call_level++ ;
+X	
+X	(*otp->ost_get_current_time)( &current_time ) ;
+X
+X	/*
+X	 * Get all timers that expired
+X	 */
+X	for ( ;; )
+X	{
+X		tp = timer_pq_head( otp->ost_timerq.tq_handle ) ;
+X
+X		if ( tp == TIMER_NULL || TV_GT( tp->t_expiration, current_time ) ||
+X																	n_expired == MAX_EXPIRED )
+X			break ;
+X		
+X		tp = timer_pq_extract_head( otp->ost_timerq.tq_handle ) ;
+X		if ( tp->t_state == TICKING )
+X		{
+X			tp->t_state = INACTIVE ;
+X
+X			tp->t_count++ ;
+X			if ( tp->t_blocked )
+X			{
+X				if ( tp->t_act == IDLE )
+X					tp->t_act = PENDING ;
+X				else if ( tp->t_act == INVOKED )
+X					tp->t_act = SCHEDULED ;
+X			}
+X			else		/* not blocked */
+X			{
+X				if ( tp->t_act == IDLE || tp->t_act == INVOKED )
+X				{
+X					tp->t_act = SCHEDULED ;
+X					expired_timers[ n_expired++ ] = tp ;
+X				}
+X			}
+X		}
+X	}
+X
+X	/*
+X	 * Check which timers have regular expiration intervals
+X	 */
+X	for ( i = 0 ; i < n_expired ; i++ )
+X	{
+X		tp = expired_timers[ i ] ;
+X
+X		if ( ! TV_ISZERO( tp->t_interval ) )
+X		{
+X			tp->t_state = TICKING ;
+X			TV_ADD( tp->t_expiration, tp->t_expiration, tp->t_interval ) ;
+X			/*
+X			 * We shouldn't have an insertion problem since we just extracted
+X			 * the timers from the queue (i.e. there should be enough room)
+X			 */
+X			(void) timer_pq_insert( otp->ost_timerq.tq_handle, tp ) ;
+X		}
+X	}
+X
+X	tp = timer_pq_head( otp->ost_timerq.tq_handle ) ;
+X
+X	if ( tp != TIMER_NULL )
+X	{
+X		struct itimerval itv ;
+X
+X		TV_ZERO( itv.it_interval ) ;
+X		/* 
+X		 * Check if we had too many expired timers
+X		 */
+X		if ( TV_LE( tp->t_expiration, current_time ) )
+X		{
+X			itv.it_value.tv_sec = 0 ;
+X			itv.it_value.tv_usec = 1 ;		/* schedule an interrupt ASAP */
+X			/* XXX:	this trick will result in another call to 
+X			 *			ostimer_interrupt. So why don't we just call it
+X			 *			recursively, instead of taking another timer interrupt ?
+X			 */
+X		}
+X		else
+X			TV_SUB( itv.it_value, tp->t_expiration, current_time ) ;
+X
+X		SET_OSTIMER( otp, itv, "ostimer_interrupt" ) ;
+X	}
+X
+X#ifdef DEBUG_MSGS
+X   printf( "\t\t%d timers expired\n", n_expired ) ;
+X#endif
+X
+X   /*
+X    * Invoke the functions of all expired timers
+X	 */
+X   for ( i = 0 ; i < n_expired ; i++ )
+X   {
+X      tp = expired_timers[ i ] ;
+X		if ( __timer_invoke( tp ) != DESTROYED &&
+X					! have_env && ( tp->t_action.ta_flags & TIMER_LONGJMP ) )
+X		{
+X			(void) memcpy( (char *)ret_env,
+X						(char *)tp->t_action.ta_env, sizeof( jmp_buf ) ) ;
+X			have_env = TRUE ;
+X		}
+X   }
+X
+X	call_level-- ;
+X
+X	/*
+X	 * If this is not a recursive call, and there is a jmp_buf, use it.
+X	 */
+X	if ( call_level == 0 && have_env )
+X	{
+X		have_env = FALSE ;
+X		longjmp( ret_env, 1 ) ;
+X	}
+X}
+X
+X
+X/*
+X * Carry out the timer action.
+X * If			the call level is 0
+X *		AND	there is not already an environment to longjmp to
+X *	 	AND	this timer has such an environment
+X *	then
+X *		longjmp to that environment
+X *
+X * Notice that all timer interrupts are blocked while this function is running.
+X * Therefore, none of the global variables checked can change.
+X */
+XPRIVATE void invoke_protocol( tp )
+X	timer_s *tp ;
+X{
+X	if ( __timer_invoke( tp ) != DESTROYED &&
+X					call_level == 0 && ! have_env &&
+X									( tp->t_action.ta_flags & TIMER_LONGJMP ) )
+X		longjmp( tp->t_action.ta_env, 1 ) ;
+X}
+X
+X
+X/*
+X * Add a timer to the specified OS timer's queue
+X * We assume that the timer already has a valid state and action
+X * associated with it.
+X * We also assume that no operations (block etc) are applied to the
+X * timer while this function is running.
+X */
+Xint __ostimer_add( otp, tp, itvp, time_type )
+X	ostimer_s				*otp ;
+X	register timer_s		*tp ;
+X	struct itimerval		*itvp ;
+X	enum timer_timetypes time_type ;
+X{
+X	struct timeval		current_time ;
+X	int					expired ;
+X
+X	/*
+X	 * While this function (__ostimer_add) is running, this will be our 
+X	 * notion of the current time.
+X	 * In reality, there may be some time skew as this function
+X	 * is running, possibly because of swapping.
+X	 */
+X	(*otp->ost_get_current_time)( &current_time ) ;
+X
+X   /*
+X    * Since we use absolute time for our calculations,
+X    * convert the user-specified time to that, if necessary
+X    *
+X    * Also check if the timer has already expired. There are 2 possibilities:
+X    *
+X    *    1. a zero interval for TIMER_RELATIVE
+X    *    2. a time before current time for TIMER_ABSOLUTE
+X	 *
+X	 * Note that we always calculate t_expiration in case the user has
+X	 * specified an it_interval.
+X    */
+X	
+X	if ( time_type == TIMER_RELATIVE )
+X	{
+X		/*
+X		 * timer_start has verified that it_value is not negative
+X		 */
+X		TV_ADD( tp->t_expiration, current_time, itvp->it_value ) ;
+X		expired = TV_ISZERO( itvp->it_value ) ;
+X	}
+X	else
+X	{
+X		tp->t_expiration = itvp->it_value ;
+X		expired = TV_LE( tp->t_expiration, current_time ) ;
+X	}
+X
+X	tp->t_interval = itvp->it_interval ;
+X
+X	if ( expired )
+X	{
+X		tp->t_count++ ;
+X		tp->t_act = SCHEDULED ;
+X
+X		if ( TV_ISZERO( tp->t_interval ) )
+X		{
+X			invoke_protocol( tp ) ;
+X			return( TIMER_OK ) ;
+X		}
+X		
+X		/*
+X		 * Keep expiring the timer until it exceeds the current time
+X		 */
+X		time_type = TIMER_ABSOLUTE ;
+X		for ( ;; )
+X		{
+X			TV_ADD( tp->t_expiration, tp->t_expiration, tp->t_interval ) ;
+X			expired = TV_LE( tp->t_expiration, current_time ) ;
+X			if ( ! expired )
+X				break ;
+X			tp->t_act = SCHEDULED ;
+X			tp->t_count++ ;
+X		}
+X		invoke_protocol( tp ) ;
+X	}
+X
+X	if ( timer_pq_insert( otp->ost_timerq.tq_handle, tp ) == PQ_ERR )
+X		HANDLE_ERROR( tp->t_flags, TIMER_ERR, tp->t_errnop, TIMER_ECANTINSERT,
+X			"TIMER __ostimer_add: can't insert timer in priority queue\n" ) ;
+X
+X	tp->t_state = TICKING ;
+X
+X	/*
+X	 * Now check if we will need to set the timer again
+X	 */
+X	if ( tp == timer_pq_head( otp->ost_timerq.tq_handle ) )
+X	{
+X      /*
+X       * Check if the user specified relative time.
+X       * If so, use the value given (for better accuracy), otherwise compute
+X       * a new value.
+X       * It is possible that by now the timer that was at the head
+X       * of the queue expired and a signal is pending. This can happen
+X       * if we are swapped out. The signal handling function will
+X       * obviously expire both the new timer and the old one, so our
+X       * setting a new timer value may cause a signal at a later time
+X       * when the queue is empty. The signal handling function should
+X       * be able to deal with an empty queue.
+X       */
+X		struct itimerval itv ;
+X
+X		TV_ZERO( itv.it_interval ) ;
+X		if ( time_type == TIMER_RELATIVE )
+X			itv.it_value = itvp->it_value ;
+X		else
+X			TV_SUB( itv.it_value, tp->t_expiration, current_time ) ;
+X		SET_OSTIMER( otp, itv, "__ostimer_add" ) ;
+X	}
+X
+X	return( TIMER_OK ) ;
+X}
+X
+X
+X/*
+X * Remove the specified timer from the OS timer's queue
+X * Timer interrupts should be blocked.
+X */
+Xvoid __ostimer_remove( otp, tp )
+X	ostimer_s	*otp ;
+X	timer_s		*tp ;
+X{
+X	struct itimerval	itv ;
+X	struct timeval		current_time ;
+X	timer_s				*new_head_timer, *old_head_timer ;
+X
+X	old_head_timer = timer_pq_head( otp->ost_timerq.tq_handle ) ;
+X	timer_pq_delete( otp->ost_timerq.tq_handle, tp ) ;
+X	new_head_timer = timer_pq_head( otp->ost_timerq.tq_handle ) ;
+X
+X	if ( old_head_timer != new_head_timer )
+X	{
+X		int do_setitimer ;
+X
+X		if ( new_head_timer != TIMER_NULL )
+X		{
+X			(*otp->ost_get_current_time)( &current_time ) ;
+X
+X			/*
+X			 * If the head_timer is less than or equal to the current time, 
+X			 * the interrupt must be pending, so we leave the OS timer running.
+X			 * Otherwise, we restart the OS timer.
+X			 */
+X			if ( TV_LE( current_time, new_head_timer->t_expiration ) )
+X				do_setitimer = FALSE ;
+X			else
+X			{
+X				do_setitimer = TRUE ;
+X				TV_SUB( itv.it_value, new_head_timer->t_expiration, current_time ) ;
+X				CHECK_INTERVAL( "__ostimer_remove", itv ) ;
+X			}
+X		}
+X		else				/* queue is empty */
+X		{
+X			do_setitimer = TRUE ;
+X			TV_ZERO( itv.it_value ) ;
+X		}
+X
+X		if ( do_setitimer )
+X		{
+X			TV_ZERO( itv.it_interval ) ;
+X			OSTIMER_SET( "__ostimer_remove", otp, itv ) ;
+X		}
+X	}
+X}
+X
+END_OF_FILE
+if test 11927 -ne `wc -c <'libs/src/timer/ostimer.c'`; then
+    echo shar: \"'libs/src/timer/ostimer.c'\" unpacked with wrong size!
+fi
+# end of 'libs/src/timer/ostimer.c'
+fi
+if test -f 'xinetd/reconfig.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xinetd/reconfig.c'\"
+else
+echo shar: Extracting \"'xinetd/reconfig.c'\" \(12082 characters\)
+sed "s/^X//" >'xinetd/reconfig.c' <<'END_OF_FILE'
+X/*
+X * (c) Copyright 1992 by Panagiotis Tsirigotis
+X * All rights reserved.  The file named COPYRIGHT specifies the terms 
+X * and conditions for redistribution.
+X */
+X
+Xstatic char RCSid[] = "$Id: reconfig.c,v 6.11 1993/06/15 23:25:57 panos Exp $" ;
+X
+X#include <sys/types.h>
+X#include <sys/socket.h>
+X#include <syslog.h>
+X#include <signal.h>
+X#include <memory.h>
+X
+X#include "state.h"
+X#include "access.h"
+X#include "defs.h"
+X#include "service.h"
+X#include "server.h"
+X#include "conf.h"
+X#include "config.h"
+X
+Xvoid exit() ;
+X
+Xvoid msg() ;
+Xvoid out_of_memory() ;
+X
+Xtypedef enum { RECONFIG_SOFT, RECONFIG_HARD } reconfig_e ;
+X
+X
+X#define SWAP( x, y, temp )			(temp) = (x), (x) = (y), (y) = (temp)
+X
+X
+XPRIVATE void do_reconfig() ;
+X
+X
+Xvoid soft_reconfig()
+X{
+X	do_reconfig( RECONFIG_SOFT ) ;
+X}
+X
+X
+Xvoid hard_reconfig()
+X{
+X	do_reconfig( RECONFIG_HARD ) ;
+X}
+X
+X
+X/*
+X * Reconfigure the server by rereading the configuration file.
+X * Services may be added, deleted or have their attributes changed.
+X * All syslog output uses the LOG_NOTICE priority level (except for
+X * errors).
+X */
+XPRIVATE void do_reconfig( reconfig_type )
+X	reconfig_e reconfig_type ;
+X{
+X	struct service				*osp ;
+X	struct service_config	*nscp ;
+X	struct configuration		new_conf ;
+X	psi_h							iter ;
+X	unsigned						new_services ;
+X	unsigned						old_services		= 0 ;
+X	unsigned						dropped_services	= 0 ;
+X	char							*func					= "do_reconfig" ;
+X	PRIVATE status_e			readjust() ;
+X	PRIVATE void				check_servers() ;
+X	PRIVATE void				swap_defaults() ;
+X	void							terminate_servers() ;
+X	void							cancel_service_retries() ;
+X
+X	msg( LOG_NOTICE, func, "Starting %s reconfiguration",
+X				( reconfig_type == RECONFIG_SOFT ) ? "soft" : "hard" ) ;
+X
+X	if ( cnf_get( &new_conf, (long)CONF_TIMEOUT ) == FAILED )
+X	{
+X		msg( LOG_WARNING, func, "reconfiguration failed" ) ;
+X		return ;
+X	}
+X
+X	iter = psi_create( SERVICES( ps ) ) ;
+X	if ( iter == NULL )
+X	{
+X		out_of_memory( func ) ;
+X		cnf_free( &new_conf ) ;
+X		return ;
+X	}
+X
+X	swap_defaults( &new_conf ) ;
+X
+X	/*
+X	 * Glossary:
+X	 *		Sconf: service configuration
+X	 *		Lconf: list of service configurations
+X	 *
+X	 * Iterate over all existing services. If the service is included in the 
+X	 * new Lconf, readjust its attributes (as a side-effect, the new service 
+X	 * Sconf is removed from the new Lconf).
+X	 *	Services not in the new Lconf are deactivated.
+X	 */
+X	for ( osp = SP( psi_start( iter ) ) ; osp ; osp = SP( psi_next( iter ) ) )
+X	{
+X		char *sid = SVC_ID( osp ) ;
+X		boolean_e drop_service ;
+X
+X		if ( ! SVC_IS_AVAILABLE( osp ) )
+X			continue ;
+X
+X		/*
+X		 * Check if this service is in the new Lconf
+X		 * Notice that the service Sconf is removed from the new Lconf
+X		 * if it is found there.
+X		 */
+X		if ( nscp = cnf_extract( &new_conf, SVC_CONF( osp ) ) )
+X		{
+X			/*
+X			 * The first action of readjust is to swap the service configuration
+X			 * with nscp. This is the reason for passing the address of nscp
+X			 * (so that on return nscp will *always* point to the old service
+X			 * configuration).
+X			 */
+X			if ( readjust( osp, &nscp, reconfig_type ) == OK )
+X			{
+X				/*
+X				 * Do the access control again
+X				 */
+X				if ( reconfig_type == RECONFIG_HARD )
+X					check_servers( osp ) ;
+X
+X				old_services++ ;
+X				drop_service = NO ;
+X			}
+X			else	/* the readjustment failed */
+X				drop_service = YES ;
+X			sc_free( nscp ) ;
+X		}
+X		else
+X			drop_service = YES ;
+X
+X		if ( drop_service == YES )
+X		{
+X			/*
+X			 * Procedure for disabling a service:
+X			 *
+X			 *		a. Terminate running servers and cancel retry attempts, in case
+X			 *			of hard reconfiguration
+X			 *		b. Deactivate the service
+X			 */
+X			if ( reconfig_type == RECONFIG_HARD )
+X			{
+X				terminate_servers( osp ) ;
+X				cancel_service_retries( osp ) ;
+X			}
+X
+X			/*
+X			 * Deactivate the service; the service will be deleted only
+X			 * if its reference count drops to 0.
+X			 */
+X			svc_deactivate( osp ) ;
+X			msg( LOG_NOTICE, func, "service %s deactivated", sid ) ;
+X			if ( SVC_RELE( osp ) == 0 )
+X				psi_remove( iter ) ;
+X			dropped_services++ ;
+X		}
+X	}
+X
+X	psi_destroy( iter ) ;
+X
+X	/*
+X	 * At this point the new Lconf only contains services that were not
+X	 * in the old Lconf.
+X	 */
+X	new_services = cnf_start_services( &new_conf ) ;
+X
+X	msg( LOG_NOTICE, func,
+X		"Reconfigured: new=%d old=%d dropped=%d (services)",
+X			new_services, old_services, dropped_services ) ;
+X
+X	if ( ps.rws.available_services == 0 )
+X	{
+X		msg( LOG_CRIT, func, "No available services. Exiting" ) ;
+X		exit( 1 ) ;
+X	}
+X
+X	cnf_free( &new_conf ) ;
+X}
+X
+X
+XPRIVATE void swap_defaults( confp )
+X	struct configuration *confp ;
+X{
+X	struct service_config *temp ;
+X
+X	/*
+X	 * Close the previous common log file, if one was specified
+X	 */
+X	if ( DEFAULT_LOG( ps ) != NULL )
+X	{
+X		log_end( SC_LOG( DEFAULTS( ps ) ), DEFAULT_LOG( ps ) ) ;
+X		DEFAULT_LOG( ps ) = NULL ;
+X	}
+X	DEFAULT_LOG_ERROR( ps ) = FALSE ;
+X
+X	SWAP( DEFAULTS( ps ), CNF_DEFAULTS( confp ), temp ) ;
+X}
+X
+X
+X
+XPRIVATE void sendsig( serp, sig )
+X	register struct server	*serp ;
+X	int							sig ;
+X{
+X	char		*sid	= SVC_ID( SERVER_SERVICE( serp ) ) ;
+X	pid_t		pid	= SERVER_PID( serp ) ;
+X	char		*func = "sendsig" ;
+X
+X	/*
+X	 * Always use a positive pid, because of the semantics of kill(2)
+X	 */
+X	if ( pid > 0 )
+X	{
+X		msg( LOG_WARNING, func, "Sending signal %d to %s server %d",
+X												sig, sid, pid ) ;
+X		(void) kill( pid, sig ) ;
+X	}
+X	else
+X		msg( LOG_ERR, func, "Negative server pid = %d. Service %s", pid, sid ) ;
+X}
+X
+X
+X/*
+X * Send signal sig to all running servers of service sp
+X */
+XPRIVATE void deliver_signal( sp, sig )
+X	register struct service *sp ;
+X	int sig ;
+X{
+X	register unsigned u ;
+X
+X	for ( u = 0 ; u < pset_count( SERVERS( ps ) ) ; u++ )
+X	{
+X		register struct server *serp ;
+X
+X		serp = SERP( pset_pointer( SERVERS( ps ), u ) ) ;
+X		if ( SERVER_SERVICE( serp ) == sp )
+X			sendsig( serp, sig ) ;
+X	}
+X}
+X
+X
+X/*
+X * Terminate all servers of the specified service
+X */
+Xvoid terminate_servers( sp )
+X	register struct service *sp ;
+X{
+X	int sig = SC_IS_INTERNAL( SVC_CONF( sp ) ) ? SIGTERM : SIGKILL ;
+X
+X	deliver_signal( sp, sig ) ;
+X}
+X
+X
+XPRIVATE void stop_interception( sp )
+X	struct service *sp ;
+X{
+X	deliver_signal( sp, INTERCEPT_SIG ) ;
+X}
+X
+X
+X/*
+X * Do access control on all servers of the specified service.
+X * If "limit" is 0, we don't mind if the service limit is exceeded.
+X * If "limit" is non-zero, we kill servers that exceed the service limit
+X * (but at most "limit" servers are killed because of exceeding the 
+X * instances limit)
+X *
+X * Return value: number of servers that failed the check (and were killed)
+X */
+XPRIVATE int server_check( sp, limit )
+X	register struct service		*sp ;
+X	int								limit ;
+X{
+X	register unsigned		u ;
+X	int						killed_servers	= 0 ;
+X	pset_h					server_set		= SERVERS( ps ) ;
+X	char						*func				= "server_check" ;
+X
+X	if ( SVC_RUNNING_SERVERS( sp ) == 0 )
+X		return( 0 ) ;
+X
+X	for ( u = 0 ; u < pset_count( server_set ) ; u++ )
+X	{
+X		register struct server *serp = SERP( pset_pointer( server_set, u ) ) ;
+X
+X		if ( SERVER_SERVICE( serp ) == sp )
+X		{
+X			access_e result ;
+X			mask_t check_mask = MASK( CF_TIME ) ;
+X
+X			if ( SVC_SOCKET_TYPE( sp ) != SOCK_DGRAM )
+X				M_OR( check_mask, check_mask, MASK( CF_ADDRESS ) ) ;
+X			if ( limit != 0 && killed_servers < limit )
+X				M_OR( check_mask, check_mask, MASK( CF_SERVICE_LIMIT ) ) ;
+X			
+X			result = access_control( sp, SERVER_CONNECTION( serp ), &check_mask );
+X
+X			if ( result == AC_OK )
+X				continue ;
+X		
+X			msg( LOG_NOTICE, func, "%s server %d failed %s check",
+X				SVC_ID( sp ), SERVER_PID( serp ), access_explain( result ) ) ;
+X			sendsig( serp, SIGKILL ) ;
+X			killed_servers++ ;
+X		}
+X	}
+X	return( killed_servers ) ;
+X}
+X
+X
+X/*
+X * Check if all the running servers of the specified service fit the 
+X * new access control specifications. The ones that don't fit are killed.
+X * 
+X * We go through the server table twice. During the first
+X * pass we ignore overruns of the server limit. During the second pass
+X * we don't ignore such overruns until a certain number of servers are
+X * terminated.
+X */
+XPRIVATE void check_servers( sp )
+X	register struct service *sp ;
+X{
+X	int existant_servers = SVC_RUNNING_SERVERS( sp ) ;
+X	int limit ;
+X
+X	existant_servers -= server_check( sp, 0 ) ;
+X
+X	limit = existant_servers - SC_INSTANCES( SVC_CONF( sp ) ) ;
+X	if ( limit < 0 )
+X		limit = 0 ;
+X	(void) server_check( sp, limit ) ;
+X}
+X
+X
+X
+X/*
+X * Stop any logging and restart if necessary.
+X * Note that this has the side-effect of using the new common log
+X * handle as it should.
+X */
+XPRIVATE status_e restart_log( sp, old_conf )
+X	struct service *sp ;
+X	struct service_config *old_conf ;
+X{
+X	struct log *lp = SC_LOG( old_conf ) ;
+X
+X	if ( log_get_type( lp ) != L_NONE && SVC_IS_LOGGING( sp ) )
+X		log_end( lp, SVC_LOG( sp ) ) ;
+X	SVC_LOG( sp ) = NULL ;
+X	
+X	return( log_start( sp, &SVC_LOG( sp ) ) ) ;
+X}
+X
+X
+X/*
+X * Unregister past versions, register new ones
+X * We do it the dumb way: first unregister; then register
+X * We try to be a little smart by checking if there has
+X * been any change in version numbers (if not, we do nothing).
+X * Also, we save the port number
+X */
+XPRIVATE status_e readjust_rpc_service( old_scp, new_scp )
+X	register struct service_config *old_scp ;
+X	register struct service_config *new_scp ;
+X{
+X	unsigned				long vers ;
+X	unsigned short		port						= SC_PORT( old_scp ) ;
+X	struct rpc_data	*new_rdp					= SC_RPCDATA( new_scp ) ;
+X	struct rpc_data	*old_rdp					= SC_RPCDATA( old_scp ) ;
+X	unsigned				registered_versions	= 0 ;
+X	char					*func						= "readjust_rpc_service" ;
+X
+X#ifndef NO_RPC
+X	SC_PORT( new_scp ) = SC_PORT( old_scp ) ;
+X
+X	if ( RD_MINVERS( old_rdp ) == RD_MINVERS( new_rdp ) &&
+X				RD_MAXVERS( old_rdp ) == RD_MAXVERS( new_rdp ) )
+X		return( OK ) ;
+X
+X	for ( vers = RD_MINVERS( old_rdp ) ; vers <= RD_MAXVERS( old_rdp ) ; vers++ )
+X		 (void) pmap_unset( RD_PROGNUM( old_rdp ), vers ) ;
+X
+X	for ( vers = RD_MINVERS( new_rdp ) ; vers <= RD_MAXVERS( new_rdp ) ; vers++ )
+X		if ( pmap_set( RD_PROGNUM( new_rdp ),
+X										vers, SC_PROTOVAL( new_scp ), port ) )
+X			registered_versions++ ;
+X		else
+X			msg( LOG_ERR, func, 
+X				"pmap_set failed. service=%s, program=%ld, version = %ld",
+X					SC_ID( new_scp ), RD_PROGNUM( new_rdp ), vers ) ;
+X
+X	if ( registered_versions == 0 )
+X	{
+X		msg( LOG_ERR, func,
+X				"No versions registered for RPC service %s", SC_ID( new_scp ) ) ;
+X		/*
+X		 * Avoid the pmap_unset
+X		 */
+X		RD_MINVERS( new_rdp ) = RD_MAXVERS( new_rdp ) + 1 ;
+X		return( FAILED ) ;
+X	}
+X#endif	/* ! NO_RPC */
+X	return( OK ) ;
+X}
+X
+X
+X/*
+X * Readjust service attributes. 
+X *
+X * We assume that the following attributes are the same:
+X *			wait
+X *			socket_type
+X *			type
+X *			protocol
+X *
+X * Readjustment happens in 3 steps:
+X *		1) We swap the svc_conf fields
+X *				This has the side-effect of free'ing the memory associated
+X *				with the old service configuration when the new configuration
+X *				is destroyed.
+X *		2) We readjust the fields that require some action to be taken:
+X *				RPC mapping
+X *				log file open
+X *		3) We update the address control fields.
+X */
+XPRIVATE status_e readjust( sp, new_conf_ptr, type )
+X	register struct service				*sp ;
+X	register struct service_config	**new_conf_ptr ;
+X	reconfig_e								type ;
+X{
+X	struct service_config	*temp_conf ;
+X	struct service_config	*old_conf	= SVC_CONF( sp ) ;
+X	struct service_config	*new_conf	= *new_conf_ptr ;
+X	char							*sid			= SVC_ID( sp ) ;
+X	char							*func			= "readjust" ;
+X
+X	msg( LOG_NOTICE, func, "readjusting service %s", sid ) ;
+X
+X	SWAP( SVC_CONF( sp ), *new_conf_ptr, temp_conf ) ;
+X
+X	if ( SC_IS_RPC( old_conf ) &&
+X						readjust_rpc_service( old_conf, new_conf ) == FAILED )
+X		return( FAILED ) ;
+X	
+X	/*
+X	 * This is what happens if the INTERCEPT flag is toggled and an
+X	 * interceptor is running:
+X	 *
+X	 * Case 1: clear->set
+X	 *		Wait until the server dies (soft reconfig) or
+X	 *		terminate the server (hard reconfig)
+X	 *
+X	 * Case 2: set->clear
+X    *    Send a signal to the interceptor to tell it to stop intercepting
+X	 */
+X	if ( SC_IS_INTERCEPTED( old_conf ) != SC_IS_INTERCEPTED( new_conf ) )
+X	{
+X		if ( SC_IS_INTERCEPTED( new_conf ) )			/* case 1 */
+X		{
+X			if ( type == RECONFIG_HARD )
+X				terminate_servers( sp ) ;
+X		}
+X		else													/* case 2 */
+X		{
+X			stop_interception( sp ) ;
+X			msg( LOG_NOTICE, func, "Stopping interception for %s", sid ) ;
+X		}
+X	}
+X	svc_setup_address_control( sp ) ;
+X	return( restart_log( sp, old_conf ) ) ;
+X}
+X
+END_OF_FILE
+if test 12082 -ne `wc -c <'xinetd/reconfig.c'`; then
+    echo shar: \"'xinetd/reconfig.c'\" unpacked with wrong size!
+fi
+# end of 'xinetd/reconfig.c'
+fi
+echo shar: End of archive 21 \(of 31\).
+cp /dev/null ark21isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 31 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

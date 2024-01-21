@@ -1,0 +1,2731 @@
+Newsgroups: comp.sources.unix
+From: kstailey@leidecker.gsfc.nasa.gov (Kenneth Stailey)
+Subject: v28i144: pint - PINT is not TWAIN (scanner interface toolset), Part06/07
+References: <1.783771355.23520@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: kstailey@leidecker.gsfc.nasa.gov (Kenneth Stailey)
+Posting-Number: Volume 28, Issue 144
+Archive-Name: pint/part06
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 6 (of 7)."
+# Contents:  pint/ibm/scandd.t.c
+# Wrapped by kstailey@leidecker on Tue Nov  1 12:27:56 1994
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'pint/ibm/scandd.t.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'pint/ibm/scandd.t.c'\"
+else
+echo shar: Extracting \"'pint/ibm/scandd.t.c'\" \(74576 characters\)
+sed "s/^X//" >'pint/ibm/scandd.t.c' <<'END_OF_FILE'
+X/*
+X *  PINT Pint Is Not TWAIN - common scanner driver interface for UN*X
+X *  Copyright (C) 1994 Kenneth Stailey ken@spacenet.com
+X *
+X *  This program is free software; you can redistribute it and/or modify
+X *  it under the terms of the GNU General Public License as published by
+X *  the Free Software Foundation; either version 2 of the License, or
+X *  (at your option) any later version.
+X *
+X *  This program is distributed in the hope that it will be useful,
+X *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+X *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X *  GNU General Public License for more details.
+X *
+X *  You should have received a copy of the GNU General Public License
+X *  along with this program; if not, write to the Free Software
+X *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X */
+X
+X/*
+X * scandd.t.c: top half of PINT
+X *
+X * This is the top half of the device driver.  Routines in it can be called
+X * only by a process and can page fault (and get paged out).
+X *
+X * Entry point routines:
+X *  scanconfig
+X *  scanopen
+X *  scanclose
+X *  scanread
+X *  scanioctl
+X *
+X */
+X
+X#define _ALL_SOURCE	  /* implicit <fcntl.h> include needs this pair */
+X#define _KERNEL		  /* of #defines */
+X
+X#include <sys/types.h>
+X#include <sys/device.h>
+X#include <sys/uio.h>
+X#include <sys/errno.h>
+X#include <sys/malloc.h>
+X#include <sys/scsi.h>
+X#include <sys/fp_io.h>
+X#include <sys/pin.h>
+X#ifdef IOSTAT
+X# include <sys/iostat.h>
+X#endif
+X#include <sys/ioctl.h>
+X#include <sys/devinfo.h>
+X#include <sys/priv.h>
+X#include <sys/watchdog.h>
+X#include <sys/sleep.h>
+X#include "scandd.h"
+X#include "scanio.h"
+X
+X/*
+X *	global data definitions
+X */
+X
+Xextern struct scan_hash_table_df scanner_list[SCANNER_HASHSIZE];
+Xextern int scanner_chain_lock;	 /* for exclusive access to scanner_list */
+Xextern int scanner_config_count; /* # of devices configured	     */
+X
+X/*
+X * scanconfig:
+X * This is the main entry point to the module. It is invoked via the
+X * sysconfig system call from user mode.
+X */
+X
+Xint
+Xscanconfig(
+X dev_t	 devno,		  /* major-minor device number	  */
+X int	 cmd,		  /* command from sysconfig()	  */
+X struct uio *uiop)	  /* uio structure containing device dependent data */
+X{
+X  struct scan_df  *scan_ptr, *back_ptr;
+X  struct devsw ds;
+X  char found;		  /* used for search through scanner_list */
+X  char scanner_offset;
+X  int undo = 0;		  /* used to keep track of what steps to reverse */
+X  int rc = 0;		  /* return code from this function */
+X
+X#ifdef DEBUG_CONFIG
+X  printf("entering scanconfig ");
+X#endif
+X
+X  /*
+X   * Check the list of defined scanner structures to see if this device
+X   * has already been defined.
+X   */
+X  scanner_offset = minor(devno) & 0x0f;
+X
+X#ifdef DEBUG_CONFIG
+X  printf("(lock");
+X#endif
+X  (void) lockl(&scanner_chain_lock, LOCK_SHORT);
+X#ifdef DEBUG_CONFIG
+X  printf("ing) \n");
+X#endif
+X
+X  found = FALSE;
+X  scan_ptr = scanner_list[scanner_offset].defined_head;
+X  back_ptr = scan_ptr;
+X
+X#ifdef DEBUG_CONFIG
+X    printf("scanconfig: devno is 0x%x	 major/minor is %d/%d\n",
+X	   devno, major(devno), minor(devno));
+X    printf("scanconfig: scan_ptr is 0x%x before searching\n", scan_ptr);
+X#endif 
+X
+X  while (!found && (scan_ptr != NULL)) {
+X    if (scan_ptr->devno == devno) {
+X      found = TRUE;
+X    } else {
+X      back_ptr = scan_ptr;
+X      scan_ptr = scan_ptr->next_defined;
+X    }
+X  }
+X
+X#ifdef DEBUG_CONFIG
+X  printf("scanconfig: scan_ptr is 0x%x after searching\n", scan_ptr);
+X#endif
+X
+X  switch (cmd) {
+X
+X  case CFG_INIT:
+X
+X    /**** make sure the device has not already been defined  ***/
+X
+X    if (!found)	{
+X      /*
+X       * To define this device:
+X       * 1) allocate pinned storage for the disk structure
+X       * 2) fill in the disk structure (DDS, misc ptrs)
+X       *
+X       * if this is the first scanner to be defined
+X       * 3) add the device switch table entries for this device.
+X       *
+X       * 4) add this structure to the linked list of defined devices
+X       * 5) register the dkstat struct
+X       *
+X       */
+X
+X      /****  allocate pinned memory for the scanner info structure  ***/
+X
+X      if ((scan_ptr = (struct scan_df *)
+X	   xmalloc((int)sizeof(struct scan_df),
+X		   2, (caddr_t)pinned_heap)) == NULL) {
+X
+X#ifdef DEBUG_CONFIG
+X	printf("scanconfig: xmalloc of scan_df failed\n");
+X#endif
+X	rc = ENOMEM;
+X	goto scanconf_exit;
+X      }
+X      ++undo;		  /* xmfree() is now necessary */
+X#ifdef DEBUG_CONFIG
+X	printf("scanconfig: xmalloc()ed scan_ptr is 0x%x\n", scan_ptr);
+X#endif
+X
+X      /****  initialize the scan_df struct  ***/
+X
+X      scan_ptr->next_defined       = NULL;
+X      scan_ptr->next_opened        = NULL;
+X      scan_ptr->devno	           = devno;
+X      scan_ptr->opened	           = (uchar)FALSE;
+X      scan_ptr->do_unload          = (uchar)TRUE;
+X      scan_ptr->diag_mode          = (uchar)FALSE;
+X      scan_ptr->retain_reservation = (uchar)FALSE;
+X      scan_ptr->adapter_error      = (uchar)FALSE;
+X      scan_ptr->check_condition    = (uchar)FALSE;
+X      scan_ptr->using_adf          = (uchar)FALSE;
+X      scan_ptr->adf_state          = ADF_UNUSED;
+X
+X      /****  fetch the DDS from the config method	 ***/
+X
+X      if (rc = uiomove((caddr_t)&scan_ptr->s_dds,
+X			sizeof(struct scan_dds), UIO_WRITE, uiop)) {
+X#ifdef DEBUG_CONFIG
+X	printf("scanconfig: uiomove of the DDS failed\n");
+X#endif
+X	goto scanconf_exit;
+X#ifdef DEBUG_CONFIG
+X      } else {
+X	printf("scanconfig: SCSI id/LUN is %d/%d\n",
+X	       scan_ptr->s_dds.scsi_id, scan_ptr->s_dds.lun);
+X	printf("scanconfig: parent major/minor is %d/%d\n",
+X	       major(scan_ptr->s_dds.parent_devno),
+X	       minor(scan_ptr->s_dds.parent_devno));
+X	printf("scanconfig: scanner type is %d	  logical name is %s\n",
+X	       scan_ptr->s_dds.scanner_type, scan_ptr->s_dds.logical_name);
+X	printf("scanconfig: window_width/window_length is %d/%d\n",
+X	       scan_ptr->s_dds.window_width, scan_ptr->s_dds.window_length);
+X	printf("scanconfig: x_resolution/y_resolution is %d/%d\n",
+X	       scan_ptr->s_dds.x_resolution, scan_ptr->s_dds.y_resolution);
+X#endif
+X      }
+X
+X      if (++scanner_config_count == 1) {
+X
+X	/**** add the device switch table entries for this device ***/
+X
+X	ds.d_open     = (int(*)())scanopen;
+X	ds.d_close    = (int(*)())scanclose;
+X	ds.d_read     = (int(*)())scanread;
+X	ds.d_write    = nodev;
+X	ds.d_ioctl    = (int(*)())scanioctl;
+X	ds.d_strategy = nodev;
+X	ds.d_ttys     = NULL;
+X	ds.d_select   = nodev;
+X	ds.d_config   = (int(*)())scanconfig;
+X	ds.d_print    = nodev;
+X	ds.d_dump     = nodev;
+X	ds.d_mpx      = nodev;
+X	ds.d_revoke   = nodev;
+X	ds.d_dsdptr   = NULL;
+X	ds.d_selptr   = NULL;
+X	ds.d_opts     = 0L;
+X
+X#ifdef DEBUG_CONFIG
+X	printf("scanconfig: calling devswadd\n");
+X#endif
+X
+X	if (rc = devswadd(devno, &ds)) {
+X#ifdef DEBUG_CONFIG
+X	  printf("scanconfig: devswadd failed\n");
+X#endif
+X	  goto scanconf_exit;
+X	} else {
+X	  ++undo;	  /* devswdel is now necessary */
+X	}
+X      }
+X
+X      /****  add this structure to the linked list of defined devices  ***/
+X
+X#ifdef DEBUG_CONFIG
+X      printf("scanconfig: back_ptr is 0x%x\n", back_ptr);
+X#endif
+X
+X      if (back_ptr == NULL) {
+X	scanner_list[scanner_offset].defined_head = scan_ptr;
+X#ifdef DEBUG_CONFIG
+X      printf("scanconfig: *scanner_list[scanner_offset].defined_head is 0x%x\n",
+X	     *scanner_list[scanner_offset].defined_head);
+X#endif
+X      } else {
+X	back_ptr->next_defined = scan_ptr;
+X      }
+X
+X      /****  register the dkstat struct	 ***/
+X#ifdef IOSTAT
+X      strcpy(scan_ptr->scan_dkstat.diskname, scan_ptr->s_dds.logical_name);
+X      scan_ptr->scan_dkstat.dknextp   = NULL;
+X      scan_ptr->scan_dkstat.dk_status = (ushort)0;
+X      scan_ptr->scan_dkstat.dk_time   = (ulong)0;
+X      scan_ptr->scan_dkstat.dk_xrate  = (ulong)0;
+X      scan_ptr->scan_dkstat.dk_bsize  = (ulong)1; /* minimum you can ask for */
+X      scan_ptr->scan_dkstat.dk_xfers  = (ulong)0;
+X      scan_ptr->scan_dkstat.dk_rblks  = (ulong)0;
+X      scan_ptr->scan_dkstat.dk_wblks  = (ulong)0;
+X      scan_ptr->scan_dkstat.dk_seek   = (ulong)0;
+X      if (rc = iostadd(DD_DISK, &scan_ptr->scan_dkstat)) {
+X#ifdef DEBUG_CONFIG
+X	printf("scanconfig: iostadd failed rc = %d\n", rc);
+X#endif /* DEBUG */
+X      } else {
+X	++undo;		  /* iostdel is now necessary */
+X      }
+X#endif /* IOSTAT */
+X
+X#ifdef DEBUG_CONFIG
+X      printf("scanconfig: scanner_list 0x%x, 0x%x, 0x%x\n",
+X	     scanner_list[0].defined_head,
+X	     scanner_list[1].defined_head,
+X	     scanner_list[2].defined_head);
+X#endif
+X    } else { /* this device has already been defined, so return an error */
+X      rc = EINVAL;
+X    }
+X    break;
+X
+X
+X  case CFG_TERM:
+X    if (found) {
+X      /*
+X       * If the scanner has been defined and is not currently opened, then
+X       * delete the device by freeing the disk structure and unregistering
+X       * the scan_dkstat structure.
+X       * If this is the last cdrom delete the switch table entry.
+X       */
+X
+X#ifdef DEBUG_CONFIG
+X	    printf("scanconfig: removing scanner\n");
+X#endif
+X
+X      if (!scan_ptr->opened) {
+X	if (--scanner_config_count == 0) {
+X#ifdef DEBUG_CONFIG
+X	    printf("scanconfig: performing devswdel\n");
+X#endif
+X	  if (rc = devswdel(devno)) {
+X#ifdef DEBUG_CONFIG
+X	    printf("scanconfig: devswdel failed\n");
+X#endif
+X	  }
+X	}
+X
+X	if (rc == 0) {
+X	  if (back_ptr == scan_ptr) {
+X	    scanner_list[scanner_offset].defined_head = NULL;
+X	  } else {
+X	    back_ptr->next_defined = scan_ptr->next_defined;
+X	  }
+X
+X#ifdef IOSTAT
+X	  /* unregister scan_dkstat structure */
+X#ifdef DEBUG_CONFIG
+X	  printf("scanconfig: unregistering scan_dkstat structure\n");
+X#endif /* DEBUG */
+X	  iostdel(&(scan_ptr->scan_dkstat));
+X#endif
+X
+X	  (void)xmfree((caddr_t)scan_ptr, (caddr_t)pinned_heap);
+X	}
+X      } else {
+X#ifdef DEBUG_CONFIG
+X	printf("scanconfig: in CFGTERM the scanner is still open\n");
+X#endif
+X	rc = EINVAL;	  /* this device is flagged as open */
+X      }
+X    } else {
+X#ifdef DEBUG_CONFIG
+X	printf("scanconfig: no scanners found\n");
+X#endif
+X    }
+X    break;
+X
+X  default:
+X#ifdef DEBUG_CONFIG
+X    printf("scanconfig: invalid command\n");
+X#endif
+X    return (EINVAL);
+X    break;
+X  }
+X
+X  /*
+X   *  Get out of scan config performing any cleanup needed by crapping
+X   *  out in the middle.
+X   *
+X   *  If "rc" has any value other than zero, then something went wrong.
+X   */
+X
+X scanconf_exit:
+X
+X#ifdef DEBUG_CONFIG
+X  printf("scanconfig: exiting ");
+X#endif
+X
+X  if (rc == 0) {
+X#ifdef DEBUG_CONFIG
+X    printf("(unlock");
+X#endif
+X    unlockl(&scanner_chain_lock);
+X#ifdef DEBUG_CONFIG
+X    printf("ing) sucessfully\n");
+X#endif
+X    return (rc);
+X  }
+X
+X#ifdef DEBUG_CONFIG
+X    printf("with level %d undo processing\n", undo);
+X#endif
+X
+X  switch (undo) {
+X#ifdef IOSTAT
+X  case 3:		  /* iostdel() is now necessary */
+X
+X    iostdel(&(scan_ptr->scan_dkstat)); /* fall through to level 2 */
+X#endif /* IOSTAT */
+X
+X  case 2:		  /* devswdel() is now necessary */
+X
+X    (void)devswdel(scan_ptr->devno); /* fall through to level 1 */
+X
+X  case 1:		  /* xmfree() is now necessary */
+X
+X    (void)xmfree((caddr_t)scan_ptr, (caddr_t)pinned_heap);
+X    
+X  case 0:		  /* release the lock */
+X    unlockl(&scanner_chain_lock);
+X    break;
+X
+X  default:
+X#ifdef DEBUG_CONFIG
+X    printf("scanconf: scanconf_exit was handed a bad undo value: %d\n", undo);
+X#endif
+X    unlockl(&scanner_chain_lock); /* don't make things worse! */
+X  }
+X
+X  return (rc);
+X}	/* end scanconfig */
+X
+X/*
+X * scanopen: open routine for scan device driver
+X *
+X * a) validate parameters
+X * b) find the scanner in the defined list
+X * c) determine if this scanner is being opened for the first time
+X *
+X * If this is the first open for a scanner:
+X * 1) open the parent adapter device
+X * 2) issue a START ioctl to the adapter device driver
+X * 3) if this is a FORCED open, send a bus device reset to the scanner
+X * 4) issue a SCSI_TEST_UNIT_READY ioctl to the adapter device driver
+X * 5) pin the bottom half routines
+X * 6) issue a SCSI_RESERVE_UNIT command to the scanner
+X */
+X
+Xint
+Xscanopen(dev_t devno, ulong devflag, chan_t chan, int ext)
+X{
+X  struct scan_df *scan_ptr;
+X  char scanner_offset;
+X  struct sc_ready scan_ready;
+X  struct devinfo adapter_devinfo;
+X
+X  int undo = 0;	     /* holds level of undo used by exit routine */
+X  int rc = 0;	     /* return code from this function */
+X
+X#ifdef DEBUG_OPEN
+X  printf("scanopen called ");
+X#endif
+X
+X  /* parameter validation  */
+X
+X  if ((devflag != FREAD)	&&	/* the scanner is a read only device */
+X      (devflag != FKERNEL)	&&	/* and it may be opened in diag mode */
+X      (devflag != (FREAD | FKERNEL))) {
+X#ifdef DEBUG_OPEN
+X    printf("with invalid parameters\n");
+X#endif
+X    return (EINVAL);
+X  }
+X
+X  /****	 locate scanner struct	***/
+X
+X#ifdef DEBUG_OPEN
+X  printf("(lock");
+X#endif
+X  (void)lockl(&scanner_chain_lock, LOCK_SHORT); /* unlockl() is now necessary*/
+X#ifdef DEBUG_OPEN
+X  printf("ing) ");
+X#endif
+X
+X  scanner_offset = minor(devno) & 0x0f;
+X  scan_ptr = scanner_list[scanner_offset].defined_head;
+X  while (scan_ptr != NULL) {
+X    if (scan_ptr->devno == devno)
+X      break;
+X    else
+X      scan_ptr = scan_ptr->next_defined;
+X  }
+X  if (scan_ptr == NULL) {
+X    rc = ENODEV;	  /* can't find the scanner in the defined list */
+X#ifdef DEBUG_OPEN
+X    printf("but the scanner couldn't be found\n");
+X#endif
+X    goto scanopen_exit;
+X  }
+X
+X  /****	 determine if the scanner is being opened for the first time  ***/
+X
+X  if (scan_ptr->opened) {
+X#ifdef DEBUG_OPEN
+X    printf("again\n");
+X#endif
+X
+X    rc = EBUSY;	  /* XXX ICK! En_US message catalog will say: */
+X		  /* "A filesystem cannot be unmounted" */
+X		  /* use C message catalog for "device busy" */
+X    goto scanopen_exit;
+X
+X    /*
+X     * This is not the first open.  Check to make sure it was not already
+X     * in diag mode, or if it is being opened in diag mode (both conditions
+X     * are illegal).  Otherwise, nothing needs to be done for multiple opens.
+X     */
+X    if ((ext & SC_DIAGNOSTIC) || (scan_ptr->diag_mode)) {
+X      rc = EBUSY;
+X      goto scanopen_exit;
+X    }
+X
+X    if (ext & SC_RETAIN_RESERVATION) {
+X      scan_ptr->retain_reservation = TRUE;
+X    }
+X    goto scanopen_exit;
+X
+X  } else {
+X#ifdef DEBUG_OPEN
+X    printf("for the first time\n");
+X#endif
+X
+X    /* openx stuff... */
+X#ifdef DEBUG_OPEN
+X    printf("scanopen: ext parameter is 0x%x\n", ext);
+X#endif
+X
+X#if WhatIsPrivcheck
+X    /*
+X     * check that the user has CTL_DEV authority if ext paramaters are used.
+X     */
+X    if (ext && priv_chk(RAS_CONFIG)) {
+X      rc = EPERM;
+X      goto scanopen_exit;
+X    }
+X#endif
+X
+X    if (ext & SC_DIAGNOSTIC) {
+X      scan_ptr->diag_mode = TRUE;
+X      /* XXX there's probably more to it that just that one line */
+X    }
+X
+X    /*  open the host adapter device (/dev/scsi0) */
+X
+X    if (rc = fp_opendev(scan_ptr->s_dds.parent_devno,
+X			FREAD, NULL, NULL, &scan_ptr->fp)) {
+X#ifdef DEBUG_OPEN
+X      printf("scanopen: fp_opendev of the adapter failed; rc = %d\n", rc);
+X#endif
+X      goto scanopen_exit;	/* open failed, get out of here */
+X    } else {
+X      ++undo;		/* closing the adapter will now be necessary */
+X    }
+X
+X    /*  get the maximum transfer from the host adapter */
+X
+X    if (rc = fp_ioctl(scan_ptr->fp, IOCINFO, &adapter_devinfo, NULL)) {
+X#ifdef DEBUG_OPEN
+X      printf("scanopen: IOCINFO ioctl failed\n");
+X#endif
+X    } else {
+X#ifdef DEBUG_OPEN
+X      printf("scanopen: max transfer is %d\n",
+X	     adapter_devinfo.un.scsi.max_transfer);
+X#endif
+X    }
+X
+X    /*  use the host adapter device driver to send start unit command */
+X
+X    if (rc = fp_ioctl(scan_ptr->fp, SCIOSTART,
+X		      IDLUN(scan_ptr->s_dds.scsi_id,
+X			    scan_ptr->s_dds.lun), NULL)) {
+X#ifdef DEBUG_OPEN
+X      printf("scanopen: fp_ioctl SCIOSTART failed; rc = %d\n", rc);
+X#endif
+X      goto scanopen_exit;	/* ioctl failed, get out of here */
+X    } else {
+X      ++undo;			/* ioctl SCIOSTOP is now necessary */
+X    }
+X
+X    /* on a SC_FORCED_OPEN issue a bus device reset to the scanner */
+X
+X    if (ext & SC_FORCED_OPEN) {
+X#ifdef DEBUG_OPEN
+X	printf("scanopen: SC_FORCED_OPEN detected--sending BDR\n");
+X#endif
+X      if (rc = fp_ioctl(scan_ptr->fp, SCIORESET,
+X			IDLUN(scan_ptr->s_dds.scsi_id,
+X			      scan_ptr->s_dds.lun), NULL)) {
+X#ifdef DEBUG_OPEN
+X	printf("scanopen: BDR failed\n");
+X#endif
+X	goto scanopen_exit;
+X      }
+X    }
+X
+X    /*  pin the bottom half of the device driver  */
+X
+X    if (rc = pincode(scaniodone)) {
+X      goto scanopen_exit;	/* pincode failed, get out of here */
+X    } else {
+X      ++undo;			/* unpincode is now necessary */
+X    }
+X
+X    /*  use the host adapter device driver to send  Test Unit Ready command  */
+X
+X    /* set the async flag if we know the scanner requires it */
+X
+X#ifdef DEBUG_OPEN
+X	printf("scanopen: sending TEST UNIT READY\n", rc);
+X#endif
+X
+X    if (scan_ptr->s_dds.scanner_type == RICOH_FS1  ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UG630 ||
+X	scan_ptr->s_dds.scanner_type == RICOH_IS50 ||
+X	scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC)
+X      scan_ready.flags   = (uchar)SC_ASYNC;
+X    else
+X      scan_ready.flags   = (uchar)0;
+X
+X    for (scan_ptr->tur_count = 0;
+X	 scan_ptr->tur_count < MAX_TUR_RETRIES; scan_ptr->tur_count++) {
+X
+X      scan_ready.scsi_id = scan_ptr->s_dds.scsi_id;
+X      scan_ready.lun_id  = scan_ptr->s_dds.lun;
+X      scan_ready.status_validity = (uchar)0;
+X      scan_ready.scsi_status     = (uchar)0;
+X      scan_ready.rsv1    = (uchar)0;
+X      scan_ready.rsv2    = (uchar)0;
+X      scan_ready.rsv3    = (uchar)0;
+X      scan_ready.rsv4    = (uint)0;
+X
+X      if (rc = fp_ioctl(scan_ptr->fp, SCIOTUR, &scan_ready, NULL)) {
+X	if (rc == ETIMEDOUT) {
+X
+X	  /* retry with the async flag turned on */
+X
+X#ifdef DEBUG_OPEN
+X	  printf("scanopen: setting SC_ASYNC flag\n", rc);
+X#endif
+X	  scan_ready.flags |= SC_ASYNC;
+X	  scan_ptr->retry = TRUE;
+X	  continue;
+X	}
+X#ifdef DEBUG_OPEN
+X	printf("scanopen: fp_ioctl SCIOTUR failed rc = %d\n", rc);
+X#endif
+X
+X	if (scan_ready.scsi_status == SC_CHECK_CONDITION) {
+X#ifdef DEBUG_OPEN
+X	  printf("scanopen: check condition detected, sending request sense\n");
+X#endif
+X	  /* send request sense */
+X	  do_request_sense(scan_ptr);
+X	}
+X#ifdef DEBUG_OPEN
+X	printf("scanopen: retrying fp_ioctl SCIOTUR\n");
+X#endif
+X	delay(100);		/* wait for 1 second between tries */
+X	continue;
+X      } else {
+X	scan_ptr->retry = FALSE;
+X	break;
+X      }
+X    }
+X    if (scan_ptr->tur_count >= MAX_TUR_RETRIES) {
+X#ifdef DEBUG_OPEN
+X      printf("scanopen: Test Unit Ready retries exceeded\n");
+X#endif
+X      goto scanopen_exit;	/* ioctl failed, get out of here */
+X    }
+X
+X    /****  send a Reserve Unit to the scanner  ***/
+X
+X    if (scan_ptr->s_dds.scanner_type != HP_SCANJET_IIC) {
+X#ifdef DEBUG_OPEN
+X      printf("scanopen: sending SCSI_RESERVE_UNIT\n");
+X#endif
+X
+X      scan_ptr->diag_mode = FALSE;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_RESERVE_UNIT, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_OPEN
+X	printf("scanopen: SCSI_RESERVE_UNIT failed\n");
+X	printf("scanopen: sending SCSI_REQUEST_SENSE\n");
+X#endif
+X	/* send request sense */
+X	scan_ptr->check_condition = FALSE;
+X	scan_ptr->retry = TRUE;
+X	scan_ptr->cmd_buf.scsi_buf.scsi_command.flags |= SC_ASYNC;
+X	scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X	scan_scsi_cmd(SCSI_REQUEST_SENSE, scan_ptr);
+X	scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X#ifdef DEBUG_OPEN
+X	printf("scanopen: sense data is 0x%x/0x%x/0x%x\n",
+X	       scan_ptr->rs.sense_key,
+X	       scan_ptr->rs.additional_sense_code,
+X	       scan_ptr->rs.additional_sense_code_qualifier);
+X#endif
+X	scan_ptr->retry = FALSE;
+X	rc = EIO;
+X	goto scanopen_exit;
+X      }
+X#ifdef DEBUG_OPEN
+X      printf("scanopen: SCSI_RESERVE_UNIT ok\n");
+X#endif
+X    }
+X    ++undo;			/* release unit is now necessary */
+X
+X#ifdef DEBUG_SET_WINDOW		/* results visable only on SCSI analyzer */
+X    printf("scanopen: sending SCSI_GET_WINDOW\n");
+X
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X    scan_scsi_cmd(SCSI_GET_WINDOW, scan_ptr);
+X    scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X#endif /* DEBUG_SET_WINDOW */
+X
+X    scan_ptr->triggered = FALSE;
+X    scan_ptr->configured = FALSE;
+X  }
+X
+X  /*   
+X   *  Get out of scanopen() performing any cleanup needed by crapping
+X   *  out in the middle.
+X   *
+X   *  If "rc" has any value other than zero, then something went wrong.
+X   */
+X
+Xscanopen_exit:
+X
+X#ifdef DEBUG_OPEN
+X  printf("scanopen: exiting ");
+X#endif
+X
+X
+X  if (rc == 0) {
+X#ifdef DEBUG_OPEN
+X    printf("sucessfully\n");
+X#endif
+X    scan_ptr->opened = TRUE;
+X    scan_ptr->retain_reservation = (ext & SC_RETAIN_RESERVATION);
+X    scan_ptr->next_opened = scanner_list[scanner_offset].opened_head;
+X    scanner_list[scanner_offset].opened_head = scan_ptr;
+X    unlockl(&scanner_chain_lock);
+X
+X    return (rc);
+X  }
+X
+X#ifdef DEBUG_OPEN
+X  printf("with level %d undo processing\n", undo);
+X#endif
+X
+X  switch (undo) {
+X  case 4:			/* release unit is now necessary */
+X
+X    if (scan_ptr->s_dds.scanner_type != HP_SCANJET_IIC) {
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_RELEASE_UNIT, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X    }
+X    
+X  case 3:			/* unpincode is now necessary */
+X    unpincode(scaniodone);
+X
+X  case 2:			/* ioctl SCIOSTOP is now necessary */
+X    fp_ioctl(scan_ptr->fp, SCIOSTOP,
+X	     IDLUN(scan_ptr->s_dds.scsi_id, scan_ptr->s_dds.lun), NULL);
+X
+X				/* fall through to 1 */
+X
+X  case 1:			/* fp_close() on adapter device */
+X    (void) fp_close(scan_ptr->fp);
+X				/* fall through to 0 */
+X
+X  case 0:			/* release the lock */
+X    unlockl(&scanner_chain_lock);
+X    break;
+X
+X  default:			/* should not be here! */
+X#ifdef DEBUG_OPEN
+X    printf("scanopen: bad undo value: %d\n", undo);
+X#endif
+X    break;
+X  }
+X
+X  return (rc);
+X}
+X
+X/*
+X * scanclose: close routine for scan device driver
+X *
+X * we get here on the last call to close() 
+X * ) find scanner in the opened list
+X * ) eject paper from ADF if appropriate
+X * ) home the carriage on UMAX scanners
+X * ) tell Sharp JX600 to stop if the window is not empty
+X * ) send stop unit & release to the scanner
+X * ) a STOP ioctl is issued to the adapter driver
+X * ) the adapter device is closed
+X * ) clear the "opened" flag
+X * ) unpincode() the bottom half routines
+X */
+X
+Xint
+Xscanclose(dev_t devno, chan_t chan)
+X{
+X  struct scan_df *scan_ptr, *back_ptr;
+X  char scanner_offset;
+X  int undo = 0;
+X  int rc = 0;
+X
+X#ifdef DEBUG_CLOSE
+X  printf("scanclose called ");
+X#endif
+X
+X  scanner_offset = minor(devno) & 0x0f;
+X
+X#ifdef DEBUG_CLOSE
+X  printf("(lock");
+X#endif
+X  (void)lockl(&scanner_chain_lock, LOCK_SHORT);
+X#ifdef DEBUG_CLOSE
+X  printf("ing) ");
+X#endif
+X
+X  scan_ptr = scanner_list[scanner_offset].opened_head;
+X  back_ptr = scan_ptr;
+X  while (scan_ptr != NULL) {
+X    if (scan_ptr->devno == devno)
+X      break;
+X    else {
+X      back_ptr = scan_ptr;
+X      scan_ptr = scan_ptr->next_opened;
+X    }
+X  }
+X  if (scan_ptr == NULL) {	/* scanner not found */
+X#ifdef DEBUG_CLOSE
+X    printf("but the scanner wasn't on the opened list\n");
+X#endif
+X    unlockl(&scanner_chain_lock);
+X    return (ENXIO);
+X  } else {
+X
+X#ifdef DEBUG_CLOSE
+X    printf("\n");
+X#endif
+X
+X    /* remove the scanner from the open list
+X       (it will still be on the defined list) */
+X
+X#ifdef DEBUG_CLOSE
+X    printf("scanclose: taking the scanner off of the open list\n");
+X#endif
+X    if (back_ptr == scan_ptr) {
+X      scanner_list[scanner_offset].opened_head = NULL;
+X    } else {
+X      back_ptr->next_opened = scan_ptr->next_opened;
+X    }
+X
+X    if ((scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X	 scan_ptr->s_dds.scanner_type == IBM_2456    ||
+X	 scan_ptr->s_dds.scanner_type == RICOH_IS50)
+X	&& scan_ptr->adf_state == ADF_CLEANUP) {
+X
+X      /* unload the paper */
+X      scan_ptr->do_unload = TRUE;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_OBJECT_POSITION, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_CLOSE
+X	printf("scanclose: SCSI_OBJECT_POSITION unload failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X      }
+X
+X      scan_ptr->adf_state = ADF_UNUSED;
+X    }
+X
+X    /*
+X     * if there is no paper in the UMAX's ADF send an unload to home
+X     * the carriage.
+X     *
+X     * if there is paper in the UMAX's ADF send an unload to eject
+X     * the paper.
+X     */
+X    if (scan_ptr->triggered) {
+X      if (scan_ptr->s_dds.scanner_type == UMAX_UG630  ||
+X	  scan_ptr->s_dds.scanner_type == UMAX_UC630) {
+X
+X#ifdef DEBUG_CLOSE
+X	printf("scanclose: sending SCSI_OBJECT_POSITION unload\n");
+X#endif
+X	scan_ptr->do_unload = TRUE;
+X
+X	scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X	scan_scsi_cmd(SCSI_OBJECT_POSITION, scan_ptr);
+X	scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X	find_umax(scan_ptr);
+X      }
+X
+X      /*
+X       * If there used to be paper in the ADF and now there's not then the
+X       * last sheet in the ADF just got ejected, so send an unload request
+X       * to home the carriage.
+X       */
+X
+X      if (scan_ptr->using_adf && !umax_has_paper_in_adf(scan_ptr)) {
+X
+X#ifdef DEBUG_CLOSE
+X	printf("scanclose: sending SCSI_OBJECT_POSITION unload\n");
+X#endif
+X	scan_ptr->do_unload = TRUE;
+X
+X	scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X	scan_scsi_cmd(SCSI_OBJECT_POSITION, scan_ptr);
+X	scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X	find_umax(scan_ptr);
+X      }
+X    }
+X
+X    /* if the Sharp has not read all of the data in the active area
+X     * issue a request to stop scanning
+X     */
+X    if (scan_ptr->s_dds.scanner_type == SHARP_JX600 && scan_ptr->window_size) {
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X      scan_ptr->cmd_buf.scsi_buf.scsi_command.flags |= SC_ASYNC;
+X      scan_scsi_cmd(SCSI_SHARP_READ_ABORT, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X    }
+X
+X    /* if the HP ScanJet IIc has not read all of it's data and the ADF
+X     * was the paper source, send an unload request
+X     */
+X    if (scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC &&
+X	scan_ptr->triggered && scan_ptr->using_adf) {
+X      scan_ptr->hp_command = HP_UNLOAD_ADF;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_WRITE, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_CLOSE
+X	printf("scanioctl: SCSI_WRITE of HP_UNLOAD_ADF failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X      }
+X    }
+X
+X    /****  do a release on the scanner	***/
+X
+X    if (scan_ptr->s_dds.scanner_type != HP_SCANJET_IIC) {
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_RELEASE_UNIT, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X    }
+X  }
+X
+X  /****	 do a SCIOSTOP on the adapter device  ***/
+X
+X  rc = fp_ioctl(scan_ptr->fp, SCIOSTOP,
+X		IDLUN(scan_ptr->s_dds.scsi_id,
+X		      scan_ptr->s_dds.lun), NULL);
+X#ifdef DEBUG_CLOSE
+X  if (rc)
+X    printf("scanclose: fp_ioctl SCIOSTOP failed; rc = %d\n", rc);
+X#endif
+X
+X  /**** close the adapter device driver	 ***/
+X
+X  (void)fp_close(scan_ptr->fp);
+X
+X  /****	 clear the opened flag	***/
+X
+X  scan_ptr->opened = FALSE;
+X
+X  rc = unpincode(scaniodone);
+X
+X  unlockl(&scanner_chain_lock);
+X
+X  if (rc) {
+X
+X#ifdef DEBUG_CLOSE
+X    printf("scanclose exiting with return value: %d\n", rc);
+X#endif
+X
+X    return(rc);
+X  } else {
+X
+X#ifdef DEBUG_CLOSE
+X    printf("scanclose exiting successfully\n");
+X#endif
+X
+X    return (0);
+X  }
+X}
+X
+X/*
+X *   scanread: read routine for scan device driver
+X *
+X * (not really a raw interface to a block device at all, but that saves on
+X *  pinned memory)
+X *
+X * basic workflow:
+X *  1 time configure (ususally SET WINDOW operation)
+X *  1 time calculation of how much data there is to move (window size)
+X *  1 time trigger to start scanning (most scanners)
+X *  on all calls convert the uio struct to a scsi buf struct and
+X *     pass the result to the SCSI I/O controller device driver's strategy
+X */
+X
+Xint
+Xscanread(dev_t devno, struct uio *uiop, chan_t chan, int ext)
+X{
+X  struct iovec	  *iov;
+X  struct xmem	  *xmemp;
+X  struct scan_buf *sbp;
+X  struct scan_df  *scan_ptr;
+X  int old_ilevel;
+X  int tries;
+X  ushort lines;
+X
+X  int rc = 0;
+X  int undo = 0;
+X
+X#ifdef DEBUG_READ
+X  printf("scanread called\n");
+X#endif
+X
+X  /* find the scanner in the opened list */
+X
+X  old_ilevel = i_disable(INTIODONE);
+X
+X  scan_ptr = scanner_list[minor(devno) & 0x0F].opened_head;
+X  while (scan_ptr != NULL) {
+X    if (scan_ptr->devno == devno)
+X      break;			/* found it! */
+X    else
+X      scan_ptr = scan_ptr->next_opened;
+X  }
+X  if (scan_ptr == NULL) {
+X#ifdef DEBUG_READ
+X    printf("scanread: can't find the scanner on the opened list\n");
+X#endif
+X    i_enable(old_ilevel);
+X    return(ENXIO);
+X  }
+X
+X  i_enable(old_ilevel);
+X
+X  /* clear the resid out of the uio pointer */
+X  uiop->uio_resid = 0;
+X
+X  if (scan_ptr->configured == FALSE) {
+X
+X    /* ************************************** */
+X    /* initialize the scanner's "active area" */
+X    /* ************************************** */
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_FS1:
+X    case RICOH_IS50:
+X
+X      /****  send a SCSI_MODE_SELECT to scanners that need it ***/
+X
+X#ifdef DEBUG_READ
+X      printf("scanread: sending SCSI_MODE_SELECT\n");
+X#endif
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_MODE_SELECT, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_MODE_SELECT failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	rc = EIO;
+X	goto scanread_exit;
+X      }
+X
+X      if (scan_ptr->adf_state == ADF_ARMED)
+X	scan_ptr->adf_state = ADF_CLEANUP; /* send unload on scanclose() */
+X
+X#ifdef DEBUG_READ
+X      printf("scanread: SCSI_MODE_SELECT ok\n");
+X#endif
+X
+X      /* fall through to SET_WINDOW... */
+X
+X    case FUJITSU:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X
+X#ifdef DEBUG_READ
+X      printf("scanread: sending SCSI_SET_WINDOW\n");
+X#endif
+X
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_SET_WINDOW, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_SET_WINDOW failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	rc = EINVAL;
+X	goto scanread_exit;
+X      }
+X#ifdef DEBUG_READ
+X      printf("scanread: SCSI_SET_WINDOW ok\n");
+X#endif
+X      scan_ptr->configured = TRUE;
+X      rc = 0;
+X      break;
+X
+X    case SHARP_JX600:
+X#ifdef DEBUG_READ
+X      printf("scanread: sending SCSI_WRITE_EXTENDED\n");
+X#endif
+X
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_WRITE_EXTENDED, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_WRITE_EXTENDED failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	rc = EINVAL;
+X	goto scanread_exit;
+X      }
+X      scan_ptr->configured = TRUE;
+X      rc = 0;
+X      break;
+X
+X    case HP_SCANJET_IIC:
+X#ifdef DEBUG_READ
+X      printf("scanread: sending SCSI_WRITE of set_window data\n");
+X#endif
+X
+X      scan_ptr->hp_command = HP_CONFIG;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_WRITE, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_WRITE failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	rc = EINVAL;
+X	goto scanread_exit;
+X      }
+X
+X      scan_ptr->configured = TRUE;
+X      rc = 0;
+X      break;
+X    }
+X  }
+X
+X  /* this section does the */
+X  /* 1 time calculation of how much data there is to move (window size) */
+X  /* and the */
+X  /* 1 time trigger to start scanning (for most scanners) */
+X
+X  if ((scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X       scan_ptr->s_dds.scanner_type == IBM_2456    ||
+X       scan_ptr->s_dds.scanner_type == RICOH_FS1   ||
+X       scan_ptr->s_dds.scanner_type == RICOH_IS50  ||
+X       scan_ptr->s_dds.scanner_type == SHARP_JX600 ||
+X       scan_ptr->s_dds.scanner_type == UMAX_UC630  ||
+X       scan_ptr->s_dds.scanner_type == UMAX_UG630  ||
+X       scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC)
+X      && scan_ptr->triggered == FALSE) {
+X
+X    /*
+X     * deal with the fact that the Sharp JX600S uses 1/25" not 1/1200"
+X     * as its base unit of measurement
+X     */
+X
+X    if (scan_ptr->s_dds.scanner_type == SHARP_JX600) {
+X      scan_ptr->s_dds.window_length /= 48;
+X      scan_ptr->s_dds.window_length *= 48;
+X
+X      scan_ptr->s_dds.window_width /= 48;
+X      scan_ptr->s_dds.window_width *= 48;
+X    }
+X
+X    /*
+X     * deal with the fact that the HP ScanJet IIc uses 1/300" not 1/1200"
+X     * as its base unit of measurement
+X     */
+X
+X    if (scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC) {
+X      scan_ptr->s_dds.window_length /= 4;
+X      scan_ptr->s_dds.window_length *= 4;
+X
+X      scan_ptr->s_dds.window_width /= 4;
+X      scan_ptr->s_dds.window_width *= 4;
+X    }
+X
+X    if ((scan_ptr->s_dds.scanner_type == UMAX_UC630  ||
+X	 scan_ptr->s_dds.scanner_type == UMAX_UG630) &&
+X	scan_ptr->s_dds.image_mode >= GRAYSCALE) {
+X      int row_len;
+X
+X      row_len = calc_umax_row_len(scan_ptr->s_dds.x_resolution,
+X				  scan_ptr->s_dds.window_width);
+X
+X      scan_ptr->window_size = row_len *
+X	((scan_ptr->s_dds.window_length * scan_ptr->s_dds.y_resolution) / 1200);
+X
+X    } else {
+X      scan_ptr->window_size =
+X	window_size(scan_ptr->s_dds.window_width, scan_ptr->s_dds.x_resolution,
+X		    scan_ptr->s_dds.window_length, scan_ptr->s_dds.y_resolution)
+X	  * (scan_ptr->s_dds.image_mode == COLOR ? 3 : 1)
+X	    / (scan_ptr->s_dds.image_mode < GRAYSCALE ? 8 : 1);
+X    }
+X#ifdef DEBUG_READ
+X    printf("scanread: window size = %d\n", scan_ptr->window_size);
+X#endif
+X
+X    /*
+X     * since Ricoh & UMAX scanners in monochrome mode throw away bits at
+X     * the end of a row that exceed the byte boundary, you need to shrink
+X     * the window to reflect the data that are lost by this step
+X     *
+X     * <window size> -= <number of rows> * (<pix per row> - <pix per row> % 8)
+X     */
+X
+X    if (scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X	scan_ptr->s_dds.scanner_type == IBM_2456    ||
+X	scan_ptr->s_dds.scanner_type == RICOH_IS50  ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UC630  ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UG630)
+X      if (scan_ptr->s_dds.image_mode == BINARY_MONOCHROME ||
+X	  scan_ptr->s_dds.image_mode == DITHERED_MONOCHROME) {
+X
+X	int num_rows =
+X	  scan_ptr->s_dds.window_length * scan_ptr->s_dds.y_resolution / 1200;
+X
+X	int bytes_per_row =
+X	  scan_ptr->s_dds.window_width * scan_ptr->s_dds.x_resolution / 9600;
+X
+X	scan_ptr->window_size = num_rows * bytes_per_row;
+X      }
+X
+X#ifdef DEBUG_READ
+X    printf("scanread: window is  %d bytes total\n", scan_ptr->window_size);
+X#endif
+X
+X    /********************************************************************/
+X    /*** end of truncate-to-byte-boundary window size adjustment step ***/
+X    /********************************************************************/
+X
+X
+X    /* do what it takes to trigger the scanning operation */
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case SHARP_JX600:
+X      /* nothing */
+X      break;
+X
+X    case HP_SCANJET_IIC:
+X      /*
+X       * remember if the HP ScanJet IIc had paper in the ADF when the read
+X       * started because if the read is aborted the scanner will not unload
+X       * the ADF
+X       */
+X      if (scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC)
+X	scan_ptr->using_adf = hp_has_paper_in_adf(scan_ptr);
+X
+X      scan_ptr->hp_command = HP_TRIGGER;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_WRITE, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: HP_TRIGGER failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	rc = EIO;
+X	goto scanread_exit;
+X      }
+X#ifdef DEBUG_READ
+X      printf("HP_TRIGGER_SCAN successful\n");
+X#endif
+X      break;
+X
+X    default:
+X
+X#ifdef DEBUG_READ
+X      printf("scanread: sending SCSI_TRIGGER_SCAN\n");
+X#endif
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_TRIGGER_SCAN, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_TRIGGER_SCAN failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	rc = EIO;
+X	goto scanread_exit;
+X      }
+X#ifdef DEBUG_READ
+X      printf("SCSI_TRIGGER_SCAN successful\n");
+X#endif
+X    }
+X
+X    /*
+X     * remember if the UMAX had paper in the ADF when the read started
+X     * because the ADF paper sensor is released at the end of the read
+X     * and we need to know how many unloads to send in order to eject
+X     * the last sheet and home the carriage
+X     */
+X    if (scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UG630) {
+X      find_umax(scan_ptr);
+X      scan_ptr->using_adf = umax_has_paper_in_adf(scan_ptr);
+X    }
+X
+X    scan_ptr->triggered = TRUE;
+X  }
+X
+X  /**********************************/
+X  /*** end of one-time init stuff ***/
+X  /**********************************/
+X
+X  /* ************************************************ */
+X  /* EOF detection for scanners that don't do EOM bit */
+X  /* ************************************************ */
+X
+X  switch (scan_ptr->s_dds.scanner_type) {
+X  case RICOH_IS410:
+X  case RICOH_FS1:
+X  case SHARP_JX600:
+X  case RICOH_IS50:
+X  case IBM_2456:
+X  case UMAX_UC630:
+X  case UMAX_UG630:
+X  case HP_SCANJET_IIC:
+X    if (scan_ptr->window_size <= 0) {
+X      uiop->uio_resid = uiop->uio_iov->iov_len;	/* Sorry, */
+X      uiop->uio_iov++;				/* no data */
+X      uiop->uio_iovcnt--;			/* for you */
+X      uiop->uio_iovdcnt++;			/* today. */
+X
+X      rc = 0;			/* EOF is indicated by no data & no error */
+X      goto scanread_exit;	/* at the same time. */
+X    }
+X  }
+X
+X  /* ***************************************************** */
+X  /* end of EOF section for scanners that don't do EOM bit */
+X  /* ***************************************************** */
+X
+X  /* ******************************* */
+X  /* start of RICOH specific polling */
+X  /* ******************************* */
+X
+X  if (scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X      scan_ptr->s_dds.scanner_type == IBM_2456    ||
+X      scan_ptr->s_dds.scanner_type == RICOH_IS50  ||
+X      scan_ptr->s_dds.scanner_type == RICOH_FS1) {
+X
+X    tries = 10;		/* don't get stuck forever! */
+X
+X    do {
+X
+X      /* if you wait a bit slowpoke scanners perform better */
+X      if (scan_ptr->s_dds.scanner_type == RICOH_IS50)
+X	delay(50);
+X
+X#ifdef DEBUG_READ
+X      printf("scanread: sending SCSI_GET_BUFFER_STATUS\n");
+X#endif
+X
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_GET_BUFFER_STATUS, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_GET_BUFFER_STATUS failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	if (scan_ptr->rs.sense_key == 0x05 &&
+X	    scan_ptr->rs.additional_sense_code == 0x2c) {
+X#ifdef DEBUG_READ
+X	  printf("scanread: command out of sequence\n");
+X#endif
+X	  goto scanread_exit;
+X	}
+X      }
+X
+X      scan_ptr->bytes_ready = 
+X	(scan_ptr->cmd_buf.scsi_buf.bufstruct.b_baddr[9] * 65536)
+X	  + (scan_ptr->cmd_buf.scsi_buf.bufstruct.b_baddr[10] * 256)
+X	    + (scan_ptr->cmd_buf.scsi_buf.bufstruct.b_baddr[11]);
+X#ifdef DEBUG_PERFORMANCE
+X      printf("scanread: %d bytes wanted\n", uiop->uio_iov->iov_len);
+X      printf("scanread: %d bytes ready\n", scan_ptr->bytes_ready);
+X#endif
+X
+X    } while (scan_ptr->bytes_ready == 0 && --tries);
+X
+X    /* ******************************************** */
+X    /* trim transfer down to the data that is ready */
+X    /* ******************************************** */
+X
+X    if (scan_ptr->bytes_ready < uiop->uio_iov->iov_len) {
+X      uiop->uio_resid = uiop->uio_iov->iov_len - scan_ptr->bytes_ready;
+X      uiop->uio_iov->iov_len = scan_ptr->bytes_ready;
+X#ifdef DEBUG_READ
+X      printf("scanread: bytes wanted exceeds bytes ready\n");
+X      printf("scanread: xfer reduced to %d\n", uiop->uio_iov->iov_len);
+X#endif
+X    }
+X  }
+X  /* *********************************** */
+X  /* end of RICOH-specific polling stuff */
+X  /* *********************************** */
+X
+X  /* ***************************************** */
+X  /* trim the transfer down to the window size */
+X  /* ***************************************** */
+X
+X  if (scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X      scan_ptr->s_dds.scanner_type == IBM_2456    ||
+X      scan_ptr->s_dds.scanner_type == RICOH_IS50  ||
+X      scan_ptr->s_dds.scanner_type == UMAX_UC630  ||
+X      scan_ptr->s_dds.scanner_type == UMAX_UG630  ||
+X      scan_ptr->s_dds.scanner_type == RICOH_FS1   ||
+X      scan_ptr->s_dds.scanner_type == SHARP_JX600 ||
+X      scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC) {
+X    if (scan_ptr->window_size < uiop->uio_iov->iov_len) {
+X      uiop->uio_resid += uiop->uio_iov->iov_len - scan_ptr->window_size;
+X      uiop->uio_iov->iov_len = scan_ptr->window_size;
+X#ifdef DEBUG_READ
+X      printf("scanread: bytes wanted exceeds window size\n");
+X      printf("scanread: xfer reduced to %d\n", uiop->uio_iov->iov_len);
+X#endif
+X    }
+X  }
+X
+X  /* ****************************************************** */
+X  /*  trim FS1 transfer down to an even scan line boundary  */
+X  /* ****************************************************** */
+X
+X  /* note: the number 400 is from (1/2000") / (3 bytes-per-pixel) */
+X
+X  if (scan_ptr->s_dds.scanner_type == RICOH_FS1) {
+X    if (uiop->uio_iov->iov_len %
+X	(scan_ptr->s_dds.window_width * scan_ptr->s_dds.x_resolution / 400)) {
+X      uiop->uio_resid += uiop->uio_iov->iov_len %
+X	(scan_ptr->s_dds.window_width * scan_ptr->s_dds.x_resolution / 400);
+X      uiop->uio_iov->iov_len -= uiop->uio_iov->iov_len %
+X	(scan_ptr->s_dds.window_width * scan_ptr->s_dds.x_resolution / 400);
+X#ifdef DEBUG_READ
+X      printf("scanread: a row is %d bytes\n",
+X	     (scan_ptr->s_dds.window_width *
+X	      scan_ptr->s_dds.x_resolution / 400));
+X      printf("scanread: transfer reduced to %d\n", uiop->uio_iov->iov_len);
+X#endif
+X      if (uiop->uio_iov->iov_len <= 0) {
+X#ifdef DEBUG_READ
+X	printf("scanread: the read request was smaller than one row\n");
+X#endif
+X	rc = EINVAL;
+X	goto scanread_exit;
+X      }
+X    }
+X  }
+X
+X
+X  /* ******************************************************** */
+X  /* trim Sharp JX600 read down to an even scan line boundary */
+X  /* ******************************************************** */
+X
+X  if (scan_ptr->s_dds.scanner_type == SHARP_JX600) {
+X
+X    int row_len = scan_ptr->s_dds.window_width * scan_ptr->s_dds.x_resolution;
+X
+X    switch (scan_ptr->s_dds.image_mode) {
+X    case COLOR:
+X      row_len /= 400;
+X      break;
+X    case GRAYSCALE:
+X    case RED:
+X    case GREEN:
+X    case BLUE:
+X      row_len /= 1200;
+X      break;
+X    case BINARY_MONOCHROME:
+X      row_len /= 9600;
+X      break;
+X    }
+X    lines = uiop->uio_iov->iov_len / row_len;
+X
+X    if (lines < 1) {
+X#ifdef DEBUG_READ
+X      printf("scanread: the read request was smaller than one row\n");
+X#endif
+X      rc = EINVAL;
+X      goto scanread_exit;     
+X    }
+X
+X    if (uiop->uio_iov->iov_len % row_len &&
+X	uiop->uio_iov->iov_len > uiop->uio_iov->iov_len % row_len) {
+X      uiop->uio_resid += uiop->uio_iov->iov_len % row_len;
+X      uiop->uio_iov->iov_len -= uiop->uio_iov->iov_len % row_len;
+X#ifdef DEBUG_READ
+X      printf("scanread: a row is %d bytes (# of rows %d)\n", row_len, lines);
+X      printf("scanread: transfer reduced to %d\n", uiop->uio_iov->iov_len);
+X#endif
+X    }
+X  }
+X
+X  /* ************************************************** */
+X  /* trim UMAX reads down to an even scan line boundary */
+X  /* ************************************************** */
+X
+X  if (scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X      scan_ptr->s_dds.scanner_type == UMAX_UG630) {
+X    int row_len;
+X
+X    if (scan_ptr->s_dds.image_mode >= GRAYSCALE)
+X      row_len = calc_umax_row_len(scan_ptr->s_dds.x_resolution,
+X				  scan_ptr->s_dds.window_width);
+X    else
+X      row_len =
+X	scan_ptr->s_dds.window_width * scan_ptr->s_dds.x_resolution / 9600;
+X
+X    if (uiop->uio_iov->iov_len < row_len) {
+X#ifdef DEBUG_READ
+X      printf("scanread: the read request was smaller than one row\n");
+X#endif
+X      rc = EINVAL;
+X      goto scanread_exit;
+X    }
+X
+X    if (uiop->uio_iov->iov_len % row_len) {
+X      uiop->uio_resid += uiop->uio_iov->iov_len % row_len;
+X      uiop->uio_iov->iov_len -= uiop->uio_iov->iov_len % row_len;
+X#ifdef DEBUG_READ
+X      printf("scanread: a row is %d bytes\n", row_len);
+X      printf("scanread: transfer reduced to %d bytes (%d rows)\n",
+X	     uiop->uio_iov->iov_len, uiop->uio_iov->iov_len / row_len);
+X#endif
+X    }
+X  }
+X
+X  /* ***************************************** */
+X  /* end of transfer size re-adjusting section */
+X  /* ***************************************** */
+X
+X  /* **************************************************************** */
+X  /* loop through the iovec's turning them into scsi_buf structs and  */
+X  /* passing the buf structs to the SCSI I/O controller device driver */
+X  /* **************************************************************** */
+X
+X  sbp = &scan_ptr->data_buf;
+X
+X  while (uiop->uio_iovcnt > 0) {
+X
+X    iov = uiop->uio_iov;
+X    xmemp = uiop->uio_xmem;
+X
+X    /* fill out the data_buf struct */
+X
+X    sbp->scsi_buf.bufstruct.b_flags = B_READ;
+X    sbp->scsi_buf.bufstruct.b_forw = (struct buf *)sbp;
+X    sbp->scsi_buf.bufstruct.av_forw = NULL;
+X    sbp->scsi_buf.bufstruct.av_back = NULL;
+X    sbp->scsi_buf.bufstruct.b_iodone = scaniodone;
+X    sbp->scsi_buf.bufstruct.b_back = (struct buf *)sbp;
+X    sbp->scsi_buf.bufstruct.b_vp = NULL;
+X    sbp->scsi_buf.bufstruct.b_dev = scan_ptr->s_dds.parent_devno;
+X    sbp->scsi_buf.bufstruct.b_blkno = 0;
+X    sbp->scsi_buf.bufstruct.b_un.b_addr = iov->iov_base;
+X    sbp->scsi_buf.bufstruct.b_bcount = iov->iov_len;
+X    sbp->scsi_buf.bufstruct.b_error = 0;
+X    sbp->scsi_buf.bufstruct.b_resid = 0;
+X    sbp->scsi_buf.bufstruct.b_work  = 0;
+X    sbp->scsi_buf.bufstruct.b_options = 0;
+X    sbp->scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X    curtime(&sbp->scsi_buf.bufstruct.b_start);
+X
+X    sbp->scan_ptr = scan_ptr;
+X
+X    if (scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC) {
+X      scan_ptr->cmd_state = SCSI_READ;
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_length = (uchar)6;
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_op_code =
+X	SCSI_READ;
+X    } else {
+X      scan_ptr->cmd_state = SCSI_READ_EXTENDED;
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_length = (uchar)10;
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_op_code =
+X	SCSI_READ_EXTENDED;
+X    }
+X
+X    scan_ptr->data_buf.scsi_buf.scsi_command.scsi_id =
+X      (uchar)scan_ptr->s_dds.scsi_id;
+X    scan_ptr->data_buf.scsi_buf.scsi_command.resvd = (uchar)0;
+X
+X    if (scan_ptr->s_dds.scanner_type == RICOH_FS1  ||
+X	scan_ptr->s_dds.scanner_type == RICOH_IS50 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UG630 ||
+X	scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC)
+X      scan_ptr->data_buf.scsi_buf.scsi_command.flags = (uchar)SC_ASYNC;
+X    else
+X      scan_ptr->data_buf.scsi_buf.scsi_command.flags = (uchar)0;
+X
+X    scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.lun =
+X      scan_ptr->s_dds.lun << 5;
+X
+X    /* byte 2 is the data type: 0 for image data, 0x80 for pixel size */
+X    /* except for the Sharp, which uses 0x80 for image data */
+X    if (scan_ptr->s_dds.scanner_type == SHARP_JX600)
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0x80;
+X    else
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] = 0;
+X
+X    /* byte 3 is reserved */
+X    scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] = 0;
+X
+X    /* bytes 4-5 make up the data type qualifier */
+X
+X    /* Fujitsu: 4 must be set to zero; 5 must be the window identifier */
+X    /* RICOH: 4-5 are data type qualifier -- 0 is image data*/
+X    /* Sharp: 4-5 are reserved and must be set to zero */
+X    scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] = 0;
+X    scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0;
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case HP_SCANJET_IIC:
+X      /* only 6 byte read request */
+X      /* bytes 2-4 are for transfer length */
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB2] =
+X	(uchar)((scan_ptr->data_buf.scsi_buf.bufstruct.b_bcount >> 16) & 0xff);
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB3] =
+X	(uchar)((scan_ptr->data_buf.scsi_buf.bufstruct.b_bcount >> 8) & 0xff);
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB4] =
+X	(uchar)(scan_ptr->data_buf.scsi_buf.bufstruct.b_bcount & 0xff);
+X
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB5] = 0;
+X      break;
+X
+X    case SHARP_JX600:
+X      /* reserved */
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB6] = 0;
+X
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB7] =
+X	(uchar)(lines >> 8);
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB8] =
+X	(uchar)(lines & 0xff);
+X      break;
+X
+X    default:
+X      /* bytes 6-8 are for transfer length */
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB6] =
+X	(uchar)((scan_ptr->data_buf.scsi_buf.bufstruct.b_bcount >> 16) & 0xff);
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB7] =
+X	(uchar)((scan_ptr->data_buf.scsi_buf.bufstruct.b_bcount >> 8) & 0xff);
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB8] =
+X	(uchar)(scan_ptr->data_buf.scsi_buf.bufstruct.b_bcount & 0xff);
+X
+X      /* the "control byte" aka vendor unique */
+X      scan_ptr->data_buf.scsi_buf.scsi_command.scsi_cmd.scsi_bytes[SCB9] = 0;
+X    }
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case RICOH_IS410:
+X    case IBM_2456:
+X    case RICOH_FS1:
+X    case RICOH_IS50:
+X    case FUJITSU:
+X    case HP_SCANJET_IIC:
+X      scan_ptr->data_buf.scsi_buf.timeout_value = 15;
+X      break;
+X
+X    case SHARP_JX600:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X      scan_ptr->data_buf.scsi_buf.timeout_value = 90;
+X      break;
+X
+X#ifdef DEBUG_READ
+X    default:
+X      printf("scanread: unknown scanner type\n");
+X#endif
+X    }
+X
+X#ifdef IOSTAT
+X    scan_ptr->scan_dkstat.dk_status |= IOST_DK_BUSY;
+X#endif
+X
+X    /* first pin the user space memory buffer and then xmattach to it */
+X
+X    if ((rc = pinu(sbp->scsi_buf.bufstruct.b_un.b_addr,
+X	 sbp->scsi_buf.bufstruct.b_bcount,
+X	 uiop->uio_segflg)) != 0) {
+X#ifdef DEBUG_READ
+X      printf("scanread: pinu(0x%x, %d, %d) failed\n",
+X	     sbp->scsi_buf.bufstruct.b_un.b_addr,
+X	     sbp->scsi_buf.bufstruct.b_bcount,
+X	     uiop->uio_segflg);
+X#endif
+X      goto scanread_exit;
+X    }
+X    ++undo;			/* unpinu is now necessary */
+X
+X
+X    /* xmattach to the user proc's buffer */
+X
+X    sbp->scsi_buf.bufstruct.b_xmemd.aspace_id = XMEM_INVAL;
+X    if (xmattach(iov->iov_base, iov->iov_len, &sbp->scsi_buf.bufstruct.b_xmemd,
+X	     uiop->uio_segflg) != XMEM_SUCC) {
+X#ifdef DEBUG_READ
+X      printf("scanread: xmattach(%d, %d, %d, %d) failed\n",
+X	     iov->iov_base, iov->iov_len,
+X	     &sbp->scsi_buf.bufstruct.b_xmemd, uiop->uio_segflg);
+X#endif
+X      rc = EFAULT;
+X      goto scanread_exit;
+X    }
+X    ++undo;			/* xmdetach is now necessary */
+X
+X    devstrat((struct buf *)sbp);
+X    scanwait((struct buf *)sbp);
+X
+X/*
+X *  post processing: convert the buf struct back into a uio struct
+X */
+X
+X    uiop->uio_resid += sbp->scsi_buf.bufstruct.b_resid;
+X
+X/*
+X * reduce the byte count in "window_size" (check for underflows)
+X */
+X
+X    if (scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X	scan_ptr->s_dds.scanner_type == IBM_2456) {
+X      if (iov->iov_len - uiop->uio_resid <= 0)
+X	if (scan_ptr->bytes_ready <= scan_ptr->window_size)
+X	  scan_ptr->window_size -= scan_ptr->bytes_ready;
+X	else
+X	  scan_ptr->window_size = 0;
+X      else
+X	scan_ptr->window_size -= (iov->iov_len - uiop->uio_resid);
+X#ifdef DEBUG_READ
+X      printf("scanread: window now has %d bytes\n", scan_ptr->window_size);
+X#endif
+X    }
+X
+X    if (scan_ptr->s_dds.scanner_type == RICOH_FS1  ||
+X	scan_ptr->s_dds.scanner_type == RICOH_IS50 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UG630 ||
+X	scan_ptr->s_dds.scanner_type == SHARP_JX600) {
+X      scan_ptr->window_size -= iov->iov_len;
+X#ifdef DEBUG_READ
+X      printf("scanread: iov_len:%d  resid:%d\n", iov->iov_len, uiop->uio_resid);
+X      printf("scanread: window now has %d bytes\n", scan_ptr->window_size);
+X#endif
+X    }
+X
+X#ifdef IOSTAT
+X    scan_ptr->scan_dkstat.dk_rblks +=
+X	(iov->iov_len - sbp->scsi_buf.bufstruct.b_resid);
+X
+X    ++scan_ptr->scan_dkstat.dk_xfers;
+X#endif
+X
+X    xmdetach(&sbp->scsi_buf.bufstruct.b_xmemd);
+X    --undo;
+X
+X    unpinu(sbp->scsi_buf.bufstruct.b_un.b_addr,
+X	   sbp->scsi_buf.bufstruct.b_bcount,
+X	   uiop->uio_segflg);
+X    --undo;
+X
+X#ifdef DEBUG_PIN
+X    printf("scanread: unpinu(0x%x, %d, %d)\n",
+X	   sbp->scsi_buf.bufstruct.b_un.b_addr,
+X	   sbp->scsi_buf.bufstruct.b_bcount,
+X	   uiop->uio_segflg);
+X#endif
+X
+X    if (scan_ptr->check_condition) {	     /* test for EOM condition */
+X      scan_ptr->check_condition = FALSE;
+X      scan_ptr->retry = TRUE;		     /* error recovery is happening */
+X
+X      scan_scsi_cmd(SCSI_REQUEST_SENSE, scan_ptr); 
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X#ifdef DEBUG_READ
+X      printf("scanread: EOM test. error code 0x%x; sense key is 0x%x\n",
+X	     scan_ptr->rs.err_code, scan_ptr->rs.sense_key);
+X#endif
+X
+X      if (scan_ptr->rs.sense_key & EOM_BIT) { /* EOM detected, no more data */
+X	rc = 0;
+X	goto scanread_exit;
+X      }
+X
+X      if (scan_ptr->rs.sense_key & ILI_BIT) { /* EOM UMAX style */
+X#ifdef DEBUG_READ
+X	printf("scanread: oops! ILI detected\n");
+X	if (scan_ptr->rs.err_code & 0x80)
+X	  printf("scanread: you tried to read %d too much\n",
+X		 (scan_ptr->rs.info1 * 65536 +
+X		  scan_ptr->rs.info2 * 256 +
+X		  scan_ptr->rs.info3));
+X#endif
+X	rc = EIO;
+X	goto scanread_exit;
+X      }
+X
+X      if (scan_ptr->rs.sense_key == 0) { /* no error? */
+X	rc = 0;
+X	goto scanread_exit;
+X      }
+X
+X      rc = EIO;
+X      goto scanread_exit;
+X    }
+X
+X    if (scan_ptr->adapter_error) {
+X#ifdef DEBUG_READ
+X      printf("scanread: adapter error -- aborting\n");
+X#endif
+X      scan_ptr->retry = TRUE;		     /* error recovery is happening */
+X      scan_ptr->adapter_error = FALSE;
+X      rc = EIO;
+X      goto scanread_exit;
+X    }
+X
+X    uiop->uio_iov++;
+X    uiop->uio_iovcnt--;
+X    uiop->uio_iovdcnt++;
+X  }
+X
+Xscanread_exit:
+X
+X  if (rc == 0) {
+X#ifdef DEBUG_READ
+X    printf("scanread: exiting ok\n");
+X#endif
+X    return (0);
+X  }
+X
+X  switch (undo) {
+X  case 2:			/* xmdetach is now necessary */
+X    xmdetach(&sbp->scsi_buf.bufstruct.b_xmemd);
+X
+X    /* fall through... */
+X
+X  case 1:			/* unpinu is now necessary */
+X
+X    unpinu(sbp->scsi_buf.bufstruct.b_un.b_addr,
+X	   sbp->scsi_buf.bufstruct.b_bcount,
+X	   uiop->uio_segflg);
+X#ifdef DEBUG_PIN
+X    printf("scanread unpinu(0x%x, %d, %d)\n",
+X	   sbp->scsi_buf.bufstruct.b_un.b_addr,
+X	   sbp->scsi_buf.bufstruct.b_bcount,
+X	   uiop->uio_segflg);
+X#endif
+X    break;
+X
+X  default:
+X#ifdef DEBUG_READ
+X    printf("scanread: exiting with level %d undo processing\n", undo);
+X    printf("scanread: returning %d\n", rc);
+X#endif
+X    break;
+X  }
+X
+X  return(rc);
+X
+X}
+X
+X
+X/*
+X *   scanioctl: ioctl routine for scan device driver
+X */
+X
+Xint
+Xscanioctl(dev_t devno, int cmd, int arg, ulong devflag, chan_t chan, int ext)
+X{
+X  struct scan_df *scan_ptr;
+X  struct scan_io s_io;
+X  struct scan_pixel_sizes pix_size;
+X  struct sc_readblk rdblk;
+X  char scanner_offset;
+X  uchar undo = 0;
+X  int rc = 0;
+X
+X#ifdef DEBUG_IOCTL
+X  printf("scanioctl called, cmd = %d ", cmd);
+X#endif
+X
+X  /****	 locate scanner struct	***/
+X
+X#ifdef DEBUG_IOCTL
+X  printf("(lock");
+X#endif
+X  (void)lockl(&scanner_chain_lock, LOCK_SHORT); /* unlockl() is now necessary*/
+X#ifdef DEBUG_IOCTL
+X  printf("ing)\n");
+X#endif
+X
+X  scanner_offset = minor(devno) & 0x0f;
+X  scan_ptr = scanner_list[scanner_offset].defined_head;
+X  while (scan_ptr != NULL) {
+X    if (scan_ptr->devno == devno)
+X      break;
+X    else
+X      scan_ptr = scan_ptr->next_defined;
+X  }
+X  if (scan_ptr == NULL) {
+X#ifdef DEBUG_IOCTL
+X    printf("but the scanner couldn't be found\n");
+X#endif
+X    unlockl(&scanner_chain_lock);
+X    return (ENODEV);	      /* can't find the scanner in the defined list */
+X  }
+X
+X  unlockl(&scanner_chain_lock);
+X#ifdef DEBUG_IOCTL
+X    printf("(unlocked)\n");
+X#endif
+X
+X  switch (cmd) {
+X  case SCAN_GET:
+X    s_io.scan_window_width  = scan_ptr->s_dds.window_width;
+X    s_io.scan_window_length = scan_ptr->s_dds.window_length;
+X    s_io.scan_x_resolution  = scan_ptr->s_dds.x_resolution;
+X    s_io.scan_y_resolution  = scan_ptr->s_dds.y_resolution;
+X    s_io.scan_x_origin	    = scan_ptr->s_dds.x_origin;
+X    s_io.scan_y_origin	    = scan_ptr->s_dds.y_origin;
+X    s_io.scan_image_mode    = scan_ptr->s_dds.image_mode;
+X    s_io.scan_brightness    = scan_ptr->s_dds.brightness;
+X    s_io.scan_contrast      = scan_ptr->s_dds.contrast;
+X    s_io.scan_scanner_type  = scan_ptr->s_dds.scanner_type;
+X
+X    if (devflag & FKERNEL) {			 /* kernel process */
+X      bcopy(&s_io, (caddr_t)arg,  sizeof(s_io));
+X      return (0);
+X    } else {					 /* user process */
+X      return
+X	(copyout(&s_io, (caddr_t)arg, sizeof(s_io)));
+X    }
+X
+X  case SCAN_SET:
+X    if (devflag & FKERNEL) {			 /* kernel process */
+X      bcopy((caddr_t)arg, &s_io, sizeof(s_io));
+X    } else {					 /* user process */
+X      rc = copyin((caddr_t)arg, &s_io, sizeof(s_io));
+X      if (rc)
+X	return (rc);
+X    }
+X
+X#ifdef DEBUG_IOCTL
+X    printf("scanioctl: w/l/x/y are %d/%d/%d/%d\n",
+X	   s_io.scan_window_width,
+X	   s_io.scan_window_length,
+X	   s_io.scan_x_origin,
+X	   s_io.scan_y_origin);
+X    printf("scanioctl: data size is %d\n",
+X	   (s_io.scan_window_width / 1200) * s_io.scan_x_resolution *
+X	   (s_io.scan_window_length / 1200) * s_io.scan_y_resolution);
+X#endif
+X
+X
+X    /****  Validate parameters  ***/
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case FUJITSU:
+X
+X      /* size constraints... (these values are taken from the OEM manual) */
+X
+X      if (s_io.scan_window_width <= 0				||
+X	  s_io.scan_x_origin + s_io.scan_window_width > 14592	|| /* 12.16" */
+X	  s_io.scan_window_length <= 0				||
+X	  s_io.scan_y_origin + s_io.scan_window_length > 20736)	   /* 17.28" */
+X	return (EINVAL);
+X
+X      /* Fujitsu can only handle 4 Meg windows max */
+X
+X      if ((s_io.scan_window_width / 1200) * s_io.scan_x_resolution *
+X	  (s_io.scan_window_length / 1200) * s_io.scan_y_resolution
+X	  > (s_io.scan_image_mode == GRAYSCALE ? 4063232 : 32505856))
+X	return (EINVAL);
+X
+X      switch (s_io.scan_x_resolution) {
+X      case 200:
+X      case 240:
+X      case 300:
+X      case 400:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      switch (s_io.scan_y_resolution) {
+X      case 200:
+X      case 240:
+X      case 300:
+X      case 400:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      switch (s_io.scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac FUJITSU */
+X
+X    case RICOH_IS410:
+X    case IBM_2456:
+X
+X      /* size constraints... */
+X
+X      if (s_io.scan_window_width <= 0				||
+X	  s_io.scan_x_origin + s_io.scan_window_width > 13800	|| /* 11.5" */
+X	  s_io.scan_window_length <= 0				||
+X	  s_io.scan_y_origin + s_io.scan_window_length > 20400)    /* 17" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io.scan_x_resolution < 100 || s_io.scan_x_resolution > 400 ||
+X	  s_io.scan_y_resolution < 100 || s_io.scan_y_resolution > 400)
+X	return (EINVAL);
+X
+X      switch (s_io.scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac RICOH_IS410 (IBM_2456) */
+X
+X    case RICOH_FS1:
+X
+X      /* size constraints... */
+X
+X      if (s_io.scan_window_width <= 0				||
+X	  s_io.scan_x_origin + s_io.scan_window_width > 10500	|| /* 8.75" */
+X	  s_io.scan_window_length <= 0				||
+X	  s_io.scan_y_origin + s_io.scan_window_length > 14400)   /* 12" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      switch (s_io.scan_x_resolution) {
+X      case 120:
+X      case 200:
+X      case 240:
+X      case 300:
+X      case 400:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      switch (s_io.scan_y_resolution) {
+X      case 120:
+X      case 200:
+X      case 240:
+X      case 300:
+X      case 400:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      if (s_io.scan_image_mode != COLOR)
+X	return (EINVAL);
+X
+X      break;			/* esac RICOH_FS1 */
+X
+X    case SHARP_JX600:
+X
+X      /* size constraints... */
+X
+X      if (s_io.scan_window_width <= 0		||
+X	  s_io.scan_x_origin
+X	  + s_io.scan_window_width > 14208	|| /* 11.84" (296 25ths) */
+X	  s_io.scan_window_length <= 0		||
+X	  s_io.scan_y_origin
+X	  + s_io.scan_window_length > 20880) /* 17.40" (435 25ths) */
+X	return (EINVAL);
+X
+X      switch (s_io.scan_x_resolution) {
+X      case 75:
+X      case 100:
+X      case 150:
+X      case 200:
+X      case 300:
+X      case 400:
+X      case 600:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      switch (s_io.scan_y_resolution) {
+X      case 75:
+X      case 100:
+X      case 150:
+X      case 200:
+X      case 300:
+X      case 400:
+X      case 600:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      switch (s_io.scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case GRAYSCALE:
+X      case COLOR:
+X      case RED:
+X      case GREEN:
+X      case BLUE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac SHARP_JX600 */
+X
+X
+X    case RICOH_IS50:
+X
+X      /* size constraints... */
+X
+X      if (s_io.scan_window_width <= 0				||
+X	  s_io.scan_x_origin + s_io.scan_window_width > 10200	|| /* 8.5" */
+X	  s_io.scan_window_length <= 0				||
+X	  s_io.scan_y_origin + s_io.scan_window_length > 16800)   /* 14" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io.scan_x_resolution < 100 || s_io.scan_x_resolution > 400 ||
+X	  s_io.scan_y_resolution < 100 || s_io.scan_y_resolution > 400)
+X	return (EINVAL);
+X
+X      switch (s_io.scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac RICOH_IS50 */
+X
+X    case UMAX_UC630:
+X      
+X      /* size constraints... */
+X
+X      if (s_io.scan_window_width <= 0				||
+X	  s_io.scan_x_origin + s_io.scan_window_width > 10200	|| /* 8.5" */
+X	  s_io.scan_window_length <= 0				||
+X	  s_io.scan_y_origin +  s_io.scan_window_length > 16800)   /* 14" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io.scan_x_resolution < 100 || s_io.scan_x_resolution > 300 ||
+X	  s_io.scan_y_resolution < 100 || s_io.scan_y_resolution > 600)
+X	return (EINVAL);
+X
+X      switch (s_io.scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X      case RED:
+X      case GREEN:
+X      case BLUE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac UMAX UC630 */
+X
+X    case UMAX_UG630:
+X      
+X      /* size constraints... */
+X
+X      if (s_io.scan_window_width <= 0				||
+X	  s_io.scan_x_origin + s_io.scan_window_width > 10200	|| /* 8.5" */
+X	  s_io.scan_window_length <= 0				||
+X	  s_io.scan_y_origin + s_io.scan_window_length > 16800)   /* 14" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io.scan_x_resolution < 100 || s_io.scan_x_resolution > 300 ||
+X	  s_io.scan_y_resolution < 100 || s_io.scan_y_resolution > 300)
+X	return (EINVAL);
+X
+X      switch (s_io.scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;			/* esac UMAX UG630 */
+X
+X    case HP_SCANJET_IIC:
+X      if (s_io.scan_window_width <= 0				||
+X	  s_io.scan_x_origin + s_io.scan_window_width > 10200	|| /* 8.5" */
+X	  s_io.scan_window_length <= 0				||
+X	  s_io.scan_y_origin + s_io.scan_window_length > 16800)   /* 14" */
+X	return (EINVAL);
+X
+X      /* resolution (dpi)... */
+X
+X      if (s_io.scan_x_resolution < 100 || s_io.scan_x_resolution > 400 ||
+X	  s_io.scan_y_resolution < 100 || s_io.scan_y_resolution > 400)
+X	return (EINVAL);
+X
+X      switch (s_io.scan_image_mode) {
+X      case BINARY_MONOCHROME:
+X      case DITHERED_MONOCHROME:
+X      case GRAYSCALE:
+X      case COLOR:
+X	break;
+X      default:
+X	return (EINVAL);
+X      }
+X
+X      break;
+X
+X#ifdef DEBUG_IOCTL
+X    default:
+X      printf("scanioctl: unsupported scanner type: %d\n",
+X	     scan_ptr->s_dds.scanner_type);
+X#endif
+X    }
+X
+X    /****  change the DDS to the new values  ***/
+X
+X    scan_ptr->s_dds.window_width  = s_io.scan_window_width;
+X    scan_ptr->s_dds.window_length = s_io.scan_window_length;
+X    scan_ptr->s_dds.x_resolution  = s_io.scan_x_resolution;
+X    scan_ptr->s_dds.y_resolution  = s_io.scan_y_resolution;
+X    scan_ptr->s_dds.x_origin	  = s_io.scan_x_origin;
+X    scan_ptr->s_dds.y_origin	  = s_io.scan_y_origin;
+X    scan_ptr->s_dds.image_mode	  = s_io.scan_image_mode;
+X    scan_ptr->s_dds.brightness    = s_io.scan_brightness;
+X    scan_ptr->s_dds.contrast      = s_io.scan_contrast;
+X
+X    /****  do what it takes to actualize the new values  ***/
+X
+X    /* if the scanner is currently reading data don't change the
+X     * parameters since many scanners will break out of read-mode
+X     */
+X    if (scan_ptr->configured == TRUE) /* configured flag gets set when */
+X      break;                          /* scanner enters read-mode */
+X
+X    switch (scan_ptr->s_dds.scanner_type) {
+X    case RICOH_IS410:		/* support for scanners that need */
+X    case IBM_2456:		/* ADF mode to be set in firmware */
+X    case RICOH_IS50:
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X      scan_scsi_cmd(SCSI_MODE_SELECT, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_MODE_SELECT failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	return (EIO);
+X      }
+X      /* fall through */
+X
+X    case RICOH_FS1:
+X    case FUJITSU:
+X    case UMAX_UC630:
+X    case UMAX_UG630:
+X
+X      /****  send a SCSI_SET_WINDOW ***/
+X
+X#ifdef DEBUG_IOCTL
+X      printf("scanioctl: sending SCSI_SET_WINDOW\n");
+X#endif
+X
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_SET_WINDOW, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_READ
+X	printf("scanread: SCSI_SET_WINDOW failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	return (EIO);
+X      }
+X#ifdef DEBUG_IOCTL
+X      printf("scanioctl: SCSI_SET_WINDOW ok\n");
+X#endif
+X      break;
+X
+X    case SHARP_JX600:
+X      
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_WRITE_EXTENDED, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_IOCTL
+X	printf("scanioctl: SCSI_WRITE_EXTENDED failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	return (EIO);
+X      }
+X
+X      break;
+X
+X    case HP_SCANJET_IIC:
+X      scan_ptr->hp_command = HP_CONFIG;
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X      scan_scsi_cmd(SCSI_WRITE, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_IOCTL
+X	printf("scanioctl: SCSI_WRITE failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	return (EIO);
+X      }
+X
+X      break;
+X
+X#ifdef DEBUG_IOCTL
+X    default:
+X      printf("scanioctl: unsupported scanner type: %d\n",
+X	     scan_ptr->s_dds.scanner_type);
+X#endif
+X    }
+X
+X    break;
+X
+X  case SCAN_USE_ADF:
+X    /* Do what it takes to make the next read come from the ADF.
+X     * If the ADF is not ready (i.e. empty or jammed) return EIO.
+X     * If the scanner is in read-mode return EINVAL.
+X     */
+X
+X    /* if the scanner is currently reading data don't change the
+X     * paper since many scanners will break out of read-mode
+X     */
+X    if (scan_ptr->configured == TRUE &&
+X	scan_ptr->window_size > 0)
+X      return (EINVAL);
+X
+X#ifdef DEBUG_IOCTL
+X    printf("scanioctl: sending SCSI_OBJECT_POSITION unload\n");
+X#endif
+X
+X    /* UMAX UC630/UG630 just tests ADF for paper */
+X    if (scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UG630) {
+X      if (umax_has_paper_in_adf(scan_ptr))
+X	return (0);
+X      else
+X	return (EIO);
+X    }
+X
+X    /* HP ScanJet IIc just tests ADF to see if it is ready */
+X    if (scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC) {
+X      if (hp_has_paper_in_adf(scan_ptr))
+X	return (0);
+X      else
+X	return (EIO);
+X    }
+X
+X    if (scan_ptr->s_dds.scanner_type == RICOH_IS410 ||
+X	scan_ptr->s_dds.scanner_type == IBM_2456 ||
+X	scan_ptr->s_dds.scanner_type == RICOH_IS50) {
+X
+X      scan_ptr->adf_state = ADF_ARMED;
+X
+X      scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X      scan_scsi_cmd(SCSI_MODE_SELECT, scan_ptr);
+X      scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X      if (scan_ptr->check_condition) {
+X#ifdef DEBUG_IOCTL
+X	printf("scanioctl: SCSI_MODE_SELECT failed\n");
+X#endif
+X	do_request_sense(scan_ptr);
+X
+X	return (EIO);
+X      }
+X    }
+X
+X    /*
+X     * Note that the SCSI_OBJECT_POSITION command will automatically toggle
+X     * between the "unload" and "load" states, so just call it twice to
+X     * get the whole job done.
+X     */
+X
+X    /* unload the paper */
+X    scan_ptr->do_unload = TRUE;
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X    scan_scsi_cmd(SCSI_OBJECT_POSITION, scan_ptr);
+X    scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X    if (scan_ptr->check_condition) {
+X#ifdef DEBUG_IOCTL
+X      printf("scanioctl: SCSI_OBJECT_POSITION unload failed\n");
+X#endif
+X      do_request_sense(scan_ptr);
+X    }
+X
+X#ifdef DEBUG_IOCTL
+X    printf("scanioctl: sending SCSI_OBJECT_POSITION load\n");
+X#endif
+X
+X    /* load the paper */
+X    scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X    scan_scsi_cmd(SCSI_OBJECT_POSITION, scan_ptr);
+X    scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X    if (scan_ptr->check_condition) {
+X#ifdef DEBUG_IOCTL
+X      printf("scanioctl: SCSI_OBJECT_POSITION failed\n");
+X#endif
+X      do_request_sense(scan_ptr);
+X
+X      scan_ptr->adf_state = ADF_UNUSED;
+X      return (EIO);
+X    }
+X    scan_ptr->adf_state = ADF_ARMED;
+X    break;
+X
+X  case SCAN_GET_PIXEL_SIZE:
+X    if (scan_ptr->s_dds.scanner_type == SHARP_JX600) {
+X      scan_ptr->s_dds.window_length /= 48;
+X      scan_ptr->s_dds.window_length *= 48;
+X
+X      scan_ptr->s_dds.window_width /= 48;
+X      scan_ptr->s_dds.window_width *= 48;
+X    }
+X    if ((scan_ptr->s_dds.scanner_type == UMAX_UC630 ||
+X	scan_ptr->s_dds.scanner_type == UMAX_UG630) &&
+X	scan_ptr->s_dds.image_mode >= GRAYSCALE)
+X      pix_size.pix_width = calc_umax_row_len(scan_ptr->s_dds.x_resolution,
+X					     scan_ptr->s_dds.window_width);
+X    else {
+X      pix_size.pix_width = (scan_ptr->s_dds.window_width
+X			    * scan_ptr->s_dds.x_resolution
+X			    / 1200);
+X
+X      if (scan_ptr->s_dds.image_mode < GRAYSCALE) {
+X	if (scan_ptr->s_dds.scanner_type == FUJITSU ||/* pad to byte boundary */
+X	    scan_ptr->s_dds.scanner_type == HP_SCANJET_IIC)
+X	  pix_size.pix_width = (pix_size.pix_width + 7) / 8;
+X	else			                /* truncate to byte boundary */
+X	  pix_size.pix_width /= 8;
+X	pix_size.pix_width *= 8;
+X      }
+X    }
+X    pix_size.pix_height = (scan_ptr->s_dds.window_length
+X			   * scan_ptr->s_dds.y_resolution
+X			   / 1200);
+X
+X    if (devflag & FKERNEL) {			 /* kernel process */
+X      bcopy(&pix_size, (caddr_t)arg,  sizeof(pix_size));
+X      return (0);
+X    } else {					 /* user process */
+X      return (copyout(&pix_size, (caddr_t)arg, sizeof(pix_size)));
+X    }
+X    break;
+X
+X  default:
+X    return (EINVAL);
+X  }
+X
+X#ifdef DEBUG_IOCTL
+X  printf("scanioctl exiting successfully\n");
+X#endif
+X
+X  return (0);
+X}
+X
+X#ifdef DEBUG_UIO
+Xprint_uio(struct uio *uiop)
+X{
+X  printf("uiop->uio_iov->iov_base = 0x%x\n", uiop->uio_iov->iov_base);
+X  printf("uiop->uio_iov->iov_len  = %d\n",   uiop->uio_iov->iov_len);
+X  printf("uiop->uio_iovcnt  = %d\n", uiop->uio_iovcnt);
+X  printf("uiop->uio_iovdcnt = %d\n", uiop->uio_iovdcnt);
+X  printf("uiop->uio_offset  = %d\n", uiop->uio_offset);
+X  printf("uiop->uio_resid   = %d\n", uiop->uio_resid);
+X}
+X#endif
+X
+Xint calc_umax_row_len(int dpi, int ww)
+X{
+X  int st[301];
+X  int i;
+X  int rowB = 0;
+X
+X  for (i = 1; i <= 300; i++)
+X    st[i] = 1;
+X
+X  for (i = 1; i <= 300 - dpi; i++)
+X    st[i * 300 / (300 - dpi)] = 0;
+X
+X  for (i = 1; i <= (ww % 1200) / 4; i++) {
+X    if (st[i])
+X      rowB++;
+X  }
+X
+X  return ((ww / 1200) * dpi + rowB);
+X}
+X
+Xint umax_has_paper_in_adf(struct scan_df *scan_ptr)
+X{
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X  scan_scsi_cmd(SCSI_INQUIRY, scan_ptr);
+X  scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X  if (scan_ptr->inq.device_type_qualifier == 1)
+X    return (1);			/* paper in ADF */
+X  else
+X    return (0);			/* no paper in ADF */
+X}
+X
+X
+X/*
+X * since UMAX scanners return an "operation complete" message even before
+X * finishing an unload or trigger operation, poll the scanner with TEST
+X * UNIT READY until it's really done and comes back online.
+X */
+X
+Xvoid find_umax(struct scan_df *scan_ptr)
+X{
+X  struct sc_ready scan_ready;
+X  int rc;
+X
+X  do {
+X    scan_ready.flags   = (uchar)SC_ASYNC;
+X    scan_ready.scsi_id = scan_ptr->s_dds.scsi_id;
+X    scan_ready.lun_id  = scan_ptr->s_dds.lun;
+X    scan_ready.status_validity = (uchar)0;
+X    scan_ready.scsi_status     = (uchar)0;
+X    scan_ready.rsv1    = (uchar)0;
+X    scan_ready.rsv2    = (uchar)0;
+X    scan_ready.rsv3    = (uchar)0;
+X    scan_ready.rsv4    = (uint)0;
+X    if (rc = fp_ioctl(scan_ptr->fp, SCIOTUR, &scan_ready, NULL)) {
+X      scan_ptr->retry = TRUE;
+X      delay(100);
+X    } else
+X      scan_ptr->retry = FALSE;
+X  } while (rc);
+X}
+X
+Xvoid do_request_sense(struct scan_df *scan_ptr)
+X{
+X#ifdef DEBUG_REQUEST_SENSE
+X  printf("do_request_sense: sending SCSI_REQUEST_SENSE\n");
+X#endif
+X  scan_ptr->check_condition = FALSE;
+X  scan_ptr->retry = TRUE;
+X  scan_ptr->cmd_buf.scsi_buf.scsi_command.flags |= SC_ASYNC;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X  scan_scsi_cmd(SCSI_REQUEST_SENSE, scan_ptr); 
+X  scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X#ifdef DEBUG_REQUEST_SENSE
+X  printf("do_request_sense: sense data is 0x%x/0x%x/0x%x\n",
+X	 scan_ptr->rs.sense_key,
+X	 scan_ptr->rs.additional_sense_code,
+X	 scan_ptr->rs.additional_sense_code_qualifier);
+X#endif
+X  scan_ptr->retry = FALSE;
+X}
+X
+Xint hp_has_paper_in_adf(struct scan_df *scan_ptr)
+X{
+X  scan_ptr->hp_command = HP_PAPER_SENSE;
+X  scan_ptr->cmd_buf.scsi_buf.scsi_command.flags |= SC_ASYNC;
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X  scan_scsi_cmd(SCSI_WRITE, scan_ptr);
+X  scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X  if (scan_ptr->check_condition) {
+X    do_request_sense(scan_ptr);
+X  }
+X
+X  scan_ptr->cmd_buf.scsi_buf.bufstruct.b_event = EVENT_NULL;
+X
+X  scan_scsi_cmd(SCSI_READ, scan_ptr);
+X  scanwait(&scan_ptr->cmd_buf.scsi_buf.bufstruct);
+X
+X  if (scan_ptr->check_condition) {
+X    do_request_sense(scan_ptr);
+X  }
+X
+X#ifdef DEBUG_IOCTL
+X  printf("scanioctl: hp_response is:  ");
+X  {
+X    int i = 0;
+X    while (scan_ptr->hp_response[i]) {
+X      if (scan_ptr->hp_response[i] == 033)
+X	printf("[esc]");
+X      else
+X	printf("%c", scan_ptr->hp_response[i]);
+X      ++i;
+X      if (i == 10)
+X	break;
+X    }
+X    printf("\n");
+X  }
+X#endif
+X  if (scan_ptr->hp_response[8] == '1')
+X    return (1);			/* paper present & ready */
+X  else
+X    return (0);			/* no paper, or ADF not ready */
+X}
+END_OF_FILE
+if test 74576 -ne `wc -c <'pint/ibm/scandd.t.c'`; then
+    echo shar: \"'pint/ibm/scandd.t.c'\" unpacked with wrong size!
+fi
+# end of 'pint/ibm/scandd.t.c'
+fi
+echo shar: End of archive 6 \(of 7\).
+cp /dev/null ark6isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 7 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

@@ -1,0 +1,1713 @@
+Newsgroups: comp.sources.unix
+From: dbell@pdact.pd.necisa.oz.au (David I. Bell)
+Subject: v26i045: CALC - An arbitrary precision C-like calculator, Part19/21
+Sender: unix-sources-moderator@pa.dec.com
+Approved: vixie@pa.dec.com
+
+Submitted-By: dbell@pdact.pd.necisa.oz.au (David I. Bell)
+Posting-Number: Volume 26, Issue 45
+Archive-Name: calc/part19
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 19 (of 21)."
+# Contents:  codegen.c
+# Wrapped by dbell@elm on Tue Feb 25 15:21:17 1992
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'codegen.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'codegen.c'\"
+else
+echo shar: Extracting \"'codegen.c'\" \(35857 characters\)
+sed "s/^X//" >'codegen.c' <<'END_OF_FILE'
+X/*
+X * Copyright (c) 1992 David I. Bell
+X * Permission is granted to use, distribute, or modify this source,
+X * provided that this copyright notice remains intact.
+X *
+X * Module to generate opcodes from the input tokens.
+X */
+X
+X#include "calc.h"
+X#include "token.h"
+X#include "symbol.h"
+X#include "label.h"
+X#include "opcodes.h"
+X#include "string.h"
+X#include "func.h"
+X#include "config.h"
+X
+X
+XFUNC *curfunc;
+X
+Xstatic BOOL getfilename(), getid();
+Xstatic void getshowcommand(), getfunction(), getbody(), getdeclarations();
+Xstatic void getstatement(), getobjstatement(), getobjvars();
+Xstatic void getmatstatement(), getsimplebody();
+Xstatic void getcondition(), getmatargs(), getelement(), checksymbol();
+Xstatic void getcallargs();
+Xstatic int getexprlist(), getassignment(), getaltcond(), getorcond();
+Xstatic int getandcond(), getrelation(), getsum(), getproduct();
+Xstatic int getorexpr(), getandexpr(), getshiftexpr(), getterm();
+Xstatic int getidexpr();
+X
+X/*
+X * Read all the commands from an input file.
+X * These are either declarations, or else are commands to execute now.
+X * In general, commands are terminated by newlines or semicolons.
+X * Exceptions are function definitions and escaped newlines.
+X * Commands are read and executed until the end of file.
+X */
+Xvoid
+Xgetcommands()
+X{
+X	char name[PATHSIZE+1];	/* program name */
+X
+X	for (;;) {
+X		tokenmode(TM_NEWLINES);
+X		switch (gettoken()) {
+X
+X		case T_DEFINE:
+X			getfunction();
+X			break;
+X
+X		case T_EOF:
+X			return;
+X
+X		case T_HELP:
+X			if (!getfilename(name, FALSE)) {
+X				strcpy(name, DEFAULTCALCHELP);
+X			}
+X			givehelp(name);
+X			break;
+X
+X		case T_READ:
+X			if (!getfilename(name, TRUE))
+X				break;
+X			if (opensearchfile(name, calcpath, CALCEXT) < 0) {
+X				scanerror(T_NULL, "Cannot open \"%s\"\n", name);
+X				break;
+X			}
+X			getcommands();
+X			break;
+X
+X		case T_WRITE:
+X			if (!getfilename(name, TRUE))
+X				break;
+X			if (writeglobals(name))
+X				scanerror(T_NULL, "Error writing \"%s\"\n", name);
+X			break;
+X
+X		case T_SHOW:
+X			rescantoken();
+X			getshowcommand();
+X			break;
+X
+X		case T_NEWLINE:
+X		case T_SEMICOLON:
+X			break;
+X
+X		default:
+X			rescantoken();
+X			initstack();
+X			if (evaluate(FALSE))
+X				updateoldvalue(curfunc);
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Evaluate a line of statements.
+X * This is done by treating the current line as a function body,
+X * compiling it, and then executing it.  Returns TRUE if the line
+X * successfully compiled and executed.  The last expression result
+X * is saved in the f_savedvalue element of the current function.
+X * The nestflag variable should be FALSE for the outermost evaluation
+X * level, and TRUE for all other calls (such as the 'eval' function).
+X * The function name begins with an asterisk to indicate specialness.
+X */
+XBOOL
+Xevaluate(nestflag)
+X	BOOL nestflag;		/* TRUE if this is a nested evaluation */
+X{
+X	char *funcname;
+X	BOOL gotstatement;
+X
+X	funcname = (nestflag ? "**" : "*");
+X	beginfunc(funcname, nestflag);
+X	gotstatement = FALSE;
+X	for (;;) {
+X		switch (gettoken()) {
+X			case T_SEMICOLON:
+X				break;
+X
+X			case T_EOF:
+X				rescantoken();
+X				goto done;
+X
+X			case T_NEWLINE:
+X				goto done;
+X
+X			case T_GLOBAL:
+X			case T_LOCAL:
+X				if (gotstatement) {
+X					scanerror(T_SEMICOLON, "Declarations must be used before code");
+X					return FALSE;
+X				}
+X				rescantoken();
+X				getdeclarations();
+X				break;
+X
+X			default:
+X				rescantoken();
+X				getstatement(NULL, NULL, NULL, NULL);
+X				gotstatement = TRUE;
+X		}
+X	}
+X
+Xdone:
+X	addop(OP_UNDEF);
+X	addop(OP_RETURN);
+X	checklabels();
+X	if (errorcount)
+X		return FALSE;
+X	calculate(curfunc, 0);
+X	return TRUE;
+X}
+X
+X
+X/*
+X * Get a function declaration.
+X * func = name '(' '' | name [ ',' name] ... ')' simplebody
+X *	| name '(' '' | name [ ',' name] ... ')' body.
+X */
+Xstatic void
+Xgetfunction()
+X{
+X	char *name;		/* parameter name */
+X	int type;		/* type of token read */
+X
+X	tokenmode(TM_DEFAULT);
+X	if (gettoken() != T_SYMBOL) {
+X		scanerror(T_NULL, "Function name expected");
+X		return;
+X	}
+X	beginfunc(tokenstring(), FALSE);
+X	if (gettoken() != T_LEFTPAREN) {
+X		scanerror(T_SEMICOLON, "Left parenthesis expected for function");
+X		return;
+X	}
+X	for (;;) {
+X		type = gettoken();
+X		if (type == T_RIGHTPAREN)
+X			break;
+X		if (type != T_SYMBOL) {
+X			scanerror(T_COMMA, "Bad function definition");
+X			return;
+X		}
+X		name = tokenstring();
+X		switch (symboltype(name)) {
+X			case SYM_UNDEFINED:
+X			case SYM_GLOBAL:
+X				(void) addparam(name);
+X				break;
+X			default:
+X				scanerror(T_NULL, "Parameter \"%s\" is already defined", name);
+X		}
+X		type = gettoken();
+X		if (type == T_RIGHTPAREN)
+X			break;
+X		if (type != T_COMMA) {
+X			scanerror(T_COMMA, "Bad function definition");
+X			return;
+X		}
+X	}
+X	switch (gettoken()) {
+X		case T_ASSIGN:
+X			rescantoken();
+X			getsimplebody();
+X			break;
+X		case T_LEFTBRACE:
+X			rescantoken();
+X			getbody(NULL, NULL, NULL, NULL, TRUE);
+X			break;
+X		default:
+X			scanerror(T_NULL,
+X				"Left brace or equals sign expected for function");
+X			return;
+X	}
+X	addop(OP_UNDEF);
+X	addop(OP_RETURN);
+X	endfunc();
+X}
+X
+X
+X/*
+X * Get a simple assignment style body for a function declaration.
+X * simplebody = '=' assignment '\n'.
+X */
+Xstatic void
+Xgetsimplebody()
+X{
+X	if (gettoken() != T_ASSIGN) {
+X		scanerror(T_SEMICOLON, "Missing equals for simple function body");
+X		return;
+X	}
+X	tokenmode(TM_NEWLINES);
+X	(void) getexprlist();
+X	addop(OP_RETURN);
+X	if (gettoken() != T_SEMICOLON)
+X		rescantoken();
+X	if (gettoken() != T_NEWLINE)
+X		scanerror(T_NULL, "Illegal function definition");
+X}
+X
+X
+X/*
+X * Get the body of a function, or a subbody of a function.
+X * body = '{' [ declarations ] ... [ statement ] ... '}'
+X *	| [ declarations ] ... [statement ] ... '\n'
+X */
+Xstatic void
+Xgetbody(contlabel, breaklabel, nextcaselabel, defaultlabel, toplevel)
+X	LABEL *contlabel, *breaklabel, *nextcaselabel, *defaultlabel;
+X	BOOL toplevel;
+X{
+X	BOOL gotstatement;	/* TRUE if seen a real statement yet */
+X
+X	if (gettoken() != T_LEFTBRACE) {
+X		scanerror(T_SEMICOLON, "Missing left brace for function body");
+X		return;
+X	}
+X	gotstatement = FALSE;
+X	for (;;) {
+X		switch (gettoken()) {
+X		case T_RIGHTBRACE:
+X			return;
+X
+X		case T_GLOBAL:
+X		case T_LOCAL:
+X			if (!toplevel) {
+X				scanerror(T_SEMICOLON, "Declarations must be at the top of the function");
+X				return;
+X			}
+X			if (gotstatement) {
+X				scanerror(T_SEMICOLON, "Declarations must be used before code");
+X				return;
+X			}
+X			rescantoken();
+X			getdeclarations();
+X			break;
+X
+X		default:
+X			rescantoken();
+X			getstatement(contlabel, breaklabel, nextcaselabel, defaultlabel);
+X			gotstatement = TRUE;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Get a line of local or global variable declarations.
+X * declarations = { LOCAL | GLOBAL } name [ ',' name ] ... ';'.
+X */
+Xstatic void
+Xgetdeclarations()
+X{
+X	int type;		/* type of declaration */
+X	char *name;		/* name of symbol seen */
+X
+X	switch (gettoken()) {
+X		case T_LOCAL:
+X			type = SYM_LOCAL;
+X			break;
+X		case T_GLOBAL:
+X			type = SYM_GLOBAL;
+X			break;
+X		default:
+X			rescantoken();
+X			return;
+X	}
+X	for (;;) {
+X		if (gettoken() != T_SYMBOL) {
+X			scanerror(T_SEMICOLON, "Variable name expected for declaration statement");
+X			return;
+X		}
+X		name = tokenstring();
+X		switch (symboltype(name)) {
+X		case SYM_UNDEFINED:
+X		case SYM_GLOBAL:
+X			if (type == SYM_LOCAL)
+X				(void) addlocal(name);
+X			else
+X				(void) addglobal(name);
+X			break;
+X		case SYM_PARAM:
+X		case SYM_LOCAL:
+X			scanerror(T_NULL, "variable \"%s\" is already defined", name);
+X			break;
+X		}
+X		switch (gettoken()) {
+X			case T_COMMA:
+X				break;
+X			case T_NEWLINE:
+X			case T_SEMICOLON:
+X				return;
+X			default:
+X				scanerror(T_SEMICOLON, "Bad syntax in declaration statement");
+X				return;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Get a statement.
+X * statement = IF condition statement [ELSE statement]
+X *	| FOR '(' [assignment] ';' [assignment] ';' [assignment] ')' statement
+X *	| WHILE condition statement
+X *	| DO statement WHILE condition ';'
+X *	| SWITCH condition '{' [caseclause] ... '}'
+X *	| CONTINUE ';'
+X *	| BREAK ';'
+X *	| RETURN assignment ';'
+X *	| GOTO label ';'
+X *	| MAT name '[' value [ ':' value ] [',' value [ ':' value ] ] ']' ';'
+X *	| OBJ type '{' arg [ ',' arg ] ... '}' ] ';'
+X *	| OBJ type name [ ',' name ] ';'
+X *	| PRINT assignment [, assignment ] ... ';'
+X *	| QUIT [ string ] ';'
+X *	| SHOW item ';'
+X *	| body
+X *	| assignment ';'
+X *	| label ':' statement
+X *	| ';'.
+X */
+Xstatic void
+Xgetstatement(contlabel, breaklabel, nextcaselabel, defaultlabel)
+X	LABEL *contlabel;	/* label for continue statement */
+X	LABEL *breaklabel;	/* label for break statement */
+X	LABEL *nextcaselabel;	/* label for next case statement */
+X	LABEL *defaultlabel;	/* label for default case */
+X{
+X	LABEL label1, label2, label3, label4;	/* locations for jumps */
+X	int type;
+X	BOOL printeol;
+X
+X	addopindex(OP_DEBUG, linenumber());
+X	switch (gettoken()) {
+X	case T_NEWLINE:
+X		rescantoken();
+X		return;
+X
+X	case T_SEMICOLON:
+X		return;
+X
+X	case T_RIGHTBRACE:
+X		scanerror(T_NULL, "Extraneous right brace");
+X		return;
+X
+X	case T_CONTINUE:
+X		if (contlabel == NULL) {
+X			scanerror(T_SEMICOLON, "CONTINUE not within FOR, WHILE, or DO");
+X			return;
+X		}
+X		addoplabel(OP_JUMP, contlabel);
+X		break;
+X
+X	case T_BREAK:
+X		if (breaklabel == NULL) {
+X			scanerror(T_SEMICOLON, "BREAK not within FOR, WHILE, or DO");
+X			return;
+X		}
+X		addoplabel(OP_JUMP, breaklabel);
+X		break;
+X
+X	case T_GOTO:
+X		if (gettoken() != T_SYMBOL) {
+X			scanerror(T_SEMICOLON, "Missing label in goto");
+X			return;
+X		}
+X		addop(OP_JUMP);
+X		addlabel(tokenstring());
+X		break;
+X
+X	case T_RETURN:
+X		switch (gettoken()) {
+X			case T_NEWLINE:
+X			case T_SEMICOLON:
+X				addop(OP_UNDEF);
+X				addop(OP_RETURN);
+X				return;
+X			default:
+X				rescantoken();
+X				(void) getexprlist();
+X				if (curfunc->f_name[0] == '*')
+X					addop(OP_SAVE);
+X				addop(OP_RETURN);
+X		}
+X		break;
+X
+X	case T_LEFTBRACE:
+X		rescantoken();
+X		getbody(contlabel, breaklabel, nextcaselabel, defaultlabel, FALSE);
+X		return;
+X
+X	case T_IF:
+X		clearlabel(&label1);
+X		clearlabel(&label2);
+X		getcondition();
+X		addoplabel(OP_JUMPEQ, &label1);
+X		getstatement(contlabel, breaklabel, (LABEL*)NULL, (LABEL*)NULL);
+X		if (gettoken() != T_ELSE) {
+X			setlabel(&label1);
+X			rescantoken();
+X			return;
+X		}
+X		addoplabel(OP_JUMP, &label2);
+X		setlabel(&label1);
+X		getstatement(contlabel, breaklabel, (LABEL*)NULL, (LABEL*)NULL);
+X		setlabel(&label2);
+X		return;
+X
+X	case T_FOR:	/* for (a; b; c) x */
+X		clearlabel(&label1);
+X		clearlabel(&label2);
+X		clearlabel(&label3);
+X		clearlabel(&label4);
+X		contlabel = NULL;
+X		breaklabel = &label4;
+X		if (gettoken() != T_LEFTPAREN) {
+X			scanerror(T_SEMICOLON, "Left parenthesis expected");
+X			return;
+X		}
+X		if (gettoken() != T_SEMICOLON) {	/* have 'a' part */
+X			rescantoken();
+X			(void) getexprlist();
+X			addop(OP_POP);
+X			if (gettoken() != T_SEMICOLON) {
+X				scanerror(T_SEMICOLON, "Missing semicolon");
+X				return;
+X			}
+X		}
+X		if (gettoken() != T_SEMICOLON) {	/* have 'b' part */
+X			setlabel(&label1);
+X			contlabel = &label1;
+X			rescantoken();
+X			(void) getexprlist();
+X			addoplabel(OP_JUMPNE, &label3);
+X			addoplabel(OP_JUMP, breaklabel);
+X			if (gettoken() != T_SEMICOLON) {
+X				scanerror(T_SEMICOLON, "Missing semicolon");
+X				return;
+X			}
+X		}
+X		if (gettoken() != T_RIGHTPAREN) {	/* have 'c' part */
+X			if (label1.l_offset <= 0)
+X				addoplabel(OP_JUMP, &label3);
+X			setlabel(&label2);
+X			contlabel = &label2;
+X			rescantoken();
+X			(void) getexprlist();
+X			addop(OP_POP);
+X			if (label1.l_offset > 0)
+X				addoplabel(OP_JUMP, &label1);
+X			if (gettoken() != T_RIGHTPAREN) {
+X				scanerror(T_SEMICOLON, "Right parenthesis expected");
+X				return;
+X			}
+X		}
+X		setlabel(&label3);
+X		if (contlabel == NULL)
+X			contlabel = &label3;
+X		getstatement(contlabel, breaklabel, (LABEL*)NULL, (LABEL*)NULL);
+X		addoplabel(OP_JUMP, contlabel);
+X		setlabel(breaklabel);
+X		return;
+X
+X	case T_WHILE:
+X		contlabel = &label1;
+X		breaklabel = &label2;
+X		clearlabel(contlabel);
+X		clearlabel(breaklabel);
+X		setlabel(contlabel);
+X		getcondition();
+X		addoplabel(OP_JUMPEQ, breaklabel);
+X		getstatement(contlabel, breaklabel, (LABEL*)NULL, (LABEL*)NULL);
+X		addoplabel(OP_JUMP, contlabel);
+X		setlabel(breaklabel);
+X		return;
+X
+X	case T_DO:
+X		contlabel = &label1;
+X		breaklabel = &label2;
+X		clearlabel(contlabel);
+X		clearlabel(breaklabel);
+X		clearlabel(&label3);
+X		setlabel(&label3);
+X		getstatement(contlabel, breaklabel, (LABEL*)NULL, (LABEL*)NULL);
+X		if (gettoken() != T_WHILE) {
+X			scanerror(T_SEMICOLON, "WHILE keyword expected for DO statement");
+X			return;
+X		}
+X		setlabel(contlabel);
+X		getcondition();
+X		addoplabel(OP_JUMPNE, &label3);
+X		setlabel(breaklabel);
+X		return;
+X
+X	case T_SWITCH:
+X		breaklabel = &label1;
+X		nextcaselabel = &label2;
+X		defaultlabel = &label3;
+X		clearlabel(breaklabel);
+X		clearlabel(nextcaselabel);
+X		clearlabel(defaultlabel);
+X		getcondition();
+X		if (gettoken() != T_LEFTBRACE) {
+X			scanerror(T_SEMICOLON, "Missing left brace for switch statement");
+X			return;
+X		}
+X		addoplabel(OP_JUMP, nextcaselabel);
+X		rescantoken();
+X		getstatement(contlabel, breaklabel, nextcaselabel, defaultlabel);
+X		addoplabel(OP_JUMP, breaklabel);
+X		setlabel(nextcaselabel);
+X		if (defaultlabel->l_offset > 0)
+X			addoplabel(OP_JUMP, defaultlabel);
+X		else
+X			addop(OP_POP);
+X		setlabel(breaklabel);
+X		return;
+X
+X	case T_CASE:
+X		if (nextcaselabel == NULL) {
+X			scanerror(T_SEMICOLON, "CASE not within SWITCH statement");
+X			return;
+X		}
+X		clearlabel(&label1);
+X		addoplabel(OP_JUMP, &label1);
+X		setlabel(nextcaselabel);
+X		clearlabel(nextcaselabel);
+X		(void) getexprlist();
+X		if (gettoken() != T_COLON) {
+X			scanerror(T_SEMICOLON, "Colon expected after CASE expression");
+X			return;
+X		}
+X		addoplabel(OP_CASEJUMP, nextcaselabel);
+X		setlabel(&label1);
+X		getstatement(contlabel, breaklabel, nextcaselabel, defaultlabel);
+X		return;
+X
+X	case T_DEFAULT:
+X		if (gettoken() != T_COLON) {
+X			scanerror(T_SEMICOLON, "Colon expected after DEFAULT keyword");
+X			return;
+X		}
+X		if (defaultlabel == NULL) {
+X			scanerror(T_SEMICOLON, "DEFAULT not within SWITCH statement");
+X			return;
+X		}
+X		if (defaultlabel->l_offset > 0) {
+X			scanerror(T_SEMICOLON, "Multiple DEFAULT clauses in SWITCH");
+X			return;
+X		}
+X		clearlabel(&label1);
+X		addoplabel(OP_JUMP, &label1);
+X		setlabel(defaultlabel);
+X		addop(OP_POP);
+X		setlabel(&label1);
+X		getstatement(contlabel, breaklabel, nextcaselabel, defaultlabel);
+X		return;
+X
+X	case T_ELSE:
+X		scanerror(T_SEMICOLON, "ELSE without preceeding IF");
+X		return;
+X
+X	case T_MAT:
+X		getmatstatement();
+X		break;
+X
+X	case T_OBJ:
+X		getobjstatement();
+X		break;
+X
+X	case T_PRINT:
+X		printeol = TRUE;
+X		for (;;) {
+X			switch (gettoken()) {
+X				case T_RIGHTBRACE:
+X				case T_NEWLINE:
+X					rescantoken();
+X					/*FALLTHRU*/
+X				case T_SEMICOLON:
+X					if (printeol)
+X						addop(OP_PRINTEOL);
+X					return;
+X				case T_COLON:
+X					printeol = FALSE;
+X					break;
+X				case T_COMMA:
+X					printeol = TRUE;
+X					addop(OP_PRINTSPACE);
+X					break;
+X				case T_STRING:
+X					printeol = TRUE;
+X					addopptr(OP_PRINTSTRING, tokenstring());
+X					break;
+X				default:
+X					printeol = TRUE;
+X					rescantoken();
+X					(void) getassignment();
+X					addopindex(OP_PRINT,
+X						(long) PRINT_NORMAL);
+X			}
+X		}
+X		break;
+X
+X	case T_QUIT:
+X		switch (gettoken()) {
+X			case T_STRING:
+X				addopptr(OP_QUIT, tokenstring());
+X				break;
+X			default:
+X				addopptr(OP_QUIT, NULL);
+X				rescantoken();
+X		}
+X		break;
+X
+X	case T_SYMBOL:
+X		if (nextchar() == ':') {	/****HACK HACK ****/
+X			definelabel(tokenstring());
+X			getstatement(contlabel, breaklabel, 
+X			    (LABEL*)NULL, (LABEL*)NULL);
+X			return;
+X		}
+X		reread();
+X		/* fall into default case */
+X
+X	default:
+X		rescantoken();
+X		type = getexprlist();
+X		if (contlabel || breaklabel || (curfunc->f_name[0] != '*')) {
+X			addop(OP_POP);
+X			break;
+X		}
+X		addop(OP_SAVE);
+X		if (isassign(type) || (curfunc->f_name[1] != '\0')) {
+X			addop(OP_POP);
+X			break;
+X		}
+X		addop(OP_PRINTRESULT);
+X		break;
+X	}
+X	switch (gettoken()) {
+X		case T_RIGHTBRACE:
+X		case T_NEWLINE:
+X			rescantoken();
+X			break;
+X		case T_SEMICOLON:
+X			break;
+X		default:
+X			scanerror(T_SEMICOLON, "Semicolon expected");
+X			break;
+X	}
+X}
+X
+X
+X/*
+X * Read in an object definition statement.
+X * This is of the following form:
+X *	OBJ type [ '{' id [ ',' id ] ... '}' ]  [ objlist ].
+X * The OBJ keyword has already been read.
+X */
+Xstatic void
+Xgetobjstatement()
+X{
+X	char *name;			/* name of object type */
+X	int count;			/* number of elements */
+X	int index;			/* current index */
+X	int i;				/* loop counter */
+X	BOOL err;			/* error flag */
+X	int indices[MAXINDICES];	/* indices for elements */
+X
+X	err = FALSE;
+X	if (gettoken() != T_SYMBOL) {
+X		scanerror(T_SEMICOLON, "Object type name missing");
+X		return;
+X	}
+X	name = addliteral(tokenstring());
+X	if (gettoken() != T_LEFTBRACE) {
+X		rescantoken();
+X		getobjvars(name);
+X		return;
+X	}
+X	/*
+X	 * Read in the definition of the elements of the object.
+X	 */
+X	count = 0;
+X	for (;;) {
+X		if (gettoken() != T_SYMBOL) {
+X			scanerror(T_SEMICOLON, "Missing element name in OBJ statement");
+X			return;
+X		}
+X		index = addelement(tokenstring());
+X		for (i = 0; i < count; i++) {
+X			if (indices[i] == index) {
+X				scanerror(T_NULL, "Duplicate element name \"%s\"", tokenstring());
+X				err = TRUE;
+X				break;
+X			}
+X		}
+X		indices[count++] = index;
+X		switch (gettoken()) {
+X			case T_RIGHTBRACE:
+X				if (!err)
+X					(void) defineobject(name, indices, count);
+X				switch (gettoken()) {
+X					case T_SEMICOLON:
+X					case T_NEWLINE:
+X						rescantoken();
+X						return;
+X				}
+X				rescantoken();
+X				getobjvars(name);
+X				return;
+X			case T_COMMA:
+X			case T_SEMICOLON:
+X			case T_NEWLINE:
+X				break;
+X			default:
+X				scanerror(T_SEMICOLON, "Bad object element definition");
+X				return;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Routine to collect a set of variables for the specified object type
+X * and initialize them as being that type of object.
+X * Here
+X *	objlist = name [ ',' name] ... ';'.
+X */
+Xstatic void
+Xgetobjvars(name)
+X	char *name;		/* object name */
+X{
+X	long index;		/* index for object */
+X
+X	index = checkobject(name);
+X	if (index < 0) {
+X		scanerror(T_SEMICOLON, "Object %s has not been defined yet", name);
+X		return;
+X	}
+X	for (;;) {
+X		(void) getidexpr(TRUE, TRUE);
+X		addopindex(OP_OBJINIT, index);
+X		switch (gettoken()) {
+X			case T_COMMA:
+X				break;
+X			case T_SEMICOLON:
+X			case T_NEWLINE:
+X				rescantoken();
+X				return;
+X			default:
+X				scanerror(T_SEMICOLON, "Bad OBJ statement");
+X				return;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Read a matrix definition statment for a one or more dimensional matrix.
+X * The MAT keyword has already been read.
+X */
+Xstatic void
+Xgetmatstatement()
+X{
+X	int dim;		/* dimension of matrix */
+X
+X	(void) getidexpr(FALSE, TRUE);
+X	if (gettoken() != T_LEFTBRACKET) {
+X		scanerror(T_SEMICOLON, "Missing left bracket for MAT");
+X		return;
+X	}
+X	dim = 1;
+X	for (;;) {
+X		(void) getassignment();
+X		switch (gettoken()) {
+X			case T_RIGHTBRACKET:
+X			case T_COMMA:
+X				rescantoken();
+X				addop(OP_ONE);
+X				addop(OP_SUB);
+X				addop(OP_ZERO);
+X				break;
+X			case T_COLON:
+X				(void) getassignment();
+X				break;
+X			default:
+X				rescantoken();
+X		}
+X		switch (gettoken()) {
+X			case T_RIGHTBRACKET:
+X				if (gettoken() != T_LEFTBRACKET) {
+X					rescantoken();
+X					addopindex(OP_MATINIT, (long) dim);
+X					return;
+X				}
+X				/* proceed into comma case */
+X				/*FALLTHRU*/
+X			case T_COMMA:
+X				if (++dim <= MAXDIM)
+X					break;
+X				scanerror(T_SEMICOLON, "Only %d dimensions allowed", MAXDIM);
+X				return;
+X			default:
+X				scanerror(T_SEMICOLON, "Illegal matrix definition");
+X				return;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Get a condition.
+X * condition = '(' assignment ')'.
+X */
+Xstatic void
+Xgetcondition()
+X{
+X	if (gettoken() != T_LEFTPAREN) {
+X		scanerror(T_SEMICOLON, "Missing left parenthesis for condition");
+X		return;
+X	}
+X	(void) getexprlist();
+X	if (gettoken() != T_RIGHTPAREN) {
+X		scanerror(T_SEMICOLON, "Missing right parenthesis for condition");
+X		return;
+X	}
+X}
+X
+X
+X/*
+X * Get an expression list consisting of one or more expressions,
+X * separated by commas.  The value of the list is that of the final expression.
+X * This is the top level routine for parsing expressions.
+X * Returns flags describing the type of assignment or expression found.
+X * exprlist = assignment [ ',' assignment ] ...
+X */
+Xstatic int
+Xgetexprlist()
+X{
+X	int	type;
+X
+X	type = getassignment();
+X	while (gettoken() == T_COMMA) {
+X		addop(OP_POP);
+X		(void) getassignment();
+X		type = EXPR_RVALUE;
+X	}
+X	rescantoken();
+X	return type;
+X}
+X
+X
+X/*
+X * Get an assignment (or possibly just an expression).
+X * Returns flags describing the type of assignment or expression found.
+X * assignment = lvalue '=' assignment
+X *	| lvalue '+=' assignment
+X *	| lvalue '-=' assignment
+X *	| lvalue '*=' assignment
+X *	| lvalue '/=' assignment
+X *	| lvalue '%=' assignment
+X *	| lvalue '//=' assignment
+X *	| lvalue '&=' assignment
+X *	| lvalue '|=' assignment
+X *	| lvalue '<<=' assignment
+X *	| lvalue '>>=' assignment
+X *	| lvalue '^=' assignment
+X *	| lvalue '**=' assignment
+X *	| orcond.
+X */
+Xstatic int
+Xgetassignment()
+X{
+X	int type;		/* type of expression */
+X	long op;		/* opcode to generate */
+X
+X	type = getaltcond();
+X	switch (gettoken()) {
+X		case T_ASSIGN:		op = 0; break;
+X		case T_PLUSEQUALS:	op = OP_ADD; break;
+X		case T_MINUSEQUALS:	op = OP_SUB; break;
+X		case T_MULTEQUALS:	op = OP_MUL; break;
+X		case T_DIVEQUALS:	op = OP_DIV; break;
+X		case T_SLASHSLASHEQUALS: op = OP_QUO; break;
+X		case T_MODEQUALS:	op = OP_MOD; break;
+X		case T_ANDEQUALS:	op = OP_AND; break;
+X		case T_OREQUALS:	op = OP_OR; break;
+X		case T_LSHIFTEQUALS: 	op = OP_LEFTSHIFT; break;
+X		case T_RSHIFTEQUALS: 	op = OP_RIGHTSHIFT; break;
+X		case T_POWEREQUALS:	op = OP_POWER; break;
+X
+X		case T_NUMBER:
+X		case T_IMAGINARY:
+X		case T_STRING:
+X		case T_SYMBOL:
+X		case T_OLDVALUE:
+X		case T_LEFTPAREN:
+X		case T_PLUSPLUS:
+X		case T_MINUSMINUS:
+X		case T_NOT:
+X			scanerror(T_NULL, "Missing operator");
+X			return type;
+X
+X		default:
+X			rescantoken();
+X			return type;
+X	}
+X	if (isrvalue(type)) {
+X		scanerror(T_NULL, "Illegal assignment");
+X		(void) getassignment();
+X		return (EXPR_RVALUE | EXPR_ASSIGN);
+X	}
+X	if (op)
+X		addop(OP_DUPLICATE);
+X	(void) getassignment();
+X	if (op) {
+X		addop(op);
+X	}
+X	addop(OP_ASSIGN);
+X	return (EXPR_RVALUE | EXPR_ASSIGN);
+X}
+X
+X
+X/*
+X * Get a possible conditional result expression (question mark).
+X * Flags are returned indicating the type of expression found.
+X * altcond = orcond [ '?' orcond ':' altcond ].
+X */
+Xstatic int
+Xgetaltcond()
+X{
+X	int type;		/* type of expression */
+X	LABEL donelab;		/* label for done */
+X	LABEL altlab;		/* label for alternate expression */
+X
+X	type = getorcond();
+X	if (gettoken() != T_QUESTIONMARK) {
+X		rescantoken();
+X		return type;
+X	}
+X	clearlabel(&donelab);
+X	clearlabel(&altlab);
+X	addoplabel(OP_JUMPEQ, &altlab);
+X	(void) getorcond();
+X	if (gettoken() != T_COLON) {
+X		scanerror(T_SEMICOLON, "Missing colon for conditional expression");
+X		return EXPR_RVALUE;
+X	}
+X	addoplabel(OP_JUMP, &donelab);
+X	setlabel(&altlab);
+X	(void) getaltcond();
+X	setlabel(&donelab);
+X	return EXPR_RVALUE;
+X}
+X
+X
+X/*
+X * Get a possible conditional or expression.
+X * Flags are returned indicating the type of expression found.
+X * orcond = andcond [ '||' andcond ] ...
+X */
+Xstatic int
+Xgetorcond()
+X{
+X	int type;		/* type of expression */
+X	LABEL donelab;		/* label for done */
+X
+X	clearlabel(&donelab);
+X	type = getandcond();
+X	while (gettoken() == T_OROR) {
+X		addoplabel(OP_CONDORJUMP, &donelab);
+X		(void) getandcond();
+X		type = EXPR_RVALUE;
+X	}
+X	rescantoken();
+X	if (donelab.l_chain > 0)
+X		setlabel(&donelab);
+X	return type;
+X}
+X
+X
+X/*
+X * Get a possible conditional and expression.
+X * Flags are returned indicating the type of expression found.
+X * andcond = relation [ '&&' relation ] ...
+X */
+Xstatic int
+Xgetandcond()
+X{
+X	int type;		/* type of expression */
+X	LABEL donelab;		/* label for done */
+X
+X	clearlabel(&donelab);
+X	type = getrelation();
+X	while (gettoken() == T_ANDAND) {
+X		addoplabel(OP_CONDANDJUMP, &donelab);
+X		(void) getrelation();
+X		type = EXPR_RVALUE;
+X	}
+X	rescantoken();
+X	if (donelab.l_chain > 0)
+X		setlabel(&donelab);
+X	return type;
+X}
+X
+X
+X/*
+X * Get a possible relation (equality or inequality), or just an expression.
+X * Flags are returned indicating the type of relation found.
+X * relation = sum '==' sum
+X *	| sum '!=' sum
+X *	| sum '<=' sum
+X *	| sum '>=' sum
+X *	| sum '<' sum
+X *	| sum '>' sum
+X *	| sum.
+X */
+Xstatic int
+Xgetrelation()
+X{
+X	int type;		/* type of expression */
+X	long op;		/* opcode to generate */
+X
+X	type = getsum();
+X	switch (gettoken()) {
+X		case T_EQ: op = OP_EQ; break;
+X		case T_NE: op = OP_NE; break;
+X		case T_LT: op = OP_LT; break;
+X		case T_GT: op = OP_GT; break;
+X		case T_LE: op = OP_LE; break;
+X		case T_GE: op = OP_GE; break;
+X		default:
+X			rescantoken();
+X			return type;
+X	}
+X	(void) getsum();
+X	addop(op);
+X	return EXPR_RVALUE;
+X}
+X
+X
+X/*
+X * Get an expression made up of sums of products.
+X * Flags indicating the type of expression found are returned.
+X * sum = product [ {'+' | '-'} product ] ...
+X */
+Xstatic int
+Xgetsum()
+X{
+X	int type;		/* type of expression found */
+X	long op;		/* opcode to generate */
+X
+X	type = getproduct();
+X	for (;;) {
+X		switch (gettoken()) {
+X			case T_PLUS:	op = OP_ADD; break;
+X			case T_MINUS:	op = OP_SUB; break;
+X			default:
+X				rescantoken();
+X				return type;
+X		}
+X		(void) getproduct();
+X		addop(op);
+X		type = EXPR_RVALUE;
+X	}
+X}
+X
+X
+X/*
+X * Get the product of arithmetic or expressions.
+X * Flags indicating the type of expression found are returned.
+X * product = orexpr [ {'*' | '/' | '//' | '%'} orexpr ] ...
+X */
+Xstatic int
+Xgetproduct()
+X{
+X	int type;		/* type of value found */
+X	long op;		/* opcode to generate */
+X
+X	type = getorexpr();
+X	for (;;) {
+X		switch (gettoken()) {
+X			case T_MULT:	op = OP_MUL; break;
+X			case T_DIV:	op = OP_DIV; break;
+X			case T_MOD:	op = OP_MOD; break;
+X			case T_SLASHSLASH: op = OP_QUO; break;
+X			default:
+X				rescantoken();
+X				return type;
+X		}
+X		(void) getorexpr();
+X		addop(op);
+X		type = EXPR_RVALUE;
+X	}
+X}
+X
+X
+X/*
+X * Get an expression made up of arithmetic or operators.
+X * Flags indicating the type of expression found are returned.
+X * orexpr = andexpr [ '|' andexpr ] ...
+X */
+Xstatic int
+Xgetorexpr()
+X{
+X	int type;		/* type of value found */
+X
+X	type = getandexpr();
+X	while (gettoken() == T_OR) {
+X		(void) getandexpr();
+X		addop(OP_OR);
+X		type = EXPR_RVALUE;
+X	}
+X	rescantoken();
+X	return type;
+X}
+X
+X
+X/*
+X * Get an expression made up of arithmetic and operators.
+X * Flags indicating the type of expression found are returned.
+X * andexpr = shiftexpr [ '&' shiftexpr ] ...
+X */
+Xstatic int
+Xgetandexpr()
+X{
+X	int type;		/* type of value found */
+X
+X	type = getshiftexpr();
+X	while (gettoken() == T_AND) {
+X		(void) getshiftexpr();
+X		addop(OP_AND);
+X		type = EXPR_RVALUE;
+X	}
+X	rescantoken();
+X	return type;
+X}
+X
+X
+X/*
+X * Get a shift or power expression.
+X * Flags indicating the type of expression found are returned.
+X * shift = term '^' shiftexpr
+X *	 | term '<<' shiftexpr
+X *	 | term '>>' shiftexpr
+X *	 | term.
+X */
+Xstatic int
+Xgetshiftexpr()
+X{
+X	int type;		/* type of value found */
+X	long op;		/* opcode to generate */
+X
+X	type = getterm();
+X	switch (gettoken()) {
+X		case T_POWER:		op = OP_POWER; break;
+X		case T_LEFTSHIFT:	op = OP_LEFTSHIFT; break;
+X		case T_RIGHTSHIFT: 	op = OP_RIGHTSHIFT; break;
+X		default:
+X			rescantoken();
+X			return type;
+X	}
+X	(void) getshiftexpr();
+X	addop(op);
+X	return EXPR_RVALUE;
+X}
+X
+X
+X/*
+X * Get a single term.
+X * Flags indicating the type of value found are returned.
+X * term = lvalue
+X *	| lvalue '[' assignment ']'
+X *	| lvalue '++'
+X *	| lvalue '--'
+X *	| '++' lvalue
+X *	| '--' lvalue
+X *	| real_number
+X *	| imaginary_number
+X *	| '.'
+X *	| string
+X *	| '(' assignment ')'
+X *	| function [ '(' [assignment  [',' assignment] ] ')' ]
+X *	| '!' term
+X *	| '+' term
+X *	| '-' term.
+X */
+Xstatic int
+Xgetterm()
+X{
+X	int type;		/* type of term found */
+X
+X	type = gettoken();
+X	switch (type) {
+X		case T_NUMBER:
+X			addopindex(OP_NUMBER, tokennumber());
+X			type = (EXPR_RVALUE | EXPR_CONST);
+X			break;
+X
+X		case T_IMAGINARY:
+X			addopindex(OP_IMAGINARY, tokennumber());
+X			type = (EXPR_RVALUE | EXPR_CONST);
+X			break;
+X
+X		case T_OLDVALUE:
+X			addop(OP_OLDVALUE);
+X			type = 0;
+X			break;
+X
+X		case T_STRING:
+X			addopptr(OP_STRING, tokenstring());
+X			type = (EXPR_RVALUE | EXPR_CONST);
+X			break;
+X
+X		case T_PLUSPLUS:
+X			if (isrvalue(getterm()))
+X				scanerror(T_NULL, "Bad ++ usage");
+X			addop(OP_PREINC);
+X			type = (EXPR_RVALUE | EXPR_ASSIGN);
+X			break;
+X
+X		case T_MINUSMINUS:
+X			if (isrvalue(getterm()))
+X				scanerror(T_NULL, "Bad -- usage");
+X			addop(OP_PREDEC);
+X			type = (EXPR_RVALUE | EXPR_ASSIGN);
+X			break;
+X
+X		case T_NOT:
+X			(void) getterm();
+X			addop(OP_NOT);
+X			type = EXPR_RVALUE;
+X			break;
+X
+X		case T_MINUS:
+X			(void) getterm();
+X			addop(OP_NEGATE);
+X			type = EXPR_RVALUE;
+X			break;
+X
+X		case T_PLUS:
+X			(void) getterm();
+X			type = EXPR_RVALUE;
+X			break;
+X
+X		case T_LEFTPAREN:
+X			type = getexprlist();
+X			if (gettoken() != T_RIGHTPAREN)
+X				scanerror(T_SEMICOLON, "Missing right parenthesis");
+X			break;
+X
+X		case T_SYMBOL:
+X			rescantoken();
+X			type = getidexpr(TRUE, FALSE);
+X			break;
+X
+X		case T_LEFTBRACKET:
+X			scanerror(T_NULL, "Bad index usage");
+X			type = 0;
+X			break;
+X
+X		case T_PERIOD:
+X			scanerror(T_NULL, "Bad element reference");
+X			type = 0;
+X			break;
+X
+X		default:
+X			if (iskeyword(type)) {
+X				scanerror(T_NULL, "Expression contains reserved keyword");
+X				type = 0;
+X				break;
+X			}
+X			rescantoken();
+X			scanerror(T_NULL, "Missing expression");
+X			type = 0;
+X	}
+X	switch (gettoken()) {
+X		case T_PLUSPLUS:
+X			if (isrvalue(type))
+X				scanerror(T_NULL, "Bad ++ usage");
+X			addop(OP_POSTINC);
+X			return (EXPR_RVALUE | EXPR_ASSIGN);
+X		case T_MINUSMINUS:
+X			if (isrvalue(type))
+X				scanerror(T_NULL, "Bad -- usage");
+X			addop(OP_POSTDEC);
+X			return (EXPR_RVALUE | EXPR_ASSIGN);
+X		default:
+X			rescantoken();
+X			return type;
+X	}
+X}
+X
+X
+X/*
+X * Read in an identifier expressions.
+X * This is a symbol name followed by parenthesis, or by square brackets or
+X * element refernces.  The symbol can be a global or a local variable name.
+X * Returns the type of expression found.
+X */
+Xstatic int
+Xgetidexpr(okmat, autodef)
+X	BOOL okmat, autodef;
+X{
+X	int type;
+X	char name[SYMBOLSIZE+1];	/* symbol name */
+X
+X	type = 0;
+X	if (!getid(name))
+X		return type;
+X	switch (gettoken()) {
+X		case T_LEFTPAREN:
+X			getcallargs(name);
+X			type = EXPR_RVALUE;
+X			break;
+X		case T_ASSIGN:
+X			autodef = TRUE;
+X			/* fall into default case */
+X		default:
+X			rescantoken();
+X			checksymbol(name, autodef);
+X	}
+X	/*
+X	 * Now collect as many element references and matrix index operations
+X	 * as there are following the id.
+X	 */
+X	for (;;) {
+X		switch (gettoken()) {
+X			case T_LEFTBRACKET:
+X				rescantoken();
+X				if (!okmat)
+X					return type;
+X				getmatargs();
+X				type = 0;
+X				break;
+X			case T_PERIOD:
+X				getelement();
+X				type = 0;
+X				break;
+X			case T_LEFTPAREN:
+X				scanerror(T_NULL, "Function calls not allowed as expressions");
+X			default:
+X				rescantoken();
+X				return type;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Read in a filename for a read or write command.
+X * Both quoted and unquoted filenames are handled here.
+X * The name must be terminated by an end of line or semicolon.
+X * Returns TRUE if the filename was successfully parsed.
+X */
+Xstatic BOOL
+Xgetfilename(name, msg_ok)
+X	char name[PATHSIZE+1];
+X	int msg_ok;		/* TRUE => ok to print error messages */
+X{
+X	tokenmode(TM_NEWLINES | TM_ALLSYMS);
+X	switch (gettoken()) {
+X		case T_STRING:
+X		case T_SYMBOL:
+X			break;
+X		default:
+X			if (msg_ok)
+X				scanerror(T_SEMICOLON, "Filename expected");
+X			return FALSE;
+X	}
+X	strcpy(name, tokenstring());
+X	switch (gettoken()) {
+X		case T_SEMICOLON:
+X		case T_NEWLINE:
+X		case T_EOF:
+X			break;
+X		default:
+X			if (msg_ok)
+X				scanerror(T_SEMICOLON, 
+X				    "Missing semicolon after filename");
+X			return FALSE;
+X	}
+X	return TRUE;
+X}
+X
+X
+X/*
+X * Read the show command and display useful information.
+X */
+Xstatic void
+Xgetshowcommand()
+X{
+X	char name[SYMBOLSIZE+1];
+X
+X	if ((gettoken() != T_SHOW) || (gettoken() != T_SYMBOL)) {
+X		scanerror(T_SEMICOLON, "Bad syntax for SHOW command");
+X		return;
+X	}
+X	strcpy(name, tokenstring());
+X	switch (gettoken()) {
+X		case T_NEWLINE:
+X		case T_SEMICOLON:
+X			break;
+X		default:
+X			scanerror(T_SEMICOLON, "Bad syntax for SHOW command");
+X	}
+X	switch ((int) stringindex("builtins\0globals\0functions\0objfuncs\0memory\0", name)) {
+X		case 1:
+X			showbuiltins();
+X			break;
+X		case 2:
+X			showglobals();
+X			break;
+X		case 3:
+X			showfunctions();
+X			break;
+X		case 4:
+X			showobjfuncs();
+X			break;
+X		case 5:
+X			mem_stats("");
+X			break;
+X		default:
+X			scanerror(T_NULL, "Unknown SHOW parameter \"%s\"", name);
+X	}
+X}
+X
+X
+X/*
+X * Read in a set of matrix index arguments, surrounded with square brackets.
+X * This also handles double square brackets for 'fast indexing'.
+X */
+Xstatic void
+Xgetmatargs()
+X{
+X	int dim;
+X
+X	if (gettoken() != T_LEFTBRACKET) {
+X		scanerror(T_NULL, "Matrix indexing expected");
+X		return;
+X	}
+X	/*
+X	 * Parse all levels of the array reference
+X	 * Look for the 'fast index' first.
+X	 */
+X	if (gettoken() == T_LEFTBRACKET) {
+X		(void) getassignment();
+X		if ((gettoken() != T_RIGHTBRACKET) ||
+X			(gettoken() != T_RIGHTBRACKET)) {
+X				scanerror(T_NULL, "Bad fast index usage");
+X				return;
+X		}
+X		addop(OP_FIADDR);
+X		return;
+X	}
+X	rescantoken();
+X	/*
+X	 * Normal indexing with the indexes separated by commas.
+X	 */
+X	dim = 1;
+X	for (;;) {
+X		(void) getassignment();
+X		switch (gettoken()) {
+X			case T_RIGHTBRACKET:
+X				if (gettoken() != T_LEFTBRACKET) {
+X					rescantoken();
+X					addopindex(OP_INDEXADDR, (long) dim);
+X					return;
+X				}
+X				/* proceed into comma case */
+X				/*FALLTHRU*/
+X			case T_COMMA:
+X				if (++dim > MAXDIM)
+X					scanerror(T_NULL, "Too many dimensions for array reference");
+X				break;
+X			default:
+X				rescantoken();
+X				scanerror(T_NULL, "Missing right bracket in array reference");
+X				return;
+X		}
+X	}
+X}
+X
+X
+X/*
+X * Get an element of an object reference.
+X * The leading period which introduces the element has already been read.
+X */
+Xstatic void
+Xgetelement()
+X{
+X	long index;
+X	char name[SYMBOLSIZE+1];
+X
+X	if (!getid(name))
+X		return;
+X	index = findelement(name);
+X	if (index < 0) {
+X		scanerror(T_NULL, "Element \"%s\" is undefined", name);
+X		return;
+X	}
+X	addopindex(OP_ELEMADDR, index);
+X}
+X
+X
+X/*
+X * Read in a single symbol name and copy its value into the given buffer.
+X * Returns TRUE if a valid symbol id was found.
+X */
+Xstatic BOOL
+Xgetid(buf)
+X	char buf[SYMBOLSIZE+1];
+X{
+X	int type;
+X
+X	type = gettoken();
+X	if (iskeyword(type)) {
+X		scanerror(T_NULL, "Reserved keyword used as symbol name");
+X		type = T_SYMBOL;
+X	}
+X	if (type != T_SYMBOL) {
+X		rescantoken();
+X		scanerror(T_NULL, "Symbol name expected");
+X		*buf = '\0';
+X		return FALSE;
+X	}
+X	strncpy(buf, tokenstring(), SYMBOLSIZE);
+X	buf[SYMBOLSIZE] = '\0';
+X	return TRUE;
+X}
+X
+X
+X/*
+X * Check a symbol name to see if it is known and generate code to reference it.
+X * The symbol can be either a parameter name, a local name, or a global name.
+X * If autodef is true, we automatically define the name as a global symbol
+X * if it is not yet known.
+X */
+Xstatic void
+Xchecksymbol(name, autodef)
+X	char *name;		/* symbol name to be checked */
+X	BOOL autodef;
+X{
+X	switch (symboltype(name)) {
+X		case SYM_LOCAL:
+X			addopindex(OP_LOCALADDR, (long) findlocal(name));
+X			return;
+X		case SYM_PARAM:
+X			addopindex(OP_PARAMADDR, (long) findparam(name));
+X			return;
+X		case SYM_GLOBAL:
+X			addopptr(OP_GLOBALADDR, (char *) findglobal(name));
+X			return;
+X	}
+X	/*
+X	 * The symbol is not yet defined.
+X	 * If we are at the top level and we are allowed to, then define it.
+X	 */
+X	if ((curfunc->f_name[0] != '*') || !autodef) {
+X		scanerror(T_NULL, "\"%s\" is undefined", name);
+X		return;
+X	}
+X	(void) addglobal(name);
+X	addopptr(OP_GLOBALADDR, (char *) findglobal(name));
+X}
+X
+X
+X/*
+X * Get arguments for a function call.
+X * The name and beginning parenthesis has already been seen.
+X * callargs = [ [ '&' ] assignment  [',' [ '&' ] assignment] ] ')'.
+X */
+Xstatic void
+Xgetcallargs(name)
+X	char *name;		/* name of function */
+X{
+X	long index;		/* function index */
+X	long op;		/* opcode to add */
+X	int argcount;		/* number of arguments */
+X	BOOL addrflag;
+X
+X	op = OP_CALL;
+X	index = getbuiltinfunc(name);
+X	if (index < 0) {
+X		op = OP_USERCALL;
+X		index = adduserfunc(name);
+X	}
+X	if (gettoken() == T_RIGHTPAREN) {
+X		if (op == OP_CALL)
+X			builtincheck(index, 0);
+X		addopfunction(op, index, 0);
+X		return;
+X	}
+X	rescantoken();
+X	argcount = 0;
+X	for (;;) {
+X		argcount++;
+X		addrflag = (gettoken() == T_AND);
+X		if (!addrflag)
+X			rescantoken();
+X		if (!islvalue(getassignment()) && addrflag)
+X			scanerror(T_NULL, "Taking address of non-variable");
+X		if (!addrflag && (op != OP_CALL))
+X			addop(OP_GETVALUE);
+X		switch (gettoken()) {
+X			case T_RIGHTPAREN:
+X				if (op == OP_CALL)
+X					builtincheck(index, argcount);
+X				addopfunction(op, index, argcount);
+X				return;
+X			case T_COMMA:
+X				break;
+X			default:
+X				scanerror(T_SEMICOLON, "Missing right parenthesis in function call");
+X				return;
+X		}
+X	}
+X}
+X
+X/* END CODE */
+END_OF_FILE
+if test 35857 -ne `wc -c <'codegen.c'`; then
+    echo shar: \"'codegen.c'\" unpacked with wrong size!
+fi
+# end of 'codegen.c'
+fi
+echo shar: End of archive 19 \(of 21\).
+cp /dev/null ark19isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 21 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

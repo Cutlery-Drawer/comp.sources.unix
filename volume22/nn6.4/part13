@@ -1,0 +1,2001 @@
+Subject:  v22i048:  NN Newsreader, release 6.4, Part13/21
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: 748490dd 2edefe04 18c447de 314e980c
+
+Submitted-by: "Kim F. Storm" <storm@texas.dk>
+Posting-number: Volume 22, Issue 48
+Archive-name: nn6.4/part13
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then feed it
+# into a shell via "sh file" or similar.  To overwrite existing files,
+# type "sh file -c".
+# The tool that generated this appeared in the comp.sources.unix newsgroup;
+# send mail to comp-sources-unix@uunet.uu.net if you want that tool.
+# Contents:  db.c folder.c man/nnmaster.8
+# Wrapped by storm@texas.dk on Sun May  6 18:19:53 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+echo If this archive is complete, you will see the following message:
+echo '          "shar: End of archive 13 (of 22)."'
+if test -f 'db.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'db.c'\"
+else
+  echo shar: Extracting \"'db.c'\" \(20768 characters\)
+  sed "s/^X//" >'db.c' <<'END_OF_FILE'
+X/*
+X *	(c) Copyright 1990, Kim Fabricius Storm.  All rights reserved.
+X *
+X *	Database access and update
+X */
+X
+X#include "config.h"
+X#include "db.h"
+X
+Ximport char
+X    *master_directory, *db_directory, *db_data_directory, *news_directory;
+X
+Xexport master_header master;
+Xexport group_header *active_groups = NULL;
+Xexport group_header **sorted_groups = NULL;
+X
+Xexport int  reread_groups_file = 0;  /* nnmaster -G */
+X
+Xexport data_header db_hdr;
+Xexport data_dynamic_data db_data;
+X
+Xexport int32 db_read_counter = 0; 	/* articles read by db_read_art */
+Xexport int32 db_write_counter = 0;	/* articles written by db_write_art */
+X
+X/*
+X * Init access to a group
+X */
+X
+Xexport group_header *current_group = NULL;
+X
+Xexport char group_path_name[FILENAME];
+Xexport char *group_file_name = NULL;
+X
+Xstatic char *group_position = NULL;
+Xstatic article_number current_digest_article = 0;
+X
+Xinit_group(gh)
+Xregister group_header *gh;
+X{
+X    register char *p, *q;
+X
+X    current_digest_article = 0;
+X
+X    if (gh == NULL) return 0;
+X    if (gh->master_flag & M_IGNORE_GROUP) return 0;
+X    if (gh == current_group) return 1;
+X
+X    current_group = gh;
+X
+X    if (gh->group_flag & G_FOLDER) {
+X	group_position = NULL;
+X	group_file_name = NULL;
+X	strcpy(group_path_name, gh->group_name);
+X	return 1;
+X    }
+X
+X#ifdef NNTP
+X    if (use_nntp && nntp_set_group(gh) < 0)
+X	return 0;
+X#endif /* NNTP */
+X
+X    if (group_position == NULL)
+X	if (who_am_i == I_AM_MASTER || who_am_i == I_AM_EXPIRE)
+X	    group_position = group_path_name;
+X	else {
+X	    strcpy(group_path_name, news_directory);
+X	    group_position = group_path_name + strlen(group_path_name);
+X	    *group_position++ = '/';
+X	}
+X
+X    for (p = group_position, q = gh->group_name; *q; q++)
+X	*p++ = (*q == '.') ? '/' : *q;
+X
+X    if (who_am_i == I_AM_MASTER) {
+X
+X	/* The master will chdir to the group's directory to get */
+X	/* better performance (can use relative path names). */
+X
+X	*p++ = NUL;
+X
+X	if (!use_nntp) {
+X	    if (chdir(news_directory) < 0)
+X		sys_error(news_directory);
+X
+X	    if (chdir(group_path_name) < 0)
+X		return 0;
+X	}
+X	group_file_name = group_path_name;
+X	return 1;
+X    }
+X
+X    /* client */
+X    if (gh->master_flag & M_NO_DIRECTORY) return 0;
+X
+X    *p++ = '/';
+X    *p = NUL;
+X    group_file_name = p;
+X    return 1;
+X}
+X
+X/*
+X *	Open master & group file; read it in if first open.
+X *
+X *	GROUPS file format is:
+X *
+X *	One line per group:
+X *	<group name> [<space><timestamp>] [<space><options>] <NL>
+X *	If <timestamp> is omitted, a timestamp of 0 is used (very old group).
+X *	If <group name> is "@", the master entry is ignored.
+X *
+X *	<options>:
+X *	D	Digest all articles in the group
+X *	N	Never digest articles
+X *	@	Bogus group, ignore completely
+X *	!	Don't collect this group
+X *
+X *	Do not edit the GROUPS file while nnmaster is running.
+X *	After editing the groups file (options), run nnmaster -G.
+X */
+X
+Xstatic FILE *group_file = NULL;
+X
+Xopen_groups(mode)
+Xint mode;
+X{
+X    group_file = open_file(relative(db_directory, "GROUPS"), mode);
+X
+X    if (group_file != NULL && (mode & OPEN_CREATE)) {
+X	fprintf(group_file, 
+X"#\n#\tRUN 'nnmaster -G' AFTER MODIFYING THIS FILE\n");
+X	fprintf(group_file, 
+X"#\n#\tDO NOT REMOVE OR REORDER ANY LINES IN THIS FILE\n#\n");
+X    }
+X    
+X    return group_file != NULL;
+X}
+X
+Xclose_groups()
+X{
+X    if (group_file != NULL) {
+X	fclose(group_file);
+X	group_file = NULL;
+X    }
+X}
+X
+Xdb_append_group(gh)
+Xregister group_header *gh;
+X{
+X    char flags[16], *fp;
+X    int was_open = (group_file != NULL);
+X
+X    if (!was_open) open_groups(OPEN_UPDATE|MUST_EXIST);
+X
+X    fseek(group_file, (off_t)0, 2);
+X    if (gh->group_name[0] == NUL) {
+X	fputc('@', group_file);
+X	goto out;
+X    }
+X
+X    fprintf(group_file, "%s", gh->group_name);
+X    if (gh->creation_time > 0)
+X	fprintf(group_file, " %ld", (long)(gh->creation_time));
+X
+X    fp = flags;
+X
+X    if (gh->master_flag & M_IGNORE_G)
+X	*fp++ = '!';
+X    if (gh->master_flag & M_ALWAYS_DIGEST)
+X	*fp++ = 'D';
+X    if (gh->master_flag & M_NEVER_DIGEST)
+X	*fp++ = 'N';
+X    if (gh->master_flag & M_INCLUDE_OLD)
+X	*fp++ = 'O';
+X    if (gh->master_flag & M_AUTO_RECOLLECT)
+X	*fp++ = 'R';
+X    if (gh->archive_file != NULL)
+X	*fp++ = '>';
+X
+X    if (fp != flags) {
+X	*fp++ = NUL;
+X	fprintf(group_file, " %s%s", flags,
+X		gh->archive_file != NULL ? gh->archive_file : "");
+X    }
+X
+X out:
+X    fputc(NL, group_file);
+X    fflush(group_file);
+X
+X    if (!was_open) close_groups();
+X}
+X
+Xstatic char *mk_archive_file(gh, cp, logerr)
+Xregister group_header *gh;
+Xregister char *cp;
+Xint logerr;
+X{
+X    char *name;
+X
+X    while (*cp && (*cp == '>' || isspace(*cp))) cp++;
+X
+X    name = cp;
+X    while (*cp && !isspace(*cp)) cp++;
+X    if (*cp) *cp++ = NUL;
+X    if (*name) {
+X	gh->archive_file = copy_str(name);
+X
+X	if (*name == '/')
+X	    gh->master_flag |= M_AUTO_ARCHIVE;
+X	else {
+X	    gh->master_flag &= ~M_AUTO_ARCHIVE;
+X	    if (who_am_i == I_AM_MASTER)
+X		if (logerr)
+X		    log_entry('E', "GROUPS %s >%s: Full path required",
+X			      gh->group_name, name);
+X		else
+X		    printf("Error in GROUPS: %s >%s: Full path required\n",
+X			      gh->group_name, name);
+X	}
+X    }
+X
+X    return cp;
+X}
+X
+Xdb_parse_group(gh, trust_master)
+Xregister group_header *gh;
+Xint trust_master;		/* trust what is in the master file */
+X{
+X    char line[256];
+X    register char *cp, *name;
+X    int ignore;
+X
+X    do {
+X	if (fgets(line, 256, group_file) == NULL) return 0;
+X	for (cp = line; *cp && isspace(*cp); cp++);
+X    } while (*cp == NUL || *cp == '#');
+X
+X    gh->archive_file = NULL;
+X
+X    name = cp;
+X
+X    if (trust_master) {
+X	cp = name + gh->group_name_length;
+X    } else {
+X	/* parse GROUPS line */
+X
+X	if (*cp == '@') {
+X	    ignore = 1;
+X	    gh->group_name_length = 0;
+X	    gh->group_name = "";
+X	    goto ignore_group;
+X	}
+X
+X	if (gh->group_name_length == 0) {
+X	    while (*cp && !isspace(*cp)) cp++;
+X	    gh->group_name_length = cp - name;
+X	} else {
+X	    cp = name + gh->group_name_length;
+X	    if (*cp == NUL || !isspace(*cp)) {
+X		sys_error("MASTER/GROUPS conflict: %d/%s", gh->group_num, line);
+X	    }
+X	}
+X    }
+X
+X    if (*cp) *cp++ = NUL;
+X    if (gh->group_name_length > 0)
+X	gh->group_name = copy_str(name);
+X    else
+X	gh->group_name = "";
+X
+X    if (trust_master) {
+X	if (gh->master_flag & M_AUTO_ARCHIVE) {
+X	    while (*cp && *cp != '>') cp++;
+X	    if (*cp == '>') cp = mk_archive_file(gh, cp, 1);
+X	}
+X	return 1;
+X    }
+X
+X    while (*cp && isspace(*cp)) cp++;
+X
+X    if (*cp && isdigit(*cp)) {
+X	gh->creation_time = atol(cp);
+X	while (*cp && isdigit(*cp)) cp++;
+X    } else
+X	gh->creation_time = 0;
+X
+X    while (*cp && isspace(*cp)) cp++;
+X
+X    ignore = 0;
+X    gh->master_flag &= ~(M_ALWAYS_DIGEST | M_NEVER_DIGEST |
+X			M_AUTO_RECOLLECT | M_AUTO_ARCHIVE);
+X
+X    while (*cp) {
+X	switch (*cp++) {
+X	 case ' ':
+X	 case '\t':
+X	 case NL:
+X	 case CR:
+X	    continue;
+X
+X	 case 'D':	/* Collect this group, digest all articles */
+X	    gh->master_flag |= M_ALWAYS_DIGEST;
+X	    continue;
+X
+X	 case 'N':	/* Collect this group, never digest articles */
+X	    gh->master_flag |= M_NEVER_DIGEST;
+X	    continue;
+X
+X	 case 'O':	/* Ignore -O option for this group */
+X	    gh->master_flag |= M_INCLUDE_OLD;
+X	    continue;
+X
+X	 case 'R':	/* Recollect this group when new articles arrive */
+X	    gh->master_flag |= M_AUTO_RECOLLECT;
+X	    continue;
+X
+X	 case '>':	/* Archive all new articles in gh->archive_file */
+X	    cp = mk_archive_file(gh, cp, 0);
+X	    continue;
+X
+X	 case '@':	/* Bogus GROUP -- ignore completely */
+X	    ignore = 1;
+X	    gh->group_name_length = 0;
+X	    break;
+X
+X	 case '!':	/* Do not collect this group */
+X	 case 'X':
+X	    ignore = 1;
+X	    break;
+X
+X	 case '#':	/* comment */
+X	    *cp = NUL;
+X	    break;
+X
+X	 default:
+X	    printf("Bad GROUPS flag for %s: `%c'\n", gh->group_name, *--cp);
+X	    break;
+X	}
+X	break;
+X    }
+X
+X ignore_group:
+X
+X    /* G_DONE indicates to master that the group must be cleaned */
+X
+X    if (ignore) {
+X	if ((gh->master_flag & M_IGNORE_GROUP) == 0) {
+X	    gh->master_flag |= M_MUST_CLEAN;
+X	    log_entry('X', "Group %s ignored", gh->group_name);
+X	}
+X	gh->master_flag |= M_IGNORE_G;
+X    } else {	/* was group ignored in GROUPS, but not active before? */
+X	if ((gh->master_flag & M_IGNORE_GROUP) == M_IGNORE_G) {
+X	    gh->master_flag &= ~M_NO_DIRECTORY;
+X	    log_entry('X', "Group %s activated", gh->group_name);
+X	}
+X	gh->master_flag &= ~M_IGNORE_G;
+X    }
+X    
+X    return 1;
+X}
+X
+X/*
+X *	Open master & group files; read then in if first open.
+X */
+X
+Xstatic FILE *master_file = NULL;
+Xstatic int db_sequential = 0;
+X
+Xopen_master(mode)
+Xint mode;
+X{
+X    register group_header *gh;
+X    int trust_master;
+X
+X    close_master();
+X
+X    master_file = open_file(relative(db_directory, "MASTER"), mode|MUST_EXIST);
+X
+X    db_sequential = 0;
+X    if (mode == OPEN_CREATE) db_sequential = 1;
+X
+X    if (mode != OPEN_READ) return;
+X
+X    db_read_master();
+X
+X    if (who_am_i != I_AM_MASTER && master.db_lock[0]) {
+X	printf("DATABASE LOCKED.\n%s\n", master.db_lock);
+X	nn_exit(88);
+X    }
+X
+X    freeobj(sorted_groups);
+X    freeobj(active_groups);
+X    active_groups = NULL;
+X    sorted_groups = NULL;
+X
+X    db_expand_master();
+X
+X    open_groups(OPEN_READ|MUST_EXIST);
+X
+X    trust_master = (who_am_i != I_AM_MASTER || !reread_groups_file);
+X
+X    db_sequential = 1;
+X    Loop_Groups_Header(gh) {
+X	gh->group_num = l_g_index;
+X	db_read_group(gh);
+X	db_parse_group(gh, trust_master);
+X    }
+X    db_sequential = 0;
+X
+X    close_groups();
+X
+X    sort_groups();
+X}
+X
+Xdb_expand_master()
+X{
+X    master.free_groups = 20;
+X
+X    active_groups = resizeobj(active_groups, group_header,
+X			      master.number_of_groups + master.free_groups);
+X    sorted_groups = resizeobj(sorted_groups, group_header *,
+X			      master.number_of_groups + master.free_groups);
+X}
+X
+Xclose_master()
+X{
+X    if (master_file != NULL) {
+X	fclose(master_file);
+X	master_file = NULL;
+X    }
+X}
+X
+Xupdate_group(gh)
+Xgroup_header *gh;
+X{
+X    group_number numg;
+X
+X    numg = master.number_of_groups;
+X    db_read_master();
+X    master.number_of_groups = numg;
+X    if (master.db_lock[0]) return -3;
+X
+X    db_read_group(gh);
+X
+X    if (gh->master_flag & M_IGNORE_GROUP) return 0;
+X    if (gh->master_flag & M_BLOCKED) return -1;
+X
+X    return 1;
+X}
+X
+X
+Xstatic sort_gh(g1, g2)
+Xgroup_header **g1, **g2;
+X{
+X    return strcmp((*g1)->group_name, (*g2)->group_name);
+X}
+X
+X
+Xsort_groups()
+X{
+X    register group_header *gh;
+X
+X    Loop_Groups_Header(gh)
+X	sorted_groups[l_g_index] = gh;
+X
+X    quicksort(sorted_groups, master.number_of_groups, group_header *, sort_gh);
+X
+X    s_g_first = 0;
+X    Loop_Groups_Sorted(gh)
+X	if (gh->group_name[0] != NUL) {
+X	    s_g_first = l_g_index;
+X	    break;
+X	}
+X}
+X
+X
+Xgroup_header *lookup_no_alias(name)
+Xchar *name;
+X{
+X    register i, j, k, t;
+X
+X    i = s_g_first; j = master.number_of_groups - 1;
+X
+X    while (i <= j) {
+X	k = (i + j) / 2;
+X
+X	if ( (t=strcmp(name, sorted_groups[k]->group_name)) > 0)
+X	    i = k+1;
+X	else
+X	if (t < 0)
+X	    j = k-1;
+X	else
+X	    return sorted_groups[k];
+X    }
+X
+X    return NULL;
+X}
+X
+Xgroup_header *lookup(name)
+Xchar *name;
+X{
+X    register group_header *gh;
+X
+X    gh = lookup_no_alias(name);
+X    if (gh == NULL || (gh->master_flag & M_ALIASED) == 0) return gh;
+X
+X    do
+X	gh = &active_groups[gh->data_write_offset];
+X    while (gh->master_flag & M_ALIASED);
+X
+X    return gh;
+X}
+X
+Xart_collected(gh, art_num)
+Xgroup_header *gh;
+Xarticle_number art_num;
+X{
+X    return gh->first_db_article <= art_num && gh->last_db_article >= art_num;
+X}
+X
+Xchar *db_data_path(namebuf, gh, d_or_x)
+Xchar *namebuf;
+Xgroup_header *gh;
+Xchar d_or_x;
+X{
+X    register char *cp, *np;
+X
+X    if (db_data_directory != NULL) {
+X#ifdef DB_LONG_NAMES
+X	sprintf(namebuf, "%s/%s.%c", db_data_directory, gh->group_name, d_or_x);
+X#else
+X	sprintf(namebuf, "%s/%d.%c", db_data_directory, gh->group_num, d_or_x);
+X#endif
+X    } else {
+X	np = namebuf;
+X	/* master chdir to the group's directory */
+X	if (who_am_i != I_AM_MASTER) {
+X	    for (cp = news_directory; *np = *cp++; np++);
+X	    *np++ = '/';
+X	    for (cp = gh->group_name; *cp; cp++)
+X		*np++ = *cp == '.' ? '/' : *cp;
+X	    *np++ = '/';
+X	}
+X
+X	*np++ = '.';
+X	*np++ = 'n';
+X	*np++ = 'n';
+X	*np++ = d_or_x;
+X	*np++ = NUL;
+X    }
+X
+X    return namebuf;
+X}
+X
+X
+XFILE *open_data_file(gh, d_or_x, mode)
+Xgroup_header *gh;
+Xchar d_or_x;
+Xint mode;
+X{
+X    char data_file[FILENAME];
+X
+X    db_data_path(data_file, gh, d_or_x);
+X
+X    if (mode == -1) {
+X	unlink(data_file);
+X	return (FILE *)NULL;
+X    } else
+X	return open_file(data_file, mode);
+X}
+X
+X
+X#ifdef NETWORK_DATABASE
+X
+X#define MASTER_FIELDS	5	/* + DB_LOCK_MESSAGE bytes */
+X#define	GROUP_FIELDS	9
+X#define	ARTICLE_FIELDS	10
+X
+X
+Xtypedef int32 net_long;
+X
+X
+X#ifdef NETWORK_BYTE_ORDER
+X
+X#define net_to_host(buf, n)
+X#define host_to_net(buf, n)
+X
+X#else
+X
+Xstatic net_to_host(buf, lgt)
+Xregister net_long *buf;
+Xint lgt;
+X{
+X    while (--lgt >= 0) {
+X	*buf = ntohl(*buf);
+X	buf++;
+X    }
+X}
+X
+Xstatic host_to_net(buf, lgt)
+Xregister net_long *buf;
+Xint lgt;
+X{
+X    while (--lgt >= 0) {
+X	*buf = htonl(*buf);
+X	buf++;
+X    }
+X}
+X#endif /* not NETWORK_BYTE_ORDER */
+X#endif /* NETWORK_DATABASE */
+X
+X#define NWDB_MAGIC 0x00190000	/* NN#n <-> NW#n */
+X
+Xdb_read_master()
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long buf[MASTER_FIELDS];
+X
+X    rewind(master_file);
+X    if (fread((char *)buf, sizeof(net_long), MASTER_FIELDS, master_file)
+X	!= MASTER_FIELDS) goto err;
+X    if (fread(master.db_lock, sizeof(char), DB_LOCK_MESSAGE, master_file)
+X	!= DB_LOCK_MESSAGE) goto err;
+X
+X    net_to_host(buf, MASTER_FIELDS);
+X
+X    master.db_magic = buf[0] ^ NWDB_MAGIC;
+X    master.last_scan = buf[1];
+X    master.last_size = buf[2];
+X    master.number_of_groups = buf[3];
+X    master.db_created = buf[4];
+X
+X#else
+X    rewind(master_file);
+X    if (fread((char *)&master, sizeof(master_header), 1, master_file) != 1)
+X	goto err;
+X#endif
+X
+X    if (master.db_magic != NNDB_MAGIC)
+X	sys_error("Database magic number mismatch");
+X    return;
+X
+X err:
+X    sys_error("Incomplete MASTER file");
+X}
+X
+X
+Xdb_write_master()
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long buf[MASTER_FIELDS];
+X
+X    buf[0] = master.db_magic ^ NWDB_MAGIC;
+X    buf[1] = master.last_scan;
+X    buf[2] = master.last_size;
+X    buf[3] = master.number_of_groups;
+X    buf[4] = master.db_created;
+X
+X    host_to_net(buf, MASTER_FIELDS);
+X    rewind(master_file);
+X    if (fwrite((char *)buf, sizeof(net_long), MASTER_FIELDS, master_file)
+X	!= MASTER_FIELDS) goto err;
+X    if (fwrite(master.db_lock, sizeof(char), DB_LOCK_MESSAGE, master_file)
+X	!= DB_LOCK_MESSAGE) goto err;
+X#else
+X    rewind(master_file);
+X    if (fwrite((char *)&master, sizeof(master_header), 1, master_file) != 1)
+X	goto err;
+X#endif
+X
+X    fflush(master_file);
+X    return;
+X
+X err:
+X    sys_error("Write to MASTER failed");
+X}
+X
+Xdb_read_group(gh)
+Xregister group_header *gh;
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long buf[GROUP_FIELDS];
+X
+X    if (!db_sequential)
+X	fseek(master_file,
+X	      (off_t)(MASTER_FIELDS * sizeof(net_long) + DB_LOCK_MESSAGE +
+X	      GROUP_FIELDS * sizeof(net_long) * gh->group_num), 0);
+X
+X    if (fread((char *)buf, sizeof(net_long), GROUP_FIELDS, master_file) != GROUP_FIELDS)
+X	goto err;
+X
+X    net_to_host(buf, GROUP_FIELDS);
+X
+X    gh->first_db_article = buf[0];
+X    gh->last_db_article = buf[1];
+X    gh->index_write_offset = buf[2];
+X    gh->data_write_offset = buf[3];
+X    gh->group_name_length = buf[4];
+X    gh->master_flag = buf[5];
+X    gh->first_a_article = buf[6];
+X    gh->last_a_article = buf[7];
+X    gh->creation_time = buf[8];
+X#else
+X
+X    if (!db_sequential)
+X	fseek(master_file, 
+X	      (off_t)(sizeof(master_header) + SAVED_GROUP_HEADER_SIZE(*gh) * gh->group_num), 0);
+X
+X    if (fread((char *)gh, SAVED_GROUP_HEADER_SIZE(*gh), 1, master_file) != 1)
+X	goto err;
+X
+X#endif
+X    return;
+X
+X err:
+X    sys_error("Read GROUPS failed");
+X}
+X
+X
+Xdb_write_group(gh)
+Xregister group_header *gh;
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long buf[GROUP_FIELDS];
+X
+X    if (!db_sequential)
+X	fseek(master_file,
+X	      (off_t)(MASTER_FIELDS * sizeof(net_long) + DB_LOCK_MESSAGE +
+X	      GROUP_FIELDS * sizeof(net_long) * gh->group_num), 0);
+X
+X    buf[0] = gh->first_db_article;
+X    buf[1] = gh->last_db_article;
+X    buf[2] = gh->index_write_offset;
+X    buf[3] = gh->data_write_offset;
+X    buf[4] = gh->group_name_length;
+X    buf[5] = gh->master_flag;
+X    buf[6] = gh->first_a_article;
+X    buf[7] = gh->last_a_article;
+X    buf[8] = gh->creation_time;
+X
+X    host_to_net(buf, GROUP_FIELDS);
+X    if (fwrite((char *)buf, sizeof(net_long), GROUP_FIELDS, master_file) != GROUP_FIELDS)
+X	goto err;
+X#else
+X    if (!db_sequential)
+X	fseek(master_file, (off_t)(sizeof(master_header) + SAVED_GROUP_HEADER_SIZE(*gh) * gh->group_num), 0);
+X
+X    if (fwrite((char *)gh, SAVED_GROUP_HEADER_SIZE(*gh), 1, master_file) != 1)
+X	goto err;
+X#endif
+X    fflush(master_file);
+X    return;
+X
+X err:
+X    sys_error("Write GROUPS failed");
+X}
+X
+Xdb_read_art(f)
+XFILE *f;
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long buf[ARTICLE_FIELDS];
+X
+X    if (fread((char *)buf, sizeof(net_long), ARTICLE_FIELDS, f) != ARTICLE_FIELDS)
+X	return 0;
+X
+X    net_to_host(buf, ARTICLE_FIELDS);
+X
+X    db_hdr.dh_number = buf[0];
+X    db_hdr.dh_date = buf[1];
+X    db_hdr.dh_hpos = buf[2];
+X    db_hdr.dh_lpos = buf[3];
+X    db_hdr.dh_fpos = buf[4];
+X    db_hdr.dh_lines = buf[5];
+X    db_hdr.dh_replies = buf[6];
+X    db_hdr.dh_cross_postings = buf[7];
+X    db_hdr.dh_subject_length = buf[8];
+X    db_hdr.dh_sender_length = buf[9];
+X#else
+X    if (fread((char *)&db_hdr, sizeof(data_header), 1, f) != 1) return 0;
+X#endif
+X
+X    if (db_hdr.dh_number < 0) {
+X	current_digest_article = db_hdr.dh_number = -db_hdr.dh_number;
+X	db_data.dh_type = DH_DIGEST_HEADER;
+X    } else
+X    if (db_hdr.dh_number == 0) {
+X	db_hdr.dh_number = current_digest_article;
+X	db_data.dh_type = DH_SUB_DIGEST;
+X    } else {
+X	current_digest_article = 0;
+X	db_data.dh_type = DH_NORMAL;
+X    }
+X
+X    if (db_hdr.dh_cross_postings)
+X    	if (fread((char *)db_data.dh_cross, sizeof(cross_post_number),
+X		  (int)db_hdr.dh_cross_postings, f)
+X	    != (int)db_hdr.dh_cross_postings) return -1;
+X
+X    if (db_hdr.dh_sender_length)
+X	if (fread(db_data.dh_sender, sizeof(char),
+X		  (int)db_hdr.dh_sender_length, f)
+X	    != db_hdr.dh_sender_length) return -1;
+X    db_data.dh_sender[db_hdr.dh_sender_length] = NUL;
+X
+X    if (db_hdr.dh_subject_length)
+X	if (fread(db_data.dh_subject, sizeof(char),
+X		  (int)db_hdr.dh_subject_length, f)
+X	    !=  db_hdr.dh_subject_length) return -1;
+X    db_data.dh_subject[db_hdr.dh_subject_length] = NUL;
+X
+X    db_read_counter++;
+X
+X    return 1;
+X}
+X
+Xdb_write_art(f)
+XFILE *f;
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long buf[ARTICLE_FIELDS];
+X#endif
+X    article_number art_num = db_hdr.dh_number;
+X
+X    switch (db_data.dh_type) {
+X     case DH_NORMAL:
+X	break;
+X     case DH_SUB_DIGEST:
+X	db_hdr.dh_number = 0;
+X	break;
+X     case DH_DIGEST_HEADER:
+X	db_hdr.dh_number = -art_num;
+X	break;
+X    }
+X
+X#ifdef NETWORK_DATABASE
+X    buf[0] = db_hdr.dh_number;
+X    buf[1] = db_hdr.dh_date;
+X    buf[2] = db_hdr.dh_hpos;
+X    buf[3] = db_hdr.dh_lpos;
+X    buf[4] = db_hdr.dh_fpos;
+X    buf[5] = db_hdr.dh_lines;
+X    buf[6] = db_hdr.dh_replies;
+X    buf[7] = db_hdr.dh_cross_postings;
+X    buf[8] = db_hdr.dh_subject_length;
+X    buf[9] = db_hdr.dh_sender_length;
+X
+X    host_to_net(buf, ARTICLE_FIELDS);
+X
+X    if (fwrite((char *)buf, sizeof(net_long), ARTICLE_FIELDS, f) != ARTICLE_FIELDS)
+X	return -1;
+X#else
+X
+X    if (fwrite((char *)&db_hdr, sizeof(data_header), 1, f) != 1)
+X	return -1;
+X
+X#endif
+X    if (db_hdr.dh_cross_postings)
+X    	if (fwrite((char *)db_data.dh_cross, sizeof(cross_post_number),
+X		  (int)db_hdr.dh_cross_postings, f)
+X	    != (int)db_hdr.dh_cross_postings) return -1;
+X
+X    if (db_hdr.dh_sender_length)
+X	if (fwrite(db_data.dh_sender, sizeof(char),
+X		  (int)db_hdr.dh_sender_length, f)
+X	    != db_hdr.dh_sender_length) return -1;
+X
+X    if (db_hdr.dh_subject_length)
+X	if (fwrite(db_data.dh_subject, sizeof(char),
+X		  (int)db_hdr.dh_subject_length, f)
+X	    != db_hdr.dh_subject_length) return -1;
+X
+X    db_hdr.dh_number = art_num;
+X
+X    db_write_counter++;
+X
+X    return 1;
+X}
+X
+X
+Xoff_t get_index_offset(gh, art_num)
+Xgroup_header *gh;
+Xarticle_number art_num;
+X{
+X#ifdef NETWORK_DATABASE
+X    return (off_t)((art_num - gh->first_db_article) * sizeof(net_long));
+X#else
+X    return (off_t)((art_num - gh->first_db_article) * sizeof(off_t));
+X#endif
+X}
+X
+Xoff_t get_data_offset(gh, art_num)
+Xgroup_header *gh;
+Xarticle_number art_num;
+X{
+X    FILE *index;
+X    off_t data_offset;
+X
+X    if (gh->first_db_article == art_num) return (off_t)0;
+X
+X    index = open_data_file(gh, 'x', OPEN_READ);
+X    if (index == NULL) return (off_t)(-1);
+X
+X    fseek(index, get_index_offset(gh, art_num), 0);
+X    if (!db_read_offset(index, &data_offset))
+X	return (off_t)(-1);
+X
+X    fclose(index);
+X
+X    return data_offset;
+X}
+X
+X
+Xdb_read_offset(f, offset)
+XFILE *f;
+Xoff_t *offset;
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long temp;
+X
+X    if (fread((char *)&temp, sizeof(net_long), 1, f) != 1) return 0;
+X
+X#ifndef NETWORK_BYTE_ORDER
+X    temp = ntohl(temp);
+X#endif
+X    *offset = temp;
+X#else
+X
+X    if (fread((char *)offset, sizeof(off_t), 1, f) != 1) return 0;
+X#endif
+X    return 1;
+X}
+X
+Xdb_write_offset(f, offset)
+XFILE *f;
+Xoff_t *offset;
+X{
+X#ifdef NETWORK_DATABASE
+X    net_long temp;
+X
+X    temp = *offset;
+X
+X#ifndef NETWORK_BYTE_ORDER
+X    temp = htonl(temp);
+X#endif
+X    if (fwrite((char *)&temp, sizeof(net_long), 1, f) != 1) return 0;
+X
+X#else
+X
+X    if (fwrite((char *)offset, sizeof(off_t), 1, f) != 1) return 0;
+X#endif
+X    return 1;
+X}
+X
+END_OF_FILE
+  if test 20768 -ne `wc -c <'db.c'`; then
+    echo shar: \"'db.c'\" unpacked with wrong size!
+  fi
+  # end of 'db.c'
+fi
+if test -f 'folder.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'folder.c'\"
+else
+  echo shar: Extracting \"'folder.c'\" \(8918 characters\)
+  sed "s/^X//" >'folder.c' <<'END_OF_FILE'
+X/*
+X *	(c) Copyright 1990, Kim Fabricius Storm.  All rights reserved.
+X *
+X *	Folder handling
+X */
+X
+X/*#include <errno.h>*/
+X#include "config.h"
+X#include "articles.h"
+X#include "news.h"
+X#include "term.h"
+X#include "menu.h"
+X
+Xexport int  dont_sort_folders = 0;
+Xexport char *folder_directory  = NULL;
+X
+X/*
+X * 	file name completion and expansion
+X *
+X *	expand_mode bits:
+X *		1:	expand path names
+X *		2:	don't expand $N
+X *		4:	don't expand any $?  (but $(...) is expanded)
+X *		8:	don't complain about ~... (shell will do that)
+X */
+X
+X
+Xexpand_file_name(dest, src, expand_mode)
+Xchar *dest, *src;
+Xint expand_mode;
+X{
+X    register char *cp, *dp, c;
+X    int parse, remap;
+X    char *cur_grp, *cur_art;
+X    import char *home_directory;
+X
+X    cur_grp = current_group ? current_group->group_name : NULL;
+X    cur_art = (group_file_name && *group_file_name) ? group_path_name : NULL;
+X
+X    for (dp = dest, parse = 1; c = *src; src++) {
+X
+X	if (parse) {
+X
+X	    if ((expand_mode & 1) && c == '+') {
+X		if (folder_directory == NULL) {
+X		    if (!(cp = getenv("FOLDER")))
+X			cp = FOLDER_DIRECTORY;
+X		    folder_directory = home_relative(cp);
+X		}
+X
+X		cp = folder_directory;
+X		goto cp_str;
+X	    }
+X
+X	    if ((expand_mode & 1) && c == '~') {
+X		if (src[1] != '/') {
+X		    if (expand_mode & 8) goto copy;
+X		    msg("Can't handle ~user expansion (yet)");
+X		    return 0;
+X		}
+X
+X		cp = home_directory;
+X
+X	     cp_str:
+X		while (*cp) *dp++ = *cp++;
+X		if (dp[-1] != '/') *dp++ = '/';
+X		goto no_parse;
+X	    }
+X
+X	    if ((expand_mode & 4) == 0 &&
+X		cur_art && c == '%' && (src[1] == ' ' || src[1] == NUL)) {
+X		cp = cur_art;
+X		while (*cp) *dp++ = *cp++;
+X		goto no_parse;
+X	    }
+X
+X	}
+X
+X	if (c == '$' && src[1] == '(') {
+X	    char envar[64];
+X	    for (src += 2, cp = envar; (c = *src) != NUL && c != ')'; src++)
+X		*cp++ = c;
+X	    *cp = NUL;
+X	    if (cp != envar) {
+X		if ((cp = getenv(envar)) != NULL)
+X		    while (*cp) *dp++ = *cp++;
+X		else {
+X		    msg("Environment variable $(%d) not set", envar);
+X		    return 0;
+X		}
+X	    }
+X	    goto no_parse;
+X	}
+X
+X	if ((expand_mode & 4) == 0 && c == '$' && !isalnum(src[2])) {
+X	    remap = 0;
+X	    cp = NULL;
+X
+X	    switch (src[1]) {
+X	     case 'A':
+X		cp = cur_art;
+X		break;
+X	     case 'F':
+X		cp = cur_grp;
+X		remap = 1;
+X		break;
+X	     case 'G':
+X		cp = cur_grp;
+X		break;
+X	     case 'L':
+X		if (cp = strrchr(cur_grp, '.'))
+X		    cp++;
+X		else
+X		    cp = cur_grp;
+X		break;
+X	     case 'N':
+X		if (expand_mode & 2) goto copy;
+X		if (cur_art) cp = group_file_name;
+X		if (cp == NULL) goto copy;
+X		break;
+X	     default:
+X		goto copy;
+X	    }
+X	    src++;
+X
+X	    if (!cp) {
+X		msg("$%c not defined on this level", c);
+X		return 0;
+X	    }
+X
+X	    while (*cp)
+X		if (remap && *cp == '.')
+X		    cp++, *dp++ = '/';
+X		else
+X		    *dp++ = *cp++;
+X	    goto no_parse;
+X	}
+X
+X	if (c == '/')
+X	    if (dp != dest && dp[-1] == '/') goto no_parse;
+X
+X     copy:
+X	*dp++ = c;
+X	parse = isspace(c);
+X	continue;
+X
+X     no_parse:
+X        parse = 0;
+X    }
+X
+X    *dp = NUL;
+X
+X    return 1;
+X}
+X
+X
+Xfile_completion(path, index)
+Xchar *path;
+Xint index;
+X{
+X    static dir_in_use = 0;
+X    static char *head, *tail = NULL;
+X    static int  tail_offset;
+X
+X    char nbuf[FILENAME], buffer[FILENAME];
+X    char *dir, *base;
+X
+X    if (path) {
+X	if (dir_in_use) {
+X	    close_directory();
+X	    dir_in_use = 0;
+X	}
+X
+X	if (index < 0) return 0;
+X
+X	head = path;
+X	tail = path + index;
+X    }
+X
+X    if (!dir_in_use) {
+X	path = head;
+X	*tail = NUL;
+X
+X	if (*path == '|') return -1;	/* no completion for pipes */
+X
+X	if (*path == '+' || *path == '~') {
+X	    if (!expand_file_name(nbuf, path, 1))
+X		return 0;	/* no completions */
+X	} else
+X	    strcpy(nbuf, path);
+X
+X	if (base = strrchr(nbuf, '/')) {
+X	    if (base == nbuf) {
+X		dir = "/";
+X		base++;
+X	    } else {
+X		*base++ = NUL;
+X		dir = nbuf;
+X	    }
+X	} else {
+X	    base = nbuf;
+X	    dir = ".";
+X	}
+X
+X	tail_offset = strlen(base);
+X
+X	dir_in_use = list_directory(dir, base);
+X
+X	return dir_in_use;
+X    }
+X
+X    if (index)
+X	return compl_help_directory();
+X
+X    if (!next_directory(buffer, 1)) return 0;
+X
+X    strcpy(tail, buffer+tail_offset);
+X
+X    return 1;
+X}
+X
+X
+Xstatic int cancel_count;
+X
+Xfcancel(ah)
+Xarticle_header *ah;
+X{
+X    if (ah->attr == A_CANCEL) {
+X	cancel_count--;
+X	ah->flag = 0;
+X    } else {
+X	cancel_count++;
+X	ah->attr = A_CANCEL;
+X    }
+X}
+X
+Xstatic folder_header()
+X{
+X    so_printxy(0, 0, "Folder: %s", current_group->group_name);
+X
+X    return 1;	/* number of header lines */
+X}
+X
+Xfolder_menu(path)
+Xchar *path;
+X{
+X    FILE 			*folder;
+X    register article_header	*ah;
+X    news_header_buffer 		dgbuf;
+X    char 			buffer[256];
+X    int				more, length, re, menu_cmd, was_raw;
+X    memory_marker		mem_marker;
+X    group_header 		fake_group;
+X    int				cc_save;
+X    extern time_stamp pack_date();
+X
+X    fake_group.group_name = path;
+X    fake_group.group_flag = G_FOLDER | G_FAKED;
+X    fake_group.master_flag = 0;
+X    fake_group.save_file = NULL;
+X    current_group = NULL;
+X    init_group(&fake_group);
+X
+X    folder = open_file(path, OPEN_READ);
+X    if (folder == NULL) {
+X	msg("%s not found", path);
+X	return ME_NO_REDRAW;
+X    }
+X
+X    was_raw = no_raw();
+X    s_keyboard = 0;
+X
+X    printf("\rReading: %-.65s", path);
+X    clrline();
+X
+X    current_group = &fake_group;
+X
+X    mark_memory(&mem_marker);
+X
+X    ah = alloc_art();
+X
+X    more = 1;
+X    while (more && (more = get_digest_article(folder, dgbuf)) >= 0) {
+X	if (s_keyboard) break;
+X
+X	ah->a_number = 0;
+X	ah->flag = A_FOLDER;
+X	ah->attr = 0;
+X
+X	ah->lines = digest.dg_lines;
+X
+X	ah->hpos = digest.dg_hpos;
+X	ah->fpos = digest.dg_fpos;
+X	ah->lpos = digest.dg_lpos;
+X
+X	if (digest.dg_from) {
+X	    length = pack_name(buffer, digest.dg_from, NAME_LENGTH);
+X	    ah->sender = alloc_str(length);
+X	    strcpy(ah->sender, buffer);
+X	    ah->name_length = length;
+X	} else {
+X	    ah->sender = "";
+X	    ah->name_length = 0;
+X	}
+X
+X	if (digest.dg_subj) {
+X	    length = pack_subject(buffer, digest.dg_subj, &re, 255);
+X	    ah->replies = re;
+X	    ah->subject = alloc_str(length);
+X	    strcpy(ah->subject, buffer);
+X	    ah->subj_length = length;
+X	} else {
+X	    ah->replies = 0;
+X	    ah->subject = "";
+X	    ah->subj_length = 0;
+X	}
+X
+X	ah->t_stamp = digest.dg_date ? pack_date(digest.dg_date) : 0;
+X
+X	add_article(ah);
+X	ah = alloc_art();
+X    }
+X
+X    fclose(folder);
+X
+X    if (was_raw) raw();
+X
+X    if (s_keyboard) {
+X	menu_cmd = ME_NO_REDRAW;
+X    } else
+X    if (n_articles == 0) {
+X	msg("Not a folder (no article header)");
+X	menu_cmd = ME_NO_REDRAW;
+X    } else {
+X	strcpy(buffer, path);
+X	fake_group.group_name = buffer;	/* save for later use */
+X
+X	if (n_articles > 1) {
+X	    clrdisp();
+X	    prompt_line = 2;
+X	    if (!dont_sort_folders) sort_articles(-1);
+X	}
+X
+X	cc_save = cancel_count;
+X	cancel_count = 0;
+X
+X     reenter_menu:
+X	menu_cmd = menu(folder_header);
+X
+X	if (cancel_count) {
+X	    clrdisp();
+X	    printf("Folder: %s\nFile:   %s\n\n", buffer, group_path_name);
+X	    if (cancel_count == n_articles)
+X		printf("Cancel all articles and remove folder? ");
+X	    else
+X		printf("Remove %d article%s from folder? ",
+X		       cancel_count, plural((long)cancel_count));
+X	    fl;
+X
+X	    switch (yes(1)) {
+X	     case 1:
+X		printf("\n\n");
+X		if (cancel_count == n_articles) {
+X		    if (unlink(group_path_name) < 0) {
+X			printf("Could not unlink %s\n", group_path_name);
+X			sleep(3);
+X		    }
+X		} else
+X		    rewrite_folder();
+X		break;
+X	     case 0:
+X		break;
+X	     default:
+X		goto reenter_menu;
+X	    }
+X	}
+X	cancel_count = cc_save;
+X    }
+X
+X    release_memory(&mem_marker);
+X
+X    return menu_cmd;
+X}
+X
+X
+Xrewrite_folder()
+X{
+X    register FILE *src, *dst;
+X    char oldfile[FILENAME], *sp;
+X    register int c;
+X    register long cnt;
+X    register article_header *ah, **ahp;
+X    register article_number n;
+X
+X    if ((src = fopen(group_path_name, "r")) == NULL) {
+X	msg("Cannot open %s", group_path_name);
+X	return;
+X    }
+X
+X    strcpy(oldfile, group_path_name);
+X    sp = strrchr(oldfile, '/');
+X    strcpy((sp == NULL ? oldfile : sp+1), "~OLD~FOLDER~");
+X
+X    unlink(oldfile);
+X    if (link(group_path_name, oldfile) < 0) goto move_error;
+X    if (unlink(group_path_name) < 0) {
+X	if (unlink(oldfile) == 0) goto move_error;
+X	printf("\n\n%s was linked to %s --- cannot proceed\n",
+X	       group_path_name, oldfile);
+X	sleep(5);
+X	return;
+X    }
+X
+X    if ((dst = fopen(group_path_name, "w")) == NULL) {
+X	fclose(src);
+X	goto move_back;
+X    }
+X
+X    sort_articles(0);
+X
+X    printf("Compressing folder..."); fl;
+X
+X    for (ahp = articles, n = n_articles; --n >= 0; ahp++) {
+X	ah = *ahp;
+X	if (ah->attr == A_CANCEL) continue;
+X	fseek(src, ah->hpos, 0);
+X	cnt = ah->lpos - ah->hpos;
+X	while (--cnt >= 0) {
+X	    if ((c = getc(src)) == EOF) break;
+X	    putc(c, dst);
+X	}
+X	putc(NL, dst);
+X    }
+X    fclose(src);
+X    if (ferror(dst)) {
+X	fclose(dst);
+X	goto move_back;
+X    }
+X    return;
+X
+Xmove_back:
+X    if (link(oldfile, group_path_name) == 0) {
+X	unlink(oldfile);
+X	printf("Cannot create new file -- Folder restored\n");
+X	sleep(2);
+X    } else {
+X	printf("Cannot create new file\n\nFolder saved in %s\n",
+X	       oldfile);
+X	sleep(10);
+X    }
+X    return;
+X
+Xmove_error:
+X    fclose(src);
+X    printf("\n\nCannot move folder %s to %s\n",
+X	   group_path_name, oldfile);
+X    sleep(3);
+X    return;
+X}
+END_OF_FILE
+  if test 8918 -ne `wc -c <'folder.c'`; then
+    echo shar: \"'folder.c'\" unpacked with wrong size!
+  fi
+  # end of 'folder.c'
+fi
+if test -f 'man/nnmaster.8' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'man/nnmaster.8'\"
+else
+  echo shar: Extracting \"'man/nnmaster.8'\" \(21325 characters\)
+  sed "s/^X//" >'man/nnmaster.8' <<'END_OF_FILE'
+X.TH NNMASTER 1M "Release 6.4"
+X.\" (c) Copyright 1988, 1990, Kim F. Storm.  All rights reserved.
+X.UC 4
+X.SH NAME
+Xnnmaster \- nn database manager
+X.SH SYNOPSIS
+X\fBnnmaster\fP \-\fBI\fP [\fIlmit\fP]
+X.br
+X\fBnnmaster\fP \-\fBw\fP
+X.br
+X\fBnnmaster\fP \-\fBv\fP
+X.br
+X\fBnnmaster\fP \-\fBl\fP [ "\fIlock message\fP" ]
+X.br
+X\fBnnmaster\fP [ \fIoptions\fP ] [ \fIgroups\fP ]
+X.br.
+X\fBnnmaster\fP \-\fBF\fP [ \fIoptions\fP ] [ \fIgroups\fP ]
+X.SH DESCRIPTION
+X.I nnmaster
+Xis the daemon which is responsible for building and maintaining the
+Xdatabase used by the \fInn\fP(1) news reader.
+X.LP
+XNormally,
+X.I nnmaster
+Xis started when the system enters multi-user mode, and runs until
+Xsystem shutdown.  To facilitate this, you should place the following
+Xcall in /etc/rc (or similar) to invoke the
+X.I nnmaster
+Xdaemon:
+X.sp 0.5v
+X	$master/nnmaster -l -r -C
+X.sp 0.5v
+Xwhere $master is the MASTER_DIRECTORY defined during configuration
+Xof \fInn\fP.
+X.LP
+XWhen
+X.I nnmaster
+Xis started as specified above, it will first unlock the database in
+Xcase it was locked (\-\fBl\fP), perform a thorough consistency check on the
+Xdatabase (\-\fBC\fP).
+X.LP
+XThen, every 10 minutes (\-\fBr\fP), it will look at the time-stamp
+Xof the news active file to see whether new articles have arrived on
+Xthe system (or whether articles have been expired).
+X.LP
+XIf the active file has been modified,
+X.I nnmaster
+Xwill collect the header information from the new articles and enter
+Xthem into the database (or remove the headers of the expired articles
+Xfrom the database).
+X.LP
+XIf it detects that some articles have been expired, it will
+Xautomatically remove the header information of the expired articles
+Xfrom the database.
+X.SH ARTICLE COLLECTION OPTIONS
+XNormally, \fInnmaster\fP will collect all available news groups
+Xdefined in the news active file.  The set of collected groups can be
+Xcontrolled via the argument line.  Groups can be either included or
+Xexcluded:
+X.sp 0.5v
+XA group name, e.g. comp, will cause the group and all its subgroups to
+Xbe collected.  Individual groups, e.g. news.software.nn, can also be
+Xspecified
+X.sp 0.5v
+XA group name preceeded by an exclamation mark, e.g. !talk.politics,
+Xwill cause the group and all its subgroups to be ignored.
+X.sp 0.5v
+XAn empty argument, i.e. "", will cause all groups that are not ignored
+Xto be collected.  For example, to collect everything but rec and misc,
+Xuse the following command:
+X.br
+X	\fInnmaster\fP -r !rec !misc ""
+X.br
+XIf the empty argument had been omitted, nothing would be collected,
+Xsince the presence of any \fIgroups\fP arguments causes \fInnmaster\fP
+Xto ignore all groups which are not explicitly mentionned.
+X.sp 0.5v
+XExample 1: The following commands can be executed by cron to collect
+Xdifferent sets of groups at different intervals or under different
+Xconditions:
+X.br
+X	\fInnmaster\fP -B -O14 rec misc sci -LBO -u
+X.br
+X	\fInnmaster\fP !rec !misc !sci "" -u
+X.sp 0.5v
+XExample 2: The group arguments are used in the given sequence, e.g. to
+Xleave out comp.sys, but still collect comp.sys.ibm.pc, use the command:
+X.br
+X	\fInnmaster\fP -r comp.sys.ibm.pc !comp.sys ""
+X.sp 0.5v
+XThe use of the \-\fBu\fP option in the first example is essential,
+Xsince each of the commands will update the active file time stamp
+Xwhich will prevent the other command from detecting new articles that
+Xhave arrived.
+X.sp 0.5v
+XUsing this method to keep specific groups out of the database must be
+Xused with great caution; just a single invocation of \fInnmaster\fP
+Xwithout any arguments will collect all the otherwise ignored groups!
+X.SH COLLECTION OF ARTICLES
+XThe following options control how \fInnmaster\fP performs the
+Xcollection of new articles.
+X.TP
+X\-\fBr\fP [ \fImin\fP ]
+X.br
+XDaemon mode.  The \fInnmaster\fP will put itself in the background
+X(unless \-\fBf\fP is also specified),
+Xand will checks for arrival of new articles and expired articles every
+X.I min
+Xminutes (and update the database accordingly).  If
+X.I min
+Xis omitted, the default is to check every 10 minutes.
+X.sp 0.5v
+XWithout the \-r option, the \fInnmaster\fP will just perform a single
+Xcollection of new articles (if any) and then exit.  This can be used
+Xto have the \fInnmaster\fP started by
+X.IR cron (8)
+Xat regular intervals instead of having it as a daemon which sleeps
+Xbetween checking for new articles.  Since the \fInnmaster\fP is a bit
+Xexpensive to start up (it has to read a few files), it is up to you to
+Xdecide which mode is best on your system.  (I have also heard that it
+Xworks to call \fInnmaster\fP without \-r from
+X.IR inews (1).
+XI cannot recommend this unless you receive batched news; invoking
+X\fInnmaster\fP for every received article sounds too expensive to me.)
+X.TP
+X.B \-f
+XRun \fInnmaster\fP in foreground in daemon mode (see \-\fBr\fP).
+XUseful if \fInnmaster\fP is invoked from inittab.  (Notice that if you
+Xuse a \fIrespawn\fP entry in inittab, you will not be able to stop
+X\fInnmaster\fP using the \-\fBk\fP option, since init will immediately
+Xstart another master.)
+X.TP
+X.B \-C
+XPerform a consistency check on the database on start-up, and rebuild
+Xcorrupted database files.  This operation can be quite time-consuming
+Xsince it reads through all the database files.
+X.TP
+X.B \-b
+XNormally, articles without a proper news header (no Newsgroups: line)
+Xare ignored.  Specifying the \-\fBb\fP option causes these `bad'
+Xarticles to be included in the database (normally with no sender or
+Xsubject).
+X.TP
+X.B \-B
+XRemove `bad' articles.  Sometimes, articles without a header ends up
+Xin the news spool directory.  These articles have no article id, and
+Xtherefore, they will never be expired by \fBexpire\fP(8).  This option
+Xwill allow the \fInnmaster\fP to silently remove these articles (a `B'
+Xentry will occur in the log file).
+X.TP
+X\-\fBO\fP \fIdays\fP
+XIgnore articles which are older than the given number of \fIdays\fP.
+XThis may help keep old 'stray' articles out of the database.  If the
+X\-\fBB\fP options is also specified, the old articles will be removed
+Xfrom the news spool directories.  Old ignored or removed articles will
+Xbe reported with an `O' entry in the log file.  This option can be
+Xdisable for individual groups by the \fBO\fP flag in the GROUPS file
+X(see below).
+X.TP
+X\-\fBR\fP \fIN\fP
+XSpecifies how the \fIauto-recollect\fP operation is performed on the
+Xgroups having this option set in the GROUPS file (see below).  Four
+Xmethods are available (default is method 1):
+X.br
+X\fB1\fP:  Run expire on the group when new articles arrive.
+X.br
+X\fB2\fP:  Run expire on the group on every scan.
+X.br
+X\fB3\fP:  Recollect all articles when new articles arrive.
+X.br
+X\fB4\fP:  Recollect all articles on every scan.
+X.br
+X.TP
+X\-\fBQ\fP
+XNormally, \fInnmaster\fP will print a message on the system console or
+Xin the syslog if a fatal error happens.  This option will prevent
+Xthis, so only a type 'E' entry is written to the Log file.
+X.SH DATABASE EXPIRATION
+XSince articles does not stay forever in the news system, the database
+Xmust be cleaned up regularly to remove the information stored for
+Xexpired articles.  Expiration of the database is normally \fBscheduled\fP
+Xusing the \fInnadmin\fP(1M) command executed by cron at a suitable
+Xtime when expire on the news articles has completed.  The following
+Xcommand will send a message to the \fInnmaster\fP and cause it to
+Xinitiate expire on all news groups:
+X.sp 0.5v
+X	nnadmin =EYW
+X.LP
+XSelective expiration of individual groups can be done from
+X\fInnadmin\fP (interactive mode).  It can also be done by invoking
+X\fInnmaster\fP with the \-\fBF\fP option.  For example, the following
+Xcommand will run expire on all groups except the `rec' groups:
+X.sp 0.5v
+X	nnmaster \-F \-k !rec ""
+X.sp 0.5v
+XThe \-\fBk\fP option is required to terminate the currently running
+Xmaster since two daemons cannot be running at the same time.  Thus to
+Xrun expire (on all groups) in this way from cron, the following
+Xcommands must be used:
+X	nnmaster \-Fk "" ; nnmaster \-r ...
+X.LP
+XIt is also possible to have \fInnmaster\fP detect expiration
+Xautomatically (see \-\fBe\fP).  This requires that the \fImin\fP field
+Xin the active file is updated by
+Xthe news expire (this is not the default case when Cnews is used).
+XHowever, this is not always a safe indication since the first article
+Xmay not have been expired, while a lot of other articles have been
+Xdeleted.
+X.LP
+XThere are several strategies available in the
+X\fInnmaster\fP to do this clean-up, each having their strengths and
+Xweaknesses.
+X.LP
+X\fBMethod 1\fP (default):  Rebuilds the database from the existing
+Xdatabase information by comparing the current database contents with
+Xthe contents of the news group directories, eliminating entries whose
+Xfile no longer exists.  This method is guaranteed to eliminate all
+Xexpired articles from the database, and it is reasonably fast because
+Xit only has to read the directories, not each article file.
+X  If news is accessed remotely via nntp, the list of existing articles
+Xcannot efficiently be fetched by reading a local directory.  Instead
+Xan XHDR request is sent to the nntp server to get a list of articles.
+X.LP
+X\fBMethod 2\fP:  Eliminates only the expired articles before the first
+Xarticle in the group.  This is very fast since only the active file
+Xand the database itself is accessed, but it will obviously leave some
+Xexpired articles in the database.  This method requires that the \fImin\fP
+Xfield in the active file is updated by \fIexpire\fP.
+X.LP
+X\fBMethod 3\fP:  Discard the current database information and
+Xrecollects all articles.  This is obviously very time consuming, and
+Xit is therefore not recommended, especially not with nntp.
+X.LP
+XThe options related to database expiration are:
+X.TP
+X\-\fBE\fP \fIN\fP
+XSelect expire method \fIN\fP.  (If \fIN\fP is omitted, the default
+Xmethod is used).
+X.TP
+X\-\fBe\fP [\fIN\fP]
+XAutomatically run expire in the database on groups where the \fImin\fP
+Xnumber in the active file has increased by \fIN\fP (1 if omitted) articles.
+XThis is disabled by default (since the \fImin\fP field is often unreliable).
+X.TP
+X\-\fBF\fP
+XRun expire once and exit.  If a list of \fIgroups\fP is specified on
+Xthe command line, the matched groups (see the rules above) will be
+Xmarked for expiration.  If no groups are specified, only the groups
+Xalready scheduled for expire will be expired.  Consequently, to expire
+Xall groups, a blank argument "" (matching all groups) must be specified.
+X.SH DATABASE LOCKING
+XThe database can be locked centrally, which will normally disallow all
+Xaccess to the database, and even block \fInnmaster\fP from being
+X(accidentally) started.  When a lock is set on the database, all
+Xcurrently running clients will terminate the next time they try to
+Xaccess the database.  Setting a lock on the database can thus also be
+Xused to force running clients to terminate.
+X.LP
+XThe following options set and clear locks on the database:
+X.TP
+X\-\fBl\fP \fImessage\fP
+XLocks the database with the given \fImessage\fP.  The message will be
+Xdisplayed every time a program tries to access the database.
+X.TP
+X.B \-l
+XUnlock the database if it was locked.
+X.TP
+X.B \-i
+XIgnore a possible lock and continue.  This can be used to have
+X\fInnmaster\fP operate on a database which is blocked from normal user
+Xaccess.
+X.LP
+XSince only one \fInnmaster\fP can operate on the database at any one
+Xtime, a running \fInnmaster\fP daemon must be stopped before a lock
+Xcan be set on the database.  If neither
+X.B \-f
+Xnor
+X.B \-r
+Xis specified with the
+X.B \-l
+Xoption (in both forms), \fInnmaster\fP will terminate after setting or
+Xclearing the lock.
+X.SH DATABASE INITIALIZATION
+XThe following options are used to initialize and update the central
+Xdatabase files:
+X.TP
+X\fB\-I\fP [\fIlimit\fP]
+XInitialize database.  This option will erase an existing database, and
+Xcreate an empty database containing entries for the currently known
+Xgroups.  \fInnmaster\fP will offer you to use an existing GROUPS file
+Xwhen initializing the database.
+X.sp 0.5v
+XThe optional \fIlimit\fP can be used to put a limit on the number of
+Xarticles that will be collected in each group during the first
+Xcollection of articles following the database initialization.  This is
+Xuseful on systems where the 'min' field in the active file is
+Xunreliable or not maintained (Cnews doesn't) to limit the work done to
+Xdo the initial collection of news after the initalization of the
+Xdatabase.  If news is accessed remotely from an NNTP server, this is
+Xeven more important!  If \fIlimit\fP is omitted, or is zero,
+X\fInnmaster\fP will trust the min field and collect all articles in
+Xthe range min..last.
+X.TP
+X.B \-G
+XReread the GROUPS file.  This option is used to instruct
+X\fInnmaster\fP to parse the GROUPS file after it has been edited.
+XSee the section on the GROUPS file below.
+X.SH MISCELLANEOUS OPTIONS
+XThe following options controls various details of the \fInnmaster\fP's
+Xbehaviour:
+X.TP
+X\fB\-D\fP [ \fIN\fP ]
+XRun \fInnmaster\fP in "debug mode".  If \fIN\fP is omitted, or equals 1 or
+X3, this will produce a compact but still very informative trace of the
+Xcollection or expire process directly on the terminal.  This is most
+Xuseful when doing the first collection of articles after initializing
+Xthe database with -I.  If \fIN\fP is 2 or 3, a trace of the NNTP
+Xtraffic is written to a file nnmaster.log in the TMP directory. This
+Xoption disables \-\fBr\fP.
+X.TP
+X\-\fBH\fP
+XIdentifies the host which \fInnmaster\fP is running on as the
+Xnntp-server for its clients, i.e. that it can access the news spool
+Xdirectory locally without using NNTP.  Normally, \fInnmaster\fP will
+Xdetect this by itself by comparing the host name to the contents of
+Xthe nntp_server file, so this option should really be superfluous.
+X.TP
+X\-\fBy\fP \fIretries\fP
+X.br
+XIn some networked environment, opening an article (shared from another
+Xmachine via NFS) may fail for no obvious reason.  Using this option,
+Xit is possible to cause
+X\fInnmaster\fP to perform \fIretries\fP attempts to open an article
+Xbefore marking the article as non-existing in the database.
+X.TP
+X\-\fBL\fP \fItypes\fP
+XExclude the specified entry types from the log file.  This is normally
+Xused to exclude the 'C'ollecting and e'X'pire entries (\-\fBL\fPCXO).
+X.TP
+X.B \-t
+XTrace the collection process.  This will place a lot of information
+Xinto the log file (T: entries).
+X.TP
+X.B \-u
+XNormally, \fInnmaster\fP will just compare the time-stamp on the
+Xactive file with a time-stamp saved in the database to see if new
+Xarticles have arrived.  The \-u option forces the \fInnmaster\fP to
+X.I read
+Xthe active file on start-up to see if new articles have arrived.
+X.TP
+X.B \-v
+XPrint the release and version identification for \fInnmaster\fP, and exit.
+X.TP
+X.B \-w
+XWakeup the real \fInnmaster\fP.  Send a signal to the \fInnmaster\fP
+Xdaemon to have it check for new articles immediately.
+X.TP
+X.B \-k
+XKill the already running \fInnmaster\fP daemon before proceeding with
+Xthe operation specified by the other options (or terminate if no other
+Xoperation is requested).
+X.SH THE GROUPS FILE
+XThe primary purpose of the GROUPS file is to store the names of the
+Xnews groups represented in the database.  Each line in the file
+Xcorresponds to an entry in the (binary) MASTER file, and the sequence
+Xof the lines in the GROUPS file must never be changed unless the
+Xdatabase is reinitialized afterwards.
+X.LP
+XHowever, the contents of the lines in the GROUPS file can be edited to
+Xcontrol how the \fInnmaster\fP should handle each individual group.
+X.LP
+XThe format of each line is:
+X.sp 0.5v
+X	news.group.name [ timestamp ] [ flags ]
+X.LP
+XThe news group name is the name of the group, and must not be changed
+Xin any way.  If the group is no longer in the news active file, and
+Xconsequently the group does no longer exist, group name can be
+Xreplaced by a `@' character which will instruct \fInnmaster\fP to
+Xignore this entry without having to rebuild the entire database.
+X.LP
+XThe optional time stamp indicates when the line was added to the
+XGROUPS file and is used by \fInn\fP to detect new groups.  When the
+XGROUPS file is built initially from the active file, the time stamps
+Xare omitted which simply means that they are "old".
+X.LP
+XOne or more of the following flags can be added to the GROUPS line to
+Xcontrol \fInnmaster\fP's handling of the group:
+X.TP
+X.B D
+XCauses \fInnmaster\fP to treat all articles in the group as digests,
+Xeven when they don't initially look like digests.  Articles which are
+Xfound not to be digests after all, are still not digested.
+X.TP
+X.B N
+XInstructs \fInnmaster\fP to never digest any articles in the group.
+X.TP
+X.B O
+XDisables the \-\fBO\fP option for this group, i.e. all existing
+Xarticles will be included in the database (and they will not be
+Xremoved if the \-\fBB\fP option is specified).  This flag should be
+Xset on groups which you never expire, or have a very long expire time!
+X.TP
+X.B R
+XCauses \fInnmaster\fP to \fIrecollect all\fP available articles in the
+Xgroup whenever a new article is received.  This is said to be useful
+Xis some high-traffic clarinet groups with many cancelled articles.
+X.TP
+X\fB>\fP\fIfile\fP
+XInstructs \fInnmaster\fP to \fIappend\fP all new articles to the
+Xspecified file.  This makes it possible to keep specific groups out of
+Xthe way of expire.  The archive file can be access directly from the
+X\fInn\fP client using the \fIgoto-group\fP command.  The file name
+Xmust be a full path name to a file in an existing, writeable directory.
+X.TP
+X.B @
+XInstructs \fInnmaster\fP to completely ignore this group - this is
+Xequivalent to setting the group name to `@' as described above.
+X.TP
+X\fB!\fP or \fBX\fP
+XCauses \fInnmaster\fP to ignore the group and not collect the group's
+Xarticles in the database.
+X.LP
+XComments (starting with `#' and continuing to the end of line) and
+Xempty lines are allow in the GROUPS file, but it is strongly
+Xrecommended to keep the changes to the GROUPS file as small as
+Xpossible, because of the implicit correspondance with the binary
+XMASTER file.
+X.LP
+XIt is not recommended to edit the GROUPS file while \fInnmaster\fP is
+Xrunning because it may add new groups to the file.  After editing the
+XGROUPS file, the command
+X.br
+X	\fInnmaster\fP -G
+X.br
+Xmust be run before restarting the \fInnmaster\fP to parse and verify
+Xthe new GROUPS file.
+X.SH NNTP SUPPORT
+XThe \fInnmaster\fP can access the news articles from a local news
+Xspool directory as well as from an NNTP server.  When compiled with
+XNNTP enabled, \fInnmaster\fP will compare the name of the NNTP server
+Xand the name of the local host; if they are identical, \fInnmaster\fP
+Xwill bypass NNTP and access the articles directly.
+X.LP
+XWhen it has to access the news articles via NNTP, it cannot time-stamp
+Xthe active file, so instead it transfers the entire active file from
+Xthe NNTP server and compares it with a local copy of the last active
+Xfile fetched from the NNTP server.  This is not very expensive in
+Xterms of cpu-cycles, disk-load, or net-bandwidth, but to stay on
+Xfriendly terms with the NNTP server administrator, you should probably
+Xnot use shorter update intervals than the standard 10 minutes.
+X.LP
+XSetting a much higher update interval than the standard 10 minutes is
+Xnot really recommended either, since an update normally implies
+Xfetching a burst of news articles from the NNTP server, so setting the
+Xinterval too long may imply that the load on the NNTP server will be
+Xmore un-even.
+X.LP
+XIn expire method 1, the use of XHDR just to get a list of existing
+Xarticles in a group is definitely a waste of resources on the nntp
+Xserver (but still lower than using method 3).  Before using
+Xthe XHDR request, \fInnmaster\fP will send a
+Xnon-standard "LISTGROUP" request; if the nntp server supports this
+Xrequest, it should return an OK_HEAD status followed by an (unordered)
+Xlist of article numbers (one per line) terminated by a `.' line.  The
+Xnntp servers supporting this request will be much less loaded during
+Xexpire.
+X.LP
+XThe \-\fBO\fP option does not work with NNTP.  The \-\fBB\fP option
+Xwill only work with NNTP if the \fInnmaster\fP is running on the NNTP
+Xserver.
+X.SH FILES
+XThe $db, $master, and $news names used below are synonyms for the
+XDB_DIRECTORY, MASTER_DIRECTORY, and NEWS_LIB_DIRECTORY defined during
+Xconfiguration.
+X.LP
+X.DT
+X.ta \w'$db/DATA/\fInnn\fP.[dx]'u+3m
+X.\"ta 0 20
+X$db/MASTER	Database master index
+X.br
+X$db/GROUPS	News group names and flags in MASTER file order
+X.br
+X$db/DATA/\fInnn\fP.[dx]	Database files for group number \fInnn\fP
+X.br
+X.../.nn[dx]	Database files if located in the group directories
+X.br
+X$master/GATE	Message channel from \fInnadmin\fP to \fInnmaster\fP
+X.br
+X$master/MPID	The process id of the \fInnmaster\fP daemon.
+X.br
+X$Log		The log file (the location is configuration dependent)
+X.br
+X$news/active	Existing articles and groups
+X.br
+X/usr/lib/nntp_server	Contains the name of the NNTP server.
+X.DT
+X.LP
+XThe MASTER file contains a record for each news group, occurring in
+Xthe same sequence as the group names in the GROUPS file.  The sequence
+Xalso defines the group numbers used to identify the files in the
+Xdatabase's DATA directory.
+X.LP
+XThe GATE file will be created by \fInnadmin\fP when needed, and
+Xremoved by \fInnmaster\fP when it has read it.  Therefore, to send a
+Xmessage to the \fInnmaster\fP requires that you are allowed to write
+Xin the $master directory.
+X.LP
+XThe contents of the Log file are described in the \fInnadmin\fP manual.
+X.SH SEE ALSO
+Xnn(1), nncheck(1), nngrep(1), nntidy(1)
+X.br
+Xnnadmin(1M), nnquery(1M), nnusage(1M), nnmaster(8)
+X.SH AUTHOR
+XKim F. Storm, Texas Instruments A/S, Denmark
+X.br
+XE-mail: storm@texas.dk
+END_OF_FILE
+  if test 21325 -ne `wc -c <'man/nnmaster.8'`; then
+    echo shar: \"'man/nnmaster.8'\" unpacked with wrong size!
+  fi
+  # end of 'man/nnmaster.8'
+fi
+echo shar: End of archive 13 \(of 22\).
+cp /dev/null ark13isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 22 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still must unpack the following archives:
+    echo "        " ${MISSING}
+fi
+exit 0
+
+exit 0 # Just in case...

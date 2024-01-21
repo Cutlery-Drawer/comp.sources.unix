@@ -1,0 +1,4256 @@
+Newsgroups: comp.sources.unix
+From: pmiller@bmr.gov.au (Peter Miller)
+Subject: v27i051: aegis - project change supervisor (V2.1), Part16/19
+References: <1.748951883.12788@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: pmiller@bmr.gov.au (Peter Miller)
+Posting-Number: Volume 27, Issue 51
+Archive-Name: aegis-2.1/part16
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 16 (of 19)."
+# Contents:  aegis/change.c aux/CHANGES.2.0
+# Wrapped by vixie@gw.home.vix.com on Sat Sep 25 03:00:53 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'aegis/change.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'aegis/change.c'\"
+else
+echo shar: Extracting \"'aegis/change.c'\" \(47426 characters\)
+sed "s/^X//" >'aegis/change.c' <<'END_OF_FILE'
+X/*
+X *	aegis - project change supervisor
+X *	Copyright (C) 1991, 1992, 1993 Peter Miller.
+X *	All rights reserved.
+X *
+X *	This program is free software; you can redistribute it and/or modify
+X *	it under the terms of the GNU General Public License as published by
+X *	the Free Software Foundation; either version 2 of the License, or
+X *	(at your option) any later version.
+X *
+X *	This program is distributed in the hope that it will be useful,
+X *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+X *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X *	GNU General Public License for more details.
+X *
+X *	You should have received a copy of the GNU General Public License
+X *	along with this program; if not, write to the Free Software
+X *	Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X * MANIFEST: functions to manipulate change state data
+X */
+X
+X#include <string.h>
+X#include <stdlib.h>
+X#include <time.h>
+X#include <stdio.h>
+X
+X#include <change.h>
+X#include <commit.h>
+X#include <error.h>
+X#include <lock.h>
+X#include <mem.h>
+X#include <option.h>
+X#include <os.h>
+X#include <project.h>
+X#include <s-v-arg.h>
+X#include <sub.h>
+X#include <trace.h>
+X#include <undo.h>
+X#include <user.h>
+X#include <word.h>
+X
+X
+Xchange_ty *
+Xchange_alloc(pp, number)
+X	project_ty	*pp;
+X	long		number;
+X{
+X	change_ty	*cp;
+X
+X	trace(("change_alloc(pp = %08lX, number = %ld)\n{\n"/*}*/, pp, number));
+X	assert(number >= 1);
+X	cp = (change_ty *)mem_alloc_clear(sizeof(change_ty));
+X	cp->reference_count = 1;
+X	cp->pp = project_copy(pp);
+X	cp->number = number;
+X	cp->filename = project_change_path_get(pp, number);
+X	trace(("return %08lX;\n", cp));
+X	trace((/*{*/"}\n"));
+X	return cp;
+X}
+X
+X
+Xvoid
+Xchange_free(cp)
+X	change_ty	*cp;
+X{
+X	trace(("change_free(cp = %08lX)\n{\n"/*}*/, cp));
+X	assert(cp->reference_count >= 1);
+X	cp->reference_count--;
+X	if (cp->reference_count <= 0)
+X	{
+X		assert(cp->pp);
+X		project_free(cp->pp);
+X		assert(cp->filename);
+X		str_free(cp->filename);
+X		if (cp->cstate_data)
+X			cstate_type.free(cp->cstate_data);
+X		if (cp->development_directory)
+X			str_free(cp->development_directory);
+X		if (cp->integration_directory)
+X			str_free(cp->integration_directory);
+X		if (cp->logfile)
+X			str_free(cp->logfile);
+X		if (cp->pconf_path)
+X			str_free(cp->pconf_path);
+X		if (cp->pconf_data)
+X			pconf_type.free(cp->pconf_data);
+X		mem_free((char *)cp);
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xchange_ty *
+Xchange_copy(cp)
+X	change_ty	*cp;
+X{
+X	trace(("change_copy(cp = %08lX)\n{\n"/*}*/, cp));
+X	assert(cp->reference_count >= 1);
+X	cp->reference_count++;
+X	trace(("return %08lX;\n", cp));
+X	trace((/*{*/"}\n"));
+X	return cp;
+X}
+X
+X
+Xstatic void improve _((cstate));
+X
+Xstatic void
+Ximprove(d)
+X	cstate		d;
+X{
+X	trace(("improve(d = %08lX)\n{\n"/*}*/, (long)d));
+X	if (!d->history)
+X		d->history =
+X			(cstate_history_list)
+X			cstate_history_list_type.alloc();
+X	if (!d->src)
+X		d->src =
+X			(cstate_src_list)
+X			cstate_src_list_type.alloc();
+X	if (!(d->mask & cstate_regression_test_exempt_mask))
+X	{
+X		d->regression_test_exempt =
+X			(
+X				d->cause != change_cause_internal_improvement
+X			&&
+X				d->cause != change_cause_external_improvement
+X			);
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic void lock_sync _((change_ty *));
+X
+Xstatic void
+Xlock_sync(cp)
+X	change_ty	*cp;
+X{
+X	long		n;
+X
+X	n = lock_magic();
+X	if (cp->lock_magic == n)
+X		return;
+X	cp->lock_magic = n;
+X
+X	if (cp->cstate_data && !cp->is_a_new_file)
+X	{
+X		cstate_type.free(cp->cstate_data);
+X		cp->cstate_data = 0;
+X	}
+X	if (cp->pconf_path)
+X	{
+X		str_free(cp->pconf_path);
+X		cp->pconf_data = 0;
+X	}
+X}
+X
+X
+Xcstate
+Xchange_cstate_get(cp)
+X	change_ty	*cp;
+X{
+X	trace(("change_cstate_get(cp = %08lX)\n{\n"/*}*/, cp));
+X	lock_sync(cp);
+X	if (!cp->cstate_data)
+X	{
+X		assert(cp->filename);
+X		change_become(cp);
+X		cp->cstate_data = cstate_read_file(cp->filename->str_text);
+X		change_become_undo();
+X		if (!cp->cstate_data->brief_description)
+X		{
+X			change_fatal
+X			(
+X				cp,
+X				"%S: corrupted brief_description field",
+X				cp->filename
+X			);
+X		}
+X		if (!cp->cstate_data->description)
+X		{
+X			change_fatal
+X			(
+X				cp,
+X				"%S: corrupted description field",
+X				cp->filename
+X			);
+X		}
+X		if (!(cp->cstate_data->mask & cstate_state_mask))
+X		{
+X			change_fatal
+X			(
+X				cp,
+X				"%S: corrupted state field",
+X				cp->filename
+X			);
+X		}
+X		if
+X		(
+X			cp->cstate_data->state >= cstate_state_being_developed
+X		&&
+X			cp->cstate_data->state <= cstate_state_being_integrated
+X		&&
+X			!cp->cstate_data->development_directory
+X		)
+X		{
+X			change_fatal
+X			(
+X				cp,
+X				"%S: no development_directory field",
+X				cp->filename
+X			);
+X		}
+X		if
+X		(
+X			cp->cstate_data->state == cstate_state_being_integrated
+X		&&
+X			!cp->cstate_data->integration_directory
+X		)
+X		{
+X			change_fatal
+X			(
+X				cp,
+X				"%S: no integration_directory field",
+X				cp->filename
+X			);
+X		}
+X		if
+X		(
+X			cp->cstate_data->state == cstate_state_completed
+X		&&
+X			!cp->cstate_data->delta_number
+X		)
+X		{
+X			change_fatal
+X			(
+X				cp,
+X				"%S: no delta_number field",
+X				cp->filename
+X			);
+X		}
+X		improve(cp->cstate_data);
+X		if (cp->cstate_data->state == cstate_state_completed)
+X		{
+X			long	j;
+X
+X			for (j = 0; j < cp->cstate_data->src->length; ++j)
+X			{
+X				static long mask =
+X					(
+X						cstate_src_file_name_mask
+X					|
+X						cstate_src_action_mask
+X					|
+X						cstate_src_edit_number_mask
+X					|
+X						cstate_src_usage_mask
+X					);
+X
+X				if ((cp->cstate_data->src->list[j]->mask & mask) != mask)
+X				{
+X					change_fatal
+X					(
+X						cp,
+X						"%S: corrupted src field",
+X						cp->filename
+X					);
+X				}
+X			}
+X		}
+X	}
+X	trace(("return %08lX;\n", cp->cstate_data));
+X	trace((/*{*/"}\n"));
+X	return cp->cstate_data;
+X}
+X
+X
+Xvoid
+Xchange_bind_new(cp)
+X	change_ty	*cp;
+X{
+X	trace(("change_bind_new(cp = %08lX)\n{\n"/*}*/, cp));
+X	assert(!cp->cstate_data);
+X	cp->is_a_new_file = 1;
+X	cp->cstate_data = (cstate)cstate_type.alloc();
+X	improve(cp->cstate_data);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstatic int src_cmp _((const void *, const void *));
+X
+Xstatic int
+Xsrc_cmp(s1p, s2p)
+X	const void	*s1p;
+X	const void	*s2p;
+X{
+X	cstate_src	s1;
+X	cstate_src	s2;
+X
+X	s1 = *(cstate_src *)s1p;
+X	s2 = *(cstate_src *)s2p;
+X	return strcmp(s1->file_name->str_text, s2->file_name->str_text);
+X}
+X
+X
+Xvoid
+Xchange_cstate_write(cp)
+X	change_ty	*cp;
+X{
+X	string_ty	*filename_new;
+X	string_ty	*filename_old;
+X	pstate		pstate_data;
+X	static int	count;
+X
+X	trace(("change_cstate_write(cp = %08lX)\n{\n"/*}*/, cp));
+X	assert(cp->pp);
+X	assert(cp->cstate_data);
+X	assert(cp->filename);
+X	if (!cp->cstate_data->brief_description)
+X		cp->cstate_data->brief_description = str_from_c("");
+X	if (!cp->cstate_data->description)
+X		cp->cstate_data->description =
+X			str_copy(cp->cstate_data->brief_description);
+X
+X	/*
+X	 * sort the files by name
+X	 */
+X	assert(cp->cstate_data->src);
+X	if (cp->cstate_data->src->length >= 2)
+X	{
+X		assert(cp->cstate_data->src->list);
+X		qsort
+X		(
+X			cp->cstate_data->src->list,
+X			cp->cstate_data->src->length,
+X			sizeof(*cp->cstate_data->src->list),
+X			src_cmp
+X		);
+X	}
+X
+X	/*
+X	 * write out the file
+X	 */
+X	pstate_data = project_pstate_get(cp->pp);
+X	filename_new = str_format("%S,%d", cp->filename, ++count);
+X	filename_old = str_format("%S,%d", cp->filename, ++count);
+X	change_become(cp);
+X	if (cp->is_a_new_file)
+X	{
+X		string_ty	*s1;
+X		string_ty	*s2;
+X
+X		s1 = project_home_path_get(cp->pp);
+X		s2 = os_below_dir(s1, cp->filename);
+X		os_mkdir_between(s1, s2, 02755);
+X		str_free(s2);
+X		undo_unlink_errok(filename_new);
+X		cstate_write_file(filename_new->str_text, cp->cstate_data);
+X		commit_rename(filename_new, cp->filename);
+X	}
+X	else
+X	{
+X		undo_unlink_errok(filename_new);
+X		cstate_write_file(filename_new->str_text, cp->cstate_data);
+X		commit_rename(cp->filename, filename_old);
+X		commit_rename(filename_new, cp->filename);
+X		commit_unlink_errok(filename_old);
+X	}
+X
+X	/*
+X	 * Change the file mode as appropriate.
+X	 * (Only need to do this for new files, but be paranoid.)
+X	 */
+X	os_chmod(filename_new, 0644 & ~change_umask(cp));
+X	change_become_undo();
+X	str_free(filename_new);
+X	str_free(filename_old);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xcstate_src
+Xchange_src_find(cp, file_name)
+X	change_ty	*cp;
+X	string_ty	*file_name;
+X{
+X	cstate		cstate_data;
+X	int		j;
+X	cstate_src	result;
+X
+X	trace(("change_src_find(cp = %08lX, file_name = \"%s\")\n{\n"/*}*/, cp, file_name->str_text));
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->src);
+X	result = 0;
+X	for (j = 0; j < cstate_data->src->length; ++j)
+X	{
+X		cstate_src	src_data;
+X
+X		src_data = cstate_data->src->list[j];
+X		if (str_equal(src_data->file_name, file_name))
+X		{
+X			result = src_data;
+X			break;
+X		}
+X	}
+X	trace(("return %08lX;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xvoid
+Xchange_src_remove(cp, file_name)
+X	change_ty	*cp;
+X	string_ty	*file_name;
+X{
+X	cstate		cstate_data;
+X	int		j;
+X	cstate_src	src_data;
+X
+X	trace(("change_src_remove(cp = %08lX, file_name = \"%s\")\n{\n"/*}*/, cp, file_name->str_text));
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->src);
+X	for (j = 0; j < cstate_data->src->length; ++j)
+X	{
+X		src_data = cstate_data->src->list[j];
+X		if (!str_equal(src_data->file_name, file_name))
+X			continue;
+X		cstate_src_type.free(src_data);
+X		cstate_data->src->list[j] =
+X			cstate_data->src->list[--cstate_data->src->length];
+X		break;
+X	}
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xcstate_src
+Xchange_src_new(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X	cstate_src	src_data;
+X	cstate_src	*src_data_p;
+X	type_ty		*type_p;
+X
+X	trace(("change_src_new(cp = %08lX)\n{\n"/*}*/, cp));
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->src);
+X	cstate_src_list_type.list_parse
+X	(
+X		cstate_data->src,
+X		&type_p,
+X		(void **)&src_data_p
+X	);
+X	src_data = (cstate_src)cstate_src_type.alloc();
+X	*src_data_p = src_data;
+X	trace(("return %08lX;\n", src_data));
+X	trace((/*{*/"}\n"));
+X	return src_data;
+X}
+X
+X
+Xcstate_history
+Xchange_history_new(cp, up)
+X	change_ty	*cp;
+X	user_ty		*up;
+X{
+X	cstate		cstate_data;
+X	cstate_history	history_data;
+X	cstate_history	*history_data_p;
+X	type_ty		*type_p;
+X
+X	trace(("change_history_new(cp = %08lX)\n{\n"/*}*/, cp));
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->history);
+X	cstate_history_list_type.list_parse
+X	(
+X		cstate_data->history,
+X		&type_p,
+X		(void **)&history_data_p
+X	);
+X	history_data = (cstate_history)cstate_history_type.alloc();
+X	*history_data_p = history_data;
+X	time(&history_data->when);
+X	history_data->who = str_copy(user_name(up));
+X	trace(("return %08lX;\n", history_data));
+X	trace((/*{*/"}\n"));
+X	return history_data;
+X}
+X
+X
+Xstring_ty *
+Xchange_developer_name(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X	cstate_history	history_data;
+X	long		pos;
+X
+X	trace(("change_developer_name(cp = %08lX)\n{\n"/*}*/, cp));
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->history);
+X	history_data = 0;
+X	for (pos = cstate_data->history->length - 1; pos >= 0 ; --pos)
+X	{
+X		history_data = cstate_data->history->list[pos];
+X		switch (history_data->what)
+X		{
+X		default:
+X			history_data = 0;
+X			continue;
+X
+X		case cstate_history_what_develop_begin:
+X		case cstate_history_what_develop_begin_undo:
+X		case cstate_history_what_develop_end:
+X		case cstate_history_what_develop_end_undo:
+X			break;
+X		}
+X		break;
+X	}
+X	trace(("return \"%s\";\n",
+X		history_data ? history_data->who->str_text : ""));
+X	trace((/*{*/"}\n"));
+X	return (history_data ? history_data->who : 0);
+X}
+X
+X
+Xstring_ty *
+Xchange_reviewer_name(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X	cstate_history	history_data;
+X	long		pos;
+X
+X	trace(("change_reviewer_name(cp = %08lX)\n{\n"/*}*/, cp));
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->history);
+X	assert(cstate_data->state >= cstate_state_awaiting_integration);
+X	history_data = 0;
+X	for (pos = cstate_data->history->length - 1; pos >= 0 ; --pos)
+X	{
+X		history_data = cstate_data->history->list[pos];
+X		switch (history_data->what)
+X		{
+X		default:
+X			history_data = 0;
+X			continue;
+X
+X		case cstate_history_what_review_pass:
+X		case cstate_history_what_review_pass_undo:
+X			break;
+X		}
+X		break;
+X	}
+X	trace(("return \"%s\";\n",
+X		history_data ? history_data->who->str_text : ""));
+X	trace((/*{*/"}\n"));
+X	return (history_data ? history_data->who : 0);
+X}
+X
+X
+Xstring_ty *
+Xchange_integrator_name(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X	cstate_history	history_data;
+X	long		pos;
+X
+X	trace(("change_integrator_name(cp = %08lX)\n{\n"/*}*/, cp));
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->history);
+X	history_data = 0;
+X	for (pos = cstate_data->history->length - 1; pos >= 0 ; --pos)
+X	{
+X		history_data = cstate_data->history->list[pos];
+X		switch (history_data->what)
+X		{
+X		default:
+X			history_data = 0;
+X			continue;
+X
+X		case cstate_history_what_integrate_pass:
+X		case cstate_history_what_integrate_fail:
+X		case cstate_history_what_integrate_begin:
+X		case cstate_history_what_integrate_begin_undo:
+X			break;
+X		}
+X		break;
+X	}
+X	trace(("return \"%s\";\n",
+X		history_data ? history_data->who->str_text : ""));
+X	trace((/*{*/"}\n"));
+X	return (history_data ? history_data->who : 0);
+X}
+X
+X
+Xvoid
+Xchange_bind_existing(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	int		j;
+X
+X	/*
+X	 * verify the change number given on the command line
+X	 */
+X	trace(("change_bind_existing(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	assert(!cp->cstate_data);
+X	assert(pstate_data->change);
+X	for (j = 0; j < pstate_data->change->length; ++j)
+X	{
+X		if (pstate_data->change->list[j] == cp->number)
+X			break;
+X	}
+X	if (j >= pstate_data->change->length)
+X		change_fatal(cp, "unknown");
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_development_directory_set(cp, s)
+X	change_ty	*cp;
+X	string_ty	*s;
+X{
+X	cstate		cstate_data;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	trace(("change_development_directory_set(cp = %08lX, s = \"%s\")\n{\n"/*}*/, cp, s->str_text));
+X	if (cp->development_directory)
+X		fatal("duplicate -DIRectory option");
+X	assert(s->str_text[0] == '/');
+X	change_become(cp);
+X	cp->development_directory = os_pathname(s, 1);
+X	change_become_undo();
+X	cstate_data = change_cstate_get(cp);
+X	if (!cstate_data->development_directory)
+X		cstate_data->development_directory = str_copy(s);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstring_ty *
+Xchange_development_directory_get(cp, resolve)
+X	change_ty	*cp;
+X	int		resolve;
+X{
+X	string_ty	*result;
+X	cstate		cstate_data;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	trace(("change_development_directory_get(cp = %08lX)\n{\n"/*}*/, cp));
+X	if (!resolve)
+X	{
+X		cstate_data = change_cstate_get(cp);
+X		result = cstate_data->development_directory;
+X	}
+X	else
+X	{
+X		if (!cp->development_directory)
+X		{
+X			cstate_data = change_cstate_get(cp);
+X			if (!cstate_data->development_directory)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X	    "this change is in the %s state, there is no development directory",
+X					cstate_state_ename(cstate_data->state)
+X				);
+X			}
+X			change_become(cp);
+X			cp->development_directory =
+X				os_pathname
+X				(
+X					cstate_data->development_directory,
+X					1
+X				);
+X			change_become_undo();
+X		}
+X		result = cp->development_directory;
+X	}
+X	trace_string(result->str_text);
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xvoid
+Xchange_integration_directory_set(cp, s)
+X	change_ty	*cp;
+X	string_ty	*s;
+X{
+X	cstate		cstate_data;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	trace(("change_integration_directory_set(cp = %08lX, s = \"%s\")\n{\n"/*}*/, cp, s->str_text));
+X	if (cp->integration_directory)
+X		fatal("duplicate -DIRectory option");
+X	change_become(cp);
+X	cp->integration_directory = os_pathname(s, 1);
+X	change_become_undo();
+X	cstate_data = change_cstate_get(cp);
+X	if (!cstate_data->integration_directory)
+X		cstate_data->integration_directory = str_copy(s);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstring_ty *
+Xchange_integration_directory_get(cp, resolve)
+X	change_ty	*cp;
+X	int		resolve;
+X{
+X	string_ty	*result;
+X	cstate		cstate_data;
+X
+X	/*
+X	 * To cope with automounters, directories are stored as given,
+X	 * or are derived from the home directory in the passwd file.
+X	 * Within aegis, pathnames have their symbolic links resolved,
+X	 * and any comparison of paths is done on this "system idea"
+X	 * of the pathname.
+X	 */
+X	trace(("change_integration_directory_get(cp = %08lX)\n{\n"/*}*/, cp));
+X	if (!resolve)
+X	{
+X		cstate_data = change_cstate_get(cp);
+X		result = cstate_data->integration_directory;
+X	}
+X	else
+X	{
+X		if (!cp->integration_directory)
+X		{
+X			cstate_data = change_cstate_get(cp);
+X			if (!cstate_data->integration_directory)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X	    "this change is in the %s state, there is no integration directory",
+X					cstate_state_ename(cstate_data->state)
+X				);
+X			}
+X			change_become(cp);
+X			cp->integration_directory =
+X				os_pathname
+X				(
+X					cstate_data->integration_directory,
+X					1
+X				);
+X			change_become_undo();
+X		}
+X		result = cp->integration_directory;
+X	}
+X	trace_string(result->str_text);
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xstring_ty *
+Xchange_logfile_get(cp)
+X	change_ty	*cp;
+X{
+X	string_ty	*s1;
+X	cstate		cstate_data;
+X
+X	trace(("change_logfile_get(cp = %08lX)\n{\n"/*}*/, cp));
+X	if (!cp->logfile)
+X	{
+X		cstate_data = change_cstate_get(cp);
+X		switch (cstate_data->state)
+X		{
+X		default:
+X			change_fatal(cp, "no log file");
+X	
+X		case cstate_state_being_integrated:
+X			s1 = change_integration_directory_get(cp, 0);
+X			break;
+X	
+X		case cstate_state_being_developed:
+X			s1 = change_development_directory_get(cp, 0);
+X			break;
+X		}
+X	
+X		cp->logfile =
+X			str_format("%S/%s.log", s1, option_progname_get());
+X	}
+X	trace(("return \"%s\";\n", cp->logfile->str_text));
+X	trace((/*{*/"}\n"));
+X	return cp->logfile;
+X}
+X
+X
+Xvoid
+Xchange_cstate_lock_prepare(cp)
+X	change_ty	*cp;
+X{
+X	trace(("change_cstate_lock_prepare(cp = %08lX)\n{\n"/*}*/, cp));
+X	lock_prepare_cstate(project_name_get(cp->pp), cp->number);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_error(cp, s sva_last)
+X	change_ty	*cp;
+X	char		*s;
+X	sva_last_decl
+X{
+X	va_list		ap;
+X	string_ty	*msg;
+X
+X	sva_init(ap, s);
+X	msg = str_vformat(s, ap);
+X	va_end(ap);
+X	project_error(cp->pp, "change %ld: %S", cp->number, msg);
+X}
+X
+X
+Xvoid
+Xchange_fatal(cp, s sva_last)
+X	change_ty	*cp;
+X	char		*s;
+X	sva_last_decl
+X{
+X	va_list		ap;
+X	string_ty	*msg;
+X
+X	sva_init(ap, s);
+X	msg = str_vformat(s, ap);
+X	va_end(ap);
+X	project_fatal(cp->pp, "change %ld: %S", cp->number, msg);
+X}
+X
+X
+Xvoid
+Xchange_verbose(cp, s sva_last)
+X	change_ty	*cp;
+X	char		*s;
+X	sva_last_decl
+X{
+X	va_list		ap;
+X	string_ty	*msg;
+X
+X	sva_init(ap, s);
+X	msg = str_vformat(s, ap);
+X	va_end(ap);
+X	project_verbose(cp->pp, "change %ld: %S", cp->number, msg);
+X}
+X
+X
+Xstring_ty *
+Xchange_pconf_path_get(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X	pstate_src	p_src_data;
+X	cstate_src	c_src_data;
+X	static string_ty *file_name;
+X
+X	trace(("change_pconf_path_get(cp = %08lX)\n{\n"/*}*/, cp));
+X	if (cp->pconf_path)
+X		goto ret;
+X	if (!file_name)
+X		file_name = str_from_c(THE_CONFIG_FILE);
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->src);
+X	switch (cstate_data->state)
+X	{
+X	case cstate_state_being_integrated:
+X		cp->pconf_path =
+X			str_format
+X			(
+X				"%S/%S",
+X				change_integration_directory_get(cp, 1),
+X				file_name
+X			);
+X		goto ret;
+X
+X	case cstate_state_being_developed:
+X	case cstate_state_being_reviewed:
+X	case cstate_state_awaiting_integration:
+X		break;
+X
+X	default:
+X		change_fatal
+X		(
+X			cp,
+X			"hunting '%S' file from weird state (bug)",
+X			file_name
+X		);
+X	}
+X	c_src_data = change_src_find(cp, file_name);
+X	if (c_src_data || cp->number == 1)
+X	{
+X		cp->pconf_path =
+X			str_format
+X			(
+X				"%S/%S",
+X				change_development_directory_get(cp, 1),
+X				file_name
+X			);
+X		goto ret;
+X	}
+X	p_src_data = project_src_find(cp->pp, file_name);
+X	if (p_src_data)
+X	{
+X		cp->pconf_path =
+X			str_format
+X			(
+X				"%S/%S",
+X				project_baseline_path_get(cp->pp, 1),
+X				file_name
+X			);
+X		goto ret;
+X	}
+X	change_fatal(cp, "has no '%S' file (bug)", file_name);
+X	ret:
+X	trace(("return \"%s\";\n", cp->pconf_path->str_text));
+X	trace((/*{*/"}\n"));
+X	return cp->pconf_path;
+X}
+X
+X
+Xpconf
+Xchange_pconf_get(cp)
+X	change_ty	*cp;
+X{
+X	trace(("change_pconf_get(cp = %08lX)\n{\n"/*}*/, cp));
+X	lock_sync(cp);
+X	if (!cp->pconf_data)
+X	{
+X		string_ty	*filename;
+X
+X		filename = change_pconf_path_get(cp);
+X		change_become(cp);
+X		if (!os_exists(filename))
+X			cp->pconf_data = (pconf)pconf_type.alloc();
+X		else
+X		{
+X			cp->pconf_data = pconf_read_file(filename->str_text);
+X			if (!cp->pconf_data->build_command)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"%S: no build_command field",
+X					filename
+X				);
+X			}
+X			if (!cp->pconf_data->development_build_command)
+X				cp->pconf_data->development_build_command =
+X					str_copy(cp->pconf_data->build_command);
+X			if (!cp->pconf_data->history_create_command)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"%S: no history_create_command field",
+X					filename
+X				);
+X			}
+X			if (!cp->pconf_data->history_get_command)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"%S: no history_get_command field",
+X					filename
+X				);
+X			}
+X			if (!cp->pconf_data->history_put_command)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"%S: no history_put_command field",
+X					filename
+X				);
+X			}
+X			if (!cp->pconf_data->history_query_command)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"%S: no history_query_command field",
+X					filename
+X				);
+X			}
+X			if (!cp->pconf_data->diff_command)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"%S: no diff_command field",
+X					filename
+X				);
+X			}
+X			if (!cp->pconf_data->diff3_command)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"%S: no diff3_command field",
+X					filename
+X				);
+X			}
+X		}
+X		change_become_undo();
+X	}
+X	trace(("return %08lX;\n", cp->pconf_data));
+X	trace((/*{*/"}\n"));
+X	return cp->pconf_data;
+X}
+X
+X
+Xvoid
+Xchange_run_change_file_command(cp, wlp, up)
+X	change_ty	*cp;
+X	wlist		*wlp;
+X	user_ty		*up;
+X{
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X	string_ty	*the_files;
+X	pstate		pstate_data;
+X	string_ty	*dd;
+X
+X	trace(("change_run_change_file_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pconf_data = change_pconf_get(cp);
+X	if (!pconf_data->change_file_command)
+X		goto ret;
+X	pstate_data = project_pstate_get(cp->pp);
+X
+X	the_files = wl2str(wlp, 0, 32767);
+X	sub_var_set("File_List", "%S", the_files);
+X	str_free(the_files);
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${version}");
+X	sub_var_set("4", "${baseline}");
+X	sub_var_set("5", "${file_list}");
+X	the_command = pconf_data->change_file_command;
+X	the_command = substitute(cp, the_command);
+X	dd = change_development_directory_get(cp, 0);
+X	user_become(up);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT, dd);
+X	user_become_undo();
+X	str_free(the_command);
+X	ret:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_project_file_command(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X
+X	/*
+X	 * make sure are sync'ed with project
+X	 */
+X	trace(("change_run_project_file_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	cstate_data = change_cstate_get(cp);
+X	if
+X	(
+X		cstate_data->project_file_command_sync
+X	==
+X		project_last_change_integrated(cp->pp)
+X	)
+X		goto done;
+X	cstate_data->project_file_command_sync =
+X		project_last_change_integrated(cp->pp);
+X
+X	/*
+X	 * make sure there is a project_file command
+X	 */
+X	pconf_data = change_pconf_get(cp);
+X	if (!pconf_data->project_file_command)
+X		goto done;
+X
+X	/*
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${version}");
+X	sub_var_set("4", "${baseline}");
+X	the_command = pconf_data->project_file_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	dd = change_development_directory_get(cp, 0);
+X	change_become(cp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT, dd);
+X	change_become_undo();
+X	str_free(the_command);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+X/*
+X * NAME
+X *	gmatch - match entryname pattern
+X *
+X * SYNOPSIS
+X *	int gmatch(char *formal, char *actual);
+X *
+X * DESCRIPTION
+X *	The formal strings is used as a template to match the given actual
+X *	string against.
+X *
+X *	The pattern elements understood are
+X *		*	match zero or more of any character
+X *		?	match any single character
+X *		[^xxx]	match any single character not in the set given.
+X *		[xxx]	match any single character in the set given.
+X *			The - character is understood to be a range indicator.
+X *			If the ] character is the first of the set it is
+X *			considered as part of the set, not the terminator.
+X *
+X * RETURNS
+X *	the gmatch function returns zero if they do not match,
+X *	and nonzero if they do.  Returns -1 on error.
+X *
+X * CAVEAT
+X *	This is a limited set of the sh(1) patterns.
+X *	Assumes that the `original' global variable has been initialized,
+X *	it is used for error reporting.
+X */
+X
+Xstatic int gmatch _((char *, char *));
+X
+Xstatic int
+Xgmatch(formal, actual)
+X	char	*formal;
+X	char	*actual;
+X{
+X	char	*cp;
+X	int	 result;
+X
+X	trace(("gmatch(formal = %08lX, actual = %08lX)\n{\n"/*}*/,
+X		formal, actual));
+X	while (*formal)
+X	{
+X		trace(("formal == \"%s\";\n", formal));
+X		trace(("actual = \"%s\";\n", actual));
+X		switch (*formal)
+X		{
+X		default:
+X			if (*actual++ != *formal++)
+X			{
+X				result = 0;
+X				goto ret;
+X			}
+X			break;
+X
+X		case '?':
+X			if (!*actual++)
+X			{
+X				result = 0;
+X				goto ret;
+X			}
+X			++formal;
+X			break;
+X
+X		case '*':
+X			cp = actual + strlen(actual);
+X			++formal;
+X			for (;;)
+X			{
+X				result = gmatch(formal, cp);
+X				if (result)
+X				{
+X					result = 1;
+X					goto ret;
+X				}
+X				--cp;
+X				if (cp < actual)
+X				{
+X					result = 0;
+X					goto ret;
+X				}
+X			}
+X
+X		case '['/*]*/:
+X			++formal;
+X			if (*formal == '^')
+X			{
+X				++formal;
+X				for (;;)
+X				{
+X					if (!*formal)
+X					{
+X						no_close:
+X						result = -1;
+X						goto ret;
+X					}
+X
+X					/*
+X					 * note: this allows leading close
+X					 * square bracket elegantly
+X					 */
+X					if
+X					(
+X						formal[1] == '-'
+X					&&
+X						formal[2]
+X					&&
+X						formal[2] != /*[*/']'
+X					&&
+X						formal[3]
+X					)
+X					{
+X						char	c1;
+X						char	c2;
+X
+X						c1 = formal[0];
+X						c2 = formal[2];
+X						formal += 3;
+X						if
+X						(
+X							c1 <= c2
+X						?
+X							(c1 <= *actual && *actual <= c2)
+X						:
+X							(c2 <= *actual && *actual <= c1)
+X						)
+X						{
+X							result = 0;
+X							goto ret;
+X						}
+X					}
+X					else
+X					if (*actual == *formal++)
+X					{
+X						result = 0;
+X						goto ret;
+X					}
+X					if (*formal == /*[*/']')
+X						break;
+X				}
+X				++formal;
+X			}
+X			else
+X			{
+X				for (;;)
+X				{
+X					if (!*formal)
+X						goto no_close;
+X
+X					/*
+X					 * note: this allows leading close
+X					 * square bracket elegantly
+X					 */
+X					trace(("formal == \"%s\";\n", formal));
+X					trace(("actual = \"%s\";\n", actual));
+X					if
+X					(
+X						formal[1] == '-'
+X					&&
+X						formal[2]
+X					&&
+X						formal[2] != /*[*/']'
+X					&&
+X						formal[3]
+X					)
+X					{
+X						char	c1;
+X						char	c2;
+X
+X						c1 = formal[0];
+X						c2 = formal[2];
+X						formal += 3;
+X						if
+X						(
+X							c1 <= c2
+X						?
+X							(c1 <= *actual && *actual <= c2)
+X						:
+X							(c2 <= *actual && *actual <= c1)
+X						)
+X							break;
+X					}
+X					else
+X					if (*actual == *formal++)
+X						break;
+X					if (*formal == /*[*/']')
+X					{
+X						result = 0;
+X						goto ret;
+X					}
+X				}
+X				for (;;)
+X				{
+X					if (!*formal)
+X						goto no_close;
+X					trace(("formal == \"%s\";\n", formal));
+X					trace(("actual = \"%s\";\n", actual));
+X					if (*formal++ == /*[*/']')
+X						break;
+X				}
+X			}
+X			++actual;
+X			break;
+X		}
+X	}
+X	result = (*actual == 0);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	ret:
+X	trace(("return %d;\n", result));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xstring_ty *
+Xchange_file_template(cp, name)
+X	change_ty	*cp;
+X	string_ty	*name;
+X{
+X	string_ty	*result;
+X	size_t		j, k;
+X	pconf		pconf_data;
+X
+X	trace(("change_file_template(name = \"%s\")\n{\n"/*}*/, name->str_text));
+X	result = 0;
+X	pconf_data = change_pconf_get(cp);
+X	if (!pconf_data->file_template)
+X		goto done;
+X	for (j = 0; j < pconf_data->file_template->length; ++j)
+X	{
+X		pconf_file_template ftp;
+X
+X		ftp = pconf_data->file_template->list[j];
+X		if (!ftp->pattern)
+X			continue;
+X		for (k = 0; k < ftp->pattern->length; ++k)
+X		{
+X			int		m;
+X			string_ty	*s;
+X
+X			s = ftp->pattern->list[k];
+X			m = gmatch(s->str_text, name->str_text);
+X			if (m < 0)
+X			{
+X				change_fatal
+X				(
+X					cp,
+X					"filename pattern \"%S\" is illegal",
+X					s
+X				);
+X			}
+X			if (m)
+X				break;
+X		}
+X		if (k < ftp->pattern->length)
+X		{
+X			result = str_copy(ftp->body);
+X			break;
+X		}
+X	}
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	if (result)
+X	{
+X		string_ty	*s;
+X
+X		sub_var_set("File_Name", "%S", name);
+X		s = substitute(cp, result);
+X		str_free(result);
+X		result = s;
+X	}
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xvoid
+Xchange_become(cp)
+X	change_ty	*cp;
+X{
+X	trace(("change_become(cp = %08lX)\n{\n"/*}*/, cp));
+X	project_become(cp->pp);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_become_undo()
+X{
+X	trace(("change_become_undo()\n{\n"/*}*/));
+X	project_become_undo();
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xint
+Xchange_umask(cp)
+X	change_ty	*cp;
+X{
+X	return project_umask(cp->pp);
+X}
+X
+X
+Xvoid
+Xchange_run_develop_end_notify_command(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X
+X	/*
+X	 * make sure there is one
+X	 */
+X	trace(("change_run_develop_end_notify_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	if (!pstate_data->develop_end_notify_command)
+X		goto done;
+X
+X	/*
+X	 * notify the change is ready for review
+X	 *	(it could be mail, or an internal bulletin board, etc)
+X	 * it happens after the data is written and the locks are released,
+X	 * so we don't much care if the command fails!
+X	 *
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${developer}");
+X	the_command = pstate_data->develop_end_notify_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	dd = change_development_directory_get(cp, 0);
+X	change_become(cp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK, dd);
+X	change_become_undo();
+X	str_free(the_command);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_develop_end_undo_notify_command(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X
+X	/*
+X	 * make sure there is one
+X	 */
+X	trace(("change_run_develop_end_undo_notify_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	if (!pstate_data->develop_end_undo_notify_command)
+X		goto done;
+X
+X	/*
+X	 * notify the change is ready for review
+X	 *	(it could be mail, or an internal bulletin board, etc)
+X	 * it happens after the data is written and the locks are released,
+X	 * so we don't much care if the command fails!
+X	 *
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${developer}");
+X	the_command = pstate_data->develop_end_undo_notify_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	dd = change_development_directory_get(cp, 0);
+X	change_become(cp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK, dd);
+X	change_become_undo();
+X	str_free(the_command);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_integrate_fail_notify_command(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X
+X	/*
+X	 * make sure there is one
+X	 */
+X	trace(("change_run_integrate_fail_notify_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	if (!pstate_data->integrate_fail_notify_command)
+X		goto done;
+X
+X	/*
+X	 * notify the integrate has failed
+X	 *	(it could be mail, or an internal bulletin board, etc)
+X	 * it happens after the data is written and the locks are released,
+X	 * so we don't much care it the command fails!
+X	 *
+X	 * In doing it after the locks are released,
+X	 * the lists will be accurate (e.g. list of files in change).
+X	 *
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${developer}");
+X	sub_var_set("4", "${reviewer}");
+X	sub_var_set("5", "${integrator}");
+X	the_command = pstate_data->integrate_fail_notify_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	dd = change_development_directory_get(cp, 0);
+X	change_become(cp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK, dd);
+X	change_become_undo();
+X	str_free(the_command);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_integrate_pass_notify_command(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	string_ty	*the_command;
+X	string_ty	*bl;
+X
+X	/*
+X	 * make sure there is one
+X	 */
+X	trace(("change_run_integrate_pass_notify_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	if (!pstate_data->integrate_pass_notify_command)
+X		goto done;
+X
+X	/*
+X	 * notify the integrate has passed
+X	 *	(it could be mail, or an internal bulletin board, etc)
+X	 * it happens after the data is written and the locks are released,
+X	 * so we don't much care it the command fails!
+X	 *
+X	 * In doing it after the locks are released,
+X	 * the lists will be accurate (e.g. list of files in change).
+X	 *
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${developer}");
+X	sub_var_set("4", "${reviewer}");
+X	sub_var_set("5", "${integrator}");
+X	the_command = pstate_data->integrate_pass_notify_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	bl = project_baseline_path_get(cp->pp, 0);
+X	project_become(cp->pp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK, bl);
+X	project_become_undo();
+X	str_free(the_command);
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_review_pass_notify_command(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X
+X	/*
+X	 * make sure there is one
+X	 */
+X	trace(("change_run_review_pass_notify_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	if (!pstate_data->review_pass_notify_command)
+X		goto done;
+X
+X	/*
+X	 * notify the review has passed
+X	 *	(it could be mail, or an internal bulletin board, etc)
+X	 * it happens after the data is written and the locks are released,
+X	 * so we don't much care if the command fails!
+X	 *
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${developer}");
+X	sub_var_set("4", "${reviewer}");
+X	the_command = pstate_data->review_pass_notify_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	dd = change_development_directory_get(cp, 0);
+X	change_become(cp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK, dd);
+X	str_free(the_command);
+X	change_become_undo();
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_review_pass_undo_notify_command(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X	string_ty	*notify;
+X
+X	/*
+X	 * make sure there is one
+X	 */
+X	trace(("change_run_review_pass_undo_notify_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	notify = pstate_data->review_pass_notify_command;
+X	if (!notify)
+X		notify = pstate_data->develop_end_undo_notify_command;
+X	if (!notify)
+X		goto done;
+X
+X	/*
+X	 * notify the review has had the pass rescinded
+X	 *	(it could be mail, or an internal bulletin board, etc)
+X	 * it happens after the data is written and the locks are released,
+X	 * so we don't much care if the command fails!
+X	 *
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${developer}");
+X	sub_var_set("4", "${reviewer}");
+X	the_command = substitute(cp, notify);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	dd = change_development_directory_get(cp, 0);
+X	change_become(cp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK, dd);
+X	str_free(the_command);
+X	change_become_undo();
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_review_fail_notify_command(cp)
+X	change_ty	*cp;
+X{
+X	pstate		pstate_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X
+X	/*
+X	 * make sure there is one
+X	 */
+X	trace(("change_run_review_fail_notify_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	pstate_data = project_pstate_get(cp->pp);
+X	if (!pstate_data->review_fail_notify_command)
+X		goto done;
+X
+X	/*
+X	 * notify the review has failed
+X	 *	(it could be mail, or an internal bulletin board, etc)
+X	 * it happens after the data is written and the locks are released,
+X	 * so we don't much care it the command fails!
+X	 *
+X	 * In doing it after the locks are released,
+X	 * the lists will be accurate (e.g. list of files in change).
+X	 *
+X	 * All of the substitutions described in aesub(5) are available.
+X	 */
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${developer}");
+X	sub_var_set("4", "${reviewer}");
+X	the_command = pstate_data->review_fail_notify_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * execute the command
+X	 */
+X	dd = change_development_directory_get(cp, 0);
+X	change_become(cp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK, dd);
+X	str_free(the_command);
+X	change_become_undo();
+X
+X	/*
+X	 * here for all exits
+X	 */
+X	done:
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_history_get_command(cp, file_name, edit_number, output_file, up)
+X	change_ty	*cp;
+X	string_ty	*file_name;
+X	string_ty	*edit_number;
+X	string_ty	*output_file;
+X	user_ty		*up;
+X{
+X	string_ty	*dir;
+X	cstate		cstate_data;
+X	string_ty	*the_command;
+X	pconf		pconf_data;
+X
+X	/*
+X	 * If the edit numbers differ, extract the
+X	 * appropriate edit from the baseline (use the
+X	 * history-get-command) into a file in /tmp
+X	 *
+X	 * All of the substitutions described in aesub(5) are available;
+X	 * in addition
+X	 *
+X	 * ${History}
+X	 *	history file
+X	 *
+X	 * ${Edit}
+X	 *	edit number
+X	 *
+X	 * ${Output}
+X	 *	output file
+X	 */
+X	trace(("change_run_history_get_command(cp = %08lX)\n{\n"/*}*/, cp));
+X	sub_var_set
+X	(
+X		"History",
+X		"%S/%S",
+X		project_history_path_get(cp->pp),
+X		file_name
+X	);
+X	sub_var_set("Edit", "%S", edit_number);
+X	sub_var_set("Output", "%S", output_file);
+X	sub_var_set("1", "${history}");
+X	sub_var_set("2", "${edit}");
+X	sub_var_set("3", "${output}");
+X	pconf_data = change_pconf_get(cp);
+X	the_command = pconf_data->history_get_command;
+X	the_command = substitute(cp, the_command);
+X
+X	/*
+X	 * run the command as the current user
+X	 * (always output is to /tmp)
+X	 */
+X	cstate_data = change_cstate_get(cp);
+X	if (cstate_data->state == cstate_state_being_integrated)
+X		dir = change_integration_directory_get(cp, 0);
+X	else
+X		dir = change_development_directory_get(cp, 0);
+X	user_become(up);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT, dir);
+X	user_become_undo();
+X	str_free(the_command);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_development_directory_clear(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->development_directory);
+X	if (cstate_data->development_directory)
+X	{
+X		str_free(cstate_data->development_directory);
+X		cstate_data->development_directory = 0;
+X	}
+X}
+X
+X
+Xvoid
+Xchange_integration_directory_clear(cp)
+X	change_ty	*cp;
+X{
+X	cstate		cstate_data;
+X
+X	cstate_data = change_cstate_get(cp);
+X	assert(cstate_data->integration_directory);
+X	if (cstate_data->integration_directory)
+X	{
+X		str_free(cstate_data->integration_directory);
+X		cstate_data->integration_directory = 0;
+X	}
+X}
+X
+X
+Xvoid
+Xchange_run_history_create_command(cp, filename)
+X	change_ty	*cp;
+X	string_ty	*filename;
+X{
+X	string_ty	*hp;
+X	string_ty	*id;
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X
+X	/*
+X	 * create a new history
+X	 * All of the substitutions described in aesub(5) are avaliable.
+X	 * In addition:
+X	 *
+X	 * ${Input}
+X	 *	absolute path of source file
+X	 *
+X	 * ${History}
+X	 *	absolute path of history file
+X	 */
+X	trace(("change_run_history_create_command(cp = %08lX, \
+Xfilename = \"%s\")\n{\n"/*}*/, (long)cp, filename->str_text));
+X	pconf_data = change_pconf_get(cp);
+X	hp = project_history_path_get(cp->pp);
+X	id = change_integration_directory_get(cp, 0);
+X	sub_var_set("Input", "%S/%S", id, filename);
+X	sub_var_set("History", "%S/%S", hp, filename);
+X	sub_var_set("1", "${input}");
+X	sub_var_set("2", "${history}");
+X	the_command = pconf_data->history_create_command;
+X	the_command = substitute(cp, the_command);
+X	project_become(cp->pp);
+X	os_mkdir_between(hp, filename, 02755);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT, id);
+X	project_become_undo();
+X	str_free(the_command);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_history_put_command(cp, filename)
+X	change_ty	*cp;
+X	string_ty	*filename;
+X{
+X	string_ty	*hp;
+X	string_ty	*id;
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X
+X	/*
+X	 * Update and existing history.
+X	 * All of the substitutions described in aesub(5) are avaliable.
+X	 * In addition:
+X	 *
+X	 * ${Input}
+X	 *	absolute path of source file
+X	 *
+X	 * ${History}
+X	 *	absolute path of history file
+X	 */
+X	trace(("change_run_history_put_command(cp = %08lX, \
+Xfilename = \"%s\")\n{\n"/*}*/, (long)cp, filename->str_text));
+X	pconf_data = change_pconf_get(cp);
+X	hp = project_history_path_get(cp->pp);
+X	id = change_integration_directory_get(cp, 0);
+X	sub_var_set("Input", "%S/%S", id, filename);
+X	sub_var_set("History", "%S/%S", hp, filename);
+X	sub_var_set("1", "${input}");
+X	sub_var_set("2", "${history}");
+X	the_command = pconf_data->history_put_command;
+X	the_command = substitute(cp, the_command);
+X	project_become(cp->pp);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT, id);
+X	project_become_undo();
+X	str_free(the_command);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xstring_ty *
+Xchange_run_history_query_command(cp, filename)
+X	change_ty	*cp;
+X	string_ty	*filename;
+X{
+X	string_ty	*hp;
+X	string_ty	*bl;
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X	string_ty	*result;
+X
+X	/*
+X	 * Ask the history file what its edit number is.
+X	 * We use this method because the string
+X	 * returned is essentially random,
+X	 * between different history programs.
+X	 * All of the substitutions described in aesub(5) are available.
+X	 * In addition
+X	 *
+X	 * ${History}
+X	 *	absolute path of history file
+X	 */
+X	trace(("change_run_history_query_command(cp = %08lX, \
+Xfilename = \"%s\")\n{\n"/*}*/, (long)cp, filename->str_text));
+X	pconf_data = change_pconf_get(cp);
+X	hp = project_history_path_get(cp->pp);
+X	bl = project_baseline_path_get(cp->pp, 0);
+X	sub_var_set("History", "%S/%S", hp, filename);
+X	sub_var_set("1", "${history}");
+X	the_command = pconf_data->history_query_command;
+X	the_command = substitute(cp, the_command);
+X	project_become(cp->pp);
+X	result =
+X		os_execute_slurp
+X		(
+X			the_command,
+X			OS_EXEC_FLAG_NO_INPUT,
+X			bl
+X		);
+X	project_become_undo();
+X	str_free(the_command);
+X	if (!result->str_length)
+X	{
+X		fatal
+X		(
+X	  "the history_query_command returned the empty string, this is invalid"
+X		);
+X	}
+X	trace(("return \"%s\";\n", result->str_text));
+X	trace((/*{*/"}\n"));
+X	return result;
+X}
+X
+X
+Xvoid
+Xchange_run_diff_command(cp, up, original, input, output)
+X	change_ty	*cp;
+X	user_ty		*up;
+X	string_ty	*original;
+X	string_ty	*input;
+X	string_ty	*output;
+X{
+X	pconf		pconf_data;
+X	string_ty	*dd;
+X	string_ty	*the_command;
+X
+X	/*
+X	 * Run the diff_command.
+X	 * All of the substitutions described in aesub(5) are available.
+X	 * In addition
+X	 *
+X	 * ${Original}
+X	 *	absolute path of original file copied from the baseline
+X	 *	usually, but not always
+X	 *
+X	 * ${Input}
+X	 *	absolute path of current file in the development directory
+X	 *	usually, but not always
+X	 *
+X	 * ${Output}
+X	 *	absolute path of file in which to write the difference listing
+X	 *	usually in the development diretcory
+X	 */
+X	trace
+X	((
+X		"change_run_diff_command(cp = %08lX, up = %08lX, \
+Xoriginal = \"%s\", input = \"%s\", output = \"%s\")\n{\n"/*}*/,
+X		(long)cp,
+X		(long)up,
+X		original->str_text,
+X		input->str_text,
+X		output->str_text
+X	));
+X	pconf_data = change_pconf_get(cp);
+X	dd = change_development_directory_get(cp, 0);
+X	sub_var_set("ORiginal", "%S", original);
+X	sub_var_set("Input", "%S", input);
+X	sub_var_set("Output", "%S", output);
+X	sub_var_set("1", "${original}");
+X	sub_var_set("2", "${input}");
+X	sub_var_set("3", "${output}");
+X	the_command = pconf_data->diff_command;
+X	the_command = substitute(cp, the_command);
+X	trace_string(the_command->str_text);
+X	user_become(up);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT, dd);
+X	user_become_undo();
+X	str_free(the_command);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_diff3_command(cp, up, original, most_recent, input, output)
+X	change_ty	*cp;
+X	user_ty		*up;
+X	string_ty	*original;
+X	string_ty	*most_recent;
+X	string_ty	*input;
+X	string_ty	*output;
+X{
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X	string_ty	*dd;
+X
+X	/*
+X	 * Run the diff3_command.
+X	 * All of the substitutions described in aesub(5) are available.
+X	 * In addition
+X	 *
+X	 * ${Original}
+X	 *	absolute path of original file copied from the baseline
+X	 *	usually somewhere in /tmp
+X	 *
+X	 * ${Most_Recent}
+X	 *	absolute path of original file currently in the baseline
+X	 *	usually, but not always
+X	 *
+X	 * ${Input}
+X	 *	absolute path of current file in the development directory
+X	 *	usually, but not always
+X	 *
+X	 * ${Output}
+X	 *	absolute path of file in which to write the difference listing
+X	 *	usually in the development diretcory
+X	 */
+X	trace
+X	((
+X		"change_run_diff3_command(cp = %08lX, up = %08lX, original = \
+X\"%s\", most_recent = \"%s\", input = \"%s\", output = \"%s\")\n{\n"/*}*/,
+X		(long)cp,
+X		(long)up,
+X		original->str_text,
+X		most_recent->str_text,
+X		input->str_text,
+X		output->str_text
+X	));
+X	pconf_data = change_pconf_get(cp);
+X	dd = change_development_directory_get(cp, 0);
+X	sub_var_set("ORiginal", "%S", original);
+X	sub_var_set("Most_Recent", "%S", most_recent);
+X	sub_var_set("Input", "%S", input);
+X	sub_var_set("Output", "%S", output);
+X	sub_var_set("1", "${original}");
+X	sub_var_set("2", "${most_recent}");
+X	sub_var_set("3", "${input}");
+X	sub_var_set("4", "${output}");
+X	the_command = pconf_data->diff3_command;
+X	the_command = substitute(cp, the_command);
+X	user_become(up);
+X	os_execute(the_command, OS_EXEC_FLAG_NO_INPUT, dd);
+X	user_become_undo();
+X	str_free(the_command);
+X	trace((/*{*/"}\n"));
+X}
+X
+X
+Xvoid
+Xchange_run_develop_begin_command(cp, up)
+X	change_ty	*cp;
+X	user_ty		*up;
+X{
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X	string_ty	*dir;
+X
+X	pconf_data = change_pconf_get(cp);
+X	if (!pconf_data->develop_begin_command)
+X		return;
+X
+X	the_command = pconf_data->develop_begin_command;
+X	the_command = substitute(cp, the_command);
+X	dir = change_development_directory_get(cp, 1);
+X	user_become(up);
+X	os_execute
+X	(
+X		the_command,
+X		OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK,
+X		dir
+X	);
+X	user_become_undo();
+X	str_free(the_command);
+X}
+X
+X
+Xvoid
+Xchange_run_integrate_begin_command(cp)
+X	change_ty	*cp;
+X{
+X	pconf		pconf_data;
+X	string_ty	*the_command;
+X	string_ty	*dir;
+X
+X	pconf_data = change_pconf_get(cp);
+X	if (!pconf_data->integrate_begin_command)
+X		return;
+X	sub_var_set("1", "${project}");
+X	sub_var_set("2", "${change}");
+X	sub_var_set("3", "${version}");
+X	the_command = pconf_data->integrate_begin_command;
+X	the_command = substitute(cp, the_command);
+X	dir = change_integration_directory_get(cp, 1);
+X	change_become(cp);
+X	os_execute
+X	(
+X		the_command,
+X		OS_EXEC_FLAG_NO_INPUT + OS_EXEC_FLAG_ERROK,
+X		dir
+X	);
+X	change_become_undo();
+X	str_free(the_command);
+X}
+END_OF_FILE
+if test 47426 -ne `wc -c <'aegis/change.c'`; then
+    echo shar: \"'aegis/change.c'\" unpacked with wrong size!
+fi
+# end of 'aegis/change.c'
+fi
+if test -f 'aux/CHANGES.2.0' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'aux/CHANGES.2.0'\"
+else
+echo shar: Extracting \"'aux/CHANGES.2.0'\" \(52993 characters\)
+sed "s/^X//" >'aux/CHANGES.2.0' <<'END_OF_FILE'
+X
+X
+X
+XProject "aegis.2.0"						 Page 1
+XList of Changes				       Tue Aug 17 23:24:16 1993
+X
+XChange	State		Description
+X------- -------		-------------
+X   1	completed	New release derived from aegis.1.4.
+X   2	completed	change references to 'alpha' to talk about
+X			'beta'
+X   3	completed	correct spelling errors
+X   4	completed	improve default page width behaviour
+X   5	completed	fix the csh command aliases
+X   6	completed	add the develop_begin command
+X   7	completed	Emphasize tests as part of source in user guide
+X   8	completed	Typo in HP support
+X   9	completed	add Linux config
+X  10	completed	fix problem in glue
+X  11	completed	add list locks functionality
+X  12	completed	cope with absent config file
+X  13	completed	add the aemv command
+X  14	completed	make log files behave more usefully
+X  15	completed	guess the default project and/or change from
+X			the pathname of the current directory
+X  16	completed	add new cause - internal_improvement
+X  17	completed	clean up, in preparation for release
+X  18	completed	add -edit options to aeca aenc and aepa
+X			commands
+X  19	completed	fix 'enum boolean' problem
+X  20	completed	add -MAJor and -MINOr options to aenpr
+X  21	completed	add the -ANticipate option to aed
+X  22	completed	project attributes could be edited by anyone
+X  23	completed	additional terse listings
+X  24	completed	fix bug in pattr_ed
+X  25	completed	add list outstanding changes
+X  26	completed	interface improvements
+X  27	being_		documentation example fails on convex
+X	integrated
+X
+X
+X
+XProject "aegis.2.0", Change 1					 Page 1
+XChange Details				       Tue Aug 17 23:24:20 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 1, Change 1.
+X
+XSUMMARY
+X	New release derived from aegis.1.4.
+X
+XDESCRIPTION
+X	New release derived from aegis.1.4.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	create	1	LICENSE
+X	source	create	1	aegis/administ.c
+X	source	create	1	aegis/administ.h
+X	source	create	1	aegis/arglex2.h
+X	source	create	1	aegis/build.c
+X	source	create	1	aegis/build.h
+X	source	create	1	aegis/cattr.def
+X	source	create	1	aegis/cattr_ed.c
+X	source	create	1	aegis/cattr_ed.h
+X	source	create	1	aegis/change.c
+X	source	create	1	aegis/change.h
+X	source	create	1	aegis/chdir.c
+X	source	create	1	aegis/chdir.h
+X	source	create	1	aegis/col.c
+X	source	create	1	aegis/col.h
+X	source	create	1	aegis/commit.c
+X	source	create	1	aegis/commit.h
+X	source	create	1	aegis/common.def
+X	source	create	1	aegis/copyfile.c
+X	source	create	1	aegis/copyfile.h
+X	source	create	1	aegis/cstate.def
+X	source	create	1	aegis/develop1.c
+X	source	create	1	aegis/develop1.h
+X	source	create	1	aegis/develop2.c
+X	source	create	1	aegis/develop2.h
+X	source	create	1	aegis/diff.c
+X	source	create	1	aegis/diff.h
+X	source	create	1	aegis/dir.c
+X	source	create	1	aegis/dir.h
+X	source	create	1	aegis/file.c
+X	source	create	1	aegis/file.h
+X	source	create	1	aegis/glue.c
+X	source	create	1	aegis/glue.h
+X	source	create	1	aegis/gonzo.c
+X	source	create	1	aegis/gonzo.h
+X	source	create	1	aegis/gram.h
+X	source	create	1	aegis/gram.y
+X	source	create	1	aegis/gstate.def
+X
+X
+X
+XProject "aegis.2.0", Change 1					 Page 2
+XChange Details				       Tue Aug 17 23:24:20 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	create	1	aegis/help.c
+X	source	create	1	aegis/help.h
+X	source	create	1	aegis/indent.c
+X	source	create	1	aegis/indent.h
+X	source	create	1	aegis/integra1.c
+X	source	create	1	aegis/integra1.h
+X	source	create	1	aegis/integra2.c
+X	source	create	1	aegis/integra2.h
+X	source	create	1	aegis/io.c
+X	source	create	1	aegis/io.h
+X	source	create	1	aegis/lex.c
+X	source	create	1	aegis/lex.h
+X	source	create	1	aegis/list.c
+X	source	create	1	aegis/list.h
+X	source	create	1	aegis/lock.c
+X	source	create	1	aegis/lock.h
+X	source	create	1	aegis/log.c
+X	source	create	1	aegis/log.h
+X	source	create	1	aegis/main.c
+X	source	create	1	aegis/new_chan.c
+X	source	create	1	aegis/new_chan.h
+X	source	create	1	aegis/new_file.c
+X	source	create	1	aegis/new_file.h
+X	source	create	1	aegis/new_proj.c
+X	source	create	1	aegis/new_proj.h
+X	source	create	1	aegis/new_rele.c
+X	source	create	1	aegis/new_rele.h
+X	source	create	1	aegis/new_test.c
+X	source	create	1	aegis/new_test.h
+X	source	create	1	aegis/os.c
+X	source	create	1	aegis/os.h
+X	source	create	1	aegis/pager.c
+X	source	create	1	aegis/pager.h
+X	source	create	1	aegis/parse.c
+X	source	create	1	aegis/parse.h
+X	source	create	1	aegis/pattr.def
+X	source	create	1	aegis/pattr_ed.c
+X	source	create	1	aegis/pattr_ed.h
+X	source	create	1	aegis/pconf.def
+X	source	create	1	aegis/project.c
+X	source	create	1	aegis/project.h
+X	source	create	1	aegis/pstate.def
+X	source	create	1	aegis/rem_file.c
+X	source	create	1	aegis/rem_file.h
+X	source	create	1	aegis/rem_proj.c
+X	source	create	1	aegis/rem_proj.h
+X	source	create	1	aegis/review.c
+X	source	create	1	aegis/review.h
+X	source	create	1	aegis/reviewer.c
+X	source	create	1	aegis/reviewer.h
+X	source	create	1	aegis/sub.c
+X	source	create	1	aegis/sub.h
+X	source	create	1	aegis/test.c
+X	source	create	1	aegis/test.h
+X	source	create	1	aegis/type.c
+X
+X
+X
+XProject "aegis.2.0", Change 1					 Page 3
+XChange Details				       Tue Aug 17 23:24:20 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	create	1	aegis/type.h
+X	source	create	1	aegis/uconf.def
+X	source	create	1	aegis/undo.c
+X	source	create	1	aegis/undo.h
+X	source	create	1	aegis/user.c
+X	source	create	1	aegis/user.h
+X	source	create	1	aegis/ustate.def
+X	source	create	1	aegis/version.c
+X	source	create	1	aegis/version.h
+X	source	create	1	aux/ALPHA.man
+X	source	create	1	aux/BUILDING.man
+X	source	create	1	aux/BUILDpyr.man
+X	source	create	1	aux/CHANGES.sh
+X	source	create	1	aux/Howto.cook
+X	source	create	1	aux/MANIFEST.sh
+X	source	create	1	aux/Makefile.awk
+X	source	create	1	aux/Makefile.sh
+X	source	create	1	aux/README.man
+X	source	create	1	aux/patches.sh
+X	source	create	1	common/ansi.c
+X	source	create	1	common/arglex.c
+X	source	create	1	common/arglex.h
+X	source	create	1	common/error.c
+X	source	create	1	common/error.h
+X	source	create	1	common/main.h
+X	source	create	1	common/mem.c
+X	source	create	1	common/mem.h
+X	source	create	1	common/option.c
+X	source	create	1	common/option.h
+X	source	create	1	common/s-v-arg.h
+X	source	create	1	common/str.c
+X	source	create	1	common/str.h
+X	source	create	1	common/trace.c
+X	source	create	1	common/trace.h
+X	source	create	1	common/word.c
+X	source	create	1	common/word.h
+X	source	create	1	conf/AIX-3.2
+X	source	create	1	conf/ConvexOS-10
+X	source	create	1	conf/SCO-2.4
+X	source	create	1	conf/SunOS-4.1.1
+X	source	create	1	conf/SunOS-4.1.2
+X	source	create	1	conf/SunOS-4.1.3
+X	source	create	1	conf/SysV-4.0
+X	source	create	1	conf/ULTRIX-4.2
+X	source	create	1	conf/apollo
+X	source	create	1	conf/dcosx
+X	source	create	1	conf/dgux-5.4.1
+X	source	create	1	conf/hpux-8.07
+X	source	create	1	config
+X	source	create	1	doc/aegis.ms
+X	source	create	1	doc/c1.0.so
+X	source	create	1	doc/c1.1.so
+X	source	create	1	doc/c1.2.so
+X	source	create	1	doc/c1.3.so
+X	source	create	1	doc/c1.4.so
+X
+X
+X
+XProject "aegis.2.0", Change 1					 Page 4
+XChange Details				       Tue Aug 17 23:24:20 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	create	1	doc/c2.0.so
+X	source	create	1	doc/c2.1.so
+X	source	create	1	doc/c2.2.so
+X	source	create	1	doc/c2.3.so
+X	source	create	1	doc/c2.4.so
+X	source	create	1	doc/c2.5.so
+X	source	create	1	doc/c3.0.so
+X	source	create	1	doc/c3.1.so
+X	source	create	1	doc/c3.2.so
+X	source	create	1	doc/c3.3.so
+X	source	create	1	doc/c4.0.so
+X	source	create	1	doc/c4.1.so
+X	source	create	1	doc/c4.2.so
+X	source	create	1	doc/c4.3.so
+X	source	create	1	doc/c5.0.so
+X	source	create	1	doc/c6.0.so
+X	source	create	1	doc/c7.0.so
+X	source	create	1	doc/c7.1.so
+X	source	create	1	doc/c7.2.so
+X	source	create	1	doc/c7.4.so
+X	source	create	1	doc/c7.5.so
+X	source	create	1	doc/c8.0.so
+X	source	create	1	doc/c8.1.so
+X	source	create	1	doc/c8.2.so
+X	source	create	1	doc/c8.3.so
+X	source	create	1	doc/cA.0.so
+X	source	create	1	doc/cB.0.so
+X	source	create	1	doc/cC.0.so
+X	source	create	1	fmtgen/id.c
+X	source	create	1	fmtgen/id.h
+X	source	create	1	fmtgen/indent.c
+X	source	create	1	fmtgen/indent.h
+X	source	create	1	fmtgen/lex.c
+X	source	create	1	fmtgen/lex.h
+X	source	create	1	fmtgen/main.c
+X	source	create	1	fmtgen/parse.h
+X	source	create	1	fmtgen/parse.y
+X	source	create	1	fmtgen/type.c
+X	source	create	1	fmtgen/type.h
+X	source	create	1	fmtgen/type_enum.c
+X	source	create	1	fmtgen/type_integ.c
+X	source	create	1	fmtgen/type_list.c
+X	source	create	1	fmtgen/type_ref.c
+X	source	create	1	fmtgen/type_strin.c
+X	source	create	1	fmtgen/type_struc.c
+X	source	create	1	h/dirent.h
+X	source	create	1	h/stdarg.h-min
+X	source	create	1	h/stddef.h
+X	source	create	1	h/stdlib.h
+X	source	create	1	h/unistd.h
+X	source	create	1	h/utime.h
+X	source	create	1	lib/cshrc
+X	source	create	1	lib/de.inews.sh
+X	source	create	1	lib/de.sh
+X	source	create	1	lib/deu.inews.sh
+X
+X
+X
+XProject "aegis.2.0", Change 1					 Page 5
+XChange Details				       Tue Aug 17 23:24:20 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	create	1	lib/deu.sh
+X	source	create	1	lib/if.inews.sh
+X	source	create	1	lib/if.sh
+X	source	create	1	lib/ip.inews.sh
+X	source	create	1	lib/ip.sh
+X	source	create	1	lib/profile
+X	source	create	1	lib/rf.inews.sh
+X	source	create	1	lib/rf.sh
+X	source	create	1	lib/rp.inews.sh
+X	source	create	1	lib/rp.sh
+X	source	create	1	lib/rpu.inews.sh
+X	source	create	1	lib/rpu.sh
+X	source	create	1	man1/aeb.1
+X	source	create	1	man1/aeca.1
+X	source	create	1	man1/aecd.1
+X	source	create	1	man1/aecp.1
+X	source	create	1	man1/aecpu.1
+X	source	create	1	man1/aed.1
+X	source	create	1	man1/aedb.1
+X	source	create	1	man1/aedbu.1
+X	source	create	1	man1/aede.1
+X	source	create	1	man1/aedeu.1
+X	source	create	1	man1/aegis.1
+X	source	create	1	man1/aeib.1
+X	source	create	1	man1/aeibu.1
+X	source	create	1	man1/aeif.1
+X	source	create	1	man1/aeip.1
+X	source	create	1	man1/ael.1
+X	source	create	1	man1/aena.1
+X	source	create	1	man1/aenc.1
+X	source	create	1	man1/aencu.1
+X	source	create	1	man1/aend.1
+X	source	create	1	man1/aenf.1
+X	source	create	1	man1/aenfu.1
+X	source	create	1	man1/aeni.1
+X	source	create	1	man1/aenpr.1
+X	source	create	1	man1/aenrls.1
+X	source	create	1	man1/aenrv.1
+X	source	create	1	man1/aent.1
+X	source	create	1	man1/aentu.1
+X	source	create	1	man1/aepa.1
+X	source	create	1	man1/aera.1
+X	source	create	1	man1/aerd.1
+X	source	create	1	man1/aerf.1
+X	source	create	1	man1/aeri.1
+X	source	create	1	man1/aerm.1
+X	source	create	1	man1/aermpr.1
+X	source	create	1	man1/aermu.1
+X	source	create	1	man1/aerp.1
+X	source	create	1	man1/aerpu.1
+X	source	create	1	man1/aerrv.1
+X	source	create	1	man1/aet.1
+X	source	create	1	man1/aev.1
+X	source	create	1	man1/install.sh
+X	source	create	1	man1/o__rules.so
+X
+X
+X
+XProject "aegis.2.0", Change 1					 Page 6
+XChange Details				       Tue Aug 17 23:24:20 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	create	1	man1/o_anticip.so
+X	source	create	1	man1/o_auto.so
+X	source	create	1	man1/o_baselin.so
+X	source	create	1	man1/o_bld_lk.so
+X	source	create	1	man1/o_change.so
+X	source	create	1	man1/o_devdir.so
+X	source	create	1	man1/o_dir.so
+X	source	create	1	man1/o_help.so
+X	source	create	1	man1/o_indep.so
+X	source	create	1	man1/o_keep.so
+X	source	create	1	man1/o_lib.so
+X	source	create	1	man1/o_list.so
+X	source	create	1	man1/o_major.so
+X	source	create	1	man1/o_manual.so
+X	source	create	1	man1/o_min.so
+X	source	create	1	man1/o_minor.so
+X	source	create	1	man1/o_nolog.so
+X	source	create	1	man1/o_overw.so
+X	source	create	1	man1/o_page.so
+X	source	create	1	man1/o_project.so
+X	source	create	1	man1/o_terse.so
+X	source	create	1	man1/o_verbose.so
+X	source	create	1	man1/z_cr.so
+X	source	create	1	man1/z_exit.so
+X	source	create	1	man1/z_intuit.so
+X	source	create	1	man1/z_name.so
+X	source	create	1	man5/aecattr.5
+X	source	create	1	man5/aecattr.so
+X	source	create	1	man5/aecstate.5
+X	source	create	1	man5/aedir.5
+X	source	create	1	man5/aegis.5
+X	source	create	1	man5/aegstate.5
+X	source	create	1	man5/aepattr.5
+X	source	create	1	man5/aepattr.so
+X	source	create	1	man5/aepconf.5
+X	source	create	1	man5/aepstate.5
+X	source	create	1	man5/aesub.5
+X	source	create	1	man5/aeuconf.5
+X	source	create	1	man5/aeustate.5
+X	source	create	1	man5/install.sh
+X	source	create	1	man5/z_cr.so
+X	source	create	1	man5/z_name.so
+X	test	create	1	test/00/t0001a.sh
+X	test	create	1	test/00/t0002a.sh
+X	test	create	1	test/00/t0003a.sh
+X	test	create	1	test/00/t0004a.sh
+X	test	create	1	test/00/t0005a.sh
+X	test	create	1	test/00/t0006a.sh
+X	test	create	1	test/00/t0007a.sh
+X	test	create	1	test/00/t0008a.sh
+X	test	create	1	test/00/t0009a.sh
+X	test	create	1	test/00/t0010a.sh
+X	test	create	1	test/00/t0011a.sh
+X	test	create	1	test/00/t0012a.sh
+X	test	create	1	test/00/t0013a.sh
+X
+X
+X
+XProject "aegis.2.0", Change 1					 Page 7
+XChange Details				       Tue Aug 17 23:24:20 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	test	create	1	test/00/t0014a.sh
+X	test	create	1	test/00/t0015a.sh
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Wed Mar 31	pmiller
+X			21:55:41 1993
+X	develop_begin	Wed Mar 31	pmiller
+X			21:55:41 1993
+X	develop_end	Wed Mar 31	pmiller
+X			21:55:41 1993
+X	review_pass	Wed Mar 31	pmiller
+X			21:55:41 1993
+X	integrate_begin Wed Mar 31	pmiller
+X			21:55:41 1993
+X	integrate_pass	Wed Mar 31	pmiller
+X			22:05:11 1993
+X
+X
+X
+XProject "aegis.2.0", Change 2					 Page 1
+XChange Details				       Tue Aug 17 23:24:21 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 2, Change 2.
+X
+XSUMMARY
+X	change references to 'alpha' to talk about 'beta'
+X
+XDESCRIPTION
+X	change references to 'alpha' to talk about 'beta'
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	remove	1	aux/ALPHA.man
+X	source	create	1	aux/BETA.man
+X	source	modify	2	aux/README.man
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Sat Apr	 3	pmiller
+X			22:13:18 1993
+X	develop_begin	Sat Apr	 3	pmiller Elapsed time: 0.000
+X			22:13:24 1993		days.
+X	develop_end	Mon Apr	 5	pmiller
+X			10:52:29 1993
+X	review_pass	Mon Apr	 5	pmiller
+X			10:52:45 1993
+X	integrate_begin Mon Apr	 5	pmiller Elapsed time: 0.169
+X			10:53:34 1993		days.
+X	integrate_pass	Mon Apr	 5	pmiller
+X			12:09:49 1993
+X
+X
+X
+XProject "aegis.2.0", Change 3					 Page 1
+XChange Details				       Tue Aug 17 23:24:22 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 3, Change 3.
+X
+XSUMMARY
+X	correct spelling errors
+X
+XDESCRIPTION
+X	Correct spelling errors in the User Guide and the manual
+X	entries.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	aux/BETA.man
+X	source	modify	2	aux/BUILDING.man
+X	source	modify	2	aux/BUILDpyr.man
+X	source	modify	3	aux/README.man
+X	source	modify	2	doc/c1.0.so
+X	source	modify	2	doc/c1.2.so
+X	source	modify	2	doc/c1.3.so
+X	source	modify	2	doc/c1.4.so
+X	source	modify	2	doc/c2.1.so
+X	source	modify	2	doc/c2.2.so
+X	source	modify	2	doc/c2.3.so
+X	source	modify	2	doc/c2.4.so
+X	source	modify	2	doc/c2.5.so
+X	source	modify	2	doc/c3.1.so
+X	source	modify	2	doc/c3.2.so
+X	source	modify	2	doc/c4.1.so
+X	source	modify	2	doc/c4.2.so
+X	source	modify	2	doc/c4.3.so
+X	source	modify	2	doc/c5.0.so
+X	source	modify	2	doc/c6.0.so
+X	source	modify	2	doc/c7.1.so
+X	source	modify	2	doc/c7.2.so
+X	source	modify	2	doc/c7.4.so
+X	source	modify	2	doc/c7.5.so
+X	source	modify	2	doc/c8.0.so
+X	source	modify	2	doc/c8.1.so
+X	source	modify	2	doc/c8.2.so
+X	source	modify	2	doc/c8.3.so
+X	source	modify	2	doc/cA.0.so
+X	source	modify	2	doc/cB.0.so
+X	source	modify	2	doc/cC.0.so
+X	source	modify	2	man1/aeb.1
+X	source	modify	2	man1/aecd.1
+X	source	modify	2	man1/aecp.1
+X	source	modify	2	man1/aed.1
+X	source	modify	2	man1/aegis.1
+X	source	modify	2	man1/aeib.1
+X
+X
+X
+XProject "aegis.2.0", Change 3					 Page 2
+XChange Details				       Tue Aug 17 23:24:22 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	man1/aencu.1
+X	source	modify	2	man1/aenfu.1
+X	source	modify	2	man1/aenpr.1
+X	source	modify	2	man1/aenrls.1
+X	source	modify	2	man1/aentu.1
+X	source	modify	2	man1/aerf.1
+X	source	modify	2	man1/aeri.1
+X	source	modify	2	man1/aerm.1
+X	source	modify	2	man1/aermu.1
+X	source	modify	2	man1/aerp.1
+X	source	modify	2	man1/o_auto.so
+X	source	modify	2	man1/o_devdir.so
+X	source	modify	2	man1/o_lib.so
+X	source	modify	2	man1/o_major.so
+X	source	modify	2	man1/o_minor.so
+X	source	modify	2	man1/o_overw.so
+X	source	modify	2	man5/aecattr.5
+X	source	modify	2	man5/aecstate.5
+X	source	modify	2	man5/aedir.5
+X	source	modify	2	man5/aegis.5
+X	source	modify	2	man5/aepattr.so
+X	source	modify	2	man5/aepconf.5
+X	source	modify	2	man5/aepstate.5
+X	source	modify	2	man5/aesub.5
+X	source	modify	2	man5/aeuconf.5
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Mon Apr	 5	pmiller
+X			12:11:59 1993
+X	develop_begin	Mon Apr	 5	pmiller Elapsed time: 0.426
+X			12:12:04 1993		days.
+X	develop_end	Mon Apr	 5	pmiller
+X			15:23:43 1993
+X	review_pass	Mon Apr	 5	pmiller
+X			15:24:21 1993
+X	integrate_begin Mon Apr	 5	pmiller Elapsed time: 0.225
+X			15:25:23 1993		days.
+X	integrate_pass	Mon Apr	 5	pmiller
+X			17:06:47 1993
+X
+X
+X
+XProject "aegis.2.0", Change 4					 Page 1
+XChange Details				       Tue Aug 17 23:24:23 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 4, Change 4.
+X
+XSUMMARY
+X	improve default page width behaviour
+X
+XDESCRIPTION
+X	1. Improve default page width behaviour, many users were
+X	seeing strangely narrow listings and error messages
+X	2. Set the umask in the tests.	Some people has very
+X	restrictive umasks, and this caused the tests to fail.
+X	3. Change the names of the functions in the option.c file, to
+X	be consistent with naming scheme used elsewhere.
+X	4. Make aegis more robust about where the /tmp directory is
+X	placed, and cope with /tmp as a symlink.
+X
+X	My thanks to Bob Hollinger <bob@david.wheaton.edu> for
+X	bringing these problems to my attention.
+X
+X	This change is exempt from testing against the baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	aegis/administ.c
+X	source	modify	2	aegis/build.c
+X	source	modify	2	aegis/cattr_ed.c
+X	source	modify	2	aegis/change.c
+X	source	modify	2	aegis/chdir.c
+X	source	modify	2	aegis/col.c
+X	source	modify	2	aegis/copyfile.c
+X	source	modify	2	aegis/develop1.c
+X	source	modify	2	aegis/develop2.c
+X	source	modify	2	aegis/diff.c
+X	source	modify	2	aegis/gonzo.c
+X	source	modify	2	aegis/help.c
+X	source	modify	2	aegis/integra1.c
+X	source	modify	2	aegis/integra2.c
+X	source	modify	2	aegis/list.c
+X	source	modify	2	aegis/main.c
+X	source	modify	2	aegis/new_chan.c
+X	source	modify	2	aegis/new_file.c
+X	source	modify	2	aegis/new_proj.c
+X	source	modify	2	aegis/new_rele.c
+X	source	modify	2	aegis/new_test.c
+X	source	modify	2	aegis/os.c
+X	source	modify	2	aegis/pattr_ed.c
+X	source	modify	2	aegis/rem_file.c
+X	source	modify	2	aegis/rem_proj.c
+X	source	modify	2	aegis/review.c
+X	source	modify	2	aegis/reviewer.c
+X	source	modify	2	aegis/test.c
+X	source	modify	2	aegis/undo.c
+X	source	modify	2	aegis/user.c
+X
+X
+X
+XProject "aegis.2.0", Change 4					 Page 2
+XChange Details				       Tue Aug 17 23:24:23 1993
+X
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	aegis/version.c
+X	source	modify	2	common/arglex.c
+X	source	modify	2	common/error.c
+X	source	modify	2	common/option.c
+X	source	modify	2	common/option.h
+X	source	modify	2	common/trace.c
+X	source	modify	2	config
+X	source	modify	2	fmtgen/main.c
+X	test	modify	2	test/00/t0001a.sh
+X	test	modify	2	test/00/t0002a.sh
+X	test	modify	2	test/00/t0003a.sh
+X	test	modify	2	test/00/t0004a.sh
+X	test	modify	2	test/00/t0005a.sh
+X	test	modify	2	test/00/t0006a.sh
+X	test	modify	2	test/00/t0007a.sh
+X	test	modify	2	test/00/t0008a.sh
+X	test	modify	2	test/00/t0009a.sh
+X	test	modify	2	test/00/t0010a.sh
+X	test	modify	2	test/00/t0011a.sh
+X	test	modify	2	test/00/t0012a.sh
+X	test	modify	2	test/00/t0013a.sh
+X	test	modify	2	test/00/t0014a.sh
+X	test	modify	2	test/00/t0015a.sh
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Mon Apr	 5	pmiller
+X			21:37:53 1993
+X	develop_begin	Mon Apr	 5	pmiller Elapsed time: 0.000
+X			21:38:03 1993		days.
+X	develop_end	Tue Apr	 6	pmiller
+X			11:35:39 1993
+X	review_pass	Tue Apr	 6	pmiller
+X			11:36:02 1993
+X	integrate_begin Tue Apr	 6	pmiller Elapsed time: 0.294
+X			11:37:12 1993		days.
+X	integrate_pass	Tue Apr	 6	pmiller
+X			13:49:29 1993
+X
+X
+X
+XProject "aegis.2.0", Change 5					 Page 1
+XChange Details				       Tue Aug 17 23:24:24 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 5, Change 5.
+X
+XSUMMARY
+X	fix the csh command aliases
+X
+XDESCRIPTION
+X	1. The cshrc file distributed with aegis failed to isolate two
+X	of the aliases inside quotes.
+X
+X	My thanks to Brian Decker <brian@arthur.melpar.esys.com> for
+X	reporting this problem.
+X
+X	2. On very fast machines, the tests can fail complaining of no
+X	current build.	This is because the last-time-modified
+X	granularity is limited to one second.  Put strategic sleeps
+X	before builds in the tests.
+X
+X	My thanks to Philip Peake <philip@wv.mentorg.com> for
+X	reporting this problem.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_bug.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	3	aux/BUILDING.man
+X	source	modify	2	aux/MANIFEST.sh
+X	source	create	1	conf/SunOS-5.1
+X	source	modify	2	lib/cshrc
+X	test	modify	3	test/00/t0002a.sh
+X	test	modify	3	test/00/t0004a.sh
+X	test	modify	3	test/00/t0005a.sh
+X	test	modify	3	test/00/t0006a.sh
+X	test	modify	3	test/00/t0007a.sh
+X	test	modify	3	test/00/t0008a.sh
+X	test	modify	3	test/00/t0009a.sh
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Tue Apr 13	pmiller
+X			22:56:11 1993
+X	develop_begin	Tue Apr 13	pmiller Elapsed time: 0.000
+X			22:59:45 1993		days.
+X	develop_end	Wed Apr 14	pmiller
+X			08:54:47 1993
+X	review_pass	Wed Apr 14	pmiller
+X			08:54:57 1993
+X	integrate_begin Wed Apr 14	pmiller Elapsed time: 0.093
+X			08:55:55 1993		days.
+X	integrate_pass	Wed Apr 14	pmiller
+X
+X
+X
+XProject "aegis.2.0", Change 5					 Page 2
+XChange Details				       Tue Aug 17 23:24:24 1993
+X
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X			09:37:44 1993
+X
+X
+X
+XProject "aegis.2.0", Change 6					 Page 1
+XChange Details				       Tue Aug 17 23:24:24 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 13, Change 6.
+X
+XSUMMARY
+X	add the develop_begin command
+X
+XDESCRIPTION
+X	Add a command that is executed within the development
+X	directory at develop begin time
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	4	aegis/change.c
+X	source	modify	3	aegis/change.h
+X	source	modify	3	aegis/develop2.c
+X	source	modify	3	aegis/integra2.c
+X	source	modify	5	aegis/list.c
+X	source	modify	2	aegis/pconf.def
+X	source	modify	3	doc/c6.0.so
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Tue Apr 13	pmiller Elapsed time: 41.351
+X			22:59:39 1993		days.
+X	develop_begin	Fri Jun 11	pmiller Elapsed time: 0.320
+X			10:37:34 1993		days.
+X	develop_end	Fri Jun 11	pmiller
+X			13:01:43 1993
+X	review_pass	Fri Jun 11	pmiller
+X			13:01:56 1993
+X	integrate_begin Fri Jun 11	pmiller Elapsed time: 0.160
+X			13:03:04 1993		days.
+X	integrate_pass	Fri Jun 11	pmiller
+X			14:15:16 1993
+X
+X
+X
+XProject "aegis.2.0", Change 7					 Page 1
+XChange Details				       Tue Aug 17 23:24:25 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 6, Change 7.
+X
+XSUMMARY
+X	Emphasize tests as part of source in user guide
+X
+XDESCRIPTION
+X	Feedback frequently contained the misconception that tests
+X	were not editable after they are created.  Add items in manual
+X	entries and the User Guide to make it clear that tests are
+X	source files, and subject to all of the same process.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	3	aegis/copyfile.c
+X	source	modify	3	aegis/new_test.c
+X	source	modify	3	doc/c2.1.so
+X	source	modify	3	doc/c2.5.so
+X	source	modify	3	doc/c7.1.so
+X	source	modify	3	man1/aecp.1
+X	source	modify	2	man1/aent.1
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Tue Apr 20	pmiller
+X			11:39:15 1993
+X	develop_begin	Tue Apr 20	pmiller Elapsed time: 10.252
+X			11:39:30 1993		days.
+X	develop_end	Tue May	 4	pmiller
+X			13:32:50 1993
+X	develop_end_	Tue May	 4	pmiller Elapsed time: 0.033
+X	undo		13:33:39 1993		days.
+X	develop_end	Tue May	 4	pmiller
+X			13:48:41 1993
+X	review_pass	Tue May	 4	pmiller
+X			13:49:43 1993
+X	integrate_begin Tue May	 4	pmiller Elapsed time: 0.375
+X			13:50:38 1993		days.
+X	integrate_pass	Tue May	 4	pmiller
+X			16:39:26 1993
+X
+X
+X
+XProject "aegis.2.0", Change 8					 Page 1
+XChange Details				       Tue Aug 17 23:24:26 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 7, Change 8.
+X
+XSUMMARY
+X	Typo in HP support
+X
+XDESCRIPTION
+X	Typo in HP support in the common/ansi.c file resulted in
+X	confusion about correct configuration.
+X
+X	My thanks to <andy@pic.melco.co.jp> for reporting this problem.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_bug.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	common/ansi.c
+X	source	modify	2	conf/hpux-8.07
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Mon May 10	pmiller
+X			09:37:51 1993
+X	develop_begin	Mon May 10	pmiller Elapsed time: 0.055
+X			09:38:07 1993		days.
+X	develop_end	Mon May 10	pmiller
+X			10:02:39 1993
+X	review_pass	Mon May 10	pmiller
+X			10:04:12 1993
+X	integrate_begin Mon May 10	pmiller Elapsed time: 0.174
+X			10:05:17 1993		days.
+X	integrate_pass	Mon May 10	pmiller
+X			11:23:27 1993
+X
+X
+X
+XProject "aegis.2.0", Change 9					 Page 1
+XChange Details				       Tue Aug 17 23:24:27 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 9, Change 9.
+X
+XSUMMARY
+X	add Linux config
+X
+XDESCRIPTION
+X	Add configuration for Linux 0.99
+X
+X	My thanks to Pat Eyler <pate@cpu.us.dynix.com> for providing
+X	this information.
+X
+X	This change is exempt from testing against the baseline.
+X
+XCAUSE
+X	This change was caused by external_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	4	aux/BUILDING.man
+X	source	modify	4	aux/README.man
+X	source	modify	3	common/ansi.c
+X	source	modify	2	conf/AIX-3.2
+X	source	modify	2	conf/ConvexOS-10
+X	source	create	1	conf/Linux-0.99
+X	source	modify	2	conf/SCO-2.4
+X	source	modify	2	conf/SunOS-4.1.1
+X	source	modify	2	conf/SunOS-4.1.2
+X	source	modify	2	conf/SunOS-4.1.3
+X	source	modify	2	conf/SunOS-5.1
+X	source	modify	2	conf/SysV-4.0
+X	source	modify	2	conf/ULTRIX-4.2
+X	source	modify	2	conf/apollo
+X	source	modify	2	conf/dcosx
+X	source	modify	2	conf/dgux-5.4.1
+X	source	modify	4	conf/hpux-8.07
+X	source	modify	3	config
+X	test	modify	3	test/00/t0001a.sh
+X	test	modify	4	test/00/t0002a.sh
+X	test	modify	3	test/00/t0003a.sh
+X	test	modify	4	test/00/t0004a.sh
+X	test	modify	4	test/00/t0005a.sh
+X	test	modify	4	test/00/t0006a.sh
+X	test	modify	4	test/00/t0007a.sh
+X	test	modify	4	test/00/t0008a.sh
+X	test	modify	4	test/00/t0009a.sh
+X	test	modify	3	test/00/t0010a.sh
+X	test	modify	3	test/00/t0011a.sh
+X	test	modify	3	test/00/t0012a.sh
+X	test	modify	3	test/00/t0013a.sh
+X	test	modify	3	test/00/t0014a.sh
+X	test	modify	3	test/00/t0015a.sh
+X
+X
+X
+XProject "aegis.2.0", Change 9					 Page 2
+XChange Details				       Tue Aug 17 23:24:27 1993
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Wed May 19	pmiller
+X			12:05:49 1993
+X	develop_begin	Wed May 19	pmiller Elapsed time: 0.099
+X			12:06:39 1993		days.
+X	develop_end	Wed May 19	pmiller Elapsed time: 0.594
+X			12:51:01 1993		days.
+X	develop_end_	Thu May 20	pmiller Elapsed time: 3.676
+X	undo		09:48:12 1993		days.
+X	develop_end	Tue May 25	pmiller
+X			14:52:11 1993
+X	review_pass	Tue May 25	pmiller
+X			14:52:23 1993
+X	integrate_begin Tue May 25	pmiller Elapsed time: 0.243
+X			14:53:47 1993		days.
+X	integrate_pass	Tue May 25	pmiller
+X			16:43:01 1993
+X
+X
+X
+XProject "aegis.2.0", Change 10					 Page 1
+XChange Details				       Tue Aug 17 23:24:27 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 8, Change 10.
+X
+XSUMMARY
+X	fix problem in glue
+X
+XDESCRIPTION
+X	Missing variable declarations prevented the glue from
+X	compiling correctly.
+X
+X	My thanks to Thierry Excoffier <exco@ligiahp.univ-lyon1.fr>
+X	for reporting this problem.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_bug.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	aegis/glue.c
+X	source	modify	3	conf/hpux-8.07
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Tue May 25	pmiller
+X			09:06:33 1993
+X	develop_begin	Tue May 25	pmiller Elapsed time: 0.104
+X			09:06:41 1993		days.
+X	develop_end	Tue May 25	pmiller
+X			09:53:25 1993
+X	review_pass	Tue May 25	pmiller
+X			09:59:41 1993
+X	integrate_begin Tue May 25	pmiller Elapsed time: 0.577
+X			10:01:08 1993		days.
+X	integrate_pass	Tue May 25	pmiller
+X			14:20:59 1993
+X
+X
+X
+XProject "aegis.2.0", Change 11					 Page 1
+XChange Details				       Tue Aug 17 23:24:28 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 10, Change 11.
+X
+XSUMMARY
+X	add list locks functionality
+X
+XDESCRIPTION
+X	add list locks functionality
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	3	aegis/glue.c
+X	source	modify	3	aegis/list.c
+X	source	modify	2	aegis/list.h
+X	source	modify	2	aegis/lock.c
+X	source	modify	2	aegis/lock.h
+X	source	modify	2	man1/ael.1
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Thu May 27	pmiller
+X			09:42:36 1993
+X	develop_begin	Thu May 27	pmiller Elapsed time: 0.689
+X			09:42:50 1993		days.
+X	develop_end	Thu May 27	pmiller
+X			14:53:00 1993
+X	review_pass	Thu May 27	pmiller
+X			14:53:16 1993
+X	integrate_begin Thu May 27	pmiller Elapsed time: 0.788
+X			14:54:45 1993		days.
+X	integrate_pass	Thu May 27	pmiller
+X			20:49:14 1993
+X
+X
+X
+XProject "aegis.2.0", Change 12					 Page 1
+XChange Details				       Tue Aug 17 23:24:29 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 11, Change 12.
+X
+XSUMMARY
+X	cope with absent config file
+X
+XDESCRIPTION
+X	When a project does not have a ``config'' file, the aegis -
+X	build command dumps core.  This was because a (false)
+X	assumption was made about the presence of this file.
+X
+X	My thanks to Ian Darwin <ian@sq.com> for reporting this
+X	problem.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_bug.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	3	aegis/build.c
+X	source	modify	3	aegis/change.c
+X	source	modify	2	aegis/change.h
+X	source	modify	4	aegis/copyfile.c
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Sun Jun	 6	pmiller
+X			00:25:38 1993
+X	develop_begin	Sun Jun	 6	pmiller Elapsed time: 0.786
+X			00:25:43 1993		days.
+X	develop_end	Mon Jun	 7	pmiller Elapsed time: 0.108
+X			15:19:37 1993		days.
+X	review_pass	Mon Jun	 7	pmiller
+X			16:08:04 1993
+X	integrate_begin Mon Jun	 7	pmiller Elapsed time: 0.309
+X			16:10:01 1993		days.
+X	integrate_pass	Tue Jun	 8	pmiller
+X			10:58:54 1993
+X
+X
+X
+XProject "aegis.2.0", Change 13					 Page 1
+XChange Details				       Tue Aug 17 23:24:30 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 12, Change 13.
+X
+XSUMMARY
+X	add the aemv command
+X
+XDESCRIPTION
+X	add the aemv command
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	aegis/arglex2.h
+X	source	modify	2	aegis/cstate.def
+X	source	modify	3	aegis/diff.c
+X	source	modify	4	aegis/list.c
+X	source	modify	3	aegis/main.c
+X	source	create	1	aegis/mv.c
+X	source	create	1	aegis/mv.h
+X	source	modify	2	aux/Howto.cook
+X	source	modify	5	aux/README.man
+X	source	create	1	aux/new.1.4.so
+X	source	create	1	aux/new.2.0.so
+X	source	modify	3	lib/cshrc
+X	source	modify	2	lib/profile
+X	source	modify	3	man1/aegis.1
+X	source	create	1	man1/aemv.1
+X	source	modify	3	man5/aecstate.5
+X	test	create	1	test/00/t0016a.sh
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Thu Jun 10	pmiller
+X			12:13:38 1993
+X	develop_begin	Thu Jun 10	pmiller Elapsed time: 0.682
+X			12:13:55 1993		days.
+X	develop_end	Fri Jun 11	pmiller
+X			09:50:57 1993
+X	review_pass	Fri Jun 11	pmiller
+X			09:51:24 1993
+X	integrate_begin Fri Jun 11	pmiller Elapsed time: 0.141
+X			09:52:28 1993		days.
+X	integrate_pass	Fri Jun 11	pmiller
+X			10:56:04 1993
+X
+X
+X
+XProject "aegis.2.0", Change 14					 Page 1
+XChange Details				       Tue Aug 17 23:24:31 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 14, Change 14.
+X
+XSUMMARY
+X	make log files behave more usefully
+X
+XDESCRIPTION
+X	Change log files so that if they have been modified "recently"
+X	then the log will append, rather than replace.	 This means
+X	that patterns of use like "aeb && aet; vi aegis.log" will not
+X	wipe out the compilation messages.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	aegis/log.c
+X	source	modify	4	config
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Fri Jun 11	pmiller
+X			14:29:44 1993
+X	develop_begin	Fri Jun 11	pmiller Elapsed time: 0.234
+X			14:29:51 1993		days.
+X	develop_end	Fri Jun 11	pmiller
+X			16:15:22 1993
+X	review_pass	Fri Jun 11	pmiller
+X			16:15:54 1993
+X	integrate_begin Fri Jun 11	pmiller Elapsed time: 0.000
+X			16:17:04 1993		days.
+X	integrate_pass	Sat Jun 12	pmiller
+X			00:03:22 1993
+X
+X
+X
+XProject "aegis.2.0", Change 15					 Page 1
+XChange Details				       Tue Aug 17 23:24:31 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 15, Change 15.
+X
+XSUMMARY
+X	guess the default project and/or change from the pathname of
+X	the current directory
+X
+XDESCRIPTION
+X	In many cases the project and/or change can be guessed by
+X	exmining the pathname of the current directory.
+X
+X	My thanks to Rick Duff <beta@edfub3.ctis.af.mil> for this
+X	suggestion.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	3	aegis/user.c
+X	source	modify	3	aux/Howto.cook
+X	source	modify	2	aux/new.2.0.so
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Wed Jul 21	pmiller
+X			14:54:26 1993
+X	develop_begin	Wed Jul 21	pmiller Elapsed time: 0.178
+X			14:54:34 1993		days.
+X	develop_end	Wed Jul 21	pmiller
+X			16:14:44 1993
+X	review_pass	Wed Jul 21	pmiller
+X			16:16:19 1993
+X	integrate_begin Wed Jul 21	pmiller Elapsed time: 0.084
+X			16:17:38 1993		days.
+X	integrate_pass	Wed Jul 21	pmiller
+X			16:55:18 1993
+X
+X
+X
+XProject "aegis.2.0", Change 16					 Page 1
+XChange Details				       Tue Aug 17 23:24:32 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 16, Change 16.
+X
+XSUMMARY
+X	add new cause - internal_improvement
+X
+XDESCRIPTION
+X	Two new causes for changes have been created, internal_
+X	improvement and external_improvement.  These are for cases
+X	where existing functionality has been improved, rather than
+X	new functionality added.  Using these causes, the change must
+X	pass the entire existing regression test suite, unless the
+X	change attributes are altered to relax this.
+X
+X	My thanks to Rick Duff <beta@edfub3.ctis.af.mil> for this
+X	suggestion.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	4	aegis/build.c
+X	source	modify	2	aegis/cattr.def
+X	source	modify	3	aegis/cattr_ed.c
+X	source	modify	5	aegis/change.c
+X	source	modify	2	aegis/common.def
+X	source	modify	5	aegis/copyfile.c
+X	source	modify	3	aegis/cstate.def
+X	source	modify	4	aegis/develop2.c
+X	source	modify	4	aegis/integra2.c
+X	source	modify	6	aegis/list.c
+X	source	modify	2	aegis/mv.c
+X	source	modify	3	aegis/new_chan.c
+X	source	modify	3	aegis/new_file.c
+X	source	modify	4	aegis/new_test.c
+X	source	modify	3	aegis/rem_file.c
+X	source	modify	3	aegis/review.c
+X	source	modify	3	aegis/test.c
+X	source	modify	2	man5/aecattr.so
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Wed Jul 21	pmiller Elapsed time: 0.031
+X			16:26:29 1993		days.
+X	develop_begin	Wed Jul 21	pmiller Elapsed time: 0.362
+X			16:40:24 1993		days.
+X	develop_end	Thu Jul 22	pmiller
+X			11:53:10 1993
+X	review_pass	Thu Jul 22	pmiller
+X			11:57:17 1993
+X
+X
+X
+XProject "aegis.2.0", Change 16					 Page 2
+XChange Details				       Tue Aug 17 23:24:32 1993
+X
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	integrate_begin Thu Jul 22	pmiller Elapsed time: 0.149
+X			11:58:58 1993		days.
+X	integrate_pass	Thu Jul 22	pmiller
+X			13:05:58 1993
+X
+X
+X
+XProject "aegis.2.0", Change 17					 Page 1
+XChange Details				       Tue Aug 17 23:24:33 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 18, Change 17.
+X
+XSUMMARY
+X	clean up, in preparation for release
+X
+XDESCRIPTION
+X	clean up, in preparation for release
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	2	aegis/mv.h
+X	source	remove	2	aux/BETA.man
+X	source	modify	5	aux/BUILDING.man
+X	source	modify	3	aux/MANIFEST.sh
+X	source	modify	6	aux/README.man
+X	source	modify	2	aux/patches.sh
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Thu Jul 22	pmiller
+X			10:44:25 1993
+X	develop_begin	Thu Jul 22	pmiller Elapsed time: 0.554
+X			10:45:07 1993		days.
+X	develop_end	Thu Jul 22	pmiller
+X			14:54:37 1993
+X	review_pass	Thu Jul 22	pmiller
+X			14:59:11 1993
+X	integrate_begin Thu Jul 22	pmiller Elapsed time: 0.967
+X			15:08:12 1993		days.
+X	integrate_fail	Fri Jul 23	pmiller abuild problems on non-
+X			14:53:15 1993		ansi compilers
+X						Elapsed time: 0.124
+X						days.
+X	develop_end	Fri Jul 23	pmiller
+X			15:49:04 1993
+X	review_pass	Fri Jul 23	pmiller
+X			15:49:33 1993
+X	integrate_begin Fri Jul 23	pmiller Elapsed time: 1.690
+X			15:50:48 1993		days.
+X	integrate_pass	Sat Jul 24	pmiller
+X			21:01:25 1993
+X
+X
+X
+XProject "aegis.2.0", Change 18					 Page 1
+XChange Details				       Tue Aug 17 23:24:33 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 19, Change 18.
+X
+XSUMMARY
+X	add -edit options to aeca aenc and aepa commands
+X
+XDESCRIPTION
+X	The previous method of listing the options into a file then
+X	editing the listing and the feeding this back into aegis was
+X	clumsy and anoying.
+X
+X	This change must pass a full regression test.  This change is
+X	exempt from testing against the development directory.	This
+X	change is exempt from testing against the baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	3	aegis/arglex2.h
+X	source	modify	4	aegis/cattr_ed.c
+X	source	modify	2	aegis/cattr_ed.h
+X	source	modify	5	aegis/integra2.c
+X	source	modify	4	aegis/main.c
+X	source	modify	4	aegis/new_chan.c
+X	source	modify	3	aegis/os.c
+X	source	modify	2	aegis/os.h
+X	source	modify	3	aegis/pattr_ed.c
+X	source	modify	4	aegis/review.c
+X	source	modify	3	aux/new.2.0.so
+X	source	modify	4	doc/c2.1.so
+X	source	modify	3	doc/c2.4.so
+X	source	modify	3	doc/c5.0.so
+X	source	modify	2	man1/aeca.1
+X	source	modify	2	man1/aeif.1
+X	source	modify	2	man1/aenc.1
+X	source	modify	2	man1/aepa.1
+X	source	modify	3	man1/aerf.1
+X	source	create	1	man1/o_edit.so
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Sat Jul 24	pmiller
+X			21:11:07 1993
+X	develop_begin	Sat Jul 24	pmiller Elapsed time: 1.121
+X			21:11:19 1993		days.
+X	develop_end	Sun Jul 25	pmiller Elapsed time: 0.033
+X			22:05:43 1993		days.
+X	review_fail	Sun Jul 25	pmiller (a) change user guide
+X			22:20:29 1993		to use new features
+X						(b) forgot the aerfail
+X						and aeifail commands
+X						Elapsed time: 0.309
+X						days.
+X
+X
+X
+XProject "aegis.2.0", Change 18					 Page 2
+XChange Details				       Tue Aug 17 23:24:33 1993
+X
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	develop_end	Tue Jul 27	pmiller
+X			09:39:34 1993
+X	review_pass	Tue Jul 27	pmiller
+X			09:46:32 1993
+X	integrate_begin Tue Jul 27	pmiller Elapsed time: 0.419
+X			09:47:44 1993		days.
+X	integrate_pass	Tue Jul 27	pmiller
+X			12:56:06 1993
+X
+X
+X
+XProject "aegis.2.0", Change 19					 Page 1
+XChange Details				       Tue Aug 17 23:24:34 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 20, Change 19.
+X
+XSUMMARY
+X	fix 'enum boolean' problem
+X
+XDESCRIPTION
+X	Many SVR4 flavours of unix have a bug in sys/types.h where
+X	they define an enum tag of ``boolean'', clearly breaking the
+X	ANSI C rules (adopted by POSIX) which say that system names
+X	must be _* or *_t and no others.     Sigh.
+X
+X	Change all fmtgen generated enum tags to have a _ty suffix, to
+X	avoid this problem.
+X
+X	This change must pass a full regression test.  This change is
+X	exempt from testing against the development directory.	This
+X	change is exempt from testing against the baseline.
+X
+XCAUSE
+X	This change was caused by internal_improvement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	5	aegis/new_chan.c
+X	source	modify	6	aux/BUILDING.man
+X	source	remove	2	aux/BUILDpyr.man
+X	source	modify	2	aux/Makefile.sh
+X	source	modify	2	fmtgen/type_enum.c
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Sun Aug	 1	pmiller
+X			22:55:52 1993
+X	develop_begin	Sun Aug	 1	pmiller Elapsed time: 0.876
+X			22:56:06 1993		days.
+X	develop_end	Mon Aug	 2	pmiller
+X			22:00:13 1993
+X	review_pass	Mon Aug	 2	pmiller
+X			22:02:45 1993
+X	integrate_begin Mon Aug	 2	pmiller Elapsed time: 0.170
+X			22:04:02 1993		days.
+X	integrate_pass	Mon Aug	 2	pmiller
+X			23:20:19 1993
+X
+X
+X
+XProject "aegis.2.0", Change 20					 Page 1
+XChange Details				       Tue Aug 17 23:24:35 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 21, Change 20.
+X
+XSUMMARY
+X	add -MAJor and -MINOr options to aenpr
+X
+XDESCRIPTION
+X	add -MAJor and -MINOr options to aenpr
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	3	aegis/new_proj.c
+X	source	modify	4	aux/new.2.0.so
+X	source	modify	3	man1/aenpr.1
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Mon Aug	 2	pmiller
+X			22:13:10 1993
+X	develop_begin	Mon Aug	 2	pmiller Elapsed time: 0.112
+X			22:13:17 1993		days.
+X	develop_end	Mon Aug	 2	pmiller
+X			23:03:45 1993
+X	review_pass	Mon Aug	 2	pmiller Elapsed time: 0.041
+X			23:06:38 1993		days.
+X	integrate_begin Mon Aug	 2	pmiller Elapsed time: 0.745
+X			23:25:11 1993		days.
+X	integrate_pass	Tue Aug	 3	pmiller
+X			21:30:37 1993
+X
+X
+X
+XProject "aegis.2.0", Change 21					 Page 1
+XChange Details				       Tue Aug 17 23:24:36 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 22, Change 21.
+X
+XSUMMARY
+X	add the -ANticipate option to aed
+X
+XDESCRIPTION
+X	There is fequently a long wait, sometimes several days, before
+X	a change is integrated.	 In that time other developers will
+X	want to synchronize their changes to match the about-to-be-
+X	integrated change.	   The -ANticipate option allows them
+X	to do this.
+X
+X	My thanks to David I. Bell <dbell@auug.org.au> for this
+X	suggestion.
+X
+XCAUSE
+X	This change was caused by internal_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	4	aegis/diff.c
+X	source	modify	5	aux/new.2.0.so
+X	test	create	1	test/00/t0017a.sh
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Tue Aug	 3	pmiller
+X			21:43:45 1993
+X	develop_begin	Tue Aug	 3	pmiller Elapsed time: 1.986
+X			21:43:50 1993		days.
+X	develop_end	Fri Aug	 6	pmiller
+X			14:07:20 1993
+X	review_pass	Fri Aug	 6	pmiller
+X			14:07:37 1993
+X	integrate_begin Fri Aug	 6	pmiller Elapsed time: 0.000
+X			14:08:56 1993		days.
+X	integrate_pass	Sat Aug	 7	pmiller
+X			21:48:58 1993
+X
+X
+X
+XProject "aegis.2.0", Change 22					 Page 1
+XChange Details				       Tue Aug 17 23:24:37 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 23, Change 22.
+X
+XSUMMARY
+X	project attributes could be edited by anyone
+X
+XDESCRIPTION
+X	There was no check that the user editing the projewct
+X	attributes was an administrator.  This is not fixed.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_bug.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	6	aegis/copyfile.c
+X	source	modify	5	aegis/diff.c
+X	source	modify	4	aegis/pattr_ed.c
+X	source	modify	4	man1/aecp.1
+X	source	modify	3	man1/aed.1
+X	source	modify	2	man1/o_anticip.so
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Sat Aug	 7	pmiller
+X			21:52:55 1993
+X	develop_begin	Sat Aug	 7	pmiller Elapsed time: 0.289
+X			21:53:00 1993		days.
+X	develop_end	Sun Aug	 8	pmiller
+X			00:03:06 1993
+X	review_pass	Sun Aug	 8	pmiller
+X			00:03:49 1993
+X	integrate_begin Sun Aug	 8	pmiller Elapsed time: 0.749
+X			00:05:37 1993		days.
+X	integrate_pass	Sun Aug	 8	pmiller
+X			22:12:51 1993
+X
+X
+X
+XProject "aegis.2.0", Change 23					 Page 1
+XChange Details				       Tue Aug 17 23:24:38 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 24, Change 23.
+X
+XSUMMARY
+X	additional terse listings
+X
+XDESCRIPTION
+X	1. Add unformatted variants of existing listings, to
+X	facilitate doing things with shell scripts.
+X	2. Add the skeleton of a ``wish'' script to give aegis a GUI
+X	interface.  Very little is functional, as yet.
+X
+X	My thanks to David Robison <david@hccw.com> for these
+X	suggestions.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_improvement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	4	aegis/arglex2.h
+X	source	modify	3	aegis/col.c
+X	source	modify	7	aegis/copyfile.c
+X	source	modify	3	aegis/help.c
+X	source	modify	7	aegis/list.c
+X	source	modify	3	aegis/list.h
+X	source	modify	5	aegis/main.c
+X	source	modify	2	aegis/pager.c
+X	source	modify	4	aux/Howto.cook
+X	source	modify	3	common/option.c
+X	source	modify	3	common/option.h
+X	source	create	1	lib/aegis.icon
+X	source	create	1	lib/aegis.mask
+X	source	create	1	lib/aegis.pgm
+X	source	modify	4	man1/aegis.1
+X	source	modify	3	man1/ael.1
+X	source	create	1	man1/o_unforma.so
+X	source	create	1	script/aegis.synpic
+X	source	create	1	script/xaegis.tcl
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Sun Aug	 8	pmiller
+X			22:33:17 1993
+X	develop_begin	Sun Aug	 8	pmiller Elapsed time: 3.970
+X			22:33:21 1993		days.
+X	develop_end	Thu Aug 12	pmiller
+X			22:20:02 1993
+X	develop_end_	Thu Aug 12	pmiller Elapsed time: 0.086
+X	undo		22:21:06 1993		days.
+X	develop_end	Thu Aug 12	pmiller
+X
+X
+X
+XProject "aegis.2.0", Change 23					 Page 2
+XChange Details				       Tue Aug 17 23:24:38 1993
+X
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X			22:59:49 1993
+X	review_pass	Thu Aug 12	pmiller
+X			23:02:39 1993
+X	integrate_begin Thu Aug 12	pmiller Elapsed time: 0.843
+X			23:04:14 1993		days.
+X	integrate_pass	Fri Aug 13	pmiller
+X			21:53:28 1993
+X
+X
+X
+XProject "aegis.2.0", Change 24					 Page 1
+XChange Details				       Tue Aug 17 23:24:38 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 25, Change 24.
+X
+XSUMMARY
+X	fix bug in pattr_ed
+X
+XDESCRIPTION
+X	My thanks to Timothy Shimeall
+X	<shimeall@gravy3.cs.nps.navy.mil> for reporting this problem.
+X
+X	I found one true bug in your source code, located near line
+X	435 in the  file "aegis/pattr_ed.c".  Your distributed code
+X	calls "str_free", deallocating a structure called "pstate_
+X	data", then immediatelty references pstate_data, where it
+X	should be referencing pattr_data.
+X
+X	Other than using the System V config.h file, the porting
+X	changes were  restricted to "aegis/os.c" had to deal with two
+X	incompatabilities: a) the routine "readlink" returns ENXIO
+X	when called with a non-symbolic on the IRIS workstations
+X	(instead of EINVAL); b) the symbol TIOCGETPGRP is not defined
+X	on the IRIS, but TIOCGPGRP is, with equivalent functionality.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by internal_bug.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	4	aegis/os.c
+X	source	modify	5	aegis/pattr_ed.c
+X	source	modify	7	aux/BUILDING.man
+X	source	modify	3	aux/Makefile.sh
+X	source	create	1	conf/IRIX-4.0
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Sat Aug 14	pmiller
+X			21:52:40 1993
+X	develop_begin	Sat Aug 14	pmiller Elapsed time: 0.218
+X			21:52:58 1993		days.
+X	develop_end	Sat Aug 14	pmiller
+X			23:30:55 1993
+X	review_pass	Sat Aug 14	pmiller
+X			23:31:06 1993
+X	integrate_begin Sat Aug 14	pmiller Elapsed time: 0.104
+X			23:32:41 1993		days.
+X	integrate_pass	Sun Aug 15	pmiller
+X			00:19:26 1993
+X
+X
+X
+XProject "aegis.2.0", Change 25					 Page 1
+XChange Details				       Tue Aug 17 23:24:39 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 26, Change 25.
+X
+XSUMMARY
+X	add list outstanding changes
+X
+XDESCRIPTION
+X	 The list command did not provide a listing of all the
+X	outstanding changes.
+X
+X	My thanks to Gary Evesson <kcs@extro.ucc.su.OZ.AU> for this
+X	suggestion.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_enhancement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	8	aegis/list.c
+X	source	modify	4	aegis/list.h
+X	source	modify	6	aux/new.2.0.so
+X	source	modify	4	man1/ael.1
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Mon Aug 16	pmiller
+X			10:21:28 1993
+X	develop_begin	Mon Aug 16	pmiller Elapsed time: 0.212
+X			10:21:36 1993		days.
+X	develop_end	Mon Aug 16	pmiller
+X			11:56:52 1993
+X	review_pass	Mon Aug 16	pmiller
+X			11:57:04 1993
+X	integrate_begin Mon Aug 16	pmiller Elapsed time: 0.130
+X			11:58:33 1993		days.
+X	integrate_pass	Mon Aug 16	pmiller
+X			12:56:54 1993
+X
+X
+X
+XProject "aegis.2.0", Change 26					 Page 1
+XChange Details				       Tue Aug 17 23:24:40 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 27, Change 26.
+X
+XSUMMARY
+X	interface improvements
+X
+XDESCRIPTION
+X	1. The aeipass command should let you know all the problems in
+X	one go, not just one.  Also, the check for the current
+X	directory was much too early, and hid more useful errors.
+X	2. It is possible for the generic options to be given befor
+X	the function slector.
+X
+X	My thanks to Ian Darwin <ian@sq.com> for this suggestion.
+X
+X	This change is exempt from testing against the development
+X	directory.  This change is exempt from testing against the
+X	baseline.
+X
+XCAUSE
+X	This change was caused by external_improvement.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	6	aegis/integra2.c
+X	source	modify	6	aegis/main.c
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Mon Aug 16	pmiller
+X			12:58:35 1993
+X	develop_begin	Mon Aug 16	pmiller Elapsed time: 0.078
+X			12:58:42 1993		days.
+X	develop_end	Mon Aug 16	pmiller
+X			13:33:57 1993
+X	review_pass	Mon Aug 16	pmiller
+X			13:34:10 1993
+X	integrate_begin Mon Aug 16	pmiller Elapsed time: 0.123
+X			13:35:44 1993		days.
+X	integrate_pass	Mon Aug 16	pmiller
+X			14:31:11 1993
+X
+X
+X
+XProject "aegis.2.0", Change 27					 Page 1
+XChange Details				       Tue Aug 17 23:24:41 1993
+X
+XNAME
+X	Project "aegis.2.0", Delta 28, Change 27.
+X
+XSUMMARY
+X	documentation example fails on convex
+X
+XDESCRIPTION
+X	need to place yyerror function in main.c of documentation
+X	example, -ly not available on convex
+X
+X	This change is exempt from testing against the baseline.
+X
+XCAUSE
+X	This change was caused by internal_bug.
+X
+XSTATE
+X	This change is in 'being_integrated' state.
+X
+XFILES
+X	Type	Action	Edit	File Name
+X	------- ------- ------- -----------
+X	source	modify	4	aux/Howto.cook
+X	test	modify	3	test/00/t0011a.sh
+X
+XHISTORY
+X	What		When		Who	Comment
+X	------		------		-----	---------
+X	new_change	Tue Aug 17	pmiller
+X			23:01:36 1993
+X	develop_begin	Tue Aug 17	pmiller Elapsed time: 0.036
+X			23:01:42 1993		days.
+X	develop_end	Tue Aug 17	pmiller
+X			23:17:53 1993
+X	review_pass	Tue Aug 17	pmiller
+X			23:19:03 1993
+X	integrate_begin Tue Aug 17	pmiller
+X			23:20:44 1993
+END_OF_FILE
+if test 52993 -ne `wc -c <'aux/CHANGES.2.0'`; then
+    echo shar: \"'aux/CHANGES.2.0'\" unpacked with wrong size!
+fi
+# end of 'aux/CHANGES.2.0'
+fi
+echo shar: End of archive 16 \(of 19\).
+cp /dev/null ark16isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 19 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

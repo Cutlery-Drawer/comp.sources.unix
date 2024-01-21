@@ -1,0 +1,3338 @@
+Newsgroups: comp.sources.unix
+From: mlschroe@immd4.informatik.uni-erlangen.de (Michael Schroeder)
+Subject: v26i304: screen-3.5 - screen manager with VT100/ANSI terminal emulation, V3.5, Part05/10
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: mlschroe@immd4.informatik.uni-erlangen.de (Michael Schroeder)
+Posting-Number: Volume 26, Issue 304
+Archive-Name: screen-3.5/part05
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 5 (of 10)."
+# Contents:  display.c socket.c terminfo/test.txt
+# Wrapped by vixie@gw.home.vix.com on Sun Jul 25 12:57:19 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'display.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'display.c'\"
+else
+echo shar: Extracting \"'display.c'\" \(27002 characters\)
+sed "s/^X//" >'display.c' <<'END_OF_FILE'
+X/* Copyright (c) 1993
+X *      Juergen Weigert (jnweiger@immd4.informatik.uni-erlangen.de)
+X *      Michael Schroeder (mlschroe@immd4.informatik.uni-erlangen.de)
+X * Copyright (c) 1987 Oliver Laumann
+X *
+X * This program is free software; you can redistribute it and/or modify
+X * it under the terms of the GNU General Public License as published by
+X * the Free Software Foundation; either version 2, or (at your option)
+X * any later version.
+X *
+X * This program is distributed in the hope that it will be useful,
+X * but WITHOUT ANY WARRANTY; without even the implied warranty of
+X * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X * GNU General Public License for more details.
+X *
+X * You should have received a copy of the GNU General Public License
+X * along with this program (see the file COPYING); if not, write to the
+X * Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X ****************************************************************
+X */
+X
+X#include "rcs.h"
+XRCS_ID("$Id: display.c,v 1.8 1993/07/21 15:43:02 mlschroe Exp $ FAU")
+X
+X
+X#include <sys/types.h>
+X#include <fcntl.h>
+X
+X#include "config.h"
+X#include "screen.h"
+X#include "extern.h"
+X
+Xstatic void CountChars __P((int));
+Xstatic void PutChar __P((int));
+Xstatic int  BlankResize __P((int, int));
+X
+X
+Xextern char *tgoto __P((char *, int, int));
+X
+Xextern struct win *windows;
+X
+Xextern int  use_hardstatus;
+Xextern int  MsgMinWait;
+Xextern int  Z0width, Z1width;
+Xextern char *blank, *null;
+X
+X/*
+X * tputs needs this to calculate the padding
+X */
+X#ifndef NEED_OSPEED
+Xextern
+X#endif /* NEED_OSPEED */
+Xshort ospeed;
+X
+X
+Xstruct display *display, *displays;
+X
+X#ifndef MULTI
+Xstruct display TheDisplay;
+X#endif
+X
+X
+X/*
+X *  The default values
+X */
+Xint defobuflimit = OBUF_MAX;
+X#ifdef AUTO_NUKE
+Xint defautonuke = 0;
+X#endif
+X
+X/*
+X *  Default layer management
+X */
+X
+Xvoid
+XDefProcess(bufp, lenp)
+Xchar **bufp;
+Xint *lenp;
+X{
+X  *bufp += *lenp;
+X  *lenp = 0;
+X}
+X
+Xvoid
+XDefRedisplayLine(y, xs, xe, isblank)
+Xint y, xs, xe, isblank;
+X{
+X  if (isblank == 0 && y >= 0)
+X    DefClearLine(y, xs, xe);
+X}
+X
+Xvoid
+XDefClearLine(y, xs, xe)
+Xint y, xs, xe;
+X{
+X  DisplayLine(null, null, null, blank, null, null, y, xs, xe);
+X}
+X
+X/*ARGSUSED*/
+Xint
+XDefRewrite(y, xs, xe, doit)
+Xint y, xs, xe, doit;
+X{
+X  return EXPENSIVE;
+X}
+X
+Xvoid
+XDefSetCursor()
+X{
+X  GotoPos(0, 0);
+X}
+X
+X/*ARGSUSED*/
+Xint
+XDefResize(wi, he)
+Xint wi, he;
+X{
+X  return -1;
+X}
+X
+Xvoid
+XDefRestore()
+X{
+X  InsertMode(0);
+X  ChangeScrollRegion(0, d_height - 1);
+X  KeypadMode(0);
+X  CursorkeysMode(0);
+X  SetAttrFont(0, ASCII);
+X  SetFlow(FLOW_NOW);
+X}
+X
+X/*
+X *  Blank layer management
+X */
+X
+Xstruct LayFuncs BlankLf =
+X{
+X  DefProcess,
+X  0,
+X  DefRedisplayLine,
+X  DefClearLine,
+X  DefRewrite,
+X  DefSetCursor,
+X  BlankResize,
+X  DefRestore
+X};
+X
+Xstruct layer BlankLayer =
+X{
+X  0,
+X  0,
+X  &BlankLf,
+X  0
+X};
+X
+X/*ARGSUSED*/
+Xstatic int
+XBlankResize(wi, he)
+Xint wi, he;
+X{
+X  return 0;
+X}
+X
+X
+X/*
+X *  Generate new display
+X */
+X
+Xstruct display *
+XMakeDisplay(uname, utty, term, fd, pid, Mode)
+Xchar *uname, *utty, *term;
+Xint fd, pid;
+Xstruct mode *Mode;
+X{
+X  struct user **u;
+X
+X#ifdef MULTI
+X  if ((display = (struct display *)malloc(sizeof(*display))) == 0)
+X    return 0;
+X  bzero((char *) display, sizeof(*display));
+X#else
+X  if (displays)
+X    return 0;
+X  display = &TheDisplay;
+X#endif
+X  display->_d_next = displays;
+X  displays = display;
+X  d_flow = 1;
+X  d_userfd = fd;
+X  d_OldMode = *Mode;
+X  Resize_obuf();  /* Allocate memory for buffer */
+X  d_obufmax = defobuflimit;
+X#ifdef AUTO_NUKE
+X  d_auto_nuke = defautonuke;
+X#endif
+X  d_obufp = d_obuf;
+X  d_userpid = pid;
+X#ifdef POSIX
+X  d_dospeed = (short) cfgetospeed(&d_OldMode.tio);
+X#else
+X# ifndef TERMIO
+X  d_dospeed = (short) d_OldMode.m_ttyb.sg_ospeed;
+X# endif
+X#endif
+X  debug1("New displays ospeed = %d\n", d_dospeed);
+X  strcpy(d_usertty, utty);
+X  strcpy(d_termname, term);
+X
+X  if (!*(u = FindUserPtr(uname)) && UserAdd(uname, NULL, u))
+X    {
+X      FreeDisplay();
+X      return NULL;	/* could not find or add user */
+X    }
+X  d_user = *u;
+X  d_lay = &BlankLayer;
+X  d_layfn = BlankLayer.l_layfn;
+X  return display;
+X}
+X
+Xvoid
+XFreeDisplay()
+X{
+X#ifdef MULTI
+X  struct display *d, **dp;
+X
+X  for (dp = &displays; (d = *dp) ; dp = &d->_d_next)
+X    if (d == display)
+X      break;
+X  ASSERT(d);
+X  if (d_status_lastmsg)
+X    free(d_status_lastmsg);
+X# ifdef COPY_PASTE
+X  if (d_copybuffer)
+X    free(d_copybuffer);
+X# endif
+X  if (d_obuf)
+X    free(d_obuf);
+X  *dp = display->_d_next;
+X  free(display);
+X#else /* MULTI */
+X  ASSERT(display == displays);
+X  ASSERT(display == &TheDisplay);
+X  displays = 0;
+X#endif /* MULTI */
+X  display = 0;
+X}
+X
+X/*
+X * if the adaptflag is on, we keep the size of this display, else
+X * we may try to restore our old window sizes.
+X */
+Xvoid
+XInitTerm(adapt)
+Xint adapt;
+X{
+X  ASSERT(display);
+X  d_top = d_bot = -1;
+X  PutStr(TI);
+X  PutStr(IS);
+X  /* Check for toggle */
+X  if (IM && strcmp(IM, EI))
+X    PutStr(EI);
+X  d_insert = 0;
+X  /* Check for toggle */
+X  if (KS && strcmp(KS, KE))
+X    PutStr(KE);
+X  d_keypad = 0;
+X  if (CCS && strcmp(CCS, CCE))
+X    PutStr(CCE);
+X  d_cursorkeys = 0;
+X  PutStr(CE0);
+X  d_font = ASCII;
+X  if (adapt == 0)
+X    ResizeDisplay(d_defwidth, d_defheight);
+X  ChangeScrollRegion(0, d_height - 1);
+X  d_x = d_y = 0;
+X  Flush();
+X  ClearDisplay();
+X  debug1("we %swant to adapt all our windows to the display\n", 
+X	 (adapt) ? "" : "don't ");
+X  /* In case the size was changed by a init sequence */
+X  CheckScreenSize((adapt) ? 2 : 0);
+X}
+X
+Xvoid
+XFinitTerm()
+X{
+X  ASSERT(display);
+X  ResizeDisplay(d_defwidth, d_defheight);
+X  DefRestore();
+X  SetAttrFont(0, ASCII);
+X  d_x = d_y = -1;
+X  GotoPos(0, d_height - 1);
+X  AddChar('\n');
+X  PutStr(TE);
+X  Flush();
+X}
+X
+X
+Xvoid
+XINSERTCHAR(c)
+Xint c;
+X{
+X  ASSERT(display);
+X  if (!d_insert && d_x < d_width - 1)
+X    {
+X      if (IC || CIC)
+X	{
+X	  if (IC)
+X	    PutStr(IC);
+X	  else
+X	    CPutStr(CIC, 1);
+X	  RAW_PUTCHAR(c);
+X	  return;
+X	}
+X      InsertMode(1);
+X      if (!d_insert)
+X	{
+X          RefreshLine(d_y, d_x, d_width-1, 0);
+X	  return;
+X	}
+X    }
+X  RAW_PUTCHAR(c);
+X}
+X
+Xvoid
+XPUTCHAR(c)
+Xint c;
+X{
+X  ASSERT(display);
+X  if (d_insert && d_x < d_width - 1)
+X    InsertMode(0);
+X  RAW_PUTCHAR(c);
+X}
+X
+Xvoid
+XPUTCHARLP(c)
+Xint c;
+X{
+X  if (d_x < d_width - 1)
+X    {
+X      if (d_insert)
+X	InsertMode(0);
+X      RAW_PUTCHAR(c);
+X      return;
+X    }
+X  if (CLP || d_y != d_bot)
+X    {
+X      RAW_PUTCHAR(c);
+X      return;
+X    }
+X  d_lp_missing = 1;
+X  d_lp_image = c;
+X  d_lp_attr = d_attr;
+X  d_lp_font = d_font;
+X}
+X
+X/*
+X * RAW_PUTCHAR() is for all text that will be displayed.
+X * NOTE: charset Nr. 0 has a conversion table, but c1, c2, ... don't.
+X */
+X
+Xvoid
+XRAW_PUTCHAR(c)
+Xint c;
+X{
+X  ASSERT(display);
+X  if (d_font == '0')
+X    {
+X      AddChar(d_c0_tab[c]);
+X    }
+X  else
+X    AddChar(c);
+X  if (++d_x >= d_width)
+X    {
+X      if ((AM && !CLP) || d_x > d_width)
+X	{
+X	  d_x -= d_width;
+X	  if (d_y < d_height-1 && d_y != d_bot)
+X	    d_y++;
+X	}
+X    }
+X}
+X
+Xstatic void
+XPutChar(c)
+Xint c;
+X{
+X  /* this PutChar for ESC-sequences only (AddChar is a macro) */
+X  AddChar(c);
+X}
+X
+Xvoid
+XPutStr(s)
+Xchar *s;
+X{
+X  if (display && s)
+X    {
+X      ospeed = d_dospeed;
+X      tputs(s, 1, PutChar);
+X    }
+X}
+X
+Xvoid
+XCPutStr(s, c)
+Xchar *s;
+Xint c;
+X{
+X  if (display && s)
+X    {
+X      ospeed = d_dospeed;
+X      tputs(tgoto(s, 0, c), 1, PutChar);
+X    }
+X}
+X
+X
+X/* Insert mode is a toggle on some terminals, so we need this hack:
+X */
+Xvoid
+XInsertMode(on)
+Xint on;
+X{
+X  if (display && on != d_insert && IM)
+X    {
+X      d_insert = on;
+X      if (d_insert)
+X	PutStr(IM);
+X      else
+X	PutStr(EI);
+X    }
+X}
+X
+X/* ...and maybe d_keypad application mode is a toggle, too:
+X */
+Xvoid
+XKeypadMode(on)
+Xint on;
+X{
+X  if (display && d_keypad != on && KS)
+X    {
+X      d_keypad = on;
+X      if (d_keypad)
+X	PutStr(KS);
+X      else
+X	PutStr(KE);
+X    }
+X}
+X
+Xvoid
+XCursorkeysMode(on)
+Xint on;
+X{
+X  if (display && d_cursorkeys != on && CCS)
+X    {
+X      d_cursorkeys = on;
+X      if (d_cursorkeys)
+X	PutStr(CCS);
+X      else
+X	PutStr(CCE);
+X    }
+X}
+X
+Xstatic int StrCost;
+X
+X/* ARGSUSED */
+Xstatic void
+XCountChars(c)
+Xint c;
+X{
+X  StrCost++;
+X}
+X
+Xint
+XCalcCost(s)
+Xregister char *s;
+X{
+X  ASSERT(display);
+X  if (s)
+X    {
+X      StrCost = 0;
+X      ospeed = d_dospeed;
+X      tputs(s, 1, CountChars);
+X      return StrCost;
+X    }
+X  else
+X    return EXPENSIVE;
+X}
+X
+Xvoid
+XGotoPos(x2, y2)
+Xint x2, y2;
+X{
+X  register int dy, dx, x1, y1;
+X  register int costx, costy;
+X  register int m;
+X  register char *s;
+X  int CMcost;
+X  enum move_t xm = M_NONE, ym = M_NONE;
+X
+X  if (!display)
+X    return;
+X
+X  x1 = d_x;
+X  y1 = d_y;
+X
+X  if (x1 == d_width)
+X    if (CLP && AM)
+X      x1 = -1;		/* don't know how the terminal treats this */
+X    else
+X      x1--;
+X  if (x2 == d_width)
+X    x2--;
+X  dx = x2 - x1;
+X  dy = y2 - y1;
+X  if (dy == 0 && dx == 0)
+X    {
+X      return;
+X    }
+X  if (!MS && d_attr)	/* Safe to move in SO mode ? */
+X    SetAttr(0);
+X  if (y1 < 0			/* don't know the y position */
+X      || (y2 > d_bot && y1 <= d_bot)	/* have to cross border */
+X      || (y2 < d_top && y1 >= d_top))	/* of scrollregion ?    */
+X    {
+X    DoCM:
+X      if (HO && !x2 && !y2)
+X        PutStr(HO);
+X      else
+X        PutStr(tgoto(CM, x2, y2));
+X      d_x = x2;
+X      d_y = y2;
+X      return;
+X    }
+X  /* Calculate CMcost */
+X  if (HO && !x2 && !y2)
+X    s = HO;
+X  else
+X    s = tgoto(CM, x2, y2);
+X  CMcost = CalcCost(s);
+X
+X  /* Calculate the cost to move the cursor to the right x position */
+X  costx = EXPENSIVE;
+X  if (x1 >= 0)	/* relativ x positioning only if we know where we are */
+X    {
+X      if (dx > 0)
+X	{
+X	  if (CRI && (dx > 1 || !ND))
+X	    {
+X	      costx = CalcCost(tgoto(CRI, 0, dx));
+X	      xm = M_CRI;
+X	    }
+X	  if ((m = d_NDcost * dx) < costx)
+X	    {
+X	      costx = m;
+X	      xm = M_RI;
+X	    }
+X	  /* Speedup: dx <= Rewrite() */
+X	  if (dx < costx && (m = Rewrite(y1, x1, x2, 0)) < costx)
+X	    {
+X	      costx = m;
+X	      xm = M_RW;
+X	    }
+X	}
+X      else if (dx < 0)
+X	{
+X	  if (CLE && (dx < -1 || !BC))
+X	    {
+X	      costx = CalcCost(tgoto(CLE, 0, -dx));
+X	      xm = M_CLE;
+X	    }
+X	  if ((m = -dx * d_LEcost) < costx)
+X	    {
+X	      costx = m;
+X	      xm = M_LE;
+X	    }
+X	}
+X      else
+X	costx = 0;
+X    }
+X  /* Speedup: Rewrite() >= x2 */
+X  if (x2 + d_CRcost < costx && (m = (x2 ? Rewrite(y1, 0, x2, 0) : 0) + d_CRcost) < costx)
+X    {
+X      costx = m;
+X      xm = M_CR;
+X    }
+X
+X  /* Check if it is already cheaper to do CM */
+X  if (costx >= CMcost)
+X    goto DoCM;
+X
+X  /* Calculate the cost to move the cursor to the right y position */
+X  costy = EXPENSIVE;
+X  if (dy > 0)
+X    {
+X      if (CDO && dy > 1)	/* DO & NL are always != 0 */
+X	{
+X	  costy = CalcCost(tgoto(CDO, 0, dy));
+X	  ym = M_CDO;
+X	}
+X      if ((m = dy * ((x2 == 0) ? d_NLcost : d_DOcost)) < costy)
+X	{
+X	  costy = m;
+X	  ym = M_DO;
+X	}
+X    }
+X  else if (dy < 0)
+X    {
+X      if (CUP && (dy < -1 || !UP))
+X	{
+X	  costy = CalcCost(tgoto(CUP, 0, -dy));
+X	  ym = M_CUP;
+X	}
+X      if ((m = -dy * d_UPcost) < costy)
+X	{
+X	  costy = m;
+X	  ym = M_UP;
+X	}
+X    }
+X  else
+X    costy = 0;
+X
+X  /* Finally check if it is cheaper to do CM */
+X  if (costx + costy >= CMcost)
+X    goto DoCM;
+X
+X  switch (xm)
+X    {
+X    case M_LE:
+X      while (dx++ < 0)
+X	PutStr(BC);
+X      break;
+X    case M_CLE:
+X      CPutStr(CLE, -dx);
+X      break;
+X    case M_RI:
+X      while (dx-- > 0)
+X	PutStr(ND);
+X      break;
+X    case M_CRI:
+X      CPutStr(CRI, dx);
+X      break;
+X    case M_CR:
+X      PutStr(CR);
+X      d_x = 0;
+X      x1 = 0;
+X      /* FALLTHROUGH */
+X    case M_RW:
+X      if (x1 < x2)
+X	(void) Rewrite(y1, x1, x2, 1);
+X      break;
+X    default:
+X      break;
+X    }
+X
+X  switch (ym)
+X    {
+X    case M_UP:
+X      while (dy++ < 0)
+X	PutStr(UP);
+X      break;
+X    case M_CUP:
+X      CPutStr(CUP, -dy);
+X      break;
+X    case M_DO:
+X      s =  (x2 == 0) ? NL : DO;
+X      while (dy-- > 0)
+X	PutStr(s);
+X      break;
+X    case M_CDO:
+X      CPutStr(CDO, dy);
+X      break;
+X    default:
+X      break;
+X    }
+X  d_x = x2;
+X  d_y = y2;
+X}
+X
+Xvoid
+XClearDisplay()
+X{
+X  ASSERT(display);
+X  Clear(0, 0, d_width - 1, d_height - 1);
+X}
+X
+Xvoid
+XClear(xs, ys, xe, ye)
+Xint xs, ys, xe, ye;
+X{
+X  int y, xxe;
+X
+X  ASSERT(display);
+X  if (xs == d_width)
+X    xs--;
+X  if (xe == d_width)
+X    xe--;
+X  if (d_lp_missing && ys <= d_bot)
+X    {
+X      if (ye > d_bot || (ye == d_bot && xe == d_width - 1))
+X	d_lp_missing = 0;
+X    }
+X  if (xe == d_width - 1 && ye == d_height - 1)
+X    {
+X#ifdef AUTO_NUKE
+X      if (xs == 0 && ys == 0 && d_auto_nuke)
+X	NukePending();
+X#endif
+X      if (xs == 0 && ys == 0 && CL)
+X	{
+X	  PutStr(CL);
+X	  d_y = d_x = 0;
+X	  return;
+X	}
+X      /* 
+X       * Workaround a hp700/22 terminal bug. Do not use CD where CE
+X       * is also appropriate.
+X       */
+X      if (CD && (ys < ye || !CE))
+X	{
+X	  GotoPos(xs, ys);
+X	  PutStr(CD);
+X	  return;
+X	}
+X    }
+X  xxe = d_width - 1;
+X  for (y = ys; y <= ye; y++, xs = 0)
+X    {
+X      if (y == ye)
+X	xxe = xe;
+X      if (xs == 0 && CB && (xxe != d_width - 1 || (d_x == xxe && d_y == y)))
+X	{
+X	  GotoPos(xxe, y);
+X	  PutStr(CB);
+X	  continue;
+X	}
+X      if (xxe == d_width - 1 && CE)
+X	{
+X	  GotoPos(xs, y);
+X	  PutStr(CE);
+X	  continue;
+X	}
+X      ClearLine(y, xs, xxe);
+X    }
+X}
+X
+X
+X/*
+X * if cur_only > 0, we only redisplay current line, as a full refresh is
+X * too expensive over a low baud line.
+X */
+Xvoid
+XRedisplay(cur_only)
+Xint cur_only;
+X{
+X  register int i, stop;
+X
+X  ASSERT(display);
+X  DefRestore();
+X  ClearDisplay();
+X  stop = d_height;
+X  i = 0;
+X  if (cur_only > 0 && d_fore)
+X    {
+X      i = stop = d_fore->w_y;
+X      stop++;
+X    }
+X  else RedisplayLine(-1, 0, d_width - 1, 1);
+X  for (; i < stop; i++)
+X    RedisplayLine(i, 0, d_width - 1, 1);
+X  Restore();
+X  SetCursor();
+X}
+X
+X
+Xvoid
+XScrollRegion(ys, ye, n)
+Xint ys, ye, n;
+X{
+X  int i;
+X  int up;
+X  int oldtop, oldbot;
+X  int alok, dlok, aldlfaster;
+X  int missy = 0;
+X
+X  ASSERT(display);
+X  if (n == 0)
+X    return;
+X  if (ys == 0 && ye == d_height - 1 && 
+X      (n >= d_height || -n >= d_height))
+X    {
+X      ClearDisplay();
+X      return;
+X    }
+X
+X  if (d_lp_missing)
+X    {
+X      if (d_bot > ye || d_bot < ys)
+X	missy = d_bot;
+X      else
+X	{
+X	  missy = d_bot - n;
+X          if (missy>ye || missy<ys)
+X	    d_lp_missing = 0;
+X	}
+X    }
+X
+X  up = 1;
+X  if (n < 0)
+X    {
+X      up = 0;
+X      n = -n;
+X    }
+X  if (n >= ye-ys+1)
+X    n = ye-ys+1;
+X
+X  oldtop = d_top;
+X  oldbot = d_bot;
+X  if (d_bot != ye)
+X    ChangeScrollRegion(ys, ye);
+X  alok = (AL || CAL || (ye == d_bot &&  up));
+X  dlok = (DL || CDL || (ye == d_bot && !up));
+X  if (d_top != ys && !(alok && dlok))
+X    ChangeScrollRegion(ys, ye);
+X
+X  if (d_lp_missing && 
+X      (oldbot != d_bot ||
+X       (oldbot == d_bot && up && d_top == ys && d_bot == ye)))
+X    {
+X      FixLP(d_width - 1, oldbot);
+X      if (oldbot == d_bot)		/* have scrolled */
+X	{
+X	  if (--n == 0)
+X	    {
+X	      ChangeScrollRegion(oldtop, oldbot);
+X	      return;
+X	    }
+X	}
+X    }
+X
+X  aldlfaster = (n > 1 && ye == d_bot && ((up && CDL) || (!up && CAL)));
+X
+X  if ((up || SR) && d_top == ys && d_bot == ye && !aldlfaster)
+X    {
+X      if (up)
+X	{
+X	  GotoPos(0, ye);
+X	  while (n-- > 0)
+X	    PutStr(NL);		/* was SF, I think NL is faster */
+X	}
+X      else
+X	{
+X	  GotoPos(0, ys);
+X	  while (n-- > 0)
+X	    PutStr(SR);
+X	}
+X    }
+X  else if (alok && dlok)
+X    {
+X      if (up || ye != d_bot)
+X	{
+X          GotoPos(0, up ? ys : ye+1-n);
+X          if (CDL && !(n == 1 && DL))
+X	    CPutStr(CDL, n);
+X	  else
+X	    for(i = n; i--; )
+X	      PutStr(DL);
+X	}
+X      if (!up || ye != d_bot)
+X	{
+X          GotoPos(0, up ? ye+1-n : ys);
+X          if (CAL && !(n == 1 && AL))
+X	    CPutStr(CAL, n);
+X	  else
+X	    for(i = n; i--; )
+X	      PutStr(AL);
+X	}
+X    }
+X  else
+X    {
+X      Redisplay(0);
+X      return;
+X    }
+X  if (d_lp_missing && missy != d_bot)
+X    FixLP(d_width - 1, missy);
+X  ChangeScrollRegion(oldtop, oldbot);
+X  if (d_lp_missing && missy != d_bot)
+X    FixLP(d_width - 1, missy);
+X}
+X
+Xvoid
+XSetAttr(new)
+Xregister int new;
+X{
+X  register int i, old;
+X
+X  if (!display || (old = d_attr) == new)
+X    return;
+X  d_attr = new;
+X  for (i = 1; i <= A_MAX; i <<= 1)
+X    {
+X      if ((old & i) && !(new & i))
+X	{
+X	  PutStr(UE);
+X	  PutStr(SE);
+X	  PutStr(ME);
+X	  if (new & A_DI)
+X	    PutStr(d_attrtab[ATTR_DI]);
+X	  if (new & A_US)
+X	    PutStr(d_attrtab[ATTR_US]);
+X	  if (new & A_BD)
+X	    PutStr(d_attrtab[ATTR_BD]);
+X	  if (new & A_RV)
+X	    PutStr(d_attrtab[ATTR_RV]);
+X	  if (new & A_SO)
+X	    PutStr(d_attrtab[ATTR_SO]);
+X	  if (new & A_BL)
+X	    PutStr(d_attrtab[ATTR_BL]);
+X	  return;
+X	}
+X    }
+X  if ((new & A_DI) && !(old & A_DI))
+X    PutStr(d_attrtab[ATTR_DI]);
+X  if ((new & A_US) && !(old & A_US))
+X    PutStr(d_attrtab[ATTR_US]);
+X  if ((new & A_BD) && !(old & A_BD))
+X    PutStr(d_attrtab[ATTR_BD]);
+X  if ((new & A_RV) && !(old & A_RV))
+X    PutStr(d_attrtab[ATTR_RV]);
+X  if ((new & A_SO) && !(old & A_SO))
+X    PutStr(d_attrtab[ATTR_SO]);
+X  if ((new & A_BL) && !(old & A_BL))
+X    PutStr(d_attrtab[ATTR_BL]);
+X}
+X
+Xvoid
+XSetFont(new)
+Xint new;
+X{
+X  if (!display || d_font == new)
+X    return;
+X  d_font = new;
+X  if (new == ASCII)
+X    PutStr(CE0);
+X  else
+X    CPutStr(CS0, new);
+X}
+X
+Xvoid
+XSetAttrFont(newattr, newcharset)
+Xint newattr, newcharset;
+X{
+X  SetAttr(newattr);
+X  SetFont(newcharset);
+X}
+X
+Xvoid
+XMakeStatus(msg)
+Xchar *msg;
+X{
+X  register char *s, *t;
+X  register int max, ti;
+X
+X  if (!display)
+X    return;
+X  
+X  if (!d_tcinited)
+X    {
+X      debug("tc not inited, just writing msg\n");
+X      AddStr(msg);
+X      AddStr("\r\n");
+X      Flush();
+X      return;
+X    }
+X  if (!use_hardstatus || !HS)
+X    {
+X      max = d_width;
+X      if (CLP == 0)
+X	max--;
+X    }
+X  else
+X    max = WS;
+X  if (d_status)
+X    {
+X      if (!d_status_bell)
+X	{
+X	  ti = time((time_t *) 0) - d_status_time;
+X	  if (ti < MsgMinWait)
+X	    sleep(MsgMinWait - ti);
+X	}
+X      RemoveStatus();
+X    }
+X  for (s = t = msg; *s && t - msg < max; ++s)
+X    if (*s == BELL)
+X      PutStr(BL);
+X    else if ((unsigned char)*s >= ' ' && *s != 0177)
+X      *t++ = *s;
+X  *t = '\0';
+X  if (t > msg)
+X    {
+X      if (t - msg >= d_status_buflen)
+X        {
+X          char *buf;
+X          if (d_status_lastmsg)
+X	    buf = realloc(d_status_lastmsg, t - msg + 1);
+X	  else
+X	    buf = malloc(t - msg + 1);
+X	  if (buf)
+X	    {
+X              d_status_lastmsg = buf;
+X              d_status_buflen = t - msg + 1;
+X            }
+X        }
+X      if (t - msg < d_status_buflen)
+X        strcpy(d_status_lastmsg, msg);
+X      d_status = 1;
+X      d_status_len = t - msg;
+X      d_status_lastx = d_x;
+X      d_status_lasty = d_y;
+X      if (!use_hardstatus || !HS)
+X	{
+X	  debug1("using STATLINE %d\n", STATLINE);
+X	  GotoPos(0, STATLINE);
+X          SetAttrFont(A_SO, ASCII);
+X	  InsertMode(0);
+X	  AddStr(msg);
+X          d_x = -1;
+X	}
+X      else
+X	{
+X	  debug("using HS\n");
+X          SetAttrFont(0, ASCII);
+X	  InsertMode(0);
+X	  CPutStr(TS, 0);
+X	  AddStr(msg);
+X	  PutStr(FS);
+X	}
+X      Flush();
+X      (void) time(&d_status_time);
+X    }
+X}
+X
+Xvoid
+XRemoveStatus()
+X{
+X  struct win *p;
+X
+X  if (!display)
+X    return;
+X  if (!d_status)
+X    return;
+X  
+X  /*
+X   * UGLY HACK ALERT - this should NOT be in display.c
+X   * We need to find the window that caused an activity or bell
+X   * message, to reenable this function there.
+X   */
+X  for (p = windows; p; p = p->w_next)
+X    { 
+X      if (p->w_display != display)
+X	continue;
+X      if (p->w_monitor == MON_MSG)
+X	{
+X	  debug1("RemoveStatus clearing monitor win %d\n", p->w_number);
+X	  p->w_monitor = MON_DONE;
+X	}
+X      if (p->w_bell == BELL_MSG)
+X	{
+X	  debug1("RemoveStatus clearing bell win %d\n", p->w_number);
+X	  p->w_bell = BELL_DONE;
+X	}
+X    }
+X  d_status = 0;
+X  d_status_bell = 0;
+X  if (!use_hardstatus || !HS)
+X    {
+X      GotoPos(0, STATLINE);
+X      RefreshLine(STATLINE, 0, d_status_len - 1, 0);
+X      GotoPos(d_status_lastx, d_status_lasty);
+X    }
+X  else
+X    {
+X      SetAttrFont(0, ASCII);
+X      PutStr(DS);
+X    }
+X  SetCursor();
+X}
+X
+Xvoid
+XRefreshLine(y, from, to, isblank)
+Xint y, from, to, isblank;
+X{
+X  ASSERT(display);
+X  debug2("RefreshLine %d %d", y, from);
+X  debug2(" %d %d\n", to, isblank);
+X  if (isblank == 0 && CE && to == d_width - 1)
+X    {
+X      GotoPos(from, y);
+X      PutStr(CE);
+X      isblank = 1;
+X    }
+X  RedisplayLine(y, from, to, isblank);
+X}
+X
+Xvoid
+XFixLP(x2, y2)
+Xregister int x2, y2;
+X{
+X  int oldattr = d_attr, oldfont = d_font;
+X
+X  ASSERT(display);
+X  GotoPos(x2, y2);
+X  SetAttrFont(d_lp_attr, d_lp_font);
+X  PUTCHAR(d_lp_image);
+X  d_lp_missing = 0;
+X  SetAttrFont(oldattr, oldfont);
+X}
+X
+Xvoid
+XDisplayLine(os, oa, of, s, as, fs, y, from, to)
+Xint from, to, y;
+Xregister char *os, *oa, *of, *s, *as, *fs;
+X{
+X  register int x;
+X  int last2flag = 0, delete_lp = 0;
+X
+X  ASSERT(display);
+X  ASSERT(y >= 0 && y < d_height);
+X  ASSERT(from >= 0 && from < d_width);
+X  ASSERT(to >= 0 && to < d_width);
+X  if (!CLP && y == d_bot && to == d_width - 1)
+X    if (d_lp_missing
+X	|| s[to] != os[to] || as[to] != oa[to] || of[to] != fs[to])
+X      {
+X	if ((IC || IM) && from < to)
+X	  {
+X	    to -= 2;
+X	    last2flag = 1;
+X	    d_lp_missing = 0;
+X	  }
+X	else
+X	  {
+X	    to--;
+X	    delete_lp = (CE || DC || CDC);
+X	    d_lp_missing = (s[to] != ' ' || as[to] || fs[to]);
+X	    d_lp_image = s[to];
+X	    d_lp_attr = as[to];
+X	    d_lp_font = fs[to];
+X	  }
+X      }
+X    else
+X      to--;
+X  for (x = from; x <= to; ++x)
+X    {
+X      if (x || d_x != d_width || d_y != y - 1)
+X        {
+X	  if (x < to || x != d_width - 1 || s[x + 1] == ' ')
+X	    if (s[x] == os[x] && as[x] == oa[x] && of[x] == fs[x])
+X	      continue;
+X	  GotoPos(x, y);
+X        }
+X      SetAttr(as[x]);
+X      SetFont(fs[x]);
+X      PUTCHAR(s[x]);
+X    }
+X  if (to == d_width - 1 && y < d_height - 1 && s[to + 1] == ' ')
+X    GotoPos(0, y + 1);
+X  if (last2flag)
+X    {
+X      GotoPos(x, y);
+X      SetAttr(as[x + 1]);
+X      SetFont(fs[x + 1]);
+X      PUTCHAR(s[x + 1]);
+X      GotoPos(x, y);
+X      SetAttr(as[x]);
+X      SetFont(fs[x]);
+X      INSERTCHAR(s[x]);
+X    }
+X  else if (delete_lp)
+X    {
+X      if (DC)
+X	PutStr(DC);
+X      else if (CDC)
+X	CPutStr(CDC, 1);
+X      else if (CE)
+X	PutStr(CE);
+X    }
+X}
+X
+Xvoid
+XSetLastPos(x,y)
+Xint x,y;
+X{
+X  ASSERT(display);
+X  d_x = x;
+X  d_y = y;
+X}
+X
+Xint
+XResizeDisplay(wi, he)
+Xint wi, he;
+X{
+X  ASSERT(display);
+X  debug2("ResizeDisplay: to (%d,%d).\n", wi, he);
+X  if (d_width == wi && d_height == he)
+X    {
+X      debug("ResizeDisplay: No change\n");
+X      return 0;
+X    }
+X  if (CWS)
+X    {
+X      debug("ResizeDisplay: using WS\n");
+X      PutStr(tgoto(CWS, wi, he));
+X      ChangeScreenSize(wi, he, 0);
+X      return 0;
+X    }
+X  else if (CZ0 && (wi == Z0width || wi == Z1width))
+X    {
+X      debug("ResizeDisplay: using Z0/Z1\n");
+X      PutStr(wi == Z0width ? CZ0 : CZ1);
+X      ChangeScreenSize(wi, d_height, 0);
+X      return (he == d_height) ? 0 : -1;
+X    }
+X  return -1;
+X}
+X
+Xvoid
+XChangeScrollRegion(newtop, newbot)
+Xint newtop, newbot;
+X{
+X  if (display == 0)
+X    return;
+X  if (CS == 0)
+X    {
+X      d_top = 0;
+X      d_bot = d_height - 1;
+X      return;
+X    }
+X  if (d_top == newtop && d_bot == newbot)
+X    return;
+X  debug2("ChangeScrollRegion: (%d - %d)\n", newtop, newbot);
+X  PutStr(tgoto(CS, newbot, newtop));
+X  d_top = newtop;
+X  d_bot = newbot;
+X  d_y = d_x = -1;		/* Just in case... */
+X}
+X
+X
+X/*
+X *  Layer creation / removal
+X */
+X
+Xint
+XInitOverlayPage(datasize, lf, block)
+Xint datasize;
+Xstruct LayFuncs *lf;
+Xint block;
+X{
+X  char *data;
+X  struct layer *newlay;
+X
+X  RemoveStatus();
+X  debug3("Entering new layer  display %#x  d_fore %#x  oldlay %#x\n", 
+X  	 (unsigned int)display, (unsigned int)d_fore, (unsigned int)d_lay);
+X  if ((newlay = (struct layer *)malloc(sizeof(struct layer))) == 0)
+X    {
+X      Msg(0, "No memory for layer struct");
+X      return(-1);
+X    }
+X  data = 0;
+X  if (datasize)
+X    {
+X      if ((data = malloc(datasize)) == 0)
+X	{
+X	  free(newlay);
+X	  Msg(0, "No memory for layer data");
+X	  return(-1);
+X	}
+X      bzero(data, datasize);
+X    }
+X  newlay->l_layfn = lf;
+X  newlay->l_block = block | d_lay->l_block;
+X  newlay->l_data = data;
+X  newlay->l_next = d_lay;
+X  if (d_fore)
+X    {
+X      d_fore->w_lay = newlay;	/* XXX: CHECK */
+X      d_fore->w_active = 0;	/* XXX: CHECK */
+X    }
+X  d_lay = newlay;
+X  d_layfn = newlay->l_layfn;
+X  Restore();
+X  return(0);
+X}
+X
+Xvoid
+XExitOverlayPage()
+X{
+X  struct layer *oldlay;
+X
+X  debug3("Exiting layer  display %#x  fore %#x  d_lay %#x\n", 
+X         (unsigned int)display, (unsigned int)d_fore, (unsigned int)d_lay);
+X  oldlay = d_lay;
+X  if (oldlay->l_data)
+X    free(oldlay->l_data);
+X  d_lay = oldlay->l_next;
+X  d_layfn = d_lay->l_layfn;
+X  free(oldlay);
+X  if (d_fore)
+X    d_fore->w_lay = d_lay;	/* XXX: Is this necessary ? */
+X  Restore();
+X  SetCursor();
+X}
+X
+X
+X/*
+X *  Output buffering routines
+X */
+X
+Xvoid
+XAddStr(str)
+Xchar *str;
+X{
+X  register char c;
+X
+X  ASSERT(display);
+X  while ((c = *str++))
+X    AddChar(c);
+X}
+X
+Xvoid
+XAddStrn(str, n)
+Xchar *str;
+Xint n;
+X{
+X  register char c;
+X
+X  ASSERT(display);
+X  while ((c = *str++) && n-- > 0)
+X    AddChar(c);
+X  while (n-- > 0)
+X    AddChar(' ');
+X}
+X
+Xvoid
+XFlush()
+X{
+X  register int l;
+X  register char *p;
+X
+X  ASSERT(display);
+X  l = d_obufp - d_obuf;
+X  debug1("Flush(): %d\n", l);
+X  ASSERT(l + d_obuffree == d_obuflen);
+X  if (l == 0)
+X    return;
+X  if (d_userfd < 0)
+X    {
+X      d_obuffree += l;
+X      d_obufp = d_obuf;
+X      return;
+X    }
+X  p = d_obuf;
+X  if (fcntl(d_userfd, F_SETFL, 0))
+X    debug1("Warning: DELAY fcntl failed: %d\n", errno);
+X  while (l)
+X    {
+X      register int wr;
+X      wr = write(d_userfd, p, l);
+X      if (wr <= 0) 
+X	{
+X	  if (errno == EINTR) 
+X	    continue;
+X	  debug1("Writing to display: %d\n", errno);
+X	  wr = l;
+X	}
+X      d_obuffree += wr;
+X      p += wr;
+X      l -= wr;
+X    }
+X  d_obuffree += l;
+X  d_obufp = d_obuf;
+X  if (fcntl(d_userfd, F_SETFL, FNDELAY))
+X    debug1("Warning: NDELAY fcntl failed: %d\n", errno);
+X}
+X
+Xvoid
+Xfreetty()
+X{
+X  if (d_userfd >= 0)
+X    close(d_userfd);
+X  debug1("did freetty %d\n", d_userfd);
+X  d_userfd = -1;
+X  d_obufp = 0;
+X  d_obuffree = 0;
+X  if (d_obuf)
+X    free(d_obuf);
+X  d_obuf = 0;
+X  d_obuflen = 0;
+X}
+X
+X/*
+X *  Asynchronous output routines by
+X *  Tim MacKenzie (tym@dibbler.cs.monash.edu.au)
+X */
+X
+Xvoid
+XResize_obuf()
+X{
+X  register int ind;
+X
+X  ASSERT(display);
+X  if (d_obuflen && d_obuf)
+X    {
+X      ind  = d_obufp - d_obuf;
+X      d_obuflen += GRAIN;
+X      d_obuffree += GRAIN;
+X      d_obuf = realloc(d_obuf, d_obuflen);
+X    }
+X  else
+X    {
+X      ind  = 0;
+X      d_obuflen = GRAIN;
+X      d_obuffree = GRAIN;
+X      d_obuf = malloc(d_obuflen);
+X    }
+X  if (!d_obuf)
+X    Panic(0, "Out of memory");
+X  d_obufp = d_obuf + ind;
+X  debug1("ResizeObuf: resized to %d\n", d_obuflen);
+X}
+X
+X#ifdef AUTO_NUKE
+Xvoid
+XNukePending()
+X{/* Nuke pending output in current display, clear screen */
+X  register int len;
+X  int oldfont = d_font, oldattr = d_attr, oldtop = d_top, oldbot = d_bot;
+X  int oldkeypad = d_keypad, oldcursorkeys = d_cursorkeys;
+X
+X  len = d_obufp - d_obuf;
+X  debug1("NukePending: nuking %d chars\n", len);
+X  
+X  /* Throw away any output that we can... */
+X# ifdef POSIX
+X  tcflush(d_userfd, TCOFLUSH);
+X# else
+X#  ifdef TCFLSH
+X  (void) ioctl(d_userfd, TCFLSH, (char *) 1);
+X#  endif
+X# endif
+X
+X  d_obufp = d_obuf;
+X  d_obuffree += len;
+X  d_top = d_bot = -1;
+X  PutStr(TI);
+X  PutStr(IS);
+X  /* Turn off all attributes. (Tim MacKenzie) */
+X  if (ME)
+X    PutStr(ME);
+X  else
+X    {
+X      PutStr(SE);
+X      PutStr(UE);
+X    }
+X  /* Check for toggle */
+X  if (IM && strcmp(IM, EI))
+X    PutStr(EI);
+X  d_insert = 0;
+X  /* Check for toggle */
+X  if (KS && strcmp(KS, KE))
+X    PutStr(KE);
+X  d_keypad = 0;
+X  if (CCS && strcmp(CCS, CCE))
+X    PutStr(CCE);
+X  d_cursorkeys = 0;
+X  PutStr(CE0);
+X  d_font = ASCII;
+X  d_attr = 0;
+X  ChangeScrollRegion(oldtop, oldbot);
+X  SetAttrFont(oldattr, oldfont);
+X  KeypadMode(oldkeypad);
+X  CursorkeysMode(oldcursorkeys);
+X  if (CWS)
+X    {
+X      debug("ResizeDisplay: using WS\n");
+X      PutStr(tgoto(CWS, d_width, d_height));
+X    }
+X  else if (CZ0 && (d_width == Z0width || d_width == Z1width))
+X    {
+X      debug("ResizeDisplay: using Z0/Z1\n");
+X      PutStr(d_width == Z0width ? CZ0 : CZ1);
+X    }
+X}
+X#endif /* AUTO_NUKE */
+END_OF_FILE
+if test 27002 -ne `wc -c <'display.c'`; then
+    echo shar: \"'display.c'\" unpacked with wrong size!
+fi
+# end of 'display.c'
+fi
+if test -f 'socket.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'socket.c'\"
+else
+echo shar: Extracting \"'socket.c'\" \(28896 characters\)
+sed "s/^X//" >'socket.c' <<'END_OF_FILE'
+X/* Copyright (c) 1993
+X *      Juergen Weigert (jnweiger@immd4.informatik.uni-erlangen.de)
+X *      Michael Schroeder (mlschroe@immd4.informatik.uni-erlangen.de)
+X * Copyright (c) 1987 Oliver Laumann
+X *
+X * This program is free software; you can redistribute it and/or modify
+X * it under the terms of the GNU General Public License as published by
+X * the Free Software Foundation; either version 2, or (at your option)
+X * any later version.
+X *
+X * This program is distributed in the hope that it will be useful,
+X * but WITHOUT ANY WARRANTY; without even the implied warranty of
+X * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+X * GNU General Public License for more details.
+X *
+X * You should have received a copy of the GNU General Public License
+X * along with this program (see the file COPYING); if not, write to the
+X * Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+X *
+X ****************************************************************
+X */
+X
+X#include "rcs.h"
+XRCS_ID("$Id: socket.c,v 1.6 1993/07/21 15:43:26 mlschroe Exp $ FAU")
+X
+X#include "config.h"
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#ifndef sgi
+X# include <sys/file.h>
+X#endif
+X#ifndef NAMEDPIPE
+X#include <sys/socket.h>
+X#endif
+X#include <fcntl.h>
+X#ifndef NAMEDPIPE
+X#include <sys/un.h>
+X#endif
+X#include <signal.h>
+X#ifndef M_XENIX
+X#include <sys/time.h>
+X#endif /* M_XENIX */
+X#ifdef DIRENT
+X# include <dirent.h>
+X#else
+X# include <sys/dir.h>
+X# define dirent direct
+X#endif
+X
+X#include "screen.h"
+X
+X#ifdef USEVARARGS
+X# if defined(__STDC__)
+X#  include <stdarg.h>
+X# else
+X#  include <varargs.h>
+X# endif
+X#endif
+X
+X#include "extern.h"
+X
+X#if defined(_SEQUENT_) && !defined(NAMEDPIPE)
+X# define connect sconnect	/* _SEQUENT_ has braindamaged connect */
+Xstatic int sconnect __P((int, struct sockaddr *, int));
+X#endif
+X
+Xextern char *RcFileName, *extra_incap, *extra_outcap;
+Xextern int ServerSocket, real_uid, real_gid, eff_uid, eff_gid;
+Xextern int dflag, iflag, rflag, lsflag, quietflag, wipeflag, xflag;
+Xextern char *attach_tty, *LoginName, HostName[];
+Xextern struct display *display, *displays;
+Xextern struct win *fore, *console_window, *windows;
+Xextern struct NewWindow nwin_undef;
+X#ifdef NETHACK
+Xextern nethackflag;
+X#endif
+X#ifdef MULTIUSER
+Xextern char *multi;
+X#endif
+X
+X#ifdef PASSWORD
+Xextern int CheckPassword;
+Xextern char Password[];
+X#endif
+Xextern char *getenv();
+X
+Xchar SockPath[MAXPATHLEN];
+Xchar *SockNamePtr, *SockName;
+X
+X#ifdef MULTIUSER
+X# define SOCKMODE (S_IWRITE | S_IREAD | (displays ? S_IEXEC : 0) | (multi ? 1 : 0))
+X#else
+X# define SOCKMODE (S_IWRITE | S_IREAD | (displays ? S_IEXEC : 0))
+X#endif
+X
+Xint
+XRecoverSocket()
+X{
+X#ifndef NOREUID
+X  setreuid(eff_uid, real_uid);
+X  setregid(eff_gid, real_gid);
+X#endif
+X  (void) unlink(SockPath);
+X#ifndef NOREUID
+X  setreuid(real_uid, eff_uid);
+X  setregid(real_gid, eff_gid);
+X#endif
+X  close(ServerSocket);
+X  if ((ServerSocket = MakeServerSocket()) < 0)
+X    return 0;
+X  return 1;
+X}
+X
+X/*
+X * Socket mode 700 means we are Attached. 600 is detached.
+X * We return how many sockets we found. If it was exactly one, we come
+X * back with a SockPath set to it and open it in a fd pointed to by fdp.
+X * If fdp == 0 we simply produce a list if all sockets.
+X */
+X/* ARGSUSED */
+Xint
+XFindSocket(how, fdp)
+Xint how;
+Xint *fdp;
+X{
+X  register int s, lasts = 0, found = 0, deadcount = 0, wipecount = 0;
+X  register int l = 0;
+X  register DIR *dirp;
+X  register struct dirent *dp;
+X  register char *Name;
+X  struct stat st;
+X  struct foundsock
+X    {
+X      char *name;
+X      int mode;
+X    } foundsock[100];	/* 100 is hopefully enough. */
+X  int foundsockcount = 0;
+X
+X  /* User may or may not give us a (prefix) SockName. We want to search. */
+X  debug("FindSocket:\n");
+X  if (SockName)
+X    {
+X      debug1("We want to match '%s'\n", SockName);
+X      l = strlen(SockName);
+X#ifdef NAME_MAX
+X      if (l > NAME_MAX)
+X	l = NAME_MAX;
+X#endif
+X    }
+X
+X#ifndef NOREUID
+X  setreuid(eff_uid, real_uid);
+X  setregid(eff_gid, real_gid);
+X#endif
+X  debug1("FindSock searching... '%s'\n", SockPath);
+X  /*
+X   * this is a hack: SockName may point to Filename(Sockpath)...
+X   */
+X  found = *SockNamePtr;
+X  *SockNamePtr = '\0';
+X  if ((dirp = opendir(SockPath)) == NULL)
+X    {
+X      Panic(0, "Cannot opendir %s", SockPath);
+X      /* NOTREACHED */
+X    }
+X  *SockNamePtr = found;
+X  found = 0;
+X  while ((dp = readdir(dirp)) != NULL)
+X    {
+X      Name = dp->d_name;
+X      /* 
+X       * there may be a file ".termcap" here. 
+X       * Ignore it just like "." and "..". 
+X       */
+X      if (Name[0] == '.')
+X	continue;
+X      if (SockName && l)
+X	{
+X	  register char *n = Name;
+X
+X	  debug2("Attach found: '%s', needed '%s'\n", Name, SockName);
+X	  /*
+X	   * The SockNames "hf", "ttyhf", "1", "12345.tty", "12345.ttyhf.medusa"
+X	   * all match the Name "12345.ttyhf.medusa".
+X	   */
+X
+X	  if ((*SockName <= '0' || *SockName > '9') && (*n > '0' && *n <= '9'))
+X	    {
+X	      while (*++n)
+X		if (*n == '.')
+X		  {
+X		    n++;
+X		    break;
+X		  }
+X	      if (strncmp("tty", SockName, 3) && !strncmp("tty", n, 3))
+X		n += 3;
+X	    }
+X	  if (strncmp(n, SockName, l))
+X	    {
+X	      debug3("strncmp('%s', '%s', %d)\n", n, SockName, l);
+X	      continue;
+X	    }
+X	}
+X      /*
+X       * ATTENTION! MakeClientSocket adds SockName to SockPath! 
+X       * Anyway, we need it earlier.
+X       */
+X      strcpy(SockNamePtr, Name);
+X      if (stat(SockPath, &st))
+X	continue;
+X#ifndef SOCK_NOT_IN_FS
+X# ifdef NAMEDPIPE
+X      if (!S_ISFIFO(st.st_mode))
+X	{
+X	  debug1("'%s' is not a pipe, ignored\n", SockPath);
+X	  continue;
+X	}
+X# else /* NAMEDPIPE */
+X#  ifdef S_ISSOCK
+X      if (!S_ISSOCK(st.st_mode))
+X	{
+X	  debug1("'%s' is not a socket, ignored\n", SockPath);
+X	  continue;
+X	}
+X#  endif
+X# endif /* NAMEDPIPE */
+X#endif
+X      if (st.st_uid != real_uid)
+X	continue;
+X      s = st.st_mode & 0777;
+X#ifdef MULTIUSER
+X      if (multi && ((s & 0677) == 0600))
+X	continue;
+X#endif
+X      foundsock[foundsockcount].name = SaveStr(Name);
+X#ifdef MULTIUSER
+X      foundsock[foundsockcount].mode = s ^ (multi ? 1 : 0);
+X#else
+X      foundsock[foundsockcount].mode = s;
+X#endif
+X      debug2("FindSocket: %s has mode %04o...\n", Name, s);
+X      {
+X	/* 
+X	 * marc parses the socketname again
+X	 */
+X	int sockmpid = 0;
+X	char *nam = Name;
+X
+X	while (*nam)
+X	  {
+X	    if (*nam > '9' || *nam < '0')
+X	      break;
+X	    sockmpid = 10 * sockmpid + *nam - '0';
+X	    nam++;
+X	  }
+X	/*
+X	 * A socket is counted as dead, when there is no
+X	 * process belongin to it. If there is one, and the
+X	 * socket mode indicates "single user detached", then
+X	 * we should be able to connect.
+X	 * If successfull, thats o.k. Otherwise we record that mode as -1.
+X	 * MakeClientSocket() must be careful not to block forever.
+X	 */
+X	if (((sockmpid > 2) && kill(sockmpid, 0) == -1 && errno == ESRCH) ||
+X	    (((s & 0677) == 0600) && (s = MakeClientSocket(0, Name)) == -1))
+X	  {
+X	    foundsock[foundsockcount].mode = -1;
+X	    deadcount++;
+X	  }
+X	else
+X	  close(s);
+X      }
+X      if (++foundsockcount >= 100)
+X	break;
+X    }
+X  closedir(dirp);
+X
+X  if (wipeflag)
+X    {
+X      for (s = 0; s < foundsockcount; s++)
+X	{
+X	  if (foundsock[s].mode == -1)
+X	    {
+X              strcpy(SockNamePtr, foundsock[s].name);
+X	      debug1("wiping '%s'\n", SockPath);
+X	      if (unlink(SockPath) == 0)
+X	        {
+X		  foundsock[s].mode = -2;
+X	          wipecount++;
+X		}
+X	    }
+X	}
+X    }
+Xdebug3("found=%d, dflag = %d, xflag = %d\n", found, dflag, xflag);
+X  for (s = 0; s < foundsockcount; s++)
+X    if ((foundsock[s].mode) == (dflag ? 0700 : 0600)
+X        || (xflag && foundsock[s].mode == 0700)) 
+X      {
+X	found++;
+Xdebug2("mode = %d --> found = %d\n", foundsock[s].mode, found);
+X	lasts = s;
+X      }
+X  if (quietflag && (lsflag || (found != 1 && rflag != 2)))
+X    eexit(10 + found);
+X  debug2("attach: found=%d, foundsockcount=%d\n", found, foundsockcount);
+X  if (found == 1 && lsflag == 0)
+X    {
+X      if ((lasts = MakeClientSocket(0, SockName = foundsock[lasts].name)) == -1)
+X        found = 0;
+X    }
+X  else if (!quietflag && foundsockcount > 0)
+X    {
+X      switch (found)
+X        {
+X        case 0:
+X          if (lsflag)
+X	    {
+X#ifdef NETHACK
+X              if (nethackflag)
+X	        printf("Your inventory:\n");
+X	      else
+X#endif
+X	      printf((foundsockcount > 1) ?
+X	             "There are screens on:\n" : "There is a screen on:\n");
+X	    }
+X          else
+X	    {
+X#ifdef NETHACK
+X              if (nethackflag)
+X	        printf("Nothing fitting exists in the game:\n");
+X	      else
+X#endif
+X	      printf((foundsockcount > 1) ?
+X	             "There are screens on:\n" : "There is a screen on:\n");
+X	    }
+X          break;
+X        case 1:
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf((foundsockcount > 1) ?
+X                   "Prove thyself worthy or perish:\n" : 
+X                   "You see here a good looking screen:\n");
+X          else
+X#endif
+X          printf((foundsockcount > 1) ? 
+X                 "There are several screens on:\n" :
+X                 "There is a possible screen on:\n");
+X          break;
+X        default:
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf((foundsockcount > 1) ? 
+X                   "You may whish for a screen, what do you want?\n" : 
+X                   "You see here a screen:\n");
+X          else
+X#endif
+X          printf((foundsockcount > 1) ?
+X                 "There are several screens on:\n" : "There is a screen on:\n");
+X          break;
+X        }
+X      for (s = 0; s < foundsockcount; s++)
+X	{
+X	  switch (foundsock[s].mode)
+X	    {
+X	    case 0700:
+X	      printf("\t%s\t(Attached)\n", foundsock[s].name);
+X	      break;
+X	    case 0600:
+X	      printf("\t%s\t(Detached)\n", foundsock[s].name);
+X	      break;
+X#ifdef MULTIUSER
+X	    case 0701:
+X	      printf("\t%s\t(Multi, attached)\n", foundsock[s].name);
+X	      break;
+X	    case 0601:
+X	      printf("\t%s\t(Multi, detached)\n", foundsock[s].name);
+X	      break;
+X#endif
+X	    case -1:
+X#if defined(__STDC__) || defined(_AIX) || defined(SVR4)
+X	      printf("\t%s\t(Dead ??\?)\n", foundsock[s].name);
+X#else
+X	      printf("\t%s\t(Dead ???)\n", foundsock[s].name);
+X#endif
+X	      break;
+X	    case -2:
+X	      printf("\t%s\t(Removed)\n", foundsock[s].name);
+X	      break;
+X	    default:
+X	      printf("\t%s\t(Wrong mode)\n", foundsock[s].name);
+X	      break;
+X	    }
+X	}
+X    }
+X  if (deadcount && !quietflag)
+X    {
+X      if (wipeflag)
+X        {
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf("You hear%s distant explosion%s.\n",
+X	       (deadcount > 1) ? "" : " a", (deadcount > 1) ? "s" : "");
+X          else
+X#endif
+X          printf("%d Socket%s wiped out.\n", deadcount, (deadcount > 1)?"s":"");
+X	}
+X      else
+X	{
+X#ifdef NETHACK
+X          if (nethackflag)
+X            printf("The dead screen%s touch%s you. Try 'screen -wipe'.\n",
+X	       (deadcount > 1) ? "s" : "", (deadcount > 1) ? "" : "es");
+X          else
+X#endif
+X          printf("Remove dead Sockets with 'screen -wipe'.\n");
+X	}
+X    }
+X
+X  for (s = 0; s < foundsockcount; s++)
+X    Free(foundsock[s].name);
+X  if (found == 1 && fdp)
+X    *fdp = lasts;
+X#ifndef NOREUID
+X  setreuid(real_uid, eff_uid);
+X  setregid(real_gid, eff_gid);
+X#endif
+X  if (fdp)
+X    return found;
+X  return foundsockcount - wipecount;
+X}
+X
+X#ifdef NAMEDPIPE
+X
+Xint
+XMakeServerSocket()
+X{
+X  register int s;
+X  struct stat st;
+X
+X  strcpy(SockNamePtr, SockName);
+X# ifdef NAME_MAX
+X  if (strlen(SockNamePtr) > NAME_MAX)
+X    {
+X      debug2("MakeClientSocket: '%s' truncated to %d chars\n",
+X	     SockNamePtr, NAME_MAX);
+X      SockNamePtr[NAME_MAX] = '\0';
+X    }
+X# endif /* NAME_MAX */
+X
+X# ifndef NOREUID
+X  setreuid(eff_uid, real_uid);
+X  setregid(eff_gid, real_gid);
+X# endif /* NOREUID */
+X  if ((s = open(SockPath, O_WRONLY | O_NDELAY)) >= 0)
+X    {
+X      debug("huii, my fifo already exists??\n");
+X      if (quietflag)
+X	{
+X	  Kill(d_userpid, SIG_BYE);
+X	  eexit(11);
+X	}
+X      printf("There is already a screen running on %s.\n",
+X	     Filename(SockPath));
+X      if (stat(SockPath, &st) == -1)
+X	Panic(errno, "stat");
+X      if (st.st_uid != real_uid)
+X	Panic(0, "Unfortunatelly you are not its owner.");
+X      if ((st.st_mode & 0700) == 0600)
+X	Panic(0, "To resume it, use \"screen -r\"");
+X      else
+X	Panic(0, "It is not detached.");
+X      /* NOTREACHED */
+X    }
+X# ifndef NOREUID
+X  (void) unlink(SockPath);
+X  if (mknod(SockPath, S_IFIFO | SOCKMODE, 0))
+X    Panic(0, "mknod fifo %s failed", SockPath);
+X#  ifdef BROKEN_PIPE
+X  if ((s = open(SockPath, O_RDWR | O_NDELAY, 0)) < 0)
+X#  else
+X  if ((s = open(SockPath, O_RDONLY | O_NDELAY, 0)) < 0)
+X#  endif
+X    Panic(errno, "open fifo %s", SockPath);
+X  setreuid(real_uid, eff_uid);
+X  setregid(real_gid, eff_gid);
+X  return s;
+X# else /* NOREUID */
+X  if (UserContext() > 0)
+X    {
+X      (void) unlink(SockPath);
+X      if (mknod(SockPath, S_IFIFO | SOCKMODE, 0))
+X	UserReturn(0);
+X      UserReturn(1);
+X    }
+X  if (UserStatus() <= 0)
+X    Panic(0, "mknod fifo %s failed", SockPath);
+X#  ifdef BROKEN_PIPE
+X  if ((s = secopen(SockPath, O_RDWR | O_NDELAY, 0)) < 0)
+X#  else
+X  if ((s = secopen(SockPath, O_RDONLY | O_NDELAY, 0)) < 0)
+X#  endif
+X    Panic(errno, "open fifo %s", SockPath);
+X  return s;
+X# endif /* NOREUID */
+X}
+X
+X
+Xint
+XMakeClientSocket(err, name)
+Xint err;
+Xchar *name;
+X{
+X  register int s = 0;
+X
+X  strcpy(SockNamePtr, name);
+X# ifdef NAME_MAX
+X  if (strlen(SockNamePtr) > NAME_MAX)
+X    {
+X      debug2("MakeClientSocket: '%s' truncated to %d chars\n",
+X	     SockNamePtr, NAME_MAX);
+X      SockNamePtr[NAME_MAX] = '\0';
+X    }
+X# endif /* NAME_MAX */
+X  
+X  if ((s = secopen(SockPath, O_WRONLY | O_NDELAY, 0)) >= 0)
+X    {
+X      (void) fcntl(s, F_SETFL, 0);
+X      return s;
+X    }
+X  if (err)
+X    Msg(errno, "open: %s (but continuing...)", SockPath);
+X  debug1("MakeClientSocket() open %s failed\n", SockPath);
+X  return -1;
+X}
+X
+X#else	/* NAMEDPIPE */
+X
+Xint
+XMakeServerSocket()
+X{
+X  register int s;
+X  struct sockaddr_un a;
+X  struct stat st;
+X
+X  if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+X    Panic(errno, "socket");
+X  a.sun_family = AF_UNIX;
+X  strcpy(SockNamePtr, SockName);
+X# ifdef NAME_MAX
+X  if (strlen(SockNamePtr) > NAME_MAX)
+X    {
+X      debug2("MakeServerSocket: '%s' truncated to %d chars\n",
+X	     SockNamePtr, NAME_MAX);
+X      SockNamePtr[NAME_MAX] = '\0';
+X    }
+X# endif /* NAME_MAX */
+X
+X  strcpy(a.sun_path, SockPath);
+X# ifndef NOREUID
+X  setreuid(eff_uid, real_uid);
+X  setregid(eff_gid, real_gid);
+X# endif /* NOREUID */
+X  if (connect(s, (struct sockaddr *) &a, strlen(SockPath) + 2) != -1)
+X    {
+X      debug("oooooh! socket already is alive!\n");
+X      if (quietflag)
+X	{ 
+X	  Kill(d_userpid, SIG_BYE);
+X	  /* 
+X	   * oh, well. nobody receives that return code. papa 
+X	   * dies by signal.
+X	   */
+X	  eexit(11);
+X	}
+X      printf("There is already a screen running on %s.\n",
+X	     Filename(SockPath));
+X      if (stat(SockPath, &st) == -1)
+X	Panic(errno, "stat");
+X      if (st.st_uid != real_uid)
+X	Panic(0, "Unfortunatelly you are not its owner.");
+X      if ((st.st_mode & 0700) == 0600)
+X	Panic(0, "To resume it, use \"screen -r\"");
+X      else
+X	Panic(0, "It is not detached.");
+X      /* NOTREACHED */
+X    }
+X#if defined(m88k) || defined(m68k)
+X  close(s);	/* we get bind: Invalid argument if this is not done */
+X  if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+X    Panic(errno, "reopen socket");
+X#endif
+X  (void) unlink(SockPath);
+X  if (bind(s, (struct sockaddr *) & a, strlen(SockPath) + 2) == -1)
+X    Panic(errno, "bind (%s)", SockPath);
+X#ifdef SOCK_NOT_IN_FS
+X    {
+X      int f;
+X      if ((f = secopen(SockPath, O_RDWR | O_CREAT, SOCKMODE)) < 0)
+X        Panic(errno, "shadow socket open");
+X      close(f);
+X    }
+X#else
+X  chmod(SockPath, SOCKMODE);
+X# ifdef NOREUID
+X  chown(SockPath, real_uid, real_gid);
+X# endif /* NOREUID */
+X#endif /* SOCK_NOT_IN_FS */
+X  if (listen(s, 5) == -1)
+X    Panic(errno, "listen");
+X# ifdef F_SETOWN
+X  fcntl(s, F_SETOWN, getpid());
+X  debug1("Serversocket owned by %d\n", fcntl(s, F_GETOWN, 0));
+X# endif /* F_SETOWN */
+X# ifndef NOREUID
+X  setreuid(real_uid, eff_uid);
+X  setregid(real_gid, eff_gid);
+X# endif /* NOREUID */
+X  return s;
+X}
+X
+Xint
+XMakeClientSocket(err, name)
+Xint err;
+Xchar *name;
+X{
+X  register int s;
+X  struct sockaddr_un a;
+X
+X  if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+X    Panic(errno, "socket");
+X  a.sun_family = AF_UNIX;
+X  strcpy(SockNamePtr, name);
+X# ifdef NAME_MAX
+X  if (strlen(SockNamePtr) > NAME_MAX)
+X    {
+X      debug2("MakeClientSocket: '%s' truncated to %d chars\n",
+X	     SockNamePtr, NAME_MAX);
+X      SockNamePtr[NAME_MAX] = '\0';
+X    }
+X# endif /* NAME_MAX */
+X
+X  strcpy(a.sun_path, SockPath);
+X# ifndef NOREUID
+X  setreuid(eff_uid, real_uid);
+X  setregid(eff_gid, real_gid);
+X# else /* NOREUID */
+X  if (access(SockPath, W_OK))
+X    {
+X      if (err)
+X	Msg(errno, "%s", SockPath);
+X      debug2("MakeClientSocket: access(%s): %d.\n", SockPath, errno);
+X      close(s);
+X      return -1;
+X    }
+X# endif /* NOREUID */
+X  if (connect(s, (struct sockaddr *) &a, strlen(SockPath) + 2) == -1)
+X    {
+X      if (err)
+X	Msg(errno, "%s: connect", SockPath);
+X      debug("MakeClientSocket: connect failed.\n");
+X      close(s);
+X      s = -1;
+X    }
+X# ifndef NOREUID
+X  setreuid(real_uid, eff_uid);
+X  setregid(real_gid, eff_gid);
+X# endif /* NOREUID */
+X  return s;
+X}
+X#endif /* NAMEDPIPE */
+X
+X
+Xvoid
+XSendCreateMsg(s, nwin)
+Xint s;
+Xstruct NewWindow *nwin;
+X{
+X  struct msg m;
+X  register char *p;
+X  register int len, n;
+X  char **av = nwin->args;
+X
+X  debug1("SendCreateMsg() to '%s'\n", SockPath);
+X  bzero((char *)&m, sizeof(m));
+X  m.type = MSG_CREATE;
+X  strcpy(m.m_tty, attach_tty);
+X  p = m.m.create.line;
+X  n = 0;
+X  if (nwin->args != nwin_undef.args)
+X    for (av = nwin->args; *av && n < MAXARGS - 1; ++av, ++n)
+X      {
+X        len = strlen(*av) + 1;
+X        if (p + len >= m.m.create.line + MAXPATHLEN - 1)
+X	  break;
+X        strcpy(p, *av);
+X        p += len;
+X      }
+X  if (nwin->aka != nwin_undef.aka && p + strlen(nwin->aka) + 1 < m.m.create.line + MAXPATHLEN)
+X    strcpy(p, nwin->aka);
+X  else
+X    *p = '\0';
+X  m.m.create.nargs = n;
+X  m.m.create.aflag = nwin->aflag;
+X  m.m.create.flowflag = nwin->flowflag;
+X  m.m.create.lflag = nwin->lflag;
+X  m.m.create.hheight = nwin->histheight;
+X#ifdef SYSV
+X  if (getcwd(m.m.create.dir, sizeof(m.m.create.dir)) == 0)
+X#else
+X  if (getwd(m.m.create.dir) == 0)
+X#endif
+X    {
+X      Msg(errno, "%s", m.m.create.dir);
+X      return;
+X    }
+X  if (nwin->term != nwin_undef.term)
+X    strncpy(m.m.create.screenterm, nwin->term, 19);
+X  m.m.create.screenterm[19] = '\0';
+X  debug1("SendCreateMsg writing '%s'\n", m.m.create.line);
+X  if (write(s, (char *) &m, sizeof m) != sizeof m)
+X    Msg(errno, "write");
+X}
+X
+Xvoid
+X#ifdef USEVARARGS
+X/*VARARGS1*/
+X# if defined(__STDC__)
+XSendErrorMsg(char *fmt, ...)
+X# else /* __STDC__ */
+XSendErrorMsg(fmt, va_alist)
+Xchar *fmt;
+Xva_dcl
+X# endif /* __STDC__ */
+X{ /* } */
+X  static va_list ap;
+X#else /* USEVARARGS */
+X/*VARARGS1*/
+XSendErrorMsg(fmt, p1, p2, p3, p4, p5, p6)
+Xchar *fmt;
+Xunsigned long p1, p2, p3, p4, p5, p6;
+X{
+X#endif /* USEVARARGS */
+X  register int s;
+X  struct msg m;
+X
+X#ifdef USEVARARGS
+X# if defined(__STDC__)
+X  va_start(ap, fmt);
+X# else /* __STDC__ */
+X  va_start(ap);
+X# endif /* __STDC__ */
+X  (void) vsprintf(m.m.message, fmt, ap);
+X  va_end(ap);
+X#else /* USEVARARGS */
+X  sprintf(m.m.message, fmt, p1, p2, p3, p4, p5, p6);
+X#endif /* USEVARARGS */
+X  debug1("SendErrorMsg: '%s'\n", m.m.message);
+X  if (display == 0)
+X    return;
+X  s = MakeClientSocket(1, SockName);
+X  m.type = MSG_ERROR;
+X  strcpy(m.m_tty, d_usertty);
+X  debug1("SendErrorMsg(): writing to '%s'\n", SockPath);
+X  (void) write(s, (char *) &m, sizeof m);
+X  close(s);
+X  sleep(2);
+X}
+X
+X#ifdef PASSWORD
+Xstatic int
+XCheckPasswd(pwd, pid, utty)
+Xint pid;
+Xchar *pwd, *utty;
+X{
+X  if (CheckPassword && 
+X      strcmp(crypt(pwd, (strlen(Password) > 1) ? Password : "JW"),
+X	     Password))
+X    {
+X      if (*pwd)
+X	{
+X# ifdef NETHACK
+X          if (nethackflag)
+X	    Msg(0, "'%s' tries to explode in the sky, but fails. (%s)", utty, pwd);
+X          else
+X# endif /* NETHACK */
+X	  Msg(0, "Illegal reattach attempt from terminal %s, \"%s\"", utty, pwd);
+X	}
+X      debug1("CheckPass() wrong password kill(%d, SIG_PW_FAIL)\n", pid);
+X      Kill(pid, SIG_PW_FAIL);
+X      return 0;
+X    }
+X  debug1("CheckPass() from %d happy\n", pid);
+X  Kill(pid, SIG_PW_OK);
+X  return 1;
+X}
+X#endif	/* PASSWORD */
+X
+Xstatic void
+XExecCreate(mp)
+Xstruct msg *mp;
+X{
+X  struct NewWindow nwin;
+X  char *args[MAXARGS];
+X  register int n;
+X  register char **pp = args, *p = mp->m.create.line;
+X
+X  nwin = nwin_undef;
+X  for (n = mp->m.create.nargs; n > 0; --n)
+X    {
+X      *pp++ = p;
+X      p += strlen(p) + 1;
+X    }
+X  *pp = 0;
+X  if (*p)
+X    nwin.aka = p;
+X  if (*args)
+X    nwin.args = args;
+X  nwin.aflag = mp->m.create.aflag;
+X  nwin.flowflag = mp->m.create.flowflag;
+X  if (*mp->m.create.dir)
+X    nwin.dir = mp->m.create.dir;
+X  nwin.lflag = mp->m.create.lflag;
+X  nwin.histheight = mp->m.create.hheight;
+X  if (*mp->m.create.screenterm)
+X    nwin.term =  mp->m.create.screenterm;
+X  MakeWindow(&nwin);
+X}
+X
+Xstatic int
+XCheckPid(pid)
+Xint pid;
+X{
+X  debug1("Checking pid %d\n", pid);
+X  if (pid < 2)
+X    return(-1);
+X  if (eff_uid == real_uid)
+X    return kill(pid, 0);
+X  if (UserContext() == 1)
+X    {
+X      UserReturn(kill(pid, 0));
+X    }
+X  return UserStatus();
+X}
+X
+Xvoid
+XReceiveMsg()
+X{
+X  int left, len, i;
+X  static struct msg m;
+X  char *p;
+X  int ns = ServerSocket;
+X  struct mode Mode;
+X#ifdef UTMPOK
+X  struct win *wi;
+X#endif
+X#ifdef REMOTE_DETACH
+X  struct display *next;
+X#endif
+X
+X#ifdef NAMEDPIPE
+X  debug("Ha, there was someone knocking on my fifo??\n");
+X  if (fcntl(ServerSocket, F_SETFL, 0) == -1)
+X    Panic(errno, "DELAY fcntl");
+X#else
+X  struct sockaddr_un a;
+X
+X  len = sizeof(a);
+X  debug("Ha, there was someone knocking on my socket??\n");
+X  if ((ns = accept(ns, (struct sockaddr *) &a, &len)) < 0)
+X    {
+X      Msg(errno, "accept");
+X      return;
+X    }
+X#endif				/* NAMEDPIPE */
+X
+X  p = (char *) &m;
+X  left = sizeof(m);
+X  while (left > 0)
+X    {
+X      len = read(ns, p, left);
+X      if (len < 0 && errno == EINTR)
+X	continue;
+X      if (len <= 0)
+X	break;
+X      p += len;
+X      left -= len;
+X    }
+X
+X#ifdef NAMEDPIPE
+X# ifndef BROKEN_PIPE
+X  /* Reopen pipe to prevent EOFs at the select() call */
+X  close(ServerSocket);
+X  if ((ServerSocket = secopen(SockPath, O_RDONLY | O_NDELAY, 0)) < 0)
+X    Panic(errno, "reopen fifo %s", SockPath);
+X# endif
+X#else
+X  close(ns);
+X#endif
+X
+X  if (len < 0)
+X    {
+X      Msg(errno, "read");
+X      return;
+X    }
+X  if (left > 0)
+X    {
+X      if (left != sizeof(m))
+X        Msg(0, "Message %d of %d bytes too small", left, sizeof(m));
+X      else
+X	debug("No data on socket.\n");
+X      return;
+X    }
+X  debug2("*** RecMsg: type %d tty %s\n", m.type, m.m_tty);
+X  for (display = displays; display; display = display->_d_next)
+X    if (strcmp(d_usertty, m.m_tty) == 0)
+X      break;
+X  debug2("display: %s display %sfound\n", m.m_tty, display ? "" : "not ");
+X  if (!display)
+X    {
+X      struct win *w;
+X
+X      for (w = windows; w; w = w->w_next)
+X        if (!strcmp(m.m_tty, w->w_tty))
+X	  {
+X            display = w->w_display;
+X	    debug2("but window %s %sfound.\n", m.m_tty, display ? "" : "deatached (ignoring) ");
+X	    break;
+X          }
+X    }
+X
+X  /* Remove the status to prevent garbage on the screen */
+X  if (display && d_status)
+X    RemoveStatus();
+X
+X  switch (m.type)
+X    {
+X    case MSG_WINCH:
+X      if (display)
+X        CheckScreenSize(1); /* Change fore */
+X      break;
+X    case MSG_CREATE:
+X      if (display)
+X	ExecCreate(&m);
+X      break;
+X    case MSG_CONT:
+X	if (display && d_userpid != 0 && kill(d_userpid, 0) == 0)
+X	  break;		/* Intruder Alert */
+X      debug2("RecMsg: apid=%d,was %d\n", m.m.attach.apid, display ? d_userpid : 0);
+X      /* FALLTHROUGH */
+X    case MSG_ATTACH:
+X      if (CheckPid(m.m.attach.apid))
+X	{
+X	  debug1("Attach attempt with bad pid(%d)\n", m.m.attach.apid);
+X	  Msg(0, "Attach attempt with bad pid(%d) !", m.m.attach.apid);
+X          break;
+X	}
+X      if ((i = secopen(m.m_tty, O_RDWR | O_NDELAY, 0)) < 0)
+X	{
+X	  debug1("ALERT: Cannot open %s!\n", m.m_tty);
+X#ifdef NETHACK
+X          if (nethackflag)
+X	    Msg(errno, 
+X	        "You can't open (%s). Perhaps there's a Monster behind it",
+X	        m.m_tty);
+X          else
+X#endif
+X	  Msg(errno, "Attach: Could not open %s", m.m_tty);
+X	  Kill(m.m.attach.apid, SIG_BYE);
+X	  break;
+X	}
+X#ifdef PASSWORD
+X      if (!CheckPasswd(m.m.attach.password, m.m.attach.apid, m.m_tty))
+X	{
+X	  debug3("RcvMsg:Checkpass(%s,%d,%s) failed\n",
+X		 m.m.attach.password, m.m.attach.apid, m.m_tty);
+X	  close(i);
+X	  break;
+X	}
+X#else
+X# ifdef MULTIUSER
+X      Kill(m.m.attach.apid, SIGCONT);
+X# endif
+X#endif				/* PASSWORD */
+X      if (display)
+X	{
+X	  debug("RecMsg: hey, why you disturb, we are not detached. hangup!\n");
+X	  close(i);
+X	  Kill(m.m.attach.apid, SIG_BYE);
+X	  Msg(0, "Attach msg ignored: We are not detached.");
+X	  break;
+X	}
+X
+X#ifdef MULTIUSER
+X      if (strcmp(m.m.attach.auser, LoginName))
+X        if (*FindUserPtr(m.m.attach.auser) == 0)
+X	  {
+X              write(i, "Access to session denied.\n", 26);
+X	      close(i);
+X	      Kill(m.m.attach.apid, SIG_BYE);
+X	      Msg(0, "Attach: access denied for user %s", m.m.attach.auser);
+X	      break;
+X	  }
+X#endif
+X
+X      errno = 0;
+X      debug2("RecMsg: apid %d is o.k. and we just opened '%s'\n", m.m.attach.apid, m.m_tty);
+X      /* turn off iflag on a multi-attach... */
+X      if (iflag && displays)
+X	{
+X	  iflag = 0;
+X	  display = displays;
+X#if defined(TERMIO) || defined(POSIX)
+X	  d_NewMode.tio.c_cc[VINTR] = VDISABLE;
+X	  d_NewMode.tio.c_lflag &= ~ISIG;
+X#else /* TERMIO || POSIX */
+X	  d_NewMode.m_tchars.t_intrc = -1;
+X#endif /* TERMIO || POSIX */
+X	  SetTTY(d_userfd, &d_NewMode);
+X	}
+X
+X      /* create new display */
+X      GetTTY(i, &Mode);
+X      if (MakeDisplay(m.m.attach.auser, m.m_tty, m.m.attach.envterm, i, m.m.attach.apid, &Mode) == 0)
+X        {
+X	  write(i, "Could not make display.\n", 24);
+X	  close(i);
+X	  Msg(errno, "Attach: could not make display for user %s", m.m.attach.auser);
+X	  Kill(m.m.attach.apid, SIG_BYE);
+X	  break;
+X        }
+X#ifdef ultrix
+X      brktty(d_userfd);	/* for some strange reason this must be done */
+X#endif
+X#if defined(pyr) || defined(xelos) || defined(sequent)
+X      /*
+X       * Kludge for systems with braindamaged termcap routines,
+X       * which evaluate $TERMCAP, regardless weather it describes
+X       * the correct terminal type or not.
+X       */
+X      debug("unsetenv(TERMCAP) in case of a different terminal");
+X      unsetenv("TERMCAP");
+X#endif
+X    
+X      /*
+X       * We reboot our Terminal Emulator. Forget all we knew about
+X       * the old terminal, reread the termcap entries in .screenrc
+X       * (and nothing more from .screenrc is read. Mainly because
+X       * I did not check, weather a full reinit is save. jw) 
+X       * and /etc/screenrc, and initialise anew.
+X       */
+X      if (extra_outcap)
+X	free(extra_outcap);
+X      if (extra_incap)
+X	free(extra_incap);
+X      extra_incap = extra_outcap = 0;
+X      debug2("Message says size (%dx%d)\n", m.m.attach.columns, m.m.attach.lines);
+X#ifdef ETCSCREENRC
+X      if ((p = getenv("SYSSCREENRC")) == NULL)
+X	StartRc(ETCSCREENRC);
+X      else
+X	StartRc(p);
+X#endif
+X      StartRc(RcFileName);
+X      if (InitTermcap(m.m.attach.columns, m.m.attach.lines))
+X	{
+X	  FreeDisplay();
+X	  Kill(m.m.attach.apid, SIG_BYE);
+X	  break;
+X	}
+X      InitTerm(m.m.attach.adaptflag);
+X      if (displays->_d_next == 0)
+X        (void) chsock();
+X      signal(SIGHUP, SigHup);
+X#ifdef UTMPOK
+X      /*
+X       * we set the Utmp slots again, if we were detached normally
+X       * and if we were detached by ^Z.
+X       */
+X      RemoveLoginSlot();
+X      if (displays->_d_next == 0)
+X        for (wi = windows; wi; wi = wi->w_next)
+X	  if (wi->w_slot != (slot_t) -1)
+X	    SetUtmp(wi);
+X#endif
+X      SetMode(&d_OldMode, &d_NewMode);
+X      SetTTY(d_userfd, &d_NewMode);
+X      if (fore && fore->w_display == 0)
+X        SetForeWindow(fore);
+X      else
+X        d_fore = 0;
+X      Activate(0);
+X      if (d_fore == 0)
+X	ShowWindows();
+X      if (displays->_d_next == 0 && console_window)
+X	{
+X	  if (TtyGrabConsole(console_window->w_ptyfd, 1, "reattach") == 0)
+X	    Msg(0, "console %s is on window %d", HostName, console_window->w_number);
+X	}
+X      debug("activated...\n");
+X      break;
+X    case MSG_ERROR:
+X      Msg(0, "%s", m.m.message);
+X      break;
+X    case MSG_HANGUP:
+X      SigHup(SIGARG);
+X      break;
+X#ifdef REMOTE_DETACH
+X    case MSG_DETACH:
+X# ifdef POW_DETACH
+X    case MSG_POW_DETACH:
+X# endif				/* POW_DETACH */
+X      for (display = displays; display; display = next)
+X	{
+X	  next = display->_d_next;
+X# ifdef POW_DETACH
+X	  if (m.type == MSG_POW_DETACH)
+X	    Detach(D_REMOTE_POWER);
+X	  else
+X# endif				/* POW_DETACH */
+X	  if (m.type == MSG_DETACH)
+X	    Detach(D_REMOTE);
+X	}
+X      break;
+X#endif
+X    default:
+X      Msg(0, "Invalid message (type %d).", m.type);
+X    }
+X}
+X
+X#if defined(_SEQUENT_) && !defined(NAMEDPIPE)
+X#undef connect
+X
+X/*
+X *  sequent_ptx socket emulation must have mode 000 on the socket!
+X */
+Xstatic int
+Xsconnect(s, sapp, len)
+Xint s, len;
+Xstruct sockaddr *sapp;
+X{
+X  register struct sockaddr_un *sap;
+X  struct stat st;
+X  int x;
+X
+X  sap = (struct sockaddr_un *)sapp;
+X  if (stat(sap->sun_path, &st))
+X    return -1;
+X  chmod(sap->sun_path, 0);
+X  x = connect(s, (struct sockaddr *) sap, len);
+X  chmod(sap->sun_path, st.st_mode);
+X  return x;
+X}
+X#endif
+X
+Xint
+Xchsock()
+X{
+X  int r, euid = geteuid();
+X  if (euid != real_uid)
+X    {
+X      if (UserContext() <= 0)
+X        return UserStatus();
+X    }
+X  r = chmod(SockPath, SOCKMODE);
+X  if (euid != real_uid)
+X    UserReturn(r);
+X  return r;
+X}
+X
+END_OF_FILE
+if test 28896 -ne `wc -c <'socket.c'`; then
+    echo shar: \"'socket.c'\" unpacked with wrong size!
+fi
+# end of 'socket.c'
+fi
+if test -f 'terminfo/test.txt' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'terminfo/test.txt'\"
+else
+echo shar: Extracting \"'terminfo/test.txt'\" \(38899 characters\)
+sed "s/^X//" >'terminfo/test.txt' <<'END_OF_FILE'
+X
+X<[H[J(A)0[?4h[?5l[m
+X 
+X 
+X 
+X 
+X 
+X 
+X 
+X 
+X 
+X    lqqqqqqqqqwwwqqqqqqqqqk                sssssssssssssssssssssssssssss
+X    x[1mMerry Chr[mx[1mx[mx[1mmas * Mer[mx                \                           /
+X    xry Christx[1mx[mx * Merry x                 pr                       rp
+X    x[1mChristmas[mx[1mx[mx[1mMerry Chr[mx                   oqrs               srqo
+X    xistmas * x[1mx[mxry Christx                       ooppqqwqwqqppoo
+X    tqqqqqqqqqj[1mx[mmqqqqqqqqqu                             x x
+X    t[1mqqqqqqqqqq`qqqqqqqqqq[mu                             x x
+X    tqqqqqqqqqk[1mx[mlqqqqqqqqqu                             x x
+X    xry Christx[1mx[mx * Merry x                             x x
+X    x[1mChristmas[mx[1mx[mx[1mMerry Chr[mx                             x x
+X    xistmas * x[1mx[mxry Christx                             x x
+X    x[1mmas * Mer[mx[1mx[mx[1mChristmas[mx                         srqqj mqqrs
+X    mqqqqqqqqqvvvqqqqqqqqqj                    [4m rqpo           opqr [m[1;10r
+X[5;79Hl[8;79Hm[6;79Hx[7;79Hx
+X[5;78Hlq[8;78Hmq[6;78Hx [7;78Hx 
+X[5;77Hlqw[8;77Hmqv[6;77Hx x[7;77Hx x
+X[5;76Hlqwq[8;76Hmqvq[6;76Hx x [7;76Hx x 
+X[5;75Hlqwq[8;75Hmqvq[6;75Hx x [7;75Hx x 
+X[5;74Hlqwq[8;74Hmqvq[6;74Hx x [7;74Hx x 
+X[5;73Hlqwq[8;73Hmqvq[6;73Hx x [7;73Hx x 
+X[5;72Hlqwq[8;72Hmqvq[6;72Hx x [7;72Hx x 
+X[5;71Hlqwq[8;71Hmqvq[6;71Hx x [7;71Hx x 
+X[5;70Hlqwq[8;70Hmqvq[6;70Hx x [7;70Hx x 
+X[8;69H/[7;69H/
+X[9;69H/[8;68H/ 
+X[10;69H/[9;68H[1m/[m [8;68H /[7;69H [6;69H/
+X[11;69H[1;4m/[m[10;68H/ [9;68H [1m/[m[8;68H /[7;68H[1m/[m/
+X[12;69H[1m/[m[11;68H[1;4m/ [m[10;68H /[9;69H[1m/[m[8;68H/[7;68H[1m/[m 
+X[13;69H/[12;68H/ [11;68H[4m /[m[10;69H[1m/[m[9;68H[1m/[m/[7;68H /[6;69H[1m/[m
+X[13;68H[1m/[m [12;68H [1m/[m[10;68H//[9;68H/[8;68H [7;68H[1m/[m [6;69H/
+X[13;68H /[11;68H[4m/[m[9;68H [8;68H/ [7;68H//[6;69H 
+X[13;68H/[12;68H[1m/[m[10;68H [9;68H[1m/[m  [8;68H/[1m/[m[7;68H [6;69H[1m/[m
+X[13;68H[1m/[m[12;68H/[11;68Hs[10;68H[1m/[m [9;68H//[8;69H [6;69H 
+X[14;53Hsssssssssss
+X[13;68H/[12;68H [11;68H[1;4m/ [m[10;68H//[9;69H [8;68H [1m/[m[7;68H/ [6;69H[1m/[m
+X[14;52Hs[14;64Hs
+X[13;68H [12;68H/ [11;68H[4m/[1m/[m[10;69H [9;68H /[8;68H/ [7;68H [1m/[m[6;69H/
+X[14;53Hrrrrrrrrrrr
+X[13;68H[1m/[m [12;69H/[11;69Hs[10;68H [1m/[m[9;68H[1m/[m [8;68H /[7;69H/
+X[14;54Hqqqqqqqqq
+X[13;68H/[1m/[m[12;69H [11;68H[4m /[m[10;68H/ [9;68H /[7;68H[1m/[m
+X[14;52Hsrqqqqqqqqqrs
+X[13;69H [12;68H [1m/[m[11;68H[4m/ [m[10;68H [1m/[m[8;68H[1m/[m[7;68H/
+X[14;51Hsr[14;64Hrs
+X[13;69H/[12;68H/ [11;68H[4m /[m[10;69H[1m/[m[9;68H[1m/[m/[7;68H /[6;69H[1m/[m
+X[14;51Hrrqq[14;62Hqqrr
+X[13;68H[1m/[m [12;68H [1m/[m[10;68H//[9;68H/[8;68H [7;68H[1m/[m [6;69H/
+X[14;55Hppppppp
+X[13;68H /[11;68H[4m/[m[9;68H [8;68H/ [7;68H//[6;69H 
+X[14;51Hrrq[14;63Hqrr
+X[13;68H/[12;68H[1m/[m[10;68H [9;68H[1m/[m  [8;68H/[1m/[m[7;68H [6;69H[1m/[m
+X[14;51Hrqpp[14;62Hppqr
+X[13;68H[1m/[m[12;68H/[11;68Hs[10;68H[1m/[m [9;68H//[8;69H [6;69H 
+X 
+X[14;50H[4mr[mqpppooooooopppq[4mr[m
+X[13;68H/[12;68H [11;68H[1;4m/ [m[10;68H//[9;69H [8;68H [1m/[m[7;68H/ [6;69H[1m/[m
+X[14;50H[4mq[mppooooooooooopp[4mq[m
+X[13;68H [12;68H/ [11;68H[4m/[1m/[m[10;69H [9;68H /[8;68H/ [7;68H [1m/[m[6;69H/
+X 
+X 
+X 
+X[13;55Hsssssss[14;52Hooo       ooo[14;57H. o f
+X 
+X[13;68H[1m/[m [12;69H/[11;69Hs[10;68H [1m/[m[9;68H[1m/[m [8;68H /[7;69H/[14;56H.f    
+X 
+X[13;53Hss[13;62Hss[14;53H  .f       
+X 
+X[13;68H/[1m/[m[12;69H [11;68H[4m /[m[10;68H/ [9;68H /[7;68H[1m/[m[14;53H       f
+X 
+X[13;48Hssssrrrrqqqqqrrrrssss[14;50Hs               s
+X 
+X[13;69H [12;68H [1m/[m[11;68H[4m/ [m[10;68H [1m/[m[8;68H[1m/[m[7;68H/[14;51H.    .      .
+X 
+X[13;47Hsssrrrrqqqqqqqqqrrrrsss[14;51Hf    f  .   f
+X 
+X[13;69H[4m/[m[12;68H/ [11;68H[4m /[m[10;69H[1m/[m[9;68H[1m/[m/[7;68H /[6;69H[14;51H        f .  
+X 
+X[13;47Hrrrqqqqpppppppppqqqqrss[14;52H.    . o f
+X 
+X[13;68H[1;4m/[m [12;68H [1m/[m[10;68H//[9;68H/[8;68H [7;68H[1m/[m [6;69H/[14;52Hf   .f    
+X 
+X[13;47Hqqqppppooooooooopppqrss[14;52H   .f       .
+X 
+X[13;68Hs/[11;68H[4m/[m[9;68H [8;68H/ [7;68H//[6;69H [14;55Hf        f
+X 
+X[12;54Hsssssssss[13;47Hqppoooo         oopqrss[13;54H.o      .[14;55H          
+X 
+X[13;68H[4m/[m[12;68H[1m/[m[10;68H [9;68H[1m/[m  [8;68H/[1m/[m[7;68H [6;69H[1m/[m[13;54Hf       f[14;51H.    .    
+X 
+X[12;52Hssrrrrrrrrrs[13;47Hqpooo            opqrss[13;53Hf [14;51Hf    f  .   f
+X 
+X[13;68H[1;4m/[m[12;68H/[11;68Hs[10;68H[1m/[m [9;68H//[8;69H [13;53Hf  o      o[14;51H        f .  
+X 
+X[12;46Hssssssrr[12;63Hrrssssss[13;47H     [13;64H      [6;69H [13;47Hf     o           o  .[14;52H.    . o f
+X 
+X[12;68Hs[11;68H[4m/ [m[10;68H//[9;69H [8;68H [1m/[m[7;69H [13;47H  .         o o      f[14;52Hf   .f    
+X 
+X[12;45Hsrrrrrrqqqqqqqqqqqqqqrrssrq[13;49Hf  o    o     .     [14;52H   .f       .
+X 
+X[12;68H[4m/ [11;68H/[1m/[m[10;69H [9;68H /[8;69H  mqvqqqqqq[5;70H lqwqqqqqq[7;70H x x[6;70H x x[13;49H .     o      f
+X 
+X[12;45Hrqqqqqqppppppppppppppq[8;71H mqvqqqqq[5;71H lqwqqqqq[7;71H x x[6;71H x x[13;50Hf   .o      . o[14;55H          
+X 
+X[12;69H[4m/[m[11;69Hs[10;68H [1m/[m[9;69H [8;72H mqvqqqq[5;72H lqwqqqq[7;72H x x[6;72H x x[13;50H    f       f  [14;51
+X 
+X[12;45Hqppppppoooooooooooooo[8;73H mqvqqq[5;73H lqwqqq[7;73H x x[6;73H x x[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X 
+X[12;69Hs[11;68H[4m /[m[10;69H [8;74H mqvqq[5;74H lqwqq[7;74H x x[6;74H x x[13;47H.   o f  o      o f[14;51H        f 
+X 
+X[12;45Hpoooooo             [8;75H mqvq[5;75H lqwq[7;75H x x[6;75H x x[12;49H  o    o      o[13;47Hf     o           o  .
+X 
+X[11;44H[4mrrrrrrrrrrrrrrrrrrrrrrrrrrrrr[m[12;45H       [12;64H        [8;76H mqv[5;76H lqw[7;76H x x[6;76H x x[12;47Ho   
+X[8;77H mq[5;77H lq[7;77H x [6;77H x [12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[8;78H m[5;78H l[7;78H x[6;78H x[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[8;79H [5;79H [7;79H [6;79H [12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[1;7m[5;25H#3 Cheers! 
+X[6;25H#4 Cheers! [m
+X 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[5;1H[K#5
+X[6;1H[K#5
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[10;1H       /ooooooooooooooo\
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[10;1H      /   sss     sss   \
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[10;1H      x  ([4msOs[m)   ([4msOs[m)  x
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[10;1H      x        `        x
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[10;1H       \  \sssssssss/  /
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[10;1H        \             /
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[10;1H         \sssssssssss/
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[10;1H          ooppqqrrsss
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[10;1H          ooppqqrrsss
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[10;1H          ooppqqrrsss
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[10;1H          ooppqqrrsss
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[10;1H          ooppqqrrsss
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[10;1H          ooppqqrrsss
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[10;1H          ooppqqrrsss[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[HM      x        `        x
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[HM      x  ([4msOs[m)   ([4msOs[m)  x
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[HM      /   sss     sss   \
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[HM       /ooooooooooooooo\ 
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[HM
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[HM
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[HM
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[HM
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[10;1H        \             /
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[10;1H         \sssssssssss/
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[10;1H          ooppqqrrsss
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[10;1H          ooppqqrrsss
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[10;1H          ooppqqrrsss
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[10;1H          ooppqqrrsss
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[10;1H          ooppqqrrsss[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[HM      /   sss     sss   \
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[HM       /ooooooooooooooo\ 
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[HM
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[HM
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[10;1H          ooppqqrrsss
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[10;1H          ooppqqrrsss
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[10;1H          ooppqqrrsss
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[10;1H          ooppqqrrsss[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[HM       /ooooooooooooooo\ 
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[HM
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[HM
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[HM
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[10;1H         \sssssssssss/
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[10;1H          ooppqqrrsss
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[10;1H          ooppqqrrsss[r
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X 
+X[4;45HJin
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[4;48Hgle
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[4;52HBells,
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[4;59HJin
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[4;62Hgle
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[4;66HBells,
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[5;45HJin
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[5;48Hgle
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[5;52Hall
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[5;56Hthe
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[5;60Hway,
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[6;45HOh!
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[6;50HWhat
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[6;55Hfun
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[6;59Hit
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[6;62His
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[6;65Hto
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[6;68Hride,
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[7;45HOn
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[7;48Ha
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[7;50Hone-
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[7;54Hhorse
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[7;60Hop
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[7;62Hen
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[7;65Hsleigh.
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf    f    
+X 
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf    f    
+X 
+X[12;47H            o o      o[13;49Hf  o    o           [14;52H             
+X[12;45H.   o  o    o             [13;49H               [14;55H          
+X[12;45Hf          o      o       [13;50H               [14;55H          
+X[12;45H                   
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf    f    
+X 
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf    f    
+X 
+X[12;47H            o o      o[13;49Hf  o    o           [14;52H             
+X[12;45H.   o  o    o             [13;49H               [14;55H          
+X[12;45Hf          o      o       [13;50H               [14;55H          
+X[12;45H                   
+X 
+X[4;45H[K[4;55HMerry Christmas
+X[5;45H[K
+X[6;45H[K[6;60H-
+X[7;45H[K
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf    f    
+X 
+X[12;47H            o o      o[13;49Hf  o    o           [14;52H             
+X[12;45H.   o  o    o             [13;49H               [14;55H          
+X[12;45Hf          o      o       [13;50H               [14;55H          
+X[12;45H                   
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf    f    
+X 
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf   .f    
+X[12;47H       .    o o      o[13;49Hf  o    o     .     [14;52H   .f       .
+X[12;45H.   o  o f  o        .   .[13;49H .     o      f[14;55Hf        f
+X[12;45Hf          o      o  f . f[13;50Hf   .o      . o[14;55H          
+X[12;45H  .  o    o    .   o   f  [13;50H    f       f  [14;51H.    .      .
+X[12;47Hf .    o  .  f o     f[13;53Hf [13;62H   .[14;51Hf    f  .   f
+X[12;47H  f       f  f        [13;47H.   o f  o      o f[14;51H        f .  
+X[12;49H  o    o      o[13;47Hf     o           o  .[14;52H.    . o f
+X[12;47Ho     o           o[13;47H  .         o o      f[14;52Hf    f    
+X 
+X[12;47H            o o      o[13;49Hf  o    o           [14;52H             
+X[12;45H.   o  o    o             [13;49H               [14;55H          
+X[12;45Hf          o      o       [13;50H               [14;55H          
+X[12;45H                   
+X[22;1H[?4l
+X
+END_OF_FILE
+echo shar: 3589 control characters may be missing from \"'terminfo/test.txt'\"
+if test 38899 -ne `wc -c <'terminfo/test.txt'`; then
+    echo shar: \"'terminfo/test.txt'\" unpacked with wrong size!
+fi
+# end of 'terminfo/test.txt'
+fi
+echo shar: End of archive 5 \(of 10\).
+cp /dev/null ark5isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 10 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

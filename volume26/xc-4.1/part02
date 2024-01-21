@@ -1,0 +1,3327 @@
+Newsgroups: comp.sources.unix
+From: jpr@jpr.com (Jean-Pierre Radley)
+Subject: v26i151: xc-4.1 - a serial communications program, V4.1, Part02/03
+Sender: unix-sources-moderator@vix.com
+Approved: paul@vix.com
+
+Submitted-By: jpr@jpr.com (Jean-Pierre Radley)
+Posting-Number: Volume 26, Issue 151
+Archive-Name: xc-4.1/part02
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 2 (of 3)."
+# Contents:  xcb+.c xcmain.c xcport.c xcxmdm.c
+# Wrapped by vixie@gw.home.vix.com on Wed Apr 14 00:22:46 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'xcb+.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xcb+.c'\"
+else
+echo shar: Extracting \"'xcb+.c'\" \(22715 characters\)
+sed "s/^X//" >'xcb+.c' <<'END_OF_FILE'
+X/*	xcb+.c -- CIS B+ Protocol module for XC
+X	This file uses 4-character tabstops
+X */
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <signal.h>
+X#include <time.h>
+X#include <fcntl.h>
+X#include <ctype.h>
+X#define NODEBUG 1	/* prevents xc.h from defining DEBUG */
+X#include "xc.h"
+X
+X#define min(x,y)	((int)(x)<(int)(y)?(x):(y))
+X#define max(x,y)	((int)(x)>(int)(y)?(x):(y))
+X#define MaskLowRange 0x01
+X#define MaskHiRange 0x10
+X#define Send_Ahead_Buffers	5
+X
+enum {
+X	Check_B,
+X	Check_CRC
+X	} ;
+X
+enum {
+X	Quote_Default,
+X	Quote_Not_NULL,
+X	Quote_Extended,
+X	Quote_Full,
+X	Quote_Mask
+X	} ;
+X
+enum {
+X	Overwrite,
+X	Resume
+X	} ;
+X
+enum {
+X	Resume_Allowed,
+X	Resume_Not_Allowed,
+X	Resume_Failed,
+X	Resume_Denied
+X	} ;
+X
+typedef enum {
+X	S_Get_DLE,
+X	S_DLE_Seen,
+X	S_DLE_B_Seen,
+X	S_Get_Data,
+X	S_Get_check,
+X	S_Get_CRC,
+X	S_Verify_CRC,
+X	S_VErify_CKS,
+X	S_VerIfy_Packet,
+X	S_Send_NAK,
+X	S_SenD_ACK,
+X	S_SEnd_ENQ,
+X	S_Resend_Packets,
+X} Sender_Action;
+X
+extern short cr_add;
+extern void cl_line();
+static char S_Buffer[1033], R_Buffer[1033], tdir[32];
+char	Name[SM_BUFF];
+static unchar Mask[32];
+static unsigned Checksum;
+static	Ch,				/* last char read from remote */
+X		Quoting,		/* quoting level requested by the user */
+X		Window_Size,	/* Send size of send ahead window */
+X		PackeT_Size,	/* Maximum block size. */
+X		R_BUffer_Len, S_Bytes, R_Bytes, Seq_Num, PendinG_Count,
+X		Next_Packet, Packets_Btwn_ACKs, Last_ACK, textmode, Last_Chr,
+X		Send_Errors, Read_Errors;
+static short Max_Errors=10, Abort_Flag, Not_Masked, Sent_ENQ, Actual_Check,
+X			Valid_To_Resume_Download, ValiD_To_Resume_Upload,
+X			Send_FIle_Information, Packet_Received, Result;
+static FILE *Data_File;
+static long	already_have, data, total_read, total_sent,
+X			fsize, start, carriage_return;
+X
+struct {
+X	int Seq;
+X	int PackeT_Size;
+X	char *packet;
+X} Pending[Send_Ahead_Buffers];
+X
+extern ushort crc_xmodem_tab[256];
+X
+static void
+init_check()
+X{
+X	Checksum=Actual_Check ? 0xffff : 0;
+X}
+X
+static void
+do_checksum(ch)
+unsigned ch;
+X{
+X	if (Actual_Check==Check_B){
+X		Checksum<<=1;
+X		if (Checksum>255)
+X			Checksum=(Checksum&0xFF)+1;
+X		Checksum+=ch&0xFF;
+X		if (Checksum>255)
+X			Checksum=(Checksum&0xFF)+1;
+X	} else
+X	Checksum=(crc_xmodem_tab[((Checksum>>8)^ch)&0xff]^(Checksum<<8))&0xffff;
+X}
+X
+X/* #define CIS_DEBUG /* for B+ logging */
+X
+X#ifdef CIS_DEBUG
+static FILE *bfp = NIL(FILE);
+static void
+xclog(dir, val)
+char dir;
+int val;
+X{
+X	static int cnt, lastdir;
+X
+X	if (!bfp)
+X		bfp=fopen("xc.log","w"),
+X		cnt=0,
+X		lastdir=dir;
+X
+X	if (++cnt>20||lastdir!=dir)
+X		fputc('\n',bfp),
+X		cnt=1;
+X
+X	if (lastdir!=dir)
+X		fputc('\n',bfp);
+X
+X	if (val>'~'||val<' ')
+X		fprintf(bfp,"%c%1x%1x ",dir,val/16,val%16);
+X	else
+X		fprintf(bfp,"%c%c  ",dir,val);
+X
+X	lastdir=dir;
+X}
+X
+static void
+Why_NAK(reason)
+char *reason;
+X{
+X	sprintf(Msg,"Sending NAK, %s",reason);
+X	S0(Msg);
+X}
+X
+X#else
+X#define xclog(dir,val)
+X#define Why_NAK(reason)
+X#endif
+X
+static void
+stats(count)
+int count;
+X{
+X	int rate, minutes, sec, data_percent, rate_percent;
+X	long chars, elapsed, now, rem;
+X
+X	data+=count;
+X
+X	if (!fsize)
+X		data_percent=0;
+X	else
+X		data_percent=100*(data+carriage_return)/fsize;
+X
+X	if (data_percent>100)
+X		data_percent=100;
+X
+X	time(&now);
+X
+X	elapsed=now-start;
+X	chars=data+carriage_return-already_have-(tdir[0]=='T'?PackeT_Size-1:0);
+X	if (elapsed<5 || !chars)
+X		ttgoto(LI-6,26),
+X		fputs("estimating",tfp);
+X	else
+X		rate=chars/elapsed,
+X		rem=(fsize-(data+carriage_return-already_have))/rate,
+X		minutes=rem/60,
+X		sec=rem%60,
+X		rate_percent=1000*rate/mrate(NIL(char)),
+X
+X		ttgoto(LI-6,26),
+X		fprintf(tfp,"%8.1d:%2.2d",minutes,sec),
+X
+X		minutes=elapsed/60,
+X		sec=elapsed%60,
+X		ttgoto(LI-6,61),
+X		fprintf(tfp,"%8.1d:%2.2d",minutes,sec),
+X
+X		ttgoto(LI-4,23),
+X		fprintf(tfp,"Rate: %d characters per second ", rate,rate_percent);
+X
+X	ttgoto(LI-8,0),
+X	fprintf(tfp,"%8.1ld",total_sent),
+X	ttgoto(LI-8,20),
+X	fprintf(tfp,"%8.1ld",total_read),
+X	ttgoto(LI-8,40);
+X	if (!data_percent)
+X		fprintf(tfp,"%8.1ld",data);
+X	else
+X		fprintf(tfp,"%8.1ld %3.1u %%",data,data_percent);
+X	if (carriage_return)
+X		ttgoto(LI-8,60),
+X		fprintf(tfp,"%+7.1ld",carriage_return);
+X}
+X
+static void
+showmode()
+X{
+X	int l;
+X	sprintf(Msg,"%s %s (%ld bytes) as %s",tdir,Name,fsize,
+X		textmode?"ASCII":"BINARY");
+X
+X	ttgoto(LI-12,0);
+X	cl_line();
+X	if ((l=strlen(Msg)) < CO)
+X		ttgoto(LI-12,(CO-l)/2 -1);
+X	fputs(Msg,tfp);
+X
+X	time(&start);
+X}
+X
+static void
+Discard_ACKed_Packets()
+X{
+X	int i, n;
+X	short Packet_Acked=FALSE;
+X
+X	Last_ACK=Ch;
+X	n=(Next_Packet+PendinG_Count)%Send_Ahead_Buffers;
+X
+X	for (i=PendinG_Count;i>0;i--){
+X		n--;
+X		if (n<0)
+X			n+=5;
+X
+X		if (Pending[n].Seq==Ch-'0')
+X			Packet_Acked=TRUE,
+X			Next_Packet=(n+1)%Send_Ahead_Buffers;
+X
+X		if (Packet_Acked==TRUE)
+X			free(Pending[n].packet),
+X			Pending[n].packet=NIL(char),
+X			PendinG_Count--;
+X	}
+X}
+X
+static void
+Send_Byte(ch)
+int ch;
+X{
+X	sendbyte(ch);
+X	total_sent++;
+X	xclog('>',ch);
+X}
+X
+static void
+Send_Masked_Byte(ch)
+int ch;
+X{
+X	if (ch<0x20){
+X		if (Quoting==Quote_Full||(Mask[ch]&MaskLowRange))
+X			Send_Byte(DLE),
+X			ch+='@';
+X	} else if (ch>=0x80&&ch<0xA0&&
+X		(Quoting==Quote_Full||(Mask[ch-0x80]&MaskHiRange)))
+X			Send_Byte(DLE),
+X			ch=ch+'`'-0x80;
+X
+X	Send_Byte(ch);
+X}
+X
+static
+Read_Byte()
+X{
+X	if ((Ch=readbyte(10))== -1)
+X		return FAILURE;
+X	total_read++;
+X	xclog('<',Ch);
+X	return SUCCESS;
+X}
+X
+static
+Read_Masked_Byte()
+X{
+X	Not_Masked=TRUE;
+X
+X	if (!Read_Byte())
+X		return FAILURE;
+X
+X	if (Ch==DLE){
+X		if (!Read_Byte())
+X			return FAILURE;
+X
+X		Not_Masked=FALSE;
+X
+X		if (Ch>='`')
+X			Ch+=0x80;
+X
+X		Ch&=0x9F;
+X	}
+X	return SUCCESS;
+X}
+X
+static void
+Send_ACK()
+X{
+X	Send_Byte(DLE);
+X	Send_Byte(Seq_Num+'0');
+X}
+X
+static void
+Init()
+X{
+X	int i;
+X
+X	R_BUffer_Len=Window_Size=PendinG_Count=Next_Packet=
+X		R_Bytes=S_Bytes=Seq_Num=Packets_Btwn_ACKs=Last_ACK=0;
+X
+X/*	PackeT_Size=(mrate(NIL(char))) > 1200 ? 1025 : 513; */
+X	i=mrate(NIL(char));
+X	PackeT_Size=(i>2400) ? 2049 : (i>1200) ? 1025 : 513;
+X
+X	Quoting=Quote_Mask;
+X
+X	for (i=0;i<Send_Ahead_Buffers;i++)
+X		Pending[i].packet=NIL(char);
+X
+X	Actual_Check=Check_B;
+X	Abort_Flag=Sent_ENQ=FALSE;
+X
+X	memset(Mask,0,32);
+X
+X	Mask[ETX]=Mask[ENQ]=Mask[DLE]=Mask[NAK]=Mask[XON]=Mask[XOFF]=MaskLowRange;
+X
+X	total_sent=total_read=data=fsize=Read_Errors=Send_Errors=
+X		already_have=carriage_return=0;
+X	fputs("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",tfp);
+X	ttgoto(LI-14,25);
+X	S1("CIS B-Plus Protocol Transfer");
+X
+X	ttgoto(LI-10,0);
+X	fputs("B+ Bytes Sent       B+ Bytes Rcvd",tfp);
+X	ttgoto(LI-10,40);
+X	fputs("Data Bytes          Carriage Returns",tfp);
+X	ttgoto(LI-6,10);
+X	fputs("Time Remaining:",tfp);
+X	ttgoto(LI-6,48);
+X	fputs("Elapsed Time:",tfp);
+X}
+X
+static void
+XXmit_Packet(Size, Seq, Packet)
+int Size, Seq;
+unchar *Packet;
+X{
+X	register I;
+X
+X	init_check();
+X	Send_Byte(DLE);
+X	Send_Byte('B');
+X	Send_Byte(Seq+'0');
+X	do_checksum(Seq+'0');
+X
+X	for (I=0;I<Size;I++)
+X		Send_Masked_Byte(Packet[I]),
+X		do_checksum(Packet[I]);
+X
+X	Send_Byte(ETX);
+X	do_checksum(ETX);
+X	if (Actual_Check==Check_B)
+X		Send_Masked_Byte(Checksum);
+X	else
+X		Send_Masked_Byte(Checksum>>8),
+X		Send_Masked_Byte(Checksum&0xff);
+X}
+X
+static
+Wait_For_ACK(Have_DLE_B, Acknowledge, Resend)
+short Have_DLE_B, Acknowledge, Resend;
+X{
+X	Sender_Action Action;
+X
+X	int i=0, n, RCV_Num, Errors=0;
+X
+X	R_BUffer_Len=0;
+X	Packet_Received=FALSE;
+X
+X	if (Have_DLE_B)
+X		Action=S_DLE_B_Seen;
+X	else
+X		Action=S_Get_DLE;
+X
+X	while (Errors<Max_Errors)
+X		switch (Action){
+X		case S_Get_Data:
+X			if (Read_Masked_Byte()==FAILURE){
+X				Action=S_Send_NAK;
+X				Why_NAK("couldn't read next data byte");
+X			} else if (Not_Masked && Ch==ETX)
+X				Action=S_Get_check;
+X			else if (Not_Masked && Ch==ENQ)
+X				Action=S_SenD_ACK;
+X			else if (i==PackeT_Size){
+X				Action=S_Send_NAK;
+X				Why_NAK("incoming buffer overflow");
+X			} else
+X				R_Buffer[i++]=Ch,
+X				do_checksum(Ch);
+X			break;
+X
+X		case S_Get_DLE:
+X			if (Packets_Btwn_ACKs>Window_Size+2&&PendinG_Count){
+X				Packets_Btwn_ACKs=0;
+X				Action=S_SEnd_ENQ;
+X				continue;
+X			}
+X			if (!Read_Byte())
+X				Action=S_SEnd_ENQ;
+X			else if (Ch==DLE)
+X				Action=S_DLE_Seen;
+X			else if (Ch==NAK)
+X				Action=S_SEnd_ENQ;
+X			else if (Ch==ENQ)
+X				Action=S_SenD_ACK;
+X			else if (Ch==ETX){
+X				Action=S_Send_NAK;
+X				Why_NAK("awaiting DLE, got ETX");
+X			}
+X			break;
+X
+X		case S_DLE_Seen:
+X			if (!Read_Byte())
+X				Action=S_SEnd_ENQ;
+X			else if (Ch>='0'&&Ch<='9')
+X				if (Sent_ENQ&&Ch==Last_ACK){
+X					Sent_ENQ=FALSE;
+X
+X					if (!PendinG_Count)
+X						return SUCCESS;
+X					else
+X						Action=S_Resend_Packets;
+X				} else {
+X					Discard_ACKed_Packets();
+X					if (Sent_ENQ)
+X						Action=S_Get_DLE;
+X					else
+X						return SUCCESS;
+X				}
+X			else if (Ch==';')
+X				Action=S_Get_DLE;
+X			else if (Ch=='B')
+X				Action=S_DLE_B_Seen;
+X			else if (Ch==ENQ)
+X				Action=S_SenD_ACK;
+X			else
+X				Action=S_Get_DLE;
+X			break;
+X
+X		case S_DLE_B_Seen:
+X			if (!Read_Byte()){
+X				Action=S_Send_NAK;
+X				Why_NAK("no data byte after DLE-B");
+X			} else if (Ch==ENQ)
+X				Action=S_SenD_ACK;
+X			else {
+X				init_check();
+X				RCV_Num=Ch-'0';
+X				do_checksum(Ch);
+X				i=0;
+X				Action=S_Get_Data;
+X			}
+X			break;
+X
+X		case S_Get_check:
+X			do_checksum(ETX);
+X
+X			if (Read_Masked_Byte()==FAILURE){
+X				Action=S_Send_NAK;
+X				Why_NAK("no incoming checksum");
+X			} else if (Not_Masked&&Ch==ENQ)
+X				Action=S_SenD_ACK;
+X			else if (Actual_Check==Check_CRC)
+X				Action=S_Get_CRC;
+X			else
+X				Action=S_VErify_CKS;
+X			break;
+X
+X		case S_Get_CRC:
+X			do_checksum(Ch);
+X
+X			if (Read_Masked_Byte()==FAILURE){
+X				Action=S_Send_NAK;
+X				Why_NAK("no incoming CRC value");
+X			} else if (Not_Masked&&Ch==ENQ)
+X				Action=S_SenD_ACK;
+X			else
+X				Action=S_Verify_CRC;
+X			break;
+X
+X		case S_Verify_CRC:
+X			do_checksum(Ch);
+X
+X			if (!Checksum)
+X				Action=S_VerIfy_Packet;
+X			else {
+X				Action=S_Send_NAK;
+X				Why_NAK("CRC error");
+X			}
+X			break;
+X
+X		case S_VErify_CKS:
+X			if (Checksum==Ch)
+X				Action=S_VerIfy_Packet;
+X			else {
+X				Action=S_Send_NAK;
+X				Why_NAK("Checksum error");
+X			}
+X			break;
+X
+X		case S_VerIfy_Packet:
+X			if (RCV_Num==((Seq_Num+1)%10)||R_Buffer[0]=='F'){
+X				Packets_Btwn_ACKs++;
+X				Seq_Num=RCV_Num;
+X				if (Acknowledge)
+X					Send_ACK();
+X				R_BUffer_Len=i;
+X				Packet_Received=TRUE;
+X				return FAILURE;
+X			} else if (RCV_Num==Seq_Num)
+X				Action=S_SenD_ACK;
+X			else {
+X				Action=S_Send_NAK;
+X				Why_NAK("packet out of sequence");
+X			}
+X			break;
+X
+X		case S_Send_NAK:
+X			ttgoto(LI-2,20);
+X			sprintf(Msg,"Read Errors: %2.1d",++Read_Errors);
+X			S;
+X			Errors++;
+X			Send_Byte(NAK);
+X			Action=S_Get_DLE;
+X			break;
+X
+X		case S_SenD_ACK:
+X			Send_ACK();
+X			Action=S_Get_DLE;
+X			break;
+X
+X		case S_SEnd_ENQ:
+X			ttgoto(LI-2,40);
+X			sprintf(Msg,"Send Errors: %2.1d",++Send_Errors);
+X			S;
+X			Errors++;
+X			Sent_ENQ=TRUE;
+X			Send_Byte(ENQ);
+X			Send_Byte(ENQ);
+X			Action=S_Get_DLE;
+X			break;
+X
+X		case S_Resend_Packets:
+X			if (Resend)
+X				for (i=0;i<PendinG_Count;i++)
+X					n=(Next_Packet+i)%Send_Ahead_Buffers,
+X					Xmit_Packet(
+X						Pending[n].PackeT_Size,
+X						Pending[n].Seq,
+X						Pending[n].packet);
+X			else
+X				return FAILURE;
+X
+X			Action=S_Get_DLE;
+X			break;
+X		}
+X	return FAILURE;
+X}
+X
+static void
+Send_Failure(Code, Text)
+char Code;
+char *Text;
+X{
+X	int Len, Seq;
+X
+X	S_Buffer[0]='F';
+X	S_Buffer[1]=Code;
+X	Len=2;
+X	while (*Text)
+X		S_Buffer[Len++]= *Text++;
+X
+X	Seq=(Seq_Num+1)%10;
+X
+X	while (PendinG_Count&&Wait_For_ACK(FALSE,FALSE,FALSE))
+X		;
+X
+X	Xmit_Packet(Len,Seq,S_Buffer);
+X
+X	do
+X		Wait_For_ACK(FALSE,FALSE,FALSE);
+X	while (Packet_Received);
+X}
+X
+static
+XFlush_Pending()
+X{
+X	while (PendinG_Count)
+X		if (!Wait_For_ACK(FALSE,TRUE,TRUE))
+X			return FAILURE;
+X
+X	return SUCCESS;
+X}
+X
+static void
+Send_Abort()
+X{
+X	fclose(Data_File);
+X	sprintf(Msg,"Transfer abort requested");
+X	S0(Msg);
+X	Send_Failure('A',Msg);
+X}
+X
+static
+Send_Packet(Size)
+int Size;
+X{
+X	int Next, Next_Seq;
+X
+X	while ((PendinG_Count>Window_Size))
+X		if (!Wait_For_ACK(FALSE,TRUE,TRUE)){
+X			Send_Abort();
+X			return FAILURE;
+X		}
+X
+X	Next=(Next_Packet+PendinG_Count)%Send_Ahead_Buffers;
+X	PendinG_Count++;
+X
+X	Next_Seq=Seq_Num=(Seq_Num+1)%10;
+X	Pending[Next].Seq=Next_Seq;
+X	Pending[Next].packet=strdup(S_Buffer);
+X	Pending[Next].PackeT_Size=Size;
+X	Packets_Btwn_ACKs=0;
+X
+X	Xmit_Packet(Size,Next_Seq,S_Buffer);
+X
+X	return SUCCESS;
+X}
+X
+static ulong
+cnvAtoL(ptr)
+char *ptr;
+X{
+X	ushort sign=FALSE;
+X	char ch;
+X	ulong result=0;
+X
+X	ch= *ptr++;
+X
+X	if (ch=='-')
+X		sign=TRUE,
+X		ch= *ptr++;
+X
+X	while (ch>='0'&&ch<='9')
+X		result=result*10+(ch-'0'),
+X		ch= *ptr++;
+X
+X	return(sign?-result:result);
+X}
+X
+static
+char *cnvLtoA(ptr, n)
+char *ptr;
+ulong n;
+X{
+X	char tmp1[11], *tmp2=tmp1;
+X
+X	if (!n){
+X		*ptr++ ='0';
+X		return ptr;
+X	}
+X
+X	*tmp2++ =0;
+X	do 
+X		*tmp2++ =((char)(n%10))+'0',
+X		n/=10;
+X	while (n>0);
+X
+X	tmp2--;
+X	while (*tmp2)
+X		*ptr++ = *tmp2--;
+X
+X	return ptr;
+X}
+X
+static void
+Send_Unexpected_Packet()
+X{
+X	sprintf(Msg,"Unexpected packet type");
+X	S0(Msg);
+X	Send_Failure('N',Msg);
+X}
+X
+XFILE *
+QueryCreate(Offer_Resume)
+short Offer_Resume;
+X{
+X	int key;
+X	short Condition;
+X	FILE *fileptr;
+X
+X	Condition = isregfile(Name) ? Offer_Resume : Resume_Denied;
+X
+X	if (access(Name,0)&&(fileptr=fopen(Name,"w"))){
+X		Result=Overwrite;
+X		return fileptr;
+X	} else if (access(Name,2))
+X		Condition = Resume_Denied;
+X
+X	switch(Condition){
+X	case Resume_Allowed:
+X		sprintf(Msg,"'%s' exists; Overwrite, Resume, reName, or Abort?",Name);
+X		break;
+X
+X	case Resume_Not_Allowed:
+X		sprintf(Msg,"'%s' exists; Overwrite, reName, or Abort?",Name);
+X		break;
+X
+X	case Resume_Failed:
+X		sprintf(Msg,"'%s' CRC error; Overwrite, reName or Abort?",Name);
+X		break;
+X
+X	case Resume_Denied:
+X		sprintf(Msg,"Permission denied for '%s'; reName, or Abort?",Name);
+X		break;
+X	}
+X	if (cismode)
+X		S0(Msg);
+X	else
+X		S2(Msg);
+X
+X	for (;;){
+X		beep();
+X		key=toupper(fgetc(stdin));
+X		if (isupper(key)){
+X			fputc(key,tfp);
+X
+X			switch(key){
+X			case 'O':
+X				if (Condition!=Resume_Denied){
+X					Result=Overwrite;
+X					return fopen(Name,"w");
+X				}
+X				break;
+X
+X			case 'N':
+X				fputc('\r',tfp);
+X				cl_line();
+X				show(-1,"Enter New Name:");
+X				getline();
+X				getword();
+X				strcpy(Name,word);
+X				return QueryCreate(Offer_Resume);
+X
+X			case 'A':
+X				return NIL(FILE);
+X
+X			case 'R':
+X				if (Condition==Resume_Allowed){
+X					Result=Resume;
+X					return fopen(Name,"r+");
+X				}
+X				break;
+X			}
+X			fputc('\b',tfp);
+X		}
+X	}
+X}
+X
+static
+Read(fp, buf, want)
+XFILE *fp;
+char *buf;
+register int want;
+X{
+X	register c;
+X	int read=0;
+X
+X	while (want--)
+X		switch(c=getc(fp)){
+X		case EOF:
+X			return read;
+X
+X		case '\n':
+X			if (cr_add&&textmode&&Last_Chr!='\r')
+X				ungetc(c,fp),
+X				carriage_return++,
+X				c='\r';
+X
+X		default:
+X			Last_Chr= *buf++ =c;
+X			read++;
+X		}
+X
+X	return read;
+X}
+X
+static
+Write(fp, buf, want)
+XFILE *fp;
+char *buf;
+register int want;
+X{
+X	int written=0;
+X
+X	for (;want-->0;buf++){
+X		if (textmode){
+X			if (*buf=='\r'){
+X				Last_Chr= *buf;
+X				continue;
+X			}
+X			if (Last_Chr=='\r')
+X				if (*buf=='\n')
+X					carriage_return--;
+X				else
+X					if (fputc('\r',fp)== -1)
+X						return -1;
+X					else
+X						written++;
+X
+X			Last_Chr= *buf;
+X		}
+X
+X	if (fputc(*buf,fp)== -1)
+X		return -1;
+X	else
+X		written++;
+X	}
+X
+X	return written;
+X}
+X
+static
+Receive_File()
+X{
+X	char *ptr;
+X	int N, i;
+X	short Request_Resume;
+X
+X	Result=Overwrite;
+X	if (Valid_To_Resume_Download==2)
+X		Request_Resume=Resume_Allowed;
+X	else
+X		Request_Resume=Resume_Not_Allowed;
+X
+X	if (!(Data_File=QueryCreate(Request_Resume))){
+X		Send_Abort();
+X		return FAILURE;
+X	}
+X
+X	chown(Name,getuid(),getgid());
+X
+X	if (Result==Resume){
+X		strcpy(tdir,"Attempting receive resume of");
+X		showmode();
+X
+X		init_check();
+X
+X		do {
+X			S_Buffer[0]='N';
+X			N=Read(Data_File,&S_Buffer[0],PackeT_Size-1);
+X
+X			if (N>0){
+X				for (i=0;i<N;i++)
+X					do_checksum(S_Buffer[i]);
+X				if (Abort_Flag){
+X					Send_Abort();
+X					return FAILURE;
+X				}
+X
+X				already_have+=N;
+X			}
+X		} while (N>0);
+X
+X		ptr= &S_Buffer[0];
+X
+X		*ptr++ ='T';
+X		*ptr++ ='r';
+X
+X		ptr=cnvLtoA(ptr,already_have);
+X		*ptr++ =' ';
+X		ptr=cnvLtoA(ptr,Checksum);
+X
+X		if (!Send_Packet(ptr- &S_Buffer[0])||!Flush_Pending()){
+X			fclose(Data_File);
+X			S0("Can't resume transfer");
+X			return FAILURE;
+X		}
+X
+X		fseek(Data_File,0L,2);
+X
+X		strcpy(tdir,"Resuming receive of");
+X		data=already_have-carriage_return;
+X		carriage_return= -carriage_return;
+X		showmode();
+X	} else
+X		Send_ACK(),
+X		strcpy(tdir,"Receiving"),
+X		already_have=0;
+X
+X	for (;;){
+X		if (Abort_Flag){
+X			Send_Abort();
+X			return FAILURE;
+X		}
+X
+X		Wait_For_ACK(FALSE,TRUE,TRUE);
+X
+X		if (Packet_Received)
+X			switch(R_Buffer[0]){
+X			case 'N':
+X				if ((N=Write(Data_File,&R_Buffer[1],R_BUffer_Len-1))== -1){
+X					sprintf(Msg,"Disk write error");
+X					S0(Msg);
+X					Send_Failure('I',Msg);
+X					fclose(Data_File);
+X					return FAILURE;
+X				}
+X
+X				stats(N);
+X				break;
+X
+X			case 'T':
+X				switch(R_Buffer[1]){
+X				case 'I':
+X					fsize=cnvAtoL(&R_Buffer[4]);
+X					showmode();
+X					break;
+X
+X				case 'C':
+X					fclose(Data_File);
+X					return SUCCESS;
+X
+X				case 'f':
+X					fclose(Data_File);
+X
+X					if (!(Data_File=QueryCreate(Resume_Failed))){
+X						Send_Abort();
+X						return FAILURE;
+X					}
+X
+X					chown(Name,getuid(),getgid());
+X					strcpy(tdir,"Receiving");
+X					data=already_have=carriage_return=0;
+X					showmode();
+X					break;
+X
+X				default:
+X					Send_Unexpected_Packet();
+X					fclose(Data_File);
+X					return FAILURE;
+X				}
+X				break;
+X
+X			case 'F':
+X				fclose(Data_File);
+X				R_Buffer[R_BUffer_Len]=0;
+X
+X				if (Result==Resume)
+X					sprintf(Msg,"Can't resume transfer: %s",&R_Buffer[3]);
+X				else
+X					sprintf(Msg,"B protocol Failure: %s",&R_Buffer[3]);
+X
+X				S0(Msg);
+X				return FAILURE;
+X
+X			default:
+X				Send_Unexpected_Packet();
+X				fclose(Data_File);
+X				return FAILURE;
+X			}
+X		else {
+X			fclose(Data_File);
+X			return FAILURE;
+X		}
+X	}
+X}
+X
+static char *
+Handle_Send_Failure()
+X{
+X	if (!R_BUffer_Len)
+X		return("Remote is not responding");
+X	else {
+X		if (R_Buffer[0]=='F'){
+X			if (R_BUffer_Len>=2){
+X					R_Buffer[min(81,R_BUffer_Len)]='\0';
+X					return(&R_Buffer[1]);
+X				} else
+X					return("No reason given by remote");
+X		} else {
+X			Send_Failure('E',"Unexpected packet type");
+X			return("Unexpected packet type");
+X		}
+X	}
+X}
+X
+static
+Send_File()
+X{
+X	int N;
+X	struct stat statbuf;
+X
+X	if (!(Data_File=fopen(Name,"r"))){
+X		sprintf(Msg,"Can't access '%s'",Name);
+X		S0(Msg);
+X		Send_Failure('M',Msg);
+X		return FAILURE;
+X	}
+X
+X	fstat(fileno(Data_File),&statbuf);
+X	fsize=statbuf.st_size;
+X
+X	strcpy(tdir,"Transmitting");
+X	showmode();
+X
+X	do {
+X		S_Buffer[0]='N';
+X		N=Read(Data_File,&S_Buffer[1],PackeT_Size-1);
+X
+X		if (N>0){
+X			if (!Send_Packet(N+1)){
+X				fclose(Data_File);
+X				S0(Handle_Send_Failure());
+X				return FAILURE;
+X			}
+X
+X			if (Abort_Flag){
+X				Send_Abort();
+X				return FAILURE;
+X			}
+X
+X			stats(N);
+X		}
+X	} while (N>0);
+X
+X	if (!N){
+X		fclose(Data_File);
+X		S_Buffer[0]='T';
+X		S_Buffer[1]='C';
+X
+X		if (!Send_Packet(2)){
+X			S0(Handle_Send_Failure());
+X			return FAILURE;
+X		}
+X
+X		return Flush_Pending();
+X	} else {
+X		sprintf(Msg,"Disk read error");
+X		S0(Msg);
+X		Send_Failure('I',Msg);
+X		return FAILURE;
+X	}
+X}
+X
+X#define Plus_PackeT_Size	18
+X#define LowRange		7
+X#define HiRange			11
+X
+X#define My_Send_Window_Size	1
+X#define My_Recv_Window_Size	1
+X#define My_Buffer_Size		8
+X#define My_Check_Method		Check_CRC
+X#define My_Download_Resume	2
+X#define My_Upload_Resume	0
+X#define My_File_Information	1
+X
+static char Quote_Level_Select_Low[]={
+X	1, 3, 3, 0, 3, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+X	0, 0, 3, 0, 3, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3
+X};
+X
+X
+static char QuotE_Level_select_Hi[]={
+X	3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+X	3, 2, 3, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3
+X};
+X
+static char QUote_Level_Mapping[]={
+X	Quote_Not_NULL,
+X	Quote_Default,
+X	Quote_Extended,
+X	Quote_Full
+X};
+X
+static
+Plus_Respond()
+X{
+X	int Status, temp_window_size, temp_method, temp_size, MaskByte, Bit, i;
+X	char Estimated_Quote_Level=0;
+X
+X	S_Buffer[0]='+';
+X	S_Buffer[1]=My_Send_Window_Size;
+X	S_Buffer[2]=My_Recv_Window_Size;
+X
+X	S_Buffer[3]=PackeT_Size/128;
+X
+X	S_Buffer[4]=My_Check_Method;
+X
+X	S_Buffer[5]=Quote_Default;
+X	S_Buffer[6]=FALSE;
+X
+X	S_Buffer[15]=My_Download_Resume;
+X	S_Buffer[16]=My_Upload_Resume;
+X	S_Buffer[17]=My_File_Information;
+X
+X	for (i=0;i<8;i++)
+X		S_Buffer[i+LowRange]=0;
+X
+X	for (MaskByte=0;MaskByte<4;MaskByte++)
+X		for (Bit=0;Bit<8;Bit++){
+X			if (Mask[MaskByte*8+Bit]&MaskLowRange)
+X				S_Buffer[MaskByte+LowRange]|=0x80>>Bit;
+X
+X			if (Mask[MaskByte*8+Bit]&MaskHiRange)
+X				S_Buffer[MaskByte+HiRange]|=0x80>>Bit;
+X		}
+X
+X	for (i=R_BUffer_Len;i<Plus_PackeT_Size;i++)
+X		R_Buffer[i]=0;
+X
+X	if (R_Buffer[3]<S_Buffer[3])
+X		temp_size=(R_Buffer[3]*128)+1;
+X	else
+X		temp_size=(S_Buffer[3]*128)+1;
+X
+X
+X	temp_window_size=min(R_Buffer[2],My_Send_Window_Size);
+X	temp_method=min(R_Buffer[4],My_Check_Method);
+X	Valid_To_Resume_Download=min(R_Buffer[15],My_Download_Resume);
+X	ValiD_To_Resume_Upload=min(R_Buffer[16],My_Upload_Resume);
+X	Send_FIle_Information=min(R_Buffer[17],My_File_Information);
+X
+X	if (R_BUffer_Len>=Plus_PackeT_Size)
+X		for (MaskByte=0;MaskByte<4;MaskByte++)
+X			for (Bit=0;Bit<8;Bit++){
+X				if (R_Buffer[LowRange+MaskByte]&(0x80>>Bit))
+X					Mask[MaskByte*8+Bit]|=MaskLowRange;
+X
+X				if (R_Buffer[HiRange+MaskByte]&(0x80>>Bit))
+X					Mask[MaskByte*8+Bit]|=MaskHiRange;
+X			}
+X	else {
+X		for (i=0;i<32&&Estimated_Quote_Level<3;i++){
+X			if (Mask[i]&MaskLowRange)
+X				Estimated_Quote_Level=
+X					max(Quote_Level_Select_Low[i],Estimated_Quote_Level);
+X
+X			if (Mask[i]&MaskHiRange)
+X				Estimated_Quote_Level=
+X					max(QuotE_Level_select_Hi[i],Estimated_Quote_Level);
+X		}
+X	}
+X
+X	Quoting=Quote_Full;
+X	S_Buffer[5]=QUote_Level_Mapping[Estimated_Quote_Level];
+X
+X	if (Status=Send_Packet(Plus_PackeT_Size))
+X		if (Status=Flush_Pending()){
+X			Actual_Check=temp_method;
+X			PackeT_Size=temp_size;
+X			Window_Size=temp_window_size;
+X		}
+X	Quoting=Quote_Mask;
+X
+X	return Status;
+X}
+X
+static
+Do_Transfer()
+X{
+X	int I, N;
+X	short Have_DLE_B=TRUE;
+X
+X	for (;;){
+X		Wait_For_ACK(Have_DLE_B,FALSE,TRUE);
+X		if (Packet_Received){
+X			if (R_Buffer[0]=='T'){
+X				if (R_Buffer[1]!='D'&&R_Buffer[1]!='U'){
+X					S0("Invalid transfer direction");
+X					Send_Failure('N',"Not implemented");
+X					return FAILURE;
+X				}
+X				if (R_Buffer[2]!='A'&&R_Buffer[2]!='B'){
+X					S0("Invalid transfer type");
+X					Send_Failure('N',"Not implemented");
+X					return FAILURE;
+X				}
+X				N=min(R_BUffer_Len-3,SM_BUFF-1);
+X				for (I=0;I<N;I++)
+X					Name[I]=R_Buffer[I+3];
+X				Name[I]='\0';
+X				textmode=(R_Buffer[2]=='A');
+X
+X				if (R_Buffer[1]=='U'){
+X					Send_ACK();
+X					return Send_File();
+X				} else
+X					return Receive_File();
+X
+X			} else if (R_Buffer[0]=='+'){
+X				if (Plus_Respond())
+X					Have_DLE_B=FALSE;
+X				else {
+X					S0("Could not negotiate B-Plus parameters");
+X					return FAILURE;
+X				}
+X			} else {
+X				Send_Unexpected_Packet();
+X				return FAILURE;
+X			}
+X		} else {
+X			S0("Remote is not responding");
+X			return FAILURE;
+X		}
+X	}
+X}
+X
+static
+void cisbsigint(junk)
+int junk;
+X{
+X	signal(SIGINT,cisbsigint);
+X	Abort_Flag=TRUE;
+X}
+X
+void
+B_Transfer()
+X{
+X	short Status=FALSE;
+X	void (*oldvec)();
+X
+X	oldvec = signal(SIGINT,cisbsigint);
+X	cur_off();
+X	Init();
+X	purge();
+X	Send_Byte(DLE);
+X	Send_Byte('+');
+X	Send_Byte('+');
+X	Send_ACK();
+X
+X	Read_Byte();
+X	switch(Ch){
+X	case DLE:
+X		Read_Byte();
+X		if (Ch=='B')
+X			Status=Do_Transfer();
+X		break;
+X
+X	default:
+X		fputc(Ch,tfp);
+X		break;
+X	}
+X
+X	sprintf(Msg,"File Transfer %s",Status?"Succeeded":"Failed");
+X	S0(Msg);
+X	beep();
+X
+X	if (Abort_Flag){
+X		while (Read_Byte() && Ch==ENQ){
+X			Seq_Num=0;
+X			Send_Byte(DLE);
+X			Send_Byte('+');
+X			Send_Byte('+');
+X			Send_ACK();
+X		}
+X	}
+X
+X	cur_on();
+X	signal(SIGINT,oldvec);
+X}
+END_OF_FILE
+if test 22715 -ne `wc -c <'xcb+.c'`; then
+    echo shar: \"'xcb+.c'\" unpacked with wrong size!
+fi
+# end of 'xcb+.c'
+fi
+if test -f 'xcmain.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xcmain.c'\"
+else
+echo shar: Extracting \"'xcmain.c'\" \(17053 characters\)
+sed "s/^X//" >'xcmain.c' <<'END_OF_FILE'
+X/*	xcmain.c -- main module for XC
+X	This file uses 4-character tabstops
+X*/
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <sys/types.h>
+X#include <signal.h>
+X#include <ctype.h>
+X#include <termio.h>
+X#include <sys/ioctl.h>
+X#include <setjmp.h>
+X#include "xc.h"
+X
+X#define Resume_Not_Allowed	1
+X
+short
+X	autoflag =	FALSE,	/* Automatic capturing */
+X	cismode =	FALSE,	/* Automatic response to CIS "ENQ" */
+X	cr_add =	TRUE,	/* Add cr to nl in B+ uploads */
+X	hdplxflag =	FALSE,	/* Half-duplex mode */
+X 	menuflag =	TRUE,	/* Show mini-menu */
+X	nl2cr =		TRUE,	/* Map nl to cr when transmitting ASCII */
+X	reterm =	FALSE,	/* Jumping into terminal mode */
+X	statflag =	FALSE,	/* Flag for status display */
+X	eofflag =	FALSE;	/* Flag to quit a script */
+int s_cis(), s_set(), s_exit(), s_shell();
+char Msg[SM_BUFF];
+unchar BS, LK;
+XFILE *tfp;
+struct termio newmode, oldmode, sigmode;
+static char	*statfmt = "\r\t\t%-8s %25s %s\r\n",
+X			version[]="@(#)XC 4.1 JPRadley 10 April 1993",
+X			oldshell[SM_BUFF],
+X			*babble[] = {
+X				"\r\nUsage: xc [-l device] [-s file | -t]",
+X				"\t-l device\tUse 'device' as the modem port",
+X				"\t-s script\tExecute 'script' immediately",
+X				"\t-t\t\tEnter terminal mode immediately",
+X				NIL(char)
+X			};
+static s_script(), s_xmodem(), s_term(), s_help(), s_dial(), puttake(),
+X	SET_proto(), SET_cr(), SET_cis(), SET_nl(), SET_xon(), SET_xcape(),
+X	SET_menu(), SET_hdplx(), SET_bps(), SET_autocapt(), SET_cfile(),
+X	SET_pfile();
+extern short scriptflag;
+extern void B_Transfer(), dbglog(), mattach(), terminal(), xreceive(), xsend(),
+X	get_ttype(), unlock_tty();
+jmp_buf erret;			/* non-local error return */
+X
+struct kw {				/* Used by command parsing routines */
+X	char *keyword;
+X	int (*rtn)();
+X};
+X
+static struct kw cmds[] = {
+X	{"c",		s_cis},
+X	{"cis",		s_cis},
+X	{"s",		s_script},
+X	{"script",	s_script},
+X	{"h",		hangup},
+X	{"hangup",	hangup},
+X	{"bindings",show_bindings},
+X	{"rb",		s_xmodem},
+X	{"rt",		s_xmodem},
+X	{"sb",		s_xmodem},
+X	{"st",		s_xmodem},
+X	{"set",		s_set},
+X	{"t",		s_term},
+X	{"term",	s_term},
+X	{"d",		s_dial},
+X	{"dial",	s_dial},
+X	{"q",		s_exit},
+X	{"quit",	s_exit},
+X	{"exit",	s_exit},
+X	{"x",		s_exit},
+X	{"!",		s_shell},
+X	{"!!",		s_shell},
+X	{"$",		s_shell},
+X	{"%p",		puttake},
+X	{"%t",		puttake},
+X	{"help",	s_help},
+X	{"?",		s_help},
+X	{NIL(char),	0}
+X};
+X
+static struct kw setlist[] = {
+X	{"auto",	SET_autocapt},
+X	{"baud",	SET_bps},
+X	{"bps",		SET_bps},
+X	{"cfile",	SET_cfile},
+X	{"cis",		SET_cis},
+X	{"cr",		SET_cr},
+X	{"hdplx",	SET_hdplx},
+X	{"menu",	SET_menu},
+X	{"nl",		SET_nl},
+X	{"pfile",	SET_pfile},
+X	{"proto",	SET_proto},
+X	{"escape",	SET_xcape},
+X	{"xcape",	SET_xcape},
+X	{"xon",		SET_xon},
+X	{"xoff",	SET_xon},
+X	{NIL(char),	0}
+X};
+X
+X/* Print the status of the program */
+static void
+status()
+X{
+X	struct kw *ptr;
+X	char p[30];
+X	int (*fct)() = 0;
+X
+X	statflag = TRUE;
+X
+X	cls();
+X	cur_off();
+X	sprintf(p,"Modem Port: %s",mport(NIL(char)));
+X	drawline(0, 0, CO);
+X	ttgoto(1, 9);
+X	sprintf(Msg,"%-29s%29s",&version[4], p);
+X	S;
+X	drawline(2, 0, CO);
+X	ttgoto(3, 0);
+X	fprintf(tfp, statfmt, "Keyword", "Description", "Status");
+X	fprintf(tfp, statfmt, "--------", "-------------------------", "-----------");
+X
+X	for (ptr = setlist; ptr->keyword; ptr++)
+X		if (ptr->rtn != fct){
+X			fct = ptr->rtn;
+X			(*fct)();
+X		}
+X
+X	ttgoto(18, 25);
+X	S1("Type \"help\" or ? for help");
+X	statflag = FALSE;
+X	cur_on();
+X}
+X
+X/* Catch a signal and jump to main. Reset signal and do a longjmp */
+static void
+catch(junk)
+int junk;
+X{
+X	if (! isatty(2))
+X		hangup(),
+X		s_exit();
+X
+X	S2("XC: Interrupt");
+X
+X	signal(SIGINT,catch);
+X	signal(SIGQUIT,catch);
+X	longjmp(erret,1);
+X}
+X
+static void
+usage()
+X{
+X	char **ptr;
+X
+X	for (ptr = babble; *ptr; ptr++)
+X		fprintf(tfp, "%s\r\n", *ptr);
+X}
+X
+main(argc, argv)
+int argc;
+char **argv;
+X{
+X	char *script = NIL(char);
+X	extern char *optarg;
+X	int c;
+X	extern int optind;
+X
+X	struct kw *ptr;
+X	tfp = stderr;
+X	if (isatty(2))
+X		get_ttype();
+X
+X	ioctl(0, TCGETA, &oldmode);	/* get current tty mode	*/
+X
+X	/* trap for SIGHUP and SIGTERM, make sure LCKfile gets killed */
+X	signal(SIGHUP,(void *)s_exit);
+X	signal(SIGTERM,(void *)s_exit);
+X
+X	newmode = oldmode;
+X
+X	newmode.c_iflag &= ~(IXON | IXOFF | IXANY);
+X	newmode.c_lflag &= ~(ICANON | ISIG | ECHO);
+X	newmode.c_oflag = 0;
+X	newmode.c_cc[VMIN] = 1;
+X	newmode.c_cc[VTIME] = 1;
+X	BS = newmode.c_cc[VERASE];
+X	LK = newmode.c_cc[VKILL];
+X
+X	sigmode = newmode;
+X	sigmode.c_lflag |= ISIG;
+X
+X	oldshell[0] = '\0';	/* set last command to blank */
+X	if (setjmp(erret))	/* set error handler to exit */
+X		exit(0);		/*  while parsing command line */
+X	signal(SIGINT,catch);	/* catch break & quit signals/keys */
+X	signal(SIGQUIT,catch);
+X
+X	default_bindings();
+X
+X	while ((c = getopt(argc, argv, "s:l:t")) != -1)
+X		switch (c){
+X		case 'l':	/* set modem port name */
+X			mport(optarg);
+X			break;
+X		case 's':	/* Execute SCRIPT file */
+X			script = optarg;
+X			break;
+X		case 't':	/* jump into terminal mode */
+X			reterm = TRUE;
+X			break;
+X		default:	/* Bad command .. print help */
+X			usage();
+X			exit(1);
+X		}
+X
+X	setuid(geteuid());
+X	setgid(getegid());
+X
+X	mopen();	/* opens and configures modem port, or exits */
+X
+X	setuid(getuid());
+X	setgid(getgid());
+X
+X	do_script(STARTUP);
+X
+X#if DEBUG
+X	dbglog();
+X#endif
+X
+X	if (!script)
+X		status();
+X
+X	for (;;){
+X		setjmp(erret);
+X		signal(SIGQUIT,(void *)s_exit);
+X		mode(SIGMODE);
+X
+X		if (script)
+X			do_script(script),
+X			script = NIL(char),
+X			reterm = TRUE;
+X
+X		if (reterm && isatty(2)){
+X			s_term();
+X			continue;
+X		}
+X
+X		fputc('\r',tfp),
+X		fputc('\n',tfp);
+X 		if (menuflag)
+X			fputc('\t',tfp),
+X 			S1("[d]ial directory  [t]erminal mode  [q]uit  [s]cript  [?]help");
+X		show(-1,"<XC>");
+X		fputc(' ',tfp);
+X
+X		lptr = line;
+X		getline();
+X		fputc('\r',tfp),
+X		fputc('\n',tfp);
+X
+X		getword();
+X		lc_word(word);
+X		if (word[0] == '\0')		/* If blank line... reprompt */
+X			continue;
+X
+X		for (ptr = cmds; ptr->keyword; ptr++)
+X			if (!strcmp(word, ptr->keyword))
+X				break;
+X
+X		if (ptr->keyword)
+X			(*ptr->rtn)();
+X		else
+X			sprintf(Msg,"Unrecognized command: %s",word),
+X			S;
+X	}
+X}
+X
+static
+s_script()
+X{
+X	getword();
+X
+X	if (word[0] == '\0'){
+X		S1("Script file not specified");
+X		return;
+X	}
+X
+X	sprintf(ddsname,"%s",word);
+X	do_script(ddsname);
+X	reterm = TRUE;
+X}
+X
+static
+s_xmodem()
+X{
+X	char d = word[0];
+X	char c = word[1];
+X	char oldproto[4];
+X
+X	strcpy(oldproto, protocol);
+X
+X	xc_setflow(FALSE);
+X	xc_setproto("8N1");
+X
+X	getword();
+X	if (word[0] == '\0')
+X		S1("Transfer file not specified");
+X	else if (d == 's')
+X		xsend(c);
+X	else
+X		xreceive(c);
+X
+X	reterm = TRUE;
+X	xc_setflow(flowflag);
+X	xc_setproto(oldproto);
+X}
+X
+static
+s_term()
+X{
+X	terminal(FALSE);
+X	if (cismode != 2)
+X		return;
+X	cismode = 1;
+X	s_cis();
+X}
+X
+static
+s_dial()
+X{
+X	terminal(TRUE);
+X	if (cismode != 2)
+X		return;
+X	cismode = 1;
+X	s_cis();
+X}
+X
+s_cis()
+X{
+X	char oldproto[4];
+X
+X	strcpy(oldproto, protocol);
+X
+X	xc_setflow(FALSE);
+X	xc_setproto("8N1");
+X	mode(SIGMODE);
+X
+X	B_Transfer();
+X
+X	reterm = TRUE;
+X	xc_setflow(flowflag);
+X	xc_setproto(oldproto);
+X}
+X
+s_shell()
+X{
+X	int stat_loc = 0;
+X	char c = word[0];
+X	static char *shell = NIL(char);
+X	void (*oldvec)();
+X
+X#if NOSHELL
+X	return(0);
+X#endif
+X	if (word[0] == word[1])
+X		strcpy(wptr = word, oldshell);
+X	else {
+X		getword();
+X		if (*wptr)
+X			strcpy(oldshell, wptr);
+X	}
+X
+X	if (!shell){
+X		shell = getenv("SHELL");
+X		if (!shell)
+X			shell = "/bin/sh";
+X	}
+X
+X	fputc('\r',tfp),
+X	fputc('\n',tfp);
+X	mode(OLDMODE);
+X
+X	if (!forkem()){
+X		if (c == '$')	/* Attach modem to stdin, stdout */
+X			mattach();
+X		signal(SIGCLD,SIG_DFL);
+X		signal(SIGINT,SIG_DFL);
+X		signal(SIGQUIT,SIG_DFL);
+X		if (word[0] == '\0')
+X			execl(shell, shell, "-i", NIL(char));
+X		else
+X			execl(shell, shell, "-c", wptr, NIL(char));
+X		S1("Exec failed!");
+X		exit(2);
+X	}
+X
+X	oldvec = signal(SIGINT,SIG_IGN);
+X	wait(&stat_loc);
+X	signal(SIGINT,oldvec);
+X
+X	strcpy(oldshell, wptr);
+X	return(!!stat_loc);
+X}
+X
+static char	*cmdlist[] = {
+X	"\tXC Command Summary",
+X	"",
+X	"\tc",
+X	"\tcis\t\tInitiate CIS B+ File Transfer (Upload and Download)",
+X	"",
+X	"\td",
+X	"\tdial\t\tDialing directory",
+X	"",
+X	"\tx",
+X	"\tq",
+X	"\texit",
+X	"\tquit\t\tExit XC",
+X	"",
+X	"\th",
+X	"\thangup\t\tHang up the modem",
+X	"",
+X	"\trb file\t\tXMODEM receive file 'file' (binary mode)",
+X	"\trt file\t\tXMODEM receive file 'file' (Ascii mode)",
+X	"",
+X	"\tsb file...\tXMODEM send file 'file' (binary mode)",
+X	"\tst file...\tXMODEM send file 'file' (Ascii mode)",
+X	"",
+X	"\tset\t\tDisplay XC parameters",
+X	"\tset kw\t\tDisplay XC parameter for 'kw'",
+X	"\tset kw val\tSet XC keyword 'kw' to 'val'",
+X	"",
+X	"\ts file",
+X	"\tscript file\tExecute XC script 'file'",
+X	"",
+X	"\tt",
+X	"\tterm\t\tEnter terminal mode",
+X	"",
+X#if !NOSHELL
+X	"\t!\t\tExecute a local interactive shell",
+X	"\t! cmd\t\tExecute shell command string on the local system",
+X	"\t!!\t\tRe-execute the last shell command string",
+X	"",
+X	"\t$ cmd\t\tShell command with stdin and stdout redirected to modem",
+X	"",
+X#endif
+X	"\t%p loc [rem]\tPut local file to a UNIX system",
+X	"",
+X	"\t%t rem [loc]\tTake remote file from a UNIX system",
+X	"",
+X	"\t?",
+X	"\thelp\t\tPrint (this) help text",
+X	"",
+X	"\tSET Keywords:",
+X	"",
+X	"\tset\t\t\tDisplay current XC status",
+X	"",
+X	"\tset auto on|off\t\tSet|Unset automatic capturing",
+X	"",
+X	"\tset bps value",
+X	"\tset baud value\t\tSet Bits/Second to 'value'",
+X	"",
+X	"\tset cfile name\t\tChange name of capture file",
+X	"",
+X	"\tset cis on\t\tSet CIS <ENQ> mode (Auto up/download)",
+X	"\tset cis off\t\tDo not respond to <ENQ>",
+X	"",
+X	"\tset cr on|off\t\tSet|Unset Carriage Return Injection mode",
+X	"",
+X	"\tset xcape char",
+X	"\tset escape char\t\tSet the Terminal mode escape character",
+X	"",
+X	"\tset hdplx on\t\tSet half-duplex mode",
+X	"\tset hdplx off\t\tUnset half-duplex mode (use full-duplex)",
+X	"",
+X 	"\tset menu on|off\t\tDo|Don't show mini-menu before XC prompt",
+X	"",
+X	"\tset nl on|off\t\tSet|Unset newline translation",
+X	"",
+X	"\tset pfile name\t\tChange name of phonelist file",
+X	"",
+X	"\tset proto 7E2\t\tSet 7-bit character size, even parity",
+X	"\tset proto 7O2\t\tSet 7-bit character size, odd parity",
+X	"\tset proto 8N1\t\tSet 8-bit character size, no parity",
+X	"",
+X	"\tset xon on|off",
+X	"\tset xoff on|off\t\tSet|Unset XON/XOFF flow control",
+X	"",
+X	"",
+X	NIL(char) };
+X
+static
+s_help()
+X{
+X	char **ptr = cmdlist;
+X	int curline = 0;
+X
+X	mode(OLDMODE);
+X	cls();
+X	cur_off();
+X	for ( ; *ptr; ptr++) {
+X		if (**ptr != '') {
+X			if (curline >= LI-2){
+X				S0("PRESS ENTER");
+X				getline();
+X				cls();
+X				curline = 0;
+X			}
+X			fprintf(tfp, "%s\r\n", *ptr);
+X			curline++;
+X		} else {
+X			S0("PRESS ENTER");
+X			getline();
+X			cls();
+X			curline = 0;
+X		}
+X	}
+X	show_bindings();
+X	S0("PRESS ENTER");
+X	getline();
+X	cls();
+X	status();
+X}
+X
+s_set()
+X{
+X	struct kw *ptr;
+X
+X	getword();
+X
+X	if (word[0] == '\0' && !scriptflag){
+X		status();
+X		return;
+X	} else if (word[0] == '\0'){
+X		S1("SET keyword requires an argument");
+X		eofflag++;
+X		return;
+X	}
+X
+X	lc_word(word);
+X
+X	for (ptr = setlist; ptr->keyword; ptr++)
+X		if (!strcmp(ptr->keyword, word)){
+X			(*ptr->rtn)();
+X			return;
+X		}
+X
+X	sprintf(Msg,"Invalid SET keyword: %s", word);
+X	S;
+X	eofflag++;
+X}
+X
+void
+set_onoff(flag)
+short *flag;
+X{
+X	char *ptr = strdup(word);
+X
+X	uc_word(ptr);
+X	getword();
+X	lc_word(word);
+X
+X	if (!strcmp(word, "on"))
+X		*flag = TRUE;
+X	else if (!strcmp(word, "off"))
+X		*flag = FALSE;
+X	else
+X		sprintf(Msg,"Set '%s' value must be 'on' or 'off'",ptr),
+X		S,
+X		eofflag++;
+X
+X	free(ptr);
+X}
+X
+static
+SET_proto()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "proto", "Port set to", protocol);
+X		return;
+X	}
+X
+X	getword();
+X	uc_word(word);
+X	if (word[0] == '\0')
+X		S1("Set proto must be 7E2, 7O2, or 8N1");
+X	else if (!xc_setproto(word))
+X		sprintf(Msg,"Unsupported protocol %s",word),
+X		S;
+X	eofflag++;
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Port set to %s", protocol),
+X		S;
+X}
+X
+static
+SET_cr()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "cr", "Carriage Return Injection",
+X			cr_add ? "ON" : "OFF");
+X		return;
+X	}
+X
+X	set_onoff(&cr_add);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Carriage Returns %s injected in B+ ASCII uploads",
+X			cr_add ? "ARE" : "are NOT"),
+X		S;
+X}
+X
+static
+SET_xcape()
+X{
+X	if (statflag) {
+X		fprintf(tfp, statfmt, "xcape", "Terminal Escape Character",
+X				 unctrl(my_escape));
+X		return;
+X	}
+X
+X	getword();
+X	if (word[0] == '\0') {
+X		show(1,"Set ESCAPE must specify escape character");
+X		eofflag++;
+X		return;
+X	}
+X
+X	my_escape = word[0];
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Terminal mode escape character set to '%s'",
+X				unctrl(my_escape)),
+X		S;
+X}
+X
+static
+SET_nl()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "nl", "Newline Translation",
+X			nl2cr ? "ON" : "OFF");
+X		return;
+X	}
+X
+X	set_onoff(&nl2cr);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Newlines %s changed to Carriage Returns",
+X			nl2cr ? "ARE" : "are NOT"),
+X		S;
+X}
+X
+static
+SET_cis()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "cis", "CIS <ENQ> Auto Download",
+X			cismode ? "ON" : "OFF");
+X		return;
+X	}
+X
+X	set_onoff(&cismode);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"CIS <ENQ> Auto Download is %s", cismode ? "ON" : "OFF"),
+X		S;
+X}
+X
+static
+SET_xon()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "xoff", "Terminal Mode XON/XOFF",
+X			flowflag ? "ON" : "OFF");
+X		return;
+X	}
+X
+X	set_onoff(&flowflag);
+X	xc_setflow(flowflag);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"XON/XOFF Flow control is %s", flowflag ? "ON" : "OFF"),
+X		S;
+X}
+X
+static
+SET_bps()
+X{
+X	if (statflag){
+X		char br[6];
+X		sprintf(br, "%d", mrate(NIL(char)));
+X		fprintf(tfp, statfmt, "bps", "Bits per Second", br);
+X		return;
+X	}
+X
+X	getword();
+X	if (word[0] == '\0')
+X		S1("Set BPS (or BAUD) must have a rate");
+X	else if (!mrate(word))
+X		sprintf(Msg,"Unsupported bps rate %s",word),
+X		S;
+X	eofflag++;
+X	if (!scriptflag)
+X		sprintf(Msg,"Bits/Second set to %d",mrate(NIL(char))),
+X		S;
+X}
+X
+static
+SET_hdplx()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "hdplx", "Half-duplex Mode",
+X			hdplxflag ? "ON" : "OFF");
+X		return;
+X	}
+X
+X	set_onoff(&hdplxflag);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Half-duplex Mode is %s", hdplxflag ? "ON" : "OFF"),
+X		S;
+X}
+X
+static
+SET_menu()
+X{
+X 	if (statflag){
+X 		fprintf(tfp, statfmt, "menu", "Mini-menu mode",
+X 			menuflag ? "ON" : "OFF");
+X 		return;
+X	}
+X 
+X 	set_onoff(&menuflag);
+X 
+X 	if (!scriptflag)
+X 		sprintf(Msg,"Mini-menu is %s shown", menuflag ? "" : "NOT"),
+X		S;
+X}
+X
+static
+SET_autocapt()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "auto", "Auto Capture",
+X			autoflag ? "ON" : "OFF");
+X		return;
+X	}
+X
+X	set_onoff(&autoflag);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Auto Capture is %s", autoflag ? "ON" : "OFF"),
+X		S;
+X}
+X
+static
+SET_cfile()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "cfile", "Capture File", captfile);
+X		return;
+X	}
+X
+X	getword();
+X	if (word[0] == '\0'){
+X		S1("Set CFILE must have file name");
+X		eofflag++;
+X		return;
+X	}
+X
+X	strcpy(captfile, word);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Capture file set to '%s'",captfile),
+X		S;
+X}
+X
+static
+SET_pfile()
+X{
+X	if (statflag){
+X		fprintf(tfp, statfmt, "pfile", "Phone Number File", phonefile);
+X		return;
+X	}
+X
+X	getword();
+X	if (word[0] == '\0'){
+X		S1("Set PFILE must have file name");
+X		eofflag++;
+X		return;
+X	}
+X
+X	strcpy(phonefile, word);
+X
+X	if (!scriptflag)
+X		sprintf(Msg,"Phone number file set to '%s'",phonefile),
+X		S;
+X}
+X
+X/*	Put and Take a file to/from a UNIX-type "cu" system. Unfortunately,
+X	the stty command is one of those commands that always gets changed
+X	with different UNIX systems, so you will get (at least) a file full of
+X	^M on the take command for systems later than V7 or work-alikes.
+X
+X	Additionally, the Take command takes a bit too much!
+X
+X	Fixed a lot of this: JPRadley 89/07/27
+X*/
+X
+static
+puttake()
+X{
+X	FILE *fp;
+X	int i, Ch;
+X	char c = word[1], fname[SM_BUFF], tname[SM_BUFF], wrkbuf[SM_BUFF];
+X
+X	getword();
+X
+X	signal(SIGINT,catch);
+X	signal(SIGQUIT,catch);
+X	xc_setflow(TRUE);
+X	if (word[0] == '\0'){
+X		sprintf(Msg,"Must give a filename with the '%%%c' option",c);
+X		S;
+X		return;
+X	}
+X
+X	strcpy(fname, word);
+X	getword();
+X	if (word[0] == '\0')
+X		strcpy(tname, fname);
+X	else
+X		strcpy(tname, word);
+X	switch (c){
+X	case 'p':
+X		if (!(fp = fopen(fname, "r")))
+X			sprintf(Msg,"Can't open '%s'",fname),
+X			S;
+X		else {
+X			fprintf(tfp, "\r\nPutting file '%s' to '%s' on remote UNIX\r\n",
+X				fname, tname);
+X			sprintf(wrkbuf,
+X				"sh -c \"stty -echo;(cat >%s)||cat >/dev/null;stty echo\"\n",
+X					tname);
+X			send_string(wrkbuf);	/* send command string to remote shell */
+X			i = 64;
+X			while ((Ch = getc(fp)) != EOF){
+X				if (++i > 64){		/* this prevents an overload on the */
+X					i = 0;			/* receiver's input buffer (64=kludge) */
+X					msecs((1+CBAUD-cbaud) * 100);
+X				}
+X				sendbyte(Ch);		/* send characters to cat command */
+X			}
+X			fclose(fp);
+X			sendbyte(EOT);			/* send a ^D to cat */
+X			purge();				/* get rid of whatever was sent back */
+X			sendbyte('\n');
+X		}
+X		break;
+X
+X	case 't':
+X		strcpy(Name, tname);
+X		if ((fp=QueryCreate(Resume_Not_Allowed))){
+X			fprintf(tfp, "\r\nTaking file '%s' from remote UNIX to '%s'\r\n",
+X				fname, tname);	
+X			purge();
+X			sprintf(wrkbuf,
+X				"sh -c \"stty nl;test -r %s&&cat %s;echo %c;stty -nl\"\n",
+X					fname, fname, DLE);	/* if 'fname' has a DLE, we'll die */
+X			send_string(wrkbuf);		/* send command to remote shell */
+X			while (readbyte(3) != '\n')	/* discard up to the \n in wrkbuf */
+X				;
+X			while ((Ch=readbyte(0)) != -1	/* while chars are being sent */
+X					 && Ch != DLE)			/* and we haven't seen our DLE */
+X				fputc(Ch,fp);
+X			fclose(fp);
+X		}
+X		break;
+X	}
+X	xc_setflow(flowflag);
+X	reterm = TRUE;
+X}
+X
+s_exit()
+X{
+X	signal(SIGHUP,SIG_IGN);
+X	signal(SIGINT,SIG_IGN);
+X	signal(SIGQUIT,SIG_IGN);
+X	signal(SIGTERM,SIG_IGN);
+X
+X	mode(OLDMODE);
+X	unlock_tty();
+X
+X	exit(0);
+X}
+END_OF_FILE
+if test 17053 -ne `wc -c <'xcmain.c'`; then
+    echo shar: \"'xcmain.c'\" unpacked with wrong size!
+fi
+# end of 'xcmain.c'
+fi
+if test -f 'xcport.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xcport.c'\"
+else
+echo shar: Extracting \"'xcport.c'\" \(11658 characters\)
+sed "s/^X//" >'xcport.c' <<'END_OF_FILE'
+X/*	xcport.c -- modem interface routines for XC
+X	This file uses 4-character tabstops
+X*/
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <sys/types.h>
+X#include <fcntl.h>
+X#include <signal.h>
+X#include <termio.h>
+X#include <sys/ioctl.h>
+X#include <errno.h>
+X#include "xc.h"
+X
+X/* define this if you need to send SIGUSR1/SIGUSR2 to
+X   handle an active getty process, or use ungetty.
+X*/
+X/*#define GETTY_HANDLER /**/
+X
+X# if DIDO == 2			/* SCO Xenix 2.2 uses ungetty */
+X#	define UNGETTY "/usr/lib/uucp/ungetty"
+X#	define UG_NOTENAB	0
+X#	define UG_ENAB		1
+X#	define UG_FAIL		2
+X#	define LOCKDIR "/usr/spool/uucp"
+X#	define SIZEOFLOCKFILE sizeof(short)
+X	static	int	code, retcode, errflag;
+X#	ifndef GETTY_HANDLER
+X#		define GETTY_HANDLER
+X#	endif
+X# endif /*DIDO==2*/
+X
+X# if DIDO == 3			/* SCO Xenix 2.3, SCO Unix */
+X#	include <utmp.h>
+X#	define LOCKDIR "/usr/spool/uucp"
+X#	ifndef ASCII_PID
+X#	 define ASCII_PID
+X#	 define PIDSIZE 10
+X#	endif
+X	static pid_t gettypid = -1;
+X# endif /*DIDO==3*/
+X
+X# if DIDO == 4			/* System V Release 4 */
+X#	include <utmp.h>
+X#	include <sys/stat.h>
+X#	include <sys/mkdev.h>
+X#	define LOCKDIR "/var/spool/locks"
+X#	ifndef ASCII_PID
+X#	 define ASCII_PID
+X#	 define PIDSIZE 10
+X#	endif
+X	static pid_t gettypid = -1;
+X# endif /*DIDO==4*/
+X
+X#ifndef SIZEOFLOCKFILE
+X#define SIZEOFLOCKFILE sizeof(int)
+X#endif
+X
+static pid_t pid;
+int cbaud = B2400;			/* default bps */
+short flowflag;				/* modem port i/o data mask */
+static int mfd = -1;		/* modem port file descriptor */
+static struct termio pmode;	/* modem device control string */
+static char port[SM_BUFF],	/* modem port device file string */
+X		lckname[SM_BUFF];	/* lockfile string */
+unsigned mrate ();
+char protocol[] = "8N1";	/* default modem protocol */
+extern int errno;
+X
+struct {
+X	char *proto;
+X	int  clear;
+X	int  set;
+X} prot_tbl[] = {
+X	"8N1",		~(CSIZE | PARENB | CSTOPB),	CS8,
+X	"7E2",		~(CSIZE | PARODD),			CS7 | PARENB | CSTOPB,
+X	"7O2",		~CSIZE,						CS7 | PARENB | PARODD | CSTOPB,
+X	NIL(char),	0,							0
+X};
+X
+struct {
+X	char	 *bps;
+X	unsigned rate;
+X	int		 cbaud;
+X} bps_tbl[] = {
+X	"300",	300,	B300,
+X	"600",	600,	B600,
+X	"1200",	1200,	B1200,
+X	"2400",	2400,	B2400,
+X	"4800",	4800,	B4800,
+X	"9600",	9600,	B9600,
+X#ifdef B19200
+X	"19200",19200,	B19200,
+X#endif
+X#ifdef B38400
+X	"38400",38400,	B38400,
+X	"57600",57600,	B50,
+X#endif
+X	"0",	0,		B0
+X};
+X
+void
+xc_setflow(flow)
+short flow;
+X{
+X	if (flow)
+X		pmode.c_iflag |= IXON | IXOFF | IXANY;
+X	else
+X		pmode.c_iflag &= ~(IXON | IXOFF | IXANY);
+X
+X	ioctl(mfd, TCSETAF, &pmode);
+X}
+X
+X/* get/set character size and parity on the port */
+char *
+xc_setproto(p)
+char *p;
+X{
+X	register i;
+X
+X	if (!p)
+X		return protocol;
+X
+X	for (i=0; prot_tbl[i].proto; i++){
+X		if (!strcmp(p,prot_tbl[i].proto)){
+X			pmode.c_cflag &= prot_tbl[i].clear;
+X			pmode.c_cflag |= prot_tbl[i].set;
+X			ioctl(mfd, TCSETAF, &pmode);
+X			strcpy(protocol,p);
+X			return protocol;
+X		}
+X	}
+X	return NIL(char);
+X}
+X
+X/* get/set port string */
+char *
+mport(s)
+char *s;
+X{
+X	if (s && mfd == -1)
+X		if (strncmp("/dev/", s, 5))
+X			strcpy(port, "/dev/"),
+X			strcat(port, s);
+X		else
+X			strcpy(port, s);
+X
+X	return(port);
+X}
+X
+X/*	Get/set the bps of the modem port; set the terminal rate to correspond. */
+unsigned
+mrate(s)
+char *s;
+X{
+X	register i;
+X
+X	if (s){
+X		for (i=0; bps_tbl[i].cbaud; i++){
+X			if (!strcmp(s,bps_tbl[i].bps)){
+X				cbaud = bps_tbl[i].cbaud;
+X				pmode.c_cflag &= ~CBAUD;
+X				pmode.c_cflag |= cbaud;
+X				ioctl(mfd, TCSETAF, &pmode);
+X				return (bps_tbl[i].rate);
+X			}
+X		}
+X		return FAILURE;
+X	}
+X
+X	for (i=0; bps_tbl[i].cbaud; i++)
+X		if ((pmode.c_cflag & CBAUD) == bps_tbl[i].cbaud)
+X			return (bps_tbl[i].rate);
+X		
+X	return FAILURE;
+X}
+X
+X/*	The following routine is used to hang up the modem. This is accomplished
+X	by setting bps to 0. According to my documentation on termio, setting bps
+X	to zero will result in DTR not being asserted. This hangs up some (most?)
+X	modems. If not, the second part of the routine sends the Hayes modem
+X	"escape" and then a hangup command.
+X*/
+hangup()
+X{
+X	S1("<< HANGUP >>");
+X
+X#if DTR_DROPS_CARRIER
+X	pmode.c_cflag &= ~CBAUD;
+X	pmode.c_cflag |= B0;		/* set cbaud 0 (drop DTR) */
+X	ioctl(mfd, TCSETAF, &pmode);
+X
+X	sleep(1);					/* wait a second */
+X
+X	pmode.c_cflag &= ~CBAUD;	/* reset bps */
+X	pmode.c_cflag |= cbaud;
+X	ioctl(mfd, TCSETAF, &pmode);
+X#else /* use Hayes command */
+X	sleep(2);					/* Allow for "escape guard time" */
+X	send_string(ATTEN);			/* Send modem escape command */
+X	sleep(3);					/* More "escape guard time" */
+X	send_string(HANGUP);		/* Send hangup command */
+X#endif
+X	return SUCCESS;
+X}
+X
+X#ifdef GETTY_HANDLER
+X# if DIDO >= 2
+X/*	suspend() sends signal to a running getty
+X			 sets:	gettypid, process number of running getty, if DIDO > 2
+X					retcode, exit value of 'ungetty', if DIDO = 2
+X	restart(): restarts getty if it had been running before
+X*/
+X#  if DIDO >= 3
+static void
+suspend()
+X{
+X	struct	utmp *t, *getutent();
+X	char buf[12];
+X	void endutent();
+X
+X	strcpy(buf, strrchr(port, '/') +1);
+X	while ((t = getutent())){
+X		if (t->ut_type == LOGIN_PROCESS && (!strcmp(buf, t->ut_line))){
+X			gettypid = t->ut_pid;	/* get getty PID */
+X			if (kill(gettypid, SIGUSR1) == -1 && errno != EPERM)
+X				S1("Can't signal getty");
+X		}
+X	}
+X	endutent();
+X}
+X
+static void
+restart()
+X{
+X	if (gettypid != -1)
+X		kill(gettypid, SIGUSR2);
+X}
+X#  endif /*DIDO>=3*/
+X#  if DIDO == 2
+static void
+suspend()
+X{
+X	code=errflag=pid=retcode=0;
+X	if ((pid = fork()) == 0){
+X		execl(UNGETTY, "ungetty", port, NIL(char));
+X		S1("ungetty exec error");
+X		exit(8);
+X		}
+X	while (((code = wait(&errflag)) != pid) && code != -1);
+X	switch ((errflag>>8) & 0xff){
+X	case UG_NOTENAB:	/* line acquired: not enabled */
+X		retcode = UG_NOTENAB;
+X		break;
+X	case UG_ENAB:	/* line acquired: need ungetty -r when done */
+X		retcode = UG_ENAB;
+X		break;
+X	case UG_FAIL:		/* could not acquire line */
+X	case 255:
+X		exit(8);
+X	}
+X}
+X
+static void
+restart()
+X{
+X	code=errflag=pid=0;
+X	if(retcode == UG_ENAB){
+X		if ((pid = fork()) == 0){
+X			execl(UNGETTY, "ungetty", "-r", port, NIL(char));
+X			exit(8);
+X		}
+X	while (((code = wait(&errflag)) != pid) && code != -1)
+X		;
+X	}
+X}
+X#  endif /*DIDO==2*/
+X# endif /*DIDO>=2*/
+X#endif /*GETTY_HANDLER*/
+X
+X/*	Attach standard input and output to the modem port. This only gets called
+X	after a fork by the child process, which then exec's a program that uses
+X	standard i/o for some data transfer protocol. (To put this here is actually
+X	a kludge, but I wanted to keep the modem-specific stuff in a black box.)
+X*/
+void
+mattach()
+X{
+X	dup2(mfd, 0);	/* close local stdin and connect to port */
+X	dup2(mfd, 1);	/* close local stdout and connect to port */
+X
+X	close(mfd);		/* close the old port descriptor */
+X}
+X
+static void
+alrm(junk)
+int junk;
+X{ /* do nothing */
+X}
+X
+X/*	Get a byte from the modem port within 'seconds' or return -1.
+X	All data read from the modem are input through this routine.
+X*/
+readbyte(seconds)
+unsigned seconds;
+X{
+X	static int count = 0;
+X	static char *p, rxbuf[SM_BUFF];
+X	unsigned alarm();
+X
+X	if (count > 0){
+X		count--;
+X		return(*p++ & 0xff);
+X	}
+X	if (seconds){
+X		signal(SIGALRM, alrm);
+X		alarm(seconds);
+X	}
+X	if ((count = read(mfd, p = rxbuf, SM_BUFF)) < 1)
+X		return(-1);
+X	if (seconds)
+X		alarm(0);
+X
+X	count--;
+X	return(*p++ & 0xff);
+X}
+X
+X/*	Output a byte to the modem port.
+X	All data sent to the modem are output through this routine.
+X*/
+void
+sendbyte(ch)
+int ch;
+X{
+X	char c = ch & 0xff;
+X
+X	if(write(mfd, &c, 1)<0)
+X		S1("sendbyte: write error!");
+X}
+X
+void
+send_string(s)
+char *s;
+X{
+X	while (*s){
+X		sendbyte(*s++);
+X		/* msecs(35); 		/* season to taste ... */
+X	}
+X}
+X
+X/* send a modem break */
+xmitbrk()
+X{
+X	S1("<< BREAK >>");
+X	ioctl(mfd, TCSBRK, 0);
+X	return SUCCESS;
+X}
+X
+X/*	lock_tty() returns FAILURE if the lock file exists (and XC will not run).
+X
+X	unlock_tty() deletes the lock file.
+X
+X	SCOXENIX 2.3 mods: Steve Manes
+X	Check for active LCK file and try to delete it
+X
+X	SCOXENIX 2.2 mods: Jean-Pierre Radley
+X	As above, using 'ungetty'
+X
+X	Tandy 6000 mods: Fred Buck
+X  	SVR4 mods: Larry Rosenman
+X*/
+X
+static
+lock_tty()
+X{
+X#if DIDO >= 2
+X	int lckfd;
+X	char *s, buf[12];
+X#ifdef ASCII_PID
+X	static char apid[PIDSIZE+2] = { '\0' };
+X#else
+X	pid = -1;
+X#endif
+X
+X	strcpy(buf, strrchr(port, '/') +1);
+X	s = buf + strlen(buf) - 1;
+X
+X#if DIDO == 2
+X	*s = toupper(*s);
+X#endif
+X#if DIDO >= 3
+X	*s = tolower(*s);
+X#endif
+X
+X#if DIDO == 4
+X	struct stat stat_buf;
+X	if(stat(port,&stat_buf)==0){
+X		sprintf(lckname,"%s/LK.%03d.%03d.%03d",LOCKDIR,
+X			major(stat_buf.st_dev),
+X			major(stat_buf.st_rdev),
+X			minor(stat_buf.st_rdev));
+X	}
+X#else
+X	sprintf(lckname, "%s/LCK..%s", LOCKDIR, buf);
+X#endif  /*DIDO==4*/
+X
+X	if (!checkLCK())	/* check LCK file */
+X		return FAILURE;	/* can't unlock it */
+X
+X	if ((lckfd = creat(lckname, 0666)) < 0){
+X		sprintf(Msg,"Can't create '%s'", lckname);
+X		S;
+X		return FAILURE;
+X	}
+X
+X#ifdef ASCII_PID
+X	sprintf(apid, "%*d\n", PIDSIZE, getpid());
+X	write(lckfd, apid, PIDSIZE+1);
+X#else
+X	pid = getpid();
+X	write(lckfd, (char *)&pid, SIZEOFLOCKFILE);
+X#endif
+X
+X	close(lckfd);
+X#endif /*DIDO*/
+X	return SUCCESS;
+X}
+X
+void
+unlock_tty()
+X{
+X	static char byettyxx[50], *byeptr;
+X	extern char *ttyname();
+X
+X	sprintf(byettyxx,"BYE%s", strrchr(ttyname(mfd),'/')+1);
+X	byeptr = getenv(byettyxx);
+X	if (byeptr && *byeptr)
+X		S1("Sending BYE string to modem"),
+X		send_string("\r"),
+X		send_string(byeptr),
+X		send_string("\r");
+X
+X	pmode.c_cflag &= ~CLOCAL;
+X	pmode.c_cflag |= B0 | HUPCL;
+X	ioctl(mfd, TCSETAF, &pmode);
+X	close(mfd);
+X
+X#if DIDO >= 2
+X	setuid(geteuid());
+X	setgid(getegid());
+X	unlink(lckname);
+X# ifdef GETTY_HANDLER
+X	restart();
+X# endif
+X#endif
+X	S1("Exiting XC");
+X}
+X
+X/*	check to see if lock file exists and is still active.
+X	kill(pid, 0) only works on ATTSV, some BSDs and Xenix
+X	returns: SUCCESS, or
+X			FAILURE if lock file active
+X	added: Steve Manes 7/29/88
+X*/
+checkLCK()
+X{
+X	int rc, fd;
+X#ifdef ASCII_PID
+X	char alckpid[PIDSIZE+2];
+X#endif
+X#if DIDO == 2
+X	short lckpid = -1;
+X#else
+X	pid_t lckpid = -1;
+X#endif
+X
+X	if ((fd = open(lckname, O_RDONLY)) == -1){
+X		if (errno == ENOENT)
+X			return SUCCESS;	/* lock file doesn't exist */
+X		goto unlock;
+X	}
+X#ifdef ASCII_PID
+X	rc = read(fd, (char *)alckpid, PIDSIZE+1);
+X	close(fd);
+X	lckpid = atoi(alckpid);
+X	if (rc != 11)
+X#else
+X	rc = read(fd, (char *)&lckpid, SIZEOFLOCKFILE);
+X	close(fd);
+X	if (rc != SIZEOFLOCKFILE)
+X#endif
+X	{
+X		S1("Lock file has bad format");
+X		goto unlock;
+X	}
+X
+X	/* now, send a bogus 'kill' and check the results */
+X	if (kill(lckpid, 0) == 0 || errno == EPERM){
+X		sprintf(Msg,"Lock file process %d on %s is still active - try later",
+X			lckpid, port);
+X		S;
+X		return FAILURE;
+X	}
+X
+unlock:
+X	if (unlink(lckname) != 0){
+X		sprintf(Msg,"Can't unlink %s file", lckname);
+X		S;
+X		return FAILURE;
+X	}
+X	return SUCCESS;
+X}
+X
+X/*	Opens the modem port and configures it. If the port string is
+X	already defined it will use that as the modem port; otherwise it
+X	gets the environment variable MODEM. Returns SUCCESS or FAILURE.
+X*/
+mopen()
+X{
+X	int c;
+X	char *p;
+X
+X	if (port[0] == '\0'){
+X		if (!(p = getenv("MODEM"))){
+X			S1("Exiting: no modem port specified or present in environment");
+X			exit(3);
+X		}
+X		mport(p);
+X	}
+X	if (!lock_tty())
+X		exit(4);
+X
+X#if DIDO
+X	p = port +strlen(port) -1;
+X	*p = toupper(*p);
+X# ifdef GETTY_HANDLER
+X	suspend();
+X# endif
+X#endif
+X
+X	if ((mfd = open(port, O_RDWR | O_NDELAY)) < 0){
+X		sprintf(Msg,"Can't open modem port %s",port);
+X		S;
+X		exit(5);
+X	}
+X
+X	ioctl(mfd, TCGETA, &pmode);
+X
+X	pmode.c_cflag &= ~(CBAUD | HUPCL);
+X	pmode.c_cflag |= CLOCAL | cbaud;
+X#if DIDO >= 3 & defined(CTSFLOW) & defined(RTSFLOW)
+X	pmode.c_cflag |= CTSFLOW | RTSFLOW ;
+X	/* pmode.c_cflag |= CRTSFL ; */
+X#endif
+X	pmode.c_iflag = IGNBRK ;
+X	pmode.c_oflag = pmode.c_lflag = 0;
+X	pmode.c_cc[VMIN] = 1; 	/* This many chars satisfies reads */
+X	pmode.c_cc[VTIME] = 0;	/* or in this many tenths of seconds */
+X
+X	xc_setflow(flowflag);
+X
+X	c = mfd;
+X	if ((mfd = open(port, O_RDWR)) < 0){	/* Reopen line with CLOCAL */
+X		sprintf(Msg,"Can't re-open modem port %s",port);
+X		S;
+X		return FAILURE;
+X	}
+X	close(c);
+X
+X	return SUCCESS;
+X}
+END_OF_FILE
+if test 11658 -ne `wc -c <'xcport.c'`; then
+    echo shar: \"'xcport.c'\" unpacked with wrong size!
+fi
+# end of 'xcport.c'
+fi
+if test -f 'xcxmdm.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'xcxmdm.c'\"
+else
+echo shar: Extracting \"'xcxmdm.c'\" \(10779 characters\)
+sed "s/^X//" >'xcxmdm.c' <<'END_OF_FILE'
+X/*	xcxmdm.c -- XMODEM Protocol module for XC
+X	This file uses 4-character tabstops
+X*/
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <signal.h>
+X#include <setjmp.h>
+X#include "xc.h"
+X
+X#define CPMEOF	032	/* ^Z */
+X#define WANTCRC 'C'
+X#define OK		 0
+X#define TIMEOUT	-1	 /* -1 is returned by readbyte() upon timeout */
+X#define ERROR	-2
+X#define WCEOT	-3
+X#define RETRYMAX 10
+X#define SECSIZ  128
+X#define Resume_Not_Allowed	1
+X
+X/* crc_xmodem_tab calculated by Mark G. Mendel, Network Systems Corporation */
+ushort crc_xmodem_tab[256] = {
+X	 0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
+X	 0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
+X	 0x1231, 0x0210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6,
+X	 0x9339, 0x8318, 0xb37b, 0xa35a, 0xd3bd, 0xc39c, 0xf3ff, 0xe3de,
+X	 0x2462, 0x3443, 0x0420, 0x1401, 0x64e6, 0x74c7, 0x44a4, 0x5485,
+X	 0xa56a, 0xb54b, 0x8528, 0x9509, 0xe5ee, 0xf5cf, 0xc5ac, 0xd58d,
+X	 0x3653, 0x2672, 0x1611, 0x0630, 0x76d7, 0x66f6, 0x5695, 0x46b4,
+X	 0xb75b, 0xa77a, 0x9719, 0x8738, 0xf7df, 0xe7fe, 0xd79d, 0xc7bc,
+X	 0x48c4, 0x58e5, 0x6886, 0x78a7, 0x0840, 0x1861, 0x2802, 0x3823,
+X	 0xc9cc, 0xd9ed, 0xe98e, 0xf9af, 0x8948, 0x9969, 0xa90a, 0xb92b,
+X	 0x5af5, 0x4ad4, 0x7ab7, 0x6a96, 0x1a71, 0x0a50, 0x3a33, 0x2a12,
+X	 0xdbfd, 0xcbdc, 0xfbbf, 0xeb9e, 0x9b79, 0x8b58, 0xbb3b, 0xab1a,
+X	 0x6ca6, 0x7c87, 0x4ce4, 0x5cc5, 0x2c22, 0x3c03, 0x0c60, 0x1c41,
+X	 0xedae, 0xfd8f, 0xcdec, 0xddcd, 0xad2a, 0xbd0b, 0x8d68, 0x9d49,
+X	 0x7e97, 0x6eb6, 0x5ed5, 0x4ef4, 0x3e13, 0x2e32, 0x1e51, 0x0e70,
+X	 0xff9f, 0xefbe, 0xdfdd, 0xcffc, 0xbf1b, 0xaf3a, 0x9f59, 0x8f78,
+X	 0x9188, 0x81a9, 0xb1ca, 0xa1eb, 0xd10c, 0xc12d, 0xf14e, 0xe16f,
+X	 0x1080, 0x00a1, 0x30c2, 0x20e3, 0x5004, 0x4025, 0x7046, 0x6067,
+X	 0x83b9, 0x9398, 0xa3fb, 0xb3da, 0xc33d, 0xd31c, 0xe37f, 0xf35e,
+X	 0x02b1, 0x1290, 0x22f3, 0x32d2, 0x4235, 0x5214, 0x6277, 0x7256,
+X	 0xb5ea, 0xa5cb, 0x95a8, 0x8589, 0xf56e, 0xe54f, 0xd52c, 0xc50d,
+X	 0x34e2, 0x24c3, 0x14a0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
+X	 0xa7db, 0xb7fa, 0x8799, 0x97b8, 0xe75f, 0xf77e, 0xc71d, 0xd73c,
+X	 0x26d3, 0x36f2, 0x0691, 0x16b0, 0x6657, 0x7676, 0x4615, 0x5634,
+X	 0xd94c, 0xc96d, 0xf90e, 0xe92f, 0x99c8, 0x89e9, 0xb98a, 0xa9ab,
+X	 0x5844, 0x4865, 0x7806, 0x6827, 0x18c0, 0x08e1, 0x3882, 0x28a3,
+X	 0xcb7d, 0xdb5c, 0xeb3f, 0xfb1e, 0x8bf9, 0x9bd8, 0xabbb, 0xbb9a,
+X	 0x4a75, 0x5a54, 0x6a37, 0x7a16, 0x0af1, 0x1ad0, 0x2ab3, 0x3a92,
+X	 0xfd2e, 0xed0f, 0xdd6c, 0xcd4d, 0xbdaa, 0xad8b, 0x9de8, 0x8dc9,
+X	 0x7c26, 0x6c07, 0x5c64, 0x4c45, 0x3ca2, 0x2c83, 0x1ce0, 0x0cc1,
+X	 0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8,
+X	 0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0
+X};
+X
+short crcheck = TRUE;		/* CRC check enabled? */
+static FILE *xfp;			/* buffered file pointer */
+static short firstsec,		/* first sector of file or not? */
+X			textmode,		/* Text translations enabled? */
+X			save_crc;		/* Saved crcheck value */
+static char wcbuf[SECSIZ];	/* Ward Christensen sector buffer */
+static ushort Updcrc();
+static jmp_buf our_env;
+static void (*oldvec)();
+X
+X/*	send 10 CAN's to try to get the other end to shut up */
+static void
+canit()
+X{
+X	int i;
+X
+X	for(i = 0; i < 20; i++)
+X		sendbyte(CAN);
+X}
+X
+static void
+xmsigint(junk)
+int junk;
+X{
+X	show_abort();
+X	signal(SIGINT, SIG_IGN);	/* Ignore subsequent DEL's */
+X	canit();					/* Abort the transmission */
+X	longjmp(our_env,1);
+X}
+X
+X/*	fill the CP/M sector buffer from the UNIX file
+X	do text adjustments if necessary
+X	return 1 if more sectors are to be read, or 0 if this is the last
+X*/
+static
+getsec()
+X{
+X	int i;
+X	register c;
+X
+X	i = 0;
+X	while(i < SECSIZ && (c = getc(xfp)) != EOF){
+X		if (textmode && c == '\n'){
+X			wcbuf[i++] = '\r';
+X			if (i >= SECSIZ){		 /* handle a newline on the last byte */
+X				ungetc(c, xfp);		 /* of the sector */
+X				return(1);
+X			}
+X		}
+X		wcbuf[i++] = c;
+X	}
+X	/* make sure that an extra blank sector is not sent */
+X	if (c != EOF && (c = getc(xfp)) != EOF){
+X		ungetc(c, xfp);
+X		return(1);
+X	}
+X	/* fill up the last sector with ^Z's if text mode or 0's if binary mode */
+X	while(i < SECSIZ)
+X		wcbuf[i++] = textmode ? CPMEOF : '\0';
+X	return(0);
+X}
+X
+X/*	wcgetsec() inputs an XMODEM "sector".
+X	This routine returns the sector number encountered, or ERROR if a valid
+X	sector is not received or CAN received; or WCEOT if EOT sector.
+X
+X	Maxtime is the timeout for the first character, set to 6 seconds for
+X	retries. No ACK is sent if the sector is received ok. This must be
+X	done by the caller when it is ready to receive the next sector.
+X*/
+static
+wcgetsec(maxtime)
+unsigned maxtime;
+X{
+X	register ushort oldcrc;
+X	register checksum, j, c;
+X	int sectcurr, sectcomp, attempts;
+X
+X	for(attempts = 0; attempts < RETRYMAX; attempts++){
+X		do {
+X			c = readbyte(maxtime);
+X		} while(c != SOH && c != EOT && c != CAN && c != TIMEOUT);
+X
+X		switch(c){
+X		case SOH:
+X			sectcurr = readbyte(3);
+X			sectcomp = readbyte(3);
+X			if ((sectcurr + sectcomp) == 0xff){
+X				oldcrc = checksum = 0;
+X				for(j = 0; j < SECSIZ; j++){
+X					if ((c = readbyte(3)) == TIMEOUT)
+X						goto timeout;
+X					wcbuf[j] = c;
+X					if (crcheck)
+X						oldcrc = Updcrc(c, oldcrc);
+X					else
+X						checksum += c;
+X				}
+X				if ((c = readbyte(3)) < 0)
+X					goto timeout;
+X				if (crcheck){
+X					oldcrc = Updcrc(c, oldcrc);
+X					if ((c = readbyte(3)) == TIMEOUT)
+X						goto timeout;
+X					if (Updcrc(c, oldcrc)){
+X						S2("CRC error");
+X						break;
+X					}
+X				}
+X				else if (((checksum - c) & 0xff) != 0){
+X					S2("Checksum error");
+X					break;
+X				}
+X				firstsec = FALSE;
+X				return(sectcurr);
+X			}
+X			else
+X				sprintf(Msg, "Sector number garbled 0%03o 0%03o",
+X					sectcurr, sectcomp);
+X				S2(Msg);
+X			break;
+X		case EOT:
+X			if (readbyte(3) == TIMEOUT)
+X				return(WCEOT);
+X			break;
+X		case CAN:
+X			S2("Sender CANcelled");
+X			return(ERROR);
+X		case TIMEOUT:
+X			if (firstsec)
+X			break;
+timeout:
+X		S2("Timeout");
+X		break;
+X		}
+X		S2("Trying again on this sector");
+X		purge();
+X		if (firstsec)
+X			sendbyte(crcheck ? WANTCRC : NAK);
+X		else
+X			maxtime = 6,
+X			sendbyte(NAK);
+X	}
+X	S2("Retry count exceeded");
+X	canit();
+X	return(ERROR);
+X}
+X
+static
+putsec()
+X{
+X	int i;
+X	register c;
+X
+X	for(i = 0; i < SECSIZ; i++){
+X		c = wcbuf[i];
+X		if (textmode){
+X			if (c == CPMEOF)
+X				return(1);
+X			if (c == '\r')
+X				continue;
+X		}
+X		putc(c, xfp);
+X	}
+X	return(0);
+X}
+X
+X/* Receive a file using XMODEM protocol */
+static
+wcrx()
+X{
+X	register sendchar, sectnum, sectcurr;
+X
+X	strcpy(Name, word);
+X	if (!(xfp=QueryCreate(Resume_Not_Allowed)))
+X		return(ERROR);
+X
+X	firstsec = TRUE;
+X	sectnum = 0;
+X	sendchar = crcheck ? WANTCRC : NAK;
+X	fputc('\r',tfp),
+X	fputc('\n', tfp);
+X	S1("Sync...");
+X
+X	while(TRUE){
+X		purge();
+X		sendbyte(sendchar);
+X		sectcurr = wcgetsec(6);
+X		if (sectcurr == ((sectnum + 1) & 0xff)){
+X			sectnum++;
+X			putsec();
+X			fprintf(tfp,"Received sector #%d\r", sectnum);
+X			sendchar = ACK;
+X			continue;
+X		}
+X
+X		if (sectcurr == (sectnum & 0xff)){
+X			sprintf(Msg, "Received duplicate sector #%d", sectnum);
+X			S2(Msg);
+X			sendchar = ACK;
+X			continue;
+X		}
+X
+X		fclose(xfp);
+X
+X		if (sectcurr == WCEOT){
+X			S1("File received OK");
+X			sendbyte(ACK);
+X			return(OK);
+X		}
+X
+X		if (sectcurr == ERROR)
+X			return(ERROR);
+X
+X		sprintf(Msg, "Sync error ... expected %d(%d), got %d",
+X			(sectnum + 1) & 0xff, sectnum, sectcurr);
+X		S;
+X		return(ERROR);
+X	}
+X}
+X
+X/*	wcputsec outputs a Ward Christensen type sector.
+X	it returns OK or ERROR
+X*/
+static
+wcputsec(sectnum)
+int sectnum;
+X{
+X	register ushort oldcrc;
+X	register checksum, j, c, attempts;
+X
+X	oldcrc = checksum = 0;
+X	for(j = 0; j < SECSIZ; j++)
+X		c = wcbuf[j],
+X		oldcrc = Updcrc(c, oldcrc),
+X		checksum += c;
+X	oldcrc = Updcrc(0, Updcrc(0, oldcrc));
+X
+X	for(attempts = 0; attempts < RETRYMAX; attempts++){
+X		sendbyte(SOH);
+X		sendbyte(sectnum);
+X		sendbyte(-sectnum - 1);
+X		for(j = 0; j < SECSIZ; j++)
+X			sendbyte(wcbuf[j]);
+X		purge();
+X		if (crcheck){
+X			sendbyte((int) (oldcrc >> 8));
+X			sendbyte((int) oldcrc);
+X		}
+X		else
+X			sendbyte(checksum);
+X		switch(c = readbyte(10)){
+X		case CAN:
+X		S2("Receiver CANcelled");
+X			return(ERROR);
+X		case ACK:
+X			firstsec = FALSE;
+X			return(OK);
+X		case NAK:
+X		S2("Got a NAK on sector acknowledge");
+X			break;
+X		case TIMEOUT:
+X		S2("Timeout on sector acknowledge");
+X			break;
+X		default:
+X			sprintf(Msg, "Got 0%03o for sector acknowledge", c);
+X			S2(Msg);
+X			do {
+X				if ((c = readbyte(3)) == CAN){
+X					S2("Receiver CANcelled");
+X					return(ERROR);
+X				}
+X			} while(c != TIMEOUT);
+X			if (firstsec)
+X				crcheck = (c == WANTCRC);
+X			break;
+X		}
+X	}
+X	S2("Retry count exceeded");
+X	return(ERROR);
+X}
+X
+X/* Transmit a file using XMODEM protocol */
+static
+wctx()
+X{
+X	register sectnum, eoflg, c, attempts;
+X
+X	if (!(xfp = fopen(word, "r"))){
+X		sprintf(Msg, "Can't open '%s'", word);
+X		S;
+X		return(ERROR);
+X	}
+X	firstsec = TRUE;
+X	attempts = 0;
+X	S1("Sync...");
+X
+X	while((c = readbyte(30)) != NAK && c != WANTCRC && c != CAN)
+X		if (c == TIMEOUT && ++attempts > RETRYMAX){
+X			S1("Receiver not responding");
+X			fclose(xfp);
+X			return(ERROR);
+X		}
+X	if (c == CAN){
+X		S1("Receiver CANcelled");
+X		fclose(xfp);
+X		return(ERROR);
+X	}
+X	crcheck = (c == WANTCRC);
+X	sprintf(Msg,"%s error checking requested", crcheck ? "CRC-16" : "Checksum");
+X	S;
+X	sectnum = 1;
+X
+X	do {
+X		eoflg = getsec();
+X		fprintf(tfp,"Transmitting sector #%d\r", sectnum);
+X
+X		if (wcputsec(sectnum) == ERROR){
+X			fclose(xfp);
+X			return(ERROR);
+X		}
+X		sectnum++;
+X	} while(eoflg);
+X
+X	fclose(xfp);
+X	attempts = 0;
+X	sendbyte(EOT);
+X	while(readbyte(5) != ACK && attempts++ < RETRYMAX)
+X		sendbyte(EOT);
+X	if (attempts >= RETRYMAX){
+X		S1("Receiver not responding to completion");
+X		return(ERROR);
+X	}
+X
+X	S1("Transmission complete");
+X	return(OK);
+X}
+X
+X/*	update the cyclic redundancy check value */
+static ushort
+Updcrc(c, crc)
+register c;
+register unsigned crc;
+X{
+X	int i;
+X
+X	for(i = 0; i < 8; i++){
+X		if (crc & 0x8000)
+X			crc <<= 1,
+X			crc += (((c <<= 1) & 0400) != 0),
+X			crc ^= 0x1021;
+X		else
+X			crc <<= 1,
+X			crc += (((c <<= 1) & 0400) != 0);
+X	}
+X	return(crc);
+X}
+X
+static
+setmode(c)
+int c;
+X{
+X	switch(tolower(c)){
+X	case 't':
+X		textmode = TRUE;
+X		break;
+X	case 'b':
+X		textmode = FALSE;
+X	case ' ':
+X		break;
+X
+X	default:
+X		return FAILURE;
+X	}
+X
+X	sprintf(Msg, "XMODEM %s file transfer mode", textmode ? "Text" : "Binary");
+X	S;
+X
+X	return SUCCESS;
+X}
+X
+X/*	Put received WC sector into a UNIX file
+X	using text translations if neccesary.
+X*/
+X
+void
+xreceive(c)
+int c;
+X{
+X	save_crc = crcheck;
+X	oldvec = signal(SIGINT, xmsigint);
+X
+X	if (setmode(c)){
+X		if (!setjmp(our_env)){
+X			/* crcheck = 0xff; */
+X
+X			sprintf(Msg, "Ready to receive single file %s", word);
+X			S;
+X			if (wcrx() == ERROR)
+X				canit();
+X			return;
+X		}
+X	}
+X
+X	signal(SIGINT, oldvec);
+X	crcheck = save_crc;
+X}
+X
+void
+xsend(c)
+int c;
+X{
+X	save_crc = crcheck;
+X	oldvec = signal(SIGINT, xmsigint);
+X
+X	if (setmode(c)){
+X		if (!setjmp(our_env)){
+X			/* crcheck = 0xff; */
+X			if (wctx() == ERROR){
+X				sprintf(Msg, "Error transmitting file %s", word);
+X				S;
+X				return;
+X			}
+X		}
+X	}
+X
+X	signal(SIGINT, oldvec);
+X	crcheck = save_crc;
+X}
+END_OF_FILE
+if test 10779 -ne `wc -c <'xcxmdm.c'`; then
+    echo shar: \"'xcxmdm.c'\" unpacked with wrong size!
+fi
+# end of 'xcxmdm.c'
+fi
+echo shar: End of archive 2 \(of 3\).
+cp /dev/null ark2isdone
+MISSING=""
+for I in 1 2 3 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 3 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

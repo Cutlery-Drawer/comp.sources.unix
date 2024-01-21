@@ -1,0 +1,2644 @@
+Path: uunet!rs
+From: rs@uunet.UU.NET (Rich Salz)
+Newsgroups: comp.sources.unix
+Subject: v10i019: Diffs for SystemV /bin/sh job control with sxt's, Part02/02
+Message-ID: <439@uunet.UU.NET>
+Date: 24 Jun 87 01:06:06 GMT
+Organization: UUNET Communications Services, Arlington, VA
+Lines: 2634
+Approved: rs@uunet.uu.net
+
+Submitted by: Simon Brown <simon@its63b.ed.ac.uk>
+Archive-name: sxt-sh-jobs/Part02
+Mod.sources: Volume 10, Number 19
+
+
+	Part 2 of context diffs for implementing job-control
+	in the System V Bourne shell.
+
+			Simon Brown
+				Department of Computer Science
+				University of Edinburgh
+				Scotland, UK.
+
+				simon@its63b.ed.ac.uk
+				simon@cstvax.ed.ac.uk
+				seismo!mcvax!ukc!{its63b,cstvax}!simon
+
+-------------cut here --------------cut here ------------ cut here -------
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create:
+#	proc.c
+#	service.c.Diff
+#	sh.1.Diff
+#	string.c.Diff
+#	sxtalloc.8
+#	sxtalloc.c
+#	word.c.Diff
+#	xec.c.Diff
+# This archive created: Fri Feb 20 17:43:13 1987
+export PATH; PATH=/bin:/usr/bin:$PATH
+echo shar: "extracting 'proc.c'" '(22373 characters)'
+if test -f 'proc.c'
+then
+	echo shar: "will not over-write existing file 'proc.c'"
+else
+cat << \SHAR_EOF > 'proc.c'
+/*
+ *		 SH Shell.
+ *
+ *
+ *	Copyright (c) S. Brown, 1987
+ *
+ *
+ *	wait stuff, for processes to be waited for.
+ *
+ *	also, job-control.
+ */
+
+#include "defs.h"
+
+extern char *sysmsg[];		/* signal messages */
+
+#ifdef JOB
+
+/*
+ *	JOB-CONTROL
+ */
+
+
+#ifdef JOBSXT
+#undef input
+#include <sys/types.h>
+#include <sys/tty.h>
+#include <sys/sxt.h>
+#include <errno.h>
+#endif JOBSXT
+
+#define PROCESS_DOT_C
+#include "job.h"
+#include <signal.h>
+
+int currentjob = 0;		/* current job */
+int fgjobs = 0;			/* no. of foreground jobs */
+int bgjobs = 0;			/* no. of background jobs */
+int mainpgrp;			/* initial process group */
+int dfltjob;			/* default jobnumber for fg, bg, notify ... */
+int bdfltjob;			/* back-one default */
+int maxpri = 0;			/* max. priority */
+int extracnt=0;			/* number of children dead in queue */
+
+#ifdef JOBSXT
+int sxtchan = -1;		/* sxt channel set */
+int savsxtchan = -1;		/* saved chan fd */
+struct sxtblock sxtblock;	/* block masks */
+int sxtcontrol = -1;		/* controlling sxt-tty */
+int sxtkludge = 1;		/* real tty virtual offset of controller */
+char blkmask;			/* virtual blocks */
+TTYNOD realtty;			/* state of physical tty */
+
+#define BLKBIT(c,n) ((c)&(1<<SXT(n)))
+#define SIGBLOCK 21		/* fake signal-number for blockages */
+int sxt_fd = -1;
+#endif JOBSXT
+
+
+
+struct jobnod *jobs[JOB_MAX];
+struct extrawait extras[EXTRAPROCS];
+
+/*
+ *	empty all of jobs table
+ */
+postclr()
+{
+	register int i;
+
+	for (i=1; i<JOB_MAX; i++)
+		postjclr(i);
+	bgjobs = fgjobs = 0;
+}
+
+
+/*
+ *	clear out an entry in jobs table
+ */
+postjclr(jobno)
+{
+	register int i;
+	if (jobs[i=jobno]){
+		free((char *)jobs[i]->jb_dir);
+		free((char *)jobs[i]->jb_cmd);
+#ifdef JOBSXT
+		if (jobs[i]->jb_sxtfg) close(jobs[i]->jb_sxtfg);
+		blkmask &= ~(1<<SXT(i));
+#endif 
+		free((char *)jobs[i]);
+		jobs[i] = (struct jobnod *)0;
+	}
+	if (i==dfltjob || i==bdfltjob) setdfj();
+}
+
+/*
+ * set default job
+ */
+setdfj()
+{
+	register int i;
+
+	maxpri = 0;
+	bdfltjob = dfltjob;
+	dfltjob = -1;
+	for (i=1; i<JOB_MAX; i++)
+		if (jobs[i] && jobs[i]->jb_pri > maxpri){
+			maxpri = jobs[i]->jb_pri;
+			bdfltjob = dfltjob;
+			dfltjob = i;
+		}
+}
+
+
+/*
+ *	place process in jobs table 
+ */
+post(procid)
+int	procid;
+{
+	register struct jobnod *jp;
+	register int i;
+
+	jp = jobs[currentjob];
+	if (jp){
+		for (i=0; i<PPERJ; i++)
+			if (jp->jb_proc[i].proc_pid==0) break;
+		if (i>PPERJ-1 || (jp->jb_flags.singlebits.lifes&(1<<i)))
+			/*error("cannot post job")*/;	/* Never Happens */
+		jp->jb_proc[i].proc_pid = procid;
+		jp->jb_flags.singlebits.lifes |= (1<<i);
+	}
+}
+
+/*
+ *	restart in background
+ */
+bg(jno)
+{
+	if (jobs[jno]){
+#ifdef JOBSXT
+		ioctl(sxt_fd,SXTIOCUBLK,SXT(jno));
+		sxtblock.input &= ~(1<<SXT(jno));
+		sxtblock.output &= ~(1<<SXT(jno));
+		blkmask &= ~(1<<SXT(jno));
+#endif JOBSXT
+		jobs[jno]->jb_flags.singlebits.back = jobs[jno]->jb_flags.singlebits.run = 1;
+		jobs[jno]->jb_pri = ++maxpri;		/* top priority */
+		bdfltjob = dfltjob;
+		if (jobs[jno]->jb_flags.singlebits.stop){
+			jobs[jno]->jb_flags.singlebits.stop = 0;
+			if (jobs[jno]->jb_cmd){
+				prs(jobs[jno]->jb_cmd);
+				prs(" &\n");
+			}
+		}
+#ifdef JOBSXT
+		if (sxtchan!=-1)
+#endif JOBSXT
+			iflags |= jobflg;
+		setjob(0);	/* so it'll stop if its reading from tty */
+		bgjobs++;
+	}
+}
+
+/*
+ *	set the "notify" bit in a job 
+ */
+notify(jno)
+{
+	if (jobs[jno])
+		jobs[jno]->jb_flags.singlebits.notify = 1;
+}
+
+
+
+/*
+ *	bring a job into foreground.
+ */
+fg(jno)
+{
+	if (jobs[jno] && jno>0){
+		jobs[jno]->jb_flags.singlebits.back = 0;
+		jobs[jno]->jb_flags.singlebits.run = 1;
+		jobs[jno]->jb_pri = ++maxpri;		/* top priority */
+		bdfltjob = dfltjob;
+		dfltjob = jno;
+#ifdef JOBSXT
+		if (sxtchan!=-1)
+#endif JOBSXT
+			iflags |= jobflg;			/* in case it was forgotten... */
+		if (jobs[jno]->jb_cmd){
+			prs(jobs[jno]->jb_cmd);
+			newline();
+		}
+		if (jobs[jno]->jb_flags.singlebits.stop)
+			jobs[jno]->jb_flags.singlebits.stop = 0;
+#ifdef JOBSXT
+		ioctl(sxt_fd, SXTIOCBLK, SXT(jno));
+		sxtblock.input &= ~(1<<SXT(jno));
+		sxtblock.output &= ~(1<<SXT(jno));
+		blkmask &= ~(1<<SXT(jno));
+#ifdef ERCC_SIGCONT
+		killpg(jobs[jno]->jb_pgrp,SIGCONT);
+#endif
+		setjob(jno);
+#endif SysV
+		await(-1,WAIT_FG);
+	}
+}
+
+/*
+ *	wait for processes to terminate.
+ *	waitflags is an ORing of
+ *		WAIT_FG	- waiting for foreground jobs
+ *		WAIT_BG - waiting for background jobs
+ *		WAIT_NOPAUSE - fast wait, don't hang around
+ *		WAIT_JOB - waiting for a job-no, not a process-no.
+ */
+await(id,waitflags)
+{
+	register int i;
+	register int gotit=0;
+#ifdef JOBSXT
+	register int j;
+	struct sxtblock block;
+	register int oldex;
+#endif
+
+	if ((waitflags&WAIT_JOB)==0 && id>0) post(id);
+	if (waitflags&WAIT_FG) fgjobs++;
+	flushb();
+	while (fgjobs>0 || ((waitflags&(WAIT_NOPAUSE|WAIT_BG)) && bgjobs>0)){
+		if ((trapnote&SIGSET) && fgjobs==0){
+			listjobs((char *)0);
+			prs("wait: interrupted\n");
+			break;
+		}
+#ifdef JOBSXT
+		if (extracnt>0){
+			gotit=announce();
+		} else if (sxtchan!=-1 && currentjob<SXTMAX
+			    		&& (waitflags&WAIT_BG)==0){
+			if (setsxt(currentjob) != SXT(currentjob))
+				continue;
+			iflags |= sxtwaiting;
+			oldex = extracnt;
+			while (ioctl(sxt_fd,SXTIOCWF,0) == -1)
+			iflags &= ~sxtwaiting;
+			setsxt(currentjob);
+			if (jobs[currentjob]->jb_sxtfg!=(-1))
+				ioctl(jobs[currentjob]->jb_sxtfg,TCSBRK,1);
+			ioctl(sxt_fd,SXTIOCSTAT,&block);
+			for (i=1; i<SXTMAX; i++){
+				BOOL blkin = (BLKBIT(block.input,i)!=0);
+				BOOL blkout = (BLKBIT(block.output,i)!=0);
+				if (i!=currentjob){
+					if (!blkin && !blkout) continue;
+					if (BLKBIT(sxtblock.input,i) || BLKBIT(sxtblock.output,i) || BLKBIT(blkmask,i))
+						continue;
+				} else {
+					if (extracnt!=oldex)
+						continue;
+				}
+				blkmask |= (1<<SXT(i));
+				jobs[i]->jb_flags.singlebits.stop = 1;
+				jobs[i]->jb_flags.singlebits.run = 0;
+				jobs[i]->jb_flags.singlebits.deaths = jobs[i]->jb_flags.singlebits.lifes;
+				if (jobs[i]->jb_flags.singlebits.back)
+					bgjobs--;
+				else {
+					fgjobs--;
+					setsxt(0);
+				}
+				for (j=0; j<PPERJ; j++)
+					if (jobs[i]->jb_proc[j].proc_pid)
+						jobs[i]->jb_proc[j].proc_status = (SIGBLOCK<<8)|0177;
+				donotify(i);
+			}
+			sxtblock.input = block.input;
+			sxtblock.output = block.output;
+		}
+		else 
+#endif JOBSXT
+		{    /* System-V or V7 without sxt's */
+#if defined(SIGCLD) || defined(SIGCHLD)
+			if (extracnt==0 && (waitflags&WAIT_NOPAUSE)==0)
+				pause();
+#else
+			extrastack(0,0);
+#endif SIGCLD or SIGCHLD
+			if (extracnt>0) gotit=announce();	
+		}
+		if ( ((waitflags&WAIT_JOB) && gotit==id)
+			    	|| ((waitflags&WAIT_NOPAUSE) && gotit!=0 && extracnt<=0))
+			break;
+	}
+	if (fgjobs<0) fgjobs=0;
+	if (extracnt<0) extracnt=0;		/* ... */
+	for (i=1; i<JOB_MAX; i++)
+		if (jobs[i] && jobs[i]->jb_flags.singlebits.deaths==jobs[i]->jb_flags.singlebits.lifes){
+			jobs[i]->jb_flags.singlebits.deaths = 0;
+			printjob(i);
+			if (jobs[i]->jb_flags.singlebits.stop==0)
+				postjclr(i);
+		}
+        setjob(0);         /* restore to control state */
+}
+
+/*
+ *	trap routine for SIGCHLD/SIGCLD
+ */
+#if defined(SIGCHLD) || defined(SIGCLD)
+job_fault()
+{
+	extrastack(0,0);
+#ifdef JOBSXT
+	if ((flags&waiting)==0 && sxtchan!=-1 && (iflags&sxtwaiting))
+		setsxt(-1);
+	else if (flags&waiting) announce();
+#endif JOBSXT
+}
+#endif SIGCHLD or SIGCLD
+
+
+
+/*
+ *	set current job to "job"
+ */
+setjob(jno)
+{
+	register struct jobnod *jp = jobs[jno<0? 0 : jno];
+
+	if ((iflags&jobflg) && jp){
+#ifdef JOBSXT
+		setsxt(jno);
+#endif JOBSXT
+	}
+	currentjob = jno;
+}
+
+
+/*
+ *	set up job stuff in parent, assumimg I/O j-control has already
+ *	been set up in the child.
+ */
+setparjob(jno)
+{
+	register struct jobnod *jp = jobs[jno];
+
+	if (jp && (iflags&jobflg)){
+#ifdef JOBSXT
+		sxtcontrol = jno;
+#endif JOBSXT
+	}
+}
+
+
+/*
+ *	set up j-control I/O in child
+ */
+setchildjob(jno,sxtflag)
+{
+	register struct jobnod *jp = jobs[jno];
+
+	if (jp){
+		if (jp->jb_pgrp==0)
+			jp->jb_pgrp = getpid();
+	}
+	if (sxtflag && jno){
+#ifdef JOBSXT
+		if (sxtflag==1){
+			ioctl(sxt_fd,SXTIOCBLK,SXT(jno));
+			setsxt(jno);
+		} else  ioctl(sxt_fd,SXTIOCUBLK,SXT(jno));
+#endif JOBSXT
+	}
+}
+
+/*
+ *	book a slot in the jobs-table
+ */
+bookjob()
+{
+	register int i;
+
+	for (i=0; i<JOB_MAX; i++)
+		if (jobs[i]==0){
+			jobs[currentjob=i] = (struct jobnod *)alloc(sizeof(struct jobnod));
+			jobs[i]->jb_dir = jobs[i]->jb_cmd = (char *)0;
+			jobs[i]->jb_pgrp = 0;
+#ifdef JOBSXT
+			jobs[i]->jb_sxtfg = -1;
+			if ((flags&(ttyflg|forked))==(ttyflg)){
+				if (sxtchan!=-1)
+					iflags |= jobflg;
+			} else iflags &= ~jobflg;
+#endif JOBSXT
+			return;
+		}
+	/*printf("Jobs Table is Full!\n");*/	/* nobody should have THAT many jobs running! */
+}
+
+
+
+
+/*
+ *	create storage for a new job (already chosen by "bookjob")
+ */
+newjob(pid,jcmd,backing,chanid)
+struct argnod * jcmd;
+{
+	register struct jobnod *jp;
+	register int j;
+        register char * cmdbuffer;
+        register int cmdlength;
+        struct argnod * storcmd;
+
+    /*		-- This should NEVER happen, so its commented out --
+	if (currentjob<0 || currentjob>=JOB_MAX || jobs[currentjob]==0){
+		prs("Job Control Error\n");
+		return(0);
+	}
+    */
+	jp = jobs[currentjob];
+#ifdef notdef
+	if ( (flags&(forked|ttyflg))!=ttyflg)
+		pid = 0;
+#endif notdef
+#ifdef JOBSXT
+	if (sxtchan!=-1)
+		jp->jb_sxtfg = chanid;		/* parent sxt channel access */
+#endif JOBSXT
+	jp->jb_pgrp = pid ? pid : jobs[0]->jb_pgrp;
+	jp->jb_pri = 0;
+	if (jcmd){
+		for (cmdlength=0, storcmd=jcmd; storcmd; storcmd=storcmd->argnxt)
+			cmdlength += length(storcmd->argval);
+		cmdbuffer = jp->jb_cmd = (char *)alloc(cmdlength+1);
+		*cmdbuffer = '\0';
+		for (storcmd=jcmd; storcmd; storcmd=storcmd->argnxt){
+			cmdbuffer = movstr(storcmd->argval,cmdbuffer);
+			cmdbuffer = movstr(" ",cmdbuffer);
+		}
+	} else jp->jb_cmd = make("(?)");
+	jp->jb_flags.totalbits = 0;
+	jp->jb_flags.singlebits.run = 1;
+	for (j=0; j<PPERJ; j++){
+		jp->jb_proc[j].proc_pid=0;
+		jp->jb_proc[j].proc_status=0;
+	}
+	if (!backing){
+		bdfltjob = dfltjob;
+		dfltjob = currentjob;
+		jp->jb_pri = ++maxpri;
+	}
+	if (pid && pid!=mainpgrp)
+		setparjob(currentjob);
+	return(currentjob);
+}
+			
+
+
+/*
+ *	the "jobs" command
+ */
+listjobs(llist)
+char *llist;
+{
+	register struct jobnod **jp;
+	register int j;
+
+#ifdef JOBSXT
+	ioctl(sxt_fd,SXTIOCSTAT,&sxtblock);
+#endif
+
+	for (jp = &jobs[1]; jp< &jobs[JOB_MAX]; jp++)
+		if (*jp){
+			prc('[');
+			prn(jp-jobs);
+			prs("] ");
+			if (llist){
+				for (j=0; j<PPERJ; j++)
+					if ((*jp)->jb_proc[j].proc_pid){
+						prn((*jp)->jb_proc[j].proc_pid);
+						prs((((*jp)->jb_flags.singlebits.lifes&(1<<j)))?" ":"Z ");
+					}
+				prc(' ');
+			} else prs("    ");
+			if (jp==&jobs[dfltjob]) prc('+');
+			else if (jp==&jobs[bdfltjob]) prc('-');
+			else prc(' ');
+			prc((*jp)->jb_flags.singlebits.notify ? '!' : ' ');
+			prc(' ');
+#ifdef JOBSXT
+			if (BLKBIT(sxtblock.input,jp-jobs) ||
+				   	BLKBIT(sxtblock.output,jp-jobs))
+				if ((*jp)->jb_flags.singlebits.stop==0){
+					if ((*jp)->jb_flags.singlebits.back)
+						bgjobs--;
+					else fgjobs--;
+					(*jp)->jb_flags.singlebits.stop=1;
+				}
+#endif JOBSXT
+			if ((*jp)->jb_flags.singlebits.stop)
+				prstop(jp-jobs, llist!=(char *)0);
+			else if ((*jp)->jb_flags.singlebits.run)
+				prs("Running\t\t");
+			else prs("(?)\t\t");
+			prc('\t');
+			prs((*jp)->jb_cmd ? (*jp)->jb_cmd : "(?)");
+			newline();
+		}
+}
+
+
+/*
+ *	print stop-state
+ */
+prstop(jno,longlist)
+{
+#ifdef JOBSXT
+	register BOOL blkin, blkout;
+
+	prs("Blocked");
+	blkin = BLKBIT(sxtblock.input,jno);
+	blkout = BLKBIT(sxtblock.output,jno);
+	if (blkin && blkout) prs(" (tty i/o)");
+	else if (blkin) prs(" (tty input)");
+	else if (blkout) prs(" (tty output)");
+	else  prs(longlist?"\t\t":"\t");
+#endif JOBSXT
+}
+
+
+/*
+ *	print info about jobs, and clean out if dead
+ */
+donotify(jobno)
+{
+	register int i;
+
+	if ((i=jobno) > 0){
+		if (jobs[i] && (jobs[i]->jb_flags.singlebits.deaths)){
+			jobs[i]->jb_flags.singlebits.deaths=0;
+			if (jobs[i]->jb_flags.singlebits.stop){
+				newline();
+				printjob(i);
+			} else {
+				printjob(i);
+				postjclr(i);
+			}
+		}
+	}
+}
+
+
+
+
+
+
+/*
+ *	If any processes have terminated, do the works.
+ */
+announce()
+{
+	BOOL stoppage=FALSE;
+	register int i, j;
+	int w, status;
+
+	if (extracnt>0){
+		extracnt--;
+		w = extras[extracnt].pid;
+		status = extras[extracnt].status;
+	} else {
+		/* This can NEVER happen! (ha ha) */
+#ifdef JOBSXT
+		/*printf("no wait/extra\n");*/
+#endif JOBSXT
+		w = 0;
+	}
+	if (w==0 || w==-1){
+		/* Can this happen? Does it matter if it does? No. */
+		/*printf("Process Failure:no wait\n");*/
+		return 0;
+	}
+	for (i=1; i<JOB_MAX; i++){
+		if (jobs[i]==0) continue;
+		for (j=0; j<PPERJ; j++)
+			if (jobs[i]->jb_proc[j].proc_pid == w){
+				jobs[i]->jb_flags.singlebits.deaths |= (1<<j);
+				jobs[i]->jb_flags.singlebits.stop = stoppage ? 1 : 0;
+				jobs[i]->jb_proc[j].proc_status = status;
+				if (jobs[i]->jb_flags.singlebits.deaths == jobs[i]->jb_flags.singlebits.lifes){
+					if (jobs[i]->jb_flags.singlebits.run)
+						if (jobs[i]->jb_flags.singlebits.back)
+							bgjobs--;
+						else	fgjobs--;
+					jobs[i]->jb_flags.singlebits.run = 0;
+					donotify(i);
+				} else if (stoppage==0){
+					jobs[i]->jb_flags.singlebits.lifes &= ~(01<<j);
+					jobs[i]->jb_flags.singlebits.deaths &= ~(01<<j);
+				}
+				return(i);
+		}
+	}
+	/* it wasn't a known process - 		 */
+	/*	so forget about it.		 */
+	/* printf("unknown process has died\n"); */
+	/* extras[extracnt].pid = w;		 */
+	/* extras[extracnt].status = status;	 */
+	/* extracnt++;				 */
+	return(0);
+}
+
+
+/*
+ *	stacking function for putting terminated jobs onto extras when
+ *	they die - 'cos they must be waited for immediately, but its
+ *	not safe to do an announce().
+ */
+extrastack(p,s)
+{
+	int w, status;
+
+	if (p==0){
+		w = wait(&status);
+	} else {
+		w=p;
+		status=s;
+	}
+	if (w>0){
+		extras[extracnt].pid = w;
+		extras[extracnt].status = status;
+		extracnt++;
+	} /* else printf("stack: wait error\n"); */
+}
+
+
+
+/*
+ *	initialize jobs table
+ *	(and set up sxt's under Sys-V)
+ */
+initjobs()
+{
+	if (jobs[0]) postjclr(0);
+	bookjob();
+	newjob(mainpgrp,(struct argnod *)0,0,0);	/* this had better be job[0] */
+	jobs[0]->jb_pgrp = mainpgrp;
+#ifdef JOBSXT
+	terminal(&realtty);
+	realtty.c_cc[VSWTCH] = 0377;
+	realtty.c_cflag &= ~LOBLK;
+	sxtinit();
+#endif
+}
+
+
+
+/*
+ *	Something has happened to a job.
+ *	Print out info and clean up if necessary.
+ */
+printjob(jno)
+{
+	register struct jobnod *jp = jobs[jno];
+	register int j;
+	BOOL fgdone = FALSE;
+	int wx=0, rc=0;
+	int sig=0;
+	int status=0;
+	char * msg=0;
+
+	if (jp){
+		for (j=0; j<PPERJ; j++){
+			int ww, ss, ww_hi;
+
+			if (jp->jb_proc[j].proc_pid==0) continue;
+			ww = jp->jb_proc[j].proc_status;
+			ww_hi = (ww>>8)&LOBYTE;
+			ss = (ww&0177);
+			if (ss==0177){
+				ss = ww_hi;
+			}
+			wx |= ww;
+			if (rc==0){
+				if (ss) sig = ss;
+				if (jp->jb_flags.singlebits.back)
+					continue;	/* just wanted the signal */
+				rc = ss ? ss|SIGFLG : ww_hi;
+				status = ww;
+				fgdone = TRUE;
+			}
+		}
+		if (jp->jb_flags.singlebits.stop==0 && jp->jb_flags.singlebits.back==0 && (sig==SIGINT || sig==SIGQUIT))
+			newline();
+		if (jp->jb_flags.singlebits.stop==0 
+			    && jp->jb_flags.singlebits.back==0){
+			TTYNOD tt;
+#ifdef JOBSXT
+			if (jp->jb_sxtfg!=(-1) && (flags&ttyflg) && sig!=SIGHUP){
+				if (ioctl(jp->jb_sxtfg,TCGETA,&tt)==0){
+					tt.c_cc[VSWTCH] = 0377; /* ^Z disabled */
+					tt.c_cflag &= ~LOBLK;	/* no blocking */
+					ioctl(0,TCSETA,&tt);
+				}
+				if (sig==SIGINT || sig==SIGQUIT){	/* Yeauch! */
+					fault(sig);	/* simulate shell's tty pgrp */
+					if (j==0 && jp->jb_proc[1].proc_pid)
+						kill(jp->jb_proc[1].proc_pid,sig);
+				}
+			}
+#endif JOBSXT
+		}
+
+		if ( (msg=(sig==SIGBLOCK?"Blocked":sysmsg[sig]))
+			     || jp->jb_flags.singlebits.notify
+			     || (ntfynod.namval) ){
+			if (msg==0 && !fgdone) msg=nullstr;
+			if (msg && (flags&stdflg)){
+#if defined(JOBSXT) && defined(BLK_BOTTOM)
+				if (jp->jb_flags.singlebits.stop)
+					blk_bottom();
+#endif (JOBSXT && BLK_BOTTOM)
+				if (jp->jb_flags.singlebits.back || jp->jb_flags.singlebits.stop){
+					prc('[');
+					prn(jno);
+					prs("]\t");
+				}
+				if (jp->jb_cmd){
+					register char *p = jp->jb_cmd;
+					while (*p && *p!=' ')
+						prc(*p++);
+					prc('\t');
+				}
+				prs(*msg ? msg : "Done");
+				if (status&0200) prs(coredump);
+				newline();
+				flushb();
+			}
+		}
+		if (fgdone)
+			if (wx && (flags&errflg)) exitsh(rc);
+			else {
+				exitval=rc;
+				exitset();
+			}
+	} /*else printf("trying to report unknown job\n");*/
+}
+
+
+
+
+
+
+/*
+ *	find a job-number from a describing "%..." string
+ */
+findjob(str)
+char *str;
+{
+	int number = -1;
+	register struct jobnod **jpp;
+	register char *p;
+	int found = 0;
+	int nlen;
+
+	if (str==0 || *str=='\0'){
+		number=dfltjob;
+		if (number<1 || jobs[number]==0) error("No appropriate jobs");
+	} else {
+		if (*str=='%') str++;
+		if (*str=='%' || *str=='\0' || *str=='+')
+			number=dfltjob;
+		else if (*str=='-')
+			number=bdfltjob;
+		else if (digit(*str))
+			number=stoi(str);
+		else if (*str=='?'){
+			nlen = length(++str)-1;
+			for (jpp=jobs; jpp < &jobs[JOB_MAX]; jpp++)
+				if (*jpp)
+					for (p=(*jpp)->jb_cmd; *p; p++)
+						if (cfn(str,p,nlen)==0){
+							number = jpp-jobs;
+							if (found++) failed(str,"ambiguous");
+							break;
+						}
+			if (!found) failed(str,"no such job");
+		} else {
+			nlen = length(str)-1;
+			for (jpp=jobs; jpp < &jobs[JOB_MAX]; jpp++)
+				if (*jpp && cfn(str,(*jpp)->jb_cmd,nlen)==0){
+					number = jpp-jobs;
+					if (found++) failed(str,"ambiguous");
+				}
+			if (!found) failed(str,"no such job");
+		}
+
+	}
+	if (number<1 || number>=JOB_MAX || jobs[number]==0)
+		failed(str,"no such job");
+	return(number);
+}
+
+
+
+
+/*
+ * check for stopped jobs
+ */
+stpjobs()
+{
+      register int i;
+
+      for(i=0; i<JOB_MAX; i++)
+              if (jobs[i] && jobs[i]->jb_flags.singlebits.stop)
+                      return(TRUE);
+      return(FALSE);
+
+}
+
+
+
+/*
+ * zap 'em
+ */
+zapjobs()
+{
+	register int i;
+
+	for (i=1; i<JOB_MAX; i++)
+		if (jobs[i] && jobs[i]->jb_flags.singlebits.stop){
+			killpg(jobs[i]->jb_pgrp, SIGHUP);
+			jobs[i]->jb_flags.singlebits.stop = 0;
+			jobs[i]->jb_flags.singlebits.back = 1;             /* so that it gets reported properly */
+			jobs[i]->jb_proc[0].proc_status = SIGHUP;
+			printjob(i);
+		}
+}
+
+
+
+#ifdef JOBSXT
+
+#ifdef JOBSXT_HUP
+char Mstart[] = "echo \"\nsh was killed off, so I hung up the following processes:\n";
+char Mend[]   = "\n\" | mail -s sh_was_killed $LOGNAME";	/* good meta-usage */
+
+/*
+ *	HUP has happened! Send mail and go away.
+ */
+hupmail()
+{
+	register int i;
+	char maillist[1024];
+	register char *mpoint;
+	int mcnt = 0;
+
+	sxtchan = -1;
+	flags &= ~ttyflg;	/* just in case ... */
+	mpoint = movstr(Mstart, maillist);
+	for (i=1; i<JOB_MAX; i++)
+		if (jobs[i] && jobs[i]->jb_flags.singlebits.back==0){
+			killpg(jobs[i]->jb_pgrp,SIGHUP);
+			if (jobs[i]->jb_cmd){
+				mpoint = movstr("\t", mpoint);
+				mpoint = movstr(jobs[i]->jb_cmd,mpoint);
+				mpoint = movstr("\n", mpoint);
+			} else mpoint = movstr("\t?\n", mpoint);
+			mcnt++;
+		}
+	movstr(Mend, mpoint);
+	if (mcnt)
+		execexp(maillist,(char * *)0);	/* bye! */
+}
+#endif JOBSXT_HUP
+
+/*
+ *	set current job using sxt's
+ */
+setsxt(jno)
+{
+	if (sxtchan != -1 && jno<SXTMAX){
+		jno = SXT(jno);
+		sxtcontrol = -1;
+		do {
+			if (ioctl(sxt_fd,SXTIOCSWTCH,jno) == 0)
+				sxtcontrol = jno;
+			/*else if (errno!=EINTR)
+				printf("sxt switch (errno %d)\n", errno);*/
+		} while (sxtcontrol!=jno && errno==EINTR);
+		return(sxtcontrol);
+	} else return(-1);
+}
+
+/*
+ *	block an sxt file
+ */
+sxtblk(jno)
+{
+	ioctl(sxt_fd, SXTIOCBLK, SXT(jno));
+}
+
+#endif JOBSXT
+
+
+/*
+ *	send a signal to all processes in a tty group.
+ *	actually, it only sends to the first and last in the pipe-order,
+ *	'cos it only knows the pid's for these (jb_proc[0] ... jb_proc[PPERJ]).
+ *	This exists as a system-call under BSD.
+ *	Luckily it knows about negative pids.
+ */
+killpg(gid,sig)
+{
+	register struct jobnod **jp;
+	register int i=0;
+	int err = 0, proc;;
+
+	for (jp=jobs; jp < &jobs[JOB_MAX]; jp++)
+		if (*jp && (*jp)->jb_pgrp==gid)
+			for (i=0; i<PPERJ; i++){
+				proc = (*jp)->jb_proc[i].proc_pid;
+				if (proc && kill(-proc,sig)==-1)
+					err = errno;
+			}
+	/* Panic Stations! It didn't work, so get really desparate... */
+	if (err!=0)
+		if (kill(-gid,sig)==-1 && kill(gid,sig)==-1)
+			err = errno;
+		else err=0;
+	return(err);
+}
+
+#if defined(JOBSXT) && defined(BLK_BOTTOM)
+/*
+ *	move cursor to bottom of screen - when job is blocked
+ *
+ *	if you have TERMCAP defined, it does it properly be sending
+ *	the "ll" string and clearing to end-of-line, otherwise it is
+ *	pretty dumb.
+ *	in fact, TERMCAP implies a lot of other stuff I havn't included
+ *	here, so tough.
+ *				simon@uk.ac.ed.its63b
+ */
+blk_bottom()
+{
+# ifdef TERMCAP
+	STRING it, p;
+
+	if (p=tcapstr[TCAP_LL])
+		tputs(p,1,prc);
+	else if (it=tcapstr[TCAP_CM]){
+		p=tgoto(it,0,tcapflag[TCAP_ROW]);
+		tputs(p,1,prc);			/* move to bottom */
+	} else
+# endif TERMCAP
+	{
+		register int n = 24;	/* bound to have 24 lines */
+		while (n--)
+			newline();	/* chug chug chug ... */
+	}
+# ifdef TERMCAP
+	if (p=tcapstr[TCAP_CE])
+		tputs(p,1,prc);		/* clear to eoln */
+# endif TERMCAP
+}
+#endif (JOBSXT && BLK_BOTTOM)
+
+#else !JOB
+ 
+
+/*
+ * for processes to be waited for
+ */
+#define MAXP 20
+static int	pwlist[MAXP];
+static int	pwc;
+
+postclr()
+{
+	register int	*pw = pwlist;
+
+	while (pw <= &pwlist[pwc])
+		*pw++ = 0;
+	pwc = 0;
+}
+
+post(pcsid)
+int	pcsid;
+{
+	register int	*pw = pwlist;
+
+	if (pcsid)
+	{
+		while (*pw)
+			pw++;
+		if (pwc >= MAXP - 1)
+			pw--;
+		else
+			pwc++;
+		*pw = pcsid;
+	}
+}
+
+await(i, bckg)
+int	i, bckg;
+{
+	int	rc = 0, wx = 0;
+	int	w;
+	int	ipwc = pwc;
+
+	post(i);
+	while (pwc)
+	{
+		register int	p;
+		register int	sig;
+		int		w_hi;
+		int	found = 0;
+
+		{
+			register int	*pw = pwlist;
+
+			p = wait(&w);
+			if (wasintr)
+			{
+				wasintr = 0;
+				if (bckg)
+				{
+					break;
+				}
+			}
+			while (pw <= &pwlist[ipwc])
+			{
+				if (*pw == p)
+				{
+					*pw = 0;
+					pwc--;
+					found++;
+				}
+				else
+					pw++;
+			}
+		}
+		if (p == -1)
+		{
+			if (bckg)
+			{
+				register int *pw = pwlist;
+
+				while (pw <= &pwlist[ipwc] && i != *pw)
+					pw++;
+				if (i == *pw)
+				{
+					*pw = 0;
+					pwc--;
+				}
+			}
+			continue;
+		}
+		w_hi = (w >> 8) & LOBYTE;
+		if (sig = w & 0177)
+		{
+			if (sig == 0177)	/* ptrace! return */
+			{
+				prs("ptrace: ");
+				sig = w_hi;
+			}
+			if (sysmsg[sig])
+			{
+				if (i != p || (flags & prompt) == 0)
+				{
+					prp();
+					prn(p);
+					blank();
+				}
+				prs(sysmsg[sig]);
+				if (w & 0200)
+					prs(coredump);
+			}
+			newline();
+		}
+		if (rc == 0 && found != 0)
+			rc = (sig ? sig | SIGFLG : w_hi);
+		wx |= w;
+		if (p == i)
+		{
+			break;
+		}
+	}
+	if (wx && flags & errflg)
+		exitsh(rc);
+	flags |= eflag;
+	exitval = rc;
+	exitset();
+}
+
+#endif JOB
+SHAR_EOF
+fi
+echo shar: "extracting 'service.c.Diff'" '(885 characters)'
+if test -f 'service.c.Diff'
+then
+	echo shar: "will not over-write existing file 'service.c.Diff'"
+else
+cat << \SHAR_EOF > 'service.c.Diff'
+*** service.c	Mon Nov 24 17:49:29 1986
+--- /cs/simon/c/shdiff-sources/service.c	Fri Feb 20 12:41:00 1987
+***************
+*** 261,266
+  }
+  
+  
+  /*
+   * for processes to be waited for
+   */
+
+--- 261,268 -----
+  }
+  
+  
++ #ifndef JOB
++ 
+  /*
+   * This should really be in "proc.c", but I left it here to keep the
+   * size of the diff-listing small.
+***************
+*** 262,267
+  
+  
+  /*
+   * for processes to be waited for
+   */
+  #define MAXP 20
+
+--- 264,276 -----
+  #ifndef JOB
+  
+  /*
++  * This should really be in "proc.c", but I left it here to keep the
++  * size of the diff-listing small.
++  *
++  *				simon@uk.ac.ed.its63b
++  */
++ 
++ /*
+   * for processes to be waited for
+   */
+  #define MAXP 20
+***************
+*** 385,390
+  	exitval = rc;
+  	exitset();
+  }
+  
+  BOOL		nosubst;
+  
+
+--- 394,401 -----
+  	exitval = rc;
+  	exitset();
+  }
++ 
++ #endif JOB
+  
+  BOOL		nosubst;
+  
+SHAR_EOF
+fi
+echo shar: "extracting 'sh.1.Diff'" '(8882 characters)'
+if test -f 'sh.1.Diff'
+then
+	echo shar: "will not over-write existing file 'sh.1.Diff'"
+else
+cat << \SHAR_EOF > 'sh.1.Diff'
+*** /cs/simon/src/util/sh.sysV/sh.1	Thu Feb 19 19:12:25 1987
+--- ../shdiff-sources/sh.1	Thu Feb 19 18:12:00 1987
+***************
+*** 31,36
+  .TH SH 1
+  .SH NAME
+  sh, rsh \- shell, the standard/restricted command programming language
+  .SH SYNOPSIS
+  .B sh
+  [
+
+--- 31,37 -----
+  .TH SH 1
+  .SH NAME
+  sh, rsh \- shell, the standard/restricted command programming language
++ (job-control version)
+  .SH SYNOPSIS
+  .B sh
+  [
+***************
+*** 552,557
+  below) for this name.
+  If it is found and there is an 'r' in the file name part of its value, the
+  shell becomes a restricted shell.
+  .PD
+  .RE
+  .PP
+
+--- 553,578 -----
+  below) for this name.
+  If it is found and there is an 'r' in the file name part of its value, the
+  shell becomes a restricted shell.
++ .TP
++ .B
++ .SM NOTIFY
++ If this is set, then you will receive asynchronous notification of the
++ termination of background jobs \- it is equivalent to an automatic
++ \f2notify\^\fP being applied to all jobs.
++ .TP
++ .B
++ .SM REALTTY
++ If job-control is being used, this parameter will hold the name of the
++ real (physical) terminal you are logged in on; the entry in \f2utmp\^\fP
++ is reset to the name of the \f2sxt\^\fP device you are using.
++ It is automatically read-only and exported.
++ .TP
++ .B
++ .SM SXT_CONTROL
++ This may be available in sub-processes in order to do their own
++ job-control. The parameter holds a number on which \f2ioctl\^\fP calls
++ can be done. To suspend itself, a process need only execute the
++ \f2\s-1SXTIOCSWTCH\s+1\fP ioctl with a channel-parameter of zero.
+  .PD
+  .RE
+  .PP
+***************
+*** 557,562
+  .PP
+  The shell gives default values to
+  \f3\s-1PATH\s+1\fP, \f3\s-1PS1\s+1\fP, \f3\s-1PS2\s+1\fP, \f3\s-1MAILCHECK\s+1\fP and \f3\s-1IFS\s+1\fP.
+  .SM
+  .B HOME
+  and
+
+--- 578,585 -----
+  .PP
+  The shell gives default values to
+  \f3\s-1PATH\s+1\fP, \f3\s-1PS1\s+1\fP, \f3\s-1PS2\s+1\fP, \f3\s-1MAILCHECK\s+1\fP and \f3\s-1IFS\s+1\fP.
++ If job-control is being used, it will also set some of
++ \f3\s-1REALTTY\s+1\fP and \f3\s-1SXT_CONTROL\s+1\fP.
+  .SM
+  .B HOME
+  and
+***************
+*** 880,885
+  the
+  .B trap
+  command below).
+  .SS Execution
+  Each time a command is executed, the above substitutions are
+  carried out.
+
+--- 903,940 -----
+  the
+  .B trap
+  command below).
++ .SS "Job Control"
++ Whenever a command is executed which results in the shell forking off
++ a subprocess, this subprocess is entered in a table of "jobs". Individual
++ jobs may then be manipulated using special job-control commands which
++ are built-ins in the shell.
++ The command \f3fg\fP brings a job into the foreground (from either the
++ background or "limbo"), \f3bg\fP resumes a blocked job in the background,
++ \f3jobs\fP lists the jobs-table, \f3notify\fP allows a job to give
++ asynchronous notification if it terminates from the background, 
++ \f3stop\fP allows a job to be blocked from doing any output when it is
++ not in the foreground (see \f3loblk\fP in \f2stty\^\fP(1)), and
++ \f3sxt1\fP allows escape from the job-control regime if this becomes
++ necessary.
++ The \f3kill\fP command is now a shell built-in and can take
++ job-specifiers as parameters, as well as the usual process-id numbers.
++ .PP
++ All of these commands use job-specifiers to name jobs. A job-specifier
++ consists of a percent-sign (\f3%\fP) followed by some unique string.
++ If the string does not name a unique job, this is considered to be
++ an error (which should perhaps not be the case \- "wildcard" globbing
++ of job-specifiers would be nice).
++ The following strings are recognized:
++ .RS
++ .nf
++ %\f2n\^\fP \| the job numbered \f2n\^\fP
++ %+ \| the current job
++ %- \| the previous job
++ %% \| a symnonym for %+
++ %\f2name\^\fP \| the job whose command-name starts with \f2name^\fP
++ %?\f2string\^\fP \| the job whose name contains the named \f2string\^\fP
++ .fi
++ .RE
+  .SS Execution
+  Each time a command is executed, the above substitutions are
+  carried out.
+***************
+*** 969,974
+  is used to find the directory containing
+  .IR file .
+  .TP
+  \f3break\fP \*(OK \f2n\^\fP \*(CK
+  Exit from the enclosing \f3for\fP or
+  .B while
+
+--- 1024,1032 -----
+  is used to find the directory containing
+  .IR file .
+  .TP
++ \f3bg\fP \*(OK \f2%job\^\fP \*CK
++ Resume the named (or "current") job in the background.
++ .TP
+  \f3break\fP \*(OK \f2n\^\fP \*(CK
+  Exit from the enclosing \f3for\fP or
+  .B while
+***************
+*** 1068,1073
+  .I not
+  be exported.
+  .TP
+  \f3hash\fP \*(OK \f3\-r\fP \*(CK \*(OK \fIname\^\fP .\|.\|. \*(CK
+  For each 
+  .IR name\^ ,
+
+--- 1126,1134 -----
+  .I not
+  be exported.
+  .TP
++ \f3fg\fP \*(OK \f2%job\^\fP \*(CK
++ Resume the named (or default) job in the foreground.
++ .TP
+  \f3hash\fP \*(OK \f3\-r\fP \*(CK \*(OK \fIname\^\fP .\|.\|. \*(CK
+  For each 
+  .IR name\^ ,
+***************
+*** 1088,1093
+  adjacent to the \f2hits\fR information.
+  \f2Cost\fR will be incremented when the recalculation is done.
+  .TP
+  \f3newgrp\fP \*(OK \f2arg\^\fP .\|.\|. \*(CK
+  Equivalent to
+  .BI "exec newgrp" " arg\^"
+
+--- 1149,1178 -----
+  adjacent to the \f2hits\fR information.
+  \f2Cost\fR will be incremented when the recalculation is done.
+  .TP
++ \f3jobs\fP \*(OK \f3-l\^\fP \*(CK
++ List all currently active (running or blocked) jobs.
++ Each job will be listed by giving its job-number within square
++ brackets, followed by a identifying character, followed
++ by a status-word (either "Blocked" or "Running"), followed by a the name of
++ the command. If the \f3-l\fP option is used, then a list of process-id
++ numbers associated with that job is printed too.
++ .br
++ The identifying-character will be one of <blank>, \f3+\fP or \f3-\fP.
++ The job "%+" is the current "default job", wheras "%-" is the previous
++ current job.
++ .br
++ The status word "Running" means that it is a pure background process,
++ "Blocked" means that it is possibly executing but will block as soon
++ as it tries to do any input (or possibly output \- see the \f3loblk\fP
++ option to \f2stty\^\fP or the \f3stop\fP command) from the terminal.
++ A physically blocked job will have either "(tty input)" or "(tty output)"
++ following the word "Blocked".
++ .TP
++ \f3kill\fP \*(OK \f2-sig\^\fP \*(CK \f2{process,%job} ...\^\fP
++ Kill the named processes or jobs by sending the named signal. If
++ no signal is named, then \f2SIGTERM\^\fP is sent \- signal 15.
++ It is not possible to give signal-name mnemonics to specify signal numbers.
++ .TP
+  \f3newgrp\fP \*(OK \f2arg\^\fP .\|.\|. \*(CK
+  Equivalent to
+  .BI "exec newgrp" " arg\^"
+***************
+*** 1096,1101
+  .IR newgrp (1)
+  for usage and description.
+  .TP
+  \f3pwd\fP
+  Print the current working directory.
+  See
+
+--- 1181,1190 -----
+  .IR newgrp (1)
+  for usage and description.
+  .TP
++ \f3notify\fP \*(OK \f2%job\^\fP \*(CK
++ Arrange for asynchronous notification when background jobs terminate.
++ If no job is given, then all subsequent jobs will asynchronously notify.
++ .TP
+  \f3pwd\fP
+  Print the current working directory.
+  See
+***************
+*** 1208,1213
+  .I n\^
+  is not given, it is assumed to be 1.
+  .TP
+  \f3test\fP
+  .br
+  Evaluate conditional expressions. See
+
+--- 1297,1314 -----
+  .I n\^
+  is not given, it is assumed to be 1.
+  .TP
++ \f3stop\fP \*(OK \f2%job\^\fP \*(CK
++ Stop a given (or the "current") running background job. A job that is
++ "stopped" will continue to execute until it tries to do input or output
++ from the terminal, and it will block as soon as this occurs.
++ .TP
++ \f3sxt1 \f2command args ...\^\fP
++ Execute a command without using job-control. This is useful for commands
++ which rely on being able to find out the name of their terminal from the
++ \f2utmp\^\fP file \- such as \f2who\^\fP, \f2mesg\^\fP, \f2tty\^\fP
++ or quite a few others. This is only necessary because of the simplisitic
++ nature of \f2utmp\^\fP.
++ .TP
+  \f3test\fP
+  .br
+  Evaluate conditional expressions. See
+***************
+*** 1476,1481
+  exec(2),
+  fork(2),
+  pipe(2),
+  signal(2),
+  ulimit(2),
+  umask(2),
+
+--- 1577,1583 -----
+  exec(2),
+  fork(2),
+  pipe(2),
++ setpgrp(2),
+  signal(2),
+  ulimit(2),
+  umask(2),
+***************
+*** 1482,1488
+  wait(2),
+  a.out(4),
+  profile(4),
+! environ(5) in the
+  \f2\s-1UNIX\s+1 System Programmer Reference Manual\fR.
+  .SH CAVEATS
+  .PP
+
+--- 1584,1591 -----
+  wait(2),
+  a.out(4),
+  profile(4),
+! environ(5),
+! sxt(7) in the
+  \f2\s-1UNIX\s+1 System Programmer Reference Manual\fR.
+  .SH CAVEATS
+  .PP
+***************
+*** 1502,1504
+  .B cd\^
+  command with a full path name
+  to correct this situation.
+
+--- 1605,1614 -----
+  .B cd\^
+  command with a full path name
+  to correct this situation.
++ .SH ADDITIONS
++ .PP
++ This version of the shell has additional job-control features 
++ for the \f2sxt\^\fP(7) driver,
++ added by Simon Brown at the University of Edinburgh.
++ (Send any bug reports to \f3simon@its63b.edinburgh.ac.uk\fP
++ or \f3seismo!mcvax!ukc!its63b!simon\fP).
+SHAR_EOF
+fi
+echo shar: "extracting 'string.c.Diff'" '(457 characters)'
+if test -f 'string.c.Diff'
+then
+	echo shar: "will not over-write existing file 'string.c.Diff'"
+else
+cat << \SHAR_EOF > 'string.c.Diff'
+*** string.c	Mon Nov 24 17:49:30 1986
+--- /cs/simon/c/shdiff-sources/string.c	Wed Feb 18 18:59:11 1987
+***************
+*** 43,48
+  	return(*--s1 - *s2);
+  }
+  
+  length(as)
+  char	*as;
+  {
+
+--- 43,60 -----
+  	return(*--s1 - *s2);
+  }
+  
++ #ifdef JOB
++ cfn(s1,s2,n)
++ register char *s1, *s2;
++ int n;
++ {
++ 	while (--n>=0 && *s1++ == *s2)
++ 		if (*s2++ == 0)
++ 			return(0);
++ 	return(n<0 ? 0 : *--s1 - *s2);
++ }
++ #endif JOB
++ 
+  length(as)
+  char	*as;
+  {
+SHAR_EOF
+fi
+echo shar: "extracting 'sxtalloc.8'" '(1774 characters)'
+if test -f 'sxtalloc.8'
+then
+	echo shar: "will not over-write existing file 'sxtalloc.8'"
+else
+cat << \SHAR_EOF > 'sxtalloc.8'
+.TH SXTALLOC 7 "Edinburgh Univ, June 6 1986"
+.SH NAME
+sxtalloc - allocate/deallocate sxt channels
+.SH SYNOPSIS
+.B /usr/lib/ssh/sxtalloc
+.br
+.B /usr/lib/ssh/sxtalloc \fIttyname status\fx
+.SH DESCRIPTION
+When called with no parameters,
+.I sxtalloc
+finds a non-busy sxt channel-zero in /dev/sxt
+and chowns all its subchannels to the real user-id of the caller
+so that the sxt is then available for use by that user.
+It replaces the users original terminal name in the
+.I utmp
+file with the new sxt device.
+It prints the name of the original terminal on the standard output.
+.PP
+If called with two parameters, it attempts to undo the damage caused by
+allocating the device. It replaces the sxt name in the
+.I utmp
+file with the
+.I ttyname
+parameter, and exits with exit-status
+.IR status .
+Checks are made that you are entitled to have
+.I ttyname
+as your terminal.
+.PP
+The use of
+.I sxtalloc
+may be restricted to certain usernames by creating files
+.I sxt.allow
+or
+.I sxt.deny
+in the directory
+.IR /usr/lib/ssh .
+If an
+.I allow
+file exists, then only those people whose name occurs in this file
+are permitted to allocate sxt channels;
+if a
+.I deny
+file exists, then everyone execept the people named in this file
+may allocate sxt's.
+If neither exist, then no restrictions on use are in force.
+.SH "STATUS RETURNS"
+When allocating an sxt device, it returns status of 0 if it succeeds,
+otherwise 1.
+When deallocating, it exits with the given exit-status, unless it fails
+for some reason (in which case it exits with status 1).
+.SH "SEE ALSO"
+ssh(1), sxt(7), utmp(4).
+.SH "FILES"
+/usr/lib/ssh/sxtalloc - binary
+.br
+/dev/sxt/??? - sxt devices
+.br
+/etc/utmp - utmp file
+.br
+/usr/lib/ssh/sxt.allow, /usr/lib/ssh/sxt.deny
+.SH BUGS
+It has to be set-user-id root.
+.SH AUTHOR
+Simon Brown
+SHAR_EOF
+fi
+echo shar: "extracting 'sxtalloc.c'" '(5826 characters)'
+if test -f 'sxtalloc.c'
+then
+	echo shar: "will not over-write existing file 'sxtalloc.c'"
+else
+cat << \SHAR_EOF > 'sxtalloc.c'
+/*
+ *	Allocate a sxt-channel for a non-priveliged user, by
+ *	chowning an unused one, so the user can pick it up later.
+ *	Probably needs locks to prevent races, but too much effort to do that.
+ *
+ *	MUST BE SET-USER-ID "root".
+ *
+ *	Used by the "ssh" shell to do job-control.
+ *
+ *	Usage:
+ *		sxtalloc 		- allocate sxt, print old ttyname on 
+ *					  stdout;
+ *					  exit status: 0=success, 1=failure.
+ *		sxtalloc realtty status - de-allocate sxt, change utmp entry
+ *					  back to "realtty";
+ *					  exit status: "status"."
+ *	Copyright (c) S. Brown, 1987
+ */
+
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/tty.h>
+#include <sys/sxt.h>
+#include <fcntl.h>
+#include <utmp.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <pwd.h>
+
+char sxt[] = "/dev/sxt/000";	/* virtual tty devices, channel 0 */
+#define SXT_CHAN 9
+char devsxt[] = "sxt000";	/* utmp dummy */
+char devreal[50];
+extern struct utmp *getutline();
+extern char *ttyname();
+extern char *strrchr();
+char *getuser();
+char *progname;
+
+/*
+ *	The "allow/deny" files, a la cron/at.
+ */
+#define ALLOW	"/usr/lib/ssh/sxt.allow"
+#define DENY	"/usr/lib/ssh/sxt.deny"
+
+#define UNAMESIZE 64	/* FAR too big! */
+
+/*
+ *	Verbose mode
+ */
+/*#define VERBOSE*/
+
+
+main(argc,argv)
+char **argv;
+{
+	int exitstat;
+
+	progname = argv[0];
+	if (argc==3){
+		release(argv[1]);
+		exitstat = atoi(argv[2]);
+	} else if (argc==1)
+		exitstat = allocate();
+	else {
+		fprintf(stderr, "%s: usage\n", argv[0]);
+		exitstat = -1;
+	}
+	exit(exitstat);
+	/*NOTREACHED*/
+}
+
+
+allocate()
+{
+	int fd;
+	int chan = 0;
+	int uid, gid;
+	char *tty;
+	int mode;
+	struct utmp *u_entry;
+	struct utmp u_start;
+	register int i;
+	struct stat statb;
+	char *username;
+
+	uid=getuid();
+	username = getuser(uid);
+	if (username==NULL){	/* you don't exist! */
+#ifdef VERBOSE
+		fprintf(stderr,"You don't exist. go away!\n");
+#endif
+		return(1);
+	}
+	if (allowed(username,ALLOW,DENY)==0){
+#ifdef VERBOSE
+		fprintf(stderr,"You are not allowed to use sxt devices\n");
+#endif
+		return(2);	/* 2 means "not permitted" */
+	}
+	do {
+		fd = open(sxt,O_RDONLY|O_EXCL);
+		if (fd==-1){
+			if (errno!=EBUSY){
+				fprintf(stderr,"%s: sxt failure on %s (errno %d)\n", progname, sxt,errno);
+				return(1);	/* some strange error, like no chans unused */
+			}
+			chan++;		/* try next device */
+			sxt[SXT_CHAN] = (chan/10)+'0';
+			sxt[SXT_CHAN+1] = (chan%10)+'0';
+		}
+	} while (fd==-1);	/* continue until found an unused dev */
+
+	gid=getgid();
+	tty=ttyname(0);
+	if (tty && stat(tty,&statb)==0){
+		mode = statb.st_mode&0777;
+		tty = strrchr(tty,'/');
+		if (tty){
+			tty++;
+			strcpy(u_start.ut_line,tty);
+			if ((u_entry=getutline(&u_start))!=(struct utmp *)0){
+				strcpy(&devsxt[3], &sxt[SXT_CHAN]);
+				devsxt[5] = '1';	/* chan 1 is control */
+				strcpy(devreal, u_entry->ut_line);
+				strcpy(u_entry->ut_line, devsxt);
+				pututline(u_entry);
+				endutent();
+			} 
+#ifdef VERBOSE
+			else fprintf(stderr,"%s: can't change utmp\n", progname); 
+#endif
+		} else fprintf(stderr,"%s: tty has silly name\n", progname);
+	} else {
+		fprintf(stderr,"%s: warning - can't seem to find tty name\n", progname);
+		mode = 0622;
+	}
+
+	for (i=0; i<MAXPCHAN; i++){	/* chown all the channels for that dev */
+
+		sxt[SXT_CHAN+2] = i+'0';
+		if (chown(sxt,uid,gid) != 0){	/* "real" id's */
+			fprintf(stderr,"%s: chown failure on %s (errno %d)\n", progname, sxt, errno);
+			return(1);	/* no point haning about */
+		}
+		if (chmod(sxt,mode) != 0){
+			fprintf(stderr,"%s: chmod failure on %s (errno %d)\n", progname, sxt, errno);
+			return(1);	/* no point haning about */
+		}
+	}
+	printf("%s\n", devreal);
+	return(0);
+}
+
+
+
+release(realtty)
+char *realtty;
+{
+	char *tty;
+	int mode;
+	struct utmp u_start;
+	struct utmp *u_entry;
+	struct stat statb;
+	int uid;
+
+	uid=getuid();
+	strcpy(devreal,"/dev/");
+	if (realtty && *realtty){
+		strcat(devreal,realtty);
+		if (stat(devreal,&statb)!=0
+			     || statb.st_uid!=uid
+			     || (statb.st_mode&S_IFMT)!=S_IFCHR){
+			fprintf(stderr,"%s: %s is not a tty belonging to you!\n",
+				progname, realtty);
+			return;
+		}
+	} else {
+		fprintf(stderr,"%s: null tty name given\n", progname);
+		return;
+	}
+	tty=ttyname(0);
+	if (tty && stat(tty,&statb)==0){
+		mode = statb.st_mode&0777;
+		tty = strrchr(tty,'/');
+		if (tty){
+			tty++;
+			strcpy(u_start.ut_line,tty);
+			if ((u_entry=getutline(&u_start))!=(struct utmp *)0){
+				strcpy(u_entry->ut_line, realtty);
+				pututline(u_entry);
+				endutent();
+			} else fprintf(stderr,"%s: can't restore utmp\n", progname);
+		} else fprintf(stderr,"%s: tty has silly name\n",progname); 
+	} else {
+		fprintf(stderr,"%s: warning - can't seem to find tty name\n", progname);
+		mode = 0622;
+	}
+	if (chmod(devreal,mode)!=0)
+		fprintf(stderr,"%s: cannot reset mode of real tty\n", progname);}
+
+
+/*
+ *	--------------------------------------------------------
+ *
+ *	The following stuff checks in the files
+ *	sxt.allow and sxt.deny files to control access
+ *
+ */
+
+
+
+struct stat globstat;
+#define	exists(file)	(stat(file,&globstat) == 0)
+
+char *getuser(uid)
+int uid;
+{
+	struct passwd *nptr,*getpwuid();
+
+	if ((nptr=getpwuid(uid)) == NULL) {
+		return(NULL); 
+	}
+	return(nptr->pw_name);
+}
+
+
+allowed(user,allow,deny)
+char *user,*allow,*deny;
+{
+	if (getuid() == 0) return(1);	/* root is a good guy */
+	if ( exists(allow) ) {
+		if ( within(user,allow) ) return(1);
+	} else if ( exists(deny) ) {
+		if ( within(user,deny) ) return(0);
+		else return(1); 
+	} else return(1);
+	return(0);
+}
+
+
+within(username,filename)
+char *username,*filename;
+{
+	char line[UNAMESIZE];
+	FILE *cap;
+	int i;
+
+	if((cap = fopen(filename,"r")) == NULL)
+		return(0);
+	while ( fgets(line,UNAMESIZE,cap) != NULL ) {
+		for ( i=0 ; line[i] != '\0' ; i++ ) {
+			if ( isspace(line[i]) ) {
+				line[i] = '\0';
+				break; }
+		}
+		if ( strcmp(line,username)==0 ) {
+			fclose(cap);
+			return(1); }
+	}
+	fclose(cap);
+	return(0);
+}
+SHAR_EOF
+fi
+echo shar: "extracting 'word.c.Diff'" '(459 characters)'
+if test -f 'word.c.Diff'
+then
+	echo shar: "will not over-write existing file 'word.c.Diff'"
+else
+cat << \SHAR_EOF > 'word.c.Diff'
+*** word.c	Mon Nov 24 17:49:31 1986
+--- /cs/simon/c/shdiff-sources/word.c	Thu Feb 19 17:56:50 1987
+***************
+*** 232,237
+  			chktrap();
+  			clearup();
+  		}
+  	} while ((len = read(f->fdes, f->fbuf, f->fsiz)) < 0 && trapnote);
+  	return(len);
+  }
+
+--- 232,240 -----
+  			chktrap();
+  			clearup();
+  		}
++ #ifdef JOB
++ 		trapnote &= ~DEVINTERRUPT;
++ #endif JOB
+  	} while ((len = read(f->fdes, f->fbuf, f->fsiz)) < 0 && trapnote);
+  	return(len);
+  }
+SHAR_EOF
+fi
+echo shar: "extracting 'xec.c.Diff'" '(13610 characters)'
+if test -f 'xec.c.Diff'
+then
+	echo shar: "will not over-write existing file 'xec.c.Diff'"
+else
+cat << \SHAR_EOF > 'xec.c.Diff'
+*** xec.c	Mon Nov 24 17:49:32 1986
+--- /cs/simon/c/shdiff-sources/xec.c	Fri Feb 20 14:36:02 1987
+***************
+*** 13,18
+  #include	"sym.h"
+  #include	"hash.h"
+  
+  static int	parent;
+  
+  /* ========	command execution	========*/
+
+--- 13,22 -----
+  #include	"sym.h"
+  #include	"hash.h"
+  
++ #ifdef JOB
++ #include "job.h"
++ #endif JOB
++ 
+  static int	parent;
+  
+  
+***************
+*** 15,20
+  
+  static int	parent;
+  
+  /* ========	command execution	========*/
+  
+  
+
+--- 19,25 -----
+  
+  static int	parent;
+  
++ 
+  /* ========	command execution	========*/
+  
+  
+***************
+*** 87,92
+  				struct ionod	*io = t->treio;
+  				short 	cmdhash;
+  				short	comtype;
+  
+  				exitval = 0;
+  
+
+--- 92,100 -----
+  				struct ionod	*io = t->treio;
+  				short 	cmdhash;
+  				short	comtype;
++ #ifdef JOB
++ 				char *fgcom[3];
++ #endif
+  
+  				exitval = 0;
+  
+***************
+*** 95,100
+  				com = scan(argn);
+  				a1 = com[1];
+  				gchain = schain;
+  
+  				if (argn != 0)
+  					cmdhash = pathlook(com[0], 1, comptr(t)->comset);
+
+--- 103,118 -----
+  				com = scan(argn);
+  				a1 = com[1];
+  				gchain = schain;
++ #ifdef JOB
++ 				if (com[0][0]=='%'){
++ 				    /* this is incredibly kludgy! */
++ 					fgcom[0] = "fg";
++ 					fgcom[1] = com[0];
++ 					fgcom[2] = 0;
++ 					com = fgcom;
++ 					argn=2;
++ 				}
++ #endif JOB
+  
+  				if (argn != 0)
+  					cmdhash = pathlook(com[0], 1, comptr(t)->comset);
+***************
+*** 165,171
+  							break;	
+  				
+  						case SYSEXIT:	
+! 							flags |= forked;	/* force exit */	
+  							exitsh(a1 ? stoi(a1) : retval);
+  				
+  						case SYSNULL:	
+
+--- 183,192 -----
+  							break;	
+  				
+  						case SYSEXIT:	
+! #ifdef JOBSXT
+!         						if ((flags&ttyflg)==ttyflg && stpjobs())
+!                 						error("There are blocked jobs");
+! #endif JOBSXT
+  							exitsh(a1 ? stoi(a1) : retval);
+  				
+  						case SYSNULL:	
+***************
+*** 250,255
+  #ifdef RES	/* Research includes login as part of the shell */	
+  		
+  						case SYSLOGIN:	
+  							oldsigs();	
+  							execa(com, -1);
+  							done();	
+
+--- 271,283 -----
+  #ifdef RES	/* Research includes login as part of the shell */	
+  		
+  						case SYSLOGIN:	
++ #ifdef JOBSXT
++         						if ((flags&ttyflg)==ttyflg && stpjobs())
++                 						error("There are blocked jobs");
++ 							sxtrelease(0);
++ 							nattrib(&TTYnod,N_VAR|N_EXPORT);
++ #endif JOBSXT
++ 							flags |= forked;
+  							oldsigs();	
+  							execa(com, -1);
+  							done();	
+***************
+*** 260,265
+  								failed(com[0], restricted);	
+  							else	
+  							{	
+  								flags |= forked;	/* force bad exec to terminate shell */	
+  								oldsigs();	
+  								execa(com, -1);
+
+--- 288,299 -----
+  								failed(com[0], restricted);	
+  							else	
+  							{	
++ #ifdef JOBSXT
++         							if ((flags&ttyflg)==ttyflg && stpjobs())
++                 							error("There are blocked jobs");
++ 								sxtrelease(0);
++ 								nattrib(&TTYnod,N_EXPORT);
++ #endif JOBSXT
+  								flags |= forked;	/* force bad exec to terminate shell */	
+  								oldsigs();	
+  								execa(com, -1);
+***************
+*** 335,340
+  							break;	
+  				
+  						case SYSWAIT:	
+  							await(a1 ? stoi(a1) : -1, 1);	
+  							break;	
+  				
+
+--- 369,377 -----
+  							break;	
+  				
+  						case SYSWAIT:	
++ #ifdef JOB
++ 							await(a1 ? stoi(a1) : -1, WAIT_BG);	
++ #else
+  							await(a1 ? stoi(a1) : -1, 1);	
+  #endif
+  							break;	
+***************
+*** 336,341
+  				
+  						case SYSWAIT:	
+  							await(a1 ? stoi(a1) : -1, 1);	
+  							break;	
+  				
+  						case SYSREAD:	
+
+--- 373,379 -----
+  							await(a1 ? stoi(a1) : -1, WAIT_BG);	
+  #else
+  							await(a1 ? stoi(a1) : -1, 1);	
++ #endif
+  							break;	
+  				
+  						case SYSREAD:	
+***************
+*** 547,552
+  									unset_name(*com);
+  							}
+  							break;
+  
+  						default:	
+  							prs_buff("unknown builtin\n");
+
+--- 585,615 -----
+  									unset_name(*com);
+  							}
+  							break;
++ #ifdef JOB
++ 						case SYSKILL:
++ 							zipkill(argn,com);
++ 							break;
++ 						case SYSSTOP:
++ 							zipstop(argn,com);
++ 							break;
++ 						case SYSJOBS:
++ 							listjobs(com[1]);
++ 							break;
++ 						case SYSFG:
++ # ifdef JOBSXT
++ 							if (sxtchan==-1)
++ 								failed(com[0],badexec);
++ 							else 
++ # endif JOBSXT
++ 	  						fg(findjob(com[1]));
++ 							break;
++ 						case SYSBG:
++ 							bg(findjob(com[1]));
++ 							break;
++ 						case SYSNOTIFY:
++ 							notify(findjob(com[1]));
++ 							break;
++ # ifdef JOBSXT
+  
+  						case SYSSXT1:
+  							{
+***************
+*** 548,553
+  							}
+  							break;
+  
+  						default:	
+  							prs_buff("unknown builtin\n");
+  						}	
+
+--- 611,632 -----
+  							break;
+  # ifdef JOBSXT
+  
++ 						case SYSSXT1:
++ 							{
++ 								int chsxt;
++ 								extern int crisps;
++ 
++ 								if (com[1]){
++ 									chsxt = hide_sxt();
++ 									execexp(com[1],&com[2]);
++ 									if (chsxt)
++ 										restore_sxt();	
++ 								}
++ 							}
++ 							break;
++ # endif JOBSXT
++ #endif JOB
++ 
+  						default:	
+  							prs_buff("unknown builtin\n");
+  						}	
+***************
+*** 586,591
+  			}
+  
+  		case TFORK:
+  			exitval = 0;
+  			if (execflg && (treeflgs & (FAMP | FPOU)) == 0)
+  				parent = 0;
+
+--- 665,674 -----
+  			}
+  
+  		case TFORK:
++ #ifdef JOB
++ 			forkprocess(t,treeflgs,com,pf1,pf2,type,execflg,errorflg,pos,exec_link,linked);
++ 			break;
++ #else
+  			exitval = 0;
+  			if (execflg && (treeflgs & (FAMP | FPOU)) == 0)
+  				parent = 0;
+***************
+*** 719,724
+  				}
+  				done();
+  			}
+  
+  		case TPAR:
+  			execute(parptr(t)->partre, exec_link, errorflg);
+
+--- 802,808 -----
+  				}
+  				done();
+  			}
++ #endif JOB
+  
+  		case TPAR:
+  			execute(parptr(t)->partre, exec_link, errorflg);
+***************
+*** 857,862
+  int	f;
+  {
+  	struct fileblk	fb;
+  
+  	push(&fb);
+  	if (s)
+
+--- 941,949 -----
+  int	f;
+  {
+  	struct fileblk	fb;
++ #ifdef JOBSXT
++ 	BOOL chsxt=FALSE;
++ #endif JOBSXT
+  
+  	push(&fb);
+  	if (s)
+***************
+*** 864,870
+  		estabf(s);
+  		fb.feval = (char **)(f);
+  	}
+! 	else if (f >= 0)
+  		initf(f);
+  	execute(cmd(NL, NLFLG | MTFLG), 0, (int)(flags & errflg));
+  	pop();
+
+--- 951,957 -----
+  		estabf(s);
+  		fb.feval = (char **)(f);
+  	}
+! 	else if (f >= 0){
+  		initf(f);
+  #ifdef JOBSXT
+  		chsxt = hide_sxt();
+***************
+*** 866,871
+  	}
+  	else if (f >= 0)
+  		initf(f);
+  	execute(cmd(NL, NLFLG | MTFLG), 0, (int)(flags & errflg));
+  	pop();
+  }
+
+--- 953,963 -----
+  	}
+  	else if (f >= 0){
+  		initf(f);
++ #ifdef JOBSXT
++ 		chsxt = hide_sxt();
++ #endif JOBSXT
++ 	}
++ 	else error("execexp: no args");
+  	execute(cmd(NL, NLFLG | MTFLG), 0, (int)(flags & errflg));
+  	pop();
+  #ifdef JOBSXT
+***************
+*** 868,873
+  		initf(f);
+  	execute(cmd(NL, NLFLG | MTFLG), 0, (int)(flags & errflg));
+  	pop();
+  }
+  
+  execprint(com)
+
+--- 960,969 -----
+  	else error("execexp: no args");
+  	execute(cmd(NL, NLFLG | MTFLG), 0, (int)(flags & errflg));
+  	pop();
++ #ifdef JOBSXT
++ 	if (chsxt)
++ 		restore_sxt();
++ #endif JOBSXT
+  }
+  
+  
+***************
+*** 870,875
+  	pop();
+  }
+  
+  execprint(com)
+  	char **com;
+  {
+
+--- 966,974 -----
+  #endif JOBSXT
+  }
+  
++ 
++ 
++ 
+  execprint(com)
+  	char **com;
+  {
+***************
+*** 885,887
+  
+  	newline();
+  }
+
+--- 984,1275 -----
+  
+  	newline();
+  }
++ 
++ #ifdef JOB
++ /*
++  * service-things for job-control.
++  */
++ /*ARGSUSED*/
++ zipkill(argc,argv)
++ char **argv;
++ {
++ 	int signo, procid, ret;
++ 	char * a1 = argv[1];
++ 	extern char * sys_errlist[];
++ 
++ 	if (!a1) failed(argv[0],synmsg);
++ 	if (*a1=='-'){
++ 		a1++;
++ 		signo=stoi(a1);
++ 		argv++;
++ 	} else signo=SIGTERM;
++ 	while (*++argv){
++ 		if (**argv=='%'){
++ 			procid = jobs[findjob(argv[0])]->jb_pgrp;
++ 			ret = killpg(procid,signo);
++ 		} else {
++ 			procid = stoi(*argv);
++ 			ret = kill(procid,signo);
++ 			if (ret==-1) ret=errno;
++ 		}
++ 		if (ret!=0){
++ 			prn_buff(procid);
++ 			prs_buff(" ");
++ 			prs_buff(procid,sys_errlist[ret]);
++ 			newline();
++ 		}
++ 	}
++     }
++ 
++ /* ------------------------------- stop ------------------------------ */
++ /*ARGSUSED*/
++ zipstop(argc,argv)
++ char **argv;
++ {
++ 	int id;
++ 
++ 	if (argv[1]==0){
++ 		register int i;
++ 
++ 		for (i=1; i<JOB_MAX; i++)
++ 			if (jobs[i]){
++ # ifdef JOBSXT
++ 				sxtblk(i);
++ # endif JOBSXT
++ 			}
++ 	} else {
++ 		argv++;
++ 		while (argv[1]){
++ 			if (jobs[id=findjob(argv[1])]){
++ # ifdef JOBSXT
++ 				sxtblk(id);
++ # endif JOBSXT
++ 			}
++ 			argv++;
++ 		}
++ 	}
++ }
++ 
++ 
++ #ifdef JOBSXT
++ #undef	 input
++ #include	<sys/types.h>
++ #include	<sys/tty.h>
++ #include	<sys/sxt.h>
++ #include	<sys/ipc.h>
++ #include	<sys/msg.h>
++ #endif JOBSXT
++ 
++ /*
++  *	fork a process, exec the child and deal with job initialization, etc...
++  *	(the parameter-passing is a bit crude)
++  */
++ forkprocess(t,treeflgs,com,pf1,pf2,type,execflg,errorflg,pos,exec_link,linked)
++ register struct trenod * t;
++ register int treeflgs;
++ register char * *com;
++ int *pf1, *pf2;
++ int type,errorflg,pos,exec_link,linked;
++ {
++ #ifdef JOBSXT
++ 	struct msgbuf msgbuffer;
++ 	int msgqid = -1;
++ #endif JOBSXT
++ 
++ 	exitval=0;
++ 	if (execflg && (treeflgs&(FAMP|FPOU))==0)
++ 		parent=0;
++ 	else {
++ 		int forkcnt = 1;
++ 
++ 		if (treeflgs & (FAMP | FPOU))
++ 		{
++ 			link_iodocs(iotemp);
++ 			linked = 1;
++ 		}
++ 		if ((treeflgs&FPIN)==0){
++ 			bookjob();	/* set up a job slot */
++ #ifdef JOBSXT
++ 			if (sxtchan!=-1)
++ 				msgqid = msgget(IPC_PRIVATE,0);
++ #endif JOBSXT
++ 		}
++ 		while ((parent=fork()) == -1){
++ 			if ((forkcnt = (forkcnt * 2)) > FORKLIM)	/* 32 */
++ 			{
++ 				switch (errno)
++ 				{
++ 				case ENOMEM:
++ 					error(noswap);
++ 					break;
++ 				default:
++ 				case EAGAIN:
++ 					error(nofork);
++ 					break;
++ 				}
++ 			}
++ 			if (trapnote&SIGSET){
++ 				postjclr(currentjob);
++ #ifdef JOBSXT
++ 				if (sxtchan!=-1)
++ 					msgctl(msgqid, IPC_RMID, (struct msqid_ds *)0);
++ #endif JOBSXT
++ 				sigchk();
++ 			}
++ 			alarm(forkcnt);
++ 			pause();
++ 		}
++ 	}
++ 
++ 
++ 	if (parent){
++ 		/* This is the parent branch of fork;	 */
++ 		/* it may or may not wait for the child. */
++ 		struct argnod *Dcom;
++ 
++ 		if (treeflgs&FPCL) closepipe(pf1);
++ 		while (type==TLST || type==TFIL || type==TFORK){
++ 			if (type==TFORK)
++ 				t=forkptr(t)->forktre;
++ 			else	t=lstptr(t)->lstlef;
++ 			type=(t->tretyp)&COMMSK;
++ 		}
++ 		if (type==TCOM)
++ 			Dcom = comptr(t)->comarg;
++ 		else	Dcom = 0;
++ 		if ((treeflgs&FPIN)==0){
++ #ifdef JOBSXT
++ 			if (sxtchan!=-1){
++ 				msgrcv(msgqid, &msgbuffer,0,0,0);
++ 				msgctl(msgqid, IPC_RMID, (struct msqid_ds *)0);
++ 				sxtchan = sxtopen(SXT(currentjob));
++ 				newjob(parent,Dcom,treeflgs&FAMP,sxtchan);
++ 				if (sxtchan==-1) sxtchan=0;	/* fix */
++ 			} else  newjob(parent,Dcom,treeflgs&FAMP,-1);
++ #else
++ 			newjob(parent,Dcom,treeflgs&FAMP,0);
++ #endif JOBSXT
++ 		}
++ 		if (treeflgs&FPRS && (flags&(ttyflg|prompt))==(ttyflg|prompt)){
++ 			prc('[');
++ 			prn(currentjob);
++ 			prs("]\t");
++ 			prn(parent);
++ 			newline();
++ 		}
++ 		if ((treeflgs&(FAMP|FPOU))==0)
++ 			await(parent,WAIT_FG);	/* a process, in the foreground */
++ 		else if ((treeflgs&FAMP)==0)
++ 			post(parent);
++ 		else {
++ 			assnum(&pcsadr, parent);
++ 			post(parent);
++ 			bg(currentjob);		/* set it running in bg, and reset current job to 0 */
++ 		}
++ 
++ 		chktrap();
++ 		return;
++ 
++ 
++ 	} else	{	/* this is the forked branch (child) of execute */
++ 		flags |= forked;
++ 		fiotemp  = 0;
++ 
++ 		if (linked == 1)
++ 		{
++ 			swap_iodoc_nm(iotemp);
++ 			exec_link |= 06;
++ 		}
++ 		else if (linked == 0)
++ 			iotemp = 0;
++ 
++ #ifdef ACCT
++ 		suspacct();
++ #endif
++ 
++ 		setchildjob(currentjob,0);
++ 		postclr();
++ 		settmp();
++ 
++ 		/* Turn off INTR and QUIT if `FINT'  */
++ 		/* Reset ramaining signals to parent */
++ 		/* except for those `lost' by trap   */
++ 		oldsigs();
++ 		fixsigs();
++ #ifdef JOBSXT
++ 		if ((iflags&jobflg)==0)
++ #endif JOBSXT
++ 		  if (treeflgs&FINT){
++ 			signal(SIGINT,SIG_IGN);
++ 			signal(SIGQUIT,SIG_IGN);
++ #ifdef NICE
++ 			if (treeflgs&FAMP)
++ 				nice(NICEVAL);
++ #endif
++ 		  }
++ 
++ #ifdef JOBSXT
++ 		/* reset fildes 0,1,2 through sxt channel */
++ 		if (sxtchan!=-1){
++ 			if (currentjob<SXTMAX)
++ 				setpgrp();
++ 			sxtchan=sxtopen(SXT(currentjob));
++ 			if ((treeflgs&(FPIN|FPOU))!=FPOU)	/*pipes once*/
++ 				setchildjob(currentjob, ((treeflgs&FAMP)==0)?1:2);
++ 			if (sxtchan != -1){
++ 				close(0); close(1); close(2);
++ 				dup(sxtchan);
++ 				dup(0); dup(0); /* stdout and stderr */
++ 			}
++ 			sxtchan = -1;	/* prevent subshell jobs */
++ #ifdef SXT_SUSPEND
++ 			if (treeflgs&FAMP)
++ #endif
++ 				close(sxt_fd);
++ 			msgbuffer.mtype = 1;
++ 			msgsnd(msgqid, msgbuffer, 0, 0);
++ 			msgctl(msgqid, IPC_RMID, (struct msqid_ds *)0);	/* delete in kid too */
++ 		}
++ 		if ((iflags&jobflg) && (treeflgs&(FPIN|FPOU))==FPOU){
++ 			alarm(1);
++ 			pause();	/* Horrendous Kludge! */
++ 		}
++ #endif JOBSXT
++ 
++ 		/* pipe in or out */
++ 		if (treeflgs&FPIN){
++ 			rename(pf1[INPIPE],0);
++ 			close(pf1[OTPIPE]);
++ 		}
++ 		if (treeflgs&FPOU){
++ 			rename(pf2[OTPIPE],1);
++ 			close(pf2[INPIPE]);
++ 		}
++ 
++ 		/* default std input for & */
++ #ifdef JOBSXT
++ 		if ((iflags&jobflg)==0)	   /* only if no job-control */
++ #endif JOBSXT
++ 		  if ((treeflgs&FINT) && ioset==0){
++ 			int devvy = chkopen(devnull);
++ 			rename(devvy,0);
++ 		  }
++ 
++ 		iflags &= ~jobflg;
++ 
++ 		/* io redirection */
++ 		initio(t->treio,0);
++ 		if (type!=TCOM){
++ 			execute(forkptr(t)->forktre,exec_link|01,errorflg);
++ 		} else if (com[0]!=ENDARGS){
++ 			eflag = 0;
++ 			setlist(comptr(t)->comset,N_EXPORT);
++ 			rmtemp(0);
++ 			execa(com,pos);
++ 		}
++ 		flags &= ~ttyflg; 	/* don't reset tty pgrp */
++ 		done();
++ 	}
++ }
++ 
++ #endif JOB
+SHAR_EOF
+fi
+exit 0
+#	End of shell archive
+

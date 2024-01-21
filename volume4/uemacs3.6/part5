@@ -1,0 +1,1812 @@
+Subject: MicroEMACS 3.6 (Part 5 of 8)
+Newsgroups: mod.sources
+Approved: jpn@panda.UUCP
+
+Mod.sources:  Volume 4, Issue 102
+Submitted by: ihnp4!itivax!duncan!lawrence
+
+echo x - display.c
+sed 's/^X//' >display.c <<'*-*-END-of-display.c-*-*'
+X/*
+X * The functions in this file handle redisplay. There are two halves, the
+X * ones that update the virtual display screen, and the ones that make the
+X * physical display screen the same as the virtual display screen. These
+X * functions use hints that are left in the windows by the commands.
+X *
+X */
+X
+X#include        <stdio.h>
+X#include	"estruct.h"
+X#include        "edef.h"
+X
+X#define WFDEBUG 0                       /* Window flag debug. */
+X
+Xtypedef struct  VIDEO {
+X        short   v_flag;                 /* Flags */
+X        char    v_text[1];              /* Screen data. */
+X}       VIDEO;
+X
+X#define VFCHG   0x0001                  /* Changed flag			*/
+X#define	VFEXT	0x0002			/* extended (beyond column 80)	*/
+X#define	VFREV	0x0004			/* reverse video status		*/
+X#define	VFREQ	0x0008			/* reverse video request	*/
+X
+Xint     vtrow   = 0;                    /* Row location of SW cursor */
+Xint     vtcol   = 0;                    /* Column location of SW cursor */
+Xint     ttrow   = HUGE;                 /* Row location of HW cursor */
+Xint     ttcol   = HUGE;                 /* Column location of HW cursor */
+Xint	lbound	= 0;			/* leftmost column of current line
+X					   being displayed */
+X
+XVIDEO   **vscreen;                      /* Virtual screen. */
+XVIDEO   **pscreen;                      /* Physical screen. */
+X
+X/*
+X * Initialize the data structures used by the display code. The edge vectors
+X * used to access the screens are set up. The operating system's terminal I/O
+X * channel is set up. All the other things get initialized at compile time.
+X * The original window has "WFCHG" set, so that it will get completely
+X * redrawn on the first call to "update".
+X */
+Xvtinit()
+X{
+X    register int i;
+X    register VIDEO *vp;
+X    char *malloc();
+X
+X    (*term.t_open)();
+X    (*term.t_rev)(FALSE);
+X    vscreen = (VIDEO **) malloc(term.t_nrow*sizeof(VIDEO *));
+X
+X    if (vscreen == NULL)
+X        exit(1);
+X
+X    pscreen = (VIDEO **) malloc(term.t_nrow*sizeof(VIDEO *));
+X
+X    if (pscreen == NULL)
+X        exit(1);
+X
+X    for (i = 0; i < term.t_nrow; ++i)
+X        {
+X        vp = (VIDEO *) malloc(sizeof(VIDEO)+term.t_ncol);
+X
+X        if (vp == NULL)
+X            exit(1);
+X
+X	vp->v_flag = 0;
+X        vscreen[i] = vp;
+X        vp = (VIDEO *) malloc(sizeof(VIDEO)+term.t_ncol);
+X
+X        if (vp == NULL)
+X            exit(1);
+X
+X	vp->v_flag = 0;
+X        pscreen[i] = vp;
+X        }
+X}
+X
+X/*
+X * Clean up the virtual terminal system, in anticipation for a return to the
+X * operating system. Move down to the last line and clear it out (the next
+X * system prompt will be written in the line). Shut down the channel to the
+X * terminal.
+X */
+Xvttidy()
+X{
+X    mlerase();
+X    movecursor(term.t_nrow, 0);
+X    (*term.t_close)();
+X}
+X
+X/*
+X * Set the virtual cursor to the specified row and column on the virtual
+X * screen. There is no checking for nonsense values; this might be a good
+X * idea during the early stages.
+X */
+Xvtmove(row, col)
+X{
+X    vtrow = row;
+X    vtcol = col;
+X}
+X
+X/*
+X * Write a character to the virtual screen. The virtual row and column are
+X * updated. If the line is too long put a "$" in the last column. This routine
+X * only puts printing characters into the virtual terminal buffers. Only
+X * column overflow is checked.
+X */
+Xvtputc(c)
+X    int c;
+X{
+X    register VIDEO      *vp;
+X
+X    vp = vscreen[vtrow];
+X
+X    if (vtcol >= term.t_ncol) {
+X        vtcol = (vtcol + 0x07) & ~0x07;
+X        vp->v_text[term.t_ncol - 1] = '$';
+X    } else if (c == '\t')
+X        {
+X        do
+X            {
+X            vtputc(' ');
+X            }
+X        while ((vtcol&0x07) != 0);
+X        }
+X    else if (c < 0x20 || c == 0x7F)
+X        {
+X        vtputc('^');
+X        vtputc(c ^ 0x40);
+X        }
+X    else
+X	vp->v_text[vtcol++] = c;
+X}
+X
+X/*	put a character to the virtual screen in an extended line. If we are
+X	not yet on left edge, don't print it yet. check for overflow on
+X	the right margin						*/
+X
+Xvtpute(c)
+X
+Xint c;
+X
+X{
+X    register VIDEO      *vp;
+X
+X    vp = vscreen[vtrow];
+X
+X    if (vtcol >= term.t_ncol) {
+X        vtcol = (vtcol + 0x07) & ~0x07;
+X        vp->v_text[term.t_ncol - 1] = '$';
+X    } else if (c == '\t')
+X        {
+X        do
+X            {
+X            vtpute(' ');
+X            }
+X        while (((vtcol + lbound)&0x07) != 0);
+X        }
+X    else if (c < 0x20 || c == 0x7F)
+X        {
+X        vtpute('^');
+X        vtpute(c ^ 0x40);
+X        }
+X    else {
+X	if (vtcol >= 0)
+X		vp->v_text[vtcol] = c;
+X	++vtcol;
+X    }
+X}
+X
+X/*
+X * Erase from the end of the software cursor to the end of the line on which
+X * the software cursor is located.
+X */
+Xvteeol()
+X{
+X    register VIDEO      *vp;
+X
+X    vp = vscreen[vtrow];
+X    while (vtcol < term.t_ncol)
+X        vp->v_text[vtcol++] = ' ';
+X}
+X
+X/*
+X * Make sure that the display is right. This is a three part process. First,
+X * scan through all of the windows looking for dirty ones. Check the framing,
+X * and refresh the screen. Second, make sure that "currow" and "curcol" are
+X * correct for the current window. Third, make the virtual and physical
+X * screens the same.
+X */
+Xupdate()
+X{
+X    register LINE *lp;
+X    register WINDOW *wp;
+X    register VIDEO *vp1;
+X    register VIDEO *vp2;
+X    register int i;
+X    register int j;
+X    register int c;
+X
+X#if	TYPEAH
+X    if (typahead())
+X	return(TRUE);
+X#endif
+X
+X	/* update the reverse video flags for any mode lines out there */
+X	for (i = 0; i < term.t_nrow; ++i)
+X		vscreen[i]->v_flag &= ~VFREQ;
+X
+X#if	REVSTA
+X	wp = wheadp;
+X	while (wp != NULL) {
+X		vscreen[wp->w_toprow+wp->w_ntrows]->v_flag |= VFREQ;
+X		wp = wp->w_wndp;
+X	}
+X#endif
+X
+X    wp = wheadp;
+X
+X    while (wp != NULL)
+X        {
+X        /* Look at any window with update flags set on. */
+X
+X        if (wp->w_flag != 0)
+X            {
+X            /* If not force reframe, check the framing. */
+X
+X            if ((wp->w_flag & WFFORCE) == 0)
+X                {
+X                lp = wp->w_linep;
+X
+X                for (i = 0; i < wp->w_ntrows; ++i)
+X                    {
+X                    if (lp == wp->w_dotp)
+X                        goto out;
+X
+X                    if (lp == wp->w_bufp->b_linep)
+X                        break;
+X
+X                    lp = lforw(lp);
+X                    }
+X                }
+X
+X            /* Not acceptable, better compute a new value for the line at the
+X             * top of the window. Then set the "WFHARD" flag to force full
+X             * redraw.
+X             */
+X            i = wp->w_force;
+X
+X            if (i > 0)
+X                {
+X                --i;
+X
+X                if (i >= wp->w_ntrows)
+X                  i = wp->w_ntrows-1;
+X                }
+X            else if (i < 0)
+X                {
+X                i += wp->w_ntrows;
+X
+X                if (i < 0)
+X                    i = 0;
+X                }
+X            else
+X                i = wp->w_ntrows/2;
+X
+X            lp = wp->w_dotp;
+X
+X            while (i != 0 && lback(lp) != wp->w_bufp->b_linep)
+X                {
+X                --i;
+X                lp = lback(lp);
+X                }
+X
+X            wp->w_linep = lp;
+X            wp->w_flag |= WFHARD;       /* Force full. */
+X
+Xout:
+X            /* Try to use reduced update. Mode line update has its own special
+X             * flag. The fast update is used if the only thing to do is within
+X             * the line editing.
+X             */
+X            lp = wp->w_linep;
+X            i = wp->w_toprow;
+X
+X            if ((wp->w_flag & ~WFMODE) == WFEDIT)
+X                {
+X                while (lp != wp->w_dotp)
+X                    {
+X                    ++i;
+X                    lp = lforw(lp);
+X                    }
+X
+X                vscreen[i]->v_flag |= VFCHG;
+X                vtmove(i, 0);
+X
+X                for (j = 0; j < llength(lp); ++j)
+X                    vtputc(lgetc(lp, j));
+X
+X                vteeol();
+X                }
+X             else if ((wp->w_flag & (WFEDIT | WFHARD)) != 0)
+X                {
+X                while (i < wp->w_toprow+wp->w_ntrows)
+X                    {
+X                    vscreen[i]->v_flag |= VFCHG;
+X                    vtmove(i, 0);
+X
+X		    /* if line has been changed */
+X                    if (lp != wp->w_bufp->b_linep)
+X                        {
+X                        for (j = 0; j < llength(lp); ++j)
+X                            vtputc(lgetc(lp, j));
+X
+X                        lp = lforw(lp);
+X                        }
+X
+X                    vteeol();
+X                    ++i;
+X                    }
+X                }
+X#if ~WFDEBUG
+X            if ((wp->w_flag&WFMODE) != 0)
+X                modeline(wp);
+X
+X            wp->w_flag  = 0;
+X            wp->w_force = 0;
+X#endif
+X            }
+X#if WFDEBUG
+X        modeline(wp);
+X        wp->w_flag =  0;
+X        wp->w_force = 0;
+X#endif
+X
+X	/* and onward to the next window */
+X        wp = wp->w_wndp;
+X        }
+X
+X    /* Always recompute the row and column number of the hardware cursor. This
+X     * is the only update for simple moves.
+X     */
+X    lp = curwp->w_linep;
+X    currow = curwp->w_toprow;
+X
+X    while (lp != curwp->w_dotp)
+X        {
+X        ++currow;
+X        lp = lforw(lp);
+X        }
+X
+X    curcol = 0;
+X    i = 0;
+X
+X    while (i < curwp->w_doto)
+X        {
+X        c = lgetc(lp, i++);
+X
+X        if (c == '\t')
+X            curcol |= 0x07;
+X        else if (c < 0x20 || c == 0x7F)
+X            ++curcol;
+X
+X        ++curcol;
+X        }
+X
+X    if (curcol >= term.t_ncol - 1) {          /* extended line. */
+X	/* flag we are extended and changed */
+X	vscreen[currow]->v_flag |= VFEXT | VFCHG;
+X	updext();				/* and output extended line */
+X    } else
+X	lbound = 0;				/* not extended line */
+X
+X/* make sure no lines need to be de-extended because the cursor is
+X   no longer on them */
+X
+X    wp = wheadp;
+X
+X    while (wp != NULL) {
+X	lp = wp->w_linep;
+X	i = wp->w_toprow;
+X
+X	while (i < wp->w_toprow + wp->w_ntrows) {
+X		if (vscreen[i]->v_flag & VFEXT) {
+X			/* always flag extended lines as changed */
+X			vscreen[i]->v_flag |= VFCHG;
+X			if ((wp != curwp) || (lp != wp->w_dotp) ||
+X			   (curcol < term.t_ncol - 1)) {
+X				vtmove(i, 0);
+X        	                for (j = 0; j < llength(lp); ++j)
+X                	            vtputc(lgetc(lp, j));
+X				vteeol();
+X
+X				/* this line no longer is extended */
+X				vscreen[i]->v_flag &= ~VFEXT;
+X			}
+X		}
+X		lp = lforw(lp);
+X		++i;
+X	}
+X	/* and onward to the next window */
+X        wp = wp->w_wndp;
+X    }
+X
+X    /* Special hacking if the screen is garbage. Clear the hardware screen,
+X     * and update your copy to agree with it. Set all the virtual screen
+X     * change bits, to force a full update.
+X     */
+X    if (sgarbf != FALSE)
+X        {
+X        for (i = 0; i < term.t_nrow; ++i)
+X            {
+X            vscreen[i]->v_flag |= VFCHG;
+X            vp1 = pscreen[i];
+X            for (j = 0; j < term.t_ncol; ++j)
+X                vp1->v_text[j] = ' ';
+X            }
+X
+X        movecursor(0, 0);               /* Erase the screen. */
+X        (*term.t_eeop)();
+X        sgarbf = FALSE;                 /* Erase-page clears */
+X        mpresf = FALSE;                 /* the message area. */
+X        }
+X
+X    /* Make sure that the physical and virtual displays agree. Unlike before,
+X     * the "updateline" code is only called with a line that has been updated
+X     * for sure.
+X     */
+X    for (i = 0; i < term.t_nrow; ++i)
+X        {
+X        vp1 = vscreen[i];
+X
+X	/* for each line that needs to be updated, or that needs its
+X	   reverse video status changed, call the line updater	*/
+X	j = vp1->v_flag;
+X        if (((j & VFCHG) != 0) || (((j & VFREV) == 0) != ((j & VFREQ) == 0)))
+X            {
+X#if	TYPEAH
+X	    if (typahead())
+X		return(TRUE);
+X#endif
+X            vp2 = pscreen[i];
+X            updateline(i, &vp1->v_text[0], &vp2->v_text[0], &vp1->v_flag);
+X            }
+X        }
+X
+X    /* Finally, update the hardware cursor and flush out buffers. */
+X
+X    movecursor(currow, curcol - lbound);
+X    (*term.t_flush)();
+X}
+X
+X/*	updext: update the extended line which the cursor is currently
+X		on at a column greater than the terminal width. The line
+X		will be scrolled right or left to let the user see where
+X		the cursor is
+X								*/
+X
+Xupdext()
+X
+X{
+X	register int rcursor;	/* real cursor location */
+X	register LINE *lp;	/* pointer to current line */
+X	register int j;		/* index into line */
+X
+X	/* calculate what column the real cursor will end up in */
+X	rcursor = ((curcol - term.t_ncol) % term.t_scrsiz) + term.t_margin;
+X	lbound = curcol - rcursor + 1;
+X
+X	/* scan through the line outputing characters to the virtual screen */
+X	/* once we reach the left edge					*/
+X	vtmove(currow, -lbound);	/* start scanning offscreen */
+X	lp = curwp->w_dotp;		/* line to output */
+X	for (j=0; j<llength(lp); ++j)	/* until the end-of-line */
+X		vtpute(lgetc(lp, j));
+X
+X	/* truncate the virtual line */
+X	vteeol();
+X
+X	/* and put a '$' in column 1 */
+X	vscreen[currow]->v_text[0] = '$';
+X}
+X
+X/*
+X * Update a single line. This does not know how to use insert or delete
+X * character sequences; we are using VT52 functionality. Update the physical
+X * row and column variables. It does try an exploit erase to end of line. The
+X * RAINBOW version of this routine uses fast video.
+X */
+Xupdateline(row, vline, pline, flags)
+X    char vline[];	/* what we want it to end up as */
+X    char pline[];	/* what it looks like now       */
+X    short *flags;	/* and how we want it that way  */
+X{
+X#if RAINBOW
+X    register char *cp1;
+X    register char *cp2;
+X    register int nch;
+X
+X    /* since we don't know how to make the rainbow do this, turn it off */
+X    flags &= (~VFREV & ~VFREQ);
+X
+X    cp1 = &vline[0];                    /* Use fast video. */
+X    cp2 = &pline[0];
+X    putline(row+1, 1, cp1);
+X    nch = term.t_ncol;
+X
+X    do
+X        {
+X        *cp2 = *cp1;
+X        ++cp2;
+X        ++cp1;
+X        }
+X    while (--nch);
+X    *flags &= ~VFCHG;
+X#else
+X	register char *cp1;
+X	register char *cp2;
+X	register char *cp3;
+X	register char *cp4;
+X	register char *cp5;
+X	register int nbflag;	/* non-blanks to the right flag? */
+X	int rev;		/* reverse video flag */
+X	int req;		/* reverse video request flag */
+X
+X
+X	/* set up pointers to virtual and physical lines */
+X	cp1 = &vline[0];
+X	cp2 = &pline[0];
+X
+X#if	REVSTA
+X	/* if we need to change the reverse video status of the
+X	   current line, we need to re-write the entire line     */
+X	rev = *flags & VFREV;
+X	req = *flags & VFREQ;
+X	if (rev != req) {
+X		movecursor(row, 0);	/* Go to start of line. */
+X		(*term.t_rev)(req != FALSE);	/* set rev video if needed */
+X
+X		/* scan through the line and dump it to the screen and
+X		   the virtual screen array				*/
+X		cp3 = &vline[term.t_ncol];
+X		while (cp1 < cp3) {
+X			(*term.t_putchar)(*cp1);
+X			++ttcol;
+X			*cp2++ = *cp1++;
+X		}
+X		(*term.t_rev)(FALSE);		/* turn rev video off */
+X
+X		/* update the needed flags */
+X		*flags &= ~VFCHG;
+X		if (req)
+X			*flags |= VFREV;
+X		else
+X			*flags &= ~VFREV;
+X		return(TRUE);
+X	}
+X#endif
+X
+X	/* advance past any common chars at the left */
+X	while (cp1 != &vline[term.t_ncol] && cp1[0] == cp2[0]) {
+X		++cp1;
+X		++cp2;
+X	}
+X
+X/* This can still happen, even though we only call this routine on changed
+X * lines. A hard update is always done when a line splits, a massive
+X * change is done, or a buffer is displayed twice. This optimizes out most
+X * of the excess updating. A lot of computes are used, but these tend to
+X * be hard operations that do a lot of update, so I don't really care.
+X */
+X	/* if both lines are the same, no update needs to be done */
+X	if (cp1 == &vline[term.t_ncol])
+X		return(TRUE);
+X
+X	/* find out if there is a match on the right */
+X	nbflag = FALSE;
+X	cp3 = &vline[term.t_ncol];
+X	cp4 = &pline[term.t_ncol];
+X
+X	while (cp3[-1] == cp4[-1]) {
+X		--cp3;
+X		--cp4;
+X		if (cp3[0] != ' ')		/* Note if any nonblank */
+X			nbflag = TRUE;		/* in right match. */
+X	}
+X
+X	cp5 = cp3;
+X
+X	if (nbflag == FALSE && eolexist == TRUE) {	/* Erase to EOL ? */
+X		while (cp5!=cp1 && cp5[-1]==' ')
+X			--cp5;
+X
+X		if (cp3-cp5 <= 3)		/* Use only if erase is */
+X			cp5 = cp3;		/* fewer characters. */
+X	}
+X
+X	movecursor(row, cp1-&vline[0]);	/* Go to start of line. */
+X
+X	while (cp1 != cp5) {		/* Ordinary. */
+X		(*term.t_putchar)(*cp1);
+X		++ttcol;
+X		*cp2++ = *cp1++;
+X	}
+X
+X	if (cp5 != cp3) {		/* Erase. */
+X		(*term.t_eeol)();
+X		while (cp1 != cp3)
+X			*cp2++ = *cp1++;
+X	}
+X	*flags &= ~VFCHG;		/* flag this line is changed */
+X#endif
+X}
+X
+X/*
+X * Redisplay the mode line for the window pointed to by the "wp". This is the
+X * only routine that has any idea of how the modeline is formatted. You can
+X * change the modeline format by hacking at this routine. Called by "update"
+X * any time there is a dirty window.
+X */
+Xmodeline(wp)
+X    WINDOW *wp;
+X{
+X    register char *cp;
+X    register int c;
+X    register int n;		/* cursor position count */
+X    register BUFFER *bp;
+X    register i;			/* loop index */
+X    register lchar;		/* character to draw line in buffer with */
+X    register firstm;		/* is this the first mode? */
+X    char tline[NLINE];		/* buffer for part of mode line */
+X
+X    n = wp->w_toprow+wp->w_ntrows;      /* Location. */
+X    vscreen[n]->v_flag |= VFCHG;        /* Redraw next time. */
+X    vtmove(n, 0);                       /* Seek to right line. */
+X    if (wp == curwp)			/* mark the current buffer */
+X	lchar = '=';
+X    else
+X#if	REVSTA
+X	if (revexist)
+X		lchar = ' ';
+X	else
+X#endif
+X		lchar = '-';
+X
+X    vtputc(lchar);
+X    bp = wp->w_bufp;
+X
+X    if ((bp->b_flag&BFCHG) != 0)                /* "*" if changed. */
+X        vtputc('*');
+X    else
+X        vtputc(lchar);
+X
+X    n  = 2;
+X    strcpy(tline, " MicroEMACS 3.6 (");		/* Buffer name. */
+X
+X    /* display the modes */
+X
+X	firstm = TRUE;
+X	for (i = 0; i < NUMMODES; i++)	/* add in the mode flags */
+X		if (wp->w_bufp->b_mode & (1 << i)) {
+X			if (firstm != TRUE)
+X				strcat(tline, " ");
+X			firstm = FALSE;
+X			strcat(tline, modename[i]);
+X		}
+X	strcat(tline,") ");
+X
+X    cp = &tline[0];
+X    while ((c = *cp++) != 0)
+X        {
+X        vtputc(c);
+X        ++n;
+X        }
+X
+X    vtputc(lchar);
+X    vtputc(lchar);
+X    vtputc(' ');
+X    n += 3;
+X    cp = &bp->b_bname[0];
+X
+X    while ((c = *cp++) != 0)
+X        {
+X        vtputc(c);
+X        ++n;
+X        }
+X
+X    vtputc(' ');
+X    vtputc(lchar);
+X    vtputc(lchar);
+X    n += 3;
+X
+X    if (bp->b_fname[0] != 0)            /* File name. */
+X        {
+X	vtputc(' ');
+X	++n;
+X        cp = "File: ";
+X
+X        while ((c = *cp++) != 0)
+X            {
+X            vtputc(c);
+X            ++n;
+X            }
+X
+X        cp = &bp->b_fname[0];
+X
+X        while ((c = *cp++) != 0)
+X            {
+X            vtputc(c);
+X            ++n;
+X            }
+X
+X        vtputc(' ');
+X        ++n;
+X        }
+X
+X#if WFDEBUG
+X    vtputc(lchar);
+X    vtputc((wp->w_flag&WFMODE)!=0  ? 'M' : lchar);
+X    vtputc((wp->w_flag&WFHARD)!=0  ? 'H' : lchar);
+X    vtputc((wp->w_flag&WFEDIT)!=0  ? 'E' : lchar);
+X    vtputc((wp->w_flag&WFMOVE)!=0  ? 'V' : lchar);
+X    vtputc((wp->w_flag&WFFORCE)!=0 ? 'F' : lchar);
+X    n += 6;
+X#endif
+X
+X    while (n < term.t_ncol)             /* Pad to full width. */
+X        {
+X        vtputc(lchar);
+X        ++n;
+X        }
+X}
+X
+Xupmode()	/* update all the mode lines */
+X
+X{
+X	register WINDOW *wp;
+X
+X	wp = wheadp;
+X	while (wp != NULL) {
+X		wp->w_flag |= WFMODE;
+X		wp = wp->w_wndp;
+X	}
+X}
+X
+X/*
+X * Send a command to the terminal to move the hardware cursor to row "row"
+X * and column "col". The row and column arguments are origin 0. Optimize out
+X * random calls. Update "ttrow" and "ttcol".
+X */
+Xmovecursor(row, col)
+X    {
+X    if (row!=ttrow || col!=ttcol)
+X        {
+X        ttrow = row;
+X        ttcol = col;
+X        (*term.t_move)(row, col);
+X        }
+X    }
+X
+X/*
+X * Erase the message line. This is a special routine because the message line
+X * is not considered to be part of the virtual screen. It always works
+X * immediately; the terminal buffer is flushed via a call to the flusher.
+X */
+Xmlerase()
+X    {
+X    int i;
+X    
+X    movecursor(term.t_nrow, 0);
+X    if (eolexist == TRUE)
+X	    (*term.t_eeol)();
+X    else {
+X        for (i = 0; i < term.t_ncol - 1; i++)
+X            (*term.t_putchar)(' ');
+X        movecursor(term.t_nrow, 1);	/* force the move! */
+X        movecursor(term.t_nrow, 0);
+X    }
+X    (*term.t_flush)();
+X    mpresf = FALSE;
+X    }
+X
+X/*
+X * Ask a yes or no question in the message line. Return either TRUE, FALSE, or
+X * ABORT. The ABORT status is returned if the user bumps out of the question
+X * with a ^G. Used any time a confirmation is required.
+X */
+X
+Xmlyesno(prompt)
+X
+Xchar *prompt;
+X
+X{
+X	char c;			/* input character */
+X	char buf[NPAT];		/* prompt to user */
+X
+X	for (;;) {
+X		/* build and prompt the user */
+X		strcpy(buf, prompt);
+X		strcat(buf, " [y/n]? ");
+X		mlwrite(buf);
+X
+X		/* get the responce */
+X		c = (*term.t_getchar)();
+X
+X		if (c == BELL)		/* Bail out! */
+X			return(ABORT);
+X
+X		if (c=='y' || c=='Y')
+X			return(TRUE);
+X
+X		if (c=='n' || c=='N')
+X			return(FALSE);
+X	}
+X}
+X
+X/*
+X * Write a prompt into the message line, then read back a response. Keep
+X * track of the physical position of the cursor. If we are in a keyboard
+X * macro throw the prompt away, and return the remembered response. This
+X * lets macros run at full speed. The reply is always terminated by a carriage
+X * return. Handle erase, kill, and abort keys.
+X */
+X
+Xmlreply(prompt, buf, nbuf)
+X    char *prompt;
+X    char *buf;
+X{
+X	return(mlreplyt(prompt,buf,nbuf,'\n'));
+X}
+X
+X/*	A more generalized prompt/reply function allowing the caller
+X	to specify the proper terminator. If the terminator is not
+X	a return ('\n') it will echo as "<NL>"
+X							*/
+Xmlreplyt(prompt, buf, nbuf, eolchar)
+X
+Xchar *prompt;
+Xchar *buf;
+Xchar eolchar;
+X
+X{
+X	register int cpos;
+X	register int i;
+X	register int c;
+X
+X	cpos = 0;
+X
+X	if (kbdmop != NULL) {
+X		while ((c = *kbdmop++) != '\0')
+X			buf[cpos++] = c;
+X
+X		buf[cpos] = 0;
+X
+X		if (buf[0] == 0)
+X			return(FALSE);
+X
+X		return(TRUE);
+X	}
+X
+X	/* check to see if we are executing a command line */
+X	if (clexec) {
+X		nxtarg(buf);
+X		return(TRUE);
+X	}
+X
+X	mlwrite(prompt);
+X
+X	for (;;) {
+X	/* get a character from the user. if it is a <ret>, change it
+X	   to a <NL>							*/
+X		c = (*term.t_getchar)();
+X		if (c == 0x0d)
+X			c = '\n';
+X
+X		if (c == eolchar) {
+X			buf[cpos++] = 0;
+X
+X			if (kbdmip != NULL) {
+X				if (kbdmip+cpos > &kbdm[NKBDM-3]) {
+X					ctrlg(FALSE, 0);
+X					(*term.t_flush)();
+X					return(ABORT);
+X				}
+X
+X				for (i=0; i<cpos; ++i)
+X					*kbdmip++ = buf[i];
+X				}
+X
+X				(*term.t_putchar)('\r');
+X				ttcol = 0;
+X				(*term.t_flush)();
+X
+X				if (buf[0] == 0)
+X					return(FALSE);
+X
+X				return(TRUE);
+X
+X			} else if (c == 0x07) {	/* Bell, abort */
+X				(*term.t_putchar)('^');
+X				(*term.t_putchar)('G');
+X				ttcol += 2;
+X				ctrlg(FALSE, 0);
+X				(*term.t_flush)();
+X				return(ABORT);
+X
+X			} else if (c == 0x7F || c == 0x08) {	/* rubout/erase */
+X				if (cpos != 0) {
+X					(*term.t_putchar)('\b');
+X					(*term.t_putchar)(' ');
+X					(*term.t_putchar)('\b');
+X					--ttcol;
+X
+X					if (buf[--cpos] < 0x20) {
+X						(*term.t_putchar)('\b');
+X						(*term.t_putchar)(' ');
+X						(*term.t_putchar)('\b');
+X						--ttcol;
+X					}
+X
+X					if (buf[cpos] == '\n') {
+X						(*term.t_putchar)('\b');
+X						(*term.t_putchar)('\b');
+X						(*term.t_putchar)(' ');
+X						(*term.t_putchar)(' ');
+X						(*term.t_putchar)('\b');
+X						(*term.t_putchar)('\b');
+X						--ttcol;
+X						--ttcol;
+X					}
+X
+X					(*term.t_flush)();
+X				}
+X
+X			} else if (c == 0x15) {	/* C-U, kill */
+X				while (cpos != 0) {
+X					(*term.t_putchar)('\b');
+X					(*term.t_putchar)(' ');
+X					(*term.t_putchar)('\b');
+X					--ttcol;
+X
+X					if (buf[--cpos] < 0x20) {
+X						(*term.t_putchar)('\b');
+X						(*term.t_putchar)(' ');
+X						(*term.t_putchar)('\b');
+X						--ttcol;
+X					}
+X				}
+X
+X				(*term.t_flush)();
+X
+X			} else {
+X				if (cpos < nbuf-1) {
+X					buf[cpos++] = c;
+X
+X					if ((c < ' ') && (c != '\n')) {
+X						(*term.t_putchar)('^');
+X						++ttcol;
+X						c ^= 0x40;
+X					}
+X
+X					if (c != '\n')
+X						(*term.t_putchar)(c);
+X					else {	/* put out <NL> for <ret> */
+X						(*term.t_putchar)('<');
+X						(*term.t_putchar)('N');
+X						(*term.t_putchar)('L');
+X						(*term.t_putchar)('>');
+X						ttcol += 3;
+X					}
+X				++ttcol;
+X				(*term.t_flush)();
+X			}
+X		}
+X	}
+X}
+X
+X/*
+X * Write a message into the message line. Keep track of the physical cursor
+X * position. A small class of printf like format items is handled. Assumes the
+X * stack grows down; this assumption is made by the "++" in the argument scan
+X * loop. Set the "message line" flag TRUE.
+X */
+X
+Xmlwrite(fmt, arg)
+X    char *fmt;
+X    {
+X    register int c;
+X    register char *ap;
+X
+X    if (eolexist == FALSE) {
+X        mlerase();
+X        (*term.t_flush)();
+X    }
+X
+X    movecursor(term.t_nrow, 0);
+X    ap = (char *) &arg;
+X    while ((c = *fmt++) != 0) {
+X        if (c != '%') {
+X            (*term.t_putchar)(c);
+X            ++ttcol;
+X            }
+X        else
+X            {
+X            c = *fmt++;
+X            switch (c) {
+X                case 'd':
+X                    mlputi(*(int *)ap, 10);
+X                    ap += sizeof(int);
+X                    break;
+X
+X                case 'o':
+X                    mlputi(*(int *)ap,  8);
+X                    ap += sizeof(int);
+X                    break;
+X
+X                case 'x':
+X                    mlputi(*(int *)ap, 16);
+X                    ap += sizeof(int);
+X                    break;
+X
+X                case 'D':
+X                    mlputli(*(long *)ap, 10);
+X                    ap += sizeof(long);
+X                    break;
+X
+X                case 's':
+X                    mlputs(*(char **)ap);
+X                    ap += sizeof(char *);
+X                    break;
+X
+X                default:
+X                    (*term.t_putchar)(c);
+X                    ++ttcol;
+X                }
+X            }
+X        }
+X    if (eolexist == TRUE)
+X        (*term.t_eeol)();
+X    (*term.t_flush)();
+X    mpresf = TRUE;
+X    }
+X
+X/*
+X * Write out a string. Update the physical cursor position. This assumes that
+X * the characters in the string all have width "1"; if this is not the case
+X * things will get screwed up a little.
+X */
+Xmlputs(s)
+X    char *s;
+X    {
+X    register int c;
+X
+X    while ((c = *s++) != 0)
+X        {
+X        (*term.t_putchar)(c);
+X        ++ttcol;
+X        }
+X    }
+X
+X/*
+X * Write out an integer, in the specified radix. Update the physical cursor
+X * position. This will not handle any negative numbers; maybe it should.
+X */
+Xmlputi(i, r)
+X    {
+X    register int q;
+X    static char hexdigits[] = "0123456789ABCDEF";
+X
+X    if (i < 0)
+X        {
+X        i = -i;
+X        (*term.t_putchar)('-');
+X        }
+X
+X    q = i/r;
+X
+X    if (q != 0)
+X        mlputi(q, r);
+X
+X    (*term.t_putchar)(hexdigits[i%r]);
+X    ++ttcol;
+X    }
+X
+X/*
+X * do the same except as a long integer.
+X */
+Xmlputli(l, r)
+X    long l;
+X    {
+X    register long q;
+X
+X    if (l < 0)
+X        {
+X        l = -l;
+X        (*term.t_putchar)('-');
+X        }
+X
+X    q = l/r;
+X
+X    if (q != 0)
+X        mlputli(q, r);
+X
+X    (*term.t_putchar)((int)(l%r)+'0');
+X    ++ttcol;
+X    }
+X
+X#if RAINBOW
+X
+Xputline(row, col, buf)
+X    int row, col;
+X    char buf[];
+X    {
+X    int n;
+X
+X    n = strlen(buf);
+X    if (col + n - 1 > term.t_ncol)
+X        n = term.t_ncol - col + 1;
+X    Put_Data(row, col, n, buf);
+X    }
+X#endif
+X
+X/* get a command name from the command line. Command completion means
+X   that pressing a <SPACE> will attempt to complete an unfinished command
+X   name if it is unique.
+X*/
+X
+Xint (*getname())()
+X
+X{
+X	register int cpos;	/* current column on screen output */
+X	register int c;
+X	register char *sp;	/* pointer to string for output */
+X	register NBIND *ffp;	/* first ptr to entry in name binding table */
+X	register NBIND *cffp;	/* current ptr to entry in name binding table */
+X	register NBIND *lffp;	/* last ptr to entry in name binding table */
+X	char buf[NSTRING];	/* buffer to hold tentative command name */
+X	int (*fncmatch())();
+X
+X	/* starting at the begining of the string buffer */
+X	cpos = 0;
+X
+X	/* if we are executing a keyboard macro, fill our buffer from there,
+X	   and attempt a straight match */
+X	if (kbdmop != NULL) {
+X		while ((c = *kbdmop++) != '\0')
+X			buf[cpos++] = c;
+X
+X		buf[cpos] = 0;
+X
+X		/* return the result of a match */
+X		return(fncmatch(&buf[0]));
+X	}
+X
+X	/* if we are executing a command line get the next arg and match it */
+X	if (clexec) {
+X		nxtarg(buf);
+X		return(fncmatch(&buf[0]));
+X	}
+X
+X	/* build a name string from the keyboard */
+X	while (TRUE) {
+X		c = (*term.t_getchar)();
+X
+X		/* if we are at the end, just match it */
+X		if (c == 0x0d) {
+X			buf[cpos] = 0;
+X
+X			/* save keyboard macro string if needed */
+X			if (kbdtext(&buf[0]) == ABORT)
+X				return( (int (*)()) NULL);
+X
+X			/* and match it off */
+X			return(fncmatch(&buf[0]));
+X
+X		} else if (c == 0x07) {	/* Bell, abort */
+X			(*term.t_putchar)('^');
+X			(*term.t_putchar)('G');
+X			ttcol += 2;
+X			ctrlg(FALSE, 0);
+X			(*term.t_flush)();
+X			return( (int (*)()) NULL);
+X
+X		} else if (c == 0x7F || c == 0x08) {	/* rubout/erase */
+X			if (cpos != 0) {
+X				(*term.t_putchar)('\b');
+X				(*term.t_putchar)(' ');
+X				(*term.t_putchar)('\b');
+X				--ttcol;
+X				--cpos;
+X				(*term.t_flush)();
+X			}
+X
+X		} else if (c == 0x15) {	/* C-U, kill */
+X			while (cpos != 0) {
+X				(*term.t_putchar)('\b');
+X				(*term.t_putchar)(' ');
+X				(*term.t_putchar)('\b');
+X				--cpos;
+X				--ttcol;
+X			}
+X
+X			(*term.t_flush)();
+X
+X		} else if (c == ' ') {
+X/* <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< */
+X	/* attempt a completion */
+X	buf[cpos] = 0;		/* terminate it for us */
+X	ffp = &names[0];	/* scan for matches */
+X	while (ffp->n_func != NULL) {
+X		if (strncmp(buf, ffp->n_name, strlen(buf)) == 0) {
+X			/* a possible match! More than one? */
+X			if ((ffp + 1)->n_func == NULL ||
+X			   (strncmp(buf, (ffp+1)->n_name, strlen(buf)) != 0)) {
+X				/* no...we match, print it */
+X				sp = ffp->n_name + cpos;
+X				while (*sp)
+X					(*term.t_putchar)(*sp++);
+X				(*term.t_flush)();
+X				return(ffp->n_func);
+X			} else {
+X/* << << << << << << << << << << << << << << << << << */
+X	/* try for a partial match against the list */
+X
+X	/* first scan down until we no longer match the current input */
+X	lffp = (ffp + 1);
+X	while ((lffp+1)->n_func != NULL) {
+X		if (strncmp(buf, (lffp+1)->n_name, strlen(buf)) != 0)
+X			break;
+X		++lffp;
+X	}
+X
+X	/* and now, attempt to partial complete the string, char at a time */
+X	while (TRUE) {
+X		/* add the next char in */
+X		buf[cpos] = ffp->n_name[cpos];
+X
+X		/* scan through the candidates */
+X		cffp = ffp + 1;
+X		while (cffp <= lffp) {
+X			if (cffp->n_name[cpos] != buf[cpos])
+X				goto onward;
+X			++cffp;
+X		}
+X
+X		/* add the character */
+X		(*term.t_putchar)(buf[cpos++]);
+X	}
+X/* << << << << << << << << << << << << << << << << << */
+X			}
+X		}
+X		++ffp;
+X	}
+X
+X	/* no match.....beep and onward */
+X	(*term.t_beep)();
+Xonward:;
+X	(*term.t_flush)();
+X/* <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< */
+X		} else {
+X			if (cpos < NSTRING-1 && c > ' ') {
+X				buf[cpos++] = c;
+X				(*term.t_putchar)(c);
+X			}
+X
+X			++ttcol;
+X			(*term.t_flush)();
+X		}
+X	}
+X}
+X
+Xkbdtext(buf)	/* add this text string to the current keyboard macro
+X		   definition						*/
+X
+Xchar *buf;	/* text to add to keyboard macro */
+X
+X{
+X	/* if we are defining a keyboard macro, save it */
+X	if (kbdmip != NULL) {
+X		if (kbdmip+strlen(buf) > &kbdm[NKBDM-4]) {
+X			ctrlg(FALSE, 0);
+X			(*term.t_flush)();
+X			return(ABORT);
+X		}
+X
+X		/* copy string in and null terminate it */
+X		while (*buf)
+X			*kbdmip++ = *buf++;
+X		*kbdmip++ = 0;
+X	}
+X	return(TRUE);
+X}
+*-*-END-of-display.c-*-*
+echo x - file.c
+sed 's/^X//' >file.c <<'*-*-END-of-file.c-*-*'
+X/*
+X * The routines in this file
+X * handle the reading and writing of
+X * disk files. All of details about the
+X * reading and writing of the disk are
+X * in "fileio.c".
+X */
+X#include        <stdio.h>
+X#include	"estruct.h"
+X#include        "edef.h"
+X
+X/*
+X * Read a file into the current
+X * buffer. This is really easy; all you do it
+X * find the name of the file, and call the standard
+X * "read a file into the current buffer" code.
+X * Bound to "C-X C-R".
+X */
+Xfileread(f, n)
+X{
+X        register int    s;
+X        char fname[NFILEN];
+X
+X        if ((s=mlreply("Read file: ", fname, NFILEN)) != TRUE)
+X                return(s);
+X        return(readin(fname, TRUE));
+X}
+X
+X/*
+X * Insert a file into the current
+X * buffer. This is really easy; all you do it
+X * find the name of the file, and call the standard
+X * "insert a file into the current buffer" code.
+X * Bound to "C-X C-I".
+X */
+Xinsfile(f, n)
+X{
+X        register int    s;
+X        char fname[NFILEN];
+X
+X	if (curbp->b_mode&MDVIEW)	/* don't allow this command if	*/
+X		return(rdonly());	/* we are in read only mode	*/
+X        if ((s=mlreply("Insert file: ", fname, NFILEN)) != TRUE)
+X                return(s);
+X        return(ifile(fname));
+X}
+X
+X/*
+X * Select a file for editing.
+X * Look around to see if you can find the
+X * fine in another buffer; if you can find it
+X * just switch to the buffer. If you cannot find
+X * the file, create a new buffer, read in the
+X * text, and switch to the new buffer.
+X * Bound to C-X C-F.
+X */
+Xfilefind(f, n)
+X{
+X        char fname[NFILEN];	/* file user wishes to find */
+X        register int s;		/* status return */
+X
+X        if ((s=mlreply("Find file: ", fname, NFILEN)) != TRUE)
+X                return(s);
+X	return(getfile(fname, TRUE));
+X}
+X
+Xviewfile(f, n)	/* visit a file in VIEW mode */
+X{
+X        char fname[NFILEN];	/* file user wishes to find */
+X        register int s;		/* status return */
+X	register WINDOW *wp;	/* scan for windows that need updating */
+X
+X        if ((s=mlreply("View file: ", fname, NFILEN)) != TRUE)
+X                return (s);
+X	s = getfile(fname, FALSE);
+X	if (s) {	/* if we succeed, put it in view mode */
+X		curwp->w_bufp->b_mode |= MDVIEW;
+X
+X		/* scan through and update mode lines of all windows */
+X		wp = wheadp;
+X		while (wp != NULL) {
+X			wp->w_flag |= WFMODE;
+X			wp = wp->w_wndp;
+X		}
+X	}
+X	return(s);
+X}
+X
+Xgetfile(fname, lockfl)
+X
+Xchar fname[];		/* file name to find */
+Xint lockfl;		/* check the file for locks? */
+X
+X{
+X        register BUFFER *bp;
+X        register LINE   *lp;
+X        register int    i;
+X        register int    s;
+X        char bname[NBUFN];	/* buffer name to put file */
+X
+X        for (bp=bheadp; bp!=NULL; bp=bp->b_bufp) {
+X                if ((bp->b_flag&BFTEMP)==0 && strcmp(bp->b_fname, fname)==0) {
+X                        if (--curbp->b_nwnd == 0) {
+X                                curbp->b_dotp  = curwp->w_dotp;
+X                                curbp->b_doto  = curwp->w_doto;
+X                                curbp->b_markp = curwp->w_markp;
+X                                curbp->b_marko = curwp->w_marko;
+X                        }
+X			swbuffer(bp);
+X                        lp = curwp->w_dotp;
+X                        i = curwp->w_ntrows/2;
+X                        while (i-- && lback(lp)!=curbp->b_linep)
+X                                lp = lback(lp);
+X                        curwp->w_linep = lp;
+X                        curwp->w_flag |= WFMODE|WFHARD;
+X                        mlwrite("[Old buffer]");
+X                        return (TRUE);
+X                }
+X        }
+X        makename(bname, fname);                 /* New buffer name.     */
+X        while ((bp=bfind(bname, FALSE, 0)) != NULL) {
+X                s = mlreply("Buffer name: ", bname, NBUFN);
+X                if (s == ABORT)                 /* ^G to just quit      */
+X                        return (s);
+X                if (s == FALSE) {               /* CR to clobber it     */
+X                        makename(bname, fname);
+X                        break;
+X                }
+X        }
+X        if (bp==NULL && (bp=bfind(bname, TRUE, 0))==NULL) {
+X                mlwrite("Cannot create buffer");
+X                return (FALSE);
+X        }
+X        if (--curbp->b_nwnd == 0) {             /* Undisplay.           */
+X                curbp->b_dotp = curwp->w_dotp;
+X                curbp->b_doto = curwp->w_doto;
+X                curbp->b_markp = curwp->w_markp;
+X                curbp->b_marko = curwp->w_marko;
+X        }
+X        curbp = bp;                             /* Switch to it.        */
+X        curwp->w_bufp = bp;
+X        curbp->b_nwnd++;
+X        return(readin(fname, lockfl));          /* Read it in.          */
+X}
+X
+X/*
+X * Read file "fname" into the current
+X * buffer, blowing away any text found there. Called
+X * by both the read and find commands. Return the final
+X * status of the read. Also called by the mainline,
+X * to read in a file specified on the command line as
+X * an argument. If the filename ends in a ".c", CMODE is
+X * set for the current buffer.
+X */
+Xreadin(fname, lockfl)
+X
+Xchar    fname[];	/* name of file to read */
+Xint	lockfl;		/* check for file locks? */
+X
+X{
+X        register LINE   *lp1;
+X        register LINE   *lp2;
+X        register int    i;
+X        register WINDOW *wp;
+X        register BUFFER *bp;
+X        register int    s;
+X        register int    nbytes;
+X        register int    nline;
+X	register char	*sptr;		/* pointer into filename string */
+X	int		lflag;		/* any lines longer than allowed? */
+X        char            line[NLINE];
+X
+X#if	FILOCK
+X	if (lockfl && lockchk(fname) == ABORT)
+X		return(ABORT);
+X#endif
+X        bp = curbp;                             /* Cheap.               */
+X        if ((s=bclear(bp)) != TRUE)             /* Might be old.        */
+X                return (s);
+X        bp->b_flag &= ~(BFTEMP|BFCHG);
+X	if (strlen(fname) > 1) {		/* check if a 'C' file	*/
+X		sptr = fname + strlen(fname) - 2;
+X		if (*sptr == '.' &&
+X		   *(sptr + 1) == 'c' || *(sptr + 1) == 'h')
+X			bp->b_mode |= MDCMOD;
+X	}
+X        strcpy(bp->b_fname, fname);
+X        if ((s=ffropen(fname)) == FIOERR)       /* Hard file open.      */
+X                goto out;
+X        if (s == FIOFNF) {                      /* File not found.      */
+X                mlwrite("[New file]");
+X                goto out;
+X        }
+X        mlwrite("[Reading file]");
+X        nline = 0;
+X	lflag = FALSE;
+X        while ((s=ffgetline(line, NLINE)) == FIOSUC || s == FIOLNG) {
+X		if (s == FIOLNG)
+X			lflag = TRUE;
+X                nbytes = strlen(line);
+X                if ((lp1=lalloc(nbytes)) == NULL) {
+X                        s = FIOERR;             /* Keep message on the  */
+X                        break;                  /* display.             */
+X                }
+X                lp2 = lback(curbp->b_linep);
+X                lp2->l_fp = lp1;
+X                lp1->l_fp = curbp->b_linep;
+X                lp1->l_bp = lp2;
+X                curbp->b_linep->l_bp = lp1;
+X                for (i=0; i<nbytes; ++i)
+X                        lputc(lp1, i, line[i]);
+X                ++nline;
+X        }
+X        ffclose();                              /* Ignore errors.       */
+X        if (s == FIOEOF) {                      /* Don't zap message!   */
+X                if (nline == 1)
+X                        mlwrite("[Read 1 line]");
+X                else
+X                        mlwrite("[Read %d lines]", nline);
+X        }
+X	if (lflag)
+X		mlwrite("[Read %d line(s), Long lines wrapped]",nline);
+Xout:
+X        for (wp=wheadp; wp!=NULL; wp=wp->w_wndp) {
+X                if (wp->w_bufp == curbp) {
+X                        wp->w_linep = lforw(curbp->b_linep);
+X                        wp->w_dotp  = lforw(curbp->b_linep);
+X                        wp->w_doto  = 0;
+X                        wp->w_markp = NULL;
+X                        wp->w_marko = 0;
+X                        wp->w_flag |= WFMODE|WFHARD;
+X                }
+X        }
+X        if (s == FIOERR || s == FIOFNF)		/* False if error.      */
+X                return(FALSE);
+X        return (TRUE);
+X}
+X
+X/*
+X * Take a file name, and from it
+X * fabricate a buffer name. This routine knows
+X * about the syntax of file names on the target system.
+X * I suppose that this information could be put in
+X * a better place than a line of code.
+X */
+Xmakename(bname, fname)
+Xchar    bname[];
+Xchar    fname[];
+X{
+X        register char   *cp1;
+X        register char   *cp2;
+X
+X        cp1 = &fname[0];
+X        while (*cp1 != 0)
+X                ++cp1;
+X
+X#if     AMIGA
+X        while (cp1!=&fname[0] && cp1[-1]!=':' && cp1[-1]!='/')
+X                --cp1;
+X#endif
+X#if     VMS
+X        while (cp1!=&fname[0] && cp1[-1]!=':' && cp1[-1]!=']')
+X                --cp1;
+X#endif
+X#if     CPM
+X        while (cp1!=&fname[0] && cp1[-1]!=':')
+X                --cp1;
+X#endif
+X#if     MSDOS
+X        while (cp1!=&fname[0] && cp1[-1]!=':' && cp1[-1]!='\\'&&cp1[-1]!='/')
+X                --cp1;
+X#endif
+X#if     V7
+X        while (cp1!=&fname[0] && cp1[-1]!='/')
+X                --cp1;
+X#endif
+X        cp2 = &bname[0];
+X        while (cp2!=&bname[NBUFN-1] && *cp1!=0 && *cp1!=';')
+X                *cp2++ = *cp1++;
+X        *cp2 = 0;
+X}
+X
+X/*
+X * Ask for a file name, and write the
+X * contents of the current buffer to that file.
+X * Update the remembered file name and clear the
+X * buffer changed flag. This handling of file names
+X * is different from the earlier versions, and
+X * is more compatable with Gosling EMACS than
+X * with ITS EMACS. Bound to "C-X C-W".
+X */
+Xfilewrite(f, n)
+X{
+X        register WINDOW *wp;
+X        register int    s;
+X        char            fname[NFILEN];
+X
+X        if ((s=mlreply("Write file: ", fname, NFILEN)) != TRUE)
+X                return (s);
+X        if ((s=writeout(fname)) == TRUE) {
+X                strcpy(curbp->b_fname, fname);
+X                curbp->b_flag &= ~BFCHG;
+X                wp = wheadp;                    /* Update mode lines.   */
+X                while (wp != NULL) {
+X                        if (wp->w_bufp == curbp)
+X                                wp->w_flag |= WFMODE;
+X                        wp = wp->w_wndp;
+X                }
+X        }
+X        return (s);
+X}
+X
+X/*
+X * Save the contents of the current
+X * buffer in its associatd file. No nothing
+X * if nothing has changed (this may be a bug, not a
+X * feature). Error if there is no remembered file
+X * name for the buffer. Bound to "C-X C-S". May
+X * get called by "C-Z".
+X */
+Xfilesave(f, n)
+X{
+X        register WINDOW *wp;
+X        register int    s;
+X
+X	if (curbp->b_mode&MDVIEW)	/* don't allow this command if	*/
+X		return(rdonly());	/* we are in read only mode	*/
+X        if ((curbp->b_flag&BFCHG) == 0)         /* Return, no changes.  */
+X                return (TRUE);
+X        if (curbp->b_fname[0] == 0) {           /* Must have a name.    */
+X                mlwrite("No file name");
+X                return (FALSE);
+X        }
+X        if ((s=writeout(curbp->b_fname)) == TRUE) {
+X                curbp->b_flag &= ~BFCHG;
+X                wp = wheadp;                    /* Update mode lines.   */
+X                while (wp != NULL) {
+X                        if (wp->w_bufp == curbp)
+X                                wp->w_flag |= WFMODE;
+X                        wp = wp->w_wndp;
+X                }
+X        }
+X        return (s);
+X}
+X
+X/*
+X * This function performs the details of file
+X * writing. Uses the file management routines in the
+X * "fileio.c" package. The number of lines written is
+X * displayed. Sadly, it looks inside a LINE; provide
+X * a macro for this. Most of the grief is error
+X * checking of some sort.
+X */
+Xwriteout(fn)
+Xchar    *fn;
+X{
+X        register int    s;
+X        register LINE   *lp;
+X        register int    nline;
+X
+X        if ((s=ffwopen(fn)) != FIOSUC)          /* Open writes message. */
+X                return (FALSE);
+X	mlwrite("[Writing..]");			/* tell us were writing */
+X        lp = lforw(curbp->b_linep);             /* First line.          */
+X        nline = 0;                              /* Number of lines.     */
+X        while (lp != curbp->b_linep) {
+X                if ((s=ffputline(&lp->l_text[0], llength(lp))) != FIOSUC)
+X                        break;
+X                ++nline;
+X                lp = lforw(lp);
+X        }
+X        if (s == FIOSUC) {                      /* No write error.      */
+X                s = ffclose();
+X                if (s == FIOSUC) {              /* No close error.      */
+X                        if (nline == 1)
+X                                mlwrite("[Wrote 1 line]");
+X                        else
+X                                mlwrite("[Wrote %d lines]", nline);
+X                }
+X        } else                                  /* Ignore close error   */
+X                ffclose();                      /* if a write error.    */
+X        if (s != FIOSUC)                        /* Some sort of error.  */
+X                return (FALSE);
+X        return (TRUE);
+X}
+X
+X/*
+X * The command allows the user
+X * to modify the file name associated with
+X * the current buffer. It is like the "f" command
+X * in UNIX "ed". The operation is simple; just zap
+X * the name in the BUFFER structure, and mark the windows
+X * as needing an update. You can type a blank line at the
+X * prompt if you wish.
+X */
+Xfilename(f, n)
+X{
+X        register WINDOW *wp;
+X        register int    s;
+X        char            fname[NFILEN];
+X
+X        if ((s=mlreply("Name: ", fname, NFILEN)) == ABORT)
+X                return (s);
+X        if (s == FALSE)
+X                strcpy(curbp->b_fname, "");
+X        else
+X                strcpy(curbp->b_fname, fname);
+X        wp = wheadp;                            /* Update mode lines.   */
+X        while (wp != NULL) {
+X                if (wp->w_bufp == curbp)
+X                        wp->w_flag |= WFMODE;
+X                wp = wp->w_wndp;
+X        }
+X	curbp->b_mode &= ~MDVIEW;	/* no longer read only mode */
+X        return (TRUE);
+X}
+X
+X/*
+X * Insert file "fname" into the current
+X * buffer, Called by insert file command. Return the final
+X * status of the read.
+X */
+Xifile(fname)
+Xchar    fname[];
+X{
+X        register LINE   *lp0;
+X        register LINE   *lp1;
+X        register LINE   *lp2;
+X        register int    i;
+X        register BUFFER *bp;
+X        register int    s;
+X        register int    nbytes;
+X        register int    nline;
+X	int		lflag;		/* any lines longer than allowed? */
+X        char            line[NLINE];
+X
+X        bp = curbp;                             /* Cheap.               */
+X        bp->b_flag |= BFCHG;			/* we have changed	*/
+X	bp->b_flag &= ~BFTEMP;			/* and are not temporary*/
+X        if ((s=ffropen(fname)) == FIOERR)       /* Hard file open.      */
+X                goto out;
+X        if (s == FIOFNF) {                      /* File not found.      */
+X                mlwrite("[No such file]");
+X		return(FALSE);
+X        }
+X        mlwrite("[Inserting file]");
+X
+X	/* back up a line and save the mark here */
+X	curwp->w_dotp = lback(curwp->w_dotp);
+X	curwp->w_doto = 0;
+X	curwp->w_markp = curwp->w_dotp;
+X	curwp->w_marko = 0;
+X
+X        nline = 0;
+X	lflag = FALSE;
+X        while ((s=ffgetline(line, NLINE)) == FIOSUC || s == FIOLNG) {
+X		if (s == FIOLNG)
+X			lflag = TRUE;
+X                nbytes = strlen(line);
+X                if ((lp1=lalloc(nbytes)) == NULL) {
+X                        s = FIOERR;             /* Keep message on the  */
+X                        break;                  /* display.             */
+X                }
+X		lp0 = curwp->w_dotp;	/* line previous to insert */
+X		lp2 = lp0->l_fp;	/* line after insert */
+X
+X		/* re-link new line between lp0 and lp2 */
+X		lp2->l_bp = lp1;
+X		lp0->l_fp = lp1;
+X		lp1->l_bp = lp0;
+X		lp1->l_fp = lp2;
+X
+X		/* and advance and write out the current line */
+X		curwp->w_dotp = lp1;
+X                for (i=0; i<nbytes; ++i)
+X                        lputc(lp1, i, line[i]);
+X                ++nline;
+X        }
+X        ffclose();                              /* Ignore errors.       */
+X	curwp->w_markp = lforw(curwp->w_markp);
+X        if (s == FIOEOF) {                      /* Don't zap message!   */
+X                if (nline == 1)
+X                        mlwrite("[Inserted 1 line]");
+X                else
+X                        mlwrite("[Inserted %d lines]", nline);
+X        }
+X	if (lflag)
+X		mlwrite("[Inserted %d line(s), Long lines wrapped]",nline);
+Xout:
+X	/* advance to the next line and mark the window for changes */
+X	curwp->w_dotp = lforw(curwp->w_dotp);
+X	curwp->w_flag |= WFHARD;
+X
+X	/* copy window parameters back to the buffer structure */
+X	curbp->b_dotp = curwp->w_dotp;
+X	curbp->b_doto = curwp->w_doto;
+X	curbp->b_markp = curwp->w_markp;
+X	curbp->b_marko = curwp->w_marko;
+X
+X        if (s == FIOERR)                        /* False if error.      */
+X                return (FALSE);
+X        return (TRUE);
+X}
+*-*-END-of-file.c-*-*
+exit
+
+

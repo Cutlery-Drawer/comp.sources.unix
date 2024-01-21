@@ -1,0 +1,2461 @@
+Subject:  v20i070:  Pcomm telecommunication package, Part04/08
+Newsgroups: comp.sources.unix
+Sender: sources
+Approved: rsalz@uunet.UU.NET
+
+Submitted-by: fthood!egray
+Posting-number: Volume 20, Issue 70
+Archive-name: pcomm1.2/part04
+
+#! /bin/sh
+# This is a shell archive, meaning:
+# 1. Remove everything above the #! /bin/sh line.
+# 2. Save the resulting text in a file.
+# 3. Execute the file with /bin/sh (not csh) to create:
+#	di_win.c
+#	dial.c
+#	dial_dir.h
+#	e_lib.c
+#	expand.c
+#	extrnl.h
+#	getcwd.c
+#	getopt.c
+#	help.c
+#	info.c
+#	init.c
+#	input.c
+#	list_dir.c
+#	ls_menu.c
+export PATH; PATH=/bin:/usr/bin:$PATH
+echo shar: "extracting 'di_win.c'" '(9205 characters)'
+if test -f 'di_win.c'
+then
+	echo shar: "will not over-write existing file 'di_win.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'di_win.c'
+X/*
+X * The dialing window routines.
+X */
+X
+X#define MAX_PASS	25
+X
+X#include <stdio.h>
+X#include <curses.h>
+X#include "config.h"
+X#include "dial_dir.h"
+X#include "misc.h"
+X#include "modem.h"
+X#include "param.h"
+X
+X/*
+X * The dialing window.  Its job is to kill the input routine, get a port,
+X * cycle thru the entries in the queue, while interpreting both the
+X * user's requests and the modem's responses.  A non-zero return code
+X * means we're ready to fire up the input routine.
+X */
+X
+Xint
+Xdial_win()
+X{
+X	extern int rc_index, fd;
+X	WINDOW *di_win, *newwin();
+X	int i, j, key, want_out, pass, tic, baud;
+X	long now, time();
+X	char *tbuf, *ctime(), *str, cr=13, *read_codes();
+X	void disp_queue(), dial_it(), delay_times(), input_off();
+X	void error_win(), line_set(), hang_up(), zap_vs(), log_calls();
+X	void st_line();
+X	unsigned int sleep();
+X					/* are we already talking? */
+X	input_off();
+X	hang_up(VERBOSE);
+X
+X	touchwin(stdscr);
+X	refresh();
+X
+X	if (get_port())
+X		return(0);
+X	/*
+X	 * If the phone number points to NULL, then either you're on a
+X	 * direct line, or you want to do the dialing yourself.
+X	 */
+X	if (*dir->number[dir->q_num[0]] == '\0') {
+X					/* check LD permission */
+X		if (limit_ld(0))
+X			return(0);
+X					/* can't talk directly to OBM */
+X		if (!strcmp(modem->mname[modem->m_cur], "OBM")) {
+X			error_win(0, "Can't access the On Board Modem directly",
+X			 "You must use the automatic dialing feature");
+X			return(0);
+X		}
+X
+X		zap_vs();
+X		touchwin(stdscr);
+X		clear();
+X		printw("Connected to /dev/%s at %d baud...\n", modem->tty[modem->t_cur], dir->baud[dir->d_cur]);
+X		refresh();
+X		return(1);
+X	}
+X
+X	di_win = newwin(17, 70, 3, 5);
+X					/* the basic window */
+X	mvwattrstr(di_win, 1, 20, A_BOLD, "D I A L I N G       W I N D O W");
+X	horizontal(di_win, 2, 0, 70);
+X	mvwaddstr(di_win, 4, 23, "System name:");
+X	mvwaddstr(di_win, 5, 23, "Pass number:");
+X	mvwaddstr(di_win, 6, 14, "Elapse time this try:");
+X	mvwaddstr(di_win, 7, 13, "Time at start of dial:");
+X	mvwaddstr(di_win, 8, 9, "Time at start of this try:");
+X	mvwaddstr(di_win, 9, 16, "Connect delay time:");
+X	mvwaddstr(di_win, 10, 17, "Redial delay time:");
+X	mvwaddstr(di_win, 11, 24, "Script/TTY:");
+X	mvwaddstr(di_win, 12, 16, "Result of last try:");
+X
+X	mvwaddstr(di_win, 14, 3, "<SPACE>: Recycle");
+X	mvwaddstr(di_win, 14, 22, "<DEL>: Remove from queue");
+X	mvwaddstr(di_win, 14, 49, "E: Change delays");
+X
+X					/* the start time */
+X	time(&now);
+X	tbuf = ctime(&now);
+X	tbuf[19] = '\0';
+X	mvwaddstr(di_win, 7, 36, &tbuf[11]);
+X
+X	mvwprintw(di_win, 9, 36, "%-4d", param->c_delay);
+X	mvwprintw(di_win, 10, 36, "%-4d", param->r_delay);
+X
+X	box(di_win, VERT, HORZ);
+X	mvwaddstr(di_win, 16, 24, " Press <ESC> to abort ");
+X
+X	pass = 0;
+X	i = 0;
+X	want_out = 0;
+X	while (!want_out && pass <= MAX_PASS) {
+X		key = -1;
+X		pass++;
+X					/* update the d_cur variable */
+X		dir->d_cur = dir->q_num[i];
+X					/* check LD permission */
+X		if (limit_ld(i)) {
+X			want_out++;
+X			break;
+X		}
+X					/* get a port */
+X		if (get_port()) {
+X			want_out++;
+X			break;
+X		}
+X					/* fill in the window */
+X		disp_queue(di_win, dir->d_cur, pass);
+X
+X		/*
+X		 * The actual dial routine.  The "i" is the index into the
+X		 * queue, not the entry number.  Returns immediately without
+X		 * waiting for a carrier.
+X		 */
+X		dial_it(i);
+X		tty_flush(fd, 0);
+X
+X		/*
+X		 * Here we do a time-slice between reading the result codes
+X		 * from the modem and reading the keyboard.  The one second
+X		 * granularity won't be too accurate, but who cares?
+X		 */
+X		tic = 0;
+X		rc_index = 0;
+X		while (tic < param->c_delay) {
+X			if ((str = read_codes()) == NULL) {
+X				mvwprintw(di_win, 6, 36, "%-4d", ++tic);
+X				wrefresh(di_win);
+X			}
+X			else {
+X				/*
+X				 * A return code that converts to an number
+X				 * that is less than 300 is probably an error
+X				 * message.
+X				 */
+X				baud = atoi(str);
+X				if (baud < 300) {
+X					mvwprintw(di_win, 12, 36, "%-20.20s", str);
+X					wmove(di_win, 12, 36);
+X					wrefresh(di_win);
+X					break;
+X				}
+X					/* we're connected */
+X				beep();
+X				clear_line(di_win, 12, 36, TRUE);
+X				wattrstr(di_win, A_BLINK, "CONNECTED");
+X				wmove(di_win, 12, 36);
+X				wrefresh(di_win);
+X				wait_key(di_win, 2);
+X				delwin(di_win);
+X
+X				/*
+X				 * Did the modem sync at a different baud
+X				 * rate than what we expected?
+X				 */
+X				if (dir->baud[dir->d_cur] != baud) {
+X					if (can_sync(baud)) {
+X						dir->baud[dir->d_cur] = baud;
+X						line_set();
+X					}
+X				}
+X
+X				zap_vs();
+X				touchwin(stdscr);
+X				clear();
+X				printw("Connected to %s at %d baud...\n",
+X				 dir->name[dir->d_cur], dir->baud[dir->d_cur]);
+X				refresh();
+X
+X					/* log the call */
+X				log_calls(i);
+X				return(1);
+X			}
+X			if (tic == param->c_delay)
+X				break;
+X					/* ok... try the keyboard */
+X			if ((key = wait_key(di_win, 1)) != -1)
+X				break;
+X
+X			mvwprintw(di_win, 6, 36, "%-4d", ++tic);
+X			wrefresh(di_win);
+X		}
+X		/*
+X		 * If the modem did not return a code, then we need to
+X		 * stop it.  Sending a CR will stop most modems cold,
+X		 * except of course for the OBM...
+X		 */
+X		if (str == NULL) {
+X			if (!strcmp(modem->mname[modem->m_cur], "OBM"))
+X				hang_up(QUIET);
+X			else
+X				write(fd, &cr, 1);
+X			sleep(1);
+X		}
+X					/* if we get here, no key was pressed */
+X		if (key == -1) {
+X			clear_line(di_win, 6, 14, TRUE);
+X			mvwaddstr(di_win, 6, 27, "Pausing:");
+X					/* no return code? */
+X			if (str == NULL) {
+X				clear_line(di_win, 12, 36, TRUE);
+X				waddstr(di_win, "TIMED OUT");
+X				wmove(di_win, 12, 36);
+X			}
+X					/* do the pause */
+X			tic = 0;
+X			while (tic < param->r_delay) {
+X				if ((key = wait_key(di_win, 1)) != -1)
+X					break;
+X				mvwprintw(di_win, 6, 36, "%-4d", ++tic);
+X				wrefresh(di_win);
+X			}
+X			clear_line(di_win, 6, 14, TRUE);
+X			waddstr(di_win, "Elapse time this try:");
+X		}
+X		mvwaddstr(di_win, 6, 36, "0   ");
+X					/* Process the keystroke */
+X		switch (key) {
+X			case ' ':	/* next in the queue */
+X				clear_line(di_win, 12, 36, TRUE);
+X				waddstr(di_win, "RECYCLED");
+X				wmove(di_win, 12, 36);
+X				wrefresh(di_win);
+X				/* fall thru... */
+X			case -1:	/* no key was pressed */
+X				i++;
+X				if (i > NUM_QUEUE)
+X					i = 0;
+X				if (dir->q_num[i] == -1)
+X					i = 0;
+X				break;
+X			case DEL:	/* <DEL> key, remove from queue */
+X				if (dir->q_num[1] == -1) {
+X					beep();
+X					clear_line(di_win, 12, 36, TRUE);
+X					waddstr(di_win, "NO MORE ENTRIES");
+X					wmove(di_win, 12, 36);
+X					wrefresh(di_win);
+X					wait_key(di_win, 3);
+X					break;
+X				}
+X				clear_line(di_win, 12, 36, TRUE);
+X				waddstr(di_win, "ENTRY DELETED");
+X				wmove(di_win, 12, 36);
+X				wrefresh(di_win);
+X				wait_key(di_win, 3);
+X
+X					/* compact the queue */
+X				for (j=i; j<NUM_QUEUE-1; j++)
+X					dir->q_num[j] = dir->q_num[j+1];
+X				dir->q_num[NUM_QUEUE-1] = -1;
+X				break;
+X			case 'e':
+X			case 'E':	/* change delay time */
+X				delay_times();
+X				touchwin(di_win);
+X				mvwprintw(di_win, 9, 36, "%-4d", param->c_delay);
+X				mvwprintw(di_win, 10, 36, "%-4d", param->r_delay);
+X				break;
+X			case ESC:	/* <ESC> key */
+X				beep();
+X				clear_line(di_win, 12, 36, TRUE);
+X				wattrstr(di_win, A_BLINK, "DIAL ABORTED");
+X				wmove(di_win, 12, 36);
+X				wrefresh(di_win);
+X				wait_key(di_win, 3);
+X				want_out++;
+X				break;
+X			default:
+X				beep();
+X				break;
+X		}
+X	}
+X					/* clean up and go home */
+X	werase(di_win);
+X	wrefresh(di_win);
+X	delwin(di_win);
+X	if (!want_out)
+X		error_win(0, "Exceeded the maximum number number of dialing attempts", "");
+X	return(0);
+X}
+X
+X/*
+X * Display what info we know at this time.
+X */
+X
+Xstatic void
+Xdisp_queue(win, entry, pass)
+XWINDOW *win;
+Xint entry, pass;
+X{
+X	long now, time();
+X	char *tbuf, *ctime();
+X	void st_line();
+X					/* redo the status line */
+X	st_line("");
+X					/* system name */
+X	clear_line(win, 4, 36, TRUE);
+X	waddstr(win, dir->name[entry]);
+X					/* pass number */
+X	mvwprintw(win, 5, 36, "%-4d", pass);
+X					/* time of this call */
+X	time(&now);
+X	tbuf = ctime(&now);
+X	tbuf[19] = '\0';
+X	mvwaddstr(win, 8, 36, &tbuf[11]);
+X					/* the script field */
+X	clear_line(win, 11, 36, TRUE);
+X	waddstr(win, dir->script[entry]);
+X
+X	wmove(win, 12, 36);
+X	wrefresh(win);
+X	return;
+X}
+X
+X/*
+X * Determine if the modem can detect the synchronization of the connected
+X * baud rate.  We check the modem database and see if the connect string
+X * is unique.  A non-zero return code means the modem can sync.
+X */
+X
+Xstatic int
+Xcan_sync(baud)
+Xint baud;
+X{
+X	int i;
+X	char *str;
+X					/* feature disabled? */
+X	if (modem->auto_baud[modem->m_cur] != 'Y')
+X		return(0);
+X					/* re-construct the string */
+X	switch (baud) {
+X		case 300:
+X			str = modem->con_3[modem->m_cur];
+X			break;
+X		case 1200:
+X			str = modem->con_12[modem->m_cur];
+X			break;
+X		case 2400:
+X			str = modem->con_24[modem->m_cur];
+X			break;
+X		case 4800:
+X			str = modem->con_48[modem->m_cur];
+X			break;
+X		case 9600:
+X			str = modem->con_96[modem->m_cur];
+X			break;
+X		case 19200:
+X			str = modem->con_192[modem->m_cur];
+X			break;
+X		default:
+X			return(0);
+X	}
+X
+X	if (*str == '\0')
+X		return(0);
+X					/* test "str" against all others */
+X	i = 0;
+X	if (!strcmp(str, modem->con_3[modem->m_cur]))
+X		i++;
+X	if (!strcmp(str, modem->con_12[modem->m_cur]))
+X		i++;
+X	if (!strcmp(str, modem->con_24[modem->m_cur]))
+X		i++;
+X	if (!strcmp(str, modem->con_48[modem->m_cur]))
+X		i++;
+X	if (!strcmp(str, modem->con_96[modem->m_cur]))
+X		i++;
+X	if (!strcmp(str, modem->con_192[modem->m_cur]))
+X		i++;
+X					/* should match only itself */
+X	if (i == 1)
+X		return(1);
+X	return(0);
+X}
+SHAR_EOF
+if test 9205 -ne "`wc -c < 'di_win.c'`"
+then
+	echo shar: "error transmitting 'di_win.c'" '(should have been 9205 characters)'
+fi
+fi
+echo shar: "extracting 'dial.c'" '(7970 characters)'
+if test -f 'dial.c'
+then
+	echo shar: "will not over-write existing file 'dial.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'dial.c'
+X/*
+X * The routines that dial the modem and listen for the return codes.
+X */
+X
+X#define HZ	60
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/times.h>
+X#include "config.h"
+X#include "dial_dir.h"
+X#include "misc.h"
+X#include "modem.h"
+X#include "param.h"
+X
+X#ifdef UNIXPC
+X#include <sys/phone.h>
+X#endif /* UNIXPC */
+X
+X/*
+X * Get the dial string ready, send it to the modem.  The parameter is not
+X * the actual entry number, it is an index into the queue.
+X */
+X
+Xvoid
+Xdial_it(num)
+Xint num;
+X{
+X	extern int fd;
+X	int i, skip;
+X	char s[100], number[40], *strcpy(), *strcat(), *n, *strchr();
+X	void send_str();
+X#ifdef UNIXPC
+X	struct updata pbuf;
+X	unsigned int sleep();
+X#endif /* UNIXPC */
+X
+X	/*
+X	 * Create the string to be sent to the modem.  The long distance
+X	 * codes are added if they are requested.
+X	 */
+X	s[0] = '\0';
+X	strcpy(s, modem->dial[modem->m_cur]);
+X
+X	switch (dir->q_ld[num]) {
+X		case 0:			/* no ld code requested */
+X			break;
+X		case '+':
+X			strcat(s, param->ld_plus);
+X			break;
+X		case '-':
+X			strcat(s, param->ld_minus);
+X			break;
+X		case '@':
+X			strcat(s, param->ld_at);
+X			break;
+X		case '#':
+X			strcat(s, param->ld_pound);
+X			break;
+X	}
+X	/*
+X	 * Purify the phone number by removing all the pretty characters
+X	 * that don't need to be sent to the modem.  Typically the "-",
+X	 * "(", ")", and space characters are just for looks.  To prevent
+X	 * this action, prepend a "\" to the character.
+X	 */
+X	i = 0;
+X	skip = 0;
+X	n = dir->number[dir->q_num[num]];
+X	while (*n) {
+X		if (*n == '\\' && !skip) {
+X			skip++;
+X			n++;
+X			continue;
+X		}
+X		if (!strchr("-() ", *n) || skip)
+X			number[i++] = *n;
+X		n++;
+X		skip = 0;
+X	}
+X	number[i] = '\0';
+X					/* add it to the string */
+X	strcat(s, number);
+X	strcat(s, modem->suffix[modem->m_cur]);
+X#ifdef DEBUG
+X	fprintf(stderr, "raw dial string: \"%s\"\n", s);
+X#endif /* DEBUG */
+X
+X#ifdef UNIXPC
+X					/* special case for OBM */
+X	if (!strcmp(modem->mname[modem->m_cur], "OBM")) {
+X					/* prepare the modem */
+X		pbuf.c_lineparam = DATA|DTMF;
+X		pbuf.c_waitdialtone = 5;
+X		pbuf.c_linestatus = 0;
+X		pbuf.c_feedback = SPEAKERON|NORMSPK;
+X		pbuf.c_waitflash = 500;
+X		ioctl(fd, PIOCSETP, &pbuf);
+X		sleep(1);
+X					/* connect the dialer */
+X		ioctl(fd, PIOCRECONN);
+X		sleep(1);
+X					/* dial each digit */
+X		n = s;
+X		while (*n) {
+X					/* switch tone/pulse dialing? */
+X			switch (*n) {
+X				case '^':
+X					pbuf.c_lineparam = DATA|PULSE;
+X					ioctl(fd, PIOCSETP, &pbuf);
+X					break;
+X				case '%':
+X					pbuf.c_lineparam = DATA|DTMF;
+X					ioctl(fd, PIOCSETP, &pbuf);
+X					break;
+X				default:
+X					ioctl(fd, PIOCDIAL, n);
+X					break;
+X			}
+X			n++;
+X		}
+X		return;
+X	}
+X#endif /* UNIXPC */
+X
+X	send_str(s, SLOW);
+X	return;
+X}
+X
+X/*
+X * Send a string to the modem.  Performs all the character synonym
+X * translations.
+X */
+X
+Xvoid
+Xsend_str(s, slow)
+Xchar *s;
+Xint slow;
+X{
+X	extern int fd;
+X	int skip, has_pause;
+X	char *strchr();
+X	unsigned int sleep();
+X	void do_pause();
+X					/* empty string? */
+X	if (s == NULL || *s == '\0')
+X		return;
+X
+X					/* contains a pause? */
+X	has_pause = 0;
+X	if (strchr(s, '~'))
+X		has_pause++;
+X
+X	tty_flush(fd, 1);
+X	/*
+X	 * Change the character synonyms to their real values.  Writes
+X	 * the characters to the modem.  To remove the special meaning
+X	 * of one of the characters, prepend a "\" to it.
+X	 */
+X	skip = 0;
+X	while (*s) {
+X					/* send the literal character */
+X		if (skip) {
+X			skip = 0;
+X			write(fd, s, 1);
+X			if (has_pause || slow)
+X				tty_drain(fd);
+X			if (slow)
+X				do_pause();
+X#ifdef DEBUG
+X			fprintf(stderr, "send_str: \"%c\", %02x, %03o, %d\n", *s, *s, *s, *s);
+X#endif /* DEBUG */
+X			s++;
+X			continue;
+X		}
+X					/* turn off the special meaning */
+X		if (*s == '\\') {
+X			skip++;
+X			s++;
+X			continue;
+X		}
+X					/* pause synonym */
+X		if (*s == param->pause_char) {
+X			sleep(1);
+X			s++;
+X			continue;
+X		}
+X					/* carriage return synonym */
+X		if (*s == param->cr_char)
+X			*s = '\r';
+X					/* 2 character control sequence */
+X		if (*s == param->ctrl_char) {
+X			s++;
+X					/* premature EOF? */
+X			if (*s == '\0')
+X				break;
+X					/* upper and lower case */
+X			if (*s > '_')
+X				*s -= 96;
+X			else
+X				*s -= 64;
+X		}
+X					/* escape synonym */
+X		if (*s == param->esc_char)
+X			*s = ESC;
+X					/* modem break synonym */
+X		if (*s == param->brk_char) {
+X			tty_break(fd);
+X			sleep(1);
+X			s++;
+X			continue;
+X		}
+X
+X		write(fd, s, 1);
+X#ifdef DEBUG
+X		fprintf(stderr, "send_str: \"%c\", %02x, %03o, %d\n", *s, *s, *s, *s);
+X#endif /* DEBUG */
+X		/*
+X		 * Because the pause char makes the timing critical, we
+X		 * wait until the buffer is clear before we continue.
+X		 */
+X		if (has_pause || slow)
+X			tty_drain(fd);
+X		if (slow)
+X			do_pause();
+X		s++;
+X	}
+X	return;
+X}
+X
+X/*
+X * Read the result codes coming back from the modem.  Test for the 6
+X * "connect" strings and the 4 "no connect" strings.  Return the connected
+X * baud rate (as a string) or the error message.
+X */
+X
+Xchar rc_buf[512];
+Xint rc_index;
+X
+Xchar *
+Xread_codes()
+X{
+X	extern int fd;
+X	int i;
+X	char c;
+X#ifdef UNIXPC
+X	unsigned int sleep();
+X	struct updata pbuf;
+X					/* special case for OBM */
+X	if (!strcmp(modem->mname[modem->m_cur], "OBM")) {
+X		ioctl(fd, PIOCGETP, &pbuf);
+X
+X		/*
+X		 * The OBM doesn't use a return message to announce the
+X		 * connection to a remote, so we fake one.  The 1200
+X		 * is quite arbitrary... it is not an indicator of the
+X		 * connected baud rate.
+X		 */
+X		if (pbuf.c_linestatus & MODEMCONNECTED)
+X			return("1200");
+X
+X		sleep(1);
+X		return(NULL);
+X	}
+X#endif /* UNIXPC */
+X					/* search for key words */
+X	for (; rc_index<511; rc_index++) {
+X		if ((i = getc_line(1)) <= 0)
+X			return(NULL);
+X
+X		c = i & 0x7f;
+X#ifdef DEBUG
+X		fprintf(stderr, "read_codes: \"%c\", %02x, %03o, %d\n", c, c, c, c);
+X#endif /* DEBUG */
+X					/* no NULLs please */
+X		if (c == '\0') {
+X			if (rc_index)
+X				rc_index--;
+X			continue;
+X		}
+X		rc_buf[rc_index] = c;
+X		rc_buf[rc_index+1] = '\0';
+X					/* the connect strings */
+X		if (match(rc_buf, modem->con_3[modem->m_cur]))
+X			return("300");
+X
+X		if (match(rc_buf, modem->con_12[modem->m_cur]))
+X			return("1200");
+X
+X		if (match(rc_buf, modem->con_24[modem->m_cur]))
+X			return("2400");
+X
+X		if (match(rc_buf, modem->con_48[modem->m_cur]))
+X			return("4800");
+X
+X		if (match(rc_buf, modem->con_96[modem->m_cur]))
+X			return("9600");
+X
+X		if (match(rc_buf, modem->con_192[modem->m_cur]))
+X			return("19200");
+X
+X					/* the no connect strings */
+X		if (match(rc_buf, modem->no_con1[modem->m_cur]))
+X			return(modem->no_con1[modem->m_cur]);
+X
+X		if (match(rc_buf, modem->no_con2[modem->m_cur]))
+X			return(modem->no_con2[modem->m_cur]);
+X
+X		if (match(rc_buf, modem->no_con3[modem->m_cur]))
+X			return(modem->no_con3[modem->m_cur]);
+X
+X		if (match(rc_buf, modem->no_con4[modem->m_cur]))
+X			return(modem->no_con4[modem->m_cur]);
+X	}
+X					/* ran out of buffer? */
+X	return("ERROR");
+X}
+X
+X/*
+X * Test for a match between two character strings.  A non-zero return code
+X * means that s2 was found at the end of s1.
+X */
+X
+Xstatic int
+Xmatch(s1, s2)
+Xchar *s1, *s2;
+X{
+X	register int i;
+X	int skip, diff;
+X	char new[40];
+X					/* if no string to match */
+X	if (*s2 == '\0')
+X		return(0);
+X					/* translate synonyms */
+X	i = 0;
+X	skip = 0;
+X	while (*s2) {
+X					/* literal character */
+X		if (skip) {
+X			skip = 0;
+X			new[i++] = *s2;
+X			s2++;
+X			continue;
+X		}
+X					/* turn off the special meaning */
+X		if (*s2 == '\\') {
+X			skip++;
+X			s2++;
+X			continue;
+X		}
+X					/* carriage return synonym */
+X		if (*s2 == param->cr_char)
+X			*s2 = '\r';
+X
+X					/* 2 character control sequence */
+X		if (*s2 == param->ctrl_char) {
+X			s2++;
+X			if (*s2 == '\0')
+X				break;
+X			if (*s2 > '_')
+X				*s2 -= 96;
+X			else
+X				*s2 -= 64;
+X		}
+X					/* escape synonym */
+X		if (*s2 == param->esc_char)
+X			*s2 = ESC;
+X
+X		new[i++] = *s2;
+X		s2++;
+X	}
+X	new[i] = '\0';
+X
+X	diff = strlen(s1) - strlen(new);
+X					/* is it possible? */
+X	if (diff < 0)
+X		return(0);
+X					/* test it out */
+X	if (!strcmp(&s1[diff], new))
+X		return(1);
+X	return(0);
+X}
+X
+X/*
+X * Apparently some modems can't take input at the rated speed while
+X * in the command mode.  Therefore, a 0.10 sec pause a required between
+X * characters.
+X */
+X
+Xvoid
+Xdo_pause()
+X{
+X	struct tms t;
+X	long t1;
+X
+X	t1 = times(&t);
+X	while ((times(&t) - t1) < HZ/10)
+X		;
+X	return;
+X}
+SHAR_EOF
+if test 7970 -ne "`wc -c < 'dial.c'`"
+then
+	echo shar: "error transmitting 'dial.c'" '(should have been 7970 characters)'
+fi
+fi
+echo shar: "extracting 'dial_dir.h'" '(932 characters)'
+if test -f 'dial_dir.h'
+then
+	echo shar: "will not over-write existing file 'dial_dir.h'"
+else
+sed 's/^X//' << \SHAR_EOF > 'dial_dir.h'
+X/*
+X * The dialing directory structure.  The first eight elements are
+X * contained in the pcomm.dial_dir file.
+X */
+X
+X#define NUM_DIR		100
+X#define NUM_QUEUE	10
+X#define FAST		0
+X#define SLOW		1
+X#define QUIET		0
+X#define VERBOSE		1
+X
+Xstruct DIAL_DIR {
+X	char	*name[NUM_DIR+1];	/* name of system being called */
+X	char	*number[NUM_DIR+1];	/* phone number */
+X	int	baud[NUM_DIR+1];	/* baud rate */
+X	char	parity[NUM_DIR+1];	/* parity */
+X	int	dbits[NUM_DIR+1];	/* data bits */
+X	int	sbits[NUM_DIR+1];	/* stop bits */
+X	char	duplex[NUM_DIR+1];	/* duplex (F = full, H = half) */
+X	char	*script[NUM_DIR+1];	/* script name (or TTY) */
+X
+X	int	q_num[NUM_QUEUE];	/* entry numbers in the queue */
+X	char	q_ld[NUM_QUEUE];	/* LD codes in the queue */
+X
+X	int	d_entries;		/* number of entries in the file */
+X	int	d_cur;			/* the current entry */
+X
+X	char	*d_path;		/* path to the pcomm.dial_dir file */
+X};
+X
+X#ifndef MAIN
+Xextern struct DIAL_DIR *dir;
+X#endif /* MAIN */
+SHAR_EOF
+if test 932 -ne "`wc -c < 'dial_dir.h'`"
+then
+	echo shar: "error transmitting 'dial_dir.h'" '(should have been 932 characters)'
+fi
+fi
+echo shar: "extracting 'e_lib.c'" '(3624 characters)'
+if test -f 'e_lib.c'
+then
+	echo shar: "will not over-write existing file 'e_lib.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'e_lib.c'
+X/*
+X * Routines to manipulate the pcomm.extrnl file
+X */
+X
+X#include <stdio.h>
+X#include "extrnl.h"
+X
+X/*
+X * Read the external file transfer program database.  Returns a pointer
+X * to a static area containing the EXTRNL structure.  This support file is 
+X * optional.
+X */
+X
+Xstruct EXTRNL *
+Xread_extrnl(extra)
+Xchar *extra;
+X{
+X	extern char *null_ptr;
+X	FILE *fp, *my_fopen();
+X	int i, line, up, entry, oops;
+X	char *str_dup(), buf[200], message[80], token[40], *str_tok(), *str;
+X	char *sep, *temp_token, *findfile();
+X	static struct EXTRNL e;
+X	void error_win();
+X
+X	if ((e.e_path = findfile(extra, "pcomm.extrnl")) == NULL) {
+X					/* not required to exist */
+X		for (i=0; i<3; i++) {
+X			e.name[0][i] = null_ptr;
+X			e.command[0][i] = null_ptr;
+X			e.prompt[0][i] = 'N';
+X			e.name[1][i] = null_ptr;
+X			e.command[1][i] = null_ptr;
+X			e.prompt[1][i] = 'N';
+X		}
+X		e.up_entries = 0;
+X		e.dn_entries = 0;
+X
+X		return(&e);
+X	}
+X
+X	if (!(fp = my_fopen(e.e_path, "r"))) {
+X		sprintf(buf, "\"%s\" for read", e.e_path);
+X		error_win(1, "Can't open external program file", buf);
+X	}
+X
+X	sep = ";;\n";
+X	line = 0;
+X	up = 1;
+X	oops = 0;
+X	while (fgets(buf, 200, fp) != NULL) {
+X		line++;
+X		if (line <= 3)
+X			entry = line-1;
+X		else {
+X			up = 0;
+X			entry = line-4;
+X		}
+X					/* get the token */
+X		if (!(temp_token = str_tok(buf, '='))) {
+X			sprintf(message, "is missing a token at line %d", line);
+X			oops++;
+X			break;
+X		}
+X		/*
+X		 * Parse the rest of the line.  This is similar to using
+X		 * the "real" strtok() function, but this version returns
+X		 * a pointer to NULL if the token is missing.  Note the
+X		 * use of the array of separators.
+X		 */
+X		for (i=0; i<3; i++) {
+X			if (!(str = str_tok((char *) NULL, sep[i]))) {
+X				sprintf(message, "is missing a parameter at line %d", line);
+X				oops++;
+X				break;
+X			}
+X			switch(i) {
+X				case 0:
+X					e.name[up][entry] = str_dup(str);
+X					break;
+X				case 1:
+X					e.command[up][entry] = str_dup(str);
+X					break;
+X				case 2:
+X					e.prompt[up][entry] = *str;
+X					break;
+X			}
+X		}
+X		if (oops)
+X			break;
+X
+X					/* sanity checking */
+X		if (up)
+X			sprintf(token, "SEND_%d", entry+1);
+X		else
+X			sprintf(token, "RCV_%d", entry+1);
+X
+X		if (strcmp(temp_token, token)) {
+X			sprintf(message, "is corrupted at line %d", line);
+X			oops++;
+X			break;
+X		}
+X	}
+X	fclose(fp);
+X
+X	if (oops) {
+X		sprintf(buf, "External program file \"%s\"", e.e_path);
+X		error_win(1, buf, message);
+X	}
+X					/* find number of upload entries */
+X	for (i=0; i<3; i++) {
+X		if (e.name[1][i] == null_ptr)
+X			break;
+X	}
+X	e.up_entries = i;
+X					/* find number of download entries */
+X	for (i=0; i<3; i++) {
+X		if (e.name[0][i] == null_ptr)
+X			break;
+X	}
+X	e.dn_entries = i;
+X					/* if empty database */
+X	if (!e.up_entries || !e.dn_entries) {
+X		sprintf(buf, "External program file \"%s\"", e.e_path);
+X		error_win(0, buf, "has no data");
+X	}
+X
+X	return(&e);
+X}
+X
+X/*
+X * Update the external file transfer program database.  A non-zero return
+X * code means a non-fatal error.
+X */
+X
+Xint
+Xup_extrnl()
+X{
+X	FILE *fp, *my_fopen();
+X	int i, up, entry;
+X	char buf[200];
+X	void error_win();
+X					/* open for write */
+X	if (!(fp = my_fopen(extrnl->e_path, "w"))) {
+X		sprintf(buf, "\"%s\"", extrnl->e_path);
+X		error_win(0, "No write permission on externl program file", buf);
+X		return(1);
+X	}
+X					/* put 'em back */
+X	up = 1;
+X	for (i=0; i<6; i++) {
+X		if (i < 3)
+X			entry = i;
+X		else {
+X			up = 0;
+X			entry = i-3;
+X		}
+X		if (up)
+X			fprintf(fp, "SEND_%d=%s;%s;%c\n", entry+1, extrnl->name[up][entry], extrnl->command[up][entry], extrnl->prompt[up][entry]);
+X		else
+X			fprintf(fp, "RCV_%d=%s;%s;%c\n", entry+1, extrnl->name[up][entry], extrnl->command[up][entry], extrnl->prompt[up][entry]);
+X	}
+X
+X	fclose(fp);
+X	return(0);
+X}
+SHAR_EOF
+if test 3624 -ne "`wc -c < 'e_lib.c'`"
+then
+	echo shar: "error transmitting 'e_lib.c'" '(should have been 3624 characters)'
+fi
+fi
+echo shar: "extracting 'expand.c'" '(2873 characters)'
+if test -f 'expand.c'
+then
+	echo shar: "will not over-write existing file 'expand.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'expand.c'
+X/*
+X * Do file name expansion with "native" shell.  Using the native shell
+X * (as described in the SHELL environmental variable) allows for csh or
+X * ksh abbreviations that sh doesn't recognize.  Returns a pointer to
+X * a static area.
+X */
+X
+X#define EXPAND_BUF	2048
+X
+X#include <stdio.h>
+X#include <signal.h>
+X#include <fcntl.h>
+X#include "config.h"
+X
+Xchar *
+Xexpand(input)
+Xchar *input;
+X{
+X	extern char *null_ptr;
+X	FILE *pfp, *n_popen();
+X	int last;
+X	char buf[1024], *strpbrk(), *strcpy();
+X	static char ans[EXPAND_BUF];
+X
+X					/* same rules as str_dup() */
+X	if (input == NULL)
+X		return(NULL);
+X	if (*input == '\0')
+X		return(null_ptr);
+X					/* any thing to expand? */
+X	if (!strpbrk(input, "$*{}[]\\?~")) {
+X		strcpy(ans, input);
+X		return(ans);
+X	}
+X					/* popen an echo */
+X	sprintf(buf, "echo %s", input);
+X
+X	pfp = n_popen(buf, "r");
+X	fgets(ans, EXPAND_BUF, pfp);
+X	n_pclose(pfp);
+X
+X	if (!strlen(ans)) {
+X		strcpy(ans, input);
+X		return(ans);
+X	}
+X	/*
+X	 * A horrible kludge...  if the last character is not a line
+X	 * feed, then the csh has returned an error message.  Otherwise
+X	 * zap the line feed.
+X	 */
+X	last = strlen(ans) -1;
+X	if (ans[last] != '\n') {
+X		strcpy(ans, input);
+X		return(ans);
+X	}
+X	else
+X		ans[last] = '\0';
+X
+X	return(ans);
+X}
+X
+X#define	tst(a,b) (*mode == 'r'? (b) : (a))
+X#define	RDR	0
+X#define	WTR	1
+Xstatic int popen_pid[20];
+X
+XFILE *
+Xn_popen(cmd, mode)
+Xchar *cmd, *mode;
+X{
+X	int myside, hisside, ppid, p[2];
+X	char *shellpath, *shell, *flags, *getenv(), *strrchr();
+X	void _exit();
+X
+X	if (pipe(p) < 0)
+X		return NULL;
+X
+X	myside = tst(p[WTR], p[RDR]);
+X	hisside = tst(p[RDR], p[WTR]);
+X					/* get the environmental variable */
+X	shellpath = getenv("SHELL");
+X	if (shellpath == NULL || *shellpath == '\0')
+X		shellpath = "/bin/sh";
+X
+X	if (shell = strrchr(shellpath, '/'))
+X		shell++;
+X	else {
+X		shellpath = "/bin/sh";
+X		shell = "sh";
+X	}
+X					/* fix up the flags */
+X	if (!strcmp(shell, "csh"))
+X		flags = "-fc";
+X	else
+X		flags = "-c";		/* Korn shell too */
+X
+X	if (!(ppid = fork())) {
+X		int stdio;
+X					/* no error messages please */
+X		close(2);
+X		open("/dev/null", O_WRONLY);
+X#ifdef SETUGID
+X		setgid(getgid());
+X		setuid(getuid());
+X#endif /* SETUGID */
+X		stdio = tst(0, 1);
+X		close(myside);
+X		close(stdio);
+X		fcntl(hisside, F_DUPFD, stdio);
+X		close(hisside);
+X		execl(shellpath, shell, flags, cmd, (char *) 0);
+X		_exit(1);
+X	}
+X	if (ppid == -1) {
+X		close(myside);
+X		close(hisside);
+X		return NULL;
+X	}
+X
+X	popen_pid[myside] = ppid;
+X
+X	close(hisside);
+X	return(fdopen(myside, mode));
+X}
+X
+Xn_pclose(ptr)
+XFILE *ptr;
+X{
+X	SIG_TYPE (*hstat)(), (*istat)(), (*qstat)();
+X	int f, r, sig_status;
+X
+X	f = fileno(ptr);
+X	fclose(ptr);
+X	istat = signal(SIGINT, SIG_IGN);
+X	qstat = signal(SIGQUIT, SIG_IGN);
+X	hstat = signal(SIGHUP, SIG_IGN);
+X
+X	while ((r = wait(&sig_status)) != popen_pid[f] && r != -1)
+X		;
+X
+X	if (r == -1)
+X		sig_status = -1;
+X
+X	signal(SIGINT, istat);
+X	signal(SIGQUIT, qstat);
+X	signal(SIGHUP, hstat);
+X	return(sig_status);
+X}
+SHAR_EOF
+if test 2873 -ne "`wc -c < 'expand.c'`"
+then
+	echo shar: "error transmitting 'expand.c'" '(should have been 2873 characters)'
+fi
+fi
+echo shar: "extracting 'extrnl.h'" '(623 characters)'
+if test -f 'extrnl.h'
+then
+	echo shar: "will not over-write existing file 'extrnl.h'"
+else
+sed 's/^X//' << \SHAR_EOF > 'extrnl.h'
+X/*
+X * The external file transfer program database.  The list is limited to
+X * 3 uploads and 3 downloads because the xfer_menu() routine uses single
+X * character input (and these selections become 7, 8, and 9).
+X */
+X
+Xstruct EXTRNL {
+X	char	*name[2][3];		/* program name (for display only) */
+X	char	*command[2][3];		/* the command line */
+X	char	prompt[2][3];		/* need to prompt for names? */
+X
+X	int	up_entries;		/* number of up entries in the file */
+X	int	dn_entries;		/* number of down entries in the file */
+X
+X	char	*e_path;		/* path to the pcomm.extrnl file */
+X};
+X
+X#ifndef MAIN
+Xextern struct EXTRNL *extrnl;
+X#endif /* MAIN */
+SHAR_EOF
+if test 623 -ne "`wc -c < 'extrnl.h'`"
+then
+	echo shar: "error transmitting 'extrnl.h'" '(should have been 623 characters)'
+fi
+fi
+echo shar: "extracting 'getcwd.c'" '(387 characters)'
+if test -f 'getcwd.c'
+then
+	echo shar: "will not over-write existing file 'getcwd.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'getcwd.c'
+X/*
+X * Can you believe it???  Masscomps don't have a function to return the
+X * current working directory while in the AT&T universe!
+X */
+X
+X#include <stdio.h>
+X
+Xchar *
+Xgetcwd(buf, size)
+Xchar *buf;
+Xint size;
+X{
+X	FILE *pfp, *popen();
+X
+X	if (!(pfp = popen("pwd", "r")))
+X		return(".");
+X
+X	fgets(buf, size, pfp);
+X	pclose(pfp);
+X					/* zap the new line */
+X	buf[strlen(buf)-1] = '\0';
+X	return(buf);
+X}
+SHAR_EOF
+if test 387 -ne "`wc -c < 'getcwd.c'`"
+then
+	echo shar: "error transmitting 'getcwd.c'" '(should have been 387 characters)'
+fi
+fi
+echo shar: "extracting 'getopt.c'" '(1035 characters)'
+if test -f 'getopt.c'
+then
+	echo shar: "will not over-write existing file 'getopt.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'getopt.c'
+X/*
+X * Parse the command line and return option flags and arguments
+X */
+X
+X#include <stdio.h>
+X
+Xint optind = 1;
+Xchar *optarg;
+X
+Xint
+Xgetopt(argc, argv, opts)
+Xint argc;
+Xchar *argv[];
+Xchar *opts;
+X{
+X	static int sp = 1;
+X	int c, strcmp();
+X	char *cp, *strchr();
+X
+X	if (sp == 1) {
+X		if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0')
+X			return(EOF);
+X		else if (strcmp(argv[optind], "--") == 0) {
+X			optind++;
+X			return(EOF);
+X		}
+X	}
+X	c = argv[optind][sp];
+X	if (c == ':' || (cp=strchr(opts, c)) == NULL) {
+X		fprintf(stderr, "%s: illegal option \"%c\"\n", argv[0], c);
+X		if (argv[optind][++sp] == '\0') {
+X			optind++;
+X			sp = 1;
+X		}
+X		return('?');
+X	}
+X	if (*++cp == ':') {
+X		if (argv[optind][sp+1] != '\0')
+X			optarg = &argv[optind++][sp+1];
+X		else if (++optind >= argc) {
+X			fprintf(stderr, "%s: option \"%c\" requires an argument\n", argv[0], c);
+X			sp = 1;
+X			return('?');
+X		} else
+X			optarg = argv[optind++];
+X		sp = 1;
+X	} else {
+X		if (argv[optind][++sp] == '\0') {
+X			sp = 1;
+X			optind++;
+X		}
+X		optarg = NULL;
+X	}
+X	return(c);
+X}
+SHAR_EOF
+if test 1035 -ne "`wc -c < 'getopt.c'`"
+then
+	echo shar: "error transmitting 'getopt.c'" '(should have been 1035 characters)'
+fi
+fi
+echo shar: "extracting 'help.c'" '(1779 characters)'
+if test -f 'help.c'
+then
+	echo shar: "will not over-write existing file 'help.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'help.c'
+X/*
+X * Display the help screen.  Press any key to continue.  If the ascii_hot
+X * string is more than 4 characters wide, this screen will look silly.
+X * Maybe one day, this will also contain full page descriptions of each
+X * command.
+X */
+X
+X#include <stdio.h>
+X#include <curses.h>
+X#include "config.h"
+X#include "misc.h"
+X
+Xvoid
+Xhelp_screen(hot)
+Xchar *hot;
+X{
+X	extern int fd;
+X	WINDOW *h_win, *newwin();
+X
+X	h_win = newwin(17, 80, 0, 0);
+X
+X	mvwattrstr(h_win, 1, 29, A_BOLD, "P C O M M       H E L P\n");
+X	horizontal(h_win, 2, 0, 80);
+X	mvwattrstr(h_win, 4, 0, A_BOLD, "       Major Functions          Utility Functions         File Functions\n\n");
+X	mvwprintw(h_win,  6,  2, "Dialing Directory.%4.4s-D  Program Info ....%4.4s-I  Send Files ....%4.4s-<up>", hot, hot, hot);
+X	mvwprintw(h_win,  7,  2, "Auto Redial ......%4.4s-R  Setup Screen ....%4.4s-S  Receive Files .%4.4s-<down>", hot, hot, hot);
+X	mvwprintw(h_win,  8,  2, "Keyboard Macros ..%4.4s-M  Change Directory.%4.4s-B  Pass Thru Mode.%4.4s-T", hot, hot, hot);
+X	mvwprintw(h_win,  9,  2, "Line Settings ....%4.4s-P  Clear Screen ....%4.4s-C  Directory .....%4.4s-F", hot, hot, hot);
+X	mvwprintw(h_win, 10,  2, "Exit Pcomm .......%4.4s-X  Toggle Duplex ...%4.4s-E  Screen Dump ...%4.4s-G", hot, hot, hot);
+X	mvwprintw(h_win, 11,  2, "Unix Gateway .....%4.4s-4  Hang Up Phone ...%4.4s-H  Start Data Log.%4.4s-1", hot, hot, hot);
+X	mvwprintw(h_win, 12, 28, "Printer On/Off ..%4.4s-L  Toggle Log ....%4.4s-2", hot, hot);
+X	mvwprintw(h_win, 13, 28, "Toggle CR-CR/LF .%4.4s-3", hot);
+X	mvwprintw(h_win, 14, 28, "Break Key .......%4.4s-7", hot);
+X
+X	box(h_win, VERT, HORZ);
+X	mvwaddstr(h_win, 16, 26, " Press any key to continue ");
+X	wrefresh(h_win);
+X
+X	wgetch(h_win);
+X	if (fd == -1) {
+X		werase(h_win);
+X		wrefresh(h_win);
+X	}
+X	delwin(h_win);
+X	return;
+X}
+SHAR_EOF
+if test 1779 -ne "`wc -c < 'help.c'`"
+then
+	echo shar: "error transmitting 'help.c'" '(should have been 1779 characters)'
+fi
+fi
+echo shar: "extracting 'info.c'" '(1548 characters)'
+if test -f 'info.c'
+then
+	echo shar: "will not over-write existing file 'info.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'info.c'
+X/*
+X * Display the initial welcome screen (to include all of the proper
+X * acknowledgements).  Press any key to continue.
+X */
+X
+X#define VERSION	"1.2.0"
+X#define DATE	"4 Feb 89"
+X
+X#include <stdio.h>
+X#include <curses.h>
+X
+Xvoid
+Xinfo(auto_clear)
+Xint auto_clear;
+X{
+X	extern int fd;
+X	WINDOW *w_win, *newwin();
+X	char buf[80];
+X					/* display the welcome screen */
+X	w_win = newwin(23, 80, 0, 0);
+X	mvwaddstr(w_win, 3, 18, "PPPPPP    CCCC    OOOO    MM   MM   MM   MM");
+X	mvwaddstr(w_win, 4, 18, "P    P   C       O    O   M M M M   M M M M");
+X	mvwaddstr(w_win, 5, 18, "PPPPPP   C       O    O   M  M  M   M  M  M");
+X	mvwaddstr(w_win, 6, 18, "P        C       O    O   M     M   M     M");
+X	mvwaddstr(w_win, 7, 18, "P         CCCC    OOOO    M     M   M     M");
+X
+X	sprintf(buf, ">>> Pcomm Version %s <<<", VERSION);
+X	mvwaddstr(w_win, 10, (80-strlen(buf))/2, buf);
+X	sprintf(buf, "Release date: %s", DATE);
+X	mvwaddstr(w_win, 11, (80-strlen(buf))/2, buf);
+X
+X	mvwaddstr(w_win, 13, 8, "Pcomm is a public domain telecommunication program for Unix that");
+X	mvwaddstr(w_win, 14, 8, "is designed to operate similar to the MSDOS program, ProComm.");
+X	mvwaddstr(w_win, 15, 8, "ProComm (TM) is copyrighted by Datastorm Technologies, Inc.");
+X	mvwaddstr(w_win, 19, 45, "Emmet P. Gray");
+X	mvwaddstr(w_win, 20, 45, "...!uunet!uiucuxc!fthood!egray");
+X	wmove(w_win, 22, 79);
+X	wrefresh(w_win);
+X					/* delay so you can read the herald */
+X	if (auto_clear)
+X		wait_key(w_win, 5);
+X	else
+X		wgetch(w_win);
+X
+X	if (fd == -1) {
+X		werase(w_win);
+X		wrefresh(w_win);
+X	}
+X	delwin(w_win);
+X	return;
+X}
+SHAR_EOF
+if test 1548 -ne "`wc -c < 'info.c'`"
+then
+	echo shar: "error transmitting 'info.c'" '(should have been 1548 characters)'
+fi
+fi
+echo shar: "extracting 'init.c'" '(3065 characters)'
+if test -f 'init.c'
+then
+	echo shar: "will not over-write existing file 'init.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'init.c'
+X/*
+X * Display the welcome screen and find the Pcomm support files.  Returns a
+X * pointer to a static area (or shared memory) containing the STATUS
+X * structure.  All errors are fatal.
+X */
+X
+X#define TMP_FILE	"/tmp/pcommXXXXXX"
+X
+X#include <stdio.h>
+X#include <curses.h>
+X#include "config.h"
+X#include "misc.h"
+X#include "status.h"
+X
+X#ifdef SHAREDMEM
+X#include <sys/types.h>
+X#include <sys/ipc.h>
+X#include <sys/shm.h>
+X#endif /* SHAREDMEM */
+X
+Xstruct STATUS *
+Xinit(short_cut)
+Xchar *short_cut;
+X{
+X	char *strcpy();
+X	struct STATUS *s_ptr;
+X	void info();
+X#ifdef SHAREDMEM
+X	int mode;
+X	extern int shm_id;
+X	char *shmat(), *memset();
+X	void perror(), exit();
+X
+X	/*
+X	 * Since the "pcomm_input" program does not run set-user/group-id
+X	 * the mode must be set so the effective ID can read/write to the
+X	 * shared memory segment.  Kinda strange... real ID's aren't used.
+X	 */
+X#ifdef SETUGID
+X	mode = 0666;
+X#else /* SETUGID */
+X	mode = 0600;
+X#endif /* SETUGID */
+X					/* create a shared memory segment */
+X	shm_id = shmget(IPC_PRIVATE, sizeof (struct STATUS),  mode|IPC_CREAT|IPC_EXCL|IPC_NOWAIT);
+X	if (shm_id < 0) {
+X		endwin();
+X		perror("shmget");
+X		exit(1);
+X	}
+X	s_ptr = (struct STATUS *) shmat(shm_id, (char *) 0, 0);
+X	if ((int) s_ptr == -1) {
+X		endwin();
+X		perror("shmat");
+X		exit(1);
+X	}
+X#else /* SHAREDMEM */
+X	char *mktemp(), tempfile[sizeof(TMP_FILE)];
+X	static struct STATUS s;
+X	s_ptr = &s;
+X#endif /* SHAREDMEM */
+X					/* some defaults */
+X	s_ptr->fd = -1;
+X	s_ptr->dup_fd = -1;
+X	s_ptr->add_lf = 0;
+X	s_ptr->log = 0;
+X	s_ptr->print = 0;
+X	strcpy(s_ptr->log_path, "NOT_DEFINED");
+X
+X#ifdef SHAREDMEM
+X	s_ptr->clr = 0;
+X	s_ptr->row = 0;
+X	s_ptr->col = 0;
+X	memset(s_ptr->vs, '\0', MAX_ROW * MAX_COL);
+X#else /* SHAREDMEM */
+X	strcpy(tempfile, TMP_FILE);
+X	strcpy(s_ptr->vs_path, mktemp(tempfile));
+X#endif /* SHAREDMEM */
+X					/* display herald if no short-cut */
+X	if (short_cut == NULL)
+X		info(AUTO_CLEAR);
+X
+X	erase();
+X	refresh();
+X	return(s_ptr);
+X}
+X
+X/*
+X * Search the extra directory (supplied on the command line), then the
+X * directory in the PCOMM environmental variable, then the current working
+X * directory, and lastly, the default directory.
+X */
+X
+Xchar *
+Xfindfile(extra, name)
+Xchar *extra, *name;
+X{
+X	int i;
+X	char *pcomm, *getenv(), *path, pbuf[200], *getcwd(), *str_dup();
+X	char temp[200];
+X
+X					/* see if PCOMM variable is set */
+X	pcomm = getenv("PCOMM");
+X	if (pcomm == NULL || *pcomm == '\0')
+X		pcomm = NULL;
+X	else {
+X					/* zap the trailing separator */
+X		if (pcomm[strlen(pcomm)-1] == '/')
+X			pcomm[strlen(pcomm)-1] = '\0';
+X	}
+X
+X	for (i=0; i<4; i++) {
+X					/* directory search order */
+X		switch (i) {
+X			case 0:		/* extra directory from command line */
+X				path = extra;
+X				break;
+X			case 1:		/* PCOMM environmental variable */
+X				path = pcomm;
+X				break;
+X			case 2:		/* current working directory */
+X				path = getcwd(pbuf, 200);
+X				break;
+X			case 3:		/* Pcomm's default directory */
+X				path = DEFAULT_DIR;
+X				break;
+X		}
+X		if (path == NULL)
+X			continue;
+X
+X		sprintf(temp, "%s/%s", path, name);
+X					/* read permission checked */
+X		if (!access(temp, 4))
+X			return(str_dup(temp));
+X	}
+X	return(NULL);
+X}
+SHAR_EOF
+if test 3065 -ne "`wc -c < 'init.c'`"
+then
+	echo shar: "error transmitting 'init.c'" '(should have been 3065 characters)'
+fi
+fi
+echo shar: "extracting 'input.c'" '(10960 characters)'
+if test -f 'input.c'
+then
+	echo shar: "will not over-write existing file 'input.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'input.c'
+X/*
+X * The input routines.  This program runs as a child process to the
+X * Pcomm program.
+X */
+X
+X#include <stdio.h>
+X#include <signal.h>
+X#include <setjmp.h>
+X#define MAIN
+X#include "config.h"
+X#include "misc.h"
+X#include "status.h"
+X#include "vcs.h"
+X
+X#ifdef SHAREDMEM
+X#include <sys/types.h>
+X#include <sys/ipc.h>
+X#include <sys/shm.h>
+X#endif /* SHAREDMEM */
+X
+Xjmp_buf i_jmp;
+Xint vcs_param[NUM_VCS][5];		/* positional parameters */
+Xint vcs_opt[NUM_VCS][10];		/* options unique to each VCS */
+Xint vcs_codes[NUM_VCS][VCS_SIZE];	/* the VCS codes */
+Xint vcs_leadin[NUM_VCS];		/* unique list of lead-in characters */
+Xint num_leadin;				/* length of lead-in list */
+Xint hold, max_row, max_col, skip_row;
+XFILE *logfp, *lprfp;
+Xstruct STATUS *status;
+X
+X#ifdef SHAREDMEM
+X#define VROW	status->row
+X#define VCOL	status->col
+X#define VS	status->vs
+X#else /* SHAREDMEM */
+Xint VROW, VCOL;
+Xchar VS[MAX_ROW][MAX_COL];
+Xstruct STATUS s;
+X#endif /* SHAREDMEM */
+X
+X/*
+X * Read the serial port and write the characters to the screen.  Watch
+X * for signals from the parent process to toggle the fancy options.
+X * Writes the characters received to a virtual screen buffer.
+X */
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	FILE *popen();
+X	register int in_cnt, out_cnt;
+X	int got_sig();
+X	char c, *strcpy(), *bufp, in_buf[INPUT_BUF], out_buf[INPUT_BUF*2];
+X	void _exit(), exit(), vcs_table(), setbuf(), vs_putchar(), vs_clear();
+X#ifdef SHAREDMEM
+X	int shm_id;
+X	char *shmat();
+X	void perror();
+X#endif /* SHAREDMEM */
+X					/* set the trap for the signals */
+X	signal(SIGALRM, SIG_IGN);
+X	signal(SIGHUP,  SIG_IGN);
+X	signal(SIGQUIT, SIG_IGN);
+X	signal(SIGUSR1, got_sig);
+X	signal(SIGUSR2, got_sig);
+X	signal(SIGINT,  got_sig);
+X	signal(SIGTERM, got_sig);
+X
+X	setbuf(stdout, (char *) NULL);
+X					/* for the curious... */
+X	if (argc == 1) {
+X		fprintf(stderr, "This is the input routine for the Pcomm program\n");
+X		fprintf(stderr, "It is not designed to be run as a separate program\n");
+X		exit(1);
+X	}
+X
+X#ifdef SHAREDMEM
+X	shm_id = atoi(argv[1]);
+X	status = (struct STATUS *) shmat(shm_id, (char *) 0, 0);
+X	if ((int) status == -1) {
+X		perror("shmat");
+X		_exit(1);
+X	}
+X#else /* SHAREDMEM */
+X	status = &s;
+X#endif /* SHAREDMEM */
+X					/* load the VCS table */
+X	vcs_table();
+X	if (max_row > MAX_ROW)
+X		max_row = MAX_ROW;
+X	if (max_col > MAX_COL-1)
+X		max_col = MAX_COL-1;
+X					/* parse the command line */
+X#ifndef SHAREDMEM
+X	status->fd = atoi(argv[1]);
+X	status->dup_fd = atoi(argv[2]);
+X	status->add_lf = atoi(argv[3]);
+X	status->log = atoi(argv[4]);
+X	status->print = atoi(argv[5]);
+X	strcpy(status->log_path, argv[6]);
+X	strcpy(status->vs_path, argv[7]);
+X#endif /* SHAREDMEM */
+X
+X	skip_row = 0;
+X
+X#ifdef SHAREDMEM
+X	if (status->clr)
+X		skip_row = 1;
+X#else /* SHAREDMEM */
+X					/* read previous screen */
+X	if (!access(status->vs_path, 0))
+X		read_vs();
+X	else
+X		skip_row = 1;
+X#endif /* SHAREDMEM */
+X
+X	hold = 0;
+X					/* start up file pointers */
+X	lprfp = (FILE *) NULL;
+X	logfp = (FILE *) NULL;
+X
+X	switch (setjmp(i_jmp)) {
+X		case 0:			/* no signal */
+X			break;
+X		case 1:			/* toggle the data logging */
+X			status->log = status->log ? 0 : 1;
+X			break;
+X		case 2:			/* toggle the printer */
+X			status->print = status->print ? 0 : 1;
+X			break;
+X		case 3:			/* suspend the input */
+X			hold = hold ? 0 : 1;
+X#ifndef SHAREDMEM
+X			if (hold)
+X				write_vs();
+X#endif /* SHAREDMEM */
+X			break;
+X		case 4:			/* clean up and go home */
+X			if (status->log)
+X				fclose(logfp);
+X			if (status->print) {
+X				putc('\f', lprfp);
+X				pclose(lprfp);
+X			}
+X#ifdef SHAREDMEM
+X					/* detach shared memory */
+X			shmdt((char *) status);
+X#endif /* SHAREDMEM */
+X			_exit(0);
+X			break;
+X	}
+X					/* any signal will awaken pause() */
+X	if (hold)
+X#ifdef BSD
+X		sigpause(0);
+X#else /* BSD */
+X		pause();
+X#endif /* BSD */
+X					/* open or close the printer */
+X	if (status->print && lprfp == NULL)
+X		lprfp = popen(LPR, "w");
+X
+X	if (!status->print && lprfp != NULL) {
+X		putc('\f', lprfp);
+X		pclose(lprfp);
+X		lprfp = (FILE *) NULL;
+X	}
+X					/* open or close the log file */
+X	if (status->log && logfp == NULL) {
+X		if (strcmp(status->log_path, "NOT_DEFINED")) {
+X			if (!(logfp = fopen(status->log_path, "a")))
+X				status->log = 0;
+X		}
+X		else
+X			status->log = 0;
+X	}
+X	if (!status->log && logfp != NULL) {
+X		fclose(logfp);
+X		logfp = (FILE *) NULL;
+X	}
+X
+X#ifdef SHAREDMEM
+X	if (status->clr) {
+X		status->clr = 0;
+X		vs_clear();
+X	}
+X#else /* SHAREDMEM */
+X					/* clear if vs_path doesn't exist */
+X	if (access(status->vs_path, 0))
+X		vs_clear();
+X#endif /* SHAREDMEM */
+X
+X	/*
+X	 * The very first screen we see after dialing has the "Connected to..."
+X	 * message at row 0, therefore we start our virtual screen at row 1.
+X	 */
+X	if (skip_row) {
+X		skip_row = 0;
+X		VROW = 1;
+X	}
+X					/* here we go... */
+X	while (1) {
+X		if ((in_cnt = read(status->fd, in_buf, INPUT_BUF)) <= 0)
+X			continue;
+X					/* send a duplicate to Pcomm */
+X		if (status->dup_fd != -1)
+X			write(status->dup_fd, in_buf, in_cnt);
+X
+X					/* "peel" the buffer one at a time */
+X		out_cnt = 0;
+X		bufp = in_buf;
+X		while (--in_cnt >= 0) {
+X			c = *bufp++ & 0xff;
+X					/* send to logfile */
+X			if (status->log) {
+X				if (c == '\r' && status->add_lf)
+X					putc('\n', logfp);
+X					/* no carriage returns in logfile */
+X				if (c != '\r')
+X					putc(c, logfp);
+X			}
+X					/* send to printer too? */
+X			if (status->print)
+X				putc(c, lprfp);
+X
+X					/* put a char in virtual screen */
+X			vs_putchar(c);
+X
+X					/* build the output buffer */
+X			out_buf[out_cnt++] = c;
+X			if (c == '\r' && status->add_lf)
+X				out_buf[out_cnt++] = '\n';
+X
+X					/* output in smaller chunks */
+X			if (out_cnt >= OUTPUT_BUF) {
+X				fwrite(out_buf, sizeof(char), out_cnt, stdout);
+X				out_cnt = 0;
+X			}
+X		}
+X		if (out_cnt)
+X			fwrite(out_buf, sizeof(char), out_cnt, stdout);
+X	}
+X}
+X
+X/*
+X * Figure out which signal we just received, and fix the return code of
+X * the setjmp function above to the proper value.
+X */
+X
+Xint
+Xgot_sig(sig)
+Xint sig;
+X{
+X	switch (sig) {
+X		case SIGUSR1:
+X			signal(SIGUSR1, got_sig);
+X			longjmp(i_jmp, 1);
+X		case SIGUSR2:
+X			signal(SIGUSR2, got_sig);
+X			longjmp(i_jmp, 2);
+X		case SIGINT:
+X			signal(SIGINT, got_sig);
+X			longjmp(i_jmp, 3);
+X		case SIGTERM:
+X			signal(SIGTERM, got_sig);
+X			longjmp(i_jmp, 4);
+X	}
+X}
+X
+X/*
+X * Put a character in the virtual screen.  This routine saves incoming
+X * characters in a two dimensional buffer designed to mimic the real
+X * screen.
+X */
+X
+Xvoid
+Xvs_putchar(c)
+Xchar c;
+X{
+X	register int i;
+X	char *memset();
+X	int tab_stop;
+X	void vs_scroll();
+X
+X	switch (vcs_filter(c)) {
+X		case MAYBE:		/* wait and see... */
+X			break;
+X		case 256+HOME:		/* home virtual screen "cursor" */
+X			VROW = 0;
+X			VCOL = 0;
+X			break;
+X		case 256+CLR_EOL:	/* clear to end of line */
+X			memset(&VS[VROW][VCOL], ' ', max_col - VCOL);
+X			VCOL = max_col -1;
+X			break;
+X		case 256+CLR_EOS:	/* clear to end of screen */
+X			memset(&VS[VROW][VCOL], ' ', max_col - VCOL);
+X			for (i=VROW+1; i<max_row; i++)
+X				memset(VS[i], ' ', max_col);
+X			VROW = max_row -1;
+X			VCOL = max_col -1;
+X			break;
+X		case 256+CLEAR:		/* clear all and home "cursor" */
+X			for (i=0; i<max_row; i++)
+X				memset(VS[i], ' ', max_col);
+X			VROW = 0;
+X			VCOL = 0;
+X			break;
+X		case 256+MV_UP:		/* move "cursor" up */
+X			VROW--;
+X			if (VROW < 0)
+X				VROW = 0;
+X			break;
+X		case 256+MV_DOWN:	/* move "cursor" down */
+X			VROW++;
+X			if (VROW >= max_row)
+X				VROW = max_row -1;
+X			break;
+X		case 256+MV_RIGHT:	/* move "cursor" right */
+X			VCOL++;
+X			if (VCOL >= max_col)
+X				VCOL = max_col -1;
+X			break;
+X		case 256+MV_LEFT:	/* move "cursor" left */
+X		case BS:		/* non destructive back space */
+X			VCOL--;
+X			if (VCOL < 0)
+X				VCOL = 0;
+X			break;
+X		case 256+MV_DIRECT:	/* direct cursor movement */
+X			VROW = vcs_param[MV_DIRECT][0];
+X			VCOL = vcs_param[MV_DIRECT][1];
+X
+X					/* if "add one" and "decimal" */
+X			if (vcs_opt[MV_DIRECT][0] && vcs_opt[MV_DIRECT][1]) {
+X				VROW--;
+X				VCOL--;
+X			}
+X					/* if "character" */
+X			if (vcs_opt[MV_DIRECT][2]) {
+X					/* if "add offset" */
+X				if (vcs_opt[MV_DIRECT][3]) {
+X					VROW -= vcs_opt[MV_DIRECT][5];
+X					VCOL -= vcs_opt[MV_DIRECT][5];
+X				}
+X					/* if "subtract offset" */
+X				if (vcs_opt[MV_DIRECT][4]) {
+X					VROW += vcs_opt[MV_DIRECT][5];
+X					VCOL += vcs_opt[MV_DIRECT][5];
+X				}
+X				VROW--;
+X				VCOL--;
+X			}
+X			break;
+X		case 0:
+X		case 7:			/* skip NULL and "bell" character */
+X			break;
+X		case '\t':		/* tab character */
+X			tab_stop = VCOL + 8 - (VCOL % 8);
+X					/* if wrap around */
+X			if (tab_stop >= max_col) {
+X					/* spaces up to eol */
+X				memset(&VS[VROW][VCOL], ' ', max_col - VCOL);
+X				VROW++;
+X				if (VROW >= max_row)
+X					vs_scroll();
+X
+X					/* the remainder of the tab */
+X				VCOL = tab_stop - max_col;
+X			}
+X			else {
+X				memset(&VS[VROW][VCOL], ' ', tab_stop - VCOL);
+X				VCOL = tab_stop;
+X			}
+X			break;
+X		case '\r':		/* carriage return */
+X			VCOL = 0;
+X			if (!status->add_lf)
+X				break;
+X			/* fall thru...*/
+X		case '\n':		/* line feed */
+X			VROW++;
+X			if (VROW >= max_row)
+X				vs_scroll();
+X			break;
+X		default:		/* a normal character */
+X			VS[VROW][VCOL] = c;
+X			VCOL++;
+X					/* wrap around */
+X			if (VCOL >= max_col) {
+X				VCOL = 0;
+X				VROW++;
+X				if (VROW >= max_row)
+X					vs_scroll();
+X			}
+X			break;
+X	}
+X	return;
+X}
+X
+X#ifndef SHAREDMEM
+X/*
+X * Save the virtual screen to a file.
+X */
+X
+Xint
+Xwrite_vs()
+X{
+X	FILE *fp;
+X	register int i;
+X
+X	if (!(fp = fopen(status->vs_path, "w")))
+X		return(1);
+X					/* current x y coordinates */
+X	fprintf(fp, "%d,%d\n", VROW, VCOL);
+X
+X	for (i=0; i<max_row; i++) {
+X		VS[i][max_col] = '\0';
+X		fprintf(fp, "%s\n", VS[i]);
+X	}
+X	fclose(fp);
+X	return(0);
+X}
+X
+X/*
+X * Get the virtual screen image from the file.  Since input() gets
+X * killed from time to time, the vs_path file is the only way to retain
+X * the screen image.
+X */
+X
+Xint
+Xread_vs()
+X{
+X	FILE *fp;
+X	register int i;
+X	char buf[10];
+X					/* in case the fopen fails... */
+X	VROW = 0;
+X	VCOL = 0;
+X					/* not guaranteed to exist yet */
+X	if (!(fp = fopen(status->vs_path, "r")))
+X		return(1);
+X					/* get the x, y coordinates */
+X	fgets(buf, 10, fp);
+X	sscanf(buf, "%d,%d\n", &VROW, &VCOL);
+X
+X					/* read the file into the vs array */
+X	for (i=0; i<max_row; i++) {
+X		fgets(VS[i], MAX_COL, fp);
+X		VS[i][max_col] = '\0';
+X	}
+X	fclose(fp);
+X	return(0);
+X}
+X#endif /* SHAREDMEM */
+X
+X/*
+X * If the user clears the screen with the ^A-C command, the input
+X * has to be in sync.
+X */
+X
+Xvoid
+Xvs_clear()
+X{
+X	register int i;
+X	char *memset();
+X
+X	for (i=0; i<max_row; i++)
+X		memset(VS[i], ' ', max_col);
+X					/* home the "cursor" */
+X	VROW = 0;
+X	VCOL = 0;
+X	return;
+X}
+X
+X/*
+X * Do a software scroll on the virtual screen.  Does not alter the
+X * "col" variable.
+X */
+X
+Xvoid
+Xvs_scroll()
+X{
+X	char *strcpy(), *memset();
+X					/* move 'em up 1 line */
+X#ifdef MEMMOVE
+X	char *MEMMOVE();
+X
+X	MEMMOVE(VS[0], VS[1], (max_row -1) * MAX_COL);
+X#else /* MEMMOVE */
+X	register int i;
+X
+X	for (i=0; i<max_row-1; i++)
+X		strcpy(VS[i], VS[i+1]);
+X#endif /* MEMMOVE */
+X					/* clear the bottom line */
+X	memset(VS[max_row-1], ' ', max_col);
+X
+X	VROW = max_row -1;
+X	return;
+X}
+X
+X#ifdef BSD
+X/*
+X * Copies the character c, n times to string str
+X */
+X
+Xchar *
+Xmemset(str, c, n)
+Xchar *str, c;
+Xint n;
+X{
+X	char *s1 = str;
+X
+X	while (n > 0) {
+X		--n;
+X		*s1++ = c;
+X	}
+X	return(str);
+X}
+X#endif /* BSD */
+SHAR_EOF
+if test 10960 -ne "`wc -c < 'input.c'`"
+then
+	echo shar: "error transmitting 'input.c'" '(should have been 10960 characters)'
+fi
+fi
+echo shar: "extracting 'list_dir.c'" '(1635 characters)'
+if test -f 'list_dir.c'
+then
+	echo shar: "will not over-write existing file 'list_dir.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'list_dir.c'
+X/*
+X * Do a shell escape with the "ls" command.  Additional command line options
+X * are allowed at run time.
+X */
+X
+X#define LS_CMD "ls -aC"
+X
+X#include <stdio.h>
+X#include <curses.h>
+X#include "config.h"
+X#include "misc.h"
+X
+Xvoid
+Xlist_dir()
+X{
+X	extern int fd;
+X	WINDOW *ls_win, *newwin();
+X	FILE *pfp, *n_popen();
+X	int lines, oops;
+X	char *ans, *cwd, *getcwd(), buf[200], *get_str();
+X
+X	ls_win = newwin(6, 70, 8, 5);
+X
+X	cwd = getcwd(buf, 200);
+X
+X	mvwprintw(ls_win, 2, 4, "Current directory: %s", cwd);
+X	mvwaddstr(ls_win, 3, 4, "File spec (wildcards allowed): ");
+X	box(ls_win, VERT, HORZ);
+X
+X	mvwattrstr(ls_win, 0, 3, A_BOLD, " List Directory ");
+X	wmove(ls_win, 3, 35);
+X	wrefresh(ls_win);
+X
+X	if ((ans = get_str(ls_win, 80, "", "\n")) == NULL) {
+X		if (fd == -1) {
+X			werase(ls_win);
+X			wrefresh(ls_win);
+X		}
+X		delwin(ls_win);
+X		return;
+X	}
+X					/* popen() an ls */
+X	sprintf(buf, "%s %s", LS_CMD, ans);
+X	pfp = n_popen(buf, "r");
+X					/* make a bigger window */
+X	werase(ls_win);
+X	wrefresh(ls_win);
+X	delwin(ls_win);
+X	ls_win = newwin(LINES-1, COLS, 0, 0);
+X	touchwin(ls_win);
+X					/* a crude kind of paging */
+X	oops = 0;
+X	lines = 0;
+X	while (fgets(buf, BUFSIZ, pfp) != NULL) {
+X		waddstr(ls_win, buf);
+X		lines++;
+X		if (lines == LINES-2) {
+X			lines = 0;
+X			mvwaddstr(ls_win, LINES-2, 28, "Press any key for more");
+X			wrefresh(ls_win);
+X			if (wgetch(ls_win) == ESC) {
+X				oops++;
+X				break;
+X			}
+X			werase(ls_win);
+X			wrefresh(ls_win);
+X		}
+X	}
+X	n_pclose(pfp);
+X
+X	if (!oops) {
+X		mvwaddstr(ls_win, LINES-2, 25, "Press any key to continue");
+X		wrefresh(ls_win);
+X		wgetch(ls_win);
+X	}
+X	if (fd == -1) {
+X		werase(ls_win);
+X		wrefresh(ls_win);
+X	}
+X	delwin(ls_win);
+X	return;
+X}
+SHAR_EOF
+if test 1635 -ne "`wc -c < 'list_dir.c'`"
+then
+	echo shar: "error transmitting 'list_dir.c'" '(should have been 1635 characters)'
+fi
+fi
+echo shar: "extracting 'ls_menu.c'" '(4816 characters)'
+if test -f 'ls_menu.c'
+then
+	echo shar: "will not over-write existing file 'ls_menu.c'"
+else
+sed 's/^X//' << \SHAR_EOF > 'ls_menu.c'
+X/*
+X * Routines for displaying current line settings and prompting for changes.
+X */
+X
+X#include <stdio.h>
+X#include <curses.h>
+X#include "config.h"
+X#include "dial_dir.h"
+X#include "misc.h"
+X#include "param.h"
+X
+X/*
+X * Display the current line settings and prompt for changes.  A non-zero
+X * return code means settings were changed.
+X */
+X
+Xint
+Xls_menu()
+X{
+X	extern int fd;
+X	WINDOW *l_win, *newwin();
+X	int num, ret_code;
+X	void disp_settings();
+X
+X	l_win = newwin(20, 47, 0, 16);
+X
+X	mvwattrstr(l_win, 1, 16, A_BOLD, "Line Settings");
+X	horizontal(l_win, 2, 0, 47);
+X	mvwaddstr(l_win, 6, 5, "1)     300,E,7,1     7)     300,N,8,1");
+X	mvwaddstr(l_win, 7, 5, "2)    1200,E,7,1     8)    1200,N,8,1");
+X	mvwaddstr(l_win, 8, 5, "3)    2400,E,7,1     9)    2400,N,8,1");
+X	mvwaddstr(l_win, 9, 5, "4)    4800,E,7,1    10)    4800,N,8,1");
+X	mvwaddstr(l_win, 10, 5, "5)    9600,E,7,1    11)    9600,N,8,1");
+X	mvwaddstr(l_win, 11, 5, "6)   19200,E,7,1    12)   19200,N,8,1");
+X	mvwaddstr(l_win, 13, 4, "Parity        Data Bits       Stop Bits");
+X	mvwaddstr(l_win, 14, 4, "13) Odd       14) 7 bits      16) 1 bit");
+X	mvwaddstr(l_win, 15, 18, "15) 8 bits      17) 2 bits");
+X	mvwaddstr(l_win, 17, 4, "18) Save Changes");
+X	mvwattrstr(l_win, 17, 28, A_BOLD, "YOUR CHOICE:");
+X	wmove(l_win, 17, 41);
+X	box(l_win, VERT, HORZ);
+X
+X	mvwaddstr(l_win, 19, 13, " Press <ESC> to return ");
+X					/* display current settings */
+X	disp_settings(l_win);
+X	wmove(l_win, 17, 41);
+X	wrefresh(l_win);
+X					/* get the options */
+X	ret_code = 0;
+X	while ((num = get_num(l_win, 2)) != -1) {
+X		switch (num) {
+X			case 1:
+X				dir->baud[dir->d_cur] = 300;
+X				dir->parity[dir->d_cur] = 'E';
+X				dir->dbits[dir->d_cur] = 7;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 2:
+X				dir->baud[dir->d_cur] = 1200;
+X				dir->parity[dir->d_cur] = 'E';
+X				dir->dbits[dir->d_cur] = 7;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 3:
+X				dir->baud[dir->d_cur] = 2400;
+X				dir->parity[dir->d_cur] = 'E';
+X				dir->dbits[dir->d_cur] = 7;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 4:
+X				dir->baud[dir->d_cur] = 4800;
+X				dir->parity[dir->d_cur] = 'E';
+X				dir->dbits[dir->d_cur] = 7;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 5:
+X				dir->baud[dir->d_cur] = 9600;
+X				dir->parity[dir->d_cur] = 'E';
+X				dir->dbits[dir->d_cur] = 7;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 6:
+X				dir->baud[dir->d_cur] = 19200;
+X				dir->parity[dir->d_cur] = 'E';
+X				dir->dbits[dir->d_cur] = 7;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 7:
+X				dir->baud[dir->d_cur] = 300;
+X				dir->parity[dir->d_cur] = 'N';
+X				dir->dbits[dir->d_cur] = 8;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 8:
+X				dir->baud[dir->d_cur] = 1200;
+X				dir->parity[dir->d_cur] = 'N';
+X				dir->dbits[dir->d_cur] = 8;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 9:
+X				dir->baud[dir->d_cur] = 2400;
+X				dir->parity[dir->d_cur] = 'N';
+X				dir->dbits[dir->d_cur] = 8;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 10:
+X				dir->baud[dir->d_cur] = 4800;
+X				dir->parity[dir->d_cur] = 'N';
+X				dir->dbits[dir->d_cur] = 8;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 11:
+X				dir->baud[dir->d_cur] = 9600;
+X				dir->parity[dir->d_cur] = 'N';
+X				dir->dbits[dir->d_cur] = 8;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 12:
+X				dir->baud[dir->d_cur] = 19200;
+X				dir->parity[dir->d_cur] = 'N';
+X				dir->dbits[dir->d_cur] = 8;
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 13:
+X				dir->parity[dir->d_cur] = 'O';
+X				break;
+X			case 14:
+X				dir->dbits[dir->d_cur] = 7;
+X				break;
+X			case 15:
+X				dir->dbits[dir->d_cur] = 8;
+X				break;
+X			case 16:
+X				dir->sbits[dir->d_cur] = 1;
+X				break;
+X			case 17:
+X				dir->sbits[dir->d_cur] = 2;
+X				break;
+X			case 18:
+X					/* copy the current settings */
+X				param->d_baud = dir->baud[dir->d_cur];
+X				param->d_parity = dir->parity[dir->d_cur];
+X				param->d_dbits = dir->dbits[dir->d_cur];
+X				param->d_sbits = dir->sbits[dir->d_cur];
+X				/*
+X				 * We've changed the values in memory even
+X				 * if the update fails.
+X				 */
+X				if (up_param()) {
+X					touchwin(l_win);
+X					wrefresh(l_win);
+X				}
+X				break;
+X			default:
+X				beep();
+X		}
+X		ret_code++;
+X		disp_settings(l_win);
+X		mvwaddstr(l_win, 17, 41, "    ");
+X		wmove(l_win, 17, 41);
+X		wrefresh(l_win);
+X	}
+X	if (fd == -1) {
+X		werase(l_win);
+X		wrefresh(l_win);
+X	}
+X	delwin(l_win);
+X	return(ret_code);
+X}
+X
+X/*
+X * Display the current settings.  Formats the entire string at one
+X * time, in case you've got a magic cookie terminal.
+X */
+X
+Xstatic void
+Xdisp_settings(win)
+XWINDOW *win;
+X{
+X	extern int xmc;
+X	char buf[40];
+X
+X	sprintf(buf, "Current Settings: %5d,%c,%d,%d", dir->baud[dir->d_cur],
+X	 dir->parity[dir->d_cur], dir->dbits[dir->d_cur],
+X	 dir->sbits[dir->d_cur]);
+X
+X	if (xmc > 0) {
+X		touchwin(win);
+X		clear_line(win, 4, 8, TRUE);
+X		wrefresh(win);
+X	}
+X	mvwattrstr(win, 4, 8, A_BOLD, buf);
+X	return;
+X}
+SHAR_EOF
+if test 4816 -ne "`wc -c < 'ls_menu.c'`"
+then
+	echo shar: "error transmitting 'ls_menu.c'" '(should have been 4816 characters)'
+fi
+fi
+exit 0
+#	End of shell archive
+
+

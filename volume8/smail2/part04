@@ -1,0 +1,2429 @@
+Subject:  v08i070:  Smail release 2.3, Part04/05
+Newsgroups: mod.sources
+Approved: mirror!rs
+
+Submitted by:  Larry Auton <lda@clyde.att.com>
+Mod.sources: Volume 8, Issue 70
+Archive-name: smail2/Part04
+
+[ OOPS!  Please excuse the "Part03/03" header on the last part.  --r$ ]
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line,
+# then unpack it by saving it in a file and typing "sh file".
+# If all goes well, you will see the message "End of shell archive."
+# Contents:  src/deliver.c src/headers.c src/main.c src/make.cf.sh
+#   src/map.c src/misc.c src/resolve.c src/smail.prompt
+#   src/svbinmail.c src/sysexits.h
+# Wrapped by rs@mirror on Mon Feb  9 17:10:08 1987
+PATH=/bin:/usr/bin:/usr/ucb; export PATH
+echo shar: extracting "'src/deliver.c'" '(11313 characters)'
+if test -f 'src/deliver.c' ; then 
+  echo shar: will not over-write existing file "'src/deliver.c'"
+else
+sed 's/^X//' >src/deliver.c <<'@//E*O*F src/deliver.c//'
+X/*
+X**  Deliver.c
+X**
+X**  Routines to effect delivery of mail for rmail/smail. 
+X**
+X*/
+X
+X#ifndef lint
+Xstatic char 	*sccsid="@(#)deliver.c	2.3 (smail) 1/26/87";
+X#endif
+X
+X# include	<stdio.h>
+X# include	<sys/types.h>
+X# include	<ctype.h>
+X# include	"defs.h"
+X#ifdef BSD
+X#include <strings.h>
+X#else
+X#include <string.h>
+X#endif
+X
+Xextern int  exitstat;		/* set if a forked mailer fails */
+Xextern enum edebug debug;	/* how verbose we are 		*/ 
+Xextern char hostname[];		/* our uucp hostname 		*/
+Xextern char hostdomain[];	/* our host's domain 		*/
+Xextern enum ehandle handle;	/* what we handle		*/
+Xextern enum erouting routing;	/* how we're routing addresses  */
+Xextern char *uuxargs;		/* arguments given to uux       */
+Xextern int  queuecost;		/* threshold for queueing mail  */
+Xextern int  maxnoqueue;		/* max number of uucico's       */
+Xextern char *spoolfile;		/* file name of spooled message */
+Xextern FILE *spoolfp;		/* file ptr  to spooled message */
+Xextern int spoolmaster;		/* set if creator of spoolfile  */
+Xextern char nows[];		/* local time in ctime(3) format*/
+Xextern char arpanows[];		/* local time in arpadate format*/
+Xchar stderrfile[20];		/* error file for stderr traping*/
+X
+X/*
+X**
+X**  deliver():  hand the letter to the proper mail programs.
+X**
+X**  Issues one command for each different host of <hostv>,
+X**  constructing the proper command for LOCAL or UUCP mail.
+X**  Note that LOCAL mail has blank host names.
+X**
+X**  The <userv> names for each host are arguments to the command.
+X** 
+X**  Prepends a "From" line to the letter just before going 
+X**  out, with a "remote from <hostname>" if it is a UUCP letter.
+X**
+X*/
+X
+Xdeliver(argc, hostv, userv, formv, costv)
+Xint argc;				/* number of addresses		*/
+Xchar *hostv[];				/* host names			*/
+Xchar *userv[];				/* user names			*/
+Xenum eform formv[];			/* form for each address	*/
+Xint costv[];				/* cost vector 			*/
+X{
+X	FILE *out;			/* pipe to mailer		*/
+X	FILE *popen();			/* to fork a mailer 		*/
+X#ifdef RECORD
+X	void record();			/* record all transactions	*/
+X#endif
+X#ifdef LOG
+X	void log();
+X#endif
+X	char *mktemp();
+X	char from[SMLBUF];		/* accumulated from argument 	*/
+X	char lcommand[SMLBUF];		/* local command issued 	*/
+X	char rcommand[SMLBUF];		/* remote command issued	*/
+X	char scommand[SMLBUF];		/* retry  command issued	*/
+X	char *command;			/* actual command		*/
+X	char buf[SMLBUF];		/* copying rest of the letter   */
+X	enum eform form;		/* holds form[i] for speed 	*/
+X	long size;			/* number of bytes of message 	*/
+X	char *flags;			/* flags for uux		*/
+X	char *sflag;			/* flag  for smail		*/
+X	int i, j, stat, retrying;
+X	char *c, *postmaster();
+X	int failcount = 0;
+X	int noqcnt = 0;			/* number of uucico's started   */
+X	char *uux_noqueue = UUX_NOQUEUE;/* uucico starts immediately    */
+X	char *uux_queue   = UUX_QUEUE;	/* uucico job gets queued       */
+X	off_t message;
+X
+X/*
+X** rewind the spool file and read the collapsed From_ line
+X*/
+X	(void) fseek(spoolfp, 0L, 0);
+X	(void) fgets(from, sizeof(from), spoolfp);
+X	if((c = index(from, '\n')) != 0) *c = '\0';
+X	message = ftell(spoolfp);
+X
+X/*
+X**  We pass through the list of addresses.
+X*/
+X	stderrfile[0] = '\0';
+X	for(i = 0; i < argc; i++) {
+X		char *lend = lcommand;
+X		char *rend = rcommand;
+X		char *send = scommand;
+X
+X/*
+X**  If we don't have sendmail, arrange to trap standard error
+X**  for inclusion in the message that is returned with failed mail.
+X*/
+X		(void) unlink(stderrfile);
+X		(void) strcpy(stderrfile, "/tmp/stderrXXXXXX");
+X		(void) mktemp(stderrfile);
+X		(void) freopen(stderrfile, "w", stderr);
+X
+X		*lend = *rend = *send = '\0';
+X
+X/*
+X**  If form == ERROR, the address was bad 
+X**  If form == SENT, it has been sent on a  previous pass.
+X*/
+X		form = formv[i];
+X		if (form == SENT) {
+X			continue;
+X		}
+X/*
+X**  Build the command based on whether this is local mail or uucp mail.
+X**  By default, don't allow more than 'maxnoqueue' uucico commands to
+X**  be started by a single invocation of 'smail'.
+X*/
+X		if(uuxargs == NULL) {	/* flags not set on command line */
+X			if(noqcnt < maxnoqueue && costv[i] <= queuecost) {
+X				flags = uux_noqueue;
+X			} else {
+X				flags = uux_queue;
+X			}
+X		} else {
+X			flags = uuxargs;
+X		}
+X
+X		retrying = 0;
+X		if(routing == JUSTDOMAIN) {
+X			sflag = "-r";
+X		} else if(routing == ALWAYS) {
+X			sflag = "-R";
+X		} else {
+X			sflag = "";
+X		}
+X
+X		(void) sprintf(lcommand, LMAIL(from, hostv[i]));
+X		(void) sprintf(rcommand, RMAIL(flags, from, hostv[i]));
+X
+X/*
+X**  For each address with the same host name and form, append the user
+X**  name to the command line, and set form = ERROR so we skip this address
+X**  on later passes. 
+X*/
+X		/* we initialized lend (rend) to point at the
+X		 * beginning of its buffer, so that at
+X		 * least one address will be used regardless
+X		 * of the length of lcommand (rcommand).
+X		 */
+X		for (j = i; j < argc; j++) {
+X			if ((formv[j] != form)
+X			 || (strcmpic(hostv[i], hostv[j]) != 0)
+X			 || ((lend - lcommand) > MAXCLEN)
+X			 || ((rend - rcommand) > MAXCLEN)) {
+X				continue;
+X			}
+X
+X			/*
+X			** seek to the end of scommand
+X			** and add on a 'smail' command
+X			** multiple commands are separated by ';'
+X			*/
+X
+X			send += strlen(send);
+X			if(send != scommand) {
+X				*send++ = ';' ;
+X			}
+X
+X			(void) sprintf(send, RETRY(sflag));
+X			send += strlen(send);
+X
+X			lend += strlen(lend);
+X			rend += strlen(rend);
+X
+X			if (form == LOCAL) {
+X				(void) sprintf(lend, LARG(userv[j]));
+X				(void) sprintf(send, LARG(userv[j]));
+X			} else {
+X				(void) sprintf(lend, RLARG(hostv[i], userv[j]));
+X				(void) sprintf(send, RLARG(hostv[i], userv[j]));
+X			}
+X
+X			(void) sprintf(rend, RARG(userv[j]));
+X			formv[j] = SENT;
+X		}
+Xretry:
+X/*
+X** rewind the spool file and read the collapsed From_ line
+X*/
+X		(void) fseek(spoolfp, message, 0);
+X
+X		/* if the address was in a bogus form (usually DOMAIN),
+X		** then don't bother trying the uux.
+X		**
+X		** Rather, go straight to the next smail routing level.
+X		*/
+X		if(form == ERROR) {
+X			static char errbuf[SMLBUF];
+X			(void) sprintf(errbuf,
+X				"address resolution ('%s' @ '%s') failed",
+X					userv[i], hostv[i]);
+X			command = errbuf;
+X			size    = 0;
+X			goto form_error;
+X		}
+X
+X		if (retrying) {
+X			command = scommand;
+X		} else if (form == LOCAL) {
+X			command = lcommand;
+X		} else {
+X			command = rcommand;
+X			if(flags == uux_noqueue) {
+X				noqcnt++;
+X			}
+X		}
+X		ADVISE("COMMAND: %s\n", command);
+X
+X/*
+X** Fork the mailer and set it up for writing so we can send the mail to it,
+X** or for debugging divert the output to stdout.
+X*/
+X		if (debug == YES) {
+X			out = stdout;
+X		} else {
+X			failcount = 0;
+X			do {
+X				out = popen(command, "w");
+X				if (out) break;
+X				/*
+X				 * Fork failed.  System probably overloaded.
+X				 * Wait awhile and try again 10 times.
+X				 * If it keeps failing, probably some
+X				 * other problem, like no uux or smail.
+X				 */
+X				(void) sleep(60);
+X			} while (++failcount < 10);
+X		}
+X		if(out == NULL) {
+X			exitstat = EX_UNAVAILABLE;
+X			(void) printf("couldn't execute %s.\n", command);
+X			continue;
+X		}
+X
+X		size = 0;
+X/*
+X**  Output our From_ line.
+X*/
+X		if (form == LOCAL) {
+X#ifdef SENDMAIL
+X			size += fprintf(out, LFROM(from, nows, hostname));
+X#else
+X			char *p;
+X			if((p=index(from, '!')) == NULL) {
+X				size += fprintf(out,
+X					LFROM(from, nows, hostname));
+X			} else {
+X				*p = NULL;
+X				size += fprintf(out, RFROM(p+1, nows, from));
+X				*p = '!';
+X			}
+X#endif
+X		} else {
+X			size += fprintf(out, RFROM(from, nows, hostname));
+X		}
+X
+X#ifdef SENDMAIL
+X/*
+X**  If using sendmail, insert a Received: line only for mail
+X**  that is being passed to uux.  If not using sendmail, always
+X**  insert the received line, since sendmail isn't there to do it.
+X*/
+X		if(command == rcommand && handle != ALL)
+X#endif
+X		{
+X			size += fprintf(out,
+X				"Received: by %s (%s)\n\tid AA%05d; %s\n",
+X					hostdomain, VERSION,
+X					getpid(), arpanows);
+X		}
+X
+X/*
+X**  Copy input.
+X*/
+X		while(fgets(buf, sizeof(buf), spoolfp) != NULL) {
+X			size += fputs(buf, out);
+X		}
+X/*
+X**  Get exit status and if non-zero, set global exitstat so when we exit
+X**  we can indicate an error.
+X*/
+Xform_error:
+X		if (debug != YES) {
+X			if(form == ERROR) {
+X				exitstat = EX_NOHOST;
+X			} else if (stat = pclose(out)) {
+X				exitstat = stat >> 8;
+X			}
+X			/*
+X			 * The 'retrying' check prevents a smail loop.
+X			 */
+X			if(exitstat != 0) {
+X				/*
+X				** the mail failed, probably because the host
+X				** being uux'ed isn't in L.sys or local user
+X				** is unknown.
+X				*/
+X
+X				if((retrying == 0)	/* first pass */
+X				&& (routing != REROUTE)	/* have higher level */
+X				&& (form != LOCAL)) {	/* can't route local */
+X					/*
+X					** Try again using a higher
+X					** level of routing.
+X					*/
+X					ADVISE("%s failed (%d)\ntrying %s\n",
+X						command, exitstat, scommand);
+X					exitstat = 0;
+X					retrying = 1;
+X					form = SENT;
+X					goto retry;
+X				}
+X
+X				/*
+X				** if we have no other routing possibilities
+X				** see that the mail is returned to sender.
+X				*/
+X
+X				if((routing == REROUTE)
+X			        || (form == LOCAL)) {
+X
+X					/*
+X					** if this was our last chance,
+X					** return the mail to the sender.
+X					*/
+X
+X					ADVISE("%s failed (%d)\n",
+X						command, exitstat);
+X					
+X					(void) fseek(spoolfp, message, 0);
+X#ifdef SENDMAIL
+X					/* if we have sendmail, then it
+X					** was handed the mail, which failed.
+X					** sendmail returns the failed mail
+X					** for us, so we need not do it again.
+X					*/
+X					if(form != LOCAL)
+X#endif
+X					{
+X						return_mail(from, command);
+X					}
+X					exitstat = 0;
+X				}
+X			}
+X# ifdef LOG
+X			else {
+X				if(retrying == 0) log(command, from, size); /* */
+X			}
+X# endif
+X		}
+X	}
+X/*
+X**  Update logs and records.
+X*/
+X# ifdef RECORD
+X	(void) fseek(spoolfp, message, 0);
+X	record(command, from, size);
+X# endif
+X
+X/*
+X**  close spool file pointer.
+X**  if we created it, then unlink file.
+X*/
+X	(void) fclose(spoolfp);
+X	if(spoolmaster) {
+X		(void) unlink(spoolfile);
+X	}
+X	(void) unlink(stderrfile);
+X}
+X
+X/*
+X** return mail to sender, as determined by From_ line.
+X*/
+Xreturn_mail(from, fcommand)
+Xchar *from, *fcommand;
+X{
+X	char buf[SMLBUF];
+X	char domain[SMLBUF], user[SMLBUF];
+X	char *r;
+X	FILE *fp, *out, *popen();
+X	int i = 0;
+X
+X	r = buf;
+X
+X	(void) sprintf(r, "%s %s", SMAIL, VFLAG);
+X	r += strlen(r);
+X
+X	if(islocal(from, domain, user)) {
+X		(void) sprintf(r, LARG(user));
+X	} else {
+X		(void) sprintf(r, RLARG(domain, user));
+X	}
+X
+X	i = 0;
+X	do {
+X		out = popen(buf, "w");
+X		if (out) break;
+X		/*
+X		 * Fork failed.  System probably overloaded.
+X		 * Wait awhile and try again 10 times.
+X		 * If it keeps failing, probably some
+X		 * other problem, like no uux or smail.
+X		 */
+X		(void) sleep(60);
+X	} while (++i < 10);
+X
+X	if(out == NULL) {
+X		(void) printf("couldn't execute %s.\n", buf);
+X		return;
+X	}
+X
+X	(void) fprintf(out, "Date: %s\n", arpanows);
+X	(void) fprintf(out, "From: MAILER-DAEMON@%s\n", hostdomain);
+X	(void) fprintf(out, "Subject: failed mail\n");
+X	(void) fprintf(out, "To: %s\n", from);
+X	(void) fprintf(out, "\n");
+X	(void) fprintf(out, "=======     command failed      =======\n\n");
+X	(void) fprintf(out, " COMMAND: %s\n\n", fcommand);
+X
+X	(void) fprintf(out, "======= standard error follows  =======\n");
+X	(void) fflush(stderr);
+X	if((fp = fopen(stderrfile, "r")) != NULL) {
+X		while(fgets(buf, sizeof(buf), fp) != NULL) {
+X			(void) fputs(buf, out);
+X		}
+X	}
+X	(void) fclose(fp);
+X	(void) fprintf(out, "======= text of message follows =======\n");
+X/*
+X**  Copy input.
+X*/
+X	(void) fprintf(out, "From %s\n", from);
+X	while(fgets(buf, sizeof(buf), spoolfp) != NULL) {
+X		(void) fputs(buf, out);
+X	}
+X	(void) pclose(out);
+X}
+@//E*O*F src/deliver.c//
+if test 11313 -ne "`wc -c <'src/deliver.c'`"; then
+    echo shar: error transmitting "'src/deliver.c'" '(should have been 11313 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/headers.c'" '(13909 characters)'
+if test -f 'src/headers.c' ; then 
+  echo shar: will not over-write existing file "'src/headers.c'"
+else
+sed 's/^X//' >src/headers.c <<'@//E*O*F src/headers.c//'
+X/*
+X**  message spooing, header and address parsing and completion
+X**  functions for smail/rmail
+X*/
+X
+X#ifndef lint
+Xstatic char 	*sccsid="@(#)headers.c	2.3 (smail) 1/26/87";
+X#endif
+X
+X# include	<stdio.h>
+X# include	<sys/types.h>
+X# include	<time.h>
+X# include	<ctype.h>
+X# include	<pwd.h>
+X# include	"defs.h"
+X#ifdef BSD
+X#include <strings.h>
+X#else
+X#include <string.h>
+X#endif
+X
+Xextern enum edebug debug;	/* how verbose we are 		*/ 
+Xextern char hostname[];		/* */
+Xextern char hostdomain[];	/* */
+Xextern char *spoolfile;		/* file name of spooled message */
+Xextern FILE *spoolfp;		/* file ptr  to spooled message */
+Xextern int spoolmaster;		/* set if creator of spoolfile  */
+Xextern time_t now;		/* time				*/
+Xextern char nows[], arpanows[];	/* time strings			*/
+Xextern struct tm *gmt, *loc;	/* time structs			*/
+X
+Xstatic char toline[SMLBUF];
+Xstatic char fromline[SMLBUF];
+Xstatic char dateline[SMLBUF];
+Xstatic char midline[SMLBUF];
+Xstatic char *ieof = "NOTNULL";
+X
+Xstruct reqheaders {
+X	char *name;
+X	char *field;
+X	char have;
+X};
+X
+Xstatic struct reqheaders reqtab[] = {
+X	"Date:"		,	dateline	,	'N'	,
+X	"From:"		,	fromline	,	'N'	,
+X	"Message-Id:"	,	midline		,	'N'	,
+X	"To:"		,	toline		,	'N'	,
+X	NULL 		,	NULL		,	'N'
+X};
+X
+X
+X/*
+X**
+X** parse(): parse <address> into <domain, user, form>.
+X**
+X** 	input		form
+X**	-----		----
+X**	user		LOCAL
+X**	domain!user	DOMAIN
+X**	user@domain	DOMAIN
+X**	@domain,address	LOCAL	(just for sendmail)
+X**	host!address	UUCP
+X**
+X*/
+X
+Xenum eform
+Xparse(address, domain, user)
+Xchar *address;		/* input address 	*/
+Xchar *domain;		/* output domain 	*/
+Xchar *user;		/* output user 		*/
+X{
+X	int parts;
+X	char *partv[MAXPATH];				/* to crack address */
+X
+X/*
+X**  If this is route address form @hosta,@hostb:user@hostd, break for
+X**  LOCAL since only sendmail would want to eat it.
+X*/
+X	if (*address == '@')
+X		goto local;
+X/*
+X**  Try splitting at @.  If it work, this is user@domain, form DOMAIN.
+X**  Prefer the righthand @ in a@b@c.
+X*/
+X	if ((parts = ssplit(address, '@', partv)) >= 2) {
+X		(void) strcpy(domain, partv[parts-1]);
+X		(void) strncpy(user, partv[0], partv[parts-1]-partv[0]-1);
+X		user[partv[parts-1]-partv[0]-1] = '\0';
+X		return (DOMAIN);
+X	} 
+X/*
+X**  Try splitting at !. If it works, see if the piece before the ! has
+X**  a . in it (domain!user, form DOMAIN) or not (host!user, form UUCP).
+X*/
+X	if (ssplit(address, '!', partv) > 1) {
+X		(void) strcpy(user, partv[1]);
+X		(void) strncpy(domain, partv[0], partv[1]-partv[0]-1);
+X		domain[partv[1]-partv[0]-1] = '\0';
+X
+X		if((parts = ssplit(domain, '.', partv)) < 2) {
+X			return(UUCP);
+X		}
+X
+X		if(partv[parts-1][0] == '\0') {
+X			partv[parts-1][-1] = '\0'; /* strip trailing . */
+X		}
+X		return (DOMAIN);
+X	}
+X/* 
+X**  Done trying.  This must be just a user name, form LOCAL.
+X*/
+Xlocal:
+X	(void) strcpy(user, address);
+X	(void) strcpy(domain, "");
+X	return(LOCAL);				/* user */
+X}
+X
+Xbuild(domain, user, form, result)
+Xchar *domain;
+Xchar *user;
+Xenum eform form;
+Xchar *result;
+X{
+X	switch((int) form) {
+X	case LOCAL:
+X		(void) sprintf(result, "%s", user); 
+X		break;
+X	case UUCP:
+X		(void) sprintf(result, "%s!%s", domain, user);
+X		break;
+X	case DOMAIN:
+X		(void) sprintf(result, "%s@%s", user, domain);
+X		break;
+X	}
+X}
+X
+X/*
+X**  ssplit(): split a line into array pointers.
+X**
+X**  Each pointer wordv[i] points to the first character after the i'th 
+X**  occurence of c in buf.  Note that each wordv[i] includes wordv[i+1].
+X**
+X*/
+X
+Xssplit(buf, c, ptr)
+Xregister char *buf;		/* line to split up 		*/
+Xchar c;				/* character to split on	*/
+Xchar **ptr;			/* the resultant vector		*/
+X{
+X        int count = 0;
+X        int wasword = 0;
+X
+X        for(; *buf; buf++) {
+X		if (!wasword) {
+X			count++;
+X			*ptr++ = buf;
+X		}
+X		wasword = (c != *buf);
+X        }
+X	if (!wasword) {
+X		count++;
+X		*ptr++ = buf;
+X	}
+X        *ptr = NULL;
+X        return(count);
+X}
+X
+X/*
+X** Determine whether an address is a local address
+X*/
+X
+Xislocal(addr, domain, user)
+Xchar *addr, *domain, *user;
+X{
+X		enum eform form, parse();
+X
+X		/*
+X		** parse the address
+X		*/
+X
+X		form = parse(addr, domain, user);
+X
+X		if((form == LOCAL)			/* user */
+X		||(strcmpic(domain, hostdomain) == 0)	/* user@hostdomain */
+X		||(strcmpic(domain, hostname)   == 0)) {/* user@hostname */
+X			return(1);
+X		}
+X		return(0);
+X}
+X
+X/*
+X** spool - message spooling module
+X**
+X** (1) get dates for headers, etc.
+X** (2) if the message is on the standard input (no '-f')
+X**     (a) create a temp file for spooling the message.
+X**     (b) collapse the From_ headers into a path.
+X**     (c) if the mail originated locally, then
+X**	     (i) establish default headers
+X**	    (ii) scan the message headers for required header fields
+X**	   (iii) add any required message headers that are absent
+X**     (d) copy rest of the message to the spool file
+X**     (e) close the spool file
+X** (3) open the spool file for reading
+X*/
+X
+Xvoid
+Xspool(argc, argv)
+Xint argc;
+Xchar **argv;
+X{
+X	static char *tmpf = "/tmp/rmXXXXXX";	/* temp file name */
+X	char *mktemp();
+X	char buf[SMLBUF];
+X	static char splbuf[SMLBUF];
+X	char from[SMLBUF], domain[SMLBUF], user[SMLBUF];
+X	void rline(), scanheaders(), compheaders();
+X
+X	/*
+X	** if the mail has already been spooled by
+X	** a previous invocation of smail don't respool.
+X	** check the file name to prevent things like
+X	** rmail -f /etc/passwd badguy@dreadfuldomain
+X	*/
+X
+X	if((spoolfile != NULL)
+X	&& (strncmp(spoolfile, tmpf, strlen(tmpf) - 6) != 0)) {
+X		error(EX_TEMPFAIL, "spool: bad file name '%s'\n", spoolfile);
+X	}
+X
+X	/*
+X	** set dates in local, arpa, and gmt forms
+X	*/
+X	setdates();
+X
+X	/*
+X	** If necessary, copy stdin to a temp file.
+X	*/
+X
+X	if(spoolfile == NULL) {
+X		spoolfile = strcpy(splbuf, tmpf);
+X		(void) mktemp(spoolfile);
+X
+X		if((spoolfp = fopen(spoolfile, "w")) == NULL) {
+X			error(EX_CANTCREAT, "can't create %s.\n", spoolfile);
+X		}
+X
+X		spoolmaster = 1;
+X
+X		/*
+X		** rline reads the standard input,
+X		** collapsing the From_ and >From_
+X		** lines into a single uucp path.
+X		** first non-from_ line is in buf[];
+X		*/
+X
+X		rline(from, buf);
+X
+X		/*
+X		** if the mail originated here, we parse the header
+X		** and add any required headers that are missing.
+X		*/
+X
+X		if(islocal(from, domain, user)) {
+X			/*
+X			** initialize default headers
+X			*/
+X			def_headers(argc, argv, from);
+X
+X			/*
+X			** buf has first, non-from_  line
+X			*/
+X			scanheaders(buf);
+X			/*
+X			** buf has first, non-header line,
+X			*/
+X
+X			compheaders();
+X
+X			if(buf[0] != '\n') {
+X				(void) fputs("\n", spoolfp);
+X			}
+X		}
+X
+X		/*
+X		** now, copy the rest of the letter into the spool file
+X		** terminate on either EOF or '^.$'
+X		*/
+X
+X		while(ieof != NULL) {
+X			(void) fputs(buf, spoolfp);
+X			if((fgets(buf, SMLBUF, stdin) == NULL)
+X			|| (buf[0] == '.' && buf[1] == '\n')) {
+X				ieof = NULL;
+X			}
+X		}
+X
+X		/*
+X		** close the spool file, and the standard input.
+X		*/
+X
+X		(void) fclose(spoolfp);
+X		(void) fclose(stdin);	/* you don't see this too often! */
+X	}
+X
+X	if((spoolfp = fopen(spoolfile, "r")) == NULL) {
+X		error(EX_TEMPFAIL, "can't open %s.\n", spoolfile);
+X	}
+X}
+X
+X/*
+X**
+X**  rline(): collapse From_ and >From_ lines.
+X**
+X**  Same idea as the old rmail, but also turns user@domain to domain!user. 
+X**
+X*/
+X
+Xvoid
+Xrline(from, retbuf)
+Xchar *from;
+Xchar *retbuf;
+X{
+X	int parts;			/* for cracking From_ lines ... */
+X	char *partv[16];		/* ... apart using ssplit() 	*/
+X	char user[SMLBUF];		/* for rewriting user@host	*/
+X	char domain[SMLBUF];		/* "   "         "          	*/
+X	char addr[SMLBUF];		/* "   "         "          	*/
+X	enum eform form, parse();	/* "   "         "          	*/
+X	extern build();			/* "   "         "          	*/
+X	struct passwd *pwent, *getpwuid();/* to get default user	*/
+X	char *c;
+X	int nhops, i;
+X	char buf[SMLBUF], tmp[SMLBUF], *hop[128], *e, *b, *p;
+X
+X	if(spoolmaster == 0) return;
+X
+X	buf[0] = from[0] = addr[0] = '\0';
+X/*
+X**  Read each line until we hit EOF or a line not beginning with "From "
+X**  or ">From " (called From_ lines), accumulating the new path in from
+X**  and stuffing the actual sending user (the user name on the last From_ 
+X**  line) in addr.
+X*/
+X	for(;;) {
+X		(void) strcpy(retbuf, buf);
+X		if(ieof == NULL) {
+X			break;
+X		}
+X		if((fgets(buf, sizeof(buf), stdin) == NULL)
+X		|| (buf[0] == '.' && buf[1] == '\n')) {
+X			ieof = NULL;
+X			break;
+X		}
+X		if (strncmp("From ", buf, 5) 
+X		    && strncmp(">From ", buf, 6)) {
+X			break;
+X		}
+X/*
+X**  Crack the line apart using ssplit.
+X*/
+X		if(c = index(buf, '\n')) {
+X			*c = '\0';
+X		}
+X		parts = ssplit(buf, ' ', partv);
+X/*
+X**  Tack host! onto the from argument if "remote from host" is present.
+X*/
+X
+X		if (parts > 3 
+X		    && !strncmp("remote from ", partv[parts-3], 12))
+X		{
+X			(void) strcat(from, partv[parts-1]);
+X			(void) strcat(from, "!");
+X		} 
+X/*
+X**  Stuff user name into addr, overwriting the user name from previous 
+X**  From_ lines, since only the last one counts.  Then rewrite user@host 
+X**  into host!user, since @'s don't belong in the From_ argument.
+X*/
+X		(void) strncpy(addr, partv[1], partv[2]-partv[1]-1); 
+X		addr[partv[2]-partv[1]-1] = '\0';	/* ugh */
+X
+X		(void) parse(addr, domain, user);
+X		if(*domain == '\0') {
+X			form = LOCAL;
+X		} else {
+X			form = UUCP;
+X		}
+X
+X		build(domain, user, form, addr);
+X	}
+X/*
+X**  Now tack the user name onto the from argument.
+X*/
+X	(void) strcat(from, addr);
+X/*
+X**  If we still have no from argument, we have junk headers, but we try
+X**  to get the user's name using /etc/passwd.
+X*/
+X	if (from[0] == '\0') {
+X		if ((pwent = getpwuid(getuid())) == NULL) {
+X			(void) strcpy(from, "nowhere");	/* bad news */
+X		} else {
+X			(void) strcpy(from, pwent->pw_name);
+X		}
+X	}
+X
+X	/* split the from line on '!'s */
+X	nhops = ssplit(from, '!', hop);
+X
+X	for(i = 0; i < (nhops - 1); i++) {
+X		b = hop[i];
+X		if(*b == '\0') {
+X			continue;
+X		}
+X		e = hop[i+1];
+X		e-- ;
+X		*e = '\0';	/* null terminate each path segment */
+X		e++;
+X
+X#ifdef HIDDENHOSTS
+X/*
+X**  Strip hidden hosts:  anything.hostname.MYDOM -> hostname.MYDOM
+X*/
+X		for(p = b;(p = index(p, '.')) != NULL; p++) {
+X			if(strcmpic(hostdomain, p+1) == 0) {
+X				(void) strcpy(b, hostdomain);
+X				break;
+X			}
+X		}
+X#endif
+X
+X/*
+X**  Strip useless MYDOM: hostname.MYDOM -> hostname
+X*/
+X		if(strcmpic(hop[i], hostdomain) == 0) {
+X			(void) strcpy(hop[i], hostname);
+X		}
+X	}
+X
+X/*
+X**  Now strip out any redundant information in the From_ line
+X**  a!b!c!c!d	=> a!b!c!d
+X*/
+X
+X	for(i = 0; i < (nhops - 2); i++) {
+X		b = hop[i];
+X		e = hop[i+1];
+X		if(strcmpic(b, e) == 0) {
+X			*b = '\0';
+X		}
+X	}
+X/*
+X**  Reconstruct the From_ line
+X*/
+X	tmp[0] = '\0';			/* empty the tmp buffer */
+X
+X	for(i = 0; i < (nhops - 1); i++) {
+X		if((hop[i][0] == '\0')	/* deleted this hop */
+X		 ||((tmp[0] == '\0')	/* first hop == hostname */
+X		  &&(strcmpic(hop[i], hostname) == 0))) {
+X			continue;
+X		}
+X		(void) strcat(tmp, hop[i]);
+X		(void) strcat(tmp, "!");
+X	}
+X	(void) strcat(tmp, hop[i]);
+X	(void) strcpy(from, tmp);
+X	(void) strcpy(retbuf, buf);
+X	(void) fprintf(spoolfp, "%s\n", from);
+X}
+X
+Xvoid
+Xscanheaders(buf)
+Xchar *buf;
+X{
+X	int inheader = 0;
+X
+X	while(ieof != NULL) {
+X		if(buf[0] == '\n') {
+X			break; /* end of headers */
+X		}
+X
+X		/*
+X		** header lines which begin with whitespace
+X		** are continuation lines
+X		*/
+X		if((inheader == 0)
+X		|| ((buf[0] != ' ' && buf[0] != '\t'))) {
+X			/* not a continuation line
+X			** check for header
+X			*/
+X			if(isheader(buf) == 0) {
+X				/*
+X				** not a header
+X				*/
+X				break;
+X			}
+X			inheader = 1;
+X			haveheaders(buf);
+X		}
+X		(void) fputs(buf, spoolfp);
+X		if((fgets(buf, SMLBUF, stdin) == NULL)
+X		|| (buf[0] == '.' && buf[1] == '\n')) {
+X			ieof = NULL;
+X		}
+X	}
+X
+X	if(isheader(buf)) {
+X		buf[0] = '\0';
+X	}
+X}
+X
+X/*
+X** complete headers - add any required headers that are not in the message
+X*/
+Xvoid
+Xcompheaders()
+X{
+X	struct reqheaders *i;
+X
+X	/*
+X	** look at the table of required headers and
+X	** add those that are missing to the spooled message.
+X	*/
+X	for(i = reqtab; i->name != NULL; i++) {
+X		if(i->have != 'Y') {
+X			(void) fprintf(spoolfp, "%s\n", i->field);
+X		}
+X	}
+X}
+X
+X/*
+X** look at a string and determine
+X** whether or not it is a valid header.
+X*/
+Xisheader(s)
+Xchar *s;
+X{
+X	char *p;
+X
+X	/*
+X	** header field names must terminate with a colon
+X	** and may not be null.
+X	*/
+X	if(((p = index(s, ':')) == NULL) || (s == p)) {
+X		return(0);
+X
+X	}
+X	/*
+X	** header field names must consist entirely of
+X	** printable ascii characters.
+X	*/
+X	while(s != p) {
+X		if((*s < '!') || (*s > '~')) {
+X			return(0);
+X		}
+X		s++;
+X	}
+X	/*
+X	** we hit the ':', so the field may be a header
+X	*/
+X	return(1);
+X}
+X
+X/*
+X** compare the header field to those in the required header table.
+X** if it matches, then mark the required header as being present
+X** in the message.
+X*/
+Xhaveheaders(s)
+Xchar *s;
+X{
+X	struct reqheaders *i;
+X
+X	for(i = reqtab; i->name != NULL; i++) {
+X		if(strncmpic(i->name, s, strlen(i->name)) == 0) {
+X			i->have = 'Y';
+X			break;
+X		}
+X	}
+X}
+X
+X/*
+X** create default headers for the message.
+X*/
+Xdef_headers(argc, argv, from)
+Xint argc;
+Xchar **argv;
+Xchar *from;
+X{
+X	def_to(argc, argv);	/* default To:		*/
+X	def_date();		/* default Date:	*/
+X	def_from(from);		/* default From: 	*/
+X	def_mid();		/* default Message-Id:	*/
+X}
+X
+X/*
+X** default Date: in arpa format
+X*/
+Xdef_date()
+X{
+X	(void) strcpy(dateline, "Date: ");
+X	(void) strcat(dateline, arpanows);
+X}
+X
+X/*
+X** default Message-Id
+X**  Message-Id: <yymmddhhmm.AAppppp@hostdomain>
+X**
+X**	yy	 year
+X**	mm	 month
+X**	dd	 day
+X**	hh	 hour
+X**	mm	 minute
+X**	ppppp	process-id
+X**
+X** date and time are set by GMT
+X*/
+Xdef_mid()
+X{
+X	(void) sprintf(midline, "Message-Id: <%02d%02d%02d%02d%02d.AA%05d@%s>",
+X		gmt->tm_year,
+X		gmt->tm_mon+1,
+X		gmt->tm_mday,
+X		gmt->tm_hour,
+X		gmt->tm_min,
+X		getpid(),
+X		hostdomain);
+X}
+X
+X/*
+X** default From:
+X**  From: user@hostdomain
+X*/
+Xdef_from(from)
+Xchar *from;
+X{
+X	(void) sprintf(fromline, "From: %s@%s", from, hostdomain);
+X}
+X
+X/*
+X** default To:
+X**  To: recip1, recip2, ...
+X**
+X** lines longer than 50 chars are continued on another line.
+X*/
+Xdef_to(argc, argv)
+Xint argc;
+Xchar **argv;
+X{
+X	int i, n;
+X	char *bol;
+X
+X	bol = toline;
+X	(void) strcpy(bol, "To:");
+X	for(n = i = 0; i < argc; i++) {
+X		n = strlen(bol);
+X		if(n > 50) {
+X			(void) strcat(bol, "\n\t");
+X			bol = bol + strlen(bol);
+X			*bol = '\0';
+X			n = 8;
+X		}
+X		if(i == 0) {
+X			(void) strcat(bol, " ");
+X		} else {
+X			(void) strcat(bol, ", ");
+X		}
+X		(void) strcat(bol, argv[i]);
+X	}
+X}
+@//E*O*F src/headers.c//
+if test 13909 -ne "`wc -c <'src/headers.c'`"; then
+    echo shar: error transmitting "'src/headers.c'" '(should have been 13909 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/main.c'" '(4213 characters)'
+if test -f 'src/main.c' ; then 
+  echo shar: will not over-write existing file "'src/main.c'"
+else
+sed 's/^X//' >src/main.c <<'@//E*O*F src/main.c//'
+X/*
+X**
+X**  rmail/smail - UUCP mailer with automatic routing.
+X**
+X**  Christopher Seiwald		/+\
+X**  chris@cbosgd.att.com	+\
+X**  January, 1985		\+/
+X**
+X*/
+X
+X#ifndef lint
+Xstatic char 	*sccsid="@(#)main.c	2.2 (smail) 1/26/87";
+X#endif
+X
+X/*
+X**
+X**  usage:  	rmail [options] address...
+X**		smail [options] address...
+X**  options:
+X**		-d 		debug - verbose and don't invoke mailers.
+X**		-v		verbose - just verbose.
+X**		-h hostname	set hostname 
+X**		-H hostdomain	set hostdomain (default hostname.MYDOM)
+X**		-p pathfile	path database filename
+X**		-r		force routing of host!address
+X**		-R		reroute even explicit path!user
+X**		-l		user@domain goes to local mailer
+X**		-L		all mail goes local
+X**		-q number	mail queueing cost threshold
+X**		-m number	limit on number of uux_noqueue jobs
+X**		-u string	string of flags for uux
+X**		-a aliasfile	aliases filename (not used with SENDMAIL)
+X*/
+X
+X#include	<stdio.h>
+X#include	<ctype.h>
+X#include	"defs.h"
+X#ifdef BSD
+X#include <strings.h>
+X#else
+X#include <string.h>
+X#endif
+X
+Xint exitstat = 0;		/* exit status, set by resolve, deliver	*/
+X
+Xenum edebug debug     = NO;	/* set by -d or -v option		*/
+Xenum ehandle handle   = HANDLE;	/* which mail we can handle, see defs.h	*/
+Xenum erouting routing = ROUTING;/* to route or not to route, see defs.h */
+X
+Xchar hostname[SMLBUF]   = "";	/* set by -h, defaults in defs.h 	*/
+Xchar hostdomain[SMLBUF] = "";	/* set by -H, defaults in defs.h 	*/
+X
+Xchar *pathfile  = PATHS;	/* or set by -p 			*/
+Xchar *uuxargs   = NULL;		/* or set by -u				*/
+Xchar *aliasfile = ALIAS;	/* or set by -a				*/
+Xint  queuecost  = QUEUECOST;	/* or set by -q				*/
+Xint  maxnoqueue = MAXNOQUEUE;	/* or set by -m                         */
+X
+Xchar *spoolfile = NULL;		/* name of the file containing letter   */
+XFILE *spoolfp;			/* file pointer to spoolfile		*/
+Xint  spoolmaster = 0;		/* indicates 'control' of spoolfile     */
+Xvoid spool();
+X
+X
+X/*
+X**
+X**  rmail/smail: mail stdin letter to argv addresses.
+X**
+X**  After processing command line options and finding our host and domain 
+X**  names, we map addresses into <host,user,form,cost> sets.  Then we deliver.
+X**
+X*/
+X
+Xmain( argc, argv )
+Xint argc;
+Xchar *argv[];
+X{
+X	char *hostv[MAXARGS];		/* UUCP neighbor 		*/
+X	char *userv[MAXARGS];		/* address given to host 	*/
+X	int  costv[MAXARGS];		/* cost of resolved route	*/
+X	enum eform formv[MAXARGS];	/* invalid, local, or uucp 	*/
+X	char *p;
+X	int c;
+X	int nargc;
+X	char **nargv, **alias();
+X
+X	char *optstr = "dvrRlLH:h:p:u:q:a:m:f:";
+X	extern char *optarg;
+X	extern int optind;
+X
+X/*
+X**  see if we aren't invoked as rmail
+X*/
+X	if((p = rindex(argv[0], '/')) == NULL) {
+X		p = argv[0];
+X	} else {
+X		p++;
+X	}
+X
+X	if(*p != 'r' ) {
+X		handle = ALL;
+X	}
+X
+X/*
+X**  Process command line arguments
+X*/
+X	while ((c = getopt(argc, argv, optstr)) != EOF) {
+X		switch ( c ) {
+X		case 'd': debug      = YES; 		break;
+X		case 'v': debug      = VERBOSE; 	break; 
+X		case 'r': routing    = ALWAYS;		break;
+X		case 'R': routing    = REROUTE;		break;
+X		case 'l': handle     = JUSTUUCP;	break;
+X		case 'L': handle     = NONE;		break;
+X		case 'f': spoolfile  = optarg;		break;
+X		case 'p': pathfile   = optarg; 		break;
+X		case 'u': uuxargs    = optarg; 		break;
+X		case 'a': aliasfile  = optarg; 		break;
+X		case 'H': (void) strcpy(hostdomain, optarg);	break;
+X		case 'h': (void) strcpy(hostname, optarg); 	break;
+X		case 'm': if(isdigit(*optarg)) {
+X				  maxnoqueue = atoi(optarg);
+X			  }
+X			  break;
+X		case 'q': if(isdigit(*optarg)) {
+X				  queuecost = atoi(optarg);
+X			  }
+X			  break;
+X		default:
+X			error( EX_USAGE, "valid flags are %s\n", optstr);
+X		}
+X	}
+X	if ( argc <= optind ) {
+X		error( EX_USAGE, "usage: %s [flags] address...\n", argv[0] );
+X	}
+X
+X/*
+X**  Get our default hostname and hostdomain.
+X*/
+X	getmynames();
+X
+X/*
+X**  Spool the letter in a temporary file.
+X*/
+X	nargc = argc - optind;
+X	spool(nargc, &argv[optind]);
+X
+X/*
+X** If we have sendmail, aliasing was done there, so alias() is a NOP.
+X** If we don't have sendmail, do our own aliasing.
+X*/
+X	nargv = alias(&nargc, &argv[optind]);
+X
+X/*
+X**  Map argv addresses to <host, user, form, cost>.
+X*/
+X	map(nargc, nargv, hostv, userv, formv, costv);
+X/*
+X**  Deliver.
+X*/
+X	deliver(nargc, hostv, userv, formv, costv);
+X/*
+X**  Exitstat was set if any resolve or deliver failed, otherwise 0.
+X*/
+X	return( exitstat );
+X}
+@//E*O*F src/main.c//
+if test 4213 -ne "`wc -c <'src/main.c'`"; then
+    echo shar: error transmitting "'src/main.c'" '(should have been 4213 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/make.cf.sh'" '(3038 characters)'
+if test -f 'src/make.cf.sh' ; then 
+  echo shar: will not over-write existing file "'src/make.cf.sh'"
+else
+sed 's/^X//' >src/make.cf.sh <<'@//E*O*F src/make.cf.sh//'
+X#! /bin/sh
+X#
+X# @(#)make.cf.sh	2.1 (smail) 12/14/86
+X#
+Xcat <<!EOM!
+XThis script will prompt you for the automatically configurable parameters
+Xin the stock version of the sendmail configuration file.  Naturally, any
+Xlocal extensions will have to be added manually.
+X
+XClyde is a VAX running AT&T System V Release 2.0, with a port of sendmail.
+XClyde is a gateway for the domain .att.com.
+X
+XBelow is a trace of the session that
+Xconfigured the sendmail.cf on clyde.ATT.COM:
+X===
+X
+X!EOM!
+X
+Xecho "press return to continue"; read foo
+X
+Xcat <<!EOM!
+XEnter Date (MM-DD-YY):
+X06-24-86
+XEnter This Host's Name:
+Xclyde
+XEnter This Host's Official Domain:
+XATT.COM
+XEnter Any Equivalent Domain Classes:
+XATT
+XEnter Any Domains For Which This Host Is An Authority:
+XATT.UUCP
+XDoes This Host Have SMTP Connections (y/n)?
+Xno
+XEnter Full Path to Executable That Will Provide Local Mail Delivery:
+X/bin/lmail
+XIs /bin/lmail A Berkeley Mailer [i.e., use -r to specify sender] (y/n)?
+Xno
+XWill This Host Act As A Gateway Between Domains (y/n)?
+Xyes
+XAre subdomains beneath this hosts' domain to be hidden (y/n)?
+Xyes
+X===
+X!EOM!
+X# get date of configuration
+XCF_DATE=`/bin/sh ./smail.prompt string "Enter Date (MM-DD-YY):"`
+X
+X# get host name
+XCF_HOST=`/bin/sh ./smail.prompt string "Enter This Host's Name:"`
+X
+X# get host domain
+XCF_DOMAIN=`/bin/sh ./smail.prompt string "Enter This Host's Official Domain:"`
+X
+X# get domain classes
+XCF_DCLASS=`/bin/sh ./smail.prompt string "Enter Any Equivalent Domain Classes:"`
+X
+X# get domain authority
+XCF_AUTHORITY=`/bin/sh ./smail.prompt string "Enter Any Domains For Which This Host Is An Authority:"`
+X
+XCF_SMTP=`/bin/sh ./smail.prompt yesno "Does This Host Have SMTP Connections (y/n)?"`
+Xif test "$CF_SMTP" = "yes"
+Xthen
+X
+X#get list of local SMTP connections
+X	CF_SMTP=`/bin/sh ./smail.prompt file "Enter Full Path to File that Contains List of SMTP Connections:"`
+X
+X	CF_SMTP="FE$CF_SMTP %s"
+Xelse
+X	CF_SMTP=""
+Xfi
+X
+X# get path to local delivery agent
+XCF_LOCALMAIL=`/bin/sh ./smail.prompt file "Enter Full Path to Executable That Will Provide Local Mail Delivery:"`
+X
+XCF_SYSTEM=`/bin/sh ./smail.prompt yesno "Is $CF_LOCALMAIL A Berkeley Mailer [i.e., use -r to specify sender] (y/n)?"`
+Xif test "$CF_SYSTEM" = "yes"
+Xthen
+X	CF_SVMAIL="#"
+X	CF_BSMAIL=""
+Xelse
+X	CF_SVMAIL=""
+X	CF_BSMAIL="#"
+Xfi
+X
+XCF_GATEWAY=`/bin/sh ./smail.prompt yesno "Will This Host Act As A Gateway Between Domains(y/n)?"`
+Xif test "$CF_GATEWAY" = "yes"
+Xthen
+X	CF_GATEWAY=""
+Xelse
+X	CF_GATEWAY="#"
+Xfi
+X
+XCF_HIDDENHOSTS=`/bin/sh ./smail.prompt yesno "Are subdomains beneath this hosts' domain to be hidden (y/n)?"`
+Xif test "$CF_HIDDENHOSTS" = "yes"
+Xthen
+X	CF_HIDDENHOSTS=""
+Xelse
+X	CF_HIDDENHOSTS="#"
+Xfi
+X
+Xsed 	\
+X	-e "s/CF_HOST/Dw$CF_HOST/" \
+X	-e "s/CF_DOMAIN/DD$CF_DOMAIN/" \
+X	-e "s/CF_AUTHORITY/DA$CF_AUTHORITY/" \
+X	-e "s/CF_DCLASS/CDUUCP $CF_DCLASS/" \
+X	-e "s;CF_SMTP;$CF_SMTP;" \
+X	-e "s;CF_DATE;$CF_DATE;" \
+X	-e "s;CF_LOCALMAIL;$CF_LOCALMAIL;" \
+X	-e "s;CF_BSMAIL;$CF_BSMAIL;" \
+X	-e "s;CF_SVMAIL;$CF_SVMAIL;" \
+X	-e "s;CF_GATEWAY;$CF_GATEWAY;" \
+X	-e "s;CF_HIDDENHOSTS;$CF_HIDDENHOSTS;" \
+X	template.cf > sendmail.cf
+@//E*O*F src/make.cf.sh//
+if test 3038 -ne "`wc -c <'src/make.cf.sh'`"; then
+    echo shar: error transmitting "'src/make.cf.sh'" '(should have been 3038 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/map.c'" '(1425 characters)'
+if test -f 'src/map.c' ; then 
+  echo shar: will not over-write existing file "'src/map.c'"
+else
+sed 's/^X//' >src/map.c <<'@//E*O*F src/map.c//'
+X#ifndef lint
+Xstatic char 	*sccsid="@(#)map.c	2.2 (smail) 1/26/87";
+X#endif
+X
+X# include	<stdio.h>
+X# include	<sys/types.h>
+X# include	"defs.h"
+X#ifdef BSD
+X#include <strings.h>
+X#else
+X#include <string.h>
+X#endif
+X
+Xextern int queuecost;
+X
+X/*
+X**
+X**  map(): map addresses into <host, user, form, cost> sets.
+X**
+X**  Calls resolve() for each address of argv.  The result is hostv and 
+X**  userv arrays (pointing into buffers userz and hostz), and formv array.
+X**
+X*/
+X
+Xmap(argc, argv, hostv, userv, formv, costv)
+Xint argc;				/* address count 		*/
+Xchar **argv;				/* address vector 		*/
+Xchar *hostv[];				/* remote host vector 		*/
+Xchar *userv[];				/* user name vector 		*/
+Xenum eform formv[];			/* address format vector 	*/
+Xint costv[];				/* cost vector 			*/
+X{
+X	int i, cost;
+X	enum eform resolve();
+X	char *c;
+X	static char userbuf[BIGBUF], *userz;
+X	static char hostbuf[BIGBUF], *hostz;
+X
+X	userz = userbuf;
+X	hostz = hostbuf;
+X
+X	for( i=0; i<argc; i++ ) {
+X#ifdef DEFQUEUE
+X		cost = queuecost+1;		/* default is queueing */
+X#else
+X		cost = queuecost-1;		/* default is no queueing */
+X#endif
+X		userv[i] = userz;		/* put results here */
+X		hostv[i] = hostz;
+X		if ( **argv == '(' ) {		/* strip () */
+X			++*argv;
+X			c = index( *argv, ')' );
+X			if (c)
+X				*c = '\0';
+X		}
+X						/* here it comes! */
+X		formv[i] = resolve(*argv++, hostz, userz, &cost);
+X		costv[i] = cost;
+X		userz += strlen( userz ) + 1;	/* skip past \0 */
+X		hostz += strlen( hostz ) + 1;
+X	}
+X}
+@//E*O*F src/map.c//
+if test 1425 -ne "`wc -c <'src/map.c'`"; then
+    echo shar: error transmitting "'src/map.c'" '(should have been 1425 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/misc.c'" '(7381 characters)'
+if test -f 'src/misc.c' ; then 
+  echo shar: will not over-write existing file "'src/misc.c'"
+else
+sed 's/^X//' >src/misc.c <<'@//E*O*F src/misc.c//'
+X
+X/*
+X**  Miscellaneous support functions for smail/rmail
+X*/
+X
+X#ifndef lint
+Xstatic char 	*sccsid="@(#)misc.c	2.3 (smail) 1/26/87";
+X#endif
+X
+X# include	<stdio.h>
+X# include	<sys/types.h>
+X# include	<ctype.h>
+X# include	"defs.h"
+X#ifdef BSD
+X# include	<sys/time.h>
+X# include	<sys/timeb.h>
+X# include	<strings.h>
+X#else
+X# include	<time.h>
+X# include	<sys/utsname.h>
+X# include	<string.h>
+X#endif
+X
+Xextern int  exitstat;		/* set if a forked mailer fails */
+Xextern enum edebug debug;	/* how verbose we are 		*/ 
+Xextern enum ehandle handle;	/* what we handle		*/
+Xextern char *uuxargs;		/* arguments given to uux       */
+Xextern int  queuecost;		/* threshold for queueing mail  */
+Xextern int  maxnoqueue;		/* max number of uucico's       */
+Xextern enum erouting routing;	/* when to route addresses	*/
+Xextern char hostdomain[];	/* */
+Xextern char hostname[];		/* */
+Xextern char *pathfile;		/* location of path database	*/
+Xextern char *spoolfile;		/* file name of spooled message */
+Xextern FILE *spoolfp;		/* file ptr  to spooled message */
+Xextern int spoolmaster;		/* set if creator of spoolfile  */
+X
+Xstruct tm *gmt, *loc;		/* GMT and local time structure	*/
+Xtime_t now;			/* current system time		*/
+Xchar nows[50];			/* time in ctime format		*/
+Xchar arpanows[50];		/* time in arpa format		*/
+X
+X# ifdef LOG
+Xvoid
+Xlog(command, from, size)
+Xchar *command, *from;
+Xlong size;
+X{
+X	FILE *fd;
+X	char *logtime, tbuf[50];
+X	int cmask;
+X
+X	logtime = strcpy(tbuf, nows);
+X	logtime[16] = '\0';
+X	logtime += 4;
+X
+X	cmask = umask(0);
+X	fd = fopen(LOG, "a");
+X	(void) umask(cmask);
+X
+X	if (fd != NULL) {
+X		(void) fprintf(fd, "%s\t%ld\t%s\t%s\n",
+X			logtime, size, from, command);
+X		(void) fclose(fd);
+X	}
+X}
+X# endif
+X
+X# ifdef RECORD
+XFILE *
+Xrecord(command, from, size)
+Xchar *command, *from;
+Xlong size;
+X{
+X	FILE *fd;
+X	char *logtime, buf[SMLBUF];
+X	int cmask;
+X
+X	logtime = strcpy(buf, nows);
+X	logtime[16] = 0;
+X	logtime += 4;
+X
+X	cmask = umask(0);
+X	fd = fopen(RECORD, "a");
+X	(void) umask(cmask);
+X
+X	if (fd != NULL) {
+X		(void) fprintf(fd, "%s: %s, from %s, %ld bytes\n", 
+X			logtime, command, from, size);
+X	}
+X	while(fgets(buf, sizeof(buf), spoolfp) != NULL) {
+X		(void) fputs(buf, fd);
+X	}
+X	(void) fclose(fd);
+X}
+X# endif
+X
+X
+Xsetdates()
+X{
+X	time_t time();
+X	struct tm *gmtime();
+X	char *ctime(), *arpadate();
+X
+X	(void) time(&now);
+X	(void) strcpy(nows, ctime(&now));
+X	gmt = gmtime(&now);
+X	loc = localtime(&now);
+X	(void) strcpy(arpanows, arpadate(nows));
+X}
+X
+X/*
+X**  Note: This routine was taken from sendmail
+X**
+X**  ARPADATE -- Create date in ARPANET format
+X**
+X**	Parameters:
+X**		ud -- unix style date string.  if NULL, one is created.
+X**
+X**	Returns:
+X**		pointer to an ARPANET date field
+X**
+X**	Side Effects:
+X**		none
+X**
+X**	WARNING:
+X**		date is stored in a local buffer -- subsequent
+X**		calls will overwrite.
+X**
+X**	Bugs:
+X**		Timezone is computed from local time, rather than
+X**		from whereever (and whenever) the message was sent.
+X**		To do better is very hard.
+X**
+X**		Some sites are now inserting the timezone into the
+X**		local date.  This routine should figure out what
+X**		the format is and work appropriately.
+X*/
+X
+Xchar *
+Xarpadate(ud)
+X	register char *ud;
+X{
+X	register char *p;
+X	register char *q;
+X	static char b[40];
+X	extern char *ctime();
+X	register int i;
+X	extern struct tm *localtime();
+X#ifndef BSD
+X	extern char *tzname[];
+X	time_t t, time();
+X#else
+X	/* V7 and 4BSD */
+X	struct timeb t;
+X	extern struct timeb *ftime();
+X	extern char *timezone();
+X#endif
+X
+X	/*
+X	**  Get current time.
+X	**	This will be used if a null argument is passed and
+X	**	to resolve the timezone.
+X	*/
+X
+X#ifndef BSD
+X	(void) time(&t);
+X	if (ud == NULL)
+X		ud = ctime(&t);
+X#else
+X	/* V7 or 4BSD */
+X	ftime(&t);
+X	if (ud == NULL)
+X		ud = ctime(&t.time);
+X#endif
+X
+X	/*
+X	**  Crack the UNIX date line in a singularly unoriginal way.
+X	*/
+X
+X	q = b;
+X
+X	p = &ud[8];		/* 16 */
+X	if (*p == ' ')
+X		p++;
+X	else
+X		*q++ = *p++;
+X	*q++ = *p++;
+X	*q++ = ' ';
+X
+X	p = &ud[4];		/* Sep */
+X	*q++ = *p++;
+X	*q++ = *p++;
+X	*q++ = *p++;
+X	*q++ = ' ';
+X
+X	p = &ud[22];		/* 1979 */
+X	*q++ = *p++;
+X	*q++ = *p++;
+X	*q++ = ' ';
+X
+X	p = &ud[11];		/* 01:03:52 */
+X	for (i = 8; i > 0; i--)
+X		*q++ = *p++;
+X
+X				/* -PST or -PDT */
+X#ifndef BSD
+X	p = tzname[localtime(&t)->tm_isdst];
+X#else
+X	p = timezone(t.timezone, localtime(&t.time)->tm_isdst);
+X#endif
+X	if (p[3] != '\0')
+X	{
+X		/* hours from GMT */
+X		p += 3;
+X		*q++ = *p++;
+X		if (p[1] == ':')
+X			*q++ = '0';
+X		else
+X			*q++ = *p++;
+X		*q++ = *p++;
+X		p++;		/* skip ``:'' */
+X		*q++ = *p++;
+X		*q++ = *p++;
+X	}
+X	else
+X	{
+X		*q++ = ' ';
+X		*q++ = *p++;
+X		*q++ = *p++;
+X		*q++ = *p++;
+X	}
+X
+X	p = &ud[0];		/* Mon */
+X	*q++ = ' ';
+X	*q++ = '(';
+X	*q++ = *p++;
+X	*q++ = *p++;
+X	*q++ = *p++;
+X	*q++ = ')';
+X
+X	*q = '\0';
+X	return (b);
+X}
+X
+X/*
+X *	The user name "postmaster" must be accepted regardless of what
+X *	combination of upper and lower case is used.  This function is
+X *	used to convert all case variants of "postmaster" to all lower
+X *	case.  If the user name passed in is not "postmaster", it is
+X *	returned unchanged.
+X */
+Xchar *
+Xpostmaster(user)
+Xchar *user;
+X{
+X	static char *pm = "postmaster";
+X
+X	if(strcmpic(user, pm) == 0) {
+X		return(pm);
+X	} else {
+X		return(user);
+X	}
+X}
+X
+X/*
+X**	strncmpic: string compare, ignore case, stop after 'n' chars
+X*/
+X
+Xstrncmpic(s1, s2, n)
+Xchar *s1, *s2;
+Xint n;
+X{
+X	register char *u = s1;
+X	register char *p = s2;
+X
+X	while((n > 0) && (*p != '\0')) {
+X		/* chars match or only case different */
+X		if(lower(*u) == lower(*p)) {
+X			p++;	/* examine next char */
+X			u++;
+X		} else {
+X			break;	/* no match - stop comparison */
+X		}
+X		n--;
+X	}
+X	if(n > 0) {
+X		return(lower(*u) - lower(*p)); /* return "difference" */
+X	} else {
+X		return(0);
+X	}
+X}
+X
+X/*
+X**	strcmpic: string compare, ignore case
+X*/
+X
+Xstrcmpic(s1, s2)
+Xchar *s1, *s2;
+X{
+X	register char *u = s1;
+X	register char *p = s2;
+X
+X	while(*p != '\0') {
+X		/* chars match or only case different */
+X		if(lower(*u) == lower(*p)) {
+X			p++;	/* examine next char */
+X			u++;
+X		} else {
+X			break;	/* no match - stop comparison */
+X		}
+X	}
+X
+X	return(lower(*u) - lower(*p)); /* return "difference" */
+X}
+X
+X/*
+X * Return 1 iff the string is "UUCP" (ignore case).
+X */
+Xisuucp(str)
+Xchar *str;
+X{
+X	if(strcmpic(str, "UUCP") == 0) {
+X		return(1);
+X	} else {
+X		return(0);
+X	}
+X}
+X
+X/*
+X** sform(form) returns a pointer to a string that tells what 'form' means
+X*/
+X
+Xchar *
+Xsform(form)
+Xenum eform form;
+X{
+X	if(form == ERROR)  return("ERROR");
+X	if(form == LOCAL)  return("LOCAL");
+X	if(form == DOMAIN) return("DOMAIN");
+X	if(form == UUCP)   return("UUCP");
+X	if(form == ROUTE)  return("ROUTE");
+X	return("UNKNOWN");
+X}
+X
+X/*
+X**
+X**  getmynames(): what is my host name and host domain?
+X**
+X**  Hostname set by -h, failing that by #define HOSTNAME, failing
+X**  that by gethostname() or uname().
+X**  
+X**  Hostdomain set by -h, failing that by #define HOSTDOMAIN,
+X**  failing that as hostname.MYDOM, or as just hostname.
+X**
+X**  See defs.h for the inside story.
+X**
+X*/
+X
+Xgetmynames()
+X{
+X#ifdef HOSTNAME
+X	if (!*hostname)
+X		(void) strcpy(hostname, HOSTNAME);
+X#endif
+X#ifdef GETHOSTNAME
+X	if (!*hostname)
+X		gethostname(hostname, SMLBUF - 1);
+X#endif
+X#ifdef UNAME
+X	if (!*hostname) {
+X		struct utsname site;
+X
+X		if (uname(&site) < 0)
+X			error(EX_SOFTWARE, "uname() call failed", 0);
+X		(void) strcpy(hostname, site.nodename);
+X	}
+X#endif
+X	if (!*hostname)
+X		error(EX_SOFTWARE, "can't determine hostname.\n", 0);
+X#ifdef HOSTDOMAIN
+X	if (!*hostdomain)
+X		(void) strcpy(hostdomain, HOSTDOMAIN);
+X#endif
+X#ifdef MYDOM
+X	if (!*hostdomain)
+X		(void) strcat(strcpy(hostdomain, hostname), MYDOM);
+X#endif
+X	if (!*hostdomain)
+X		(void) strcpy(hostdomain, hostname);
+X
+X}
+@//E*O*F src/misc.c//
+if test 7381 -ne "`wc -c <'src/misc.c'`"; then
+    echo shar: error transmitting "'src/misc.c'" '(should have been 7381 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/resolve.c'" '(7236 characters)'
+if test -f 'src/resolve.c' ; then 
+  echo shar: will not over-write existing file "'src/resolve.c'"
+else
+sed 's/^X//' >src/resolve.c <<'@//E*O*F src/resolve.c//'
+X/*
+X**
+X**  Resolve.c
+X**
+X**  Routes then resolves addresses into UUCP or LOCAL.
+X**
+X*/
+X#ifndef lint
+Xstatic char 	*sccsid="@(#)resolve.c	2.2 (smail) 1/26/87";
+X#endif
+X
+X#include	<ctype.h>
+X#include	<stdio.h>
+X#include	"defs.h"
+X#ifdef BSD
+X#include <strings.h>
+X#else
+X#include <string.h>
+X#endif
+X
+Xextern int exitstat;		/* set if address doesn't resolve 	*/
+Xextern enum ehandle handle;	/* what mail we can handle		*/
+Xextern enum edebug debug;	/* verbose and debug modes		*/
+Xextern enum erouting routing;	/* when to route addresses		*/
+Xextern char hostdomain[];	/* */
+Xextern char hostname[];		/* */
+Xextern char *pathfile;		/* location of path database		*/
+X
+Xchar *sform();
+X
+X/*
+X**
+X**  rsvp(): how to resolve addresses.
+X**
+X**  After parsing an address into <form>, the resolved form will be
+X**  rsvp( form ).  If == ROUTE, we route the parsed address and parse again.
+X**
+X*/
+X
+X# define rsvp(a) table[(int)a][(int)handle]
+X
+Xenum eform table[5][3] = {
+X/*	all		justuucp	none */
+X{	ERROR, 		ERROR, 		ERROR }, 	/* error */
+X{	LOCAL, 		LOCAL,	 	LOCAL }, 	/* local */
+X{	ROUTE, 		LOCAL, 		LOCAL }, 	/* domain */
+X{	UUCP, 		UUCP, 		LOCAL }, 	/* uucp */
+X{	ERROR, 		ERROR, 		ERROR }};	/* route */
+X
+X/*
+X**
+X**  resolve(): resolve addresses to <host, user, form>.
+X**
+X**  This is a gnarly piece of code, but it does it all.  Each section 
+X**  is documented.
+X**
+X*/
+X
+Xenum eform
+Xresolve( address, domain, user , cost)
+Xchar *address;				/* the input address 	*/
+Xchar *domain;				/* the returned domain 	*/
+Xchar *user;				/* the returned user 	*/
+Xint *cost;				/* the returned cost 	*/
+X{
+X	enum eform form;		/* the returned form	*/ 
+X	enum eform parse();		/* to crack addresses	*/
+X	int parts;			/* to ssplit addresses	*/
+X	char *partv[MAXPATH];		/* "  "      "		*/
+X	char temp[SMLBUF];		/* "  "      "		*/
+X	int i;
+X		
+X
+X/*
+X**  If we set REROUTE and are prepared to deliver UUCP mail, we split the 
+X**  address apart at !'s and try to resolve successively larger righthand 
+X**  substrings until we succeed.  Otherwise, we just resolve the whole thing 
+X**  once.
+X*/
+X	if ((routing == REROUTE) && (rsvp( UUCP ) == UUCP)) {
+X		parts = ssplit( address, '!', partv );
+X	} else {
+X		parts = 1;
+X		partv[0] = address;
+X	}
+X/*
+X**  This for(i) loop selects successively larger
+X**  righthand substrings of the address.
+X*/
+X	for( i = parts - 1; i >= 0; i-- ) {
+X/*
+X**  Parse the address.
+X*/
+X		(void) strcpy( temp, partv[i] );
+X		form = parse( temp, domain, user );
+X
+XDEBUG("resolve: parse address '%s' = '%s' @ '%s' (%s)\n",
+X	temp,user,domain,sform(form));
+X
+X/*
+X**  If we are looking at a substring (that's not the entire string)
+X**  which parses to a LOCAL address, we skip to the next larger substring.
+X*/
+X		if((i != 0) && (form == LOCAL))
+X			continue;
+X/*
+X**  Routing, when required, is the next step.
+X**  We route the address if we have a ROUTE form
+X**  or if we have a UUCP form and we are told to
+X**  route ALWAYS or REROUTE (i.e., routing != JUSTDOMAIN)
+X*/
+X		if((rsvp( form ) == ROUTE)
+X		 ||((rsvp( form ) == UUCP) && (routing != JUSTDOMAIN ))) {
+X
+X			int look_smart = 0;
+X
+X			if((routing == REROUTE) && (i == 0)) {
+X				look_smart = 1; /* last chance */
+X			}
+X
+X			/* route() puts the new route in 'temp' */
+X			if(route(domain,user,look_smart,temp,cost) != EX_OK) {
+X				continue;	/* If routing fails, try
+X						/* next larger substring.
+X						/* */
+X			}
+X/*
+X**  After routing, reparse the new route into domain and user. 
+X*/
+X			form = parse( temp, domain, user );
+X
+XDEBUG("resolve: parse route '%s' = '%s' @ '%s' (%s)\n",
+X	temp,user,domain,sform(form));
+X
+X		}
+X		break;	/* route is resolved */
+X	}
+X/*
+X**  For LOCAL mail in non-local format, we rewrite the full address into 
+X**  <user> and leave <domain> blank.
+X*/
+X	if ((rsvp( form ) == LOCAL) && (form != LOCAL )) {
+X		build( domain, user, form, temp );
+X		(void) strcpy( user, temp );
+X		(void) strcpy( domain, "" );
+X		form = LOCAL;
+X	}
+X/*
+X**  If we were supposed to route an address but failed (form == ERROR), 
+X**  or after routing we are left with an address that still needs to
+X**  be routed (rsvp( form ) == ROUTE), complain.
+X*/
+X	if ((form == ERROR) || (rsvp( form ) == ROUTE )) {
+X		exitstat = EX_NOHOST;
+X		ADVISE("resolve failed '%s' = '%s' @ '%s' (%s)\n",
+X			address, user, domain, sform(form));
+X		form = ERROR;
+X	} else {
+X		ADVISE("resolve '%s' = '%s' @ '%s' (%s)\n",
+X			address, user, domain, sform(form));
+X	}
+X	return ( form );
+X}
+X
+X/*
+X**
+X**  route(): route domain, plug in user.
+X**
+X**  Less complicated than it looks.  Each section is documented.
+X**
+X*/
+X
+Xroute(domain, user, look_smart, result, cost)
+Xchar *domain;			/* domain or host name 	*/
+Xchar *user;			/* user name 		*/
+Xint look_smart;			/* do we try to route through a smarter host? */
+Xchar *result;			/* output route 	*/
+Xint *cost;			/* cost of output route */
+X{
+X	int	uucpdom = 0;
+X	int	domains, step;			/* to split domain	*/
+X	char	*domainv[MAXDOMS];		/* "  "     "		*/
+X	char	temp[SMLBUF], path[SMLBUF];
+X
+X/*
+X**  Fully qualify the domain, and then strip the last (top level domain) 
+X**  component off, so that we look it up separately.
+X*/
+X	temp[0] = '.';
+X	(void) strcpy(temp+1, domain );
+X
+X	domains = ssplit( temp+1, '.', domainv );
+X
+X/*
+X** check target domain for the local host name and host domain.
+X** if it matches, then the path skip the lookup in the database.
+X** this prevents mail loops for cases where SMARTHOST is defined
+X** in the routing table, but the local host is not.  It also is
+X** a little faster when the local host is the target domain.
+X*/
+X	if((strcmpic(domain, hostname) == 0)
+X	|| (strcmpic(domain, hostdomain) == 0)) {
+X		step = 0;
+X		*cost = 0;
+X		(void) strcpy(path, "%s");
+XDEBUG("route: '%s' is local\n", domain);
+X		goto route_complete;
+X	}
+X
+X	/* If the domain ends in .UUCP, trim that off. */
+X	if((domains > 0) && isuucp(domainv[domains-1])) {
+X		domains--;
+X		domainv[domains][-1] = '\0';
+X		uucpdom = 1;
+X	}
+X/*
+X**  Try to get the path for successive components of the domain.  
+X**  Example for osgd.cb.att.uucp:
+X**	osgd.cb.att
+X**	cb.att
+X**	att
+X**	uucp ( remember stripping top level? )
+X**	SMARTHOST
+X**  Returns with error if we find no path.
+X*/
+X	for(step = 0; (step < domains); step++) {
+X		if((getpath(domainv[step]-1, path, cost) == EX_OK) /* w/ dot */
+X		|| (getpath(domainv[step]  , path, cost) == EX_OK))/* no dot */
+X			break;
+X	}
+X
+X	if(step == domains) {
+X	/*
+X	** we've looked at each component of the domain without success
+X	*/
+X		/*
+X		** If domain is a UUCP address, look for a UUCP gateway.
+X		*/
+X		if((uucpdom == 0) || (getpath(".UUCP", path, cost) != EX_OK)) {
+X			/*
+X			** The domain not is a UUCP address, or we can't
+X			** find a UUCP gateway.  If this is our last chance,
+X			** look for a smarter host to deliver the mail.
+X			*/
+X			if((look_smart == 0)
+X			|| (getpath(SMARTHOST, path, cost) != EX_OK)) {
+X				/*
+X				** All our efforts have been in vain.
+X				** Tell them the bad news.
+X				*/
+X				DEBUG("route '%s' failed\n", domain);
+X				return( EX_NOHOST );
+X			}
+X		}
+X	}
+X
+Xroute_complete:
+X
+XDEBUG("route:  '%s' (%s) = '%s' (%d)\n", domain, domainv[step], path, *cost);
+X
+X/*
+X**  If we matched on the entire domain name, this address is fully resolved, 
+X**  and we plug <user> into it.  If we matched on only part of the domain 
+X**  name, we plug <domain>!<user> in.  
+X*/
+X	build(domain, user, (step == 0) ? LOCAL : UUCP, temp);
+X	(void) sprintf(result, path, temp);
+X	return( EX_OK );
+X}
+@//E*O*F src/resolve.c//
+if test 7236 -ne "`wc -c <'src/resolve.c'`"; then
+    echo shar: error transmitting "'src/resolve.c'" '(should have been 7236 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/smail.prompt'" '(762 characters)'
+if test -f 'src/smail.prompt' ; then 
+  echo shar: will not over-write existing file "'src/smail.prompt'"
+else
+sed 's/^X//' >src/smail.prompt <<'@//E*O*F src/smail.prompt//'
+X#
+X# @(#)smail.prompt	2.1 (smail) 12/14/86
+X#
+X
+Xloop=true
+Xwhile test $loop = true
+Xdo 
+X	case "$1" in
+X	string)
+X		echo "$2" 1>&2
+X		read ans
+X		if test ! -z "$ans"
+X		then
+X			echo $ans
+X			loop=false;
+X		fi
+X	;;
+X	file)
+X		echo "$2" 1>&2
+X		read ans
+X		case "$ans" in
+X		/*)
+X			if test -f "$ans"
+X			then
+X				echo $ans
+X				loop=false;
+X			else
+X				echo "file '$ans' not found" 1>&2
+X			fi
+X		;;
+X		*)
+X			echo "must give FULL PATH to file" 1>&2
+X		;;
+X		esac
+X	;;
+X	yesno)
+X		echo "$2" 1>&2
+X		read ans
+X		case "$ans" in
+X		y|Y|yes|Yes|YES)
+X			echo "yes"
+X			loop=false
+X		;;
+X		n|N|no|No|NO)
+X			echo "no"
+X			loop=false
+X		;;
+X		*)
+X			echo "Please enter yes or no" 1>&2
+X		;;
+X		esac
+X	;;
+X	*)
+X
+X		echo "usage: $0 string|yesno prompt_message" 1>&2
+X		echo BOGUS_PROMPT_STRING
+X		loop=false
+X	;;
+X	esac
+Xdone
+@//E*O*F src/smail.prompt//
+if test 762 -ne "`wc -c <'src/smail.prompt'`"; then
+    echo shar: error transmitting "'src/smail.prompt'" '(should have been 762 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/svbinmail.c'" '(1749 characters)'
+if test -f 'src/svbinmail.c' ; then 
+  echo shar: will not over-write existing file "'src/svbinmail.c'"
+else
+sed 's/^X//' >src/svbinmail.c <<'@//E*O*F src/svbinmail.c//'
+X#ifndef lint
+Xstatic char	*sccsid = "@(#)svbinmail.c	2.2 (smail) 1/26/87";
+X#endif
+X/* */
+X/* This program will be used in place of /bin/mail on SVR2 sites.
+X/* It looks at the arguments and decides whether to call
+X/* SENDER for sending mail, or READER for reading mail.
+X/*
+X/* before installing as /bin/mail, move the stock /bin/mail to /bin/lmail
+X/*
+X/*  */
+X
+X#include <stdio.h>
+X#include "defs.h"
+X#ifdef BSD
+X#include <strings.h>
+X#else
+X#include <string.h>
+X#endif
+X
+X#ifdef SENDMAIL
+X#define SENDER	SENDMAIL
+X#else
+X#define	SENDER	"/bin/rmail"
+X#endif
+X
+X#define	READER	"/bin/lmail"
+X
+X#define TRUE 1
+X#define FALSE 0
+X
+Xchar prog[128];
+X
+Xvoid	perror(), exit(), usage();
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X	extern int optind;
+X	extern char *optarg;
+X
+X	int i, j, c;
+X	int reading, sending;
+X
+X	reading = sending = FALSE;
+X
+X	(void) strcpy(prog, argv[0]);
+X
+X	if(argc == 1) {
+X		reading = TRUE;
+X	} else {
+X		while((c = getopt(argc, argv, "epqrtf:")) != EOF) {
+X			switch(c) {
+X			case 'e':
+X			case 'p':
+X			case 'q':
+X			case 'r':
+X			case 'f':
+X				reading = TRUE;
+X				break;
+X			case 't':
+X				sending = TRUE;
+X				break;
+X			default:
+X				usage();
+X				return(1);
+X			}
+X		}
+X	}
+X
+X	/* any arguments left over -> sending */
+X	if(argc > optind) {
+X		sending = TRUE;
+X	}
+X
+X	if((reading == TRUE) && (sending == TRUE)) {
+X		usage();
+X		return(1);
+X	}
+X
+X	if(sending == TRUE) {
+X		argv[0] = SENDER;
+X		for(i = 1, j = optind; j < argc; i++, j++) {
+X			argv[i] = argv[j];
+X		}
+X		argv[i] = NULL;
+X	} else {
+X		argv[0] = READER;
+X	}
+X
+X	(void) execvp(argv[0], argv);
+X	(void) fprintf(stderr, "%s: execvp(\"%s\", argv) failed: ",
+X		prog, argv[0]);
+X	perror("");
+X	return(1);
+X}
+X
+Xvoid
+Xusage()
+X{
+X	(void) fprintf(stderr, "usage:\t%s [ -epqr ] [ -f file ]\n", prog);
+X	(void) fprintf(stderr, "\t%s [ -t ] persons\n", prog);
+X}
+@//E*O*F src/svbinmail.c//
+if test 1749 -ne "`wc -c <'src/svbinmail.c'`"; then
+    echo shar: error transmitting "'src/svbinmail.c'" '(should have been 1749 characters)'
+fi
+fi # end of overwriting check
+echo shar: extracting "'src/sysexits.h'" '(483 characters)'
+if test -f 'src/sysexits.h' ; then 
+  echo shar: will not over-write existing file "'src/sysexits.h'"
+else
+sed 's/^X//' >src/sysexits.h <<'@//E*O*F src/sysexits.h//'
+X/*
+X**	@(#)sysexits.h	2.1 (smail) 12/14/86
+X*/
+X
+X# define EX_OK		0	/* successful termination */
+X# define EX_USAGE	64	/* command line usage error */
+X# define EX_NOHOST	68	/* host name unknown */
+X# define EX_UNAVAILABLE	69	/* service unavailable */
+X# define EX_SOFTWARE	70	/* internal software error */
+X# define EX_OSFILE	72	/* critical OS file missing */
+X# define EX_CANTCREAT	73	/* can't create (user) output file */
+X# define EX_TEMPFAIL	75	/* temp failure; user is invited to retry */
+@//E*O*F src/sysexits.h//
+if test 483 -ne "`wc -c <'src/sysexits.h'`"; then
+    echo shar: error transmitting "'src/sysexits.h'" '(should have been 483 characters)'
+fi
+fi # end of overwriting check
+echo shar: "End of shell archive."
+exit 0

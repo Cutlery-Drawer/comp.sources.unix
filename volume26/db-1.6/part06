@@ -1,0 +1,2706 @@
+Newsgroups: comp.sources.unix
+From: bostic@cs.berkeley.edu (Keith Bostic)
+Subject: v26i285: db-1.6 - A New Hashing Package for UNIX(tm) (updates dbm/ndbm), Part06/09
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: bostic@cs.berkeley.edu (Keith Bostic)
+Posting-Number: Volume 26, Issue 285
+Archive-Name: db-1.6/part06
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 6 (of 9)."
+# Contents:  btree/bt_split.c doc/btree.3.ps hash/hash_bigkey.c
+#   test/btree.tests/main.c
+# Wrapped by vixie@gw.home.vix.com on Mon Jul  5 15:27:27 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'btree/bt_split.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'btree/bt_split.c'\"
+else
+echo shar: Extracting \"'btree/bt_split.c'\" \(22158 characters\)
+sed "s/^X//" >'btree/bt_split.c' <<'END_OF_FILE'
+X/*-
+X * Copyright (c) 1990, 1993
+X *	The Regents of the University of California.  All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Mike Olson.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Berkeley and its contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#if defined(LIBC_SCCS) && !defined(lint)
+Xstatic char sccsid[] = "@(#)bt_split.c	8.1 (Berkeley) 6/4/93";
+X#endif /* LIBC_SCCS and not lint */
+X
+X#include <sys/types.h>
+X
+X#define	__DBINTERFACE_PRIVATE
+X#include <limits.h>
+X#include <stdio.h>
+X#include <stdlib.h>
+X#include <string.h>
+X
+X#include <db.h>
+X#include "btree.h"
+X
+Xstatic int	 bt_broot __P((BTREE *, PAGE *, PAGE *, PAGE *));
+Xstatic PAGE	*bt_page
+X		    __P((BTREE *, PAGE *, PAGE **, PAGE **, u_int *, size_t));
+Xstatic int	 bt_preserve __P((BTREE *, pgno_t));
+Xstatic PAGE	*bt_psplit
+X		    __P((BTREE *, PAGE *, PAGE *, PAGE *, u_int *, size_t));
+Xstatic PAGE	*bt_root
+X		    __P((BTREE *, PAGE *, PAGE **, PAGE **, u_int *, size_t));
+Xstatic int	 bt_rroot __P((BTREE *, PAGE *, PAGE *, PAGE *));
+Xstatic recno_t	 rec_total __P((PAGE *));
+X
+X#ifdef STATISTICS
+Xu_long	bt_rootsplit, bt_split, bt_sortsplit, bt_pfxsaved;
+X#endif
+X
+X/*
+X * __BT_SPLIT -- Split the tree.
+X *
+X * Parameters:
+X *	t:	tree
+X *	sp:	page to split
+X *	key:	key to insert
+X *	data:	data to insert
+X *	flags:	BIGKEY/BIGDATA flags
+X *	ilen:	insert length
+X *	skip:	index to leave open
+X *
+X * Returns:
+X *	RET_ERROR, RET_SUCCESS
+X */
+Xint
+X__bt_split(t, sp, key, data, flags, ilen, skip)
+X	BTREE *t;
+X	PAGE *sp;
+X	const DBT *key, *data;
+X	u_long flags;
+X	size_t ilen;
+X	u_int skip;
+X{
+X	BINTERNAL *bi;
+X	BLEAF *bl, *tbl;
+X	DBT a, b;
+X	EPGNO *parent;
+X	PAGE *h, *l, *r, *lchild, *rchild;
+X	indx_t nxtindex;
+X	size_t n, nbytes, nksize;
+X	int parentsplit;
+X	char *dest;
+X
+X	/*
+X	 * Split the page into two pages, l and r.  The split routines return
+X	 * a pointer to the page into which the key should be inserted and with
+X	 * skip set to the offset which should be used.  Additionally, l and r
+X	 * are pinned.
+X	 */
+X	h = sp->pgno == P_ROOT ?
+X	    bt_root(t, sp, &l, &r, &skip, ilen) :
+X	    bt_page(t, sp, &l, &r, &skip, ilen);
+X	if (h == NULL)
+X		return (RET_ERROR);
+X
+X	/*
+X	 * Insert the new key/data pair into the leaf page.  (Key inserts
+X	 * always cause a leaf page to split first.)
+X	 */
+X	h->linp[skip] = h->upper -= ilen;
+X	dest = (char *)h + h->upper;
+X	if (ISSET(t, R_RECNO))
+X		WR_RLEAF(dest, data, flags)
+X	else
+X		WR_BLEAF(dest, key, data, flags)
+X
+X	/* If the root page was split, make it look right. */
+X	if (sp->pgno == P_ROOT &&
+X	    (ISSET(t, R_RECNO) ?
+X	    bt_rroot(t, sp, l, r) : bt_broot(t, sp, l, r)) == RET_ERROR)
+X		goto err2;
+X
+X	/*
+X	 * Now we walk the parent page stack -- a LIFO stack of the pages that
+X	 * were traversed when we searched for the page that split.  Each stack
+X	 * entry is a page number and a page index offset.  The offset is for
+X	 * the page traversed on the search.  We've just split a page, so we
+X	 * have to insert a new key into the parent page.
+X	 *
+X	 * If the insert into the parent page causes it to split, may have to
+X	 * continue splitting all the way up the tree.  We stop if the root
+X	 * splits or the page inserted into didn't have to split to hold the
+X	 * new key.  Some algorithms replace the key for the old page as well
+X	 * as the new page.  We don't, as there's no reason to believe that the
+X	 * first key on the old page is any better than the key we have, and,
+X	 * in the case of a key being placed at index 0 causing the split, the
+X	 * key is unavailable.
+X	 *
+X	 * There are a maximum of 5 pages pinned at any time.  We keep the left
+X	 * and right pages pinned while working on the parent.   The 5 are the
+X	 * two children, left parent and right parent (when the parent splits)
+X	 * and the root page or the overflow key page when calling bt_preserve.
+X	 * This code must make sure that all pins are released other than the
+X	 * root page or overflow page which is unlocked elsewhere.
+X	 */
+X	while ((parent = BT_POP(t)) != NULL) {
+X		lchild = l;
+X		rchild = r;
+X
+X		/* Get the parent page. */
+X		if ((h = mpool_get(t->bt_mp, parent->pgno, 0)) == NULL)
+X			goto err2;
+X
+X	 	/*
+X		 * The new key goes ONE AFTER the index, because the split
+X		 * was to the right.
+X		 */
+X		skip = parent->index + 1;
+X
+X		/*
+X		 * Calculate the space needed on the parent page.
+X		 *
+X		 * Prefix trees: space hack when inserting into BINTERNAL
+X		 * pages.  Retain only what's needed to distinguish between
+X		 * the new entry and the LAST entry on the page to its left.
+X		 * If the keys compare equal, retain the entire key.  Note,
+X		 * we don't touch overflow keys, and the entire key must be
+X		 * retained for the next-to-left most key on the leftmost
+X		 * page of each level, or the search will fail.  Applicable
+X		 * ONLY to internal pages that have leaf pages as children.
+X		 * Further reduction of the key between pairs of internal
+X		 * pages loses too much information.
+X		 */
+X		switch (rchild->flags & P_TYPE) {
+X		case P_BINTERNAL:
+X			bi = GETBINTERNAL(rchild, 0);
+X			nbytes = NBINTERNAL(bi->ksize);
+X			break;
+X		case P_BLEAF:
+X			bl = GETBLEAF(rchild, 0);
+X			nbytes = NBINTERNAL(bl->ksize);
+X			if (t->bt_pfx && !(bl->flags & P_BIGKEY) &&
+X			    (h->prevpg != P_INVALID || skip > 1)) {
+X				tbl = GETBLEAF(lchild, NEXTINDEX(lchild) - 1);
+X				a.size = tbl->ksize;
+X				a.data = tbl->bytes;
+X				b.size = bl->ksize;
+X				b.data = bl->bytes;
+X				nksize = t->bt_pfx(&a, &b);
+X				n = NBINTERNAL(nksize);
+X				if (n < nbytes) {
+X#ifdef STATISTICS
+X					bt_pfxsaved += nbytes - n;
+X#endif
+X					nbytes = n;
+X				} else
+X					nksize = 0;
+X			} else
+X				nksize = 0;
+X			break;
+X		case P_RINTERNAL:
+X		case P_RLEAF:
+X			nbytes = NRINTERNAL;
+X			break;
+X		default:
+X			abort();
+X		}
+X
+X		/* Split the parent page if necessary or shift the indices. */
+X		if (h->upper - h->lower < nbytes + sizeof(indx_t)) {
+X			sp = h;
+X			h = h->pgno == P_ROOT ?
+X			    bt_root(t, h, &l, &r, &skip, nbytes) :
+X			    bt_page(t, h, &l, &r, &skip, nbytes);
+X			if (h == NULL)
+X				goto err1;
+X			parentsplit = 1;
+X		} else {
+X			if (skip < (nxtindex = NEXTINDEX(h)))
+X				memmove(h->linp + skip + 1, h->linp + skip,
+X				    (nxtindex - skip) * sizeof(indx_t));
+X			h->lower += sizeof(indx_t);
+X			parentsplit = 0;
+X		}
+X
+X		/* Insert the key into the parent page. */
+X		switch(rchild->flags & P_TYPE) {
+X		case P_BINTERNAL:
+X			h->linp[skip] = h->upper -= nbytes;
+X			dest = (char *)h + h->linp[skip];
+X			memmove(dest, bi, nbytes);
+X			((BINTERNAL *)dest)->pgno = rchild->pgno;
+X			break;
+X		case P_BLEAF:
+X			h->linp[skip] = h->upper -= nbytes;
+X			dest = (char *)h + h->linp[skip];
+X			WR_BINTERNAL(dest, nksize ? nksize : bl->ksize,
+X			    rchild->pgno, bl->flags & P_BIGKEY);
+X			memmove(dest, bl->bytes, nksize ? nksize : bl->ksize);
+X			if (bl->flags & P_BIGKEY &&
+X			    bt_preserve(t, *(pgno_t *)bl->bytes) == RET_ERROR)
+X				goto err1;
+X			break;
+X		case P_RINTERNAL:
+X			/*
+X			 * Update the left page count.  If split
+X			 * added at index 0, fix the correct page.
+X			 */
+X			if (skip > 0)
+X				dest = (char *)h + h->linp[skip - 1];
+X			else
+X				dest = (char *)l + l->linp[NEXTINDEX(l) - 1];
+X			((RINTERNAL *)dest)->nrecs = rec_total(lchild);
+X			((RINTERNAL *)dest)->pgno = lchild->pgno;
+X
+X			/* Update the right page count. */
+X			h->linp[skip] = h->upper -= nbytes;
+X			dest = (char *)h + h->linp[skip];
+X			((RINTERNAL *)dest)->nrecs = rec_total(rchild);
+X			((RINTERNAL *)dest)->pgno = rchild->pgno;
+X			break;
+X		case P_RLEAF:
+X			/*
+X			 * Update the left page count.  If split
+X			 * added at index 0, fix the correct page.
+X			 */
+X			if (skip > 0)
+X				dest = (char *)h + h->linp[skip - 1];
+X			else
+X				dest = (char *)l + l->linp[NEXTINDEX(l) - 1];
+X			((RINTERNAL *)dest)->nrecs = NEXTINDEX(lchild);
+X			((RINTERNAL *)dest)->pgno = lchild->pgno;
+X
+X			/* Update the right page count. */
+X			h->linp[skip] = h->upper -= nbytes;
+X			dest = (char *)h + h->linp[skip];
+X			((RINTERNAL *)dest)->nrecs = NEXTINDEX(rchild);
+X			((RINTERNAL *)dest)->pgno = rchild->pgno;
+X			break;
+X		default:
+X			abort();
+X		}
+X
+X		/* Unpin the held pages. */
+X		if (!parentsplit) {
+X			mpool_put(t->bt_mp, h, MPOOL_DIRTY);
+X			break;
+X		}
+X
+X		/* If the root page was split, make it look right. */
+X		if (sp->pgno == P_ROOT &&
+X		    (ISSET(t, R_RECNO) ?
+X		    bt_rroot(t, sp, l, r) : bt_broot(t, sp, l, r)) == RET_ERROR)
+X			goto err1;
+X
+X		mpool_put(t->bt_mp, lchild, MPOOL_DIRTY);
+X		mpool_put(t->bt_mp, rchild, MPOOL_DIRTY);
+X	}
+X
+X	/* Unpin the held pages. */
+X	mpool_put(t->bt_mp, l, MPOOL_DIRTY);
+X	mpool_put(t->bt_mp, r, MPOOL_DIRTY);
+X
+X	/* Clear any pages left on the stack. */
+X	return (RET_SUCCESS);
+X
+X	/*
+X	 * If something fails in the above loop we were already walking back
+X	 * up the tree and the tree is now inconsistent.  Nothing much we can
+X	 * do about it but release any memory we're holding.
+X	 */
+Xerr1:	mpool_put(t->bt_mp, lchild, MPOOL_DIRTY);
+X	mpool_put(t->bt_mp, rchild, MPOOL_DIRTY);
+X
+Xerr2:	mpool_put(t->bt_mp, l, 0);
+X	mpool_put(t->bt_mp, r, 0);
+X	__dbpanic(t->bt_dbp);
+X	return (RET_ERROR);
+X}
+X
+X/*
+X * BT_PAGE -- Split a non-root page of a btree.
+X *
+X * Parameters:
+X *	t:	tree
+X *	h:	root page
+X *	lp:	pointer to left page pointer
+X *	rp:	pointer to right page pointer
+X *	skip:	pointer to index to leave open
+X *	ilen:	insert length
+X *
+X * Returns:
+X *	Pointer to page in which to insert or NULL on error.
+X */
+Xstatic PAGE *
+Xbt_page(t, h, lp, rp, skip, ilen)
+X	BTREE *t;
+X	PAGE *h, **lp, **rp;
+X	u_int *skip;
+X	size_t ilen;
+X{
+X	PAGE *l, *r, *tp;
+X	pgno_t npg;
+X
+X#ifdef STATISTICS
+X	++bt_split;
+X#endif
+X	/* Put the new right page for the split into place. */
+X	if ((r = __bt_new(t, &npg)) == NULL)
+X		return (NULL);
+X	r->pgno = npg;
+X	r->lower = BTDATAOFF;
+X	r->upper = t->bt_psize;
+X	r->nextpg = h->nextpg;
+X	r->prevpg = h->pgno;
+X	r->flags = h->flags & P_TYPE;
+X
+X	/*
+X	 * If we're splitting the last page on a level because we're appending
+X	 * a key to it (skip is NEXTINDEX()), it's likely that the data is
+X	 * sorted.  Adding an empty page on the side of the level is less work
+X	 * and can push the fill factor much higher than normal.  If we're
+X	 * wrong it's no big deal, we'll just do the split the right way next
+X	 * time.  It may look like it's equally easy to do a similar hack for
+X	 * reverse sorted data, that is, split the tree left, but it's not.
+X	 * Don't even try.
+X	 */
+X	if (h->nextpg == P_INVALID && *skip == NEXTINDEX(h)) {
+X#ifdef STATISTICS
+X		++bt_sortsplit;
+X#endif
+X		h->nextpg = r->pgno;
+X		r->lower = BTDATAOFF + sizeof(indx_t);
+X		*skip = 0;
+X		*lp = h;
+X		*rp = r;
+X		return (r);
+X	}
+X
+X	/* Put the new left page for the split into place. */
+X	if ((l = malloc(t->bt_psize)) == NULL) {
+X		mpool_put(t->bt_mp, r, 0);
+X		return (NULL);
+X	}
+X	l->pgno = h->pgno;
+X	l->nextpg = r->pgno;
+X	l->prevpg = h->prevpg;
+X	l->lower = BTDATAOFF;
+X	l->upper = t->bt_psize;
+X	l->flags = h->flags & P_TYPE;
+X
+X	/* Fix up the previous pointer of the page after the split page. */
+X	if (h->nextpg != P_INVALID) {
+X		if ((tp = mpool_get(t->bt_mp, h->nextpg, 0)) == NULL) {
+X			free(l);
+X			/* XXX mpool_free(t->bt_mp, r->pgno); */
+X			return (NULL);
+X		}
+X		tp->prevpg = r->pgno;
+X		mpool_put(t->bt_mp, tp, 0);
+X	}
+X
+X	/*
+X	 * Split right.  The key/data pairs aren't sorted in the btree page so
+X	 * it's simpler to copy the data from the split page onto two new pages
+X	 * instead of copying half the data to the right page and compacting
+X	 * the left page in place.  Since the left page can't change, we have
+X	 * to swap the original and the allocated left page after the split.
+X	 */
+X	tp = bt_psplit(t, h, l, r, skip, ilen);
+X
+X	/* Move the new left page onto the old left page. */
+X	memmove(h, l, t->bt_psize);
+X	if (tp == l)
+X		tp = h;
+X	free(l);
+X
+X	*lp = h;
+X	*rp = r;
+X	return (tp);
+X}
+X
+X/*
+X * BT_ROOT -- Split the root page of a btree.
+X *
+X * Parameters:
+X *	t:	tree
+X *	h:	root page
+X *	lp:	pointer to left page pointer
+X *	rp:	pointer to right page pointer
+X *	skip:	pointer to index to leave open
+X *	ilen:	insert length
+X *
+X * Returns:
+X *	Pointer to page in which to insert or NULL on error.
+X */
+Xstatic PAGE *
+Xbt_root(t, h, lp, rp, skip, ilen)
+X	BTREE *t;
+X	PAGE *h, **lp, **rp;
+X	u_int *skip;
+X	size_t ilen;
+X{
+X	PAGE *l, *r, *tp;
+X	pgno_t lnpg, rnpg;
+X
+X#ifdef STATISTICS
+X	++bt_split;
+X	++bt_rootsplit;
+X#endif
+X	/* Put the new left and right pages for the split into place. */
+X	if ((l = __bt_new(t, &lnpg)) == NULL ||
+X	    (r = __bt_new(t, &rnpg)) == NULL)
+X		return (NULL);
+X	l->pgno = lnpg;
+X	r->pgno = rnpg;
+X	l->nextpg = r->pgno;
+X	r->prevpg = l->pgno;
+X	l->prevpg = r->nextpg = P_INVALID;
+X	l->lower = r->lower = BTDATAOFF;
+X	l->upper = r->upper = t->bt_psize;
+X	l->flags = r->flags = h->flags & P_TYPE;
+X
+X	/* Split the root page. */
+X	tp = bt_psplit(t, h, l, r, skip, ilen);
+X
+X	*lp = l;
+X	*rp = r;
+X	return (tp);
+X}
+X
+X/*
+X * BT_RROOT -- Fix up the recno root page after it has been split.
+X *
+X * Parameters:
+X *	t:	tree
+X *	h:	root page
+X *	l:	left page
+X *	r:	right page
+X *
+X * Returns:
+X *	RET_ERROR, RET_SUCCESS
+X */
+Xstatic int
+Xbt_rroot(t, h, l, r)
+X	BTREE *t;
+X	PAGE *h, *l, *r;
+X{
+X	char *dest;
+X
+X	/* Insert the left and right keys, set the header information. */
+X	h->linp[0] = h->upper = t->bt_psize - NRINTERNAL;
+X	dest = (char *)h + h->upper;
+X	WR_RINTERNAL(dest,
+X	    l->flags & P_RLEAF ? NEXTINDEX(l) : rec_total(l), l->pgno);
+X
+X	h->linp[1] = h->upper -= NRINTERNAL;
+X	dest = (char *)h + h->upper;
+X	WR_RINTERNAL(dest,
+X	    r->flags & P_RLEAF ? NEXTINDEX(r) : rec_total(r), r->pgno);
+X
+X	h->lower = BTDATAOFF + 2 * sizeof(indx_t);
+X
+X	/* Unpin the root page, set to recno internal page. */
+X	h->flags &= ~P_TYPE;
+X	h->flags |= P_RINTERNAL;
+X	mpool_put(t->bt_mp, h, MPOOL_DIRTY);
+X
+X	return (RET_SUCCESS);
+X}
+X
+X/*
+X * BT_BROOT -- Fix up the btree root page after it has been split.
+X *
+X * Parameters:
+X *	t:	tree
+X *	h:	root page
+X *	l:	left page
+X *	r:	right page
+X *
+X * Returns:
+X *	RET_ERROR, RET_SUCCESS
+X */
+Xstatic int
+Xbt_broot(t, h, l, r)
+X	BTREE *t;
+X	PAGE *h, *l, *r;
+X{
+X	BINTERNAL *bi;
+X	BLEAF *bl;
+X	size_t nbytes;
+X	char *dest;
+X
+X	/*
+X	 * If the root page was a leaf page, change it into an internal page.
+X	 * We copy the key we split on (but not the key's data, in the case of
+X	 * a leaf page) to the new root page.
+X	 *
+X	 * The btree comparison code guarantees that the left-most key on any
+X	 * level of the tree is never used, so it doesn't need to be filled in.
+X	 */
+X	nbytes = NBINTERNAL(0);
+X	h->linp[0] = h->upper = t->bt_psize - nbytes;
+X	dest = (char *)h + h->upper;
+X	WR_BINTERNAL(dest, 0, l->pgno, 0);
+X
+X	switch(h->flags & P_TYPE) {
+X	case P_BLEAF:
+X		bl = GETBLEAF(r, 0);
+X		nbytes = NBINTERNAL(bl->ksize);
+X		h->linp[1] = h->upper -= nbytes;
+X		dest = (char *)h + h->upper;
+X		WR_BINTERNAL(dest, bl->ksize, r->pgno, 0);
+X		memmove(dest, bl->bytes, bl->ksize);
+X
+X		/*
+X		 * If the key is on an overflow page, mark the overflow chain
+X		 * so it isn't deleted when the leaf copy of the key is deleted.
+X		 */
+X		if (bl->flags & P_BIGKEY &&
+X		    bt_preserve(t, *(pgno_t *)bl->bytes) == RET_ERROR)
+X			return (RET_ERROR);
+X		break;
+X	case P_BINTERNAL:
+X		bi = GETBINTERNAL(r, 0);
+X		nbytes = NBINTERNAL(bi->ksize);
+X		h->linp[1] = h->upper -= nbytes;
+X		dest = (char *)h + h->upper;
+X		memmove(dest, bi, nbytes);
+X		((BINTERNAL *)dest)->pgno = r->pgno;
+X		break;
+X	default:
+X		abort();
+X	}
+X
+X	/* There are two keys on the page. */
+X	h->lower = BTDATAOFF + 2 * sizeof(indx_t);
+X
+X	/* Unpin the root page, set to btree internal page. */
+X	h->flags &= ~P_TYPE;
+X	h->flags |= P_BINTERNAL;
+X	mpool_put(t->bt_mp, h, MPOOL_DIRTY);
+X
+X	return (RET_SUCCESS);
+X}
+X
+X/*
+X * BT_PSPLIT -- Do the real work of splitting the page.
+X *
+X * Parameters:
+X *	t:	tree
+X *	h:	page to be split
+X *	l:	page to put lower half of data
+X *	r:	page to put upper half of data
+X *	pskip:	pointer to index to leave open
+X *	ilen:	insert length
+X *
+X * Returns:
+X *	Pointer to page in which to insert.
+X */
+Xstatic PAGE *
+Xbt_psplit(t, h, l, r, pskip, ilen)
+X	BTREE *t;
+X	PAGE *h, *l, *r;
+X	u_int *pskip;
+X	size_t ilen;
+X{
+X	BINTERNAL *bi;
+X	BLEAF *bl;
+X	RLEAF *rl;
+X	EPGNO *c;
+X	PAGE *rval;
+X	void *src;
+X	indx_t full, half, nxt, off, skip, top, used;
+X	size_t nbytes;
+X	int bigkeycnt, isbigkey;
+X
+X	/*
+X	 * Split the data to the left and right pages.  Leave the skip index
+X	 * open.  Additionally, make some effort not to split on an overflow
+X	 * key.  This makes internal page processing faster and can save
+X	 * space as overflow keys used by internal pages are never deleted.
+X	 */
+X	bigkeycnt = 0;
+X	skip = *pskip;
+X	full = t->bt_psize - BTDATAOFF;
+X	half = full / 2;
+X	used = 0;
+X	for (nxt = off = 0, top = NEXTINDEX(h); nxt < top; ++off) {
+X		if (skip == off) {
+X			nbytes = ilen;
+X			isbigkey = 0;		/* XXX: not really known. */
+X		} else
+X			switch (h->flags & P_TYPE) {
+X			case P_BINTERNAL:
+X				src = bi = GETBINTERNAL(h, nxt);
+X				nbytes = NBINTERNAL(bi->ksize);
+X				isbigkey = bi->flags & P_BIGKEY;
+X				break;
+X			case P_BLEAF:
+X				src = bl = GETBLEAF(h, nxt);
+X				nbytes = NBLEAF(bl);
+X				isbigkey = bl->flags & P_BIGKEY;
+X				break;
+X			case P_RINTERNAL:
+X				src = GETRINTERNAL(h, nxt);
+X				nbytes = NRINTERNAL;
+X				isbigkey = 0;
+X				break;
+X			case P_RLEAF:
+X				src = rl = GETRLEAF(h, nxt);
+X				nbytes = NRLEAF(rl);
+X				isbigkey = 0;
+X				break;
+X			default:
+X				abort();
+X			}
+X
+X		/*
+X		 * If the key/data pairs are substantial fractions of the max
+X		 * possible size for the page, it's possible to get situations
+X		 * where we decide to try and copy too much onto the left page.
+X		 * Make sure that doesn't happen.
+X		 */
+X		if (skip <= off && used + nbytes >= full) {
+X			--off;
+X			break;
+X		}
+X
+X		/* Copy the key/data pair, if not the skipped index. */
+X		if (skip != off) {
+X			++nxt;
+X
+X			l->linp[off] = l->upper -= nbytes;
+X			memmove((char *)l + l->upper, src, nbytes);
+X		}
+X
+X		used += nbytes;
+X		if (used >= half) {
+X			if (!isbigkey || bigkeycnt == 3)
+X				break;
+X			else
+X				++bigkeycnt;
+X		}
+X	}
+X
+X	/*
+X	 * Off is the last offset that's valid for the left page.
+X	 * Nxt is the first offset to be placed on the right page.
+X	 */
+X	l->lower += (off + 1) * sizeof(indx_t);
+X
+X	/*
+X	 * If splitting the page that the cursor was on, the cursor has to be
+X	 * adjusted to point to the same record as before the split.  If the
+X	 * cursor is at or past the skipped slot, the cursor is incremented by
+X	 * one.  If the cursor is on the right page, it is decremented by the
+X	 * number of records split to the left page.
+X	 *
+X	 * Don't bother checking for the B_SEQINIT flag, the page number will
+X	 * be P_INVALID.
+X	 */
+X	c = &t->bt_bcursor;
+X	if (c->pgno == h->pgno) {
+X		if (c->index >= skip)
+X			++c->index;
+X		if (c->index < nxt)			/* Left page. */
+X			c->pgno = l->pgno;
+X		else {					/* Right page. */
+X			c->pgno = r->pgno;
+X			c->index -= nxt;
+X		}
+X	}
+X
+X	/*
+X	 * If the skipped index was on the left page, just return that page.
+X	 * Otherwise, adjust the skip index to reflect the new position on
+X	 * the right page.
+X	 */
+X	if (skip <= off) {
+X		skip = 0;
+X		rval = l;
+X	} else {
+X		rval = r;
+X		*pskip -= nxt;
+X	}
+X
+X	for (off = 0; nxt < top; ++off) {
+X		if (skip == nxt) {
+X			++off;
+X			skip = 0;
+X		}
+X		switch (h->flags & P_TYPE) {
+X		case P_BINTERNAL:
+X			src = bi = GETBINTERNAL(h, nxt);
+X			nbytes = NBINTERNAL(bi->ksize);
+X			break;
+X		case P_BLEAF:
+X			src = bl = GETBLEAF(h, nxt);
+X			nbytes = NBLEAF(bl);
+X			break;
+X		case P_RINTERNAL:
+X			src = GETRINTERNAL(h, nxt);
+X			nbytes = NRINTERNAL;
+X			break;
+X		case P_RLEAF:
+X			src = rl = GETRLEAF(h, nxt);
+X			nbytes = NRLEAF(rl);
+X			break;
+X		default:
+X			abort();
+X		}
+X		++nxt;
+X		r->linp[off] = r->upper -= nbytes;
+X		memmove((char *)r + r->upper, src, nbytes);
+X	}
+X	r->lower += off * sizeof(indx_t);
+X
+X	/* If the key is being appended to the page, adjust the index. */
+X	if (skip == top)
+X		r->lower += sizeof(indx_t);
+X
+X	return (rval);
+X}
+X
+X/*
+X * BT_PRESERVE -- Mark a chain of pages as used by an internal node.
+X *
+X * Chains of indirect blocks pointed to by leaf nodes get reclaimed when the
+X * record that references them gets deleted.  Chains pointed to by internal
+X * pages never get deleted.  This routine marks a chain as pointed to by an
+X * internal page.
+X *
+X * Parameters:
+X *	t:	tree
+X *	pg:	page number of first page in the chain.
+X *
+X * Returns:
+X *	RET_SUCCESS, RET_ERROR.
+X */
+Xstatic int
+Xbt_preserve(t, pg)
+X	BTREE *t;
+X	pgno_t pg;
+X{
+X	PAGE *h;
+X
+X	if ((h = mpool_get(t->bt_mp, pg, 0)) == NULL)
+X		return (RET_ERROR);
+X	h->flags |= P_PRESERVE;
+X	mpool_put(t->bt_mp, h, MPOOL_DIRTY);
+X	return (RET_SUCCESS);
+X}
+X
+X/*
+X * REC_TOTAL -- Return the number of recno entries below a page.
+X *
+X * Parameters:
+X *	h:	page
+X *
+X * Returns:
+X *	The number of recno entries below a page.
+X *
+X * XXX
+X * These values could be set by the bt_psplit routine.  The problem is that the
+X * entry has to be popped off of the stack etc. or the values have to be passed
+X * all the way back to bt_split/bt_rroot and it's not very clean.
+X */
+Xstatic recno_t
+Xrec_total(h)
+X	PAGE *h;
+X{
+X	recno_t recs;
+X	indx_t nxt, top;
+X
+X	for (recs = 0, nxt = 0, top = NEXTINDEX(h); nxt < top; ++nxt)
+X		recs += GETRINTERNAL(h, nxt)->nrecs;
+X	return (recs);
+X}
+END_OF_FILE
+if test 22158 -ne `wc -c <'btree/bt_split.c'`; then
+    echo shar: \"'btree/bt_split.c'\" unpacked with wrong size!
+fi
+# end of 'btree/bt_split.c'
+fi
+if test -f 'doc/btree.3.ps' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'doc/btree.3.ps'\"
+else
+echo shar: Extracting \"'doc/btree.3.ps'\" \(16545 characters\)
+sed "s/^X//" >'doc/btree.3.ps' <<'END_OF_FILE'
+X%!PS-Adobe-3.0
+X%%Creator: groff version 1.08
+X%%DocumentNeededResources: font Times-Roman
+X%%+ font Times-Bold
+X%%+ font Times-Italic
+X%%DocumentSuppliedResources: procset grops 1.08 0
+X%%Pages: 2
+X%%PageOrder: Ascend
+X%%Orientation: Portrait
+X%%EndComments
+X%%BeginProlog
+X%%BeginResource: procset grops 1.08 0
+X/setpacking where{
+Xpop
+Xcurrentpacking
+Xtrue setpacking
+X}if
+X/grops 120 dict dup begin
+X/SC 32 def
+X/A/show load def
+X/B{0 SC 3 -1 roll widthshow}bind def
+X/C{0 exch ashow}bind def
+X/D{0 exch 0 SC 5 2 roll awidthshow}bind def
+X/E{0 rmoveto show}bind def
+X/F{0 rmoveto 0 SC 3 -1 roll widthshow}bind def
+X/G{0 rmoveto 0 exch ashow}bind def
+X/H{0 rmoveto 0 exch 0 SC 5 2 roll awidthshow}bind def
+X/I{0 exch rmoveto show}bind def
+X/J{0 exch rmoveto 0 SC 3 -1 roll widthshow}bind def
+X/K{0 exch rmoveto 0 exch ashow}bind def
+X/L{0 exch rmoveto 0 exch 0 SC 5 2 roll awidthshow}bind def
+X/M{rmoveto show}bind def
+X/N{rmoveto 0 SC 3 -1 roll widthshow}bind def
+X/O{rmoveto 0 exch ashow}bind def
+X/P{rmoveto 0 exch 0 SC 5 2 roll awidthshow}bind def
+X/Q{moveto show}bind def
+X/R{moveto 0 SC 3 -1 roll widthshow}bind def
+X/S{moveto 0 exch ashow}bind def
+X/T{moveto 0 exch 0 SC 5 2 roll awidthshow}bind def
+X/SF{
+Xfindfont exch
+X[exch dup 0 exch 0 exch neg 0 0]makefont
+Xdup setfont
+X[exch/setfont cvx]cvx bind def
+X}bind def
+X/MF{
+Xfindfont
+X[5 2 roll
+X0 3 1 roll 
+Xneg 0 0]makefont
+Xdup setfont
+X[exch/setfont cvx]cvx bind def
+X}bind def
+X/level0 0 def
+X/RES 0 def
+X/PL 0 def
+X/LS 0 def
+X/PLG{
+Xgsave newpath clippath pathbbox grestore
+Xexch pop add exch pop
+X}bind def
+X/BP{
+X/level0 save def
+X1 setlinecap
+X1 setlinejoin
+X72 RES div dup scale
+XLS{
+X90 rotate
+X}{
+X0 PL translate
+X}ifelse
+X1 -1 scale
+X}bind def
+X/EP{
+Xlevel0 restore
+Xshowpage
+X}bind def
+X/DA{
+Xnewpath arcn stroke
+X}bind def
+X/SN{
+Xtransform
+X.25 sub exch .25 sub exch
+Xround .25 add exch round .25 add exch
+Xitransform
+X}bind def
+X/DL{
+XSN
+Xmoveto
+XSN
+Xlineto stroke
+X}bind def
+X/DC{
+Xnewpath 0 360 arc closepath
+X}bind def
+X/TM matrix def
+X/DE{
+XTM currentmatrix pop
+Xtranslate scale newpath 0 0 .5 0 360 arc closepath
+XTM setmatrix
+X}bind def
+X/RC/rcurveto load def
+X/RL/rlineto load def
+X/ST/stroke load def
+X/MT/moveto load def
+X/CL/closepath load def
+X/FL{
+Xcurrentgray exch setgray fill setgray
+X}bind def
+X/BL/fill load def
+X/LW/setlinewidth load def
+X/RE{
+Xfindfont
+Xdup maxlength 1 index/FontName known not{1 add}if dict begin
+X{
+X1 index/FID ne{def}{pop pop}ifelse
+X}forall
+X/Encoding exch def
+Xdup/FontName exch def
+Xcurrentdict end definefont pop
+X}bind def
+X/DEFS 0 def
+X/EBEGIN{
+Xmoveto
+XDEFS begin
+X}bind def
+X/EEND/end load def
+X/CNT 0 def
+X/level1 0 def
+X/PBEGIN{
+X/level1 save def
+Xtranslate
+Xdiv 3 1 roll div exch scale
+Xneg exch neg exch translate
+X0 setgray
+X0 setlinecap
+X1 setlinewidth
+X0 setlinejoin
+X10 setmiterlimit
+X[]0 setdash
+X/setstrokeadjust where{
+Xpop
+Xfalse setstrokeadjust
+X}if
+X/setoverprint where{
+Xpop
+Xfalse setoverprint
+X}if
+Xnewpath
+X/CNT countdictstack def
+Xuserdict begin
+X/showpage{}def
+X}bind def
+X/PEND{
+Xclear
+Xcountdictstack CNT sub{end}repeat
+Xlevel1 restore
+X}bind def
+Xend def
+X/setpacking where{
+Xpop
+Xsetpacking
+X}if
+X%%EndResource
+X%%IncludeResource: font Times-Roman
+X%%IncludeResource: font Times-Bold
+X%%IncludeResource: font Times-Italic
+Xgrops begin/DEFS 1 dict def DEFS begin/u{.001 mul}bind def end/RES 72 def/PL
+X792 def/LS false def/ENC0[/asciicircum/asciitilde/Scaron/Zcaron/scaron/zcaron
+X/Ydieresis/trademark/quotesingle/.notdef/.notdef/.notdef/.notdef/.notdef
+X/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef
+X/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef/.notdef/space
+X/exclam/quotedbl/numbersign/dollar/percent/ampersand/quoteright/parenleft
+X/parenright/asterisk/plus/comma/hyphen/period/slash/zero/one/two/three/four
+X/five/six/seven/eight/nine/colon/semicolon/less/equal/greater/question/at/A/B/C
+X/D/E/F/G/H/I/J/K/L/M/N/O/P/Q/R/S/T/U/V/W/X/Y/Z/bracketleft/backslash
+X/bracketright/circumflex/underscore/quoteleft/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q
+X/r/s/t/u/v/w/x/y/z/braceleft/bar/braceright/tilde/.notdef/quotesinglbase
+X/guillemotleft/guillemotright/bullet/florin/fraction/perthousand/dagger
+X/daggerdbl/endash/emdash/ff/fi/fl/ffi/ffl/dotlessi/dotlessj/grave/hungarumlaut
+X/dotaccent/breve/caron/ring/ogonek/quotedblleft/quotedblright/oe/lslash
+X/quotedblbase/OE/Lslash/.notdef/exclamdown/cent/sterling/currency/yen/brokenbar
+X/section/dieresis/copyright/ordfeminine/guilsinglleft/logicalnot/minus
+X/registered/macron/degree/plusminus/twosuperior/threesuperior/acute/mu
+X/paragraph/periodcentered/cedilla/onesuperior/ordmasculine/guilsinglright
+X/onequarter/onehalf/threequarters/questiondown/Agrave/Aacute/Acircumflex/Atilde
+X/Adieresis/Aring/AE/Ccedilla/Egrave/Eacute/Ecircumflex/Edieresis/Igrave/Iacute
+X/Icircumflex/Idieresis/Eth/Ntilde/Ograve/Oacute/Ocircumflex/Otilde/Odieresis
+X/multiply/Oslash/Ugrave/Uacute/Ucircumflex/Udieresis/Yacute/Thorn/germandbls
+X/agrave/aacute/acircumflex/atilde/adieresis/aring/ae/ccedilla/egrave/eacute
+X/ecircumflex/edieresis/igrave/iacute/icircumflex/idieresis/eth/ntilde/ograve
+X/oacute/ocircumflex/otilde/odieresis/divide/oslash/ugrave/uacute/ucircumflex
+X/udieresis/yacute/thorn/ydieresis]def/Times-Italic@0 ENC0/Times-Italic RE
+X/Times-Bold@0 ENC0/Times-Bold RE/Times-Roman@0 ENC0/Times-Roman RE
+X%%EndProlog
+X%%Page: 1 1
+X%%BeginPageSetup
+XBP
+X%%EndPageSetup
+X/F0 10/Times-Roman@0 SF 378.84(BTREE\(3\) BTREE\(3\))72 48 R/F1 9/Times-Bold@0
+XSF -.18(NA)72 84 S(ME).18 E F0(btree \255 btree database access method)108 96 Q
+XF1(SYNOPSIS)72 112.8 Q/F2 10/Times-Bold@0 SF(#include <sys/types.h>)108 124.8 Q
+X(#include <db)108 136.8 Q(.h>)-.4 E F1(DESCRIPTION)72 153.6 Q F0 .198
+X(The routine)108 165.6 R/F3 10/Times-Italic@0 SF(dbopen)2.698 E F0 .198
+X(is the library interf)2.698 F .198(ace to database \214les.)-.1 F .198
+X(One of the supported \214le formats is btree \214les.)5.198 F .974
+X(The general description of the database access methods is in)108 177.6 R F3
+X(dbopen)3.475 E F0 .975(\(3\), this manual page describes only).24 F
+X(the btree speci\214c information.)108 189.6 Q(The btree data structure is a s\
+Xorted, balanced tree structure storing associated k)108 206.4 Q -.15(ey)-.1 G
+X(/data pairs.).15 E .504(The btree access method speci\214c data structure pro)
+X108 223.2 R .504(vided to)-.15 F F3(dbopen)3.004 E F0 .503
+X(is de\214ned in the <db)3.003 F .503(.h> include \214le as)-.4 F(follo)108
+X235.2 Q(ws:)-.25 E(typedef struct {)108 252 Q(u_long \215ags;)144 264 Q
+X(u_int cachesize;)144 276 Q(inde)144 288 Q(x_t psize;)-.15 E(int lorder;)144
+X300 Q(int mink)144 312 Q -.15(ey)-.1 G(page;).15 E
+X(int \(*compare\)\(const DBT *k)144 324 Q -.15(ey)-.1 G(1, const DBT *k).15 E
+X-.15(ey)-.1 G(2\);).15 E(int \(*pre\214x\)\(const DBT *k)144 336 Q -.15(ey)-.1
+XG(1, const DBT *k).15 E -.15(ey)-.1 G(2\);).15 E 2.5(}B)108 348 S(TREEINFO;)
+X121.97 348 Q(The elements of this structure are as follo)108 364.8 Q(ws:)-.25 E
+X14.61(\215ags The)108 381.6 R(\215ag v)2.5 E(alue is speci\214ed by)-.25 E F3
+X(or)2.5 E F0('ing an).73 E 2.5(yo)-.15 G 2.5(ft)313.2 381.6 S(he follo)321.81
+X381.6 Q(wing v)-.25 E(alues:)-.25 E(R_DUP)144 398.4 Q 1.296(Permit duplicate k)
+X180 410.4 R -.15(ey)-.1 G 3.796(si).15 G 3.796(nt)275.578 410.4 S 1.296
+X(he tree, i.e. permit insertion if the k)287.154 410.4 R 1.596 -.15(ey t)-.1 H
+X3.796(ob).15 G 3.796(ei)466.878 410.4 S 1.296(nserted already)477.894 410.4 R
+X-.15(ex)180 422.4 S 1.935(ists in the tree.).15 F 1.935(The def)6.935 F 1.935
+X(ault beha)-.1 F(vior)-.2 E 4.435(,a)-.4 G 4.435(sd)358.215 422.4 S 1.935
+X(escribed in)371.54 422.4 R F3(dbopen)4.435 E F0 1.935(\(3\), is to o).24 F
+X-.15(ve)-.15 G 1.935(rwrite a).15 F .148(matching k)180 434.4 R .448 -.15(ey w)
+X-.1 H .148(hen inserting a ne).15 F 2.649(wk)-.25 G .449 -.15(ey o)329.709
+X434.4 T 2.649(rt).15 G 2.649(of)355.407 434.4 S .149(ail if the R_NOO)366.286
+X434.4 R(VER)-.5 E .149(WRITE \215ag is speci-)-.55 F 5.972(\214ed. The)180
+X446.4 R 3.472(R_DUP \215ag is o)5.972 F -.15(ve)-.15 G 3.472
+X(rridden by the R_NOO).15 F(VER)-.5 E 3.471(WRITE \215ag, and if the)-.55 F
+X(R_NOO)180 458.4 Q(VER)-.5 E .781
+X(WRITE \215ag is speci\214ed, attempts to insert duplicate k)-.55 F -.15(ey)-.1
+XG 3.282(si).15 G .782(nto the tree will)474.604 458.4 R -.1(fa)180 470.4 S(il.)
+X.1 E 1.13(If the database contains duplicate k)180 487.2 R -.15(ey)-.1 G 1.129
+X(s, the order of retrie).15 F -.25(va)-.25 G 3.629(lo).25 G 3.629(fk)439.644
+X487.2 S -.15(ey)451.503 487.2 S 1.129(/data pairs is unde-).15 F .837
+X(\214ned if the)180 499.2 R F3 -.1(ge)3.337 G(t).1 E F0 .837
+X(routine is used, ho)3.337 F(we)-.25 E -.15(ve)-.25 G -.4(r,).15 G F3(seq)3.737
+XE F0 .838(routine calls with the R_CURSOR \215ag set)3.337 F(will al)180 511.2
+XQ -.1(wa)-.1 G(ys return the logical `).1 E(`\214rst')-.74 E 2.5('o)-.74 G 2.5
+X(fa)333.85 511.2 S .3 -.15(ny g)344.12 511.2 T(roup of duplicate k).15 E -.15
+X(ey)-.1 G(s.).15 E(cachesize)108 528 Q 3.056(As)144 540 S .556
+X(uggested maximum size \(in bytes\) of the memory cache.)158.166 540 R .555
+X(This v)5.556 F .555(alue is)-.25 F F2(only)3.055 E F0(advisory)3.055 E 3.055
+X(,a)-.65 G .555(nd the)514.725 540 R .759
+X(access method will allocate more memory rather than f)144 552 R 3.259
+X(ail. Since)-.1 F -2.15 -.25(ev e)3.259 H .76(ry search e).25 F .76
+X(xamines the root)-.15 F .055
+X(page of the tree, caching the most recently used pages substantially impro)144
+X564 R -.15(ve)-.15 G 2.554(sa).15 G .054(ccess time.)459.578 564 R .054
+X(In addi-)5.054 F .661(tion, ph)144 576 R .662(ysical writes are delayed as lo\
+Xng as possible, so a moderate cache can reduce the number)-.05 F .601
+X(of I/O operations signi\214cantly)144 588 R 5.601(.O)-.65 G -.15(bv)280.744
+X588 S(iously).15 E 3.101(,u)-.65 G .601(sing a cache increases \(b)324.995 588
+XR .6(ut only increases\) the lik)-.2 F(eli-)-.1 E .19(hood of corruption or lo\
+Xst data if the system crashes while a tree is being modi\214ed.)144 600 R(If)
+X5.191 E F3(cac)2.691 E(hesize)-.15 E F0(is)2.691 E 2.5(0\()144 612 S
+X(no size is speci\214ed\) a def)154.83 612 Q(ault cache is used.)-.1 E 12.95
+X(psize P)108 628.8 R .45
+X(age size is the size \(in bytes\) of the pages used for nodes in the tree.)
+X-.15 F .449(The minimum page size is)5.449 F .442
+X(512 bytes and the maximum page size is 64K.)144 640.8 R(If)5.442 E F3(psize)
+X2.942 E F0 .442(is 0 \(no page size is speci\214ed\) a page size)2.942 F
+X(is chosen based on the underlying \214le system I/O block size.)144 652.8 Q
+X9.62(lorder The)108 669.6 R 1.597(byte order for inte)4.097 F 1.596
+X(gers in the stored database metadata.)-.15 F 1.596
+X(The number should represent the)6.596 F .688(order as an inte)144 681.6 R .689
+X(ger; for e)-.15 F .689(xample, big endian order w)-.15 F .689
+X(ould be the number 4,321.)-.1 F(If)5.689 E F3(lor)3.189 E(der)-.37 E F0 .689
+X(is 0 \(no)3.189 F(order is speci\214ed\) the current host order is used.)144
+X693.6 Q(1)535 768 Q EP
+X%%Page: 2 2
+X%%BeginPageSetup
+XBP
+X%%EndPageSetup
+X/F0 10/Times-Roman@0 SF 378.84(BTREE\(3\) BTREE\(3\))72 48 R(mink)108 84 Q -.15
+X(ey)-.1 G(page).15 E 1.423(The minimum number of k)144 96 R -.15(ey)-.1 G 3.923
+X(sw).15 G 1.422(hich will be stored on an)282.245 96 R 3.922(ys)-.15 G 1.422
+X(ingle page.)400.618 96 R 1.422(This v)6.422 F 1.422(alue is used to)-.25 F
+X.257(determine which k)144 108 R -.15(ey)-.1 G 2.757(sw).15 G .257
+X(ill be stored on o)242.001 108 R -.15(ve)-.15 G(r\215o).15 E 2.757(wp)-.25 G
+X.257(ages, i.e. if a k)348.006 108 R .558 -.15(ey o)-.1 H 2.758(rd).15 G .258
+X(ata item is longer than the)435.11 108 R 1.102(pagesize di)144 120 R 1.102
+X(vided by the mink)-.25 F -.15(ey)-.1 G 1.102(page v).15 F 1.102
+X(alue, it will be stored on o)-.25 F -.15(ve)-.15 G(r\215o).15 E 3.602(wp)-.25
+XG 1.102(ages instead of in the)451.164 120 R(page itself.)144 132 Q(If)5 E/F1
+X10/Times-Italic@0 SF(mink)2.5 E -.3(ey)-.1 G(pa).3 E -.1(ge)-.1 G F0
+X(is 0 \(no minimum number of k)2.6 E -.15(ey)-.1 G 2.5(si).15 G 2.5(ss)392.84
+X132 S(peci\214ed\) a v)403.12 132 Q(alue of 2 is used.)-.25 E(compare)108 148.8
+XQ .751(Compare is the k)144 160.8 R 1.051 -.15(ey c)-.1 H .751
+X(omparison function.).15 F .751(It must return an inte)5.751 F .752
+X(ger less than, equal to, or greater)-.15 F .913(than zero if the \214rst k)144
+X172.8 R 1.213 -.15(ey a)-.1 H -.18(rg).15 G .913
+X(ument is considered to be respecti).18 F -.15(ve)-.25 G .913
+X(ly less than, equal to, or greater).15 F .352(than the second k)144 184.8 R
+X.652 -.15(ey a)-.1 H -.18(rg).15 G 2.852(ument. The).18 F .353
+X(same comparison function must be used on a gi)2.852 F -.15(ve)-.25 G 2.853(nt)
+X.15 G .353(ree e)503.127 184.8 R -.15(ve)-.25 G(ry).15 E .817
+X(time it is opened.)144 196.8 R(If)5.817 E F1(compar)3.317 E(e)-.37 E F0 .817
+X(is NULL \(no comparison function is speci\214ed\), the k)3.317 F -.15(ey)-.1 G
+X3.316(sa).15 G .816(re com-)508.364 196.8 R(pared le)144 208.8 Q(xically)-.15 E
+X2.5(,w)-.65 G(ith shorter k)214.57 208.8 Q -.15(ey)-.1 G 2.5(sc).15 G
+X(onsidered less than longer k)282.92 208.8 Q -.15(ey)-.1 G(s.).15 E 10.17
+X(pre\214x Pre\214x)108 225.6 R .291(is the pre\214x comparison function.)2.791
+XF .292(If speci\214ed, this routine must return the number of bytes)5.291 F
+X.937(of the second k)144 237.6 R 1.237 -.15(ey a)-.1 H -.18(rg).15 G .937
+X(ument which are necessary to determine that it is greater than the \214rst k)
+X.18 F -.15(ey)-.1 G(ar)144 249.6 Q 3.477(gument. If)-.18 F .977(the k)3.477 F
+X-.15(ey)-.1 G 3.477(sa).15 G .977(re equal, the k)241.898 249.6 R 1.277 -.15
+X(ey l)-.1 H .978(ength should be returned.).15 F .978
+X(Note, the usefulness of this)5.978 F .558(routine is v)144 261.6 R .558
+X(ery data dependent, b)-.15 F .558
+X(ut, in some data sets can produce signi\214cantly reduced tree sizes)-.2 F
+X.354(and search times.)144 273.6 R(If)5.354 E F1(pr)2.854 E(e\214x)-.37 E F0
+X.354(is NULL \(no pre\214x function is speci\214ed\),)2.854 F/F2 10
+X/Times-Bold@0 SF(and)2.854 E F0 .354(no comparison function)2.854 F .193
+X(is speci\214ed, a def)144 285.6 R .193(ault le)-.1 F .193
+X(xical comparison routine is used.)-.15 F(If)5.192 E F1(pr)2.692 E(e\214x)-.37
+XE F0 .192(is NULL and a comparison rou-)2.692 F
+X(tine is speci\214ed, no pre\214x comparison is done.)144 297.6 Q .79
+X(If the \214le already e)108 314.4 R .79(xists \(and the O_TR)-.15 F .79
+X(UNC \215ag is not speci\214ed\), the v)-.4 F .79
+X(alues speci\214ed for the parameters)-.25 F
+X(\215ags, lorder and psize are ignored in f)108 326.4 Q -.2(avo)-.1 G 2.5(ro).2
+XG 2.5(ft)284.4 326.4 S(he v)293.01 326.4 Q(alues used when the tree w)-.25 E
+X(as created.)-.1 E -.15(Fo)108 343.2 S(rw).15 E
+X(ard sequential scans of a tree are from the least k)-.1 E .3 -.15(ey t)-.1 H
+X2.5(ot).15 G(he greatest.)348.55 343.2 Q 1.043(Space freed up by deleting k)108
+X360 R -.15(ey)-.1 G 1.043(/data pairs from the tree is ne).15 F -.15(ve)-.25 G
+X3.543(rr).15 G 1.043(eclaimed, although it is normally made)378.686 360 R -.2
+X(av)108 372 S 1.394(ailable for reuse.)-.05 F 1.394
+X(This means that the btree storage structure is gro)6.394 F(w-only)-.25 E 6.395
+X(.T)-.65 G 1.395(he only solutions are to)441.09 372 R -.2(avo)108 384 S(id e)
+X.2 E(xcessi)-.15 E .3 -.15(ve d)-.25 H
+X(eletions, or to create a fresh tree periodically from a scan of an e).15 E
+X(xisting one.)-.15 E .344(Searches, insertions, and deletions in a btree will \
+Xall complete in O lg base N where base is the a)108 400.8 R -.15(ve)-.2 G .343
+X(rage \214ll).15 F -.1(fa)108 412.8 S(ctor).1 E 5.798(.O)-.55 G .799
+X(ften, inserting ordered data into btrees results in a lo)146.188 412.8 R 3.299
+X<778c>-.25 G .799(ll f)377.505 412.8 R(actor)-.1 E 5.799(.T)-.55 G .799
+X(his implementation has been)423.443 412.8 R(modi\214ed to mak)108 424.8 Q 2.5
+X(eo)-.1 G(rdered insertion the best case, resulting in a much better than norm\
+Xal page \214ll f)185.4 424.8 Q(actor)-.1 E(.)-.55 E/F3 9/Times-Bold@0 SF
+X(SEE ALSO)72 441.6 Q F1(dbopen)108 453.6 Q F0(\(3\),).24 E F1(hash)2.5 E F0
+X(\(3\),).28 E F1(mpool)2.5 E F0(\(3\),).51 E F1 -.37(re)2.5 G(cno).37 E F0
+X(\(3\)).18 E F1(The Ubiquitous B-tr)108 477.6 Q(ee)-.37 E F0 2.5(,D).18 G
+X(ouglas Comer)209.47 477.6 Q 2.5(,A)-.4 G(CM Comput. Surv)276.72 477.6 Q 2.5
+X(.1)-.65 G(1, 2 \(June 1979\), 121-138.)360.25 477.6 Q F1(Pr)108 501.6 Q 1.588
+X(e\214x B-tr)-.37 F(ees)-.37 E F0 4.088(,B).27 G 1.587(ayer and Unterauer)
+X177.636 501.6 R 4.087(,A)-.4 G 1.587(CM T)270.447 501.6 R 1.587
+X(ransactions on Database Systems, V)-.35 F 1.587(ol. 2, 1 \(March 1977\),)-1.29
+XF(11-26.)108 513.6 Q F1(The Art of Computer Pr)108 537.6 Q -.1(og)-.45 G -.15
+X(ra).1 G(mming V).15 E(ol. 3: Sorting and Sear)-1.11 E -.15(ch)-.37 G(ing).15 E
+XF0 2.5(,D).22 G(.E. Knuth, 1968, pp 471-480.)382 537.6 Q F3 -.09(BU)72 554.4 S
+X(GS).09 E F0(Only big and little endian byte order is supported.)108 566.4 Q(2)
+X535 768 Q EP
+X%%Trailer
+Xend
+X%%EOF
+END_OF_FILE
+if test 16545 -ne `wc -c <'doc/btree.3.ps'`; then
+    echo shar: \"'doc/btree.3.ps'\" unpacked with wrong size!
+fi
+# end of 'doc/btree.3.ps'
+fi
+if test -f 'hash/hash_bigkey.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'hash/hash_bigkey.c'\"
+else
+echo shar: Extracting \"'hash/hash_bigkey.c'\" \(16249 characters\)
+sed "s/^X//" >'hash/hash_bigkey.c' <<'END_OF_FILE'
+X/*-
+X * Copyright (c) 1990, 1993
+X *	The Regents of the University of California.  All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Margo Seltzer.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Berkeley and its contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#if defined(LIBC_SCCS) && !defined(lint)
+Xstatic char sccsid[] = "@(#)hash_bigkey.c	8.1 (Berkeley) 6/4/93";
+X#endif /* LIBC_SCCS and not lint */
+X
+X/*
+X * PACKAGE: hash
+X * DESCRIPTION:
+X *	Big key/data handling for the hashing package.
+X *
+X * ROUTINES:
+X * External
+X *	__big_keydata
+X *	__big_split
+X *	__big_insert
+X *	__big_return
+X *	__big_delete
+X *	__find_last_page
+X * Internal
+X *	collect_key
+X *	collect_data
+X */
+X
+X#include <sys/param.h>
+X
+X#include <errno.h>
+X#include <stdio.h>
+X#include <stdlib.h>
+X#include <string.h>
+X
+X#ifdef DEBUG
+X#include <assert.h>
+X#endif
+X
+X#include <db.h>
+X#include "hash.h"
+X#include "page.h"
+X#include "extern.h"
+X
+Xstatic int collect_key __P((HTAB *, BUFHEAD *, int, DBT *, int));
+Xstatic int collect_data __P((HTAB *, BUFHEAD *, int, int));
+X
+X/*
+X * Big_insert
+X *
+X * You need to do an insert and the key/data pair is too big
+X *
+X * Returns:
+X * 0 ==> OK
+X *-1 ==> ERROR
+X */
+Xextern int
+X__big_insert(hashp, bufp, key, val)
+X	HTAB *hashp;
+X	BUFHEAD *bufp;
+X	const DBT *key, *val;
+X{
+X	register u_short *p;
+X	int key_size, n, val_size;
+X	u_short space, move_bytes, off;
+X	char *cp, *key_data, *val_data;
+X
+X	cp = bufp->page;		/* Character pointer of p. */
+X	p = (u_short *)cp;
+X
+X	key_data = (char *)key->data;
+X	key_size = key->size;
+X	val_data = (char *)val->data;
+X	val_size = val->size;
+X
+X	/* First move the Key */
+X	for (space = FREESPACE(p) - BIGOVERHEAD; key_size;
+X	    space = FREESPACE(p) - BIGOVERHEAD) {
+X		move_bytes = MIN(space, key_size);
+X		off = OFFSET(p) - move_bytes;
+X		memmove(cp + off, key_data, move_bytes);
+X		key_size -= move_bytes;
+X		key_data += move_bytes;
+X		n = p[0];
+X		p[++n] = off;
+X		p[0] = ++n;
+X		FREESPACE(p) = off - PAGE_META(n);
+X		OFFSET(p) = off;
+X		p[n] = PARTIAL_KEY;
+X		bufp = __add_ovflpage(hashp, bufp);
+X		if (!bufp)
+X			return (-1);
+X		n = p[0];
+X		if (!key_size)
+X			if (FREESPACE(p)) {
+X				move_bytes = MIN(FREESPACE(p), val_size);
+X				off = OFFSET(p) - move_bytes;
+X				p[n] = off;
+X				memmove(cp + off, val_data, move_bytes);
+X				val_data += move_bytes;
+X				val_size -= move_bytes;
+X				p[n - 2] = FULL_KEY_DATA;
+X				FREESPACE(p) = FREESPACE(p) - move_bytes;
+X				OFFSET(p) = off;
+X			} else
+X				p[n - 2] = FULL_KEY;
+X		p = (u_short *)bufp->page;
+X		cp = bufp->page;
+X		bufp->flags |= BUF_MOD;
+X	}
+X
+X	/* Now move the data */
+X	for (space = FREESPACE(p) - BIGOVERHEAD; val_size;
+X	    space = FREESPACE(p) - BIGOVERHEAD) {
+X		move_bytes = MIN(space, val_size);
+X		/*
+X		 * Here's the hack to make sure that if the data ends on the
+X		 * same page as the key ends, FREESPACE is at least one.
+X		 */
+X		if (space == val_size && val_size == val->size)
+X			move_bytes--;
+X		off = OFFSET(p) - move_bytes;
+X		memmove(cp + off, val_data, move_bytes);
+X		val_size -= move_bytes;
+X		val_data += move_bytes;
+X		n = p[0];
+X		p[++n] = off;
+X		p[0] = ++n;
+X		FREESPACE(p) = off - PAGE_META(n);
+X		OFFSET(p) = off;
+X		if (val_size) {
+X			p[n] = FULL_KEY;
+X			bufp = __add_ovflpage(hashp, bufp);
+X			if (!bufp)
+X				return (-1);
+X			cp = bufp->page;
+X			p = (u_short *)cp;
+X		} else
+X			p[n] = FULL_KEY_DATA;
+X		bufp->flags |= BUF_MOD;
+X	}
+X	return (0);
+X}
+X
+X/*
+X * Called when bufp's page  contains a partial key (index should be 1)
+X *
+X * All pages in the big key/data pair except bufp are freed.  We cannot
+X * free bufp because the page pointing to it is lost and we can't get rid
+X * of its pointer.
+X *
+X * Returns:
+X * 0 => OK
+X *-1 => ERROR
+X */
+Xextern int
+X__big_delete(hashp, bufp)
+X	HTAB *hashp;
+X	BUFHEAD *bufp;
+X{
+X	register BUFHEAD *last_bfp, *rbufp;
+X	u_short *bp, pageno;
+X	int key_done, n;
+X
+X	rbufp = bufp;
+X	last_bfp = NULL;
+X	bp = (u_short *)bufp->page;
+X	pageno = 0;
+X	key_done = 0;
+X
+X	while (!key_done || (bp[2] != FULL_KEY_DATA)) {
+X		if (bp[2] == FULL_KEY || bp[2] == FULL_KEY_DATA)
+X			key_done = 1;
+X
+X		/*
+X		 * If there is freespace left on a FULL_KEY_DATA page, then
+X		 * the data is short and fits entirely on this page, and this
+X		 * is the last page.
+X		 */
+X		if (bp[2] == FULL_KEY_DATA && FREESPACE(bp))
+X			break;
+X		pageno = bp[bp[0] - 1];
+X		rbufp->flags |= BUF_MOD;
+X		rbufp = __get_buf(hashp, pageno, rbufp, 0);
+X		if (last_bfp)
+X			__free_ovflpage(hashp, last_bfp);
+X		last_bfp = rbufp;
+X		if (!rbufp)
+X			return (-1);		/* Error. */
+X		bp = (u_short *)rbufp->page;
+X	}
+X
+X	/*
+X	 * If we get here then rbufp points to the last page of the big
+X	 * key/data pair.  Bufp points to the first one -- it should now be
+X	 * empty pointing to the next page after this pair.  Can't free it
+X	 * because we don't have the page pointing to it.
+X	 */
+X
+X	/* This is information from the last page of the pair. */
+X	n = bp[0];
+X	pageno = bp[n - 1];
+X
+X	/* Now, bp is the first page of the pair. */
+X	bp = (u_short *)bufp->page;
+X	if (n > 2) {
+X		/* There is an overflow page. */
+X		bp[1] = pageno;
+X		bp[2] = OVFLPAGE;
+X		bufp->ovfl = rbufp->ovfl;
+X	} else
+X		/* This is the last page. */
+X		bufp->ovfl = NULL;
+X	n -= 2;
+X	bp[0] = n;
+X	FREESPACE(bp) = hashp->BSIZE - PAGE_META(n);
+X	OFFSET(bp) = hashp->BSIZE - 1;
+X
+X	bufp->flags |= BUF_MOD;
+X	if (rbufp)
+X		__free_ovflpage(hashp, rbufp);
+X	if (last_bfp != rbufp)
+X		__free_ovflpage(hashp, last_bfp);
+X
+X	hashp->NKEYS--;
+X	return (0);
+X}
+X/*
+X * Returns:
+X *  0 = key not found
+X * -1 = get next overflow page
+X * -2 means key not found and this is big key/data
+X * -3 error
+X */
+Xextern int
+X__find_bigpair(hashp, bufp, ndx, key, size)
+X	HTAB *hashp;
+X	BUFHEAD *bufp;
+X	int ndx;
+X	char *key;
+X	int size;
+X{
+X	register u_short *bp;
+X	register char *p;
+X	int ksize;
+X	u_short bytes;
+X	char *kkey;
+X
+X	bp = (u_short *)bufp->page;
+X	p = bufp->page;
+X	ksize = size;
+X	kkey = key;
+X
+X	for (bytes = hashp->BSIZE - bp[ndx];
+X	    bytes <= size && bp[ndx + 1] == PARTIAL_KEY;
+X	    bytes = hashp->BSIZE - bp[ndx]) {
+X		if (memcmp(p + bp[ndx], kkey, bytes))
+X			return (-2);
+X		kkey += bytes;
+X		ksize -= bytes;
+X		bufp = __get_buf(hashp, bp[ndx + 2], bufp, 0);
+X		if (!bufp)
+X			return (-3);
+X		p = bufp->page;
+X		bp = (u_short *)p;
+X		ndx = 1;
+X	}
+X
+X	if (bytes != ksize || memcmp(p + bp[ndx], kkey, bytes)) {
+X#ifdef HASH_STATISTICS
+X		++hash_collisions;
+X#endif
+X		return (-2);
+X	} else
+X		return (ndx);
+X}
+X
+X/*
+X * Given the buffer pointer of the first overflow page of a big pair,
+X * find the end of the big pair
+X *
+X * This will set bpp to the buffer header of the last page of the big pair.
+X * It will return the pageno of the overflow page following the last page
+X * of the pair; 0 if there isn't any (i.e. big pair is the last key in the
+X * bucket)
+X */
+Xextern u_short
+X__find_last_page(hashp, bpp)
+X	HTAB *hashp;
+X	BUFHEAD **bpp;
+X{
+X	BUFHEAD *bufp;
+X	u_short *bp, pageno;
+X	int n;
+X
+X	bufp = *bpp;
+X	bp = (u_short *)bufp->page;
+X	for (;;) {
+X		n = bp[0];
+X
+X		/*
+X		 * This is the last page if: the tag is FULL_KEY_DATA and
+X		 * either only 2 entries OVFLPAGE marker is explicit there
+X		 * is freespace on the page.
+X		 */
+X		if (bp[2] == FULL_KEY_DATA &&
+X		    ((n == 2) || (bp[n] == OVFLPAGE) || (FREESPACE(bp))))
+X			break;
+X
+X		pageno = bp[n - 1];
+X		bufp = __get_buf(hashp, pageno, bufp, 0);
+X		if (!bufp)
+X			return (0);	/* Need to indicate an error! */
+X		bp = (u_short *)bufp->page;
+X	}
+X
+X	*bpp = bufp;
+X	if (bp[0] > 2)
+X		return (bp[3]);
+X	else
+X		return (0);
+X}
+X
+X/*
+X * Return the data for the key/data pair that begins on this page at this
+X * index (index should always be 1).
+X */
+Xextern int
+X__big_return(hashp, bufp, ndx, val, set_current)
+X	HTAB *hashp;
+X	BUFHEAD *bufp;
+X	int ndx;
+X	DBT *val;
+X	int set_current;
+X{
+X	BUFHEAD *save_p;
+X	u_short *bp, len, off, save_addr;
+X	char *tp;
+X
+X	bp = (u_short *)bufp->page;
+X	while (bp[ndx + 1] == PARTIAL_KEY) {
+X		bufp = __get_buf(hashp, bp[bp[0] - 1], bufp, 0);
+X		if (!bufp)
+X			return (-1);
+X		bp = (u_short *)bufp->page;
+X		ndx = 1;
+X	}
+X
+X	if (bp[ndx + 1] == FULL_KEY) {
+X		bufp = __get_buf(hashp, bp[bp[0] - 1], bufp, 0);
+X		if (!bufp)
+X			return (-1);
+X		bp = (u_short *)bufp->page;
+X		save_p = bufp;
+X		save_addr = save_p->addr;
+X		off = bp[1];
+X		len = 0;
+X	} else
+X		if (!FREESPACE(bp)) {
+X			/*
+X			 * This is a hack.  We can't distinguish between
+X			 * FULL_KEY_DATA that contains complete data or
+X			 * incomplete data, so we require that if the data
+X			 * is complete, there is at least 1 byte of free
+X			 * space left.
+X			 */
+X			off = bp[bp[0]];
+X			len = bp[1] - off;
+X			save_p = bufp;
+X			save_addr = bufp->addr;
+X			bufp = __get_buf(hashp, bp[bp[0] - 1], bufp, 0);
+X			if (!bufp)
+X				return (-1);
+X			bp = (u_short *)bufp->page;
+X		} else {
+X			/* The data is all on one page. */
+X			tp = (char *)bp;
+X			off = bp[bp[0]];
+X			val->data = (u_char *)tp + off;
+X			val->size = bp[1] - off;
+X			if (set_current) {
+X				if (bp[0] == 2) {	/* No more buckets in
+X							 * chain */
+X					hashp->cpage = NULL;
+X					hashp->cbucket++;
+X					hashp->cndx = 1;
+X				} else {
+X					hashp->cpage = __get_buf(hashp,
+X					    bp[bp[0] - 1], bufp, 0);
+X					if (!hashp->cpage)
+X						return (-1);
+X					hashp->cndx = 1;
+X					if (!((u_short *)
+X					    hashp->cpage->page)[0]) {
+X						hashp->cbucket++;
+X						hashp->cpage = NULL;
+X					}
+X				}
+X			}
+X			return (0);
+X		}
+X
+X	val->size = collect_data(hashp, bufp, (int)len, set_current);
+X	if (val->size == -1)
+X		return (-1);
+X	if (save_p->addr != save_addr) {
+X		/* We are pretty short on buffers. */
+X		errno = EINVAL;			/* OUT OF BUFFERS */
+X		return (-1);
+X	}
+X	memmove(hashp->tmp_buf, (save_p->page) + off, len);
+X	val->data = (u_char *)hashp->tmp_buf;
+X	return (0);
+X}
+X/*
+X * Count how big the total datasize is by recursing through the pages.  Then
+X * allocate a buffer and copy the data as you recurse up.
+X */
+Xstatic int
+Xcollect_data(hashp, bufp, len, set)
+X	HTAB *hashp;
+X	BUFHEAD *bufp;
+X	int len, set;
+X{
+X	register u_short *bp;
+X	register char *p;
+X	BUFHEAD *xbp;
+X	u_short save_addr;
+X	int mylen, totlen;
+X
+X	p = bufp->page;
+X	bp = (u_short *)p;
+X	mylen = hashp->BSIZE - bp[1];
+X	save_addr = bufp->addr;
+X
+X	if (bp[2] == FULL_KEY_DATA) {		/* End of Data */
+X		totlen = len + mylen;
+X		if (hashp->tmp_buf)
+X			free(hashp->tmp_buf);
+X		hashp->tmp_buf = malloc(totlen);
+X		if (!hashp->tmp_buf)
+X			return (-1);
+X		if (set) {
+X			hashp->cndx = 1;
+X			if (bp[0] == 2) {	/* No more buckets in chain */
+X				hashp->cpage = NULL;
+X				hashp->cbucket++;
+X			} else {
+X				hashp->cpage =
+X				    __get_buf(hashp, bp[bp[0] - 1], bufp, 0);
+X				if (!hashp->cpage)
+X					return (-1);
+X				else if (!((u_short *)hashp->cpage->page)[0]) {
+X					hashp->cbucket++;
+X					hashp->cpage = NULL;
+X				}
+X			}
+X		}
+X	} else {
+X		xbp = __get_buf(hashp, bp[bp[0] - 1], bufp, 0);
+X		if (!xbp || ((totlen =
+X		    collect_data(hashp, xbp, len + mylen, set)) < 1))
+X			return (-1);
+X	}
+X	if (bufp->addr != save_addr) {
+X		errno = EINVAL;			/* Out of buffers. */
+X		return (-1);
+X	}
+X	memmove(&hashp->tmp_buf[len], (bufp->page) + bp[1], mylen);
+X	return (totlen);
+X}
+X
+X/*
+X * Fill in the key and data for this big pair.
+X */
+Xextern int
+X__big_keydata(hashp, bufp, key, val, set)
+X	HTAB *hashp;
+X	BUFHEAD *bufp;
+X	DBT *key, *val;
+X	int set;
+X{
+X	key->size = collect_key(hashp, bufp, 0, val, set);
+X	if (key->size == -1)
+X		return (-1);
+X	key->data = (u_char *)hashp->tmp_key;
+X	return (0);
+X}
+X
+X/*
+X * Count how big the total key size is by recursing through the pages.  Then
+X * collect the data, allocate a buffer and copy the key as you recurse up.
+X */
+Xstatic int
+Xcollect_key(hashp, bufp, len, val, set)
+X	HTAB *hashp;
+X	BUFHEAD *bufp;
+X	int len;
+X	DBT *val;
+X	int set;
+X{
+X	BUFHEAD *xbp;
+X	char *p;
+X	int mylen, totlen;
+X	u_short *bp, save_addr;
+X
+X	p = bufp->page;
+X	bp = (u_short *)p;
+X	mylen = hashp->BSIZE - bp[1];
+X
+X	save_addr = bufp->addr;
+X	totlen = len + mylen;
+X	if (bp[2] == FULL_KEY || bp[2] == FULL_KEY_DATA) {    /* End of Key. */
+X		if (hashp->tmp_key)
+X			free(hashp->tmp_key);
+X		hashp->tmp_key = malloc(totlen);
+X		if (!hashp->tmp_key)
+X			return (-1);
+X		if (__big_return(hashp, bufp, 1, val, set))
+X			return (-1);
+X	} else {
+X		xbp = __get_buf(hashp, bp[bp[0] - 1], bufp, 0);
+X		if (!xbp || ((totlen =
+X		    collect_key(hashp, xbp, totlen, val, set)) < 1))
+X			return (-1);
+X	}
+X	if (bufp->addr != save_addr) {
+X		errno = EINVAL;		/* MIS -- OUT OF BUFFERS */
+X		return (-1);
+X	}
+X	memmove(&hashp->tmp_key[len], (bufp->page) + bp[1], mylen);
+X	return (totlen);
+X}
+X
+X/*
+X * Returns:
+X *  0 => OK
+X * -1 => error
+X */
+Xextern int
+X__big_split(hashp, op, np, big_keyp, addr, obucket, ret)
+X	HTAB *hashp;
+X	BUFHEAD *op;	/* Pointer to where to put keys that go in old bucket */
+X	BUFHEAD *np;	/* Pointer to new bucket page */
+X			/* Pointer to first page containing the big key/data */
+X	BUFHEAD *big_keyp;
+X	int addr;	/* Address of big_keyp */
+X	u_int   obucket;/* Old Bucket */
+X	SPLIT_RETURN *ret;
+X{
+X	register BUFHEAD *tmpp;
+X	register u_short *tp;
+X	BUFHEAD *bp;
+X	DBT key, val;
+X	u_int change;
+X	u_short free_space, n, off;
+X
+X	bp = big_keyp;
+X
+X	/* Now figure out where the big key/data goes */
+X	if (__big_keydata(hashp, big_keyp, &key, &val, 0))
+X		return (-1);
+X	change = (__call_hash(hashp, key.data, key.size) != obucket);
+X
+X	if (ret->next_addr = __find_last_page(hashp, &big_keyp)) {
+X		if (!(ret->nextp =
+X		    __get_buf(hashp, ret->next_addr, big_keyp, 0)))
+X			return (-1);;
+X	} else
+X		ret->nextp = NULL;
+X
+X	/* Now make one of np/op point to the big key/data pair */
+X#ifdef DEBUG
+X	assert(np->ovfl == NULL);
+X#endif
+X	if (change)
+X		tmpp = np;
+X	else
+X		tmpp = op;
+X
+X	tmpp->flags |= BUF_MOD;
+X#ifdef DEBUG1
+X	(void)fprintf(stderr,
+X	    "BIG_SPLIT: %d->ovfl was %d is now %d\n", tmpp->addr,
+X	    (tmpp->ovfl ? tmpp->ovfl->addr : 0), (bp ? bp->addr : 0));
+X#endif
+X	tmpp->ovfl = bp;	/* one of op/np point to big_keyp */
+X	tp = (u_short *)tmpp->page;
+X#ifdef DEBUG
+X	assert(FREESPACE(tp) >= OVFLSIZE);
+X#endif
+X	n = tp[0];
+X	off = OFFSET(tp);
+X	free_space = FREESPACE(tp);
+X	tp[++n] = (u_short)addr;
+X	tp[++n] = OVFLPAGE;
+X	tp[0] = n;
+X	OFFSET(tp) = off;
+X	FREESPACE(tp) = free_space - OVFLSIZE;
+X
+X	/*
+X	 * Finally, set the new and old return values. BIG_KEYP contains a
+X	 * pointer to the last page of the big key_data pair. Make sure that
+X	 * big_keyp has no following page (2 elements) or create an empty
+X	 * following page.
+X	 */
+X
+X	ret->newp = np;
+X	ret->oldp = op;
+X
+X	tp = (u_short *)big_keyp->page;
+X	big_keyp->flags |= BUF_MOD;
+X	if (tp[0] > 2) {
+X		/*
+X		 * There may be either one or two offsets on this page.  If
+X		 * there is one, then the overflow page is linked on normally
+X		 * and tp[4] is OVFLPAGE.  If there are two, tp[4] contains
+X		 * the second offset and needs to get stuffed in after the
+X		 * next overflow page is added.
+X		 */
+X		n = tp[4];
+X		free_space = FREESPACE(tp);
+X		off = OFFSET(tp);
+X		tp[0] -= 2;
+X		FREESPACE(tp) = free_space + OVFLSIZE;
+X		OFFSET(tp) = off;
+X		tmpp = __add_ovflpage(hashp, big_keyp);
+X		if (!tmpp)
+X			return (-1);
+X		tp[4] = n;
+X	} else
+X		tmpp = big_keyp;
+X
+X	if (change)
+X		ret->newp = tmpp;
+X	else
+X		ret->oldp = tmpp;
+X	return (0);
+X}
+END_OF_FILE
+if test 16249 -ne `wc -c <'hash/hash_bigkey.c'`; then
+    echo shar: \"'hash/hash_bigkey.c'\" unpacked with wrong size!
+fi
+# end of 'hash/hash_bigkey.c'
+fi
+if test -f 'test/btree.tests/main.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'test/btree.tests/main.c'\"
+else
+echo shar: Extracting \"'test/btree.tests/main.c'\" \(14829 characters\)
+sed "s/^X//" >'test/btree.tests/main.c' <<'END_OF_FILE'
+X/*-
+X * Copyright (c) 1990, 1993
+X *	The Regents of the University of California.  All rights reserved.
+X *
+X * This code is derived from software contributed to Berkeley by
+X * Mike Olson.
+X *
+X * Redistribution and use in source and binary forms, with or without
+X * modification, are permitted provided that the following conditions
+X * are met:
+X * 1. Redistributions of source code must retain the above copyright
+X *    notice, this list of conditions and the following disclaimer.
+X * 2. Redistributions in binary form must reproduce the above copyright
+X *    notice, this list of conditions and the following disclaimer in the
+X *    documentation and/or other materials provided with the distribution.
+X * 3. All advertising materials mentioning features or use of this software
+X *    must display the following acknowledgement:
+X *	This product includes software developed by the University of
+X *	California, Berkeley and its contributors.
+X * 4. Neither the name of the University nor the names of its contributors
+X *    may be used to endorse or promote products derived from this software
+X *    without specific prior written permission.
+X *
+X * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+X * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+X * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+X * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+X * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+X * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+X * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+X * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+X * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+X * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+X * SUCH DAMAGE.
+X */
+X
+X#if defined(LIBC_SCCS) && !defined(lint)
+Xstatic char sccsid[] = "@(#)main.c	8.1 (Berkeley) 6/4/93";
+X#endif /* LIBC_SCCS and not lint */
+X
+X#include <sys/param.h>
+X#include <fcntl.h>
+X#include <db.h>
+X#include <errno.h>
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <stdlib.h>
+X#include <string.h>
+X#include "btree.h"
+X
+Xtypedef struct cmd_table {
+X	char *cmd;
+X	int nargs;
+X	int rconv;
+X	void (*func) __P((DB *, char **));
+X	char *usage, *descrip;
+X} cmd_table;
+X
+Xint stopstop;
+XDB *globaldb;
+X
+Xvoid append	__P((DB *, char **));
+Xvoid bstat	__P((DB *, char **));
+Xvoid cursor	__P((DB *, char **));
+Xvoid delcur	__P((DB *, char **));
+Xvoid delete	__P((DB *, char **));
+Xvoid dump	__P((DB *, char **));
+Xvoid first	__P((DB *, char **));
+Xvoid get	__P((DB *, char **));
+Xvoid help	__P((DB *, char **));
+Xvoid iafter	__P((DB *, char **));
+Xvoid ibefore	__P((DB *, char **));
+Xvoid icursor	__P((DB *, char **));
+Xvoid insert	__P((DB *, char **));
+Xvoid keydata	__P((DBT *, DBT *));
+Xvoid last	__P((DB *, char **));
+Xvoid list	__P((DB *, char **));
+Xvoid load	__P((DB *, char **));
+Xvoid mstat	__P((DB *, char **));
+Xvoid next	__P((DB *, char **));
+Xint  parse	__P((char *, char **, int));
+Xvoid previous	__P((DB *, char **));
+Xvoid show	__P((DB *, char **));
+Xvoid usage	__P((void));
+Xvoid user	__P((DB *));
+X
+Xcmd_table commands[] = {
+X	"?",	0, 0, help, "help", NULL,
+X	"a",	2, 1, append, "append key def", "append key with data def",
+X	"b",	0, 0, bstat, "bstat", "stat btree",
+X	"c",	1, 1, cursor,  "cursor word", "move cursor to word",
+X	"delc",	0, 0, delcur, "delcur", "delete key the cursor references",
+X	"dele",	1, 1, delete, "delete word", "delete word",
+X	"d",	0, 0, dump, "dump", "dump database",
+X	"f",	0, 0, first, "first", "move cursor to first record",
+X	"g",	1, 1, get, "get key", "locate key",
+X	"h",	0, 0, help, "help", "print command summary",
+X	"ia",	2, 1, iafter, "iafter key data", "insert data after key",
+X	"ib",	2, 1, ibefore, "ibefore key data", "insert data before key",
+X	"ic",	2, 1, icursor, "icursor key data", "replace cursor",
+X	"in",	2, 1, insert, "insert key def", "insert key with data def",
+X	"la",	0, 0, last, "last", "move cursor to last record",
+X	"li",	1, 1, list, "list file", "list to a file",
+X	"loa",	1, 0, load, "load file", NULL,
+X	"loc",	1, 1, get, "get key", NULL,
+X	"m",	0, 0, mstat, "mstat", "stat memory pool",
+X	"n",	0, 0, next, "next", "move cursor forward one record",
+X	"p",	0, 0, previous, "previous", "move cursor back one record",
+X	"q",	0, 0, NULL, "quit", "quit",
+X	"sh",	1, 0, show, "show page", "dump a page",
+X	{ NULL },
+X};
+X
+Xint recno;					/* use record numbers */
+Xchar *dict = "words";				/* default dictionary */
+Xchar *progname;
+X
+Xint
+Xmain(argc, argv)
+X	int argc;
+X	char **argv;
+X{
+X	int c;
+X	DB *db;
+X	BTREEINFO b;
+X
+X	progname = *argv;
+X
+X	b.flags = 0;
+X	b.cachesize = 0;
+X	b.maxkeypage = 0;
+X	b.minkeypage = 0;
+X	b.psize = 0;
+X	b.compare = NULL;
+X	b.prefix = NULL;
+X	b.lorder = 0;
+X
+X	while ((c = getopt(argc, argv, "bc:di:lp:ru")) != EOF) {
+X		switch (c) {
+X		case 'b':
+X			b.lorder = BIG_ENDIAN;
+X			break;
+X		case 'c':
+X			b.cachesize = atoi(optarg);
+X			break;
+X		case 'd':
+X			b.flags |= R_DUP;
+X			break;
+X		case 'i':
+X			dict = optarg;
+X			break;
+X		case 'l':
+X			b.lorder = LITTLE_ENDIAN;
+X			break;
+X		case 'p':
+X			b.psize = atoi(optarg);
+X			break;
+X		case 'r':
+X			recno = 1;
+X			break;
+X		case 'u':
+X			b.flags = 0;
+X			break;
+X		default:
+X			usage();
+X		}
+X	}
+X	argc -= optind;
+X	argv += optind;
+X
+X	if (recno)
+X		db = dbopen(*argv == NULL ? NULL : *argv, O_RDWR,
+X		    0, DB_RECNO, NULL);
+X	else
+X		db = dbopen(*argv == NULL ? NULL : *argv, O_CREAT|O_RDWR,
+X		    0600, DB_BTREE, &b);
+X
+X	if (db == NULL) {
+X		(void)fprintf(stderr, "dbopen: %s\n", strerror(errno));
+X		exit(1);
+X	}
+X	globaldb = db;
+X	user(db);
+X	exit(0);
+X	/* NOTREACHED */
+X}
+X
+Xvoid
+Xuser(db)
+X	DB *db;
+X{
+X	FILE *ifp;
+X	int argc, i, last;
+X	char *lbuf, *argv[4], buf[512];
+X
+X	if ((ifp = fopen("/dev/tty", "r")) == NULL) {
+X		(void)fprintf(stderr,
+X		    "/dev/tty: %s\n", strerror(errno));
+X		exit(1);
+X	}
+X	for (last = 0;;) {
+X		(void)printf("> ");
+X		(void)fflush(stdout);
+X		if ((lbuf = fgets(&buf[0], 512, ifp)) == NULL)
+X			break;
+X		if (lbuf[0] == '\n') {
+X			i = last;
+X			goto uselast;
+X		}
+X		lbuf[strlen(lbuf) - 1] = '\0';
+X
+X		if (lbuf[0] == 'q')
+X			break;
+X
+X		argc = parse(lbuf, &argv[0], 3);
+X		if (argc == 0)
+X			continue;
+X
+X		for (i = 0; commands[i].cmd != NULL; i++)
+X			if (strncmp(commands[i].cmd, argv[0],
+X			    strlen(commands[i].cmd)) == 0)
+X				break;
+X
+X		if (commands[i].cmd == NULL) {
+X			(void)fprintf(stderr,
+X			    "%s: command unknown ('help' for help)\n", lbuf);
+X			continue;
+X		}
+X
+X		if (commands[i].nargs != argc - 1) {
+X			(void)fprintf(stderr, "usage: %s\n", commands[i].usage);
+X			continue;
+X		}
+X
+X		if (recno && commands[i].rconv) {
+X			static recno_t nlong;
+X			nlong = atoi(argv[1]);
+X			argv[1] = (char *)&nlong;
+X		}
+Xuselast:	last = i;
+X		(*commands[i].func)(db, argv);
+X	}
+X	if ((db->sync)(db) == RET_ERROR)
+X		perror("dbsync");
+X	else if ((db->close)(db) == RET_ERROR)
+X		perror("dbclose");
+X}
+X
+Xint
+Xparse(lbuf, argv, maxargc)
+X	char *lbuf, **argv;
+X	int maxargc;
+X{
+X	int argc = 0;
+X	char *c;
+X
+X	c = lbuf;
+X	while (isspace(*c))
+X		c++;
+X	while (*c != '\0' && argc < maxargc) {
+X		*argv++ = c;
+X		argc++;
+X		while (!isspace(*c) && *c != '\0') {
+X			c++;
+X		}
+X		while (isspace(*c))
+X			*c++ = '\0';
+X	}
+X	return (argc);
+X}
+X
+Xvoid
+Xappend(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT key, data;
+X	int status;
+X
+X	if (!recno) {
+X		(void)fprintf(stderr,
+X		    "append only available for recno db's.\n");
+X		return;
+X	}
+X	key.data = argv[1];
+X	key.size = sizeof(recno_t);
+X	data.data = argv[2];
+X	data.size = strlen(data.data);
+X	status = (db->put)(db, &key, &data, R_APPEND);
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("append/put");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("%s (duplicate key)\n", argv[1]);
+X		break;
+X	case RET_SUCCESS:
+X		break;
+X	}
+X}
+X
+Xvoid
+Xcursor(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT data, key;
+X	int status;
+X
+X	key.data = argv[1];
+X	if (recno)
+X		key.size = sizeof(recno_t);
+X	else
+X		key.size = strlen(argv[1]) + 1;
+X	status = (*db->seq)(db, &key, &data, R_CURSOR);
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("cursor/seq");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("key not found\n");
+X		break;
+X	case RET_SUCCESS:
+X		keydata(&key, &data);
+X		break;
+X	}
+X}
+X
+Xvoid
+Xdelcur(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	int status;
+X
+X	status = (*db->del)(db, NULL, R_CURSOR);
+X
+X	if (status == RET_ERROR)
+X		perror("delcur/del");
+X}
+X
+Xvoid
+Xdelete(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT key;
+X	int status;
+X
+X	key.data = argv[1];
+X	if (recno)
+X		key.size = sizeof(recno_t);
+X	else
+X		key.size = strlen(argv[1]) + 1;
+X
+X	status = (*db->del)(db, &key, 0);
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("delete/del");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("key not found\n");
+X		break;
+X	case RET_SUCCESS:
+X		break;
+X	}
+X}
+X
+Xvoid
+Xdump(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	__bt_dump(db);
+X}
+X
+Xvoid
+Xfirst(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT data, key;
+X	int status;
+X
+X	status = (*db->seq)(db, &key, &data, R_FIRST);
+X
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("first/seq");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("no more keys\n");
+X		break;
+X	case RET_SUCCESS:
+X		keydata(&key, &data);
+X		break;
+X	}
+X}
+X
+Xvoid
+Xget(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT data, key;
+X	int status;
+X
+X	key.data = argv[1];
+X	if (recno)
+X		key.size = sizeof(recno_t);
+X	else
+X		key.size = strlen(argv[1]) + 1;
+X
+X	status = (*db->get)(db, &key, &data, 0);
+X
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("get/get");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("key not found\n");
+X		break;
+X	case RET_SUCCESS:
+X		keydata(&key, &data);
+X		break;
+X	}
+X}
+X
+Xvoid
+Xhelp(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	int i;
+X
+X	for (i = 0; commands[i].cmd; i++)
+X		if (commands[i].descrip)
+X			(void)printf("%s: %s\n",
+X			    commands[i].usage, commands[i].descrip);
+X}
+X
+Xvoid
+Xiafter(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT key, data;
+X	int status;
+X
+X	if (!recno) {
+X		(void)fprintf(stderr,
+X		    "iafter only available for recno db's.\n");
+X		return;
+X	}
+X	key.data = argv[1];
+X	key.size = sizeof(recno_t);
+X	data.data = argv[2];
+X	data.size = strlen(data.data);
+X	status = (db->put)(db, &key, &data, R_IAFTER);
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("iafter/put");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("%s (duplicate key)\n", argv[1]);
+X		break;
+X	case RET_SUCCESS:
+X		break;
+X	}
+X}
+X
+Xvoid
+Xibefore(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT key, data;
+X	int status;
+X
+X	if (!recno) {
+X		(void)fprintf(stderr,
+X		    "ibefore only available for recno db's.\n");
+X		return;
+X	}
+X	key.data = argv[1];
+X	key.size = sizeof(recno_t);
+X	data.data = argv[2];
+X	data.size = strlen(data.data);
+X	status = (db->put)(db, &key, &data, R_IBEFORE);
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("ibefore/put");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("%s (duplicate key)\n", argv[1]);
+X		break;
+X	case RET_SUCCESS:
+X		break;
+X	}
+X}
+X
+Xvoid
+Xicursor(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	int status;
+X	DBT data, key;
+X
+X	key.data = argv[1];
+X	if (recno)
+X		key.size = sizeof(recno_t);
+X	else
+X		key.size = strlen(argv[1]) + 1;
+X	data.data = argv[2];
+X	data.size = strlen(argv[2]) + 1;
+X
+X	status = (*db->put)(db, &key, &data, R_CURSOR);
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("icursor/put");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("%s (duplicate key)\n", argv[1]);
+X		break;
+X	case RET_SUCCESS:
+X		break;
+X	}
+X}
+X
+Xvoid
+Xinsert(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	int status;
+X	DBT data, key;
+X
+X	key.data = argv[1];
+X	if (recno)
+X		key.size = sizeof(recno_t);
+X	else
+X		key.size = strlen(argv[1]) + 1;
+X	data.data = argv[2];
+X	data.size = strlen(argv[2]) + 1;
+X
+X	status = (*db->put)(db, &key, &data, R_NOOVERWRITE);
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("insert/put");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("%s (duplicate key)\n", argv[1]);
+X		break;
+X	case RET_SUCCESS:
+X		break;
+X	}
+X}
+X
+Xvoid
+Xlast(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT data, key;
+X	int status;
+X
+X	status = (*db->seq)(db, &key, &data, R_LAST);
+X
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("last/seq");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("no more keys\n");
+X		break;
+X	case RET_SUCCESS:
+X		keydata(&key, &data);
+X		break;
+X	}
+X}
+X
+Xvoid
+Xlist(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT data, key;
+X	FILE *fp;
+X	int status;
+X
+X	if ((fp = fopen(argv[1], "w")) == NULL) {
+X		(void)fprintf(stderr, "%s: %s\n", argv[1], strerror(errno));
+X		return;
+X	}
+X	status = (*db->seq)(db, &key, &data, R_FIRST);
+X	while (status == RET_SUCCESS) {
+X		(void)fprintf(fp, "%s\n", key.data);
+X		status = (*db->seq)(db, &key, &data, R_NEXT);
+X	}
+X	if (status == RET_ERROR)
+X		perror("list/seq");
+X}
+X
+XDB *BUGdb;
+Xvoid
+Xload(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	register char *p, *t;
+X	FILE *fp;
+X	DBT data, key;
+X	recno_t cnt;
+X	size_t len;
+X	int status;
+X	char *lp, buf[16 * 1024];
+X
+X	BUGdb = db;
+X	if ((fp = fopen(argv[1], "r")) == NULL) {
+X		(void)fprintf(stderr, "%s: %s\n", argv[1], strerror(errno));
+X		return;
+X	}
+X	(void)printf("loading %s...\n", argv[1]);
+X
+X	for (cnt = 1; (lp = fgetline(fp, &len)) != NULL; ++cnt) {
+X		if (recno) {
+X			key.data = &cnt;
+X			key.size = sizeof(recno_t);
+X			data.data = lp;
+X			data.size = len + 1;
+X		} else { 
+X			key.data = lp;
+X			key.size = len + 1;
+X			for (p = lp + len - 1, t = buf; p >= lp; *t++ = *p--);
+X			*t = '\0';
+X			data.data = buf;
+X			data.size = len + 1;
+X		}
+X
+X		status = (*db->put)(db, &key, &data, R_NOOVERWRITE);
+X		switch (status) {
+X		case RET_ERROR:
+X			perror("load/put");
+X			exit(1);
+X		case RET_SPECIAL:
+X			if (recno)
+X				(void)fprintf(stderr,
+X				    "duplicate: %ld {%s}\n", cnt, data.data);
+X			else
+X				(void)fprintf(stderr,
+X				    "duplicate: %ld {%s}\n", cnt, key.data);
+X			exit(1);
+X		case RET_SUCCESS:
+X			break;
+X		}
+X	}
+X	(void)fclose(fp);
+X}
+X
+Xvoid
+Xnext(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT data, key;
+X	int status;
+X
+X	status = (*db->seq)(db, &key, &data, R_NEXT);
+X
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("next/seq");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("no more keys\n");
+X		break;
+X	case RET_SUCCESS:
+X		keydata(&key, &data);
+X		break;
+X	}
+X}
+X
+Xvoid
+Xprevious(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	DBT data, key;
+X	int status;
+X
+X	status = (*db->seq)(db, &key, &data, R_PREV);
+X
+X	switch (status) {
+X	case RET_ERROR:
+X		perror("previous/seq");
+X		break;
+X	case RET_SPECIAL:
+X		(void)printf("no more keys\n");
+X		break;
+X	case RET_SUCCESS:
+X		keydata(&key, &data);
+X		break;
+X	}
+X}
+X
+Xvoid
+Xshow(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	BTREE *t;
+X	PAGE *h;
+X	pgno_t pg;
+X
+X	pg = atoi(argv[1]);
+X	t = db->internal;
+X	if ((h = mpool_get(t->bt_mp, pg, 0)) == NULL) {
+X		(void)printf("getpage of %ld failed\n", pg);
+X		return;
+X	}
+X	if (pg == 0)
+X		__bt_dmpage(h);
+X	else
+X		__bt_dpage(h);
+X	mpool_put(t->bt_mp, h, 0);
+X}
+X
+Xvoid
+Xbstat(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	(void)printf("BTREE\n");
+X	__bt_stat(db);
+X}
+X
+Xvoid
+Xmstat(db, argv)
+X	DB *db;
+X	char **argv;
+X{
+X	(void)printf("MPOOL\n");
+X	mpool_stat(((BTREE *)db->internal)->bt_mp);
+X}
+X
+Xvoid
+Xkeydata(key, data)
+X	DBT *key, *data;
+X{
+X	if (!recno && key->size > 0)
+X		(void)printf("%s/", key->data);
+X	if (data->size > 0)
+X		(void)printf("%s", data->data);
+X	(void)printf("\n");
+X}
+X
+Xvoid
+Xusage()
+X{
+X	(void)fprintf(stderr,
+X	    "usage: %s [-bdlu] [-c cache] [-i file] [-p page] [file]\n",
+X	    progname);
+X	exit (1);
+X}
+END_OF_FILE
+if test 14829 -ne `wc -c <'test/btree.tests/main.c'`; then
+    echo shar: \"'test/btree.tests/main.c'\" unpacked with wrong size!
+fi
+# end of 'test/btree.tests/main.c'
+fi
+echo shar: End of archive 6 \(of 9\).
+cp /dev/null ark6isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 9 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

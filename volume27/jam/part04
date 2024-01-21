@@ -1,0 +1,2509 @@
+Newsgroups: comp.sources.unix
+From: seiwald@vix.com (Christopher Seiwald)
+Subject: v27i084: jam - just another make, Part04/05
+References: <1.753385306.22859@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: seiwald@vix.com (Christopher Seiwald)
+Posting-Number: Volume 27, Issue 84
+Archive-Name: jam/part04
+
+Submitted-by: seiwald@vix.com
+Archive-name: jam - make(1) redux/part04
+
+#!/bin/sh
+# This is part 04 of jam - make(1) redux
+# ============= regexp.h ==============
+if test -f 'regexp.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping regexp.h (File already exists)'
+else
+echo 'x - extracting regexp.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'regexp.h' &&
+X/*
+X * Definitions etc. for regexp(3) routines.
+X *
+X * Caveat:  this is V8 regexp(3) [actually, a reimplementation thereof],
+X * not the System V one.
+X */
+X#define NSUBEXP  10
+Xtypedef struct regexp {
+X	char *startp[NSUBEXP];
+X	char *endp[NSUBEXP];
+X	char regstart;		/* Internal use only. */
+X	char reganch;		/* Internal use only. */
+X	char *regmust;		/* Internal use only. */
+X	int regmlen;		/* Internal use only. */
+X	char program[1];	/* Unwarranted chumminess with compiler. */
+X} regexp;
+X
+Xextern regexp *regcomp();
+Xextern int regexec();
+Xextern void regsub();
+Xextern void regerror();
+X
+X/*
+X * The first byte of the regexp internal "program" is actually this magic
+X * number; the start node begins in the second byte.
+X */
+X#define	MAGIC	0234
+SHAR_EOF
+chmod 0444 regexp.h ||
+echo 'restore of regexp.h failed'
+Wc_c="`wc -c < 'regexp.h'`"
+test 728 -eq "$Wc_c" ||
+	echo 'regexp.h: original size 728, current size' "$Wc_c"
+fi
+# ============= rules.c ==============
+if test -f 'rules.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping rules.c (File already exists)'
+else
+echo 'x - extracting rules.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'rules.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "lists.h"
+X# include "parse.h"
+X# include "variable.h"
+X# include "rules.h"
+X# include "newstr.h"
+X# include "hash.h"
+X
+X/*
+X * rules.c - access to RULEs, TARGETs, and ACTIONs
+X *
+X * External routines:
+X *
+X *    bindrule() - return pointer to RULE, creating it if necessary
+X *    bindtarget() - return pointer to TARGET, creating it if necessary
+X *    touchtarget() - mark a target to simulate being new
+X *    targetlist() - turn list of target names into a TARGET chain
+X *    actionlist - for each target, append an ACTION to its action chain
+X *    addsettings() - add a deferred "set" command to a target
+X *    usesettings() - set all target specific variables
+X *    pushsettings() - set all target specific variables
+X *    popsettings() - reset target specific variables to their pre-push values
+X *    donerules() - free RULE and TARGET tables
+X */
+X
+Xstatic struct hash *rulehash = 0;
+Xstatic struct hash *targethash = 0;
+X
+X
+X/*
+X * bindrule() - return pointer to RULE, creating it if necessary
+X */
+X
+XRULE *
+Xbindrule( rulename ) 
+Xchar 	*rulename;
+X{
+X	RULE rule, *r = &rule;
+X
+X	if( !rulehash )
+X	    rulehash = hashinit( sizeof( RULE ), "rules" );
+X
+X	r->name = rulename;
+X
+X	if( hashenter( rulehash, (HASHDATA **)&r ) )
+X	{
+X	    r->name = newstr( rulename );	/* never freed */
+X	    r->procedure = (PARSE *)0;
+X	    r->actions = (char *)0;
+X	    r->flags = 0;
+X	}
+X
+X	return r;
+X}
+X
+X/*
+X * bindtarget() - return pointer to TARGET, creating it if necessary
+X */
+X
+XTARGET *
+Xbindtarget( targetname )
+Xchar	*targetname;
+X{
+X	TARGET target, *t = &target;
+X
+X	if( !targethash )
+X	    targethash = hashinit( sizeof( TARGET ), "targets" );
+X
+X	t->name = targetname;
+X
+X	if( hashenter( targethash, (HASHDATA **)&t ) )
+X	{
+X	    memset( (char *)t, '\0', sizeof( *t ) );
+X	    t->name = newstr( targetname );	/* never freed */
+X	}
+X
+X	return t;
+X}
+X
+X/*
+X * touchtarget() - mark a target to simulate being new
+X */
+X
+Xvoid
+Xtouchtarget( t )
+Xchar *t;
+X{
+X	bindtarget( t )->flags |= T_FLAG_TOUCHED;
+X}
+X
+X/*
+X * targetlist() - turn list of target names into a TARGET chain
+X *
+X * Inputs:
+X *	chain	existing TARGETS to append to
+X *	targets	list of target names
+X */
+X
+XTARGETS *
+Xtargetlist( chain, targets )
+XTARGETS	*chain;
+XLIST 	*targets;
+X{
+X	while( targets )
+X	{
+X	    TARGETS *c;
+X
+X	    c = (TARGETS *)malloc( sizeof( TARGETS ) );
+X	    c->target = bindtarget( targets->string );
+X
+X	    if( !chain ) chain = c;
+X	    else chain->tail->next = c;
+X	    chain->tail = c;
+X	    c->next = 0;
+X
+X	    targets = list_next( targets );
+X	}
+X
+X	return chain;
+X}
+X
+X/*
+X * actionlist - for each target, append an ACTION to its action chain
+X */
+X
+Xvoid
+Xactionlist( targets, action )
+XTARGETS	*targets;
+XACTION	*action;
+X{
+X	/* Append this action to the actions of each target */
+X
+X	for( ; targets; targets = targets->next )
+X	{
+X	    ACTIONS *actions = (ACTIONS *)malloc( sizeof( ACTIONS ) );
+X	    TARGET  *target = targets->target;
+X
+X	    actions->action = action;
+X
+X	    if( !target->actions ) target->actions = actions;
+X	    else target->actions->tail->next = actions;
+X	    target->actions->tail = actions;
+X	    actions->next = 0;
+X	}
+X}
+X
+X/*
+X * addsettings() - add a deferred "set" command to a target
+X */
+X
+XSETTINGS *
+Xaddsettings( head, symbol, value )
+XSETTINGS *head;
+Xchar	*symbol;
+XLIST	*value;
+X{
+X	SETTINGS *v;
+X	
+X	/* Look for previous setting */
+X
+X	for( v = head; v; v = v->next )
+X	    if( !strcmp( v->symbol, symbol ) )
+X		break;
+X
+X	/* If previous set, reset.  If not, alloc a new. */
+X
+X	if( v )
+X	{
+X	    list_free( v->value );
+X	    v->value = value;
+X	    v = head;
+X	} 
+X	else 
+X	{
+X	    v = (SETTINGS *)malloc( sizeof( *v ) );
+X	    v->symbol = newstr( symbol );
+X	    v->value = value;
+X	    v->next = head;
+X	}
+X
+X	return v;
+X}
+X
+X/*
+X * pushsettings() - set all target specific variables
+X */
+X
+Xvoid
+Xpushsettings( v )
+XSETTINGS *v;
+X{
+X	for( ; v; v = v->next )
+X	    v->value = var_swap( v->symbol, v->value );
+X}
+X
+X/*
+X * popsettings() - reset target specific variables to their pre-push values
+X */
+X
+Xvoid
+Xpopsettings( v )
+XSETTINGS *v;
+X{
+X	pushsettings( v );	/* just swap again */
+X}
+X
+X/*
+X * donerules() - free RULE and TARGET tables
+X */
+X
+Xvoid
+Xdonerules()
+X{
+X	hashdone( rulehash );
+X	hashdone( targethash );
+X}
+SHAR_EOF
+chmod 0444 rules.c ||
+echo 'restore of rules.c failed'
+Wc_c="`wc -c < 'rules.c'`"
+test 4141 -eq "$Wc_c" ||
+	echo 'rules.c: original size 4141, current size' "$Wc_c"
+fi
+# ============= rules.h ==============
+if test -f 'rules.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping rules.h (File already exists)'
+else
+echo 'x - extracting rules.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'rules.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * rules.h -  targets, rules, and related information
+X *
+X * This file describes the structures holding the targets, rules, and
+X * related information accumulated by interpreting the statements
+X * of the jam files.
+X *
+X * The following are defined:
+X *
+X *	RULE - a generic jam rule, the product of RULE and ACTIONS 
+X *	ACTIONS - a chain of ACTIONs 
+X *	ACTION - a RULE instance with targets and sources 
+X *	SETTINGS - variables to set when executing a TARGET's ACTIONS 
+X *	TARGETS - a chain of TARGETs 
+X *	TARGET - a file or "thing" that can be built 
+X */
+X
+Xtypedef struct _rule RULE;
+Xtypedef struct _target TARGET;
+Xtypedef struct _targets TARGETS;
+Xtypedef struct _action ACTION;
+Xtypedef struct _actions ACTIONS;
+Xtypedef struct _settings SETTINGS ;
+X
+X/* RULE - a generic jam rule, the product of RULE and ACTIONS */
+X
+Xstruct _rule {
+X	char	*name;
+X	PARSE	*procedure;		/* parse tree from RULE */
+X	char	*actions;		/* command string from ACTIONS */
+X	int	flags;			/* modifiers on ACTIONS */
+X
+X# define	RULE_NEWSRCS	0x01	/* $(>) is updated sources only */
+X# define	RULE_TOGETHER	0x02	/* combine actions on single target */
+X# define	RULE_IGNORE	0x04	/* ignore return status of executes */
+X# define	RULE_QUIETLY	0x08	/* don't mention it unless verbose */
+X# define	RULE_PIECEMEAL	0x10	/* split exec so each $(>) is small */
+X
+X} ;
+X
+X/* ACTIONS - a chain of ACTIONs */
+X
+Xstruct _actions {
+X	ACTIONS	*next;
+X	ACTIONS	*tail;			/* valid only for head */
+X	ACTION	*action;
+X} ;
+X
+X/* ACTION - a RULE instance with targets and sources */
+X
+Xstruct _action {
+X	RULE	*rule;
+X	TARGETS	*targets;
+X	TARGETS	*sources;		/* aka $(>) */
+X	int	progress;		/* see TARGET progress */
+X} ;
+X
+X/* SETTINGS - variables to set when executing a TARGET's ACTIONS */
+X
+Xstruct _settings {
+X	SETTINGS *next;
+X	char	*symbol;		/* symbol name for var_set() */
+X	LIST	*value;			/* symbol value for var_set() */
+X} ;
+X
+X/* TARGETS - a chain of TARGETs */
+X
+Xstruct _targets {
+X	TARGETS	*next;
+X	TARGETS	*tail;			/* valid only for head */
+X	TARGET	*target;
+X} ;
+X
+X/* TARGET - a file or "thing" that can be built */
+X
+Xstruct _target {
+X	char	*name;
+X	char	*boundname;		/* if search() relocates target */
+X	ACTIONS	*actions;		/* rules to execute, if any */
+X	TARGETS	*deps;			/* dependencies */
+X	SETTINGS *settings;		/* variables to define */
+X	time_t	time;			/* update time */
+X
+X	int	flags;			/* status info */
+X
+X# define 	T_FLAG_TEMP 	0x01	/* TEMPORARY applied */
+X# define 	T_FLAG_NOCARE 	0x02	/* NOCARE applied */
+X# define 	T_FLAG_NOTIME 	0x04	/* NOTIME applied */
+X# define	T_FLAG_TOUCHED	0x08	/* -t target applied */
+X
+X	int	binding;		/* how target relates to real file */
+X
+X# define 	T_BIND_UNBOUND	0	/* a disembodied name */
+X# define 	T_BIND_TEMP	1	/* a present temporary */
+X# define 	T_BIND_EXISTS	2	/* name names a real file */
+X# define 	T_BIND_MISSING	3	/* couldn't find real file */
+X
+X	int	fate;			/* make0()'s diagnosis */
+X
+X# define 	T_FATE_INIT	0	/* nothing done to target */
+X# define 	T_FATE_MAKING	1	/* make0(target) on stack */
+X# define 	T_FATE_STABLE	2	/* target didn't need updating */
+X# define	T_FATE_TOUCHED	3	/* manually touched with -t */
+X					/* ...rest mean new target... */ 
+X# define 	T_FATE_ISTMP	4	/* unneeded temp target oddly present */
+X# define	T_FATE_MISSING	5	/* is missing, needs updating */
+X# define 	T_FATE_OUTDATED	6	/* is out of date, needs updating */
+X# define 	T_FATE_UPDATE	7	/* deps updated, needs updating */
+X# define 	T_FATE_DONTKNOW	8	/* no rules to make missing target */
+X
+X	int	progress;		/* tracks make1() progress */
+X
+X# define	T_MAKE_INIT	0	/* make1(target) not yet called */
+X# define	T_MAKE_STABLE	1	/* make1(target) had nothing to do */
+X# define	T_MAKE_OK	2	/* make1(target) hasn't failed (yet) */
+X# define	T_MAKE_FAIL	3	/* make1(target) failed */
+X# define	T_MAKE_INTR	4	/* make1(target) interrupted by ^C */
+X
+X	TARGETS	*headers;		/* list of header file codependencies */
+X	time_t	htime;			/* collected update time for headers */
+X	int	hfate;			/* collected fate for headers */
+X} ;
+X
+XRULE	*bindrule();
+XTARGET	*bindtarget();
+Xvoid	touchtarget();
+XTARGETS	*targetlist();
+Xvoid	actionlist();
+XSETTINGS *addsettings();
+Xvoid 	pushsettings();
+Xvoid 	popsettings();
+SHAR_EOF
+chmod 0444 rules.h ||
+echo 'restore of rules.h failed'
+Wc_c="`wc -c < 'rules.h'`"
+test 4149 -eq "$Wc_c" ||
+	echo 'rules.h: original size 4149, current size' "$Wc_c"
+fi
+# ============= scan.c ==============
+if test -f 'scan.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping scan.c (File already exists)'
+else
+echo 'x - extracting scan.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'scan.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "jamgram.h"
+X# include "lists.h"
+X# include "parse.h"
+X# include "scan.h"
+X# include "newstr.h"
+X
+X/*
+X * scan.c - the jam yacc scanner
+X */
+X
+Xstruct keyword {
+X	char *word;
+X	int type;
+X} keywords[] = {
+X# include "jamgramtab.h"
+X	0, 0
+X} ;
+X
+X# define MAX_INCLUDES 10
+X
+Xstatic struct {
+X	char *string;
+X	FILE *file;
+X	char *fname;
+X	int line;
+X	char buf[ 512 ];
+X} includes[ MAX_INCLUDES ] = {0}, *incp = includes;
+X
+Xstatic int incdepth = 0;
+X
+Xint scan_asstring = 0;
+X
+Xstatic char *symdump();
+X
+X/* 
+X */
+X
+Xyyerror( s )
+Xchar *s;
+X{
+X	if( incdepth )
+X	    printf( "%s: line %d: ", incp->fname, incp->line );
+X
+X	printf( "%s at %s\n", s, symdump( &yylval ) );
+X}
+X
+Xyyfparse( s )
+Xchar *s;
+X{
+X	FILE *f = stdin;
+X
+X	if( incdepth == MAX_INCLUDES )
+X	{
+X	    printf( "%s: too many levels of nested includes\n", s );
+X	    return;
+X	}
+X
+X	if( strcmp( s, "-" ) && !( f = fopen( s, "r" ) ) )
+X	    perror( s );
+X
+X	incdepth++;
+X	incp = &includes[ incdepth - 1 ];
+X	incp->string = "";
+X	incp->file = f;
+X	incp->fname = s;
+X	incp->line = 0;
+X}
+X
+X/*
+X * get character routine
+X */
+X
+Xyyline()
+X{
+Xtop:
+X	if( incp->file )
+X	{
+X	    if( fgets( incp->buf, sizeof( incp->buf ), incp->file ) )
+X	    {
+X		incp->line++;
+X		incp->string = incp->buf;
+X		return *incp->string++;
+X	    }
+X
+X	    if( incp->file != stdin )
+X		    fclose( incp->file );
+X	} 
+X
+X	if( !--incdepth )
+X	    return EOF;
+X
+X	incp = &includes[ incdepth - 1 ];
+X
+X	if( !*incp->string )
+X	    goto top;
+X
+X	return *incp->string++;
+X}
+X
+X/*
+X * yylex() - set yylval to current token; return its type
+X */
+X
+X# define yychar() ( *incp->string ? *incp->string++ : yyline() )
+X
+Xyylex()
+X{
+X	char buf[512];
+X	int c = *incp->string;
+X
+X	for( ;; )
+X	{
+X		while( !c || isspace( c ) && c != EOF )
+X			c = yychar();
+X		if( c != '#' )
+X			break;
+X		while( ( c = yychar() ) != EOF && c != '\n' )
+X			;
+X	}
+X
+X	if( c == EOF )
+X	{
+X		yylval.type = EOF;
+X		return EOF;
+X	} 
+X	else if( c == '{' && scan_asstring )
+X	{
+X		/* look for closing { */
+X
+X		char *b = buf;
+X		int nest = 1;
+X
+X		while( ( c = yychar() ) != EOF )
+X		{
+X			if( c == '{' )
+X				nest++;
+X			else if( c == '}' )
+X				nest--;
+X			if( !nest )
+X			    break;
+X			*b++ = c;
+X		}
+X		*b = 0;
+X		yylval.type = STRING;
+X		yylval.string = newstr( buf );
+X	}
+X	else 
+X	{
+X		/* look for white space to delimit word */
+X		/* "'s get stripped but preserve white space */
+X
+X		char *b = buf;
+X		int inquote = 0;
+X		int literal = 0;
+X		int hasquote = 0;
+X		struct keyword *k;
+X
+X		do {
+X		    if( literal )
+X			*b++ = c, literal = 0;
+X		    else if( c == '\\' )
+X			literal++;
+X		    else if( c == '"' )
+X			inquote = !inquote, hasquote++;
+X		    else
+X			*b++ = c;
+X		}
+X		while( ( c=yychar() ) != EOF && ( inquote || !isspace( c ) ) );
+X		incp->string--;
+X		*b = 0;
+X
+X		/* scan token table, except for $anything and quoted anything */
+X
+X		yylval.type = ARG;
+X
+X		if( *buf != '$' && !hasquote )
+X		    for( k = keywords; k->word; k++ )
+X			if( *buf == *k->word && !strcmp( k->word, buf ) )
+X		{
+X		    yylval.type = k->type;
+X		    yylval.string = k->word;	/* used by symdump */
+X		    break;
+X		}
+X
+X		if( yylval.type == ARG )
+X		    yylval.string = newstr( buf );
+X	}
+X
+X	if( DEBUG_SCAN )
+X		printf( "scan %s\n", symdump( &yylval ) );
+X
+X	return yylval.type;
+X}
+X
+Xstatic char *
+Xsymdump( s )
+XYYSTYPE *s;
+X{
+X	static char buf[ 512 ];
+X
+X	switch( s->type )
+X	{
+X	case EOF:
+X		sprintf( buf, "EOF" );
+X		break;
+X	case 0:
+X		sprintf( buf, "unknown symbol %s", s->string );
+X		break;
+X	case ARG:
+X		sprintf( buf, "argument %s", s->string );
+X		break;
+X	case STRING:
+X		sprintf( buf, "string \"%s\"", s->string );
+X		break;
+X	default:
+X		sprintf( buf, "keyword %s", s->string );
+X		break;
+X	}
+X	return buf;
+X}
+SHAR_EOF
+chmod 0444 scan.c ||
+echo 'restore of scan.c failed'
+Wc_c="`wc -c < 'scan.c'`"
+test 3568 -eq "$Wc_c" ||
+	echo 'scan.c: original size 3568, current size' "$Wc_c"
+fi
+# ============= scan.h ==============
+if test -f 'scan.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping scan.h (File already exists)'
+else
+echo 'x - extracting scan.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'scan.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * scan.h - the jam yacc scanner
+X */
+X
+X/*
+X * needed by parser, scanner
+X */
+X
+X# define YYSTYPE YYSYMBOL
+X
+Xtypedef struct _YYSTYPE {
+X	int		type;
+X	char		*string;
+X	PARSE		*parse;
+X	LIST		*list;
+X	int		number;
+X} YYSTYPE;
+X
+Xextern YYSTYPE yylval;
+X
+Xextern int scan_asstring;
+SHAR_EOF
+chmod 0444 scan.h ||
+echo 'restore of scan.h failed'
+Wc_c="`wc -c < 'scan.h'`"
+test 312 -eq "$Wc_c" ||
+	echo 'scan.h: original size 312, current size' "$Wc_c"
+fi
+# ============= search.c ==============
+if test -f 'search.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping search.c (File already exists)'
+else
+echo 'x - extracting search.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'search.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "lists.h"
+X# include "search.h"
+X# include "timestamp.h"
+X# include "filesys.h"
+X# include "variable.h"
+X# include "newstr.h"
+X
+X/*
+X * search.c - find a target along $(SEARCH) or $(LOCATE) 
+X */
+X
+Xchar *
+Xsearch( target, time )
+Xchar	*target;
+Xtime_t	*time;
+X{
+X	FILENAME f[1];
+X	LIST	*varlist;
+X	char	buf[ MAXPATH ];
+X
+X	/* Parse the filename */
+X
+X	file_parse( target, f );
+X
+X	f->f_grist.ptr = 0;
+X	f->f_grist.len = 0;
+X
+X	if( varlist = var_get( "LOCATE" ) )
+X	{
+X	    f->f_root.ptr = varlist->string;
+X	    f->f_root.len = strlen( varlist->string );
+X
+X	    file_build( f, buf );
+X
+X	    if( DEBUG_SEARCH )
+X		printf( "locate %s: %s\n", target, buf );
+X
+X	    timestamp( buf, time );
+X
+X	    return newstr( buf );
+X	}
+X	else if( varlist = var_get( "SEARCH" ) )
+X	{
+X	    while( varlist )
+X	    {
+X		f->f_root.ptr = varlist->string;
+X		f->f_root.len = strlen( varlist->string );
+X
+X		file_build( f, buf );
+X
+X		if( DEBUG_SEARCH )
+X		    printf( "search %s: %s\n", target, buf );
+X
+X		timestamp( buf, time );
+X
+X		if( *time )
+X		    return newstr( buf );
+X
+X		varlist = list_next( varlist );
+X	    }
+X	}
+X
+X	/* Look for the obvious */
+X	/* This is a questionable move.  Should we look in the */
+X	/* obvious place if SEARCH is set? */
+X
+X	f->f_root.ptr = 0;
+X	f->f_root.len = 0;
+X
+X	file_build( f, buf );
+X
+X	if( DEBUG_SEARCH )
+X	    printf( "search %s: %s\n", target, buf );
+X
+X	timestamp( target, time );
+X
+X	return newstr( buf );
+X}
+SHAR_EOF
+chmod 0444 search.c ||
+echo 'restore of search.c failed'
+Wc_c="`wc -c < 'search.c'`"
+test 1438 -eq "$Wc_c" ||
+	echo 'search.c: original size 1438, current size' "$Wc_c"
+fi
+# ============= search.h ==============
+if test -f 'search.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping search.h (File already exists)'
+else
+echo 'x - extracting search.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'search.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * search.h - find a target along $(SEARCH) or $(LOCATE) 
+X */
+X
+Xchar *search();
+SHAR_EOF
+chmod 0444 search.h ||
+echo 'restore of search.h failed'
+Wc_c="`wc -c < 'search.h'`"
+test 129 -eq "$Wc_c" ||
+	echo 'search.h: original size 129, current size' "$Wc_c"
+fi
+# ============= timestamp.c ==============
+if test -f 'timestamp.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping timestamp.c (File already exists)'
+else
+echo 'x - extracting timestamp.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'timestamp.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "hash.h"
+X# include "filesys.h"
+X# include "timestamp.h"
+X# include "newstr.h"
+X
+X/*
+X * timestamp.c - get the timestamp of a file or archive member
+X */
+X
+X/*
+X * BINDING - all known files
+X */
+X
+Xtypedef struct _binding BINDING;
+X
+Xstruct _binding {
+X	char	*name;
+X	short	flags;
+X
+X# define BIND_SCANNED	0x01	/* if directory or arch, has been scanned */
+X
+X	short	progress;
+X
+X# define BIND_INIT	0	/* never seen */
+X# define BIND_NOENTRY	1	/* timestamp requested but file never found */
+X# define BIND_SPOTTED	2	/* file found but not timed yet */
+X# define BIND_MISSING	3	/* file found but can't get timestamp */
+X# define BIND_FOUND	4	/* file found and time stamped */
+X
+X	time_t	time;		/* update time - 0 if not exist */
+X} ;
+X
+Xstatic struct hash *bindhash = 0;
+Xstatic void time_enter();
+X
+Xstatic char *time_progress[] =
+X{
+X	"INIT",
+X	"NOENTRY",
+X	"SPOTTED",
+X	"MISSING",
+X	"FOUND"
+X} ;
+X
+X
+X/*
+X * timestamp() - return timestamp on a file, if present
+X */
+X
+Xvoid
+Xtimestamp( target, time )
+Xchar	*target;
+Xtime_t	*time;
+X{
+X	FILENAME f1, f2;
+X	BINDING	binding, *b = &binding;
+X	char buf[ MAXPATH ];
+X
+X	if( !bindhash )
+X	    bindhash = hashinit( sizeof( BINDING ), "bindings" );
+X
+X	/* Quick path - is it there? */
+X
+X	b->name = target;
+X	b->time = b->flags = 0;
+X	b->progress = BIND_INIT;
+X
+X	if( hashenter( bindhash, (HASHDATA **)&b ) )
+X	    b->name = newstr( target );		/* never freed */
+X
+X	if( b->progress != BIND_INIT )
+X	    goto afterscanning;
+X
+X	b->progress = BIND_NOENTRY;
+X
+X	/* Not found - have to scan for it */
+X
+X	file_parse( target, &f1 );
+X	memset( (char *)&f2, '\0', sizeof( f2 ) );
+X
+X	/* Scan directory if not already done so */
+X
+X	{
+X	    BINDING binding, *b = &binding;
+X
+X	    f2.f_dir = f1.f_dir;
+X	    file_build( &f2, buf );
+X
+X	    b->name = buf;
+X	    b->time = b->flags = 0;
+X	    b->progress = BIND_INIT;
+X
+X	    if( hashenter( bindhash, (HASHDATA **)&b ) )
+X		b->name = newstr( buf );	/* never freed */
+X
+X	    if( !( b->flags & BIND_SCANNED ) )
+X	    {
+X		file_dirscan( buf, time_enter );
+X		b->flags |= BIND_SCANNED;
+X	    }
+X	}
+X
+X	/* Scan archive if not already done so */
+X
+X	if( f1.f_member.len )
+X	{
+X	    BINDING binding, *b = &binding;
+X
+X	    f2.f_base = f1.f_base;
+X	    f2.f_suffix = f1.f_suffix;
+X	    file_build( &f2, buf );
+X
+X	    b->name = buf;
+X	    b->time = b->flags = 0;
+X	    b->progress = BIND_INIT;
+X
+X	    if( hashenter( bindhash, (HASHDATA **)&b ) )
+X		b->name = newstr( buf );	/* never freed */
+X
+X	    if( !( b->flags & BIND_SCANNED ) )
+X	    {
+X		file_archscan( buf, time_enter );
+X		b->flags |= BIND_SCANNED;
+X	    }
+X	}
+X
+X    afterscanning:
+X
+X	if( b->progress == BIND_SPOTTED )
+X	{
+X	    if( file_time( b->name, &b->time ) < 0 )
+X		b->progress = BIND_MISSING;
+X	    else
+X		b->progress = BIND_FOUND;
+X	}
+X
+X	*time = b->progress == BIND_FOUND ? b->time : 0;
+X
+X	if( DEBUG_BIND && b->progress == BIND_FOUND )
+X	{
+X	    printf( "time ( %s ) : %s", target, ctime( time ) );
+X	}
+X}
+X
+Xstatic void
+Xtime_enter( target, found, time )
+Xchar	*target;
+Xint	found;
+Xtime_t	time;
+X{
+X	BINDING	binding, *b = &binding;
+X
+X	b->name = target;
+X	b->flags = 0;
+X
+X	if( hashenter( bindhash, (HASHDATA **)&b ) )
+X	    b->name = newstr( target );		/* never freed */
+X
+X	b->time = time;
+X	b->progress = found ? BIND_FOUND : BIND_SPOTTED;
+X
+X	if( DEBUG_BINDSCAN )
+X	    printf( "time ( %s ) : %s\n", target, time_progress[b->progress] );
+X}
+X
+X/*
+X * donestamps() - free timestamp tables
+X */
+X
+Xvoid
+Xdonestamps()
+X{
+X	hashdone( bindhash );
+X}
+SHAR_EOF
+chmod 0444 timestamp.c ||
+echo 'restore of timestamp.c failed'
+Wc_c="`wc -c < 'timestamp.c'`"
+test 3402 -eq "$Wc_c" ||
+	echo 'timestamp.c: original size 3402, current size' "$Wc_c"
+fi
+# ============= timestamp.h ==============
+if test -f 'timestamp.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping timestamp.h (File already exists)'
+else
+echo 'x - extracting timestamp.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'timestamp.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * timestamp.h - get the timestamp of a file or archive member
+X */
+X
+Xvoid timestamp();
+X
+SHAR_EOF
+chmod 0444 timestamp.h ||
+echo 'restore of timestamp.h failed'
+Wc_c="`wc -c < 'timestamp.h'`"
+test 137 -eq "$Wc_c" ||
+	echo 'timestamp.h: original size 137, current size' "$Wc_c"
+fi
+# ============= variable.c ==============
+if test -f 'variable.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping variable.c (File already exists)'
+else
+echo 'x - extracting variable.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'variable.c' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X# include "jam.h"
+X# include "lists.h"
+X# include "parse.h"
+X# include "variable.h"
+X# include "expand.h"
+X# include "hash.h"
+X# include "filesys.h"
+X# include "newstr.h"
+X
+X/*
+X * variable.c - handle jam multi-element variables
+X *
+X * External routines:
+X *
+X *	var_defines() - load a bunch of variable=value settings
+X *	var_list() - variable expand an input list, generating a new list
+X *	var_string() - expand a string with variables in it
+X *	var_get() - get value of a user defined symbol
+X *	var_set() - set a variable in jam's user defined symbol table
+X *	var_swap() - swap a variable's value with the given one
+X *	var_done() - free variable tables
+X *
+X * Internal routines:
+X *
+X *	var_dump() - dump a variable to stdout
+X */
+X
+Xstatic struct hash *varhash = 0;
+X
+X/*
+X * VARIABLE - a user defined multi-value variable
+X */
+X
+Xtypedef struct _variable VARIABLE ;
+X
+Xstruct _variable {
+X	char	*symbol;
+X	LIST	*value;
+X} ;
+X
+Xstatic void	var_dump();
+X
+X
+X
+X/*
+X * var_defines() - load a bunch of variable=value settings
+X */
+X
+Xvoid
+Xvar_defines( e )
+Xchar **e;
+X{
+X	for( ; *e; e++ )
+X	{
+X	    char sym[ MAXSYM ], *val;
+X
+X	    if( val = strchr( *e, '=' ) )
+X	    {
+X		strncpy( sym, *e, val - *e );
+X		sym[ val - *e ] = '\0';
+X		var_set( sym, list_new( (LIST *)0, newstr( val + 1 ) ) );
+X	    }
+X	}
+X}
+X
+X/*
+X * var_list() - variable expand an input list, generating a new list
+X *
+X * Returns a newly created list.
+X */
+X
+XLIST *
+Xvar_list( ilist, targets, sources )
+XLIST	*ilist;
+XLIST	*targets;
+XLIST	*sources;
+X{
+X	LIST *olist = 0;
+X
+X	while( ilist )
+X	{
+X	    char *s = ilist->string;
+X	    olist = var_expand( olist, s, s + strlen(s), targets, sources );
+X	    ilist = list_next( ilist );
+X	}
+X
+X	return olist;
+X}
+X
+X
+X/*
+X * var_string() - expand a string with variables in it
+X *
+X * Copies in to out; doesn't modify targets & sources.
+X */
+X
+Xint
+Xvar_string( in, out, targets, sources )
+Xchar	*in;
+Xchar	*out;
+XLIST	*targets;
+XLIST	*sources;
+X{
+X	char 	*out0 = out;
+X
+X	while( *in )
+X	{
+X	    char	*lastword;
+X	    int		dollar = 0;
+X
+X	    /* Copy white space */
+X
+X	    while( isspace( *in ) )
+X		*out++ = *in++;
+X
+X	    lastword = out;
+X
+X	    /* Copy non-white space, watching for variables */
+X
+X	    while( *in && !isspace( *in ) )
+X	    {
+X		if( in[0] == '$' && in[1] == '(' )
+X		    dollar++;
+X		*out++ = *in++;
+X	    }
+X
+X	    /* If a variable encountered, expand it and and embed the */
+X	    /* space-separated members of the list in the output. */
+X
+X	    if( dollar )
+X	    {
+X		LIST	*l;
+X
+X		l = var_expand( (LIST *)0, lastword, out, targets, sources );
+X
+X		out = lastword;
+X
+X		for( ; l; l = list_next( l ) )
+X		{
+X		    strcpy( out, l->string );
+X		    out += strlen( out );
+X		    *out++ = ' ';
+X		}
+X
+X		list_free( l );
+X	    }
+X	}
+X	*out++ = '\0';
+X
+X	return out - out0;
+X}
+X
+X/*
+X * var_get() - get value of a user defined symbol
+X *
+X * Returns NULL if symbol unset.
+X */
+X
+XLIST *
+Xvar_get( symbol )
+Xchar	*symbol;
+X{
+X	VARIABLE var, *v = &var;
+X
+X	v->symbol = symbol;
+X
+X	if( varhash && hashcheck( varhash, (HASHDATA **)&v ) )
+X	{
+X	    if( DEBUG_VARGET )
+X		var_dump( v->symbol, v->value, "get" );
+X	    return v->value;
+X	}
+X    
+X	return 0;
+X}
+X
+X/*
+X * var_set() - set a variable in jam's user defined symbol table
+X *
+X * Copies symbol.  Takes ownership of list.
+X */
+X
+Xvoid
+Xvar_set( symbol, value )
+Xchar	*symbol;
+XLIST	*value;
+X{
+X	list_free( var_swap( symbol, value ) );
+X}
+X
+X/*
+X * var_swap() - swap a variable's value with the given one
+X */
+X
+XLIST *
+Xvar_swap( symbol, value )
+Xchar	*symbol;
+XLIST	*value;
+X{
+X	VARIABLE var, *v = &var;
+X	LIST *oldvalue;
+X
+X	if( DEBUG_VARSET )
+X	    var_dump( symbol, value, "set" );
+X
+X	if( !varhash )
+X	    varhash = hashinit( sizeof( VARIABLE ), "variables" );
+X
+X	v->symbol = symbol;
+X	v->value = 0;
+X
+X	if( hashenter( varhash, (HASHDATA **)&v ) )
+X	    v->symbol = newstr( symbol );	/* never freed */
+X
+X	oldvalue = v->value;
+X	v->value = value;
+X
+X	return oldvalue;
+X}
+X
+X
+X
+X/*
+X * var_dump() - dump a variable to stdout
+X */
+X
+Xstatic void
+Xvar_dump( symbol, value, what )
+Xchar	*symbol;
+XLIST	*value;
+Xchar	*what;
+X{
+X	printf( "%s %s = ", what, symbol );
+X	list_print( value );
+X	printf( "\n" );
+X}
+X
+X/*
+X * var_done() - free variable tables
+X */
+X
+Xvoid
+Xvar_done()
+X{
+X	hashdone( varhash );
+X}
+SHAR_EOF
+chmod 0444 variable.c ||
+echo 'restore of variable.c failed'
+Wc_c="`wc -c < 'variable.c'`"
+test 4103 -eq "$Wc_c" ||
+	echo 'variable.c: original size 4103, current size' "$Wc_c"
+fi
+# ============= variable.h ==============
+if test -f 'variable.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping variable.h (File already exists)'
+else
+echo 'x - extracting variable.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'variable.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * variable.h - handle jam multi-element variables
+X */
+X
+XLIST *var_get();
+Xvoid var_defines();
+Xvoid var_set();
+XLIST *var_swap();
+XLIST *var_list();
+Xint var_string();
+SHAR_EOF
+chmod 0444 variable.h ||
+echo 'restore of variable.h failed'
+Wc_c="`wc -c < 'variable.h'`"
+test 213 -eq "$Wc_c" ||
+	echo 'variable.h: original size 213, current size' "$Wc_c"
+fi
+# ============= jam.c ==============
+if test -f 'jam.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping jam.c (File already exists)'
+else
+echo 'x - extracting jam.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'jam.c' &&
+X/*
+X * /+\
+X * +\	Copyright 1993 Christopher Seiwald.
+X * \+/
+X *
+X * Permission is granted to use this software and distribute it
+X * freely, as long as this notice is retained and modifications are
+X * clearly marked.
+X *
+X * The author assumes no liability for the consequences of using this
+X * software.
+X */
+X
+X# include "jam.h"
+X# include "option.h"
+X# include "make.h"
+X
+X/*
+X * jam.c - make redux
+X *
+X * See jam(1) and Jambase(5) for usage information.
+X *
+X * The top half of the code is structured such:
+X *
+X *                       jam 
+X *                      / | \
+X *                 +---+  |  \
+X *                /       |   \
+X *         jamgram     option  \
+X *        /  |   \              \
+X *       /   |    \              \
+X *      /    |     \             |
+X *  scan     |     compile      make
+X *           |    /    \       / |  \
+X *           |   /      \     /  |   \
+X *           |  /        \   /   |    \
+X *         parse         rules  search execute
+X *                               |
+X *                               |
+X *                               |
+X *                           timestamp
+X *
+X *
+X * The support routines are called by all of the above, but themselves
+X * are layered thus:
+X *
+X *                     variable|expand
+X *                      /  |   |   |
+X *                     /   |   |   |
+X *                    /    |   |   |
+X *                 lists   |   |   filesys
+X *                    \    |   |
+X *                     \   |   |
+X *                      \  |   |
+X *                     newstr  |
+X *                        \    |
+X *                         \   |
+X *                          \  |
+X *                          hash
+X *
+X * Roughly, the modules are:
+X *
+X *	compile.c - compile parsed jam statements
+X *	execunix.c - execute a shell script on UNIX
+X *	execvms.c - execute a shell script, ala VMS
+X *	expand.c - expand a buffer, given variable values
+X *	fileunix.c - manipulate file names and scan directories on UNIX
+X *	filevms.c - manipulate file names and scan directories on VMS
+X *	hash.c - simple in-memory hashing routines 
+X *	headers.c - handle #includes in source files
+X *	lists.c - maintain lists of strings
+X *	make.c - bring a target up to date, once rules are in place
+X *	newstr.c - string manipulation routines
+X *	option.c - command line option processing
+X *	parse.c - make and destroy parse trees as driven by the parser
+X *	regexp.c - Henry Spencer's regexp
+X *	rules.c - access to RULEs, TARGETs, and ACTIONs
+X *	scan.c - the jam yacc scanner
+X *	search.c - find a target along $(SEARCH) or $(LOCATE) 
+X *	timestamp.c - get the timestamp of a file or archive member
+X *	variable.c - handle jam multi-element variables
+X *	jamgram.yy - jam grammar
+X */
+X
+Xstruct globs globs = {
+X	1,			/* debug */
+X	0			/* noexec */
+X} ;
+X
+X/* Symbols to be defined as true for use in Jambase */
+X
+Xstatic char *othersyms[] = { OTHERSYMS, 0 } ;
+Xextern char **environ;
+X
+Xchar *usage = 
+X	"jam [-n] [-f<Jambase>] [-d<debuglevel>] [-t<target>...] [target...]";
+X
+Xmain( argc, argv )
+Xchar	**argv;
+X{
+X	int		n;
+X	char		*s;
+X	struct option	optv[N_OPTS];
+X	char		*ruleset = JAMBASE;
+X	char		*all = "all";
+X
+X	argc--, argv++;
+X
+X	if( ( n = getoptions( argc, argv, "d:f:t:n", optv ) ) < 0 )
+X	{
+X		printf( "usage: %s\n", usage );
+X		exit( 1 );
+X	}
+X
+X	argc -= n, argv += n;
+X
+X	/* Pick up interesting options */
+X
+X	if( ( s = getoptval( optv, 'n', 0 ) ) )
+X	    globs.noexec++;
+X
+X	if( ( s = getoptval( optv, 'd', 0 ) ) )
+X	    globs.debug = atoi( s );
+X
+X	/* load up environment variables */
+X
+X	var_defines( othersyms );
+X	var_defines( environ );
+X
+X	/* Parse ruleset */
+X
+X	for( n = 0; s = getoptval( optv, 'f', n ); n++ )
+X	{
+X	    yyfparse( s );
+X	    yyparse();
+X	}
+X
+X	if( !n )
+X	{
+X	    yyfparse( ruleset );
+X	    yyparse();
+X	}
+X
+X	/* Manually touch -t targets */
+X
+X	for( n = 0; s = getoptval( optv, 't', n ); n++ )
+X	    touchtarget( s );
+X
+X	/* Now make target */
+X
+X	if( argc )
+X	    make( argc, argv );
+X	else
+X	    make( 1, &all );
+X
+X	/* Widely scattered cleanup */
+X
+X	var_done();
+X	donerules();
+X	donestamps();
+X	donestr();
+X
+X	return EXITOK;
+X}
+SHAR_EOF
+chmod 0444 jam.c ||
+echo 'restore of jam.c failed'
+Wc_c="`wc -c < 'jam.c'`"
+test 4003 -eq "$Wc_c" ||
+	echo 'jam.c: original size 4003, current size' "$Wc_c"
+fi
+# ============= jam.h ==============
+if test -f 'jam.h' -a X"$1" != X"-c"; then
+	echo 'x - skipping jam.h (File already exists)'
+else
+echo 'x - extracting jam.h (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'jam.h' &&
+X/*
+X * Copyright 1993 Christopher Seiwald.
+X */
+X
+X/*
+X * jam.h - includes and globals for jam
+X */
+X
+X# ifdef VMS
+X
+X# ifdef __ALPHA
+X
+X# include <types.h>
+X# include <file.h>
+X# include <stat.h>
+X# include <stdio.h>
+X# include <ctype.h>
+X# include <stdlib.h>
+X# include <signal.h>
+X# include <string.h>
+X# include <time.h>
+X
+X# define OTHERSYMS "VMS=true","OS=OPENVMS"
+X
+X# else
+X
+X# include <types.h>
+X# include <file.h>
+X# include <stat.h>
+X# include <stdio.h>
+X# include <ctype.h>
+X# include <signal.h>
+X# include <string.h>
+X# include <time.h>
+X
+X# define OTHERSYMS "VMS=true","OS=VMS"
+X
+X# endif 
+X
+X# define MAXCMD	1023 /* longest command */
+X# define JAMBASE "Jambase.VMS"
+X# define EXITOK 1
+X
+X# else
+X
+X# include <sys/types.h>
+X# include <sys/file.h>
+X# include <sys/stat.h>
+X# include <fcntl.h>
+X# ifndef ultrix
+X# include <stdlib.h>
+X# endif
+X# include <stdio.h>
+X# include <ctype.h>
+X# ifndef __bsdi__
+X# include <malloc.h>
+X# endif
+X# include <memory.h>
+X# include <signal.h>
+X# include <string.h>
+X# include <time.h>
+X
+X# ifdef AIX
+X# define OTHERSYMS "UNIX=true","OS=AIX"
+X# endif
+X# ifdef __bsdi__
+X# define OTHERSYMS "UNIX=true","OS=BSDI"
+X# endif
+X# ifdef __DGUX
+X# define OTHERSYMS "UNIX=true","OS=DGUX"
+X# endif
+X# ifdef __hpux
+X# define OTHERSYMS "UNIX=true","OS=HPUX"
+X# endif
+X# ifdef __osf__
+X# define OTHERSYMS "UNIX=true","OS=OSF"
+X# endif
+X# ifdef _SEQUENT_
+X# define OTHERSYMS "UNIX=true","OS=PTX"
+X# endif
+X# ifdef __sgi
+X# define OTHERSYMS "UNIX=true","OS=IRIX"
+X# endif
+X# ifdef sun
+X# define OTHERSYMS "UNIX=true","OS=SUNOS"
+X# endif
+X# ifdef solaris
+X# undef OTHERSYMS
+X# define OTHERSYMS "UNIX=true","OS=SOLARIS"
+X# endif
+X# ifdef ultrix
+X# define OTHERSYMS "UNIX=true","OS=ULTRIX"
+X# endif
+X# ifndef OTHERSYMS
+X# define OTHERSYMS "UNIX=true"
+X# endif
+X
+X# define JAMBASE "/usr/local/lib/jam/Jambase"
+X# define MAXCMD	10240	/* longest command */
+X# define EXITOK 0
+X
+X# endif /* UNIX */
+X
+X/* You probably don't need to much with these. */
+X
+X# define MAXSYM	1024	/* longest symbol in the environment */
+X# define MAXARG 1024	/* longest single word on a line */
+X# define MAXPATH 1024	/* longest filename */
+X
+X/* Jam private definitions below. */
+X
+Xstruct globs {
+X	int	debug;
+X	int	noexec;
+X} ;
+X
+Xextern struct globs globs;
+X
+X# define DEBUG_MAKE	( globs.debug >= 1 )	/* show actions when executed */
+X# define DEBUG_MAKEQ	( globs.debug >= 2 )	/* show even quiet actions */
+X# define DEBUG_EXEC	( globs.debug >= 2 )	/* show text of actons */
+X# define DEBUG_MAKEPROG	( globs.debug >= 3 )	/* show progress of make0 */
+X
+X# define DEBUG_BIND	( globs.debug >= 4 )	/* show when files bound */
+X# define DEBUG_COMPILE	( globs.debug >= 5 )	/* show rule invocations */
+X# define DEBUG_MEM	( globs.debug >= 5 )	/* show memory use */
+X# define DEBUG_HEADER	( globs.debug >= 6 )	/* show result of header scan */
+X# define DEBUG_BINDSCAN	( globs.debug >= 6 )	/* show result of dir scan */
+X# define DEBUG_SEARCH	( globs.debug >= 6 )	/* show attempts at binding */
+X
+X# define DEBUG_IF	( globs.debug >= 7 )	/* show 'if' calculations */
+X# define DEBUG_VARSET	( globs.debug >= 7 )	/* show variable settings */
+X# define DEBUG_VARGET	( globs.debug >= 8 )	/* show variable fetches */
+X# define DEBUG_VAREXP	( globs.debug >= 8 )	/* show variable expansions */
+X# define DEBUG_LISTS	( globs.debug >= 9 )	/* show list manipulation */
+X# define DEBUG_SCAN	( globs.debug >= 9 )	/* show scanner tokens */
+X
+SHAR_EOF
+chmod 0444 jam.h ||
+echo 'restore of jam.h failed'
+Wc_c="`wc -c < 'jam.h'`"
+test 3290 -eq "$Wc_c" ||
+	echo 'jam.h: original size 3290, current size' "$Wc_c"
+fi
+# ============= jamgram.c ==============
+if test -f 'jamgram.c' -a X"$1" != X"-c"; then
+	echo 'x - skipping jamgram.c (File already exists)'
+else
+echo 'x - extracting jamgram.c (Text)'
+sed 's/^X//' << 'SHAR_EOF' > 'jamgram.c' &&
+Xextern char *malloc(), *realloc();
+X# define _BANG 257
+X# define _BANG_EQUALS 258
+X# define _AMPERAMPER 259
+X# define _LPAREN 260
+X# define _RPAREN 261
+X# define _COLON 262
+X# define _SEMIC 263
+X# define _LANGLE 264
+X# define _LANGLE_EQUALS 265
+X# define _EQUALS 266
+X# define _RANGLE 267
+X# define _RANGLE_EQUALS 268
+X# define ACTIONS 269
+X# define CASE 270
+X# define DEFAULT 271
+X# define ELSE 272
+X# define FOR 273
+X# define IF 274
+X# define IGNORE 275
+X# define IN 276
+X# define INCLUDE 277
+X# define ON 278
+X# define PIECEMEAL 279
+X# define QUIETLY 280
+X# define RULE 281
+X# define SWITCH 282
+X# define TOGETHER 283
+X# define UPDATED 284
+X# define _LBRACE 285
+X# define _BARBAR 286
+X# define _RBRACE 287
+X# define ARG 288
+X# define STRING 289
+X
+X# line 47 "jamgram.y"
+X#include "lists.h"
+X#include "parse.h"
+X#include "scan.h"
+X#include "compile.h"
+X#include "newstr.h"
+X
+X# define F0 (void (*)())0
+X# define P0 (PARSE *)0
+X# define L0 (LIST *)0
+X# define S0 (char *)0
+X
+X# define pset( l,r ) 	  parse_make( compile_set,P0,P0,S0,S0,l,r,0 )
+X# define psettings( l,p ) parse_make( compile_settings,p,P0,S0,S0,l,L0,0 )
+X# define pseton( l,r ) 	  parse_make( F0,P0,P0,S0,S0,l,r,0 )
+X# define psetdef( l,r )   parse_make( compile_setdefault,P0,P0,S0,S0,l,r,0 )
+X# define prule( s,l,r )   parse_make( compile_rule,P0,P0,s,S0,l,r,0 )
+X# define prules( l,r )	  parse_make( compile_rules,l,r,S0,S0,L0,L0,0 )
+X# define pfor( s,p,l )    parse_make( compile_foreach,p,P0,s,S0,l,L0,0 )
+X# define psetc( s,p )     parse_make( compile_setcomp,p,P0,s,S0,L0,L0,0 )
+X# define psete( s,s1,f )  parse_make( compile_setexec,P0,P0,s,s1,L0,L0,f )
+X# define pincl( l )       parse_make( compile_include,P0,P0,S0,S0,l,L0,0 )
+X# define pswitch( l,p )   parse_make( compile_switch,p,P0,S0,S0,l,L0,0 )
+X# define pcases( l,r )    parse_make( F0,l,r,S0,S0,L0,L0,0 )
+X# define pcase( s,p )     parse_make( F0,p,P0,s,S0,L0,L0,0 )
+X# define pif( l,r )	  parse_make( compile_if,l,r,S0,S0,L0,L0,0 )
+X# define pthen( l,r )	  parse_make( F0,l,r,S0,S0,L0,L0,0 )
+X# define pcond( c,l,r )	  parse_make( F0,l,r,S0,S0,L0,L0,c )
+X# define pcomp( c,l,r )	  parse_make( F0,P0,P0,S0,S0,l,r,c )
+X
+X#define yyclearin yychar = -1
+X#define yyerrok yyerrflag = 0
+Xextern int yychar;
+Xextern int yyerrflag;
+X#ifndef YYMAXDEPTH
+X#define YYMAXDEPTH 150
+X#endif
+X#ifndef YYSTYPE
+X#define YYSTYPE int
+X#endif
+XYYSTYPE yylval, yyval;
+X# define YYERRCODE 256
+Xint yyexca[] ={
+X-1, 1,
+X	0, -1,
+X	-2, 0,
+X-1, 4,
+X	266, 35,
+X	271, 35,
+X	278, 35,
+X	-2, 33,
+X	};
+X# define YYNPROD 43
+X# define YYLAST 177
+Xint yyact[]={
+X
+X    10,    84,    51,    83,     6,     8,    53,    52,     3,    27,
+X    50,    49,     9,     7,    81,    47,    11,    10,    88,     4,
+X    76,     6,     8,    29,    28,     3,    27,    23,    78,     9,
+X     7,    27,    75,    11,    10,    82,     4,    17,     6,     8,
+X    59,    57,     3,    26,    33,    27,     9,     7,    87,    27,
+X    11,    10,    55,     4,    36,     6,     8,    27,    34,     3,
+X    31,    27,    27,     9,     7,    39,    27,    11,    27,    63,
+X     4,    40,    41,    38,    42,    43,    36,    79,    73,    14,
+X    35,    37,    86,    21,    15,    25,    22,    36,    54,    48,
+X     2,    16,    20,    61,    62,    27,    12,    13,    74,    24,
+X    18,     5,     1,    37,     0,    19,     0,    30,     0,    32,
+X     0,     0,    46,     0,     0,     0,     0,     0,     0,     0,
+X     0,    64,    56,     0,    58,     0,    60,    44,    45,     0,
+X     0,    67,    68,    69,    70,    71,    72,     0,     0,     0,
+X     0,     0,    65,    66,     0,     0,     0,     0,     0,     0,
+X     0,     0,    77,     0,     0,     0,    80,     0,     0,     0,
+X     0,     0,     0,     0,    85,     0,     0,     0,     0,     0,
+X     0,     0,    89,     0,     0,     0,    90 };
+Xint yypact[]={
+X
+X -1000,  -218, -1000, -1000, -1000,  -187,  -251, -1000,  -174,  -261,
+X -1000, -1000,  -220,  -239, -1000,  -206, -1000,  -232,  -227,  -205,
+X  -193,  -174,  -174,  -218,  -273,  -235, -1000, -1000, -1000, -1000,
+X  -222, -1000,  -226, -1000,  -201, -1000,  -174,  -174, -1000, -1000,
+X -1000, -1000, -1000, -1000, -1000,  -183, -1000, -1000, -1000, -1000,
+X -1000, -1000, -1000, -1000, -1000, -1000,  -231, -1000,  -243, -1000,
+X  -257,  -210,  -201,  -274,  -252, -1000,  -172,  -279,  -279,  -279,
+X  -279,  -279,  -279, -1000,  -286, -1000, -1000,  -262, -1000, -1000,
+X -1000,  -180,  -224, -1000, -1000,  -269, -1000,  -218, -1000,  -218,
+X -1000 };
+Xint yypgo[]={
+X
+X     0,   102,    88,    85,    92,   101,    93,   105,    99,    98,
+X    94,    89 };
+Xint yyr1[]={
+X
+X     0,     1,     1,     3,     3,     2,     2,     2,     2,     2,
+X     2,     2,     2,     2,     2,     2,     9,     2,     2,     7,
+X     7,     7,     7,     7,     7,     7,     7,     7,     7,     7,
+X     6,     6,    10,     4,     4,     5,     8,     8,    11,    11,
+X    11,    11,    11 };
+Xint yyr2[]={
+X
+X     0,     1,     5,     1,     5,     7,     7,    11,     9,    11,
+X    13,    15,    11,    11,    15,     7,     1,    11,     7,     3,
+X     7,     7,     7,     7,     7,     7,     5,     7,     7,     7,
+X     1,     5,     9,     1,     5,     3,     1,     5,     3,     3,
+X     3,     3,     3 };
+Xint yychk[]={
+X
+X -1000,    -1,    -2,   277,   288,    -5,   273,   282,   274,   281,
+X   269,   285,    -4,    -4,   266,   271,   278,   288,    -4,    -7,
+X    -4,   257,   260,   288,    -8,    -3,   263,   288,   263,   262,
+X    -4,   266,    -4,   276,   285,   285,   259,   286,   266,   258,
+X   264,   265,   267,   268,    -7,    -7,    -2,   288,   -11,   284,
+X   283,   275,   280,   279,    -2,   287,    -4,   263,    -4,   266,
+X    -4,    -6,   -10,   270,    -3,    -7,    -7,    -4,    -4,    -4,
+X    -4,    -4,    -4,   261,    -9,   263,   263,    -4,   285,   287,
+X    -6,   288,   287,   289,   263,    -3,   262,   272,   287,    -3,
+X    -2 };
+Xint yydef[]={
+X
+X     1,    -2,     2,    33,    -2,     0,     0,    33,    33,     0,
+X    36,     3,     0,     0,    33,     0,    33,     0,     0,     0,
+X    19,    33,    33,     0,     0,     0,     5,    34,     6,    33,
+X     0,    33,     0,    33,    30,     3,    33,    33,    33,    33,
+X    33,    33,    33,    33,    26,     0,    15,    16,    37,    38,
+X    39,    40,    41,    42,     4,    18,     0,     8,     0,    33,
+X     0,     0,    30,     0,     0,    27,    28,    20,    21,    22,
+X    23,    24,    25,    29,     0,     7,     9,     0,     3,    12,
+X    31,     0,    13,    17,    10,     0,     3,     0,    11,    32,
+X    14 };
+Xtypedef struct { char *t_name; int t_val; } yytoktype;
+X#ifndef YYDEBUG
+X#	define YYDEBUG	0	/* don't allow debugging */
+X#endif
+X
+X#if YYDEBUG
+X
+Xyytoktype yytoks[] =
+X{
+X	"_BANG",	257,
+X	"_BANG_EQUALS",	258,
+X	"_AMPERAMPER",	259,
+X	"_LPAREN",	260,
+X	"_RPAREN",	261,
+X	"_COLON",	262,
+X	"_SEMIC",	263,
+X	"_LANGLE",	264,
+X	"_LANGLE_EQUALS",	265,
+X	"_EQUALS",	266,
+X	"_RANGLE",	267,
+X	"_RANGLE_EQUALS",	268,
+X	"ACTIONS",	269,
+X	"CASE",	270,
+X	"DEFAULT",	271,
+X	"ELSE",	272,
+X	"FOR",	273,
+X	"IF",	274,
+X	"IGNORE",	275,
+X	"IN",	276,
+X	"INCLUDE",	277,
+X	"ON",	278,
+X	"PIECEMEAL",	279,
+X	"QUIETLY",	280,
+X	"RULE",	281,
+X	"SWITCH",	282,
+X	"TOGETHER",	283,
+X	"UPDATED",	284,
+X	"_LBRACE",	285,
+X	"_BARBAR",	286,
+X	"_RBRACE",	287,
+X	"ARG",	288,
+X	"STRING",	289,
+X	"-unknown-",	-1	/* ends search */
+X};
+X
+Xchar * yyreds[] =
+X{
+X	"-no such reduction-",
+X	"stmts : /* empty */",
+X	"stmts : stmts rule",
+X	"rules : /* empty */",
+X	"rules : rules rule",
+X	"rule : INCLUDE args _SEMIC",
+X	"rule : ARG args _SEMIC",
+X	"rule : ARG args _COLON args _SEMIC",
+X	"rule : arg1 _EQUALS args _SEMIC",
+X	"rule : arg1 DEFAULT _EQUALS args _SEMIC",
+X	"rule : arg1 ON args _EQUALS args _SEMIC",
+X	"rule : FOR ARG IN args _LBRACE rules _RBRACE",
+X	"rule : SWITCH args _LBRACE cases _RBRACE",
+X	"rule : IF cond _LBRACE rules _RBRACE",
+X	"rule : IF cond _LBRACE rules _RBRACE ELSE rule",
+X	"rule : RULE ARG rule",
+X	"rule : ACTIONS eflags ARG",
+X	"rule : ACTIONS eflags ARG STRING",
+X	"rule : _LBRACE rules _RBRACE",
+X	"cond : args",
+X	"cond : args _EQUALS args",
+X	"cond : args _BANG_EQUALS args",
+X	"cond : args _LANGLE args",
+X	"cond : args _LANGLE_EQUALS args",
+X	"cond : args _RANGLE args",
+X	"cond : args _RANGLE_EQUALS args",
+X	"cond : _BANG cond",
+X	"cond : cond _AMPERAMPER cond",
+X	"cond : cond _BARBAR cond",
+X	"cond : _LPAREN cond _RPAREN",
+X	"cases : /* empty */",
+X	"cases : case cases",
+X	"case : CASE ARG _COLON rules",
+X	"args : /* empty */",
+X	"args : args ARG",
+X	"arg1 : ARG",
+X	"eflags : /* empty */",
+X	"eflags : eflags eflag",
+X	"eflag : UPDATED",
+X	"eflag : TOGETHER",
+X	"eflag : IGNORE",
+X	"eflag : QUIETLY",
+X	"eflag : PIECEMEAL",
+X};
+X#endif /* YYDEBUG */
+X#line 1 "/usr/lib/yaccpar"
+X/*	@(#)yaccpar 1.10 89/04/04 SMI; from S5R3 1.10	*/
+X
+X/*
+X** Skeleton parser driver for yacc output
+X*/
+X
+X/*
+X** yacc user known macros and defines
+X*/
+X#define YYERROR		goto yyerrlab
+X#define YYACCEPT	{ free(yys); free(yyv); return(0); }
+X#define YYABORT		{ free(yys); free(yyv); return(1); }
+X#define YYBACKUP( newtoken, newvalue )\
+X{\
+X	if ( yychar >= 0 || ( yyr2[ yytmp ] >> 1 ) != 1 )\
+X	{\
+X		yyerror( "syntax error - cannot backup" );\
+X		goto yyerrlab;\
+X	}\
+X	yychar = newtoken;\
+X	yystate = *yyps;\
+X	yylval = newvalue;\
+X	goto yynewstate;\
+X}
+X#define YYRECOVERING()	(!!yyerrflag)
+X#ifndef YYDEBUG
+X#	define YYDEBUG	1	/* make debugging available */
+X#endif
+X
+X/*
+X** user known globals
+X*/
+Xint yydebug;			/* set to 1 to get debugging */
+X
+X/*
+X** driver internal defines
+X*/
+X#define YYFLAG		(-1000)
+X
+X/*
+X** static variables used by the parser
+X*/
+Xstatic YYSTYPE *yyv;			/* value stack */
+Xstatic int *yys;			/* state stack */
+X
+Xstatic YYSTYPE *yypv;			/* top of value stack */
+Xstatic int *yyps;			/* top of state stack */
+X
+Xstatic int yystate;			/* current state */
+Xstatic int yytmp;			/* extra var (lasts between blocks) */
+X
+Xint yynerrs;			/* number of errors */
+X
+Xint yyerrflag;			/* error recovery flag */
+Xint yychar;			/* current input token number */
+X
+X
+X/*
+X** yyparse - return 0 if worked, 1 if syntax error not recovered from
+X*/
+Xint
+Xyyparse()
+X{
+X	register YYSTYPE *yypvt;	/* top of value stack for $vars */
+X	unsigned yymaxdepth = YYMAXDEPTH;
+X
+X	/*
+X	** Initialize externals - yyparse may be called more than once
+X	*/
+X	yyv = (YYSTYPE*)malloc(yymaxdepth*sizeof(YYSTYPE));
+X	yys = (int*)malloc(yymaxdepth*sizeof(int));
+X	if (!yyv || !yys)
+X	{
+X		yyerror( "out of memory" );
+X		return(1);
+X	}
+X	yypv = &yyv[-1];
+X	yyps = &yys[-1];
+X	yystate = 0;
+X	yytmp = 0;
+X	yynerrs = 0;
+X	yyerrflag = 0;
+X	yychar = -1;
+X
+X	goto yystack;
+X	{
+X		register YYSTYPE *yy_pv;	/* top of value stack */
+X		register int *yy_ps;		/* top of state stack */
+X		register int yy_state;		/* current state */
+X		register int  yy_n;		/* internal state number info */
+X
+X		/*
+X		** get globals into registers.
+X		** branch to here only if YYBACKUP was called.
+X		*/
+X	yynewstate:
+X		yy_pv = yypv;
+X		yy_ps = yyps;
+X		yy_state = yystate;
+X		goto yy_newstate;
+X
+X		/*
+X		** get globals into registers.
+X		** either we just started, or we just finished a reduction
+X		*/
+X	yystack:
+X		yy_pv = yypv;
+X		yy_ps = yyps;
+X		yy_state = yystate;
+X
+X		/*
+X		** top of for (;;) loop while no reductions done
+X		*/
+X	yy_stack:
+X		/*
+X		** put a state and value onto the stacks
+X		*/
+X#if YYDEBUG
+X		/*
+X		** if debugging, look up token value in list of value vs.
+X		** name pairs.  0 and negative (-1) are special values.
+X		** Note: linear search is used since time is not a real
+X		** consideration while debugging.
+X		*/
+X		if ( yydebug )
+X		{
+X			register int yy_i;
+X
+X			(void)printf( "State %d, token ", yy_state );
+X			if ( yychar == 0 )
+X				(void)printf( "end-of-file\n" );
+X			else if ( yychar < 0 )
+X				(void)printf( "-none-\n" );
+X			else
+X			{
+X				for ( yy_i = 0; yytoks[yy_i].t_val >= 0;
+X					yy_i++ )
+X				{
+X					if ( yytoks[yy_i].t_val == yychar )
+X						break;
+X				}
+X				(void)printf( "%s\n", yytoks[yy_i].t_name );
+X			}
+X		}
+X#endif /* YYDEBUG */
+X		if ( ++yy_ps >= &yys[ yymaxdepth ] )	/* room on stack? */
+X		{
+X			/*
+X			** reallocate and recover.  Note that pointers
+X			** have to be reset, or bad things will happen
+X			*/
+X			int yyps_index = (yy_ps - yys);
+X			int yypv_index = (yy_pv - yyv);
+X			int yypvt_index = (yypvt - yyv);
+X			yymaxdepth += YYMAXDEPTH;
+X			yyv = (YYSTYPE*)realloc((char*)yyv,
+X				yymaxdepth * sizeof(YYSTYPE));
+X			yys = (int*)realloc((char*)yys,
+X				yymaxdepth * sizeof(int));
+X			if (!yyv || !yys)
+X			{
+X				yyerror( "yacc stack overflow" );
+X				return(1);
+X			}
+X			yy_ps = yys + yyps_index;
+X			yy_pv = yyv + yypv_index;
+X			yypvt = yyv + yypvt_index;
+X		}
+X		*yy_ps = yy_state;
+X		*++yy_pv = yyval;
+X
+X		/*
+X		** we have a new state - find out what to do
+X		*/
+X	yy_newstate:
+X		if ( ( yy_n = yypact[ yy_state ] ) <= YYFLAG )
+X			goto yydefault;		/* simple state */
+X#if YYDEBUG
+X		/*
+X		** if debugging, need to mark whether new token grabbed
+X		*/
+X		yytmp = yychar < 0;
+X#endif
+X		if ( ( yychar < 0 ) && ( ( yychar = yylex() ) < 0 ) )
+X			yychar = 0;		/* reached EOF */
+X#if YYDEBUG
+X		if ( yydebug && yytmp )
+X		{
+X			register int yy_i;
+X
+X			(void)printf( "Received token " );
+X			if ( yychar == 0 )
+X				(void)printf( "end-of-file\n" );
+X			else if ( yychar < 0 )
+X				(void)printf( "-none-\n" );
+X			else
+X			{
+X				for ( yy_i = 0; yytoks[yy_i].t_val >= 0;
+X					yy_i++ )
+X				{
+X					if ( yytoks[yy_i].t_val == yychar )
+X						break;
+X				}
+X				(void)printf( "%s\n", yytoks[yy_i].t_name );
+X			}
+X		}
+X#endif /* YYDEBUG */
+X		if ( ( ( yy_n += yychar ) < 0 ) || ( yy_n >= YYLAST ) )
+X			goto yydefault;
+X		if ( yychk[ yy_n = yyact[ yy_n ] ] == yychar )	/*valid shift*/
+X		{
+X			yychar = -1;
+X			yyval = yylval;
+X			yy_state = yy_n;
+X			if ( yyerrflag > 0 )
+X				yyerrflag--;
+X			goto yy_stack;
+X		}
+X
+X	yydefault:
+X		if ( ( yy_n = yydef[ yy_state ] ) == -2 )
+X		{
+X#if YYDEBUG
+X			yytmp = yychar < 0;
+X#endif
+X			if ( ( yychar < 0 ) && ( ( yychar = yylex() ) < 0 ) )
+X				yychar = 0;		/* reached EOF */
+X#if YYDEBUG
+X			if ( yydebug && yytmp )
+X			{
+X				register int yy_i;
+X
+X				(void)printf( "Received token " );
+X				if ( yychar == 0 )
+X					(void)printf( "end-of-file\n" );
+X				else if ( yychar < 0 )
+X					(void)printf( "-none-\n" );
+X				else
+X				{
+X					for ( yy_i = 0;
+X						yytoks[yy_i].t_val >= 0;
+X						yy_i++ )
+X					{
+X						if ( yytoks[yy_i].t_val
+X							== yychar )
+X						{
+X							break;
+X						}
+X					}
+X					(void)printf( "%s\n", yytoks[yy_i].t_name );
+X				}
+X			}
+X#endif /* YYDEBUG */
+X			/*
+X			** look through exception table
+X			*/
+X			{
+X				register int *yyxi = yyexca;
+X
+X				while ( ( *yyxi != -1 ) ||
+X					( yyxi[1] != yy_state ) )
+X				{
+X					yyxi += 2;
+X				}
+X				while ( ( *(yyxi += 2) >= 0 ) &&
+X					( *yyxi != yychar ) )
+X					;
+X				if ( ( yy_n = yyxi[1] ) < 0 )
+X					YYACCEPT;
+X			}
+X		}
+X
+X		/*
+X		** check for syntax error
+X		*/
+X		if ( yy_n == 0 )	/* have an error */
+X		{
+X			/* no worry about speed here! */
+X			switch ( yyerrflag )
+X			{
+X			case 0:		/* new error */
+X				yyerror( "syntax error" );
+X				goto skip_init;
+X			yyerrlab:
+X				/*
+X				** get globals into registers.
+X				** we have a user generated syntax type error
+X				*/
+X				yy_pv = yypv;
+X				yy_ps = yyps;
+X				yy_state = yystate;
+X				yynerrs++;
+X			skip_init:
+X			case 1:
+X			case 2:		/* incompletely recovered error */
+X					/* try again... */
+X				yyerrflag = 3;
+X				/*
+X				** find state where "error" is a legal
+X				** shift action
+X				*/
+X				while ( yy_ps >= yys )
+X				{
+X					yy_n = yypact[ *yy_ps ] + YYERRCODE;
+X					if ( yy_n >= 0 && yy_n < YYLAST &&
+X						yychk[yyact[yy_n]] == YYERRCODE)					{
+X						/*
+X						** simulate shift of "error"
+X						*/
+X						yy_state = yyact[ yy_n ];
+X						goto yy_stack;
+X					}
+X					/*
+X					** current state has no shift on
+X					** "error", pop stack
+X					*/
+X#if YYDEBUG
+X#	define _POP_ "Error recovery pops state %d, uncovers state %d\n"
+X					if ( yydebug )
+X						(void)printf( _POP_, *yy_ps,
+X							yy_ps[-1] );
+X#	undef _POP_
+X#endif
+X					yy_ps--;
+X					yy_pv--;
+X				}
+X				/*
+X				** there is no state on stack with "error" as
+X				** a valid shift.  give up.
+X				*/
+X				YYABORT;
+X			case 3:		/* no shift yet; eat a token */
+X#if YYDEBUG
+X				/*
+X				** if debugging, look up token in list of
+X				** pairs.  0 and negative shouldn't occur,
+X				** but since timing doesn't matter when
+X				** debugging, it doesn't hurt to leave the
+X				** tests here.
+X				*/
+X				if ( yydebug )
+X				{
+X					register int yy_i;
+X
+X					(void)printf( "Error recovery discards " );
+X					if ( yychar == 0 )
+X						(void)printf( "token end-of-file\n" );
+X					else if ( yychar < 0 )
+X						(void)printf( "token -none-\n" );
+X					else
+X					{
+X						for ( yy_i = 0;
+X							yytoks[yy_i].t_val >= 0;
+X							yy_i++ )
+X						{
+X							if ( yytoks[yy_i].t_val
+X								== yychar )
+X							{
+X								break;
+X							}
+X						}
+X						(void)printf( "token %s\n",
+X							yytoks[yy_i].t_name );
+X					}
+X				}
+X#endif /* YYDEBUG */
+X				if ( yychar == 0 )	/* reached EOF. quit */
+X					YYABORT;
+X				yychar = -1;
+X				goto yy_newstate;
+X			}
+X		}/* end if ( yy_n == 0 ) */
+X		/*
+X		** reduction by production yy_n
+X		** put stack tops, etc. so things right after switch
+X		*/
+X#if YYDEBUG
+X		/*
+X		** if debugging, print the string that is the user's
+X		** specification of the reduction which is just about
+X		** to be done.
+X		*/
+X		if ( yydebug )
+X			(void)printf( "Reduce by (%d) \"%s\"\n",
+X				yy_n, yyreds[ yy_n ] );
+X#endif
+X		yytmp = yy_n;			/* value to switch over */
+X		yypvt = yy_pv;			/* $vars top of value stack */
+X		/*
+X		** Look in goto table for next state
+X		** Sorry about using yy_state here as temporary
+X		** register variable, but why not, if it works...
+X		** If yyr2[ yy_n ] doesn't have the low order bit
+X		** set, then there is no action to be done for
+X		** this reduction.  So, no saving & unsaving of
+X		** registers done.  The only difference between the
+X		** code just after the if and the body of the if is
+X		** the goto yy_stack in the body.  This way the test
+X		** can be made before the choice of what to do is needed.
+X		*/
+X		{
+X			/* length of production doubled with extra bit */
+X			register int yy_len = yyr2[ yy_n ];
+X
+X			if ( !( yy_len & 01 ) )
+X			{
+X				yy_len >>= 1;
+X				yyval = ( yy_pv -= yy_len )[1];	/* $$ = $1 */
+X				yy_state = yypgo[ yy_n = yyr1[ yy_n ] ] +
+X					*( yy_ps -= yy_len ) + 1;
+X				if ( yy_state >= YYLAST ||
+X					yychk[ yy_state =
+X					yyact[ yy_state ] ] != -yy_n )
+X				{
+X					yy_state = yyact[ yypgo[ yy_n ] ];
+X				}
+X				goto yy_stack;
+X			}
+X			yy_len >>= 1;
+X			yyval = ( yy_pv -= yy_len )[1];	/* $$ = $1 */
+X			yy_state = yypgo[ yy_n = yyr1[ yy_n ] ] +
+X				*( yy_ps -= yy_len ) + 1;
+X			if ( yy_state >= YYLAST ||
+X				yychk[ yy_state = yyact[ yy_state ] ] != -yy_n )
+X			{
+X				yy_state = yyact[ yypgo[ yy_n ] ];
+X			}
+X		}
+X					/* save until reenter driver code */
+X		yystate = yy_state;
+X		yyps = yy_ps;
+X		yypv = yy_pv;
+X	}
+X	/*
+X	** code supplied by user is placed in this switch
+X	*/
+X	switch( yytmp )
+X	{
+X		
+Xcase 1:
+X# line 85 "jamgram.y"
+X{
+X			compile_builtins();
+X		} break;
+Xcase 2:
+X# line 89 "jamgram.y"
+X{ 
+X			(*(yypvt[-0].parse->func))( yypvt[-0].parse, L0, L0 );
+X			parse_free( yypvt[-0].parse );
+X		} break;
+Xcase 3:
+X# line 101 "jamgram.y"
+X{ yyval.parse = prules( P0, P0 ); } break;
+Xcase 4:
+X# line 103 "jamgram.y"
+X{ yyval.parse = prules( yypvt[-1].parse, yypvt[-0].parse ); } break;
+Xcase 5:
+X# line 107 "jamgram.y"
+X{ yyval.parse = pincl( yypvt[-1].list ); } break;
+Xcase 6:
+X# line 109 "jamgram.y"
+X{ yyval.parse = prule( yypvt[-2].string, yypvt[-1].list, L0 ); } break;
+Xcase 7:
+X# line 111 "jamgram.y"
+X{ yyval.parse = prule( yypvt[-4].string, yypvt[-3].list, yypvt[-1].list ); } break;
+Xcase 8:
+X# line 113 "jamgram.y"
+X{ yyval.parse = pset( yypvt[-3].list, yypvt[-1].list ); } break;
+Xcase 9:
+X# line 115 "jamgram.y"
+X{ yyval.parse = psetdef( yypvt[-4].list, yypvt[-1].list ); } break;
+Xcase 10:
+X# line 117 "jamgram.y"
+X{ yyval.parse = psettings( yypvt[-3].list, pseton( yypvt[-5].list, yypvt[-1].list ) ); } break;
+Xcase 11:
+X# line 119 "jamgram.y"
+X{ yyval.parse = pfor( yypvt[-5].string, yypvt[-1].parse, yypvt[-3].list ); } break;
+Xcase 12:
+X# line 121 "jamgram.y"
+X{ yyval.parse = pswitch( yypvt[-3].list, yypvt[-1].parse ); } break;
+Xcase 13:
+X# line 123 "jamgram.y"
+X{ yyval.parse = pif( yypvt[-3].parse, pthen( yypvt[-1].parse, P0 ) ); } break;
+Xcase 14:
+X# line 125 "jamgram.y"
+X{ yyval.parse = pif( yypvt[-5].parse, pthen( yypvt[-3].parse, yypvt[-0].parse ) ); } break;
+Xcase 15:
+X# line 127 "jamgram.y"
+X{ yyval.parse = psetc( yypvt[-1].string, yypvt[-0].parse ); } break;
+Xcase 16:
+X# line 129 "jamgram.y"
+X{ scan_asstring = 1; } break;
+Xcase 17:
+X# line 131 "jamgram.y"
+X{ yyval.parse = psete( yypvt[-2].string, yypvt[-0].string, yypvt[-3].number );
+X		  scan_asstring = 0; } break;
+Xcase 18:
+X# line 134 "jamgram.y"
+X{ yyval.parse = yypvt[-1].parse; } break;
+Xcase 19:
+X# line 142 "jamgram.y"
+X{ yyval.parse = pcomp( COND_EXISTS, yypvt[-0].list, L0 ); } break;
+Xcase 20:
+X# line 144 "jamgram.y"
+X{ yyval.parse = pcomp( COND_EQUALS, yypvt[-2].list, yypvt[-0].list ); } break;
+Xcase 21:
+X# line 146 "jamgram.y"
+X{ yyval.parse = pcomp( COND_NOTEQ, yypvt[-2].list, yypvt[-0].list ); } break;
+Xcase 22:
+X# line 148 "jamgram.y"
+X{ yyval.parse = pcomp( COND_LESS, yypvt[-2].list, yypvt[-0].list ); } break;
+Xcase 23:
+X# line 150 "jamgram.y"
+X{ yyval.parse = pcomp( COND_LESSEQ, yypvt[-2].list, yypvt[-0].list ); } break;
+Xcase 24:
+X# line 152 "jamgram.y"
+X{ yyval.parse = pcomp( COND_MORE, yypvt[-2].list, yypvt[-0].list ); } break;
+Xcase 25:
+X# line 154 "jamgram.y"
+X{ yyval.parse = pcomp( COND_MOREEQ, yypvt[-2].list, yypvt[-0].list ); } break;
+Xcase 26:
+X# line 156 "jamgram.y"
+X{ yyval.parse = pcond( COND_NOT, yypvt[-0].parse, P0 ); } break;
+Xcase 27:
+X# line 158 "jamgram.y"
+X{ yyval.parse = pcond( COND_AND, yypvt[-2].parse, yypvt[-0].parse ); } break;
+Xcase 28:
+X# line 160 "jamgram.y"
+X{ yyval.parse = pcond( COND_OR, yypvt[-2].parse, yypvt[-0].parse ); } break;
+Xcase 29:
+X# line 162 "jamgram.y"
+X{ yyval.parse = yypvt[-1].parse; } break;
+Xcase 30:
+X# line 173 "jamgram.y"
+X{ yyval.parse = P0; } break;
+Xcase 31:
+X# line 175 "jamgram.y"
+X{ yyval.parse = pcases( yypvt[-1].parse, yypvt[-0].parse ); } break;
+Xcase 32:
+X# line 179 "jamgram.y"
+X{ yyval.parse = pcase( yypvt[-2].string, yypvt[-0].parse ); } break;
+Xcase 33:
+X# line 188 "jamgram.y"
+X{ yyval.list = L0; } break;
+Xcase 34:
+X# line 190 "jamgram.y"
+X{ yyval.list = list_new( yypvt[-1].list, copystr( yypvt[-0].string ) ); } break;
+Xcase 35:
+X# line 194 "jamgram.y"
+X{ yyval.list = list_new( L0, copystr( yypvt[-0].string ) ); } break;
+Xcase 36:
+X# line 203 "jamgram.y"
+X{ yyval.number = 0; } break;
+Xcase 37:
+X# line 205 "jamgram.y"
+X{ yyval.number = yypvt[-1].number | yypvt[-0].number; } break;
+Xcase 38:
+X# line 209 "jamgram.y"
+X{ yyval.number = EXEC_UPDATED; } break;
+Xcase 39:
+X# line 211 "jamgram.y"
+X{ yyval.number = EXEC_TOGETHER; } break;
+Xcase 40:
+X# line 213 "jamgram.y"
+X{ yyval.number = EXEC_IGNORE; } break;
+Xcase 41:
+X# line 215 "jamgram.y"
+X{ yyval.number = EXEC_QUIETLY; } break;
+Xcase 42:
+X# line 217 "jamgram.y"
+X{ yyval.number = EXEC_PIECEMEAL; } break;
+X	}
+X	goto yystack;		/* reset registers in driver code */
+X}
+SHAR_EOF
+chmod 0444 jamgram.c ||
+echo 'restore of jamgram.c failed'
+Wc_c="`wc -c < 'jamgram.c'`"
+test 22556 -eq "$Wc_c" ||
+	echo 'jamgram.c: original size 22556, current size' "$Wc_c"
+fi
+true || echo 'restore of jamgram.h failed'
+echo End of part 4, continue with part 5
+exit 0

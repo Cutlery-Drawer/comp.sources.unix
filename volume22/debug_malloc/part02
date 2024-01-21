@@ -1,0 +1,2193 @@
+Subject:  v22i113:  Debugging malloc() library, Part02/02
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: 781b16f7 302faa92 8449794f 3a8d14ed
+
+Submitted-by: "Conor P. Cahill" <virtech!cpcahil@uunet.uu.net>
+Posting-number: Volume 22, Issue 113
+Archive-name: debug_malloc/part02
+
+#!/bin/sh
+# This is part 02 of Malloclib
+if touch 2>&1 | fgrep '[-amc]' > /dev/null
+ then TOUCH=touch
+ else TOUCH=true
+fi
+# ============= malloc.h ==============
+if test X"$1" != X"-c" -a -f 'malloc.h'; then
+	echo "File already exists: skipping 'malloc.h'"
+else
+echo "x - extracting malloc.h (Text)"
+sed 's/^X//' << 'SHAR_EOF' > malloc.h &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X/*
+X * $Id: malloc.h,v 1.3 90/05/11 11:04:10 cpcahil Exp $
+X */
+Xstruct mlist
+X{
+X	struct mlist	* next;			/* next entry in chain	*/
+X	struct mlist	* prev;			/* prev entry in chain	*/
+X	int	 	  flag;			/* inuse flag		*/
+X	unsigned int	  r_size;		/* requested size	*/
+X	union
+X	{
+X		unsigned int	  size;		/* actual size		*/
+X		double		  unused_just_for_alignment;
+X	} s;
+X	char		  data[4];
+X};
+X
+X#define M_SIZE		((int)(char *)((struct mlist *)0)->data)
+X#define M_RND		0x08
+X
+X#define M_INUSE 	0x01
+X#define M_MAGIC 	0x03156100
+X
+X#define M_BLOCKSIZE	(1024*8)
+X
+X#define M_FILL		'\01'
+X#define M_FREE_FILL	'\02'
+X
+X#define M_ROUNDUP(size)	{\
+X				if( size & (M_RND-1) ) \
+X				{ \
+X					size &= ~(M_RND-1); \
+X					size += M_RND; \
+X				} \
+X			}
+X
+X/*
+X * Malloc warning/fatal error handler defines...
+X */
+X#define M_HANDLE_DUMP	0x80  /* 128 */
+X#define M_HANDLE_IGNORE	0
+X#define M_HANDLE_ABORT	1
+X#define M_HANDLE_EXIT	2
+X#define M_HANDLE_CORE	3
+X	
+X/*
+X * Mallopt commands and defaults
+X */
+X
+X#define MALLOC_WARN	1		/* set malloc warning handling	*/
+X#define MALLOC_FATAL	2		/* set malloc fatal handling	*/
+X#define MALLOC_ERRFILE	3		/* specify malloc error file	*/
+X#define MALLOC_CKCHAIN	4		/* turn on chain checking	*/
+X
+X
+X/*
+X * Malloc warning/fatal error codes
+X */
+X
+X#define M_CODE_CHAIN_BROKE	1	/* malloc chain is broken	*/
+X#define M_CODE_NO_END		2	/* chain end != endptr		*/
+X#define M_CODE_BAD_PTR		3	/* pointer not in malloc area	*/
+X#define M_CODE_BAD_MAGIC	4	/* bad magic number in header	*/
+X#define M_CODE_BAD_CONNECT	5	/* chain poingers corrupt	*/
+X#define M_CODE_OVERRUN		6	/* data overrun in malloc seg	*/
+X#define M_CODE_REUSE		7	/* reuse of freed area		*/
+X#define M_CODE_NOT_INUSE	8	/* pointer is not in use	*/
+X#define M_CODE_NOMORE_MEM	9	/* no more memory available	*/
+X#define M_CODE_OUTOF_BOUNDS	10	/* gone beyound bounds 		*/
+X
+Xvoid malloc_warning();
+Xvoid malloc_fatal();
+Xvoid malloc_check_data();
+Xvoid malloc_check_str();
+Xvoid malloc_verify();
+X
+X/*
+X * $Log:	malloc.h,v $
+X * Revision 1.3  90/05/11  11:04:10  cpcahil
+X * took out some extraneous lines
+X * 
+X * Revision 1.2  90/05/11  00:13:09  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.1  90/02/23  07:09:03  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0511110490 malloc.h &&
+chmod 0444 malloc.h ||
+echo "restore of malloc.h failed"
+set `wc -c malloc.h`;Wc_c=$1
+if test "$Wc_c" != "2346"; then
+	echo original size 2346, current size $Wc_c
+fi
+fi
+# ============= malloc_chk.c ==============
+if test X"$1" != X"-c" -a -f 'malloc_chk.c'; then
+	echo "File already exists: skipping 'malloc_chk.c'"
+else
+echo "x - extracting malloc_chk.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > malloc_chk.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X
+X#include <stdio.h>
+X#include "malloc.h"
+X#include "debug.h"
+X
+X#ifndef lint
+Xstatic
+Xchar rcs_hdr[] = "$Id: malloc_chk.c,v 1.4 90/05/11 00:13:09 cpcahil Exp $";
+X#endif
+X
+Xextern struct mlist	  malloc_start;
+Xextern struct mlist	* malloc_end;
+Xextern char		* malloc_data_start;
+Xextern char		* malloc_data_end;
+X
+X/*
+X * Function:	malloc_in_arena()
+X *
+X * Purpose:	to verify address is within malloc arena.
+X *
+X * Arguments:	ptr	- pointer to verify
+X *
+X * Returns:	TRUE	- if pointer is within malloc area
+X *		FALSE	- otherwise
+X *
+X * Narrative:
+X *   IF pointer is >= malloc area start AND <= malloc area end
+X *      return TRUE
+X *   ELSE
+X *      return FALSE
+X *
+X * Mod History:	
+X *   90/01/24	cpcahil		Initial revision.
+X */
+Xint
+Xmalloc_in_arena(ptr)
+X	char	* ptr;
+X{
+X	extern char	* malloc_data_start;
+X	extern char	* malloc_data_end;
+X	int		  rtn = 0;
+X
+X	if( ptr >= malloc_data_start && ptr <= malloc_data_end )
+X	{
+X		rtn = 1;
+X	}
+X	
+X	return(rtn);
+X}
+X
+X/*
+X * Function:	malloc_check_str()
+X *
+X * Arguments:	func	- name of function calling this routine
+X *		str	- pointer to area to check
+X *
+X * Purpose:	to verify that if str is within the malloc arena, the data 
+X *		it points to does not extend beyond the applicable region.
+X *
+X * Returns:	Nothing of any use (function is void).
+X *
+X * Narrative:
+X *   IF pointer is within malloc arena
+X *      determin length of string
+X *      call malloc_verify() to verify data is withing applicable region
+X *   return 
+X *
+X * Mod History:	
+X *   90/01/24	cpcahil		Initial revision.
+X *   90/01/29	cpcahil		Added code to ignore recursive calls.
+X */
+Xvoid
+Xmalloc_check_str(func,str)
+X	char		* func;
+X	char		* str;
+X{
+X	static int	  layers;
+X	register char	* s;
+X
+X	if( (layers++ == 0) &&  malloc_in_arena(str) )
+X	{
+X		for( s=str; *s; s++)
+X		{
+X		}
+X		
+X		malloc_verify(func,str,s-str+1);
+X	}
+X
+X	layers--;
+X}
+X
+X/*
+X * Function:	malloc_check_data()
+X *
+X * Arguments:	func	- name of function calling this routine
+X *		ptr	- pointer to area to check
+X *		len 	- length to verify
+X *
+X * Purpose:	to verify that if ptr is within the malloc arena, the data 
+X *		it points to does not extend beyond the applicable region.
+X *
+X * Returns:	Nothing of any use (function is void).
+X *
+X * Narrative:
+X *   IF pointer is within malloc arena
+X *      call malloc_verify() to verify data is withing applicable region
+X *   return 
+X *
+X * Mod History:	
+X *   90/01/24	cpcahil		Initial revision.
+X *   90/01/29	cpcahil		Added code to ignore recursive calls.
+X */
+Xvoid
+Xmalloc_check_data(func,ptr,len)
+X	char		* func;
+X	char		* ptr;
+X	int		  len;
+X{
+X	static int	  layers;
+X
+X	if( layers++ == 0 )
+X	{
+X		DEBUG3(40,"malloc_check_data(%s,0x%x,%d) called...",
+X			func,ptr,len);
+X		if( malloc_in_arena(ptr) )
+X		{
+X			DEBUG0(10,"pointer in malloc arena, verifying...");
+X			malloc_verify(func,ptr,len);
+X		}
+X	}
+X
+X	layers--;
+X}
+X
+X/*
+X * Function:	malloc_verify()
+X *
+X * Arguments:	func	- name of function calling the malloc check routines
+X *		ptr	- pointer to area to check
+X *		len 	- length to verify
+X *
+X * Purpose:	to verify that the data ptr points to does not extend beyond
+X *		the applicable malloc region.  This function is only called 
+X *		if it has been determined that ptr points into the malloc arena.
+X *
+X * Returns:	Nothing of any use (function is void).
+X *
+X * Narrative:
+X *
+X * Mod History:	
+X *   90/01/24	cpcahil		Initial revision.
+X */
+Xvoid
+Xmalloc_verify(func,ptr,len)
+X	char		* func;
+X	char		* ptr;
+X	int		  len;
+X{
+X	extern struct mlist	* malloc_end;
+X	extern int		  malloc_errno;
+X	extern struct mlist 	  malloc_start;
+X	struct mlist		* mptr;
+X	
+X	DEBUG3(40,"malloc_verify(%s,0x%x,%d) called...", func,ptr,len);
+X	/*
+X	 * Find the malloc block that includes this pointer
+X	 */
+X	mptr = &malloc_start;
+X	while( mptr && 
+X		! (((char *)mptr < ptr) && ((mptr->data+mptr->s.size) > ptr) ) )
+X	{
+X		mptr = mptr->next;
+X	}
+X
+X	/*
+X	 * if ptr was not in a malloc block, it must be part of
+X	 *    some direct sbrk() stuff, so just return.
+X	 */
+X	if( ! mptr )
+X	{
+X		DEBUG1(10,"ptr (0x%x) not found in malloc search", ptr);
+X		return;
+X	}
+X	
+X	/*
+X 	 * Now we have a valid malloc block that contains the indicated
+X	 * pointer.  We must verify that it is withing the requested block
+X	 * size (as opposed to the real block size which is rounded up to
+X	 * allow for correct alignment).
+X	 */
+X
+X	DEBUG4(60,"Checking  0x%x-0x%x, 0x%x-0x%x",
+X			ptr, ptr+len, mptr->data, mptr->data+mptr->r_size);
+X	
+X	if( (ptr < mptr->data) || ((ptr+len) > (mptr->data+mptr->r_size)) )
+X	{
+X		DEBUG4(0,"pointer not within region 0x%x-0x%x, 0x%x-0x%x",
+X			ptr, ptr+len, mptr->data, mptr->data+mptr->r_size);
+X
+X		malloc_errno = M_CODE_OUTOF_BOUNDS;
+X		malloc_warning(func);
+X	}
+X
+X	return;
+X}
+X
+X/*
+X * $Log:	malloc_chk.c,v $
+X * Revision 1.4  90/05/11  00:13:09  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.3  90/02/24  21:50:22  cpcahil
+X * lots of lint fixes
+X * 
+X * Revision 1.2  90/02/24  17:29:38  cpcahil
+X * changed $Header to $Id so full path wouldnt be included as part of rcs 
+X * id string
+X * 
+X * Revision 1.1  90/02/24  14:57:03  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0511001490 malloc_chk.c &&
+chmod 0444 malloc_chk.c ||
+echo "restore of malloc_chk.c failed"
+set `wc -c malloc_chk.c`;Wc_c=$1
+if test "$Wc_c" != "5125"; then
+	echo original size 5125, current size $Wc_c
+fi
+fi
+# ============= malloc_chn.c ==============
+if test X"$1" != X"-c" -a -f 'malloc_chn.c'; then
+	echo "File already exists: skipping 'malloc_chn.c'"
+else
+echo "x - extracting malloc_chn.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > malloc_chn.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X#include <stdio.h>
+X#include <fcntl.h>
+X#include "malloc.h"
+X
+X/*
+X * Function:	malloc_chain_check()
+X *
+X * Purpose:	to verify malloc chain is intact
+X *
+X * Arguments:	todo	- 0 - just check and return status
+X *			  1 - call malloc_warn if error detected
+X *
+X * Returns:	0	- malloc chain intact & no overflows
+X *		other	- problems detected in malloc chain
+X *
+X * Narrative:
+X *
+X * Notes:	If todo is non-zero the malloc_warn function, when called
+X *		may not return (i.e. it may exit)
+X *
+X */
+X#ifndef lint
+Xstatic
+Xchar rcs_hdr[] = "$Id: malloc_chn.c,v 1.4 90/05/11 00:13:09 cpcahil Exp $";
+X#endif
+X
+X
+Xint
+Xmalloc_chain_check(todo)
+X	int		  todo;
+X{
+X	char			* func = "malloc_chain_check";
+X	int			  i;
+X	extern char		* malloc_data_start;
+X	extern char		* malloc_data_end;
+X	extern struct mlist 	* malloc_end;
+X	extern int		  malloc_errno;
+X	extern struct mlist	  malloc_start;
+X	struct mlist		* oldptr;
+X	struct mlist		* ptr;
+X	int			  rtn = 0;
+X
+X	oldptr = &malloc_start;
+X	for(ptr = malloc_start.next; ; ptr = ptr->next)
+X	{
+X		/*
+X		 * Since the malloc chain is a forward only chain, any
+X		 * pointer that we get should always be positioned in 
+X		 * memory following the previous pointer.  If this is not
+X		 * so, we must have a corrupted chain.
+X		 */
+X		if( ptr )
+X		{
+X			if(ptr < oldptr )
+X			{
+X				malloc_errno = M_CODE_CHAIN_BROKE;
+X				if( todo )
+X				{
+X					malloc_fatal(func);
+X				}
+X				rtn++;
+X				break;
+X			}
+X			oldptr = ptr;
+X		}
+X		else
+X		{
+X			if( oldptr != malloc_end )
+X			{
+X				/*
+X				 * This should never happen.  If it does, then
+X				 * we got a real problem.
+X				 */
+X				malloc_errno = M_CODE_NO_END;
+X				if( todo )
+X				{
+X					malloc_fatal(func);
+X				}
+X				rtn++;
+X			}
+X			break;
+X		}
+X		
+X		/*
+X		 * verify that ptr is within the malloc region...
+X		 * since we started within the malloc chain this should never
+X		 * happen.
+X		 */
+X
+X		if( ((char *)ptr < malloc_data_start) ||
+X		    ((char *)ptr > malloc_data_end) )
+X		{
+X			malloc_errno = M_CODE_BAD_PTR;
+X			if( todo )
+X			{
+X				malloc_fatal(func);
+X			}
+X			rtn++;
+X			break;
+X		}
+X
+X		/* 
+X		 * verify magic flag is set
+X		 */
+X		
+X		if( (ptr->flag&M_MAGIC) != M_MAGIC )
+X		{
+X			malloc_errno = M_CODE_BAD_MAGIC;
+X			if( todo )
+X			{
+X				malloc_warning(func);
+X			}
+X			rtn++;
+X			continue;
+X		}
+X
+X		/* 
+X		 * verify segments are correctly linked together
+X		 */
+X		
+X		if( (ptr->prev && (ptr->prev->next != ptr) ) ||
+X		    (ptr->next && (ptr->next->prev != ptr) ) ||
+X		    ((ptr->next == NULL) && (ptr->prev == NULL)) )
+X		{
+X			malloc_errno = M_CODE_BAD_CONNECT;
+X			if( todo )
+X			{
+X				malloc_warning(func);
+X			}
+X			rtn++;
+X			continue;
+X		}
+X
+X		/*
+X		 * If this segment is allocated
+X		 */
+X
+X		if( (ptr->flag & M_INUSE) != 0 )
+X		{
+X			/*
+X			 * verify no overflow of data area
+X			 */
+X
+X			for(i=ptr->r_size; i < ptr->s.size; i++)
+X			{
+X				if( ptr->data[i] != M_FILL )
+X				{
+X					malloc_errno = M_CODE_OVERRUN;
+X					if( todo )
+X					{
+X						malloc_warning(func);
+X					}
+X					rtn++;
+X					break;
+X				}
+X			}
+X		}
+X		else /* it's not allocated so */
+X		{
+X			/*
+X			 * verify no reuse of freed data blocks
+X			 */
+X
+X			for(i=0; i < ptr->s.size; i++)
+X			{
+X				if( ptr->data[i] != M_FREE_FILL )
+X				{
+X					malloc_errno = M_CODE_REUSE;
+X					if( todo )
+X					{
+X						malloc_warning(func);
+X					}
+X					rtn++;
+X					break;
+X				}
+X			}
+X		}
+X
+X	} /* for(... */
+X
+X	return(rtn);
+X
+X} /* malloc_chain_check(... */
+SHAR_EOF
+$TOUCH -am 0511001490 malloc_chn.c &&
+chmod 0444 malloc_chn.c ||
+echo "restore of malloc_chn.c failed"
+set `wc -c malloc_chn.c`;Wc_c=$1
+if test "$Wc_c" != "3449"; then
+	echo original size 3449, current size $Wc_c
+fi
+fi
+# ============= mallopt.c ==============
+if test X"$1" != X"-c" -a -f 'mallopt.c'; then
+	echo "File already exists: skipping 'mallopt.c'"
+else
+echo "x - extracting mallopt.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > mallopt.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X#include <stdio.h>
+X#include <fcntl.h>
+X#include "malloc.h"
+X
+X/*
+X * Function:	mallopt()
+X *
+X * Purpose:	to set options for the malloc debugging library
+X *
+X * Arguments:	none
+X *
+X * Returns:	nothing of any value
+X *
+X * Narrative:	
+X *
+X */
+X
+X#ifndef lint
+Xstatic
+Xchar rcs_hdr[] = "$Id: mallopt.c,v 1.4 90/05/11 00:13:10 cpcahil Exp $";
+X#endif
+X
+Xunion val
+X{
+X	int	  i;
+X	char	* str;
+X};
+X
+Xint
+Xmallopt(cmd,value)
+X	int			  cmd;
+X	union val		  value;
+X{
+X	int			  i;
+X	extern int		  malloc_checking;
+X	extern char		* malloc_data_start;
+X	extern int		  malloc_errfd;
+X	extern int		  malloc_fatal_level;
+X	void			  malloc_init();
+X	extern int		  malloc_warn_level;
+X	register char		* s;
+X
+X	/*
+X 	 * If not initialized...
+X	 */
+X	if( malloc_data_start == (char *) 0)
+X	{
+X		malloc_init();
+X	}
+X
+X
+X	switch(cmd)
+X	{
+X		case MALLOC_WARN:
+X			malloc_warn_level = value.i;
+X			break;
+X
+X		case MALLOC_FATAL:
+X			malloc_fatal_level = value.i;
+X			break;
+X
+X		case MALLOC_CKCHAIN:
+X			malloc_checking = value.i;
+X			break;
+X
+X		case MALLOC_ERRFILE:
+X			
+X			i = open(value.str,O_CREAT|O_APPEND|O_WRONLY,0666);
+X			if( i == -1 )
+X			{
+X				(void) write(2,
+X					  "Unable to open malloc error file: ",
+X					  (unsigned) 34);
+X				for(s=value.str; *s; s++)
+X				{
+X					/* do nothing */;
+X				}
+X				(void) write(2,value.str,
+X					     (unsigned)(s-value.str));
+X				(void) write(2,"\n",(unsigned)1);
+X			}
+X			else
+X			{
+X				if( malloc_errfd != 2 )
+X				{
+X					(void) close(malloc_errfd);
+X				}
+X			}
+X			
+X			break;
+X
+X		default:
+X			return(1);
+X			break;
+X	}
+X
+X	return(0);
+X}
+X
+X/*
+X * $Log:	mallopt.c,v $
+X * Revision 1.4  90/05/11  00:13:10  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.3  90/02/25  11:03:26  cpcahil
+X * changed to return int so that it agrees with l libmalloc.a's mallopt()
+X * 
+X * Revision 1.2  90/02/25  11:01:21  cpcahil
+X * added support for malloc chain checking.
+X * 
+X * Revision 1.1  90/02/24  21:50:24  cpcahil
+X * Initial revision
+X * 
+X * Revision 1.1  90/02/24  17:10:53  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0511001490 mallopt.c &&
+chmod 0444 mallopt.c ||
+echo "restore of mallopt.c failed"
+set `wc -c mallopt.c`;Wc_c=$1
+if test "$Wc_c" != "2128"; then
+	echo original size 2128, current size $Wc_c
+fi
+fi
+# ============= memory.c ==============
+if test X"$1" != X"-c" -a -f 'memory.c'; then
+	echo "File already exists: skipping 'memory.c'"
+else
+echo "x - extracting memory.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > memory.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X
+X#ifndef lint
+Xstatic
+Xchar rcs_hdr[] = "$Id: memory.c,v 1.5 90/05/11 15:39:36 cpcahil Exp $";
+X#endif
+X
+Xchar *
+Xmemccpy(ptr1, ptr2, ch, len)
+X	register char	* ptr1;
+X	register char	* ptr2;
+X	int		  len;
+X	int		  ch;
+X{
+X	int		  check;
+X	register int	  i;
+X	char		* rtn;
+X
+X	/*
+X	 * I know that the assignment could be done in the following, but
+X	 * I wanted to perform a check before any assignment, so first I 
+X	 * determine the length, check the pointers and then do the assignment.
+X	 */
+X	for( i=0; (i < len) && (ptr2[i] != ch); i++)
+X	{
+X	}
+X	if( ptr2[i] == ch )
+X	{
+X		check = i+1;
+X	}
+X
+X	malloc_check_data("memccpy", ptr1, check);
+X	malloc_check_data("memccpy", ptr2, check);
+X
+X	/*
+X	 * if we found the character...
+X 	 */
+X
+X	if( i < len )
+X	{
+X		rtn = ptr1+i+1;
+X		i++;
+X	}
+X	else
+X	{
+X		rtn = (char *) 0;
+X	}
+X
+X 	while( i-- )
+X	{
+X		*(ptr1++) = *(ptr2++);
+X	}
+X	
+X	return(rtn);
+X}
+X
+Xchar *
+Xmemchr(ptr1,ch,len)
+X	register char	* ptr1;
+X	register int	  ch;
+X	int		  len;
+X{
+X	int		  i;
+X
+X	for( i=0; (i < len) && (ptr1[i] != ch); i++)
+X	{
+X	}
+X
+X	malloc_check_data("memchr", ptr1, i);
+X
+X	if( i < len )
+X	{
+X		return( ptr1+i );
+X	}
+X	else
+X	{
+X		return( (char *) 0);	
+X	}
+X}
+X
+Xchar *
+Xmemcpy(ptr1, ptr2, len)
+X	register char	* ptr1;
+X	register char	* ptr2;
+X	register int	  len;
+X{
+X	char		* rtn = ptr1;
+X
+X	malloc_check_data("memcpy", ptr1, len);
+X	malloc_check_data("memcpy", ptr2, len);
+X	
+X	while( len-- )
+X	{
+X		*(ptr1++) = *(ptr2++);
+X	}
+X	return(rtn);
+X}
+X
+Xint
+Xmemcmp(ptr1, ptr2, len)
+X	register char	* ptr1;
+X	register char	* ptr2;
+X	register int	  len;
+X{
+X	malloc_check_data("memcpy", ptr1, len);
+X	malloc_check_data("memcpy", ptr2, len);
+X
+X	while( --len && (*ptr1 == *ptr2) )
+X	{
+X		ptr1++;
+X		ptr2++;
+X	}
+X	return( *ptr1 - *ptr2 );
+X}
+X
+Xchar * 
+Xmemset(ptr1, ch, len)
+X	register char	* ptr1;
+X	register int	  ch;
+X	register int	  len;
+X{
+X	char		* rtn = ptr1;
+X
+X	malloc_check_data("memcpy", ptr1, len);
+X
+X	while( len-- )
+X	{
+X		*(ptr1++) = ch;
+X	}
+X
+X	return(rtn);
+X}
+X
+Xchar *
+Xbcopy(ptr2,ptr1,len)
+X	char		* ptr2;
+X	char		* ptr1;
+X	int		  len;
+X{
+X	return(memcpy(ptr1,ptr2,len));
+X}
+X
+Xchar *
+Xbzero(ptr1,len)
+X	char		* ptr1;
+X	int		  len;
+X{
+X	return(memset(ptr1,'\0',len));
+X}
+X
+Xint
+Xbcmp(ptr2, ptr1, len)
+X	char		* ptr1;
+X	char		* ptr2;
+X	int		  len;
+X{
+X	return( memcmp(ptr1,ptr2,len) );
+X}
+X
+X/*
+X * $Log:	memory.c,v $
+X * Revision 1.5  90/05/11  15:39:36  cpcahil
+X * fixed bug in memccpy().
+X * 
+X * Revision 1.4  90/05/11  00:13:10  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.3  90/02/24  21:50:29  cpcahil
+X * lots of lint fixes
+X * 
+X * Revision 1.2  90/02/24  17:29:41  cpcahil
+X * changed $Header to $Id so full path wouldnt be included as part of rcs 
+X * id string
+X * 
+X * Revision 1.1  90/02/22  23:17:43  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0511153990 memory.c &&
+chmod 0444 memory.c ||
+echo "restore of memory.c failed"
+set `wc -c memory.c`;Wc_c=$1
+if test "$Wc_c" != "2817"; then
+	echo original size 2817, current size $Wc_c
+fi
+fi
+# ============= realloc.c ==============
+if test X"$1" != X"-c" -a -f 'realloc.c'; then
+	echo "File already exists: skipping 'realloc.c'"
+else
+echo "x - extracting realloc.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > realloc.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X#include <stdio.h>
+X#include "malloc.h"
+X
+X/*
+X * Function:	realloc()
+X *
+X * Purpose:	to re-allocate a data area.
+X *
+X * Arguments:	cptr	- pointer to area to reallocate
+X *		size	- size to change area to
+X *
+X * Returns:	pointer to new area (may be same area)
+X *
+X * Narrative:	verify pointer is within malloc region
+X *		obtain mlist pointer from cptr
+X *		verify magic number is correct
+X *		verify inuse flag is set
+X *		verify connection to adjoining segments is correct
+X *		save requested size
+X *		round-up size to appropriate boundry
+X *		IF size is bigger than what is in this segment
+X *		    try to join next segment to this segment
+X *		IF size is less than what is is this segment
+X *		    determine leftover amount of space
+X *		ELSE
+X *		    allocate new segment of size bites
+X *		    IF allocation failed
+X *		        return NULL
+X *		    copy previous data to new segment
+X *		    free previous segment
+X *		    return new pointer
+X *		split of extra space in this segment (if any)
+X *		clear bytes beyound what they had before
+X *		return pointer to data 
+X */
+X#ifndef lint
+Xstatic
+Xchar rcs_hdr[] = "$Id: realloc.c,v 1.7 90/05/11 00:13:10 cpcahil Exp $";
+X#endif
+X
+Xchar *
+Xrealloc(cptr,size)
+X	char			* cptr;
+X	unsigned int		  size;
+X{
+X	void			  free();
+X	char			* func = "realloc";
+X	int			  i;
+X	char			* malloc();
+X	extern int		  malloc_checking;
+X	extern struct mlist 	* malloc_end;
+X	extern int		  malloc_errno;
+X	extern char		* malloc_data_end;
+X	extern char		* malloc_data_start;
+X	char			* memcpy();
+X	char			* new_cptr;
+X	struct mlist		* ptr;
+X	int			  r_size;
+X
+X	/*
+X	 * IF malloc chain checking is on, go do it.
+X	 */
+X	if( malloc_checking )
+X	{
+X		(void) malloc_chain_check(1);
+X	}
+X
+X	/*
+X	 * verify that cptr is within the malloc region...
+X	 */
+X	if( cptr < malloc_data_start || cptr > malloc_data_end )
+X	{
+X		malloc_errno = M_CODE_BAD_PTR;
+X		malloc_warning(func);
+X		return (NULL);
+X	}
+X
+X	/* 
+X	 * convert pointer to mlist struct pointer.  To do this we must 
+X	 * move the pointer backwards the correct number of bytes...
+X	 */
+X	
+X	ptr = (struct mlist *) (cptr - M_SIZE);
+X	
+X	if( (ptr->flag&M_MAGIC) != M_MAGIC )
+X	{
+X		malloc_errno = M_CODE_BAD_MAGIC;
+X		malloc_warning(func);
+X		return(NULL);
+X	}
+X
+X	if( ! (ptr->flag & M_INUSE) )
+X	{
+X		malloc_errno = M_CODE_NOT_INUSE ;
+X		malloc_warning(func);
+X		return(NULL);
+X	}
+X
+X 	if( (ptr->prev && (ptr->prev->next != ptr) ) ||
+X	    (ptr->next && (ptr->next->prev != ptr) ) ||
+X	    ((ptr->next == NULL) && (ptr->prev == NULL)) )
+X	{
+X		malloc_errno = M_CODE_BAD_CONNECT;
+X		malloc_warning(func);
+X		return(NULL);
+X	}
+X
+X	r_size = ++size;
+X
+X	M_ROUNDUP(size);
+X
+X	if( size > ptr->s.size )
+X	{
+X		malloc_join(ptr,ptr->next,1,1);
+X	}
+X
+X	if( size > ptr->s.size )
+X	{
+X		/*
+X		 * else we can't combine it, so lets allocate a new chunk,
+X		 * copy the data and free the old chunk...
+X		 */
+X		new_cptr = malloc(size);
+X
+X		if( new_cptr == (char *) 0)
+X		{
+X			return(new_cptr);
+X		}
+X
+X		if( r_size < ptr->r_size )
+X		{
+X			i = r_size;
+X		}
+X		else
+X		{
+X			i = ptr->r_size;
+X		}
+X		(void)memcpy(new_cptr,ptr->data,i);
+X		free(cptr);
+X		return(new_cptr);
+X
+X	} /* else... */
+X
+X	/*
+X	 * save amount of real data in new segment (this will be used in the
+X	 * memset later) and then save requested size of this segment.
+X	 */
+X
+X	if( ptr->r_size < r_size )
+X	{
+X		i = ptr->r_size;
+X	}
+X	else
+X	{
+X		i = r_size;
+X	}
+X
+X	ptr->r_size = r_size;
+X
+X	/*
+X	 * split off extra free space at end of this segment, if possible...
+X	 */
+X
+X	malloc_split(ptr);
+X
+X	malloc_memset( ptr->data+i, M_FILL, ptr->s.size - i);
+X		
+X	return(ptr->data);
+X
+X} /* realloc(... */
+X
+X
+X/*
+X * $Log:	realloc.c,v $
+X * Revision 1.7  90/05/11  00:13:10  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.6  90/02/25  11:01:20  cpcahil
+X * added support for malloc chain checking.
+X * 
+X * Revision 1.5  90/02/24  21:50:31  cpcahil
+X * lots of lint fixes
+X * 
+X * Revision 1.4  90/02/24  17:29:39  cpcahil
+X * changed $Header to $Id so full path wouldnt be included as part of rcs 
+X * id string
+X * 
+X * Revision 1.3  90/02/24  17:20:00  cpcahil
+X * attempt to get rid of full path in rcs header.
+X * 
+X * Revision 1.2  90/02/24  15:14:20  cpcahil
+X * 1. added function header 
+X * 2. changed calls to malloc_warning to conform to new usage
+X * 3. added setting of malloc_errno
+X *  4. broke up bad pointer determination so that errno's would be more
+X *    descriptive
+X * 
+X * Revision 1.1  90/02/22  23:17:43  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0511001490 realloc.c &&
+chmod 0444 realloc.c ||
+echo "restore of realloc.c failed"
+set `wc -c realloc.c`;Wc_c=$1
+if test "$Wc_c" != "4496"; then
+	echo original size 4496, current size $Wc_c
+fi
+fi
+# ============= string.c ==============
+if test X"$1" != X"-c" -a -f 'string.c'; then
+	echo "File already exists: skipping 'string.c'"
+else
+echo "x - extracting string.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > string.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X
+X#include <stdio.h>
+X#include <string.h>
+X#include <sys/types.h>
+X#include "malloc.h"
+X
+X#ifndef lint
+Xstatic
+Xchar rcs_hdr[] = "$Id: string.c,v 1.5 90/06/10 14:59:49 cpcahil Exp $";
+X#endif
+X
+Xint	malloc_checking = 0;
+X
+Xchar *
+Xstrcat(str1,str2)
+X	register char	* str1;
+X	register char	* str2;
+X{
+X	char		* rtn;
+X	int	  len;
+X
+X	/* 
+X	 * check pointers agains malloc region.  The malloc* functions
+X	 * will properly handle the case where a pointer does not
+X	 * point into malloc space.
+X	 */
+X	malloc_checking = 1;
+X
+X	len = strlen(str2);
+X	malloc_check_str("strcat", str2);
+X
+X	len += strlen(str1) + 1;
+X	malloc_checking = 0;
+X
+X	malloc_check_data("strcat", str1, len);
+X
+X	rtn = str1;
+X
+X	while( *str1 )
+X	{
+X		str1++;
+X	}
+X	
+X	while( (*str1 = *str2) != '\0' )
+X	{
+X		str1++;
+X		str2++;
+X	}
+X	
+X	return(rtn);
+X}
+X
+Xchar *
+Xstrdup(str1)
+X	register char	* str1;
+X{
+X	char		* malloc();
+X	char		* rtn;
+X	register char	* str2;
+X
+X	malloc_check_str("strdup", str1);
+X
+X	rtn = str2 = malloc((unsigned)strlen(str1)+1);
+X
+X	if( rtn != (char *) 0)
+X	{
+X		while( (*str2 = *str1) != '\0' )
+X		{
+X			str1++;
+X			str2++;
+X		}
+X	}
+X
+X	return(rtn);
+X}
+X
+Xchar *
+Xstrncat(str1,str2,len)
+X	register char	* str1;
+X	register char	* str2;
+X	register int	  len;
+X{
+X	int 		  len1;
+X	int 		  len2;
+X	char		* rtn;
+X
+X	malloc_checking = 1;
+X
+X	len2 = strlen(str2) + 1;
+X	len1 = strlen(str1);
+X
+X	malloc_checking = 0;
+X
+X	malloc_check_data("strncat", str2,len2);
+X
+X	if( (len+1) < len2 )
+X	{
+X		len1 += len + 1;
+X	}
+X	else
+X	{
+X		len1 += len2;
+X	}
+X	malloc_check_data("strncat", str1, len1);
+X
+X	rtn = str1;
+X
+X	while( *str1 )
+X	{
+X		str1++;
+X	}
+X
+X	while( len-- && ((*str1++ = *str2++) != '\0') )
+X	{
+X	}
+X	
+X	if( ! len )
+X	{
+X		*str1 = '\0';
+X	}
+X
+X	return(rtn);
+X}
+X
+Xint
+Xstrcmp(str1,str2)
+X	register char	* str1;
+X	register char	* str2;
+X{
+X	malloc_check_str("strcmp", str1);
+X	malloc_check_str("strcmp", str2);
+X
+X	while( *str1 && (*str1 == *str2) )
+X	{
+X		str1++;
+X		str2++;
+X	}
+X	return( *str1 - *str2 );
+X}
+X
+Xint
+Xstrncmp(str1,str2,len)
+X	register char	* str1;
+X	register char	* str2;
+X	register int	  len;
+X{
+X	malloc_check_str("strncmp", str1);
+X	malloc_check_str("strncmp", str2);
+X
+X	while( --len && *str1 && (*str1 == *str2) )
+X	{
+X		str1++;
+X		str2++;
+X	}
+X	return( *str1 - *str2 );
+X}
+X
+Xchar *
+Xstrcpy(str1,str2)
+X	register char	* str1;
+X	register char	* str2;
+X{
+X	char		* rtn;
+X	int		  len;
+X
+X	malloc_checking = 1;
+X	len = strlen(str2) + 1;
+X	malloc_checking = 0;
+X
+X	malloc_check_data("strcpy", str1, len);
+X	malloc_check_data("strcpy", str2, len);
+X
+X	rtn = str1;
+X
+X	while( (*str1++ = *str2++) != '\0')
+X	{
+X	}
+X
+X	return(rtn);
+X}
+X
+Xchar *
+Xstrncpy(str1,str2,len)
+X	register char	* str1;
+X	register char	* str2;
+X	register int	  len;
+X{
+X	int		  i;
+X	extern int	  malloc_checking;
+X	char		* rtn;
+X
+X	malloc_check_data("strncpy", str1, len);
+X
+X	malloc_checking = 1;
+X	i = strlen(str2);
+X	malloc_checking = 0;
+X
+X	if( i > len )
+X	{
+X		i = len;
+X	}
+X
+X	malloc_check_data("strncpy", str2, i);
+X
+X	rtn = str1;
+X
+X	while((len-- > 0) && (*str1++ = *str2++) != '\0')
+X	{
+X	}
+X	while( (len-- > 0) )
+X	{
+X		*str1++ = '\0';
+X	}
+X
+X	return(rtn);
+X}
+X
+Xint
+Xstrlen(str1)
+X	register char	* str1;
+X{
+X	register char	* s;
+X
+X	if(! malloc_checking )
+X	{
+X		malloc_check_str("strlen", str1);
+X	}
+X
+X	for( s = str1; *s; s++)
+X	{
+X	}
+X
+X	return( s - str1 );
+X}
+X
+Xchar *
+Xstrchr(str1,c)
+X	register char	* str1;
+X	register int	  c;
+X{
+X	malloc_check_str("strchr", str1);
+X
+X	while( *str1 && (*str1 != (char) c) )
+X	{
+X		str1++;
+X	}
+X
+X	if(! *str1 )
+X	{
+X		str1 = (char *) 0;
+X	}
+X
+X	return(str1);
+X}
+X
+Xchar *
+Xstrrchr(str1,c)
+X	register char	* str1;
+X	register int	  c;
+X{
+X	register char	* rtn = (char *) 0;
+X
+X	malloc_check_str("strrchr", str1);
+X
+X	while( *str1 )
+X	{
+X		if(*str1 == (char) c )
+X		{
+X			rtn = str1;
+X		}
+X		str1++;
+X	}
+X
+X	return(rtn);
+X}
+X
+Xchar *
+Xindex(str1,c)
+X	char		* str1;
+X	char		  c;
+X{
+X	return( strchr(str1,c) );
+X}
+X
+Xchar *
+Xrindex(str1,c)
+X	char		* str1;
+X	char		  c;
+X{
+X	return( strrchr(str1,c) );
+X}
+X
+Xchar *
+Xstrpbrk(str1,str2)
+X	register char	* str1;
+X	register char	* str2;
+X{
+X	register char	* tmp;
+X
+X	malloc_check_str("strpbrk", str1);
+X	malloc_check_str("strpbrk", str2);
+X
+X	while(*str1)
+X	{
+X		for( tmp=str2; *tmp && *tmp != *str1; tmp++)
+X		{
+X		}
+X		if( *tmp )
+X		{
+X			break;
+X		}
+X		str1++;
+X	}
+X
+X	if( ! *str1 )
+X	{
+X		str1 = (char *) 0;
+X	}
+X
+X	return(str1);
+X}
+X
+Xint
+Xstrspn(str1,str2)
+X	register char	* str1;
+X	register char	* str2;
+X{
+X	register char	* tmp;
+X	char		* orig = str1;
+X
+X	malloc_check_str("strspn", str1);
+X	malloc_check_str("strspn", str2);
+X
+X	while(*str1)
+X	{
+X		for( tmp=str2; *tmp && *tmp != *str1; tmp++)
+X		{
+X		}
+X		if(! *tmp )
+X		{
+X			break;
+X		}
+X		str1++;
+X	}
+X
+X	return( (int) (str1 - orig) );
+X}
+X
+Xint
+Xstrcspn(str1,str2)
+X	register char	* str1;
+X	register char	* str2;
+X{
+X	register char	* tmp;
+X	char		* orig = str1;
+X
+X	malloc_check_str("strcspn", str1);
+X	malloc_check_str("strcspn", str2);
+X
+X	while(*str1)
+X	{
+X		for( tmp=str2; *tmp && *tmp != *str1; tmp++)
+X		{
+X		}
+X		if( *tmp )
+X		{
+X			break;
+X		}
+X		str1++;
+X	}
+X
+X	return( (int) (str1 - orig) );
+X}
+X
+X/*
+X * strtok() source taken from that posted to comp.lang.c by Chris Torek
+X * in Jan 1990.
+X */
+X
+X/*
+X * Copyright (c) 1989 The Regents of the University of California.
+X * All rights reserved.
+X *
+X * Redistribution and use in source and binary forms are permitted
+X * provided that the above copyright notice and this paragraph are
+X * duplicated in all such forms and that any documentation,
+X * advertising materials, and other materials related to such
+X * distribution and use acknowledge that the software was developed
+X * by the University of California, Berkeley.  The name of the
+X * University may not be used to endorse or promote products derived
+X * from this software without specific prior written permission.
+X * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+X * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+X * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+X */
+X
+X/*
+X * Get next token from string s (NULL on 2nd, 3rd, etc. calls),
+X * where tokens are nonempty strings separated by runs of
+X * chars from delim.  Writes NULs into s to end tokens.  delim need not
+X * remain constant from call to call.
+X *
+X * Modified by cpc: 	changed variable names to conform with naming
+X *			conventions used in rest of code.  Added malloc pointer
+X *			check calls.
+X */
+Xchar *
+Xstrtok(str1, str2)
+X	char 	* str1;
+X	char	* str2;
+X{
+X	static char 	* last;
+X	char		* strtoken();
+X
+X	if( str1 )
+X	{
+X		malloc_check_str("strtok", str1);
+X		last = str1;
+X	}
+X	malloc_check_str("strtok", str2);
+X
+X	return (strtoken(&last, str2, 1));
+X}
+X
+X
+X/*
+X * Get next token from string *stringp, where tokens are (possibly empty)
+X * strings separated by characters from delim.  Tokens are separated
+X * by exactly one delimiter iff the skip parameter is false; otherwise
+X * they are separated by runs of characters from delim, because we
+X * skip over any initial `delim' characters.
+X *
+X * Writes NULs into the string at *stringp to end tokens.
+X * delim will usually, but need not, remain constant from call to call.
+X * On return, *stringp points past the last NUL written (if there might
+X * be further tokens), or is NULL (if there are definitely no more tokens).
+X *
+X * If *stringp is NULL, strtoken returns NULL.
+X */
+Xchar *
+Xstrtoken(stringp, delim, skip)
+X	register char **stringp;
+X	register char *delim;
+X	int skip;
+X{
+X	register char *s;
+X	register char *spanp;
+X	register int c, sc;
+X	char *tok;
+X
+X	if ((s = *stringp) == NULL)
+X		return (NULL);
+X
+X	if (skip) {
+X		/*
+X		 * Skip (span) leading delimiters (s += strspn(s, delim)).
+X		 */
+X	cont:
+X		c = *s;
+X		for (spanp = delim; (sc = *spanp++) != 0;) {
+X			if (c == sc) {
+X				s++;
+X				goto cont;
+X			}
+X		}
+X		if (c == 0) {		/* no token found */
+X			*stringp = NULL;
+X			return (NULL);
+X		}
+X	}
+X
+X	/*
+X	 * Scan token (scan for delimiters: s += strcspn(s, delim), sort of).
+X	 * Note that delim must have one NUL; we stop if we see that, too.
+X	 */
+X	for (tok = s;;) {
+X		c = *s++;
+X		spanp = delim;
+X		do {
+X			if ((sc = *spanp++) == c) {
+X				if (c == 0)
+X					s = NULL;
+X				else
+X					s[-1] = 0;
+X				*stringp = s;
+X				return (tok);
+X			}
+X		} while (sc != 0);
+X	}
+X	/* NOTREACHED */
+X}
+X
+X/*
+X * $Log:	string.c,v $
+X * Revision 1.5  90/06/10  14:59:49  cpcahil
+X * Fixed a couple of bugs in strncpy & strdup
+X * 
+X * Revision 1.4  90/05/11  00:13:10  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.3  90/02/24  21:50:32  cpcahil
+X * lots of lint fixes
+X * 
+X * Revision 1.2  90/02/24  17:29:40  cpcahil
+X * changed $Header to $Id so full path wouldnt be included as part of rcs 
+X * id string
+X * 
+X * Revision 1.1  90/02/22  23:17:44  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0610150290 string.c &&
+chmod 0444 string.c ||
+echo "restore of string.c failed"
+set `wc -c string.c`;Wc_c=$1
+if test "$Wc_c" != "8521"; then
+	echo original size 8521, current size $Wc_c
+fi
+fi
+# ============= testmalloc.c ==============
+if test X"$1" != X"-c" -a -f 'testmalloc.c'; then
+	echo "File already exists: skipping 'testmalloc.c'"
+else
+echo "x - extracting testmalloc.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > testmalloc.c &&
+X/* NOT copyright by SoftQuad Inc. -- msb, 1988 */
+X#ifndef lint
+Xstatic char *SQ_SccsId = "@(#)mtest3.c	1.2 88/08/25";
+X#endif
+X#include <stdio.h>
+X/*
+X** looptest.c -- intensive allocator tester 
+X**
+X** Usage:  looptest
+X**
+X** History:
+X**	4-Feb-1987 rtech!daveb 
+X*/
+X
+X# ifdef SYS5
+X# define random	rand
+X# else
+X# include <sys/vadvise.h>
+X# endif
+X
+X# include <stdio.h>
+X# include <signal.h>
+X# include <setjmp.h>
+X
+X# define MAXITER	1000000		/* main loop iterations */
+X# define MAXOBJS	1000		/* objects in pool */
+X# define BIGOBJ		90000		/* max size of a big object */
+X# define TINYOBJ	80		/* max size of a small object */
+X# define BIGMOD		100		/* 1 in BIGMOD is a BIGOBJ */
+X# define STATMOD	10000		/* interation interval for status */
+X
+Xmain( argc, argv )
+Xint argc;
+Xchar **argv;
+X{
+X	register int **objs;		/* array of objects */
+X	register int *sizes;		/* array of object sizes */
+X	register int n;			/* iteration counter */
+X	register int i;			/* object index */
+X	register int size;		/* object size */
+X	register int r;			/* random number */
+X
+X	int objmax;			/* max size this iteration */
+X	int cnt;			/* number of allocated objects */
+X	int nm = 0;			/* number of mallocs */
+X	int nre = 0;			/* number of reallocs */
+X	int nal;			/* number of allocated objects */
+X	int nfre;			/* number of free list objects */
+X	long alm;			/* memory in allocated objects */
+X	long frem;			/* memory in free list */
+X	long startsize;			/* size at loop start */
+X	long endsize;			/* size at loop exit */
+X	long maxiter = 0;		/* real max # iterations */
+X
+X	extern char end;		/* memory before heap */
+X	char *calloc();
+X	char *malloc();
+X	char *sbrk();
+X	long atol();
+X
+X# ifndef SYS5
+X	/* your milage may vary... */
+X	vadvise( VA_ANOM );
+X# endif
+X
+X	if (argc > 1)
+X		maxiter = atol (argv[1]);
+X	if (maxiter <= 0)
+X		maxiter = MAXITER;
+X
+X	printf("MAXITER %d MAXOBJS %d ", maxiter, MAXOBJS );
+X	printf("BIGOBJ %d, TINYOBJ %d, nbig/ntiny 1/%d\n",
+X	BIGOBJ, TINYOBJ, BIGMOD );
+X	fflush( stdout );
+X
+X	if( NULL == (objs = (int **)calloc( MAXOBJS, sizeof( *objs ) ) ) )
+X	{
+X		fprintf(stderr, "Can't allocate memory for objs array\n");
+X		exit(1);
+X	}
+X
+X	if( NULL == ( sizes = (int *)calloc( MAXOBJS, sizeof( *sizes ) ) ) )
+X	{
+X		fprintf(stderr, "Can't allocate memory for sizes array\n");
+X		exit(1);
+X	}
+X
+X	/* as per recent discussion on net.lang.c, calloc does not 
+X	** necessarily fill in NULL pointers...
+X	*/
+X	for( i = 0; i < MAXOBJS; i++ )
+X		objs[ i ] = NULL;
+X
+X	startsize = sbrk(0) - &end;
+X	printf( "Memory use at start: %d bytes\n", startsize );
+X	fflush(stdout);
+X
+X	printf("Starting the test...\n");
+X	fflush(stdout);
+X	for( n = 0; n < maxiter ; n++ )
+X	{
+X		if( !(n % STATMOD) )
+X		{
+X			printf("%d iterations\n", n);
+X			fflush(stdout);
+X		}
+X
+X		/* determine object of interst and it's size */
+X
+X		r = random();
+X		objmax = ( r % BIGMOD ) ? TINYOBJ : BIGOBJ;
+X		size = r % objmax;
+X		i = r % (MAXOBJS - 1);
+X
+X		/* either replace the object of get a new one */
+X
+X		if( objs[ i ] == NULL )
+X		{
+X			objs[ i ] = (int *)malloc( size );
+X			nm++;
+X		}
+X		else
+X		{
+X			/* don't keep bigger objects around */
+X			if( size > sizes[ i ] )
+X			{
+X				objs[ i ] = (int *)realloc( objs[ i ], size );
+X				nre++;
+X			}
+X			else
+X			{
+X				free( objs[ i ] );
+X				objs[ i ] = (int *)malloc( size );
+X				nm++;
+X			}
+X		}
+X
+X		sizes[ i ] = size;
+X		if( objs[ i ] == NULL )
+X		{
+X			printf("\nCouldn't allocate %d byte object!\n", 
+X				size );
+X			break;
+X		}
+X	} /* for() */
+X
+X	printf( "\n" );
+X	cnt = 0;
+X	for( i = 0; i < MAXOBJS; i++ )
+X		if( objs[ i ] )
+X			cnt++;
+X
+X	printf( "Did %d iterations, %d objects, %d mallocs, %d reallocs\n",
+X		n, cnt, nm, nre );
+X	printf( "Memory use at end: %d bytes\n", sbrk(0) - &end );
+X	fflush( stdout );
+X
+X	/* free all the objects */
+X	for( i = 0; i < MAXOBJS; i++ )
+X		if( objs[ i ] != NULL )
+X			free( objs[ i ] );
+X
+X	endsize = sbrk(0) - &end;
+X	printf( "Memory use after free: %d bytes\n", endsize );
+X	fflush( stdout );
+X
+X	if( startsize != endsize )
+X		printf("startsize %d != endsize %d\n", startsize, endsize );
+X
+X	free( objs );
+X	free( sizes );
+X
+X	malloc_dump(2);
+X	exit( 0 );
+X}
+X
+SHAR_EOF
+$TOUCH -am 0511175990 testmalloc.c &&
+chmod 0444 testmalloc.c ||
+echo "restore of testmalloc.c failed"
+set `wc -c testmalloc.c`;Wc_c=$1
+if test "$Wc_c" != "3971"; then
+	echo original size 3971, current size $Wc_c
+fi
+fi
+# ============= testmem.c ==============
+if test X"$1" != X"-c" -a -f 'testmem.c'; then
+	echo "File already exists: skipping 'testmem.c'"
+else
+echo "x - extracting testmem.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > testmem.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X
+X/* 
+X * I have only partially implemented these tests.  If you have the time and
+X * energy and wish to add some tests, feel free to do so.  I would appreciate
+X * it if you sent me a copy of the modified files. 
+X */
+X
+X#include <stdio.h>
+X
+X/* 
+X * These tests test the memory functions...
+X */
+X
+Xmain()
+X{
+X	char	  buffer[500];
+X	int	  exitval = 0;
+X	char	* memccpy();
+X	char	* memchr();
+X	char	* ptr1;
+X	char	* ptr2;
+X
+X	fprintf(stdout,"Begining memory(3) tests...\n");
+X
+X	/*
+X 	 * test memccpy()...
+X 	 */
+X
+X	ptr1 = "abcdefghijklmn";	
+X
+X	buffer[0] = 'n';
+X	buffer[1] = 'o';
+X	buffer[2] = 'p';
+X	buffer[3] = 'q'; 
+X	buffer[4] = 'r';
+X	buffer[5] = 's';
+X	ptr2 = memccpy(buffer,ptr1,'d',3);
+X
+X	if( ptr2 != (char *) 0)
+X	{
+X		fprintf(stdout,"memccpy() failed to use passed length\n");
+X		exitval++;
+X	}
+X
+X	/*
+X 	 * verify that the correct bytes got copied and the others do not
+X	 * get clobbered
+X	 */
+X	if( (buffer[0] != 'a') ||
+X	    (buffer[1] != 'b') ||
+X	    (buffer[2] != 'c') ||
+X	    (buffer[3] != 'q') ||
+X	    (buffer[4] != 'r') ||
+X	    (buffer[5] != 's')  )
+X	{
+X		fprintf(stdout,"memccpy() failed to copy bytes correctly\n");
+X		fprintf(stdout,"Should have been 'abcqrs' was '%6.6s'\n",buffer);
+X		exitval++;
+X	}
+X
+X
+X
+X	buffer[0] = 'n';
+X	buffer[1] = 'o';
+X	buffer[2] = 'p';
+X	buffer[3] = 'q'; 
+X	buffer[4] = 'r';
+X	buffer[5] = 's';
+X	ptr2 = memccpy(buffer,ptr1,'d',4);
+X
+X	if( ptr2 != (buffer+4) )
+X	{
+X		fprintf(stdout,"memccpy() failed to find byte in data\n");
+X		exitval++;
+X	}
+X
+X	/*
+X 	 * verify that the correct bytes got copied and the others do not
+X	 * get clobbered
+X	 */
+X	if( (buffer[0] != 'a') ||
+X	    (buffer[1] != 'b') ||
+X	    (buffer[2] != 'c') ||
+X	    (buffer[3] != 'd') ||
+X	    (buffer[4] != 'r') ||
+X	    (buffer[5] != 's')  )
+X	{
+X		fprintf(stdout,"memccpy() failed to copy bytes correctly\n");
+X		fprintf(stdout,"Should have been 'abcdrs' was '%6.6s'\n",buffer);
+X		exitval++;
+X	}
+X
+X	/*
+X	 * Test memchr()...
+X	 */
+X
+X	ptr1 = "abcdefghijklmn";
+X
+X	ptr2 = memchr(ptr1,'c',10);
+X	
+X	if( ptr2 != (ptr1+2) )
+X	{
+X		fprintf(stdout,"memchr() failed to find byte in data\n");
+X		exitval++;
+X	}
+X
+X	ptr2 = memchr(ptr1,'j',10);
+X	
+X	if( ptr2 != (ptr1+9) )
+X	{
+X		fprintf(stdout,"memchr() failed to find byte in data\n");
+X		exitval++;
+X	}
+X
+X	ptr2 = memchr(ptr1,'k',10);
+X	
+X	if( ptr2 != (char *) 0)
+X	{
+X		fprintf(stdout,"memchr() failed to obey length argument\n");
+X		exitval++;
+X	}
+X
+X	fprintf(stdout,"Memory tests complete!\n");
+X	exit(exitval);
+X
+X}
+SHAR_EOF
+$TOUCH -am 0511153990 testmem.c &&
+chmod 0444 testmem.c ||
+echo "restore of testmem.c failed"
+set `wc -c testmem.c`;Wc_c=$1
+if test "$Wc_c" != "2552"; then
+	echo original size 2552, current size $Wc_c
+fi
+fi
+# ============= tostring.c ==============
+if test X"$1" != X"-c" -a -f 'tostring.c'; then
+	echo "File already exists: skipping 'tostring.c'"
+else
+echo "x - extracting tostring.c (Text)"
+sed 's/^X//' << 'SHAR_EOF' > tostring.c &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X#include "tostring.h"
+X
+X/*
+X * Function:	tostring()
+X *
+X * Purpose:	to convert an integer to an ascii display string
+X *
+X * Arguments:	buf	- place to put the 
+X *		val	- integer to convert
+X *		len	- length of output field (0 if just enough to hold data)
+X *		base	- base for number conversion (only works for base <= 16)
+X *		fill	- fill char when len > # digits
+X *
+X * Returns:	length of string
+X *
+X * Narrative:	IF fill character is non-blank
+X *		    Determine base
+X *		        If base is HEX
+X *		            add "0x" to begining of string
+X *		        IF base is OCTAL
+X *		            add "0" to begining of string
+X *
+X *		While value is greater than zero
+X *		    use val % base as index into xlation str to get cur char
+X *		    divide val by base
+X *
+X *		Determine fill-in length
+X *
+X *		Fill in fill chars
+X *
+X *		Copy in number
+X *		
+X *
+X * Mod History:	
+X *   90/01/24	cpcahil		Initial revision.
+X */
+X
+X#ifndef lint
+Xstatic
+Xchar rcs_hdr[] = "$Id: tostring.c,v 1.4 90/05/11 00:13:11 cpcahil Exp $";
+X#endif
+X
+X#define T_LEN 10
+X
+Xint
+Xtostring(buf,val,len,base,fill)
+X	int	  base;
+X	char	* buf;
+X	char	  fill;
+X	int	  len;
+X	int	  val;
+X	
+X{
+X	char	* bufstart = buf;
+X	int	  i = T_LEN;
+X	char	* xbuf = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+X	char	  tbuf[T_LEN];
+X
+X	/*
+X	 * if we are filling with non-blanks, make sure the
+X	 * proper start string is added
+X	 */
+X	if( fill != ' ' )
+X	{
+X		switch(base)
+X		{
+X			case B_HEX:
+X				*(buf++) = '0';
+X				*(buf++) = 'x';
+X				if( len )
+X				{
+X					len -= 2;
+X				}
+X				break;
+X			case B_OCTAL:
+X				*(buf++) = fill;
+X				if( len )
+X				{
+X					len--;
+X				}
+X				break;
+X			default:
+X				break;
+X		}
+X	}
+X
+X	while( val > 0 )
+X	{
+X		tbuf[--i] = xbuf[val % base];
+X		val = val / base;
+X	}
+X
+X	if( len )
+X	{
+X		len -= (T_LEN - i);
+X
+X		if( len > 0 )
+X		{
+X			while(len-- > 0)
+X			{
+X				*(buf++) = fill;
+X			}
+X		}
+X		else
+X		{
+X			/* 
+X			 * string is too long so we must truncate
+X			 * off some characters.  We do this the easiest
+X			 * way by just incrementing i.  This means the
+X			 * most significant digits are lost.
+X			 */
+X			while( len++ < 0 )
+X			{
+X				i++;
+X			}
+X		}
+X	}
+X
+X	while( i < T_LEN )
+X	{
+X		*(buf++) = tbuf[i++];
+X	}
+X
+X	return( (int) (buf - bufstart) );
+X
+X} /* tostring(... */
+X
+X/*
+X * $Log:	tostring.c,v $
+X * Revision 1.4  90/05/11  00:13:11  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.3  90/02/24  21:50:33  cpcahil
+X * lots of lint fixes
+X * 
+X * Revision 1.2  90/02/24  17:29:42  cpcahil
+X * changed $Header to $Id so full path wouldnt be included as part of rcs 
+X * id string
+X * 
+X * Revision 1.1  90/02/22  23:17:44  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0511001490 tostring.c &&
+chmod 0444 tostring.c ||
+echo "restore of tostring.c failed"
+set `wc -c tostring.c`;Wc_c=$1
+if test "$Wc_c" != "2716"; then
+	echo original size 2716, current size $Wc_c
+fi
+fi
+# ============= tostring.h ==============
+if test X"$1" != X"-c" -a -f 'tostring.h'; then
+	echo "File already exists: skipping 'tostring.h'"
+else
+echo "x - extracting tostring.h (Text)"
+sed 's/^X//' << 'SHAR_EOF' > tostring.h &&
+X/*
+X * (c) Copyright 1990 Conor P. Cahill (uunet!virtech!cpcahil).  
+X * You may copy, distribute, and use this software as long as this
+X * copyright statement is not removed.
+X */
+X/*
+X * $Id: tostring.h,v 1.2 90/05/11 00:13:11 cpcahil Exp $
+X */
+X#define B_BIN	 2
+X#define B_DEC	10
+X#define B_HEX	16
+X#define B_OCTAL	 8
+X
+X/* 
+X * $Log:	tostring.h,v $
+X * Revision 1.2  90/05/11  00:13:11  cpcahil
+X * added copyright statment
+X * 
+X * Revision 1.1  90/02/23  07:09:05  cpcahil
+X * Initial revision
+X * 
+X */
+SHAR_EOF
+$TOUCH -am 0511001490 tostring.h &&
+chmod 0444 tostring.h ||
+echo "restore of tostring.h failed"
+set `wc -c tostring.h`;Wc_c=$1
+if test "$Wc_c" != "491"; then
+	echo original size 491, current size $Wc_c
+fi
+fi
+exit 0
+

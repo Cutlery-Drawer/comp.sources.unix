@@ -1,0 +1,3849 @@
+Newsgroups: comp.sources.unix
+From: davison@borland.com (Wayne Davison)
+Subject: v27i097: trn-3.3 - threaded newsreader based on RN, V3.3, Part04/12
+References: <1.754431075.7231@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: davison@borland.com (Wayne Davison)
+Posting-Number: Volume 27, Issue 97
+Archive-Name: trn-3.3/part04
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 4 (of 12)."
+# Contents:  head.c kfile.c ngstuff.c nntp/acttimes.c rcln.c
+#   rt-process.c unship.c util.c
+# Wrapped by vixie@gw.home.vix.com on Sun Nov 21 01:14:03 1993
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'head.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'head.c'\"
+else
+echo shar: Extracting \"'head.c'\" \(10506 characters\)
+sed "s/^X//" >'head.c' <<'END_OF_FILE'
+X/* $Id: head.c,v 3.0 1992/02/23 21:25:39 davison Trn $
+X */
+X/* This software is Copyright 1991 by Stan Barber. 
+X *
+X * Permission is hereby granted to copy, reproduce, redistribute or otherwise
+X * use this software as long as: there is no monetary profit gained
+X * specifically from the use or reproduction of this software, it is not
+X * sold, rented, traded or otherwise marketed, and this copyright notice is
+X * included prominently in any copy made. 
+X *
+X * The authors make no claims as to the fitness or correctness of this software
+X * for any use whatsoever, and it is provided as is. Any use of this software
+X * is at the user's own risk. 
+X */
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "artio.h"
+X#include "cache.h"
+X#include "ng.h"
+X#include "ngdata.h"
+X#include "util.h"
+X#include "hash.h"
+X#include "rthread.h"
+X#include "rt-process.h"
+X#include "rt-util.h"
+X#include "final.h"
+X#include "nntp.h"
+X#include "INTERN.h"
+X#include "head.h"
+X
+Xbool first_one;		/* is this the 1st occurance of this header line? */
+X
+Xstatic char htypeix[26] =
+X    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+X
+Xvoid
+Xhead_init()
+X{
+X    register int i;
+X
+X    for (i=HEAD_FIRST+1; i<HEAD_LAST; i++)
+X	htypeix[*htype[i].ht_name - 'a'] = i;
+X
+X    headbuf_size = LBUFLEN * 8;
+X    headbuf = safemalloc(headbuf_size);
+X}
+X
+X#ifdef DEBUG
+Xvoid
+Xdumpheader(where)
+Xchar *where;
+X{
+X    register int i;
+X
+X    printf("header: %d %s", parsed_art, where);
+X
+X    for (i=0; i<HEAD_LAST; i++) {
+X	printf("%15s %4d %4d %03o\n",htype[i].ht_name,
+X	    htype[i].ht_minpos,
+X	    htype[i].ht_maxpos,
+X	    htype[i].ht_flags) FLUSH;
+X    }
+X}
+X#endif
+X
+Xint
+Xset_line_type(bufptr,colon)
+Xchar *bufptr;
+Xregister char *colon;
+X{
+X    char lc[LONGKEY+3];
+X    register char *t, *f;
+X    register int i, len;
+X
+X    if (colon-bufptr > LONGKEY+2)
+X	return SOME_LINE;
+X
+X    for (t=lc,f=bufptr; f<colon; f++, t++) {
+X	if (isspace(*f))
+X	/* guard against space before : */
+X	    break;
+X	*t = isupper(*f) ? tolower(*f) : *f;
+X    }
+X    *t = '\0';
+X    f = lc;				/* get lc into register */
+X    len = t - f;
+X
+X    /* now scan the headtype table, backwards so we don't have to supply an
+X     * extra terminating value, using first letter as index, and length as
+X     * optimization to avoid calling subroutine strEQ unnecessarily.  Hauls.
+X     */
+X    if (islower(*f)) {
+X	for (i = htypeix[*f - 'a']; *htype[i].ht_name == *f; --i) {
+X	    if (len == htype[i].ht_length && strEQ(f, htype[i].ht_name)) {
+X		return i;
+X	    }
+X	}
+X    }
+X    return SOME_LINE;
+X}
+X
+Xvoid
+Xstart_header(artnum)
+XART_NUM artnum;
+X{
+X    register int i;
+X
+X#ifdef DEBUG
+X    if (debug & DEB_HEADER)
+X	dumpheader("start_header\n");
+X#endif
+X    for (i=0; i<HEAD_LAST; i++) {
+X	htype[i].ht_minpos = -1;
+X	htype[i].ht_maxpos = 0;
+X    }
+X    in_header = SOME_LINE;
+X    first_one = FALSE;
+X    parsed_art = artnum;
+X}
+X
+Xvoid
+Xend_header_line()
+X{
+X    if (first_one) {		/* did we just pass 1st occurance? */
+X	first_one = FALSE;
+X	/* remember where line left off */
+X	htype[in_header].ht_maxpos = artpos;
+X	if (htype[in_header].ht_flags & HT_CACHED) {
+X	    ARTICLE *ap = article_ptr(parsed_art);
+X	    if (!get_cached_line(ap, in_header, TRUE)) {
+X		int start = htype[in_header].ht_minpos
+X			  + htype[in_header].ht_length + 1;
+X		MEM_SIZE size;
+X		char *s;
+X		while (headbuf[start] == ' ' || headbuf[start] == '\t')
+X		    start++;
+X		size = artpos - start + 1 - 1;	/* pre-strip newline */
+X		if (in_header == SUBJ_LINE)
+X		    set_subj_line(ap,headbuf+start,size-1);
+X		else {
+X		    s = safemalloc(size);
+X		    *s = '\0';
+X		    safecat(s,headbuf+start,size);
+X		    set_cached_line(ap,in_header,s);
+X		}
+X	    }
+X	}
+X    }
+X}
+X
+Xbool
+Xparseline(art_buf,newhide,oldhide)
+Xchar *art_buf;
+Xint newhide, oldhide;
+X{
+X    if (*art_buf == ' ' || *art_buf == '\t') {
+X					/* header continuation line? */
+X	return oldhide;
+X    } else {				/* maybe another header line */
+X	char *s;
+X	end_header_line();
+X	s = index(art_buf,':');
+X	if (s == Nullch) {	/* is it the end of the header? */
+X#ifdef USE_NNTP
+X	    /* Did NNTP ship us a mal-formed header line? */
+X	    if (*art_buf && *art_buf != '\n') {
+X		in_header = SOME_LINE;
+X		return newhide;
+X	    }
+X#endif
+X	    in_header = PAST_HEADER;
+X	} else {		/* it is a new header line */
+X	    in_header = set_line_type(art_buf,s);
+X	    first_one = (htype[in_header].ht_minpos < 0);
+X	    if (first_one) {
+X		htype[in_header].ht_minpos = artpos;
+X		if (in_header == DATE_LINE) {
+X		    register ARTICLE *ap = article_ptr(parsed_art);
+X		    if (!ap->date)
+X			ap->date = parsedate(art_buf+6);
+X		}
+X	    }
+X#ifdef DEBUG
+X	    if (debug & DEB_HEADER)
+X		dumpheader(art_buf);
+X#endif
+X	    if (htype[in_header].ht_flags & HT_HIDE)
+X		return newhide;
+X	}
+X    }
+X    return FALSE;			/* don't hide this line */
+X}
+X
+Xvoid
+Xend_header()
+X{
+X    register ARTICLE *ap = article_ptr(parsed_art);
+X
+X    end_header_line();
+X    in_header = PAST_HEADER;	/* just to be sure */
+X
+X    if (!ap->subj) {
+X#if 0
+X	uncache_article(ap,FALSE);
+X	return;
+X#else
+X	set_subj_line(ap,"Subject: <none>",15);
+X#endif
+X    }
+X
+X#ifndef DBM_XREFS
+X    if (htype[XREF_LINE].ht_minpos < 0)
+X	article_ptr(parsed_art)->xrefs = nullstr;
+X#endif
+X#ifdef USE_NNTP
+X    htype[PAST_HEADER].ht_minpos = artpos+1;  /* remember where body starts */
+X#else
+X    htype[PAST_HEADER].ht_minpos = ftell(artfp);
+X#endif
+X
+X    if (ThreadedGroup && !(ap->flags & AF_THREADED)) {
+X	if (valid_article(ap)) {
+X	    ARTICLE *artp_hold = artp;
+X	    references = fetchlines(parsed_art, REFS_LINE);
+X	    thread_article(ap);
+X	    free(references);
+X	    artp = artp_hold;
+X	    check_poster(ap);
+X	}
+X    } else if (!(ap->flags & AF_CACHED)) {
+X	cache_article(ap);
+X	check_poster(ap);
+X    }
+X}
+X
+X/* read the header into memory and parse it if we haven't already */
+X
+Xbool
+Xparseheader(artnum)
+XART_NUM artnum;
+X{
+X    register char *bp;
+X    register int len;
+X
+X    if (parsed_art == artnum)
+X	return TRUE;
+X    if (artnum > lastart)
+X	return FALSE;
+X    spin(20);
+X#ifdef USE_NNTP
+X    if (!nntp_header(artnum)) {
+X	uncache_article(article_ptr(artnum),FALSE);
+X	return FALSE;
+X    }
+X#else
+X    if (!artopen(artnum))
+X	return FALSE;
+X#endif
+X    start_header(artnum);
+X    artpos = 0;
+X    bp = headbuf;
+X    while (in_header) {
+X	if (headbuf_size < artpos + LBUFLEN) {
+X	    headbuf_size += LBUFLEN * 4;
+X	    headbuf = saferealloc(headbuf,headbuf_size);
+X	}
+X#ifdef USE_NNTP
+X	nntp_gets(bp,LBUFLEN);
+X	if (*bp == '.') {
+X	    if (!bp[1]) {
+X		*bp++ = '\n';		/* tag the end with an empty line */
+X		break;
+X	    }
+X	    strcpy(bp,bp+1);
+X	}
+X	len = strlen(bp);
+X	bp[len++] = '\n';
+X	bp[len] = '\0';
+X#else
+X	if (fgets(bp,LBUFLEN,artfp) == Nullch)
+X	    break;
+X	len = strlen(bp);
+X#endif
+X	parseline(bp,FALSE,FALSE);
+X	artpos += len;
+X	bp += len;
+X    }
+X    *bp = '\0';   /* this probably isn't needed */
+X    end_header();
+X    return TRUE;
+X}
+X
+X/* get a header line from an article */
+X
+Xchar *
+Xfetchlines(artnum,which_line)
+XART_NUM artnum;				/* article to get line from */
+Xint which_line;				/* type of line desired */
+X{
+X    char *s, *t;
+X    register ART_POS firstpos;
+X    register ART_POS lastpos;
+X    int size;
+X
+X    /* Only return a cached subject line if it isn't the current article */
+X    if (which_line != SUBJ_LINE || parsed_art != artnum) {
+X	s = fetchcache(artnum,which_line,FILL_CACHE);
+X	if (s)
+X	    return savestr(s);
+X    }
+X    if ((firstpos = htype[which_line].ht_minpos) < 0)
+X	return savestr(nullstr);
+X
+X    firstpos += htype[which_line].ht_length + 1;
+X    lastpos = htype[which_line].ht_maxpos;
+X    size = lastpos - firstpos;
+X#ifdef DEBUG
+X    if (debug && (size < 1 || size > 1000)) {
+X	printf("Firstpos = %ld, lastpos = %ld\n",(long)firstpos,(long)lastpos);
+X	gets(cmd_buf);
+X    }
+X#endif
+X    s = safemalloc((MEM_SIZE)size);
+X    t = headbuf + firstpos;
+X    while (*t == ' ' || *t == '\t') t++;
+X    *s = '\0';
+X    safecat(s,t,size);
+X    return s;
+X}
+X
+X/* prefetch a header line from one or more articles */
+X
+Xchar *
+Xprefetchlines(artnum,which_line,copy)
+XART_NUM artnum;				/* article to get line from */
+Xint which_line;				/* type of line desired */
+Xbool_int copy;				/* do you want it savestr()ed? */
+X{
+X    char *s, *t;
+X    register ART_POS firstpos;
+X    register ART_POS lastpos;
+X    int size;
+X
+X#ifdef USE_NNTP
+X    if (parsed_art != artnum) {
+X	ARTICLE *ap;
+X	int size;
+X	register ART_NUM num, priornum, lastnum;
+X	bool cached;
+X
+X	s = fetchcache(artnum,which_line,DONT_FILL_CACHE);
+X	if (s) {
+X	    if (copy)
+X		s = savestr(s);
+X	    return s;
+X	}
+X
+X	spin(20);
+X	if (copy)
+X	    s = safemalloc((MEM_SIZE)(size = LBUFLEN));
+X	else {
+X	    s = cmd_buf;
+X	    size = sizeof cmd_buf;
+X	}
+X	*s = '\0';
+X	priornum = artnum-1;
+X	if ((cached = (htype[which_line].ht_flags & HT_CACHED)) != 0) {
+X	    lastnum = artnum + PREFETCH_SIZE - 1;
+X	    if (lastnum > lastart)
+X		lastnum = lastart;
+X	    sprintf(ser_line,"XHDR %s %ld-%ld",htype[which_line].ht_name,
+X		artnum,lastnum);
+X	} else {
+X	    lastnum = artnum;
+X	    sprintf(ser_line,"XHDR %s %ld",htype[which_line].ht_name,artnum);
+X	}
+X	nntp_command(ser_line);
+X	if (nntp_check(TRUE) == NNTP_CLASS_OK) {
+X	    for (ap = find_article(artnum); ; ) {
+X		nntp_gets(ser_line, sizeof ser_line);
+X# ifdef DEBUG
+X		if (debug & DEB_NNTP)
+X		    printf("<%s\n", ser_line) FLUSH;
+X# endif
+X		if (ser_line[0] == '.')
+X		    break;
+X		if ((t = index(ser_line, '\r')) != Nullch)
+X		    *t = '\0';
+X		if (!(t = index(ser_line, ' ')))
+X		    continue;
+X		t++;
+X		num = atol(ser_line);
+X		if (num < artnum || num > lastnum)
+X		    continue;
+X		while (++priornum < num)
+X		    uncache_article(ap++,FALSE);
+X		if (which_line == SUBJ_LINE)
+X		    set_subj_line(ap++, t, strlen(t));
+X		else if (cached)
+X		    set_cached_line(ap++, which_line, savestr(t));
+X		if (num == artnum)
+X		    safecat(s,t,size);
+X	    }
+X	} else {
+X	    fprintf(stderr,"\nUnexpected close of server socket.\n");
+X	    finalize(1);
+X	}
+X	while (priornum++ < lastnum)
+X	    uncache_article(ap++,FALSE);
+X	if (copy)
+X	    s = saferealloc(s, (MEM_SIZE)strlen(s)+1);
+X	return s;
+X    }
+X#endif
+X
+X    /* Only return a cached subject line if it isn't the current article */
+X    s = Nullch;
+X    if (which_line != SUBJ_LINE || parsed_art != artnum)
+X	s = fetchcache(artnum,which_line,FILL_CACHE);
+X    if ((firstpos = htype[which_line].ht_minpos) < 0)
+X	s = nullstr;
+X    if (s) {
+X	if (copy)
+X	    s = savestr(s);
+X	return s;
+X    }
+X
+X    firstpos += htype[which_line].ht_length + 1;
+X    lastpos = htype[which_line].ht_maxpos;
+X    size = lastpos - firstpos;
+X    if (copy)
+X	s = safemalloc((MEM_SIZE)size);
+X    else {				/* hope this is okay--we're */
+X	s = cmd_buf;			/* really scraping for space here */
+X	if (size > sizeof cmd_buf)
+X	    size = sizeof cmd_buf;
+X    }
+X    t = headbuf + firstpos;
+X    while (*t == ' ' || *t == '\t') t++;
+X    *s = '\0';
+X    safecat(s,t,size);
+X    return s;
+X}
+END_OF_FILE
+if test 10506 -ne `wc -c <'head.c'`; then
+    echo shar: \"'head.c'\" unpacked with wrong size!
+fi
+# end of 'head.c'
+fi
+if test -f 'kfile.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'kfile.c'\"
+else
+echo shar: Extracting \"'kfile.c'\" \(11223 characters\)
+sed "s/^X//" >'kfile.c' <<'END_OF_FILE'
+X/* $Id: kfile.c,v 3.0 1991/09/09 20:18:23 davison Trn $
+X */
+X/* This software is Copyright 1991 by Stan Barber. 
+X *
+X * Permission is hereby granted to copy, reproduce, redistribute or otherwise
+X * use this software as long as: there is no monetary profit gained
+X * specifically from the use or reproduction of this software, it is not
+X * sold, rented, traded or otherwise marketed, and this copyright notice is
+X * included prominently in any copy made. 
+X *
+X * The authors make no claims as to the fitness or correctness of this software
+X * for any use whatsoever, and it is provided as is. Any use of this software
+X * is at the user's own risk. 
+X */
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "term.h"
+X#include "util.h"
+X#include "cache.h"
+X#include "artsrch.h"
+X#include "ng.h"
+X#include "ngdata.h"
+X#include "intrp.h"
+X#include "ngstuff.h"
+X#include "rcstuff.h"
+X#include "trn.h"
+X#include "hash.h"
+X#include "rthread.h"
+X#include "rt-process.h"
+X#include "rt-select.h"
+X#include "INTERN.h"
+X#include "kfile.h"
+X
+Xextern HASHTABLE *msgid_hash;
+X
+Xstatic bool exitcmds = FALSE;
+X
+Xvoid
+Xkfile_init()
+X{
+X    ;
+X}
+X
+X#ifndef KILLFILES
+Xint
+Xedit_kfile()
+X{
+X    notincl("^K");
+X    return -1;
+X}
+X
+X#else /* KILLFILES */
+X
+Xchar killglobal[] = KILLGLOBAL;
+Xchar killlocal[] = KILLLOCAL;
+X
+Xvoid
+Xmention(str)
+Xchar *str;
+X{
+X#ifdef VERBOSE
+X    IF(verbose) {
+X#ifdef NOFIREWORKS
+X	no_sofire();
+X#endif
+X	standout();
+X	fputs(str,stdout);
+X	un_standout();
+X	putchar('\n');
+X    }
+X    ELSE
+X#endif
+X#ifdef TERSE
+X	putchar('.');
+X#endif
+X    fflush(stdout);
+X}
+X
+Xstatic bool kill_mentioned;
+X
+Xint
+Xdo_kfile(kfp,entering)
+XFILE *kfp;
+Xint entering;
+X{
+X    bool first_time = (entering && !killfirst);
+X    ART_UNREAD selections = selected_count;
+X    ART_UNREAD unread = toread[ng];
+X    int thread_kill_cnt = 0;
+X    int thread_select_cnt = 0;
+X    char *cp;
+X
+X    art = lastart+1;
+X    killfirst = firstart;
+X    fseek(kfp,0L,0);			/* rewind file */
+X    while (fgets(buf,LBUFLEN,kfp) != Nullch) {
+X	if (*(cp = buf + strlen(buf) - 1) == '\n')
+X	    *cp = '\0';
+X	if (strnEQ(buf,"THRU",4)) {
+X	    killfirst = atol(buf+4)+1;
+X	    if (killfirst < absfirst)
+X		killfirst = absfirst;
+X	    if (killfirst > lastart)
+X		killfirst = lastart+1;
+X	    if (entering)
+X		localkf_changes |= 1;
+X	    continue;
+X	}
+X	if (*buf == 'X') {		/* exit command? */
+X	    if (entering) {
+X		exitcmds = TRUE;
+X		continue;
+X	    }
+X	    strcpy(buf,buf+1);
+X	}
+X	else if (!entering)
+X	    continue;
+X
+X	if (*buf == '&') {
+X	    mention(buf);
+X	    switcheroo();
+X	}
+X	else if (*buf == '/') {
+X	    has_normal_kills = TRUE;
+X	    if (firstart > lastart)
+X		continue;
+X	    mention(buf);
+X	    kill_mentioned = TRUE;
+X	    switch (art_search(buf, (sizeof buf), FALSE)) {
+X	    case SRCH_ABORT:
+X		continue;
+X	    case SRCH_INTR:
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    printf("\n(Interrupted at article %ld)\n",(long)art)
+X		      FLUSH;
+X		ELSE
+X#endif
+X#ifdef TERSE
+X		    printf("\n(Intr at %ld)\n",(long)art) FLUSH;
+X#endif
+X		return -1;
+X	    case SRCH_DONE:
+X		break;
+X	    case SRCH_SUBJDONE:
+X		fputs("\tsubject not found (?)\n",stdout) FLUSH;
+X		break;
+X	    case SRCH_NOTFOUND:
+X		fputs("\tnot found\n",stdout) FLUSH;
+X		break;
+X	    case SRCH_FOUND:
+X		fputs("\tfound\n",stdout) FLUSH;
+X	    }
+X	}
+X	else if (first_time && *buf == '<') {
+X	    register ARTICLE *ap;
+X	    cp = index(buf,' ');
+X	    if (!cp)
+X		cp = "T,";
+X	    else
+X		*cp++ = '\0';
+X	    if ((ap = get_article(buf)) != Nullart) {
+X		if ((ap->flags & AF_FAKE) == AF_FAKE) {
+X		    if (*cp == 'T')
+X			cp++;
+X		    switch (*cp) {
+X		    case '+':
+X			ap->flags |= AF_AUTOSELECTALL;
+X			thread_select_cnt++;
+X			break;
+X		    case '.':
+X			ap->flags |= AF_AUTOSELECT;
+X			thread_select_cnt++;
+X			break;
+X		    case 'J':
+X		    case 'j':
+X			ap->flags |= AF_AUTOKILLALL;
+X			thread_kill_cnt++;
+X			break;
+X		    case ',':
+X			ap->flags |= AF_AUTOKILL;
+X			thread_kill_cnt++;
+X			break;
+X		    }
+X		} else {
+X		    art = article_num(ap);
+X		    artp = ap;
+X		    perform(cp,FALSE);
+X		    if (ap->flags & (AF_AUTOSELECT|AF_AUTOSELECTALL))
+X			thread_select_cnt++;
+X		    else if (ap->flags & (AF_AUTOKILL|AF_AUTOKILLALL))
+X			thread_kill_cnt++;
+X		}
+X	    }
+X	    art = lastart+1;
+X	} else if (*buf == '*') {
+X	    register ARTICLE *ap;
+X	    register int killmask = AF_READ;
+X	    switch (buf[1]) {
+X	    case 'X':
+X		killmask |= sel_mask;	/* don't kill selected articles */
+X		/* FALL THROUGH */
+X	    case 'j':
+X		for (art = killfirst, ap = article_ptr(killfirst);
+X		     art <= lastart;
+X		     art++, ap++
+X		) {
+X		    if (!(ap->flags & killmask))
+X			set_read(ap);
+X		}
+X		break;
+X	    }
+X	    has_normal_kills = TRUE;
+X	}
+X    }
+X    if (thread_kill_cnt) {
+X	sprintf(buf,"%ld auto-kill command%s.", (long)thread_kill_cnt,
+X		thread_kill_cnt == 1? "" : "s");
+X	mention(buf);
+X	kill_mentioned = TRUE;
+X    }
+X    if (thread_select_cnt) {
+X	sprintf(buf,"%ld auto-select command%s.", (long)thread_select_cnt,
+X		thread_select_cnt == 1? "" : "s");
+X	mention(buf);
+X	kill_mentioned = TRUE;
+X    }
+X    unread -= toread[ng];
+X    selections -= selected_count;
+X#ifdef VERBOSE
+X    IF(verbose && (unread > 0 || selections < 0)) {
+X	putchar('\n');
+X	if (unread > 0) {
+X	    printf("Killed %ld article%s", (long)unread,
+X		unread == 1? nullstr : "s");
+X	    if (selections < 0)
+X		fputs("; ",stdout);
+X	}
+X	if (selections < 0)
+X	    printf("Selected %ld article%s", (long)-selections,
+X		selections == -1? nullstr : "s");
+X	fputs(".\n",stdout) FLUSH;
+X	kill_mentioned = TRUE;
+X    }
+X#endif
+X    return 0;
+X}
+X
+Xvoid
+Xkill_unwanted(starting,message,entering)
+XART_NUM starting;
+Xchar *message;
+Xint entering;
+X{
+X    bool intr = FALSE;			/* did we get an interrupt? */
+X    ART_NUM oldfirst;
+X    char oldmode = mode;
+X    bool anytokill = (toread[ng] > 0);
+X
+X    mode = 'k';
+X    if ((entering || exitcmds) && (localkfp || globkfp)) {
+X	exitcmds = FALSE;
+X	oldfirst = firstart;
+X	firstart = starting;
+X	clear();
+X#ifdef VERBOSE
+X# ifdef TERSE
+X	if (message && (verbose || entering))
+X# else
+X	if (message)
+X# endif
+X#else
+X	if (message && entering)
+X#endif
+X	    fputs(message,stdout) FLUSH;
+X
+X	kill_mentioned = FALSE;
+X	if (localkfp)
+X	    intr = do_kfile(localkfp,entering);
+X	if (globkfp && !intr)
+X	    intr = do_kfile(globkfp,entering);
+X	putchar('\n') FLUSH;
+X	if (entering && kill_mentioned && novice_delays)
+X#ifdef VERBOSE
+X	    IF(verbose)
+X		get_anything();
+X	    ELSE
+X#endif
+X#ifdef TERSE
+X		pad(just_a_sec);
+X#endif
+X	if (anytokill)			/* if there was anything to kill */
+X	    forcelast = FALSE;		/* allow for having killed it all */
+X	firstart = oldfirst;
+X    }
+X    if (!entering && localkf_changes && !intr)
+X	rewrite_kfile(lastart);
+X    mode = oldmode;
+X}
+X
+Xstatic FILE *newkfp;
+X
+Xstatic void write_thread_commands(data, extra)
+XHASHDATUM *data;
+Xint extra;
+X{
+X    register ARTICLE *ap = (data->dat_ptr? (ARTICLE*)data->dat_ptr
+X					: article_ptr(data->dat_len));
+X    register int flags;
+X    char ch;
+X
+X    if (flags = (ap->flags & AF_AUTOFLAGS)) {
+X	if (!(ap->flags & AF_MISSING) || ap->child1) {
+X	    if (flags & AF_AUTOKILLALL)
+X		ch = 'J';
+X	    else if (flags & AF_AUTOKILL)
+X		ch = ',';
+X	    else if (flags & AF_AUTOSELECTALL)
+X		ch = '+';
+X	    else if (flags & AF_AUTOSELECT)
+X		ch = '.';
+X	    fprintf(newkfp,"%s T%c\n", ap->msgid, ch);
+X	}
+X    }
+X}
+X
+Xvoid
+Xrewrite_kfile(thru)
+XART_NUM thru;
+X{
+X    bool no_kills = 0, has_star_commands = FALSE;
+X
+X    if (localkfp) {
+X	fseek(localkfp,0L,0);		/* rewind current file */
+X	/* If we're writing ids, we know the file is not null */
+X	if (localkf_changes > 1)
+X	    ;
+X	else if (fgets(buf,LBUFLEN,localkfp) != Nullch
+X	 && (strnNE(buf,"THRU",4) || fgets(buf,LBUFLEN,localkfp) != Nullch))
+X	    fseek(localkfp,0L,0);
+X	else
+X	    no_kills = 1;
+X    }
+X    strcpy(buf,filexp(getval("KILLLOCAL",killlocal)));
+X    if (!localkfp)
+X	makedir(buf,MD_FILE);
+X    UNLINK(buf);			/* to prevent file reuse */
+X    if (no_kills)
+X	open_kfile(KF_LOCAL);		/* close file and reset open flag */
+X    else if (newkfp = fopen(buf,"w")) {
+X	fprintf(newkfp,"THRU %ld\n",(long)thru);
+X	while (localkfp && fgets(buf,LBUFLEN,localkfp) != Nullch) {
+X	    if (strnEQ(buf,"THRU",4))
+X		continue;
+X	    /* Write star commands after other kill commands */
+X	    if (*buf == '*') {
+X		has_star_commands = TRUE;
+X		continue;
+X	    }
+X	    /* Leave out any outdated thread commands */
+X	    if (*buf != 'T' && *buf != '<')
+X		fputs(buf,newkfp);
+X	}
+X	if (has_star_commands) {
+X	    fseek(localkfp,0L,0);			/* rewind file */
+X	    while (fgets(buf,LBUFLEN,localkfp) != Nullch) {
+X		if (*buf == '*')
+X		    fputs(buf,newkfp);
+X	    }
+X	}
+X	/* Append all the still-valid thread commands */
+X	hashwalk(msgid_hash, write_thread_commands, 0);
+X	fclose(newkfp);
+X	open_kfile(KF_LOCAL);		/* and reopen local file */
+X    }
+X    else
+X	printf(cantcreate,buf) FLUSH;
+X    localkf_changes = 0;
+X    has_normal_kills = FALSE;
+X}
+X
+X/* edit KILL file for newsgroup */
+X
+Xint
+Xedit_kfile()
+X{
+X    int r = -1;
+X
+X    if (in_ng) {
+X	register SUBJECT *sp;
+X
+X	if (localkf_changes)
+X	    rewrite_kfile(lastart);
+X	for (sp = first_subject; sp; sp = sp->next)
+X	    clear_subject(sp);
+X	localkf_changes = 0;
+X	strcpy(buf,filexp(getval("KILLLOCAL",killlocal)));
+X    } else
+X	strcpy(buf,filexp(getval("KILLGLOBAL",killglobal)));
+X    if ((r = makedir(buf,MD_FILE)) >= 0) {
+X	sprintf(cmd_buf,"%s %s",
+X	    filexp(getval("VISUAL",getval("EDITOR",defeditor))),buf);
+X	printf("\nEditing %s KILL file:\n%s\n",
+X	    (in_ng?"local":"global"),cmd_buf) FLUSH;
+X	resetty();			/* make sure tty is friendly */
+X	r = doshell(sh,cmd_buf);/* invoke the shell */
+X	noecho();			/* and make terminal */
+X	crmode();			/*   unfriendly again */
+X	open_kfile(in_ng);
+X	if (localkfp) {
+X	    fseek(localkfp,0L,0);			/* rewind file */
+X	    has_normal_kills = FALSE;
+X	    while (fgets(buf,LBUFLEN,localkfp) != Nullch) {
+X		if (*buf == '/' || *buf == '*')
+X		    has_normal_kills = TRUE;
+X		else if (*buf == '<') {
+X		    register ARTICLE *ap;
+X		    char *cp = index(buf,' ');
+X		    if (!cp)
+X			cp = ",";
+X		    else
+X			*cp++ = '\0';
+X		    if ((ap = get_article(buf)) != Nullart) {
+X			if (*cp == 'T')
+X			    cp++;
+X			switch (*cp) {
+X			case '+':
+X			    ap->flags |= AF_AUTOSELECTALL;
+X			    break;
+X			case '.':
+X			    ap->flags |= AF_AUTOSELECT;
+X			    break;
+X			case 'J':
+X			case 'j':
+X			    ap->flags |= AF_AUTOKILLALL;
+X			    break;
+X			case ',':
+X			    ap->flags |= AF_AUTOKILL;
+X			    break;
+X			}
+X		    }
+X		}
+X	    }
+X	}
+X    }
+X    else
+X	printf("Can't make %s\n",buf) FLUSH;
+X    return r;
+X}
+X
+Xvoid
+Xopen_kfile(local)
+Xint local;
+X{
+X    char *kname = filexp(local ?
+X	getval("KILLLOCAL",killlocal) :
+X	getval("KILLGLOBAL",killglobal)
+X	);
+X    
+X    /* delete the file if it is empty */
+X    if (stat(kname,&filestat) >= 0 && !filestat.st_size)
+X	UNLINK(kname);
+X    if (local) {
+X	if (localkfp)
+X	    fclose(localkfp);
+X	localkfp = fopen(kname,"r");
+X    }
+X    else {
+X	if (globkfp)
+X	    fclose(globkfp);
+X	globkfp = fopen(kname,"r");
+X    }
+X}
+X
+Xvoid
+Xkf_append(cmd)
+Xchar *cmd;
+X{
+X    strcpy(cmd_buf,filexp(getval("KILLLOCAL",killlocal)));
+X    if (makedir(cmd_buf,MD_FILE) >= 0) {
+X#ifdef VERBOSE
+X	IF(verbose)
+X	    printf("\nDepositing command in %s...",cmd_buf);
+X	ELSE
+X#endif
+X#ifdef TERSE
+X	    printf("\n--> %s...",cmd_buf);
+X#endif
+X	fflush(stdout);
+X	if (novice_delays)
+X	    sleep(2);
+X	if ((tmpfp = fopen(cmd_buf,"a")) != Nullfp) {
+X	    fseek(tmpfp,0L,2);		/* get to EOF for sure */
+X	    fprintf(tmpfp,"%s\n",cmd);
+X	    fclose(tmpfp);
+X	    fputs("done\n",stdout) FLUSH;
+X	}
+X	else
+X	    printf(cantopen,cmd_buf) FLUSH;
+X    }
+X    has_normal_kills = TRUE;
+X}
+X#endif /* KILLFILES */
+END_OF_FILE
+if test 11223 -ne `wc -c <'kfile.c'`; then
+    echo shar: \"'kfile.c'\" unpacked with wrong size!
+fi
+# end of 'kfile.c'
+fi
+if test -f 'ngstuff.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'ngstuff.c'\"
+else
+echo shar: Extracting \"'ngstuff.c'\" \(10350 characters\)
+sed "s/^X//" >'ngstuff.c' <<'END_OF_FILE'
+X/* $Id: ngstuff.c,v 3.0 1991/09/09 20:23:31 davison Trn $
+X */
+X/* This software is Copyright 1991 by Stan Barber. 
+X *
+X * Permission is hereby granted to copy, reproduce, redistribute or otherwise
+X * use this software as long as: there is no monetary profit gained
+X * specifically from the use or reproduction of this software, it is not
+X * sold, rented, traded or otherwise marketed, and this copyright notice is
+X * included prominently in any copy made. 
+X *
+X * The authors make no claims as to the fitness or correctness of this software
+X * for any use whatsoever, and it is provided as is. Any use of this software
+X * is at the user's own risk. 
+X */
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "term.h"
+X#include "util.h"
+X#include "cache.h"
+X#include "bits.h"
+X#include "ngdata.h"
+X#include "ng.h"
+X#include "intrp.h"
+X#include "head.h"
+X#include "final.h"
+X#include "sw.h"
+X#include "rthread.h"
+X#include "rt-select.h"
+X#include "rt-wumpus.h"
+X#include "trn.h"
+X#include "rcstuff.h"
+X#include "respond.h"
+X#include "kfile.h"
+X#include "decode.h"
+X#include "INTERN.h"
+X#include "ngstuff.h"
+X
+Xvoid
+Xngstuff_init()
+X{
+X    ;
+X}
+X
+X/* do a shell escape */
+X
+Xint
+Xescapade()
+X{
+X    register char *s;
+X    bool interactive = (buf[1] == FINISHCMD);
+X    bool docd;
+X    char whereiam[512];
+X
+X    if (!finish_command(interactive))	/* get remainder of command */
+X	return -1;
+X    s = buf+1;
+X    docd = *s != '!';
+X    if (!docd) {
+X	s++;
+X    }
+X    else {
+X	getwd(whereiam);
+X	if (chdir(cwd)) {
+X	    printf(nocd,cwd) FLUSH;
+X	    sig_catcher(0);
+X	}
+X    }
+X    while (*s == ' ') s++;
+X					/* skip leading spaces */
+X    interp(cmd_buf, (sizeof cmd_buf), s);/* interpret any % escapes */
+X    resetty();				/* make sure tty is friendly */
+X    doshell(Nullch,cmd_buf);	/* invoke the shell */
+X    noecho();				/* and make terminal */
+X    crmode();				/*   unfriendly again */
+X    if (docd) {
+X	if (chdir(whereiam)) {
+X	    printf(nocd,whereiam) FLUSH;
+X	    sig_catcher(0);
+X	}
+X    }
+X#ifdef MAILCALL
+X    mailcount = 0;			/* force recheck */
+X#endif
+X    return 0;
+X}
+X
+X/* process & command */
+X
+Xint
+Xswitcheroo()
+X{
+X    if (!finish_command(TRUE)) /* get rest of command */
+X	return -1;	/* if rubbed out, try something else */
+X    if (!buf[1])
+X	pr_switches();
+X    else if (buf[1] == '&') {
+X	if (!buf[2]) {
+X	    page_init();
+X	    show_macros();
+X	}
+X	else {
+X	    char tmpbuf[LBUFLEN];
+X	    register char *s;
+X
+X	    for (s=buf+2; isspace(*s); s++);
+X	    mac_line(s,tmpbuf,(sizeof tmpbuf));
+X	}
+X    }
+X    else {
+X	bool docd = (instr(buf,"-d", TRUE) != Nullch);
+X 	char whereami[512];
+X 
+X	if (docd)
+X	    getwd(whereami);
+X	sw_list(buf+1);
+X	if (docd) {
+X	    cwd_check();
+X	    if (chdir(whereami)) {		/* -d does chdirs */
+X		printf(nocd,whereami) FLUSH;
+X		sig_catcher(0);
+X	    }
+X	}
+X    }
+X    return 0;
+X}
+X
+X/* process range commands */
+X
+Xint
+Xnumnum()
+X{
+X    ART_NUM min, max;
+X    char *cmdlst = Nullch;
+X    register char *s, *c;
+X    ART_NUM oldart = art;
+X    char tmpbuf[LBUFLEN];
+X    bool justone = TRUE;		/* assume only one article */
+X
+X    perform_cnt = 0;
+X    if (!finish_command(TRUE))	/* get rest of command */
+X	return NN_INP;
+X	if (lastart < 1) {
+X	    fputs("\nNo articles\n",stdout) FLUSH;
+X	    return NN_ASK;
+X	}
+X#ifdef ARTSEARCH
+X    if (srchahead)
+X	srchahead = -1;
+X#endif
+X    for (s=buf; *s && (isdigit(*s) || index(" ,-.$",*s)); s++)
+X	if (!isdigit(*s))
+X	    justone = FALSE;
+X    if (*s) {
+X	cmdlst = savestr(s);
+X	justone = FALSE;
+X    }
+X    else if (!justone)
+X	cmdlst = savestr("m");
+X    *s++ = ',';
+X    *s = '\0';
+X    safecpy(tmpbuf,buf,LBUFLEN);
+X    for (s = tmpbuf; c = index(s,','); s = ++c) {
+X	*c = '\0';
+X	if (*s == '.')
+X	    min = oldart;
+X	else
+X	    min = atol(s);
+X	if (min < absfirst) {
+X	    min = absfirst;
+X	    printf("(First article is %ld)\n",(long)absfirst) FLUSH;
+X	    pad(just_a_sec/3);
+X	}
+X	if ((s=index(s,'-')) != Nullch) {
+X	    s++;
+X	    if (*s == '$')
+X		max = lastart;
+X	    else if (*s == '.')
+X		max = oldart;
+X	    else
+X		max = atol(s);
+X	}
+X	else
+X	    max = min;
+X	if (max>lastart) {
+X	    max = lastart;
+X	    if (min > max)
+X		min = max;
+X	    printf("(Last article is %ld)\n",(long)lastart) FLUSH;
+X	    pad(just_a_sec/3);
+X	}
+X	if (max < min) {
+X	    fputs("\nBad range\n",stdout) FLUSH;
+X	    if (cmdlst)
+X		free(cmdlst);
+X	    return NN_ASK;
+X	}
+X	if (justone) {
+X	    art = min;
+X	    return NN_REREAD;
+X	}
+X	for (art=min, artp=article_ptr(min); art<=max; art++, artp++) {
+X	    if (perform(cmdlst,TRUE)) {
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    printf("\n(Interrupted at article %ld)\n",(long)art)
+X		      FLUSH;
+X		ELSE
+X#endif
+X#ifdef TERSE
+X		    printf("\n(Intr at %ld)\n",(long)art) FLUSH;
+X#endif
+X		if (cmdlst)
+X		    free(cmdlst);
+X		return NN_ASK;
+X	    }
+X	}
+X    }
+X    art = oldart;
+X    if (cmdlst)
+X	free(cmdlst);
+X    return NN_NORM;
+X}
+X
+Xint
+Xuse_selected()
+X{
+X    register SUBJECT *sp;
+X    register ARTICLE *ap;
+X    bool want_read;
+X    char *cmdstr;
+X    int len, ret = 1;
+X    int subj_mask = (sel_mode == SM_THREAD? (SF_THREAD|SF_VISIT) : SF_VISIT);
+X
+X    if (!finish_command(TRUE))	/* get rest of command */
+X	return 0;
+X    if (!buf[1])
+X	return -1;
+X    cmdstr = savestr(buf+1);
+X    want_read = (sel_rereading || *cmdstr =='m');
+X
+X    perform_cnt = 0;
+X    page_line = 1;
+X    len = strlen(cmdstr);
+X
+X    /* A few commands can just loop through the subjects. */
+X    if ((len == 1 && (*cmdstr == 't' || *cmdstr == 'J'))
+X     || (len == 2
+X      && (((*cmdstr == '+' || *cmdstr == '-') && cmdstr[0] == cmdstr[1])
+X       || *cmdstr == 'T'))) {
+X	for (sp = first_subject; sp; sp = sp->next) {
+X	    if ((sp->flags & subj_mask) == subj_mask) {
+X		artp = first_art(sp);
+X		if (artp) {
+X		    art = article_num(artp);
+X		    if (perform(cmdstr, FALSE)) {
+X			fputs("\nInterrupted\n", stdout) FLUSH;
+X			goto break_out;
+X		    }
+X		}
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    if (mode != 't' && *cmdstr != 't' && *cmdstr != 'T')
+X			putchar('\n') FLUSH;
+X#endif
+X	    }
+X	}
+X    } else if (strEQ(cmdstr, "E")) {
+X	/* The 'E'nd-decode command doesn't do any looping at all. */
+X	if (decode_fp)
+X	    decode_end();
+X	else
+X	    ret = 2;
+X    } else {
+X	/* The rest loop through all (selected) articles. */
+X	/* Use the explicit article-order if it exists */
+X	if (artptr_list) {
+X	    ARTICLE **app, **limit = artptr_list + artptr_list_size;
+X	    for (app = artptr_list; app < limit; app++)
+X		if ((!((ap = *app)->flags & AF_READ) ^ want_read)
+X		 && (ap->flags & sel_mask)) {
+X		    art = article_num(ap);
+X		    artp = ap;
+X		    if (perform(cmdstr, TRUE)) {
+X			fputs("\nInterrupted\n", stdout) FLUSH;
+X			goto break_out;
+X		    }
+X		}
+X	} else {
+X	    for (sp = first_subject; sp; sp = sp->next)
+X		if ((sp->flags & subj_mask) == subj_mask)
+X		    for (ap = first_art(sp); ap; ap = next_art(ap))
+X			if ((!(ap->flags & AF_READ) ^ want_read)
+X			 && (ap->flags & sel_mask)) {
+X			    art = article_num(ap);
+X			    artp = ap;
+X			    if (perform(cmdstr, TRUE)) {
+X				fputs("\nInterrupted\n", stdout) FLUSH;
+X				goto break_out;
+X			    }
+X			}
+X	}
+X    }
+X  break_out:
+X    free(cmdstr);
+X    return ret;
+X}
+X
+Xint
+Xperform(cmdlst,toplevel)
+Xregister char *cmdlst;
+Xint toplevel;
+X{
+X    register int ch;
+X    bool saveit = FALSE;
+X    
+X    if (toplevel) {
+X	printf("%-6ld ",art);
+X	fflush(stdout);
+X    }
+X    perform_cnt++;
+X    for (; ch = *cmdlst; cmdlst++) {
+X	if (isspace(ch) || ch == ':')
+X	    continue;
+X	if (ch == 'j' && !saveit) {
+X	    if (!was_read(art)) {
+X		mark_as_read();
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    fputs("\tJunked",stdout);
+X#endif
+X	    }
+X	    if (sel_rereading)
+X		deselect_article(artp);
+X	} else if (ch == '+') {
+X	    if ((saveit || cmdlst[1] == '+') && artp->subj) {
+X		if (sel_mode == SM_THREAD)
+X		    select_thread(artp->subj->thread,
+X				  saveit? AF_AUTOSELECTALL : 0);
+X		else
+X		    select_subject(artp->subj, saveit? AF_AUTOSELECTALL : 0);
+X		cmdlst++;
+X	    } else
+X		select_article(artp, (saveit? AF_AUTOSELECTALL : 0) | AF_ECHO);
+X	} else if (ch == '.') {
+X	    select_subthread(artp, saveit? AF_AUTOSELECT : 0);
+X	} else if (ch == '-') {
+X	    if (cmdlst[1] == '-' && artp->subj) {
+X		if (sel_mode == SM_THREAD)
+X		    deselect_thread(artp->subj->thread);
+X		else
+X		    deselect_subject(artp->subj);
+X		cmdlst++;
+X	    } else
+X		deselect_article(artp);
+X	} else if (ch == ',') {
+X	    kill_subthread(artp, saveit? (KF_ALL|KF_KILLFILE) : KF_ALL);
+X	} else if (ch == 'J' || ch == 'j') {
+X	    if (!artp->subj) {
+X		set_read(artp);
+X		artp->flags |= AF_AUTOKILLALL;
+X	    } else if (sel_mode == SM_THREAD)
+X		kill_thread(artp->subj->thread,
+X			saveit? (KF_ALL|KF_KILLFILE) : KF_ALL);
+X	    else
+X		kill_subject(artp->subj,
+X			saveit? (KF_ALL|KF_KILLFILE) : KF_ALL);
+X	} else if (ch == 't') {
+X	    entire_tree(artp);
+X	} else if (ch == 'T') {
+X	    saveit = TRUE;
+X	} else if (ch == 'm') {
+X	    if ((article_ptr(art)->flags & (AF_READ|AF_MISSING)) == AF_READ) {
+X		unmark_as_read();
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    fputs("\tMarked unread",stdout);
+X#endif
+X	    }
+X	}
+X	else if (ch == 'M') {
+X	    delay_unmark(artp);
+X	    oneless(artp);
+X#ifdef VERBOSE
+X	    IF(verbose)
+X		fputs("\tWill return",stdout);
+X#endif
+X	}
+X	else if (ch == '=') {
+X	    printf("\t%s",fetchsubj(art,FALSE));
+X#ifdef VERBOSE
+X	    IF(verbose)
+X		;
+X	    ELSE
+X#endif
+X		putchar('\n') FLUSH;		/* ghad! */
+X	}
+X	else if (ch == 'C') {
+X#ifdef ASYNC_PARSE
+X	    printf("\t%sancelled",(cancel_article() ? "Not c" : "C"));
+X#else
+X	    notincl("C");
+X	    return -1;
+X#endif
+X	}
+X	else if (ch == '%') {
+X#ifdef ASYNC_PARSE
+X	    char tmpbuf[512];
+X
+X	    if (one_command)
+X		interp(tmpbuf, (sizeof tmpbuf), cmdlst);
+X	    else
+X		cmdlst = dointerp(tmpbuf, (sizeof tmpbuf), cmdlst, ":") - 1;
+X	    perform_cnt--;
+X	    if (perform(tmpbuf,FALSE))
+X		return -1;
+X#else
+X	    notincl("%");
+X	    return -1;
+X#endif
+X	}
+X	else if (index("!&sSwWe|",ch)) {
+X	    if (one_command)
+X		strcpy(buf,cmdlst);
+X	    else
+X		cmdlst = cpytill(buf,cmdlst,':') - 1;
+X	    /* we now have the command in buf */
+X	    if (ch == '!') {
+X		escapade();
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    fputs("\tShell escaped",stdout);
+X#endif
+X	    }
+X	    else if (ch == '&') {
+X		switcheroo();
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    if (buf[1] && buf[1] != '&')
+X			fputs("\tSwitched",stdout);
+X#endif
+X	    }
+X	    else {
+X		putchar('\t');
+X		save_article();
+X#ifdef VERBOSE
+X		IF(verbose)
+X		    ;
+X		ELSE
+X#endif
+X		    putchar('\n') FLUSH;
+X	    }
+X	}
+X	else {
+X	    printf("\t???%s\n",cmdlst);
+X	    return -1;
+X	}
+X#ifdef VERBOSE
+X	fflush(stdout);
+X#endif
+X	if (one_command)
+X	    break;
+X    }
+X    if (toplevel) {
+X#ifdef VERBOSE
+X	IF(verbose)
+X	    putchar('\n') FLUSH;
+X#endif
+X    }
+X    if (int_count) {
+X	int_count = 0;
+X	return -1;
+X    }
+X    return 0;
+X}
+END_OF_FILE
+if test 10350 -ne `wc -c <'ngstuff.c'`; then
+    echo shar: \"'ngstuff.c'\" unpacked with wrong size!
+fi
+# end of 'ngstuff.c'
+fi
+if test -f 'nntp/acttimes.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'nntp/acttimes.c'\"
+else
+echo shar: Extracting \"'nntp/acttimes.c'\" \(10481 characters\)
+sed "s/^X//" >'nntp/acttimes.c' <<'END_OF_FILE'
+X/* $Header: acttimes.c,v 1.1 91/11/02 18:38:29 davison Exp $
+X**
+X** $Log:	acttimes.c,v $
+X*/
+X
+X/* This program will maintain the file active.times if your news software
+X** doesn't already do this for you.  The file contains a list of newsgroup
+X** names followed by the time of creation (in seconds since 1970) and the
+X** address of the creator.  Since we can't tell who actually created the
+X** group, they will all indicate acttimes@DOMAIN.
+X**
+X** Place this file in your NNTP support directory and change your
+X** common/conf.h to undef NGDATE_FILE and STAT_FILE, and define
+X** ACTIVE_TIMES_FILE.  To make, you can replace every mention of
+X** "mkgrdates" in the support/Makefile with "acttimes" and then
+X** type "make".  
+X**
+X** To use this without having NNTP around, undefine the NNTP_SUPPORT
+X** define, edit the other defines that follow to indicate your setup,
+X** and compile it with something like "cc -O -o acttimes acttimes.c".
+X**
+X** Use either "acttimes -d" to start a daemon process that wakes up every
+X** 10 minutes (by default) to check if the active file is a different
+X** size, or put "acttimes" into your cron file to be run periodically.
+X*/
+X
+X#define NNTP_SUPPORT		/* comment out if not using NNTP */
+X
+X#include <stdio.h>
+X#include <sys/types.h>
+X#include <sys/stat.h>
+X#include <signal.h>
+X#include <errno.h>
+X#ifdef NNTP_SUPPORT
+X#include "../common/conf.h"
+X#endif
+X#ifdef USG
+X#include <time.h>
+X#else
+X#include <sys/time.h>
+X#endif
+X
+X/* ---------- Start of configuration defines ---------- */
+X
+X#ifndef USG
+X#define TERMIO			/* Is this is termio system? */
+X#endif
+X
+X/* NNTP sites have the following already defined in ../common/conf.h */
+X
+X#ifndef DOMAIN			/* our domain name */
+X#define DOMAIN	"local"
+X#endif
+X
+X#ifndef ACTIVE_FILE		/* the active file for your news system */
+X#define ACTIVE_FILE "/usr/lib/news/active"
+X#endif
+X
+X#ifndef ACTIVE_TIMES_FILE	/* the name of the file to update */
+X#define ACTIVE_TIMES_FILE "/usr/lib/news/active.times"
+X#endif
+X
+X#ifndef SIGRET			/* set this to "int" if you have problems */
+X#define SIGRET void
+X#endif
+X
+X#ifndef MAXPATHLEN		/* you'll probably want to leave this alone */
+X#define	MAXPATHLEN	1024
+X#endif
+X
+X/*#define index   strchr	/* uncomment these if you need them */
+X/*#define rindex  strrchr	/* (i.e. if index is undefined) */
+X
+X/* ---------- End of configuration defines ---------- */
+X
+X#ifdef TERMIO
+X#include <termio.h>
+X#else
+X#include <sgtty.h>
+X#endif
+X
+X#define TIMER_FIRST 1
+X#define TIMER_DEFAULT (10 * 60)
+X
+X#define strnEQ(x,y,n) (!strncmp((x),(y),(n)))
+X
+Xextern errno;
+X
+Xchar *index(), *rindex(), *malloc();
+XSIGRET alarm_handler(), quit_handler();
+Xvoid active_times(), free_lines(), wrap_it_up();
+X
+Xtypedef struct _active_line {
+X    struct _active_line *link;
+X    char *name;
+X    char type;
+X} ACTIVE_LINE;
+X
+XACTIVE_LINE *line_root = NULL, *last_line = NULL, *pline = NULL;
+Xlong last_actsize;
+Xint daemon_delay = 0, kill_daemon = 0, old_groups = 0;
+X
+XFILE *fp_lock;
+X
+Xstruct stat filestat;
+X
+Xchar buf[MAXPATHLEN];
+Xchar lockfile[MAXPATHLEN];
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X    int fd;
+X    long pid;
+X    char *cp;
+X
+X    while (--argc) {
+X	if (**++argv == '-') {
+X	    while (*++*argv) {
+X		switch (**argv) {
+X		case 'd':		/* run in daemon mode */
+X		    if (*++*argv <= '9' && **argv >= '0') {
+X			daemon_delay = atoi(*argv) * 60;
+X			while (*++*argv <= '9' && **argv >= '0') {
+X			    ;
+X			}
+X		    } else {
+X			daemon_delay = TIMER_DEFAULT;
+X		    }
+X		    --*argv;
+X		    break;
+X		case 'k':		/* kill running acttimes */
+X		    kill_daemon++;
+X		    break;
+X		default:
+X		    fprintf(stderr, "Unknown option: '%c'\n", **argv);
+X		    exit(1);
+X		}
+X	    }
+X	} else {
+X	    fprintf(stderr,
+X		"Usage:  acttimes [-d<mins>]\nOr:     acttimes -k\n");
+X	    exit(1);
+X	}
+X    }
+X
+X    /* Set up a nice friendly umask. */
+X    umask(002);
+X
+X    /* Make sure we're not already running by creating a lock file. */
+X    strcpy(lockfile, ACTIVE_TIMES_FILE);
+X    if ((cp = rindex(lockfile, '/')) != 0) {
+X	cp++;
+X    } else {
+X	cp = lockfile;
+X    }
+X    *cp = '\0';
+X    sprintf(buf, "%sLOCK.%ld", lockfile, (long)getpid());
+X    if ((fp_lock = fopen(buf, "w")) == 0) {
+X	fprintf(stderr, "Unable to create lock temporary `%s'.\n", buf);
+X	exit(1);
+X    }
+X    fprintf(fp_lock, "%ld\n", (long)getpid());
+X    fclose(fp_lock);
+X
+X    /* Try to link to lock file. */
+X    strcat(lockfile, "LOCKacttimes");
+X  dolink:
+X    if (link(buf, lockfile) < 0) {
+X      long otherpid;
+X	/* Try to avoid possible race with daemon starting up. */
+X	sleep (5);
+X	if ((fp_lock = fopen(lockfile, "r")) == 0) {
+X	    fprintf(stderr, "unable to open %s\n", lockfile);
+X	    unlink(buf);
+X	    exit(1);
+X	}
+X	if (fscanf(fp_lock, "%ld", &otherpid) != 1) { 
+X	    fprintf(stderr, "unable to read pid from %s\n", lockfile);
+X	    unlink(buf);
+X	    fclose(fp_lock);
+X	    exit(1);
+X	}
+X	fclose(fp_lock);
+X	if (kill(otherpid, kill_daemon ? SIGTERM : 0) == -1
+X	 && errno == ESRCH) {
+X	    if (unlink(lockfile) == -1) {
+X		fprintf(stderr, "unable to unlink lockfile %s\n", lockfile);
+X		unlink(buf);
+X		exit(1);
+X	    }
+X	    if (!kill_daemon) {
+X		goto dolink;
+X	    }
+X	}
+X	unlink(buf);
+X	if (kill_daemon) {
+X	    fprintf(stderr, "killing currently running acttimes.\n");
+X	    exit(0);
+X	} else {
+X	    fprintf(stderr, "acttimes is already running.\n");
+X	    exit(1);
+X	}
+X    }
+X
+X    unlink(buf);			/* remove temporary LOCK.<pid> file */
+X
+X    if (kill_daemon) {
+X	fprintf(stderr, "acttimes is not running.\n");
+X	wrap_it_up(1);
+X    }
+X
+X#ifdef SIGHUP
+X    if( signal( SIGHUP, SIG_IGN ) != SIG_IGN ) {
+X	signal( SIGHUP, quit_handler );
+X    }
+X#endif
+X    if( signal( SIGINT, SIG_IGN ) != SIG_IGN ) {
+X	signal( SIGINT, quit_handler );
+X    }
+X#ifdef SIGQUIT
+X    if( signal( SIGQUIT, SIG_IGN ) != SIG_IGN ) {
+X	signal( SIGQUIT, quit_handler );
+X    }
+X#endif
+X    signal( SIGTERM, quit_handler );
+X#ifdef SIGTTIN
+X    signal( SIGTTIN, SIG_IGN );
+X    signal( SIGTTOU, SIG_IGN );
+X#endif
+X    signal( SIGALRM, SIG_IGN );
+X
+X    /* If we're not in daemon mode, run through once and quit. */
+X    if (!daemon_delay) {
+X	active_times();
+X    } else {
+X	/* For daemon mode, we cut ourself off from anything tty-related and
+X	** run in the background (involves forks, but no knives).
+X	*/
+X	close(0);
+X	if (open("/dev/null", 2) != 0) {
+X	    fprintf(stderr, "unable to open /dev/null!\n");
+X	    wrap_it_up(1);
+X	}
+X	close(1);
+X	close(2);
+X	dup(0);
+X	dup(0);
+X	while ((pid = fork()) < 0) {
+X	    sleep(2);
+X	}
+X	if (pid) {
+X	    exit(0);
+X	}
+X#ifdef TIOCNOTTY
+X	if ((fd = open("/dev/tty", 1)) >= 0) {
+X	    ioctl(fd, TIOCNOTTY, (int*)0);
+X	    close(fd);
+X	}
+X#else
+X	(void) setpgrp();
+X	while ((pid = fork()) < 0) {
+X	    sleep(2);
+X	}
+X	if (pid) {
+X	    exit(0);
+X	}
+X#endif
+X	/* Put our pid in the lock file for death detection */
+X	if( (fp_lock = fopen(lockfile, "w")) != 0) {
+X	    fprintf(fp_lock, "%ld\n", (long)getpid());
+X	    fclose(fp_lock);
+X	}
+X
+X	signal(SIGALRM, alarm_handler);
+X
+X	/* Start timer -- first interval is shorter than all others */
+X	alarm(TIMER_FIRST);
+X	for (;;) {
+X	    pause();		/* let alarm go off */
+X	    alarm(0);
+X
+X	    if (stat(ACTIVE_FILE, &filestat) < 0) {
+X		fprintf(stderr, "Unable to stat active file -- quitting.\n");
+X		wrap_it_up(1);
+X	    }
+X	    if (filestat.st_size != last_actsize) {
+X		last_actsize = filestat.st_size;
+X		active_times();
+X	    }
+X	    alarm(daemon_delay);
+X	} /* for */
+X    }/* if */
+X
+X    wrap_it_up(0);
+X}
+X
+XSIGRET
+Xalarm_handler()
+X{
+X    signal(SIGALRM, alarm_handler);
+X}
+X
+XSIGRET
+Xquit_handler()
+X{
+X    wrap_it_up(0);
+X}
+X
+Xvoid
+Xwrap_it_up(ret)
+X{
+X    unlink(lockfile);
+X    exit(ret);
+X}
+X
+Xvoid
+Xactive_times()
+X{
+X    FILE *fp_active, *fp_date_r, *fp_date_w;
+X    register char *cp;
+X
+X    if ((fp_active = fopen(ACTIVE_FILE, "r")) == NULL) {
+X	if (!daemon_delay) {
+X	    fprintf(stderr, "Unable to open active file.\n");
+X	}
+X	return;
+X    }
+X    if ((fp_date_r = fopen(ACTIVE_TIMES_FILE, "r")) == NULL) {
+X	if (!daemon_delay) {
+X	    fprintf(stderr, "Creating active.times file.\n");
+X	}
+X	old_groups = 1;
+X    } else {
+X	old_groups = 0;
+X    }
+X    sprintf(buf, "%s.n", ACTIVE_TIMES_FILE);
+X    if ((fp_date_w = fopen(buf, "w")) == NULL) {
+X	if (!daemon_delay) {
+X	    fprintf(stderr, "Unable to create active.times file.\n");
+X	}
+X	return;
+X    }
+X
+X    /* Loop through entire active file and remember each line. */
+X    while (fgets(buf, sizeof buf, fp_active)) {
+X	if (!(cp = index(buf, ' ')) || cp[1] == '\0') {
+X	    continue;
+X	}
+X	cp[1] = '\0';		/* include trailing space */
+X	if (!(cp = rindex(cp + 2, ' '))) {
+X	    continue;
+X	}
+X	pline = (ACTIVE_LINE*)malloc(sizeof (ACTIVE_LINE));
+X	if (!pline) {
+X	    if (line_root) {
+X		last_line->link = NULL;
+X		free_lines();
+X	    }
+X	  bug_out:
+X	    fclose(fp_active);
+X	    fclose(fp_date_r);
+X	    fclose(fp_date_w);
+X	    return;
+X	}
+X	pline->name = malloc(strlen(buf) + 1);
+X	if (!pline->name) {
+X	    if (line_root) {
+X		last_line->link = NULL;
+X		pline->name = NULL;
+X		free_lines();
+X	    } else {
+X		free(pline);
+X	    }
+X	    goto bug_out;
+X	}
+X	strcpy(pline->name, buf);
+X	pline->type = cp[1];
+X	if (!last_line) {
+X	    line_root = pline;
+X	} else {
+X	    last_line->link = pline;
+X	}
+X	last_line = pline;
+X    }
+X    last_line->link = NULL;
+X    fclose(fp_active);
+X
+X    if (fp_date_r) {
+X	/* Loop through date file, copying existing groups to new file. */
+X	while (fgets(buf, sizeof buf, fp_date_r)) {
+X	    last_line = NULL;
+X	    for (pline = line_root; pline; pline = pline->link) {
+X		if (strnEQ(buf, pline->name, strlen(pline->name))) {
+X		    fputs(buf, fp_date_w);
+X		    free(pline->name);
+X		    if (last_line) {
+X			last_line->link = pline->link;
+X		    } else {
+X			line_root = pline->link;
+X		    }
+X		    free(pline);
+X		    break;
+X		}
+X		last_line = pline;
+X	    }/* for */
+X	}
+X    }
+X    /* Remaining entries from active file are new groups. */
+X    for (pline = line_root; pline; pline = last_line) {
+X	if (pline->type != 'x' && pline->type != '=') {
+X	    /* If it's not 'x'ed out, write it out with the current time. */
+X	    fprintf(fp_date_w, "%s%ld acttimes@%s\n", pline->name,
+X		old_groups ? 30010440L : time(NULL), DOMAIN);
+X	}
+X	free(pline->name);
+X	last_line = pline->link;
+X	free(pline);
+X    }
+X    fclose(fp_date_w);
+X    fclose(fp_date_r);
+X    line_root = NULL;
+X
+X    /* rm active.times.o */
+X    sprintf(buf,"%s.o", ACTIVE_TIMES_FILE);
+X    unlink(buf);
+X    /* mv active.times active.times.o */
+X    link(ACTIVE_TIMES_FILE, buf);
+X    unlink(ACTIVE_TIMES_FILE);
+X    /* mv active.times.n active.times */
+X    sprintf(buf, "%s.n", ACTIVE_TIMES_FILE);
+X    link(buf, ACTIVE_TIMES_FILE);
+X    unlink(buf);
+X}
+X
+Xvoid
+Xfree_lines()
+X{
+X    for (pline = line_root; pline; pline = last_line) {
+X	if (pline->name) {
+X	    free(pline->name);
+X	}
+X	last_line = pline->link;
+X	free(pline);
+X    }
+X    line_root = NULL;
+X}
+END_OF_FILE
+if test 10481 -ne `wc -c <'nntp/acttimes.c'`; then
+    echo shar: \"'nntp/acttimes.c'\" unpacked with wrong size!
+fi
+# end of 'nntp/acttimes.c'
+fi
+if test -f 'rcln.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'rcln.c'\"
+else
+echo shar: Extracting \"'rcln.c'\" \(12353 characters\)
+sed "s/^X//" >'rcln.c' <<'END_OF_FILE'
+X/* $Id: rcln.c,v 3.0 1992/02/01 03:09:32 davison Trn $
+X */
+X/* This software is Copyright 1991 by Stan Barber. 
+X *
+X * Permission is hereby granted to copy, reproduce, redistribute or otherwise
+X * use this software as long as: there is no monetary profit gained
+X * specifically from the use or reproduction of this software, it is not
+X * sold, rented, traded or otherwise marketed, and this copyright notice is
+X * included prominently in any copy made. 
+X *
+X * The authors make no claims as to the fitness or correctness of this software
+X * for any use whatsoever, and it is provided as is. Any use of this software
+X * is at the user's own risk. 
+X */
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "util.h"
+X#include "rcstuff.h"
+X#include "ngdata.h"
+X#include "INTERN.h"
+X#include "rcln.h"
+X
+Xvoid
+Xrcln_init()
+X{
+X    ;
+X}
+X
+X#ifdef CATCHUP
+Xvoid
+Xcatch_up(ngx)
+XNG_NUM ngx;
+X{
+X    char tmpbuf[128];
+X    
+X#ifdef VERBOSE
+X    IF(verbose)
+X	printf("\nMarking %s as all read.\n",rcline[ngx]) FLUSH;
+X    ELSE
+X#endif
+X#ifdef TERSE
+X	fputs("\nMarked read\n",stdout) FLUSH;
+X#endif
+X    sprintf(tmpbuf,"%s: 1-%ld", rcline[ngx],(long)getngsize(ngx));
+X    free(rcline[ngx]);
+X    rcline[ngx] = savestr(tmpbuf);
+X    *(rcline[ngx] + rcnums[ngx] - 1) = '\0';
+X    toread[ngx] = TR_NONE;
+X    write_rc();
+X}
+X#endif
+X
+X/* add an article number to a newsgroup, if it isn't already read */
+X
+Xint
+Xaddartnum(artnum,ngnam)
+XART_NUM artnum;
+Xchar *ngnam;
+X{
+X    register NG_NUM ngnum = find_ng(ngnam);
+X    register char *s, *t, *maxt = Nullch;
+X    ART_NUM min = 0, max = -1, lastnum = 0;
+X    char *mbuf;
+X    bool morenum;
+X
+X    if (!artnum)
+X	return 0;
+X    if (ngnum == nextrcline || !rcnums[ngnum])
+X					/* not found in newsrc? */
+X	return 0;
+X    if (!abs1st[ngnum])
+X#ifndef ANCIENT_NEWS
+X					/* now is a good time to trim down */
+X	set_toread(ngnum);		/* the list due to expires if we */
+X					/* have not yet. */
+X#endif
+X#ifdef DEBUG
+X    if (artnum > ngmax[ngnum] + 100) {	/* allow for incoming articles */
+X	printf("\nCorrupt Xref line!!!  %ld --> %s(1..%ld)\n",
+X	    artnum,ngnam,
+X	    ngmax[ngnum]) FLUSH;
+X	paranoid = TRUE;		/* paranoia reigns supreme */
+X	return -1;			/* hope this was the first newsgroup */
+X    }
+X#endif
+X
+X    if (toread[ngnum] == TR_BOGUS)
+X	return 0;
+X#ifdef DEBUG
+X    if (debug & DEB_XREF_MARKER) {
+X	printf("%ld->\n%s%c%s\n",(long)artnum,rcline[ngnum],rcchar[ngnum],
+X	  rcline[ngnum] + rcnums[ngnum]) FLUSH;
+X    }
+X#endif
+X    s = rcline[ngnum] + rcnums[ngnum];
+X    while (*s == ' ') s++;		/* skip spaces */
+X    t = s;
+X    while (isdigit(*s) && artnum >= (min = atol(s))) {
+X					/* while it might have been read */
+X	for (t = s; isdigit(*t); t++) ;	/* skip number */
+X	if (*t == '-') {		/* is it a range? */
+X	    t++;			/* skip to next number */
+X	    if (artnum <= (max = atol(t)))
+X		return 0;		/* it is in range => already read */
+X	    lastnum = max;		/* remember it */
+X	    maxt = t;			/* remember position in case we */
+X					/* want to overwrite the max */
+X	    while (isdigit(*t)) t++;	/* skip second number */
+X	}
+X	else {
+X	    if (artnum == min)		/* explicitly a read article? */
+X		return 0;
+X	    lastnum = min;		/* remember what the number was */
+X	    maxt = Nullch;		/* last one was not a range */
+X	}
+X	while (*t && !isdigit(*t)) t++;	/* skip comma and any spaces */
+X	s = t;
+X    }
+X
+X    /* we have not read it, so insert the article number before s */
+X
+X    morenum = isdigit(*s);		/* will it need a comma after? */
+X    *(rcline[ngnum] + rcnums[ngnum] - 1) = RCCHAR(rcchar[ngnum]);
+X    mbuf = safemalloc((MEM_SIZE)(strlen(s) + (s-rcline[ngnum]) + 6+2+1));
+X    strcpy(mbuf,rcline[ngnum]);		/* make new rc line */
+X    if (maxt && lastnum && artnum == lastnum+1)
+X    					/* can we just extend last range? */
+X	t = mbuf + (maxt-rcline[ngnum]);/* then overwrite previous max */
+X    else {
+X	t = mbuf + (t-rcline[ngnum]);	/* point t into new line instead */
+X	if (lastnum) {			/* have we parsed any line? */
+X	    if (!morenum)		/* are we adding to the tail? */
+X		*t++ = ',';		/* supply comma before */
+X	    if (!maxt && artnum == lastnum+1 && *(t-1) == ',')
+X					/* adjacent singletons? */
+X		*(t-1) = '-';		/* turn them into a range */
+X	}
+X    }
+X    if (morenum) {			/* is there more to life? */
+X	if (min == artnum+1) {		/* can we consolidate further? */
+X	    bool range_before = (*(t-1) == '-');
+X	    bool range_after;
+X	    char *nextmax;
+X
+X	    for (nextmax = s; isdigit(*nextmax); nextmax++) ;
+X	    range_after = *nextmax++ == '-';
+X	    
+X	    if (range_before)
+X		*t = '\0';		/* artnum is redundant */
+X	    else
+X		sprintf(t,"%ld-",(long)artnum);/* artnum will be new min */
+X	    
+X	    if (range_after)
+X		s = nextmax;		/* *s is redundant */
+X	/*  else
+X		s = s */		/* *s is new max */
+X	}
+X	else
+X	    sprintf(t,"%ld,",(long)artnum);	/* put the number and comma */
+X    }
+X    else
+X	sprintf(t,"%ld",(long)artnum);	/* put the number there (wherever) */
+X    strcat(t,s);			/* copy remainder of line */
+X#ifdef DEBUG
+X    if (debug & DEB_XREF_MARKER) {
+X	printf("%s\n",mbuf) FLUSH;
+X    }
+X#endif
+X    free(rcline[ngnum]);
+X    rcline[ngnum] = mbuf;		/* pull the switcheroo */
+X    *(rcline[ngnum] + rcnums[ngnum] - 1) = '\0';
+X					/* wipe out : or ! */
+X    if (toread[ngnum] > TR_NONE)	/* lest we turn unsub into bogus */
+X	--toread[ngnum];
+X    return 0;
+X}
+X
+X#ifdef MCHASE
+X/* delete an article number from a newsgroup, if it is there */
+X
+Xvoid
+Xsubartnum(artnum,ngnam)
+Xregister ART_NUM artnum;
+Xchar *ngnam;
+X{
+X    register NG_NUM ngnum = find_ng(ngnam);
+X    register char *s, *t;
+X    register ART_NUM min, max;
+X    char *mbuf;
+X    int curlen;
+X
+X    if (!artnum)
+X	return;
+X    if (ngnum == nextrcline || !rcnums[ngnum])
+X	return;				/* not found in newsrc? */
+X#ifdef DEBUG
+X    if (debug & DEB_XREF_MARKER) {
+X	printf("%ld<-\n%s%c%s\n",(long)artnum,rcline[ngnum],rcchar[ngnum],
+X	  rcline[ngnum] + rcnums[ngnum]) FLUSH;
+X    }
+X#endif
+X    s = rcline[ngnum] + rcnums[ngnum];
+X    while (*s == ' ') s++;		/* skip spaces */
+X    
+X    /* a little optimization, since it is almost always the last number */
+X    
+X    for (t=s; *t; t++) ;		/* find end of string */
+X    curlen = t-rcline[ngnum];
+X    for (t--; isdigit(*t); t--) ;	/* find previous delim */
+X    if (*t == ',' && atol(t+1) == artnum) {
+X	*t = '\0';
+X	if (toread[ngnum] >= TR_NONE)
+X	    ++toread[ngnum];
+X#ifdef DEBUG
+X	if (debug & DEB_XREF_MARKER)
+X	    printf("%s%c %s\n",rcline[ngnum],rcchar[ngnum],s) FLUSH;
+X#endif
+X	return;
+X    }
+X
+X    /* not the last number, oh well, we may need the length anyway */
+X
+X    while (isdigit(*s) && artnum >= (min = atol(s))) {
+X					/* while it might have been read */
+X	for (t = s; isdigit(*t); t++) ;	/* skip number */
+X	if (*t == '-') {		/* is it a range? */
+X	    t++;			/* skip to next number */
+X	    max = atol(t);
+X	    while (isdigit(*t)) t++;	/* skip second number */
+X	    if (artnum <= max) {
+X					/* it is in range => already read */
+X		if (artnum == min) {
+X		    min++;
+X		    artnum = 0;
+X		}
+X		else if (artnum == max) {
+X		    max--;
+X		    artnum = 0;
+X		}
+X		*(rcline[ngnum] + rcnums[ngnum] - 1) = RCCHAR(rcchar[ngnum]);
+X		mbuf = safemalloc((MEM_SIZE)(curlen + (artnum?(6+1)*2+1:1+1)));
+X		*s = '\0';
+X		strcpy(mbuf,rcline[ngnum]);	/* make new rc line */
+X		s = mbuf + (s-rcline[ngnum]);
+X					/* point s into mbuf now */
+X		if (artnum) {		/* split into two ranges? */
+X		    prange(s,min,artnum-1);
+X		    s += strlen(s);
+X		    *s++ = ',';
+X		    prange(s,artnum+1,max);
+X		}
+X		else			/* only one range */
+X		    prange(s,min,max);
+X		strcat(s,t);		/* copy remainder over */
+X#ifdef DEBUG
+X		if (debug & DEB_XREF_MARKER) {
+X		    printf("%s\n",mbuf) FLUSH;
+X		}
+X#endif
+X		free(rcline[ngnum]);
+X		rcline[ngnum] = mbuf;	/* pull the switcheroo */
+X		*(rcline[ngnum] + rcnums[ngnum] - 1) = '\0';
+X					/* wipe out : or ! */
+X		if (toread[ngnum] >= TR_NONE)
+X		    ++toread[ngnum];
+X		return;
+X	    }
+X	}
+X	else {
+X	    if (artnum == min) {	/* explicitly a read article? */
+X		if (*t == ',')		/* pick a comma, any comma */
+X		    t++;
+X		else if (s[-1] == ',')
+X		    s--;
+X		else if (s[-2] == ',')	/* (in case of space) */
+X		    s -= 2;
+X		strcpy(s,t);		/* no need to realloc */
+X		if (toread[ngnum] >= TR_NONE)
+X		    ++toread[ngnum];
+X#ifdef DEBUG
+X		if (debug & DEB_XREF_MARKER) {
+X		    printf("%s%c%s\n",rcline[ngnum],rcchar[ngnum],
+X		      rcline[ngnum] + rcnums[ngnum]) FLUSH;
+X		}
+X#endif
+X		return;
+X	    }
+X	}
+X	while (*t && !isdigit(*t)) t++;	/* skip comma and any spaces */
+X	s = t;
+X    }
+X}
+X
+Xvoid
+Xprange(where,min,max)
+Xchar *where;
+XART_NUM min,max;
+X{
+X    if (min == max)
+X	sprintf(where,"%ld",(long)min);
+X    else
+X	sprintf(where,"%ld-%ld",(long)min,(long)max);
+X}
+X#endif
+X
+X/* calculate the number of unread articles for a newsgroup */
+X
+Xvoid
+Xset_toread(ngnum)
+Xregister NG_NUM ngnum;
+X{
+X    register char *s, *c, *h;
+X    char tmpbuf[64], *mybuf = tmpbuf;
+X    char *nums;
+X    int length;
+X    bool virgin_ng = (!abs1st[ngnum]);
+X    ART_NUM ngsize = getngsize(ngnum);
+X    ART_NUM unread = ngsize;
+X    ART_NUM newmax;
+X
+X    if (ngsize == TR_BOGUS) {
+X	printf("\nWarning!  Bogus newsgroup: %s\n",rcline[ngnum]) FLUSH;
+X	paranoid = TRUE;
+X	toread[ngnum] = TR_BOGUS;
+X	return;
+X    }
+X    if (virgin_ng) {
+X	sprintf(tmpbuf," 1-%ld",(long)ngsize);
+X	if (strNE(tmpbuf,rcline[ngnum]+rcnums[ngnum]))
+X	    checkexpired(ngnum);	/* this might realloc rcline */
+X    }
+X    nums = rcline[ngnum]+rcnums[ngnum];
+X    length = strlen(nums);
+X    if (length+5+1 > sizeof tmpbuf)
+X	mybuf = safemalloc((MEM_SIZE)(length+5+1));
+X    strcpy(mybuf,nums);
+X    mybuf[length++] = ',';
+X    mybuf[length] = '\0';
+X    for (s = mybuf; isspace(*s); s++)
+X	    ;
+X    for ( ; (c = index(s,',')) != Nullch ; s = ++c) {
+X				    /* for each range */
+X	*c = '\0';			/* keep index from running off */
+X	if ((h = index(s,'-')) != Nullch)	/* find - in range, if any */
+X	    unread -= (newmax = atol(h+1)) - atol(s) + 1;
+X	else if (newmax = atol(s))
+X	    unread--;		/* recalculate length */
+X	if (newmax > ngsize) {	/* paranoia check */
+X	    if (newmax > ngsize + 100) {
+X		unread = -1;
+X		break;
+X	    } else {
+X		unread += newmax - ngsize;
+X		ngmax[ngnum] = ngsize = newmax;
+X	    }
+X	}
+X    }
+X    if (unread >= 0)		/* reasonable number? */
+X	toread[ngnum] = (ART_UNREAD)unread;
+X					/* remember how many are left */
+X    else {				/* SOMEONE RESET THE NEWSGROUP!!! */
+X	toread[ngnum] = (ART_UNREAD)ngsize;
+X					/* assume nothing carried over */
+X	printf("\nWarning!  Somebody reset %s--assuming nothing read.\n",
+X	    rcline[ngnum]) FLUSH;
+X	*(rcline[ngnum] + rcnums[ngnum]) = '\0';
+X	paranoid = TRUE;		/* enough to make a guy paranoid */
+X    }
+X    if (mybuf != tmpbuf)
+X	free(mybuf);
+X    if (rcchar[ngnum] == NEGCHAR)
+X	toread[ngnum] = TR_UNSUB;
+X}
+X
+X/* make sure expired articles are marked as read */
+X
+Xvoid
+Xcheckexpired(ngnum)
+Xregister NG_NUM ngnum;
+X{
+X    register ART_NUM a1st = abs1st[ngnum];
+X    register char *s;
+X    register ART_NUM num, lastnum = 0;
+X    char *mbuf, *newnum;
+X
+X    if (a1st<=1)
+X	return;
+X#ifdef DEBUG
+X    if (debug & DEB_XREF_MARKER) {
+X	printf("1-%ld->\n%s%c%s\n",(long)(a1st-1),rcline[ngnum],rcchar[ngnum],
+X	  rcline[ngnum] + rcnums[ngnum]) FLUSH;
+X    }
+X#endif
+X    for (s = rcline[ngnum] + rcnums[ngnum]; isspace(*s); s++);
+X    while (*s && (num = atol(s)) <= a1st) {
+X	while (isdigit(*s)) s++;
+X	while (*s && !isdigit(*s)) s++;
+X	lastnum = num;
+X    }
+X    if (*s) {
+X	if (s[-1] == '-') {			/* landed in a range? */
+X	    if (lastnum != 1) {
+X		if (3 + strlen(s) > strlen(rcline[ngnum]+rcnums[ngnum])) {
+X		    mbuf = safemalloc((MEM_SIZE)(rcnums[ngnum] + 3 +
+X			strlen(s) + 1));
+X		    strcpy(mbuf, rcline[ngnum]);
+X		    sprintf(mbuf+rcnums[ngnum]," 1-%s",s);
+X		    free(rcline[ngnum]);
+X		    rcline[ngnum] = mbuf;
+X		} else {
+X		    sprintf(rcline[ngnum]+rcnums[ngnum]," 1-%s",s);
+X		}
+X	    }
+X	    goto ret;
+X	}
+X    }
+X    /* s now points to what should follow first range */
+X    if (s - rcline[ngnum] > rcnums[ngnum] + 6+4+1)
+X	mbuf = rcline[ngnum];
+X    else {
+X	mbuf = safemalloc((MEM_SIZE)(rcnums[ngnum] + strlen(s) + 6+4+1));
+X	strcpy(mbuf,rcline[ngnum]);
+X    }
+X    newnum = mbuf+rcnums[ngnum];
+X    sprintf(newnum," 1-%ld",(long)(a1st - (lastnum != a1st)));
+X    if (*s)
+X	sprintf(newnum+strlen(newnum),",%s",s);
+X
+X    if (!checkflag && mbuf == rcline[ngnum]) {
+X	rcline[ngnum] = saferealloc(rcline[ngnum],
+X	    (MEM_SIZE)(rcnums[ngnum] + strlen(newnum) + 1));
+X    }
+X    else {
+X	if (!checkflag)
+X	    free(rcline[ngnum]);
+X	rcline[ngnum] = mbuf;
+X    }
+X
+Xret:;		/* semicolon in case DEBUG undefined */
+X#ifdef DEBUG
+X    if (debug & DEB_XREF_MARKER) {
+X	printf("%s%c%s\n",rcline[ngnum],rcchar[ngnum],
+X	  rcline[ngnum] + rcnums[ngnum]) FLUSH;
+X    }
+X#endif
+X}
+X
+END_OF_FILE
+if test 12353 -ne `wc -c <'rcln.c'`; then
+    echo shar: \"'rcln.c'\" unpacked with wrong size!
+fi
+# end of 'rcln.c'
+fi
+if test -f 'rt-process.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'rt-process.c'\"
+else
+echo shar: Extracting \"'rt-process.c'\" \(12898 characters\)
+sed "s/^X//" >'rt-process.c' <<'END_OF_FILE'
+X/* $Id: rt-process.c,v 3.0 1992/12/14 00:14:13 davison Trn $
+X*/
+X/* The authors make no claims as to the fitness or correctness of this software
+X * for any use whatsoever, and it is provided as is. Any use of this software
+X * is at the user's own risk. 
+X */
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "intrp.h"
+X#include "trn.h"
+X#include "cache.h"
+X#include "bits.h"
+X#include "final.h"
+X#include "ng.h"
+X#include "ngdata.h"
+X#include "rcln.h"
+X#include "util.h"
+X#include "kfile.h"
+X#include "hash.h"
+X#include "rthread.h"
+X#include "rt-select.h"
+X
+Xextern HASHTABLE *msgid_hash;
+X
+Xstatic char *valid_message_id _((char*, char*));
+Xstatic void merge_threads _((SUBJECT*, SUBJECT*));
+Xstatic void link_child _((ARTICLE*));
+Xstatic void unlink_child _((ARTICLE*));
+X
+X/* This depends on art being set to the current article number.
+X*/
+XARTICLE *
+Xallocate_article(artnum)
+XART_NUM artnum;
+X{
+X    register ARTICLE *article;
+X
+X    /* create an new article */
+X    if (artnum >= absfirst) {
+X	if (artnum > lastart)
+X	    grow_cache(artnum);
+X	article = article_ptr(artnum);
+X    } else {
+X	article = (ARTICLE *)safemalloc(sizeof (ARTICLE));
+X	bzero((char*)article, sizeof (ARTICLE));
+X	article->flags |= AF_READ|AF_FAKE|AF_TMPMEM;
+X    }
+X    return article;
+X}
+X
+Xvoid
+Xfix_msgid(msgid)
+Xchar *msgid;
+X{
+X    register char *cp;
+X
+X    if ((cp = index(msgid, '@')) != Nullch) {
+X	while (*++cp) {
+X	    if (isupper(*cp)) {
+X		*cp = tolower(*cp);	/* lower-case domain portion */
+X	    }
+X	}
+X    }
+X}
+X
+Xint
+Xmsgid_cmp(key, keylen, data)
+Xchar *key;
+Xint keylen;
+XHASHDATUM data;
+X{
+X    ARTICLE *article = (data.dat_ptr? (ARTICLE*)data.dat_ptr
+X				    : article_ptr(data.dat_len));
+X    /* We already know that the lengths are equal, just compare the strings */
+X    return bcmp(key, article->msgid, keylen);
+X}
+X
+XSUBJECT *fake_had_subj; /* the fake-turned-real article had this subject */
+X
+Xbool
+Xvalid_article(article)
+XARTICLE *article;
+X{
+X    ARTICLE *ap, *fake_ap;
+X    char *msgid = article->msgid;
+X    HASHDATUM data;
+X
+X    if (msgid) {
+X	fix_msgid(msgid);
+X	data = hashfetch(msgid_hash, msgid, strlen(msgid));
+X	if ((fake_ap = (ARTICLE*)data.dat_ptr) == Nullart) {
+X	    if (!data.dat_len) {
+X		data.dat_len = article_num(article);
+X		hashstorelast(data);
+X		fake_had_subj = Nullsubj;
+X		return TRUE;
+X	    }
+X	    if (data.dat_len == article_num(article)) {
+X		fake_had_subj = Nullsubj;
+X		return TRUE;
+X	    }
+X	}
+X
+X	/* Whenever we replace a fake art with a real one, it's a lot of work
+X	** cleaning up the references.  Fortunately, this is not often. */
+X	if (fake_ap) {
+X	    article->parent = fake_ap->parent;
+X	    article->child1 = fake_ap->child1;
+X	    article->sibling = fake_ap->sibling;
+X	    fake_had_subj = fake_ap->subj;
+X	    if (fake_ap->flags & AF_AUTOFLAGS) {
+X		article->flags |= fake_ap->flags & AF_AUTOFLAGS;
+X		localkf_changes = 2;
+X	    }
+X	    if (curr_artp == fake_ap) {
+X		curr_artp = article;
+X		curr_art = article_num(article);
+X	    }
+X	    if (recent_artp == fake_ap) {
+X		recent_artp = article;
+X		recent_art = article_num(article);
+X	    }
+X	    if ((ap = article->parent) != Nullart) {
+X		if (ap->child1 == fake_ap)
+X		    ap->child1 = article;
+X		else {
+X		    ap = ap->child1;
+X		    goto sibling_search;
+X		}
+X	    } else if (fake_had_subj) {
+X		register SUBJECT *sp = fake_had_subj;
+X		if ((ap = sp->thread) == fake_ap) {
+X		    do {
+X			sp->thread = article;
+X			sp = sp->thread_link;
+X		    } while (sp != fake_had_subj);
+X		} else {
+X		  sibling_search:
+X		    while (ap->sibling) {
+X			if (ap->sibling == fake_ap) {
+X			    ap->sibling = article;
+X			    break;
+X			}
+X			ap = ap->sibling;
+X		    }
+X		}
+X	    }
+X	    for (ap = article->child1; ap; ap = ap->sibling)
+X		ap->parent = article;
+X	    clear_article(fake_ap);
+X	    free((char*)fake_ap);
+X	    data.dat_ptr = Nullch;
+X	    data.dat_len = article_num(article);
+X	    hashstorelast(data);
+X	    return TRUE;
+X	}
+X    }
+X    /* Forget about the duplicate message-id or bogus article. */
+X    uncache_article(article,TRUE);
+X    return FALSE;
+X}
+X
+X/* Take a message-id and see if we already know about it.  If so, return
+X** the article, otherwise create a fake one.
+X*/
+XARTICLE *
+Xget_article(msgid)
+Xchar *msgid;
+X{
+X    register ARTICLE *article;
+X    HASHDATUM data;
+X
+X    fix_msgid(msgid);
+X
+X    data = hashfetch(msgid_hash, msgid, strlen(msgid));
+X    if (!(article = (ARTICLE *)data.dat_ptr)) {
+X	if (data.dat_len)
+X	    article = article_ptr(data.dat_len);
+X	else {
+X	    article = allocate_article(0);
+X	    data.dat_ptr = (char*)article;
+X	    article->msgid = savestr(msgid);
+X	    hashstorelast(data);
+X	}
+X    }
+X    return article;
+X}
+X
+X/* Take all the data we've accumulated about the article and shove it into
+X** the article tree at the best place we can deduce.
+X*/
+Xvoid
+Xthread_article(article)
+XARTICLE *article;
+X{
+X    register ARTICLE *ap, *last;
+X    register char *cp, *end;
+X    ARTICLE *kill_ap = ((article->flags & AF_AUTOKILL)? article : Nullart);
+X    int select_this_art = article->flags
+X	| (article->subj->articles? article->subj->articles->flags : 0);
+X
+X    /* We're definitely not a fake anymore */
+X    article->flags = (article->flags & ~AF_FAKE) | AF_THREADED;
+X
+X    /* If the article was already part of an existing thread, unlink it
+X    ** to try to put it in the best possible spot.
+X    */
+X    if (fake_had_subj) {
+X	if (fake_had_subj->thread != article->subj->thread) {
+X	    fake_had_subj->flags &= ~SF_THREAD;
+X	    merge_threads(fake_had_subj, article->subj);
+X	}
+X	/* Check for a real or shared-fake parent */
+X	ap = article->parent;
+X	while (ap && (ap->flags&AF_FAKE) == AF_FAKE && !ap->child1->sibling)
+X	    ap = ap->parent;
+X	unlink_child(article);
+X	if (ap) {			/* do we have decent parents? */
+X	    /* Yes: assume that our references are ok, and just reorder us
+X	    ** with our siblings by date.
+X	    */
+X	    link_child(article);
+X	    /* Freshen the date & subject in any faked parent articles. */
+X	    for (ap = article->parent;
+X		 ap && (ap->flags&AF_FAKE)==AF_FAKE && article->date < ap->date;
+X		 ap = ap->parent)
+X	    {
+X		ap->date = article->date;
+X		ap->subj = article->subj;
+X		unlink_child(ap);
+X		link_child(ap);
+X	    }
+X	    goto exit;
+X	}
+X	/* We'll assume that this article has as good or better references
+X	** than the child that faked us initially.  Free the fake reference-
+X	** chain and process our references as usual.
+X	*/
+X	for (ap = article->parent; ap; ap = last) {
+X	    unlink_child(ap);
+X	    last = ap->parent;
+X	    ap->date = 0;
+X	    ap->subj = 0;
+X	    ap->parent = 0;
+X	    /* don't free it until group exit since we probably re-use it */
+X	}
+X	article->parent = Nullart;		/* neaten up */
+X	article->sibling = Nullart;
+X    }
+X
+X    /* If we have references, process them from the right end one at a time
+X    ** until we either run into somebody, or we run out of references.
+X    */
+X    if (*references) {
+X	last = article;
+X	ap = Nullart;
+X	end = references + strlen(references) - 1;
+X	while ((cp = rindex(references, '<')) != Nullch) {
+X	    while (end >= cp && ((unsigned char)*end <= ' ' || *end == ',')) {
+X		end--;
+X	    }
+X	    end[1] = '\0';
+X	    /* Quit parsing references if this one is garbage. */
+X	    if (!(end = valid_message_id(cp, end)))
+X		break;
+X	    /* Dump all domains that end in '.', such as "..." & "1@DEL." */
+X	    if (end[-1] == '.')
+X		break;
+X	    ap = get_article(cp);
+X	    *cp = '\0';
+X	    select_this_art |= ap->flags;
+X	    if (ap->flags & AF_AUTOKILL)
+X		kill_ap = ap;
+X
+X	    /* Check for duplicates on the reference line.  Brand-new data has
+X	    ** no date.  Data we just allocated earlier on this line has a
+X	    ** date but no subj.  Special-case the article itself, since it
+X	    ** does have a subj.
+X	    */
+X	    if ((ap->date && !ap->subj) || ap == article) {
+X		if ((ap = last) == article)
+X		    ap = Nullart;
+X		continue;
+X	    }
+X	    last->parent = ap;
+X	    link_child(last);
+X	    if (ap->subj)
+X		break;
+X
+X	    ap->date = article->date;
+X	    last = ap;
+X	    end = cp-1;
+X	}
+X	if (!ap)
+X	    goto no_references;
+X
+X	/* Check if we ran into anybody that was already linked.  If so, we
+X	** just use their thread.
+X	*/
+X	if (ap->subj) {
+X	    /* See if this article spans the gap between what we thought
+X	    ** were two different threads.
+X	    */
+X	    if (article->subj->thread != ap->subj->thread)
+X		merge_threads(ap->subj, article->subj);
+X	} else {
+X	    /* We didn't find anybody we knew, so either create a new thread
+X	    ** or use the article's thread if it was previously faked.
+X	    */
+X	    ap->subj = article->subj;
+X	    link_child(ap);
+X	}
+X	/* Set the subj of faked articles we created as references. */
+X	for (ap = article->parent; ap && !ap->subj; ap = ap->parent)
+X	    ap->subj = article->subj;
+X
+X	/* Make sure we didn't circularly link to a child article(!), by
+X	** ensuring that we run off the top before we run into ourself.
+X	*/
+X	while (ap && ap->parent != article)
+X	    ap = ap->parent;
+X	if (ap) {
+X	    /* Ugh.  Someone's tweaked reference line with an incorrect
+X	    ** article-order arrived first, and one of our children is
+X	    ** really one of our ancestors. Cut off the bogus child branch
+X	    ** right where we are and link it to the thread.
+X	    */
+X	    unlink_child(ap);
+X	    ap->parent = Nullart;
+X	    link_child(ap);
+X	}
+X    } else {
+X      no_references:
+X	/* The article has no references.  Either turn it into a new thread
+X	** or re-attach the fleshed-out article to its old thread.
+X	*/
+X	link_child(article);
+X    }
+Xexit:
+X    if (!(article->flags & AF_CACHED))
+X	cache_article(article);
+X    if (select_this_art & AF_AUTOSELECTALL) {
+X	if (sel_mode == SM_THREAD)
+X	    select_thread(article->subj->thread, AF_AUTOSELECTALL);
+X	else
+X	    select_subject(article->subj, AF_AUTOSELECTALL);
+X    } else if (select_this_art & AF_AUTOSELECT)
+X	select_subthread(article, AF_AUTOSELECT);
+X    if (kill_ap)
+X	kill_subthread(kill_ap, KF_ALL|KF_KILLFILE);
+X}
+X
+X/* Check if the string we've found looks like a valid message-id reference.
+X*/
+Xstatic char *
+Xvalid_message_id(start, end)
+Xregister char *start, *end;
+X{
+X    char *mid;
+X
+X    if (start == end)
+X	return 0;
+X
+X    if (*end != '>') {
+X	/* Compensate for space cadets who include the header in their
+X	** subsitution of all '>'s into another citation character.
+X	*/
+X	if (*end == '<' || *end == '-' || *end == '!' || *end == '%'
+X	 || *end == ')' || *end == '|' || *end == ':' || *end == '}'
+X	 || *end == '*' || *end == '+' || *end == '#' || *end == ']'
+X	 || *end == '@' || *end == '$') {
+X	    *end = '>';
+X	}
+X    } else if (end[-1] == '>') {
+X	*(end--) = '\0';
+X    }
+X    /* Id must be "<...@...>" */
+X    if (*start != '<' || *end != '>' || (mid = index(start, '@')) == Nullch
+X     || mid == start+1 || mid+1 == end) {
+X	return 0;
+X    }
+X    return end;
+X}
+X
+X/* Remove an article from its parent/siblings.  Leave parent pointer intact.
+X*/
+Xstatic void
+Xunlink_child(child)
+Xregister ARTICLE *child;
+X{
+X    register ARTICLE *last;
+X
+X    if (!(last = child->parent)) {
+X	register SUBJECT *sp = child->subj;
+X	if ((last = sp->thread) == child) {
+X	    do {
+X		sp->thread = child->sibling;
+X		sp = sp->thread_link;
+X	    } while (sp != child->subj);
+X	} else
+X	    goto sibling_search;
+X    } else {
+X	if (last->child1 == child)
+X	    last->child1 = child->sibling;
+X	else {
+X	    last = last->child1;
+X	  sibling_search:
+X	    while (last->sibling != child)
+X		last = last->sibling;
+X	    last->sibling = child->sibling;
+X	}
+X    }
+X}
+X
+X/* Link an article to its parent article.  If its parent pointer is zero,
+X** link it to its thread.  Sorts siblings by date.
+X*/
+Xstatic void
+Xlink_child(child)
+Xregister ARTICLE *child;
+X{
+X    register ARTICLE *ap;
+X
+X    if (!(ap = child->parent)) {
+X	register SUBJECT *sp = child->subj;
+X	ap = sp->thread;
+X	if (!ap || child->date < ap->date) {
+X	    do {
+X		sp->thread = child;
+X		sp = sp->thread_link;
+X	    } while (sp != child->subj);
+X	    child->sibling = ap;
+X	} else
+X	    goto sibling_search;
+X    } else {
+X	ap = ap->child1;
+X	if (!ap || child->date < ap->date) {
+X	    child->sibling = ap;
+X	    child->parent->child1 = child;
+X	} else {
+X	  sibling_search:
+X	    while (ap->sibling && ap->sibling->date <= child->date)
+X		ap = ap->sibling;
+X	    child->sibling = ap->sibling;
+X	    ap->sibling = child;
+X	}
+X    }
+X}
+X
+X/* Merge all of s2's thread into s1's thread.
+X*/
+Xstatic void
+Xmerge_threads(s1, s2)
+XSUBJECT *s1, *s2;
+X{
+X    register SUBJECT *sp;
+X    register ARTICLE *t1, *t2;
+X    int visit_flag;
+X
+X    t1 = s1->thread;
+X    t2 = s2->thread;
+X    t1->subj->flags &= ~SF_THREAD;
+X    if (sel_mode == SM_THREAD)
+X	visit_flag = (t1->subj->flags | (t2? t2->subj->flags : 0)) & SF_VISIT;
+X    else
+X	visit_flag = 0;
+X    /* Change all of t2's thread pointers to a common lead article */
+X    sp = s2;
+X    do {
+X	sp->thread = t1;
+X	sp->flags &= ~SF_THREAD;
+X	sp = sp->thread_link;
+X    } while (sp != s2);
+X
+X    /* Join the two circular lists together */
+X    sp = s2->thread_link;
+X    s2->thread_link = s1->thread_link;
+X    s1->thread_link = sp;
+X
+X    /* Link each article that was attached to t2 to t1. */
+X    for (t1 = t2; t1; t1 = t2) {
+X	t2 = t2->sibling;
+X	link_child(t1);      /* parent is null, thread is newly set */
+X    }
+X    s1->thread->subj->flags |= SF_THREAD | visit_flag;
+X}
+END_OF_FILE
+if test 12898 -ne `wc -c <'rt-process.c'`; then
+    echo shar: \"'rt-process.c'\" unpacked with wrong size!
+fi
+# end of 'rt-process.c'
+fi
+if test -f 'unship.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'unship.c'\"
+else
+echo shar: Extracting \"'unship.c'\" \(11878 characters\)
+sed "s/^X//" >'unship.c' <<'END_OF_FILE'
+X/* unship.c -- for unpacking ship files via trn */
+X/* Based on ship.c -- Not copyrighted 1991 Mark Adler. */
+X/* Modified by Wayne Davison, but still not copyrighted. */
+X
+X/* The authors make no claims as to the fitness or correctness of this software
+X * for any use whatsoever, and it is provided as is. Any use of this software
+X * is at the user's own risk. 
+X */
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "respond.h"
+X#include "decode.h"
+X
+Xtypedef unsigned long ulg;	/* 32-bit unsigned integer */
+X
+X/* Function prototypes */
+X
+Xstatic void decode_line _((unsigned char *));
+Xstatic void err _((int));
+X
+X/* Globals for ship() */
+Xulg ccnt;		/* count of bytes read or written */
+Xulg crc;		/* CRC register */
+Xulg buf4;		/* four byte buffer */
+Xint bcnt;		/* buffer count */
+X
+Xunsigned int decb;	/* bit buffer for decode */
+Xunsigned int decn;	/* number of bits in decb */
+X
+Xbool fast;		/* true for arithmetic coding, else base 85 */
+Xbool overwrite = 1;	/* should we overwrite existing files? */
+X
+X/* Errors */
+X#define SE_FORM 1
+X#define SE_CONT 2
+X#define SE_CRC 3
+X#define SE_OVER 4
+X#define SE_FULL 5
+Xchar *errors[] = {
+X  /* 1 */ "Invalid ship format.",
+X  /* 2 */ "This piece is out of sequence.",
+X  /* 3 */ "CRC check failed.",
+X  /* 4 */ "File already exists.",
+X  /* 5 */ "Error writing file.",
+X};
+X
+X/* Set of 86 characters used for the base 85 digits (last one not used), and
+X   the 86 character arithmetic coding.	Selected to be part of both the ASCII
+X   printable characters, and the common EBCDIC printable characters whose
+X   ASCII translations are universal. */
+Xunsigned char safe[] = {
+X	'{','"','#','$','%','&','\'','(',')','*','+',',','-','.','/',
+X	'0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?','@',
+X	'A','B','C','D','E','F','G','H','I','J','K','L','M',
+X	'N','O','P','Q','R','S','T','U','V','W','X','Y','Z','_',
+X	'a','b','c','d','e','f','g','h','i','j','k','l','m',
+X	'n','o','p','q','r','s','t','u','v','w','x','y','z','}'};
+X
+X#define LOWSZ (sizeof(safe)-64)		/* low set size for fast coding */
+X
+X/* Special replacement pairs--if first of each pair is received, it is
+X   treated like the second member of the pair.	You're probably
+X   wondering why.  The first pair is for compatibility with an
+X   earlier version of ship that used ! for the base 85 zero digit.
+X   However, there exist ASCII-EBCDIC translation tables that don't
+X   know about exclamation marks.  The second set has mysterious
+X   historical origins that are best left unspoken ... */
+Xunsigned char aliases[] = {'!','{','|','+',0};
+X
+X/* Inverse of safe[], filled in by unship_init() */
+Xunsigned char invsafe[256];
+X
+X/* Table of CRC-32's of all single byte values (made by makecrc.c) */
+Xulg crctab[] = {
+X  0x00000000L, 0x77073096L, 0xee0e612cL, 0x990951baL, 0x076dc419L,
+X  0x706af48fL, 0xe963a535L, 0x9e6495a3L, 0x0edb8832L, 0x79dcb8a4L,
+X  0xe0d5e91eL, 0x97d2d988L, 0x09b64c2bL, 0x7eb17cbdL, 0xe7b82d07L,
+X  0x90bf1d91L, 0x1db71064L, 0x6ab020f2L, 0xf3b97148L, 0x84be41deL,
+X  0x1adad47dL, 0x6ddde4ebL, 0xf4d4b551L, 0x83d385c7L, 0x136c9856L,
+X  0x646ba8c0L, 0xfd62f97aL, 0x8a65c9ecL, 0x14015c4fL, 0x63066cd9L,
+X  0xfa0f3d63L, 0x8d080df5L, 0x3b6e20c8L, 0x4c69105eL, 0xd56041e4L,
+X  0xa2677172L, 0x3c03e4d1L, 0x4b04d447L, 0xd20d85fdL, 0xa50ab56bL,
+X  0x35b5a8faL, 0x42b2986cL, 0xdbbbc9d6L, 0xacbcf940L, 0x32d86ce3L,
+X  0x45df5c75L, 0xdcd60dcfL, 0xabd13d59L, 0x26d930acL, 0x51de003aL,
+X  0xc8d75180L, 0xbfd06116L, 0x21b4f4b5L, 0x56b3c423L, 0xcfba9599L,
+X  0xb8bda50fL, 0x2802b89eL, 0x5f058808L, 0xc60cd9b2L, 0xb10be924L,
+X  0x2f6f7c87L, 0x58684c11L, 0xc1611dabL, 0xb6662d3dL, 0x76dc4190L,
+X  0x01db7106L, 0x98d220bcL, 0xefd5102aL, 0x71b18589L, 0x06b6b51fL,
+X  0x9fbfe4a5L, 0xe8b8d433L, 0x7807c9a2L, 0x0f00f934L, 0x9609a88eL,
+X  0xe10e9818L, 0x7f6a0dbbL, 0x086d3d2dL, 0x91646c97L, 0xe6635c01L,
+X  0x6b6b51f4L, 0x1c6c6162L, 0x856530d8L, 0xf262004eL, 0x6c0695edL,
+X  0x1b01a57bL, 0x8208f4c1L, 0xf50fc457L, 0x65b0d9c6L, 0x12b7e950L,
+X  0x8bbeb8eaL, 0xfcb9887cL, 0x62dd1ddfL, 0x15da2d49L, 0x8cd37cf3L,
+X  0xfbd44c65L, 0x4db26158L, 0x3ab551ceL, 0xa3bc0074L, 0xd4bb30e2L,
+X  0x4adfa541L, 0x3dd895d7L, 0xa4d1c46dL, 0xd3d6f4fbL, 0x4369e96aL,
+X  0x346ed9fcL, 0xad678846L, 0xda60b8d0L, 0x44042d73L, 0x33031de5L,
+X  0xaa0a4c5fL, 0xdd0d7cc9L, 0x5005713cL, 0x270241aaL, 0xbe0b1010L,
+X  0xc90c2086L, 0x5768b525L, 0x206f85b3L, 0xb966d409L, 0xce61e49fL,
+X  0x5edef90eL, 0x29d9c998L, 0xb0d09822L, 0xc7d7a8b4L, 0x59b33d17L,
+X  0x2eb40d81L, 0xb7bd5c3bL, 0xc0ba6cadL, 0xedb88320L, 0x9abfb3b6L,
+X  0x03b6e20cL, 0x74b1d29aL, 0xead54739L, 0x9dd277afL, 0x04db2615L,
+X  0x73dc1683L, 0xe3630b12L, 0x94643b84L, 0x0d6d6a3eL, 0x7a6a5aa8L,
+X  0xe40ecf0bL, 0x9309ff9dL, 0x0a00ae27L, 0x7d079eb1L, 0xf00f9344L,
+X  0x8708a3d2L, 0x1e01f268L, 0x6906c2feL, 0xf762575dL, 0x806567cbL,
+X  0x196c3671L, 0x6e6b06e7L, 0xfed41b76L, 0x89d32be0L, 0x10da7a5aL,
+X  0x67dd4accL, 0xf9b9df6fL, 0x8ebeeff9L, 0x17b7be43L, 0x60b08ed5L,
+X  0xd6d6a3e8L, 0xa1d1937eL, 0x38d8c2c4L, 0x4fdff252L, 0xd1bb67f1L,
+X  0xa6bc5767L, 0x3fb506ddL, 0x48b2364bL, 0xd80d2bdaL, 0xaf0a1b4cL,
+X  0x36034af6L, 0x41047a60L, 0xdf60efc3L, 0xa867df55L, 0x316e8eefL,
+X  0x4669be79L, 0xcb61b38cL, 0xbc66831aL, 0x256fd2a0L, 0x5268e236L,
+X  0xcc0c7795L, 0xbb0b4703L, 0x220216b9L, 0x5505262fL, 0xc5ba3bbeL,
+X  0xb2bd0b28L, 0x2bb45a92L, 0x5cb36a04L, 0xc2d7ffa7L, 0xb5d0cf31L,
+X  0x2cd99e8bL, 0x5bdeae1dL, 0x9b64c2b0L, 0xec63f226L, 0x756aa39cL,
+X  0x026d930aL, 0x9c0906a9L, 0xeb0e363fL, 0x72076785L, 0x05005713L,
+X  0x95bf4a82L, 0xe2b87a14L, 0x7bb12baeL, 0x0cb61b38L, 0x92d28e9bL,
+X  0xe5d5be0dL, 0x7cdcefb7L, 0x0bdbdf21L, 0x86d3d2d4L, 0xf1d4e242L,
+X  0x68ddb3f8L, 0x1fda836eL, 0x81be16cdL, 0xf6b9265bL, 0x6fb077e1L,
+X  0x18b74777L, 0x88085ae6L, 0xff0f6a70L, 0x66063bcaL, 0x11010b5cL,
+X  0x8f659effL, 0xf862ae69L, 0x616bffd3L, 0x166ccf45L, 0xa00ae278L,
+X  0xd70dd2eeL, 0x4e048354L, 0x3903b3c2L, 0xa7672661L, 0xd06016f7L,
+X  0x4969474dL, 0x3e6e77dbL, 0xaed16a4aL, 0xd9d65adcL, 0x40df0b66L,
+X  0x37d83bf0L, 0xa9bcae53L, 0xdebb9ec5L, 0x47b2cf7fL, 0x30b5ffe9L,
+X  0xbdbdf21cL, 0xcabac28aL, 0x53b39330L, 0x24b4a3a6L, 0xbad03605L,
+X  0xcdd70693L, 0x54de5729L, 0x23d967bfL, 0xb3667a2eL, 0xc4614ab8L,
+X  0x5d681b02L, 0x2a6f2b94L, 0xb40bbe37L, 0xc30c8ea1L, 0x5a05df1bL,
+X  0x2d02ef8dL
+X};
+X
+X/* Macro to update the CRC shift register one byte at a time */
+X#define CRC(c,b) (crctab[((int)(c)^(int)(b))&0xff]^((c)>>8))
+X
+X/* cputc(d,x)--like putc(d,f), but delays four bytes and computes a CRC.
+X   x is a cfile *, and d is expected to be an ulg. */
+X#define cputf(fp) (int)(crc=CRC(crc,buf4),putc((int)buf4&0xff,fp),ccnt++)
+X#define cputc(d,fp) (bcnt!=4?bcnt++:cputf(fp),buf4=(buf4>>8)+((ulg)(d)<<24))
+X
+X/* Build invsafe[], the inverse of safe[]. */
+Xvoid
+Xunship_init()
+X{
+X  int i;
+X
+X  for (i = 0; i < 256; i++)
+X    invsafe[i] = 127;
+X  for (i = 0; i < sizeof(safe); i++)
+X    invsafe[safe[i]] = (char)i;
+X  for (i = 0; aliases[i]; i += 2)
+X    invsafe[aliases[i]] = invsafe[aliases[i + 1]];
+X}
+X
+Xint
+Xunship(in)
+XFILE *in;
+X{
+X  int b;		/* state of line loop */
+X  char l[LBUFLEN];	/* line buffer on input */
+X  char *p;		/* modifies line buffer */
+X  char *q;		/* scans continuation line */
+X
+X  /* Loop on the latest article's lines */
+X  b = 2;				/* not in body yet */
+X  while (1)				/* return on end of last file */
+X  {
+X    /* Get next line from file */
+X    if (fgets(l, LBUFLEN, in) == Nullch)
+X      break;
+X
+X    /* Strip control characters and leading blank space, if any */
+X    for (q = l; *q && *q <= ' ' && *q != '\n'; q++)
+X      ;
+X    for (p = l; *q; q++)
+X      if (*q >= ' ' || *q == '\n')
+X	*p++ = *q;
+X    *p = 0;
+X
+X    /* Based on current state, end or start on terminator.  States are:
+X	 b == 0:  at start of body or body terminator line
+X	 b == 1:  in middle of body line
+X	 b == 2:  at start of non-body line
+X	 b == 3:  in middle of non-body line
+X	 b == 4:  at information line
+X    */
+X    switch (b)
+X    {
+X    case 0:
+X      if ((!fast && strEQ(l, "$\n")) ||
+X	  (fast && strEQ(l, "$ f\n")))
+X      {
+X	b = 4;
+X	break;
+X      }
+X      /* fall through to case 1 */
+X    case 1:
+X      decode_line((unsigned char *)l);
+X      b = l[strlen(l) - 1] != '\n';
+X      break;
+X    case 2:
+X      if (strEQ(l, "$\n") || strEQ(l, "$ f\n"))
+X      {
+X	fast = l[1] == ' ';
+X	b = 4;
+X	break;
+X      }
+X      /* fall through to case 3 */
+X    case 3:
+X      b = l[strlen(l)-1] == '\n' ? 2 : 3;
+X      break;
+X    case 4:
+X      /* Possible information lines are ship, more, cont, and end */
+X      if (l[b = strlen(l) - 1] != '\n')
+X      {
+X	err(SE_FORM);
+X	decode_end();
+X	return -1;
+X      }
+X      l[b] = 0;
+X      if (strnEQ(l, "ship ", 5))
+X      {
+X	/* get name, open new output file */
+X	if (decode_fp != Nullfp)
+X	  decode_end();			/* outputs an "incomplete" warning */
+X	if (strEQ(l + 5, "-"))
+X	  strcpy(decode_fname, "unnamed");
+X	else
+X	  strcpy(decode_fname, l + 5);
+X	sprintf(decode_dest, "%s/%s", extractdest, decode_fname);
+X	printf("Decoding: %s\n", decode_fname);
+X#ifndef VMS	/* shouldn't have explicit version #, so VMS won't overwrite */
+X	if (!overwrite && (decode_fp = fopen(decode_dest, "r")) != Nullfp)
+X	{
+X	  fclose(decode_fp);
+X	  decode_fp = Nullfp;
+X	  err(SE_OVER);
+X	  return -1;
+X	}
+X#endif /* !VMS */
+X	if ((decode_fp = fopen(decode_dest, FOPEN_WB)) == Nullfp)
+X	{
+X	  err(SE_FULL);
+X	  return -1;
+X	}
+X	crc = 0xffffffffL;		/* preload CRC register */
+X	buf4 = 0;			/* empty fifo (for output) */
+X	bcnt = 0;			/* fifo is empty (output) */
+X	b = decb = decn = 0;
+X	ccnt = 0;
+X      }
+X      else if (strEQ(l, "more"))
+X      {
+X	/* check if currently writing */
+X	if (decode_fp == Nullfp)
+X	{
+X	  err(SE_FORM);
+X	  return -1;
+X	}
+X	b = 2;
+X      }
+X      else if (strnEQ(l, "cont ", 5))
+X      {
+X	/* check name and file offset */
+X	if (decode_fp == Nullfp)
+X	{
+X	  err(SE_CONT);
+X	  return -1;
+X	}
+X	for (q = l + 5; *q && *q != ' '; q++)
+X	  ;
+X	if (*q == 0 || atol(l + 5) != ccnt + 4 + (decn != 0) ||
+X	    strNE(q + 1, decode_fname))
+X	{
+X	  err(SE_CONT);
+X	  return -1;
+X	}
+X	b = 0;
+X      }
+X      else if (strcmp(l, "end") == 0)
+X      {
+X	/* check crc, close output file */
+X	if (decode_fp == Nullfp)
+X	{
+X	  err(SE_FORM);
+X	  return -1;
+X	}
+X	if (bcnt != 4 || buf4 != ~crc)
+X	  err(SE_CRC);
+X	else
+X	  printf("CRC verified -- Done.\n");
+X	if (ferror(decode_fp) || fclose(decode_fp))
+X	{
+X	  err(SE_FULL);
+X	  decode_end();
+X	  return -1;
+X	}
+X	decode_fp = Nullfp;
+X	b = 2;
+X      }
+X      else
+X      {
+X	for (q = l; *q && *q != ' '; q++)
+X	  ;
+X	*q = 0;
+X	printf("Ignoring unsupported ship keyword: '%s'\n", l);
+X	b = 4;
+X      }
+X      break;
+X    }
+X  }
+X  if (!(b & 2)) {
+X    err(SE_FORM);
+X    return -1;
+X  }
+X  if (decode_fp)
+X    printf("(Continued)\n");
+X  return 0;
+X}
+X
+X/* Decode s, a string of base 85 digits or, if fast is true, a string of safe
+X   characters generated arithmetically, into its binary equivalent, writing
+X   the result to decode_fp, using cputc(). */
+Xstatic void
+Xdecode_line(s)
+Xunsigned char *s;	/* data to decode */
+X{
+X  int b;		/* state of line loop, next character */
+X  int k;		/* counts bits or digits read */
+X  /* powers of 85 table for decoding */
+X  static ulg m[] = {1L,85L,85L*85L,85L*85L*85L,85L*85L*85L*85L};
+X
+X  if (fast)
+X  {
+X    unsigned int d;	/* disperses bits */
+X
+X    d = decb;
+X    k = decn;
+X    while ((b = *s++) != 0)
+X      if ((b = invsafe[b]) < sizeof(safe))
+X      {
+X	if (b < LOWSZ)
+X	{
+X	  d |= b << k;
+X	  k += 7;
+X	}
+X	else if ((b -= LOWSZ) < LOWSZ)
+X	{
+X	  d |= (b + 0x40) << k;
+X	  k += 7;
+X	}
+X	else
+X	{
+X	  d |= b << k;
+X	  k += 6;
+X	}
+X	if (k >= 8)
+X	{
+X	  cputc(d, decode_fp);
+X	  d >>= 8;
+X	  k -= 8;
+X	}
+X      }
+X    decb = d;
+X    decn = k;
+X  }
+X  else
+X  {
+X    ulg d;		/* disperses bytes */
+X
+X    d = k = 0;
+X    while ((b = *s++) != 0)
+X      if ((b = invsafe[b]) < 85)
+X      {
+X	d += m[k] * b;
+X	if (++k == 5)
+X	{
+X	  cputc(d, decode_fp);  d >>= 8;
+X	  cputc(d, decode_fp);  d >>= 8;
+X	  cputc(d, decode_fp);  d >>= 8;
+X	  cputc(d, decode_fp);
+X	  d = k = 0;
+X	}
+X      }
+X    if (--k > 0)
+X    {
+X      while (--k)
+X      {
+X	cputc(d, decode_fp);
+X	d >>= 8;
+X      }
+X      cputc(d, decode_fp);
+X    }
+X  }
+X}
+X
+Xstatic void
+Xerr(n)
+Xint n;			/* error number */
+X{
+X  if (n == SE_FULL)
+X    perror("ship");
+X  fputs(errors[n - 1], stdout);
+X  putchar('\n') FLUSH;
+X}
+END_OF_FILE
+if test 11878 -ne `wc -c <'unship.c'`; then
+    echo shar: \"'unship.c'\" unpacked with wrong size!
+fi
+# end of 'unship.c'
+fi
+if test -f 'util.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'util.c'\"
+else
+echo shar: Extracting \"'util.c'\" \(10707 characters\)
+sed "s/^X//" >'util.c' <<'END_OF_FILE'
+X/* $Id: util.c,v 3.0 1992/02/23 21:25:39 davison Trn $
+X */
+X/* This software is Copyright 1991 by Stan Barber. 
+X *
+X * Permission is hereby granted to copy, reproduce, redistribute or otherwise
+X * use this software as long as: there is no monetary profit gained
+X * specifically from the use or reproduction of this software, it is not
+X * sold, rented, traded or otherwise marketed, and this copyright notice is
+X * included prominently in any copy made. 
+X *
+X * The authors make no claims as to the fitness or correctness of this software
+X * for any use whatsoever, and it is provided as is. Any use of this software
+X * is at the user's own risk. 
+X */
+X
+X#include "EXTERN.h"
+X#include "common.h"
+X#include "final.h"
+X#include "term.h"
+X#include "INTERN.h"
+X#include "util.h"
+X
+Xvoid
+Xutil_init()
+X{
+X    ;
+X}
+X    
+X/* fork and exec a shell command */
+X
+Xint
+Xdoshell(shl,s)
+Xchar *s, *shl;
+X{
+X    int status, pid, w;
+X    char *shell;
+X
+X#ifdef SIGTSTP
+X    sigset(SIGTSTP,SIG_DFL);
+X    sigset(SIGTTOU,SIG_DFL);
+X    sigset(SIGTTIN,SIG_DFL);
+X#endif
+X    if (shl != Nullch)
+X	shell = shl;
+X    else if ((shell = getenv("SHELL")) == Nullch || !*shell)
+X	shell = PREFSHELL;
+X    if ((pid = vfork()) == 0) {
+X#ifdef USE_NNTP
+X        int i;
+X
+X	/* This is necessary to keep bourne shell from puking */
+X
+X        for (i = 3; i < 10; ++i)
+X                close(i);
+X#endif /* USE_NNTP */
+X
+X	if (*s)
+X	    execl(shell, shell, "-c", s, Nullch);
+X	else
+X	    execl(shell, shell, Nullch, Nullch, Nullch);
+X	_exit(127);
+X    }
+X    signal(SIGINT, SIG_IGN);
+X#ifdef SIGQUIT
+X    signal(SIGQUIT, SIG_IGN);
+X#endif 
+X    termlib_reset();
+X    waiting = TRUE;
+X    while ((w = wait(&status)) != pid)
+X	if (w == -1 && errno != EINTR)
+X	    break;
+X    if (w == -1)
+X	status = -1;
+X    termlib_init();
+X    waiting = FALSE;
+X    sigset(SIGINT, int_catcher);	/* always catch interrupts */
+X#ifdef SIGQUIT
+X    signal(SIGQUIT, SIG_DFL);
+X#endif 
+X#ifdef SIGTSTP
+X    sigset(SIGTSTP,stop_catcher);
+X    sigset(SIGTTOU,stop_catcher);
+X    sigset(SIGTTIN,stop_catcher);
+X#endif
+X    return status;
+X}
+X
+Xstatic char nomem[] = "trn: out of memory!\n";
+X
+X/* paranoid version of malloc */
+X
+Xchar *
+Xsafemalloc(size)
+XMEM_SIZE size;
+X{
+X    char *ptr;
+X
+X    ptr = malloc(size ? size : (MEM_SIZE)1);
+X    if (ptr == Nullch) {
+X	fputs(nomem,stdout) FLUSH;
+X	sig_catcher(0);
+X    }
+X    return ptr;
+X}
+X
+X/* paranoid version of realloc.  If where is NULL, call malloc */
+X
+Xchar *
+Xsaferealloc(where,size)
+Xchar *where;
+XMEM_SIZE size;
+X{
+X    char *ptr;
+X
+X    if (!where)
+X	ptr = malloc(size ? size : (MEM_SIZE)1);
+X    else
+X	ptr = realloc(where, size ? size : (MEM_SIZE)1);
+X    if (!ptr) {
+X	fputs(nomem,stdout) FLUSH;
+X	sig_catcher(0);
+X    }
+X    return ptr;
+X}
+X
+X/* safe version of string copy */
+X
+Xchar *
+Xsafecpy(to,from,len)
+Xchar *to;
+Xregister char *from;
+Xregister int len;
+X{
+X    register char *dest = to;
+X
+X    if (from != Nullch) 
+X	for (len--; len && (*dest++ = *from++); len--) ;
+X    *dest = '\0';
+X    return to;
+X}
+X
+X/* safe version of string concatenate, with \n deletion and space padding */
+X
+Xchar *
+Xsafecat(to,from,len)
+Xchar *to;
+Xregister char *from;
+Xregister int len;
+X{
+X    register char *dest = to;
+X
+X    len--;				/* leave room for null */
+X    if (*dest) {
+X	while (len && *dest++) len--;
+X	if (len) {
+X	    len--;
+X	    *(dest-1) = ' ';
+X	}
+X    }
+X    if (from != Nullch)
+X	while (len && (*dest++ = *from++)) len--;
+X    if (len)
+X	dest--;
+X    if (*(dest-1) == '\n')
+X	dest--;
+X    *dest = '\0';
+X    return to;
+X}
+X
+X/* copy a string up to some (non-backslashed) delimiter, if any */
+X
+Xchar *
+Xcpytill(to,from,delim)
+Xregister char *to, *from;
+Xregister int delim;
+X{
+X    for (; *from; from++,to++) {
+X	if (*from == '\\' && from[1] == delim)
+X	    from++;
+X	else if (*from == delim)
+X	    break;
+X	*to = *from;
+X    }
+X    *to = '\0';
+X    return from;
+X}
+X
+X/* return ptr to little string in big string, NULL if not found */
+X
+Xchar *
+Xinstr(big, little, case_matters)
+Xchar *big, *little;
+Xbool_int case_matters;
+X{
+X    register char *t, *s, *x;
+X
+X    for (t = big; *t; t++) {
+X	for (x=t,s=little; *s; x++,s++) {
+X	    if (!*x)
+X		return Nullch;
+X	    if (case_matters == TRUE) {
+X		if(*s != *x)
+X		    break;
+X	    } else {
+X		register char c,d;
+X		if (isupper(*s)) 
+X		    c = tolower(*s);
+X		else
+X		    c = *s;
+X		if (isupper(*x)) 
+X		    d = tolower(*x);
+X		else
+X		    d = *x;
+X		if ( c != d )
+X		    break;
+X	   }
+X	}
+X	if (!*s)
+X	    return t;
+X    }
+X    return Nullch;
+X}
+X
+X/* effective access */
+X
+X#ifdef SETUIDGID
+Xint
+Xeaccess(filename, mod)
+Xchar *filename;
+Xint mod;
+X{
+X    int protection, euid;
+X    
+X    mod &= 7;				/* remove extraneous garbage */
+X    if (stat(filename, &filestat) < 0)
+X	return -1;
+X    euid = geteuid();
+X    if (euid == ROOTID)
+X	return 0;
+X    protection = 7 & (filestat.st_mode >>
+X      (filestat.st_uid == euid ? 6 :
+X        (filestat.st_gid == getegid() ? 3 : 0)
+X      ));
+X    if ((mod & protection) == mod)
+X	return 0;
+X    errno = EACCES;
+X    return -1;
+X}
+X#endif
+X
+X/*
+X * Get working directory
+X */
+X#ifndef HAS_GETWD
+X#ifdef HAS_GETCWD
+Xchar *
+Xgetwd(np)
+Xchar *np;
+X{
+X    char *ret;
+X    extern char *getcwd();
+X
+X    if ((ret = getcwd(np,512)) == Nullch) {
+X	printf("Cannot determine current working directory!\n") FLUSH;
+X	finalize(1);
+X    }
+X    return ret;
+X}
+X#else
+Xchar *
+Xgetwd(np)
+Xchar *np;
+X{
+X    FILE *popen();
+X    FILE *pipefp;
+X
+X    if ((pipefp = popen("/bin/pwd","r")) == Nullfp) {
+X	printf("Can't run /bin/pwd\n") FLUSH;
+X	finalize(1);
+X    }
+X    fgets(np,512,pipefp);
+X    np[strlen(np)-1] = '\0';	/* wipe out newline */
+X    if (pclose(pipefp) == EOF) {
+X	printf("Failed to run /bin/pwd\n") FLUSH;
+X	finalize(1);
+X    }
+X    return np;
+X}
+X#endif
+X#endif
+X
+X/* just like fgets but will make bigger buffer as necessary */
+X
+Xchar *
+Xget_a_line(original_buffer,buffer_length,fp)
+Xchar *original_buffer;
+Xregister int buffer_length;
+XFILE *fp;
+X{
+X    register int bufix = 0;
+X    register int nextch;
+X    register char *some_buffer_or_other = original_buffer;
+X
+X    do {
+X	if (bufix >= buffer_length) {
+X	    buffer_length *= 2;
+X	    if (some_buffer_or_other == original_buffer) {
+X					/* currently static? */
+X		some_buffer_or_other = safemalloc((MEM_SIZE)buffer_length+1);
+X		strncpy(some_buffer_or_other,original_buffer,buffer_length/2);
+X					/* so we must copy it */
+X	    }
+X	    else {			/* just grow in place, if possible */
+X		some_buffer_or_other = saferealloc(some_buffer_or_other,
+X		    (MEM_SIZE)buffer_length+1);
+X	    }
+X	}
+X	if ((nextch = getc(fp)) == EOF)
+X	    return Nullch;
+X	some_buffer_or_other[bufix++] = (char) nextch;
+X    } while (nextch && nextch != '\n');
+X    some_buffer_or_other[bufix] = '\0';
+X    len_last_line_got = bufix;
+X    buflen_last_line_got = buffer_length;
+X    return some_buffer_or_other;
+X}
+X
+X/* copy a string to a safe spot */
+X
+Xchar *
+Xsavestr(str)
+Xchar *str;
+X{
+X    register char *newaddr = safemalloc((MEM_SIZE)(strlen(str)+1));
+X
+X    strcpy(newaddr,str);
+X    return newaddr;
+X}
+X
+Xint
+Xmakedir(dirname,nametype)
+Xregister char *dirname;
+Xint nametype;
+X{
+X#ifdef MAKEDIR
+X    register char *end;
+X    register char *s;
+X    char tmpbuf[1024];
+X    register char *tbptr = tmpbuf+5;
+X
+X    for (end = dirname; *end; end++) ;	/* find the end */
+X    if (nametype == MD_FILE) {		/* not to create last component? */
+X	for (--end; end != dirname && *end != '/'; --end) ;
+X	if (*end != '/')
+X	    return 0;			/* nothing to make */
+X	*end = '\0';			/* isolate file name */
+X    }
+X    strcpy(tmpbuf,"mkdir");
+X
+X    s = end;
+X    for (;;) {
+X	if (stat(dirname,&filestat) >= 0 && (filestat.st_mode & S_IFDIR)) {
+X					/* does this much exist as a dir? */
+X	    *s = '/';			/* mark this as existing */
+X	    break;
+X	}
+X	s = rindex(dirname,'/');	/* shorten name */
+X	if (!s)				/* relative path! */
+X	    break;			/* hope they know what they are doing */
+X	*s = '\0';			/* mark as not existing */
+X    }
+X    
+X    for (s=dirname; s <= end; s++) {	/* this is grody but efficient */
+X	if (!*s) {			/* something to make? */
+X	    sprintf(tbptr," %s",dirname);
+X	    tbptr += strlen(tbptr);	/* make it, sort of */
+X	    *s = '/';			/* mark it made */
+X	}
+X    }
+X    if (nametype == MD_DIR)		/* don't need final slash unless */
+X	*end = '\0';			/*  a filename follows the dir name */
+X
+X    return (tbptr==tmpbuf+5 ? 0 : doshell(sh,tmpbuf));
+X					/* exercise our faith */
+X#else
+X    sprintf(cmd_buf,"%s %s %d", filexp(DIRMAKER), dirname, nametype);
+X    return doshell(sh,cmd_buf);
+X#endif
+X}
+X
+X#ifdef SETENV
+Xstatic bool firstexport = TRUE;
+Xextern char **environ;
+X
+Xvoid
+Xexport(nam,val)
+Xchar *nam, *val;
+X{
+X    register int i=envix(nam);		/* where does it go? */
+X
+X    if (!environ[i]) {			/* does not exist yet */
+X	if (firstexport) {		/* need we copy environment? */
+X	    int j;
+X#ifndef lint
+X	    char **tmpenv = (char**)	/* point our wand at memory */
+X		safemalloc((MEM_SIZE) (i+2) * sizeof(char*));
+X#else
+X	    char **tmpenv = Null(char **);
+X#endif /* lint */
+X    
+X	    firstexport = FALSE;
+X	    for (j=0; j<i; j++)		/* copy environment */
+X		tmpenv[j] = environ[j];
+X	    environ = tmpenv;		/* tell exec where it is now */
+X	}
+X#ifndef lint
+X	else
+X	    environ = (char**) saferealloc((char*) environ,
+X		(MEM_SIZE) (i+2) * sizeof(char*));
+X					/* just expand it a bit */
+X#endif /* lint */
+X	environ[i+1] = Nullch;	/* make sure it's null terminated */
+X    }
+X    environ[i] = safemalloc((MEM_SIZE) strlen(nam) + strlen(val) + 2);
+X					/* this may or may not be in */
+X					/* the old environ structure */
+X    sprintf(environ[i],"%s=%s",nam,val);/* all that work just for this */
+X}
+X
+Xint
+Xenvix(nam)
+Xchar *nam;
+X{
+X    register int i, len = strlen(nam);
+X
+X    for (i = 0; environ[i]; i++) {
+X	if (strnEQ(environ[i],nam,len) && environ[i][len] == '=')
+X	    break;			/* strnEQ must come first to avoid */
+X    }					/* potential SEGV's */
+X    return i;
+X}
+X#endif
+X
+Xvoid
+Xnotincl(feature)
+Xchar *feature;
+X{
+X    printf("\nNo room for feature \"%s\" on this machine.\n",feature) FLUSH;
+X}
+X
+Xchar *
+Xgetval(nam,def)
+Xchar *nam,*def;
+X{
+X    char *val;
+X
+X    if ((val = getenv(nam)) == Nullch || !*val)
+X	val = def;
+X    return val;
+X}
+X
+X/* grow a static string to at least a certain length */
+X
+Xvoid
+Xgrowstr(strptr,curlen,newlen)
+Xchar **strptr;
+Xint *curlen;
+Xint newlen;
+X{
+X    if (newlen > *curlen) {		/* need more room? */
+X	if (*curlen)
+X	    *strptr = saferealloc(*strptr,(MEM_SIZE)newlen);
+X	else
+X	    *strptr = safemalloc((MEM_SIZE)newlen);
+X	*curlen = newlen;
+X    }
+X}
+X
+Xvoid
+Xsetdef(buffer,dflt)
+Xchar *buffer,*dflt;
+X{
+X#ifdef STRICTCR
+X    if (*buffer == ' ')
+X#else
+X    if (*buffer == ' ' || *buffer == '\n')
+X#endif
+X    {
+X	if (*dflt == '^' && isupper(dflt[1]))
+X	    *buffer = Ctl(dflt[1]);
+X	else
+X	    *buffer = *dflt;
+X	lastchar = *buffer;
+X    }
+X}
+X
+Xvoid
+Xsafelink(old, new)
+Xchar *old, *new;
+X{
+X#if 0
+X    extern int sys_nerr;
+X    extern char *sys_errlist[];
+X#endif
+X
+X    if (link(old,new)) {
+X	printf("Can't link backup (%s) to .newsrc (%s)\n", old, new) FLUSH;
+X#if 0
+X	if (errno>0 && errno<sys_nerr)
+X	    printf("%s\n", sys_errlist[errno]);
+X#endif
+X	finalize(1);
+X    }
+X}
+END_OF_FILE
+if test 10707 -ne `wc -c <'util.c'`; then
+    echo shar: \"'util.c'\" unpacked with wrong size!
+fi
+# end of 'util.c'
+fi
+echo shar: End of archive 4 \(of 12\).
+cp /dev/null ark4isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 12 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

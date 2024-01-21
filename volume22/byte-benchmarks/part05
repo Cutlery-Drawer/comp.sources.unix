@@ -1,0 +1,875 @@
+Subject:  v22i032:  Byte Unix benchmarks, Part05/05
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: c5a9c6a9 eb24bf40 7bab71c5 9e371ee8
+
+Submitted-by: "Ben Smith @ BYTE" <ben@bytepb.byte.com>
+Posting-number: Volume 22, Issue 32
+Archive-name: byte-benchmarks/part05
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 5 (of 5)."
+# Contents:  dbmscli.c
+# Wrapped by rsalz@papaya.bbn.com on Tue May  8 08:55:34 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'dbmscli.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'dbmscli.c'\"
+else
+echo shar: Extracting \"'dbmscli.c'\" \(19728 characters\)
+sed "s/^X//" >'dbmscli.c' <<'END_OF_FILE'
+X
+X/*******************************************************************************
+X *  The BYTE UNIX Benchmarks - Release 2
+X *          Module: dbmscli.c   SID: 2.4 4/17/90 16:45:36
+X *          
+X *******************************************************************************
+X * Bug reports, patches, comments, suggestions should be sent to:
+X *
+X *	Ben Smith or Rick Grehan at BYTE Magazine
+X *	bensmith@bixpb.UUCP    rick_g@bixpb.UUCP
+X *
+X *****************************************************************************
+X *  Modification Log:
+X *
+X *	7/6/89 - Reworked messaging system so the semaphores were no
+X *	longer used in all cases.  Semaphores now only control the append
+X *	operation.  Messages contain caller's pid in type field.
+X *	The semaphore also serves to indicate the presence of the server. RG
+X *	 
+X *	7/6/89 - added some debugging output to VERBOSE
+X *	7/9/89 - ifdef code that starts server from client - problems. BSS
+X *	7/11/89 - Added semaphore to set.  One semaphore controls the queue,
+X *	the other controls the append operation. RG
+X *      New command line format: dbmserv <filename> <queue size>
+X *****************************************************************************/
+X/*
+X * Multi-user DBMS simulation.
+X * Clients
+X * Database has the form:
+X * IIIINNNNNNNNNNNNNNNNNNNNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPPPPPPPPPP
+X * Where IIII is the 4-digit id number (0-padded)
+X *       NN... is the 20-character name
+X *       AA... is the 40-character address
+X *       PP... is the 10-character phone number
+X * Records are accessed by ID number (1 is the 0th record, 2 is 1st..etc.)
+X *
+X * This is the client system, which you execute with:
+X *      dbmscli n t i
+X * where:
+X *      n = the number of tasks to fork
+X *      t = is the sleep time in seconds each task waits between requests
+X *      i = is the number of test iterations
+X *
+X * NOTE: This version assumes Unix V compatibility.
+X */
+Xchar id[] = "@(#) @(#)dbmscli.c:1.5 -- 7/10/89 18:54:57";
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X#include <errno.h>
+X#include <sys/types.h>
+X#include <sys/signal.h>
+X#include <sys/ipc.h>
+X#include <sys/sem.h>
+X#include <sys/msg.h>
+X#include <sys/param.h>
+X
+X#ifdef VERBOSE
+X#include <sys/times.h>
+X#define DEBUG	/* remove this after debugging */
+X#endif
+X
+X#define ERROR	(-1)
+X/*
+X** Record definitions.
+X*/
+X
+X#define IDLEN 4
+X#define NAMELEN 20
+X#define ADDRLEN 40
+X#define PHONLEN 10
+X#define RECLEN  74	/* Sum of the above. */
+X
+X/*
+X** Queue and semaphore names.
+X*/
+X#define	RQUEUE	"READ"		/* Read queue */
+X#define WQUEUE	"WRIT"		/* Write queue */
+X#define SEMA	"SEMA"		/* Semaphore name */
+X
+X/*
+X** Message types.
+X*/
+X#define READREQ	1		/* Read a record */
+X#define WRITEREQ 2		/* Write a record */
+X#define ADDREQ 3		/* Add a new record */
+X#define GETLREQ 4		/* Get largest record number */
+X#define RESULTREQ 10		/* Record contains results figures */
+X				/* Results are stored as:
+X				*  nnnnnnnnnnbmmmmmmmmmmb
+X				*   n = total time
+X				*   m = number of errors
+X				*   b = blank
+X				*/
+X#define DIEREQ 99		/* Orders server to terminate. */
+X
+X
+X/*
+X** Return codes from the server.
+X*/
+X#define AOK 1			/* Request met ok */
+X#define DERR_RNF 2		/* Record not found */
+X#define DERR_RAE 3		/* Record already exists */
+X#define DERR_WRD 4		/* Unexplainable error */
+X#define DERR_UNK 9		/* Unknown request type */
+X
+X/*
+X** Error codes.
+X*/
+X#define QERR 1			/* Queue error */
+X#define SEMERR 2		/* Semaphore error */
+X
+X/*
+X** Structures.
+X*/
+X
+Xtypedef struct {
+X	char id[IDLEN];
+X	char name[NAMELEN];
+X	char address[ADDRLEN];
+X	char phone[PHONLEN];
+X} dbrec;
+X
+Xtypedef struct {
+X	int request;		/* Request type and response code */
+X	char recdat[RECLEN];	/* DBMS record data */
+X} msgdata;
+X
+Xtypedef struct {
+X	long type;		/* Hold's caller's pid */
+X	msgdata data;		/* Pointer to request and data */
+X} amess;
+X
+Xstruct ticker { unsigned long real,
+X		       system,
+X		       cpu; };
+X
+X/******************************************************************
+X	  ####   #        ####   #####     ##    #        ####
+X	 #    #  #       #    #  #    #   #  #   #       #
+X	 #       #       #    #  #####   #    #  #        ####
+X	 #  ###  #       #    #  #    #  ######  #            #
+X	 #    #  #       #    #  #    #  #    #  #       #    #
+X	  ####   ######   ####   #####   #    #  ######   ####
+X*******************************************************************/
+X/*
+X** Structure instances.
+X*/
+Xdbrec myrec;		/* Data record */
+Xamess myreq;		/* Client request */
+Xamess hisresp;		/* Response from server */
+X
+Xstruct sembuf unlockq = { 0 , 1 , SEM_UNDO };
+Xstruct sembuf lockq = { 0 , -1 , SEM_UNDO };
+Xstruct sembuf unlocka = { 0, 1, SEM_UNDO };
+Xstruct sembuf locka = { 0, -1, SEM_UNDO };
+X
+X#ifdef VERBOSE
+Xstruct tms tbuff;	/* For times system call */
+Xstruct ticker stopwatch = {0L, 0L, 0L};
+Xstruct ticker tottime = {0L, 0L, 0L};
+X#endif
+X
+Xint ntasks = 1;			/* Number of tasks */
+Xint sleeptime = 0;		/* Time to sleep */
+Xint iters = 1000;		/* iterations */
+Xint readq;			/* ID of read queue */
+Xint writeq;			/* ID of write queue */
+Xint qsema;			/* ID of semaphore for append */
+Xunsigned long errcnt;		/* Error count */
+Xint waitval;			/* Status return location for wait() */
+Xint rid;			/* ID chosen at random */
+Xint need_server; 			/* flag for server */
+Xkey_t sema_key;
+X
+X/*
+X**  Externs and function defs.
+X*/
+Xlong randnum(), randwc();
+Xkey_t makey();
+X
+X/**************************************************************************
+X		 #    #    ##       #    #    #
+X		 ##  ##   #  #      #    ##   #
+X		 # ## #  #    #     #    # #  #
+X		 #    #  ######     #    #  # #
+X		 #    #  #    #     #    #   ##
+X		 #    #  #    #     #    #    #
+X****************************************************************************/
+Xmain(argc,argv,envp)
+Xint argc;
+Xchar *argv[];
+Xchar **envp;
+X{
+X
+X	int i,j,cerr;		/* Loop variables */
+X
+X	/*
+X	* Make sure we have proper input.
+X	*/
+X	if(argc<2)
+X	{
+X	fprintf(stderr,
+X	  "usage: %s datafile [ntasks] [sleeptime] [iter]\n",argv[0]);
+X	exit(1);
+X	}
+X
+X	/************* process command line parameters ************/
+X	/*
+X	* Get number of tasks and sleeptime.
+X	*/
+X	if(argc==5)
+X		{
+X		if((iters=atoi(argv[4]))<=0)
+X
+X			{
+X			fprintf(stderr,"**Illegal iter\n");
+X			exit(1);
+X			}
+X		}
+X
+X	if(argc >=4)
+X	{
+X		if((sleeptime=atoi(argv[3]))<0)
+X			{
+X			fprintf(stderr,"**Illegal sleep time\n");
+X			exit(1);
+X			}
+X	}
+X
+X	if(argc >=3)
+X		{
+X		if((ntasks=atoi(argv[2]))<=0)
+X			{
+X			fprintf(stderr,"**Illegal ntasks\n");
+X			exit(1);
+X			}
+X		}
+X	
+X	/* argv[1] is the data file name */
+X
+X	/*
+X	* Make sure the server is active.
+X	*/
+X
+X        sema_key=makey(SEMA);
+X	/* test to see if the server is already running */
+X	if((qsema=semget(sema_key,2,0))==ERROR)
+X		{
+X		int bad_news();
+X
+X		/* fork off for an exec to the server */
+X		if(!(j=fork())) /* this is the child aspiring to be */
+X			{	/* a server */
+X#ifdef DEBUG
+X			printf("I am the child (%d) aspiring to be a server\nn",
+X			   getpid());
+X#endif
+X			argv[0]="dbmserv";
+X			execvp(argv[0],argv);
+X			/* if it gets this far, exec must have failed */
+X			perror("exec of dbmserv failed");
+X			exit(1);
+X			}
+X		/* better not do anything until the server
+X		 * is running. Just wait for the server,
+X		 * in this case a child process, gives us
+X		 * signal to proceed.
+X		 */
+X		signal(SIGALRM,bad_news);
+X		alarm(30); /* give the server 30 seconds to get it going */
+X		while ((qsema=semget(sema_key,1,0))==ERROR)
+X			{
+X#ifdef DEBUG
+X			printf("waiting for server\n");
+X#endif
+X			sleep(1);
+X			}
+X
+X                }	
+X
+X	/* get the message queue ids */
+X	if((readq=msgget(makey(RQUEUE),0))==ERROR)
+X		{
+X		qerror("Client getting read queue id");
+X		exit(1);
+X		}
+X#ifdef DEBUG
+X	else
+X		printf("read queue id is %d\n",readq);
+X#endif
+X	if((writeq=msgget(makey(WQUEUE),0))==ERROR)
+X		{
+X		qerror("Client getting write queue id");
+X		exit(1);
+X		}
+X#ifdef DEBUG
+X	else
+X		printf("write queue id is %d\n",readq);
+X#endif
+X	/*
+X	* Now fork off a bunch of processes, giving each
+X	* one a different starting seed.
+X	* (if fork() returns zero, this is already the child.
+X	*/
+X	i=ntasks;
+X	do {
+X		j=fork();
+X	} while((j!=0)&&(--i!=0));
+X
+X	/*
+X	* Am I a child or a father?
+X	*/
+X	if( j==0)
+X	{
+X#ifdef DEBUG
+X	printf("I am child client %d\n",getpid());
+X#endif
+X		/* ***Child process*** */
+X		if((cerr=dotests(i,iters))!=0)
+X		{
+X		fprintf(stderr,"**Child error:\n");
+X		switch(cerr)
+X		   {
+X		   case(QERR):
+X			qerror("    Error is");
+X			break;
+X		   case(SEMERR):
+X			serror("    Error is");
+X			break;
+X		   default:
+X			perror("    Error is");
+X			break;
+X		   }
+X		exit(1);	/* If any error - just die. */
+X		}
+X		else
+X		{
+X		clearrec(myreq.data.recdat);
+X#ifdef VERBOSE
+X		/*
+X		** Log net elapsed time.
+X		*/
+X		   sprintf(myreq.data.recdat,"%#010ld %#010ld %#010ld %#010d ",
+X			tottime.cpu,tottime.system,tottime.real,errcnt);
+X#else
+X		   sprintf(myreq.data.recdat,"%#010d ", errcnt);
+X#endif
+X		   myreq.type=RESULTREQ;
+X		   if(semop(qsema,&lockq,1) == ERROR) exit(0);
+X		   if(msgsnd(writeq,&myreq,RECLEN,0)<0)
+X			exit(0);
+X		   if(semop(qsema,&unlockq,1) == ERROR) exit(0);
+X
+X		exit(0);
+X		}
+X	}
+X	else
+X	{
+X#ifdef DEBUG
+X	printf("I am parent client %d\n",getpid());
+X#endif
+X		/* ***Father process*** */
+X		/*
+X		** Wait for the children to complete.
+X		*/
+X		i=ntasks;
+X		while(i--) wait(&waitval);
+X
+X		/*
+X		** Now tell the server to go away.
+X		** Note that if we have trouble (for some reason)
+X		** getting the semaphore...we just barrel on through.
+X		*/
+X		myreq.data.request=DIEREQ;
+X		myreq.type=1L; /* Pid not needed */
+X		if(msgsnd(writeq,&myreq,RECLEN,0)<0)
+X			qerror("**Message queue error during termination\n");
+X		exit(0);
+X	}
+X}
+X
+X/********************************* dotests *************************
+X** Execute tests.
+X** Input number acts as seed for random number generator.
+X** Returns -1 if failure.
+X********************************************************************/
+Xint
+Xdotests(sseed,iter)
+Xint sseed;
+Xint iter;			/* Number of iterations */
+X{
+X
+X	int i,j;		/* Loop variables */
+X	int maxid;		/* Max ID currently in database */
+X	long mypid;		/* Get my process id */
+X
+X	/*
+X	** Initialize the random number seed.
+X	*/
+X	randnum((unsigned long)sseed);
+X
+X	/*
+X	** Initialize error count and timer stuff.
+X	*/
+X	errcnt=0;
+X
+X	/*
+X	** I need to know my process id.
+X	*/
+X	mypid = (long)getpid();
+X
+X	/*
+X	** Find out what the maximum id in the database
+X	** is.
+X	*/
+X	myreq.data.request=GETLREQ;
+X	myreq.type=mypid;
+X#ifdef DEBUG
+X printf("About to send 1st transmission\n");
+X#endif
+X	if(semop(qsema,&lockq,1)==ERROR) return(SEMERR);
+X	if(msgsnd(writeq,&myreq,RECLEN,0)<0) return(QERR);
+X	if(msgrcv(readq,&hisresp,RECLEN,mypid,MSG_NOERROR)<0) return(QERR);
+X	if(semop(qsema,&unlockq,1)==ERROR) return(SEMERR);
+X#ifdef DEBUG
+X printf("maxid string  = %s\n",hisresp.data.recdat);
+X#endif
+X	maxid=atoi(hisresp.data.recdat);
+X#ifdef DEBUG
+X printf("maxid = %d\n",maxid);
+X#endif
+X
+X	/*
+X	** Now loop through the tests iter times.
+X	*/
+X	for(i=0;i<iter;i++)
+X	{
+X#ifdef DEBUG
+X printf("In outer loop of client\n");
+X#endif
+X		/* Do 4 reads */
+X		for(j=0;j<4;j++)
+X		{
+X#ifdef DEBUG
+X printf("In inner loop of client\n");
+X#endif
+X			rid=(int)randwc(maxid)+1;
+X			clearrec(myreq.data.recdat);
+X			sprintf(myreq.data.recdat,"%#04d",rid);
+X			myreq.data.request=READREQ;
+X
+X#ifdef VERBOSE
+X			/* Turn on timer */
+X			stopwatch.real = times(&tbuff);
+X			stopwatch.system = tbuff.tms_stime;
+X			stopwatch.cpu = tbuff.tms_utime;
+X#endif
+X#ifdef DEBUG
+X			printf("About to read\n");
+X#endif
+X
+X			if(semop(qsema,&lockq,1)==ERROR) return(SEMERR);
+X			if(msgsnd(writeq,&myreq,RECLEN,0)<0)
+X				return(QERR);
+X			if(msgrcv(readq,&hisresp,RECLEN,mypid,MSG_NOERROR)<0)
+X				return(QERR);
+X			if(semop(qsema,&unlockq,1)==ERROR) return(SEMERR);
+X
+X
+X#ifdef VERBOSE
+X			/* Turn off timer */
+X			tottime.real += times(&tbuff)-stopwatch.real;
+X			tottime.system += tbuff.tms_stime-stopwatch.system;
+X			tottime.cpu += tbuff.tms_utime-stopwatch.cpu;
+X
+X#endif
+X			/* Did we get what we should? */
+X			errcnt+=verify();
+X		}
+X
+X		/* Do 1 write */
+X		rid=(int)randwc(maxid)+1;
+X		clearrec(myreq.data.recdat);
+X		sprintf(myreq.data.recdat,"%#04d",rid);
+X		loadrec((rid-1)%10);
+X		strncpy(myreq.data.recdat+4,myrec.name,RECLEN-4);
+X		myreq.data.request=WRITEREQ;
+X
+X#ifdef VERBOSE
+X		/* Turn on timer */
+X		stopwatch.real = times(&tbuff);
+X		stopwatch.system = tbuff.tms_stime;
+X		stopwatch.cpu = tbuff.tms_utime;
+X#endif
+X
+X		if(semop(qsema,&lockq,1)==ERROR) return(SEMERR);
+X		if(msgsnd(writeq,&myreq,RECLEN,0)<0)
+X			return(QERR);
+X		if(msgrcv(readq,&hisresp,RECLEN,mypid,MSG_NOERROR)<0)
+X			return(QERR);
+X		if(semop(qsema,&unlockq,1)==ERROR) return(SEMERR);
+X#ifdef DEBUG
+X		printf("Message recieved\n");
+X#endif
+X
+X#ifdef VERBOSE
+X		/* Turn off timer */
+X		tottime.real += times(&tbuff)-stopwatch.real;
+X		tottime.system += tbuff.tms_stime-stopwatch.system;
+X		tottime.cpu += tbuff.tms_utime-stopwatch.cpu;
+X#endif
+X
+X		if(hisresp.data.request!=(long)AOK) errcnt++;
+X		/* Sleep a little */
+X		if(sleeptime) sleep(sleeptime);
+X
+X		/* Do an append every 10 times through the loop */
+X		if((i%10)==0)
+X		{
+X		myreq.data.request=GETLREQ;
+X
+X#ifdef VERBOSE
+X		/* Turn on timer */
+X		stopwatch.real = times(&tbuff);
+X		stopwatch.system = tbuff.tms_stime;
+X		stopwatch.cpu = tbuff.tms_utime;
+X#endif
+X		if(semop(qsema,&locka,1)==ERROR) return(SEMERR);
+X		if(semop(qsema,&lockq,1)==ERROR) return(SEMERR);
+X		if(msgsnd(writeq,&myreq,RECLEN,0)<0) return(QERR);
+X		if(msgrcv(readq,&hisresp,RECLEN,mypid,MSG_NOERROR)<0)
+X		  return(QERR);
+X		if(semop(qsema,&unlockq,1)==ERROR) return(SEMERR);
+X
+X#ifdef VERBOSE
+X		/* Turn off timer */
+X		tottime.real += times(&tbuff)-stopwatch.real;
+X		tottime.system += tbuff.tms_stime-stopwatch.system;
+X		tottime.cpu += tbuff.tms_utime-stopwatch.cpu;
+X#endif
+X
+X		maxid=atoi(hisresp.data.recdat);
+X		rid=(maxid+=1);
+X		clearrec(myreq.data.recdat);
+X		sprintf(myreq.data.recdat,"%#04d",rid);
+X		loadrec((rid-1)%10);
+X		strncpy(myreq.data.recdat+4,myrec.name,RECLEN-4);
+X		myreq.data.request=ADDREQ;
+X
+X#ifdef VERBOSE
+X		/* Turn on timer */
+X		stopwatch.real = times(&tbuff);
+X		stopwatch.system = tbuff.tms_stime;
+X		stopwatch.cpu = tbuff.tms_utime;
+X#endif
+X
+X		if(semop(qsema,&lockq,1)==ERROR) return(SEMERR);
+X		if(msgsnd(writeq,&myreq,RECLEN,0)<0) return(QERR);
+X		if(msgrcv(readq,&hisresp,RECLEN,mypid,MSG_NOERROR)<0)
+X		  return(QERR);
+X		if(semop(qsema,&unlockq,1)==ERROR) return(SEMERR);
+X		if(semop(qsema,&unlocka,1)==ERROR) return(SEMERR);
+X
+X#ifdef VERBOSE
+X		/* Turn off timer */
+X		tottime.real += times(&tbuff)-stopwatch.real;
+X		tottime.system += tbuff.tms_stime-stopwatch.system;
+X		tottime.cpu += tbuff.tms_utime-stopwatch.cpu;
+X#endif
+X
+X		if(hisresp.data.request!=(long)AOK) errcnt++;
+X
+X		/* Sleep a little */
+X		if(sleeptime) sleep(sleeptime);
+X
+X		}
+X	}
+X
+X	/*
+X	** All's well that ends well.
+X	*/
+X	return(0);
+X}
+X
+X/*
+X** verify
+X*/
+Xint verify()
+X{
+X	char buffr[80];
+X
+X	/* Is there response an error response? */
+X	if(hisresp.data.request!=(long)AOK)
+X	 return(1);
+X
+X	/* Was it the number we were looking for? */
+X	strncpy(buffr,hisresp.data.recdat,4);
+X	buffr[4]='\0';
+X	if(atoi(buffr)!=rid) 
+X	return(1);
+X
+X	/* Check the record number with its contents */
+X	loadrec((rid-1)%10);
+X
+X	if(strncmp(hisresp.data.recdat+4,myrec.name,RECLEN-4)!=0)
+X		return(1);
+X
+X	/* Looks good */
+X	return(0);
+X}
+X
+X
+X/*
+X** Clear a record
+X*/
+Xclearrec(rptr)
+Xchar *rptr;
+X{
+X	int i;
+X
+X	for(i=0;i<RECLEN;++i)
+X		*rptr++='\0';
+X
+X 	return;
+X}
+X
+X/*
+X** Load the record up with random data.
+X*/
+Xloadrec(sel)
+Xint sel;		/* Select which fake record */
+X
+X{
+X
+X	char *nname;
+X	char *naddr;
+X	char *nphon;
+X
+X	switch(sel)
+X	{
+X	case 0:	nname="Tom Thompson        ";
+X		naddr="9401 Billy Willy Road                   ";
+X		nphon="3334442222";
+X		break;
+X	case 1: nname="Steve Apiki         ";
+X		naddr="50 Hawaii Way c/o Jack Lord             ";
+X		nphon="1234443333";
+X		break;
+X	case 2: nname="Stan Diehl          ";
+X		naddr="27 Hoptoad Hollow Way                   ";
+X		nphon="3332221111";
+X		break;
+X	case 3: nname="Judy Grehan         ";
+X		naddr="Suite 3, WallState Building             ";
+X		nphon="9995556666";
+X		break;
+X	case 4: nname="Aaron Richards      ";
+X		naddr="Highway 40 OverPass, Second Pylon       ";
+X		nphon="8883339999";
+X		break;
+X	case 5: nname="Benjamin Davidson   ";
+X		naddr="Under The Bridge, HeavyWater City       ";
+X		nphon="7773229988";
+X		break;
+X	case 6: nname="Dayle Woolston      ";
+X		naddr="4040 Pleasant Way, WICAT Central        ";
+X		nphon="2228332299";
+X		break;
+X	case 7: nname="Jim Carls           ";
+X		naddr="Big Oak Tree Behind Barsodie's          ";
+X		nphon="32244566657";
+X		break;
+X	case 8: nname="Steve Smith         ";
+X		naddr="7000 Aloth Cove                         ";
+X		nphon="2118332929";
+X		break;
+X	case 9: 
+X	default: nname="Blind Willy Chitlins";
+X		naddr="Unavailable Until Further Notice        ";
+X		nphon="3456789012";
+X		break;
+X	}
+X
+X	/*
+X	** Fill the structure with fake data.
+X	*/
+X	strncpy(myrec.name,nname,NAMELEN);
+X	strncpy(myrec.address,naddr,ADDRLEN);
+X	strncpy(myrec.phone,nphon,PHONLEN);
+X
+X	return;
+X}
+X
+X/*
+X** randwc(num)
+X** Returns random modulo num.
+X*/
+Xlong randwc(num)
+Xlong num;
+X{
+X	return(randnum(0L)%num);
+X}
+X
+X/*
+X** randnum(val)
+X** Second order linear congruential generator.
+X** Constants suggested by J. G. Skellam.
+X** If val==0, returns next member of sequence.
+X**    val!=0, "seeds" generator with val.
+X*/
+Xlong randnum(lngval)
+Xunsigned long lngval;
+X{
+X	register unsigned long interm;
+X	static unsigned long randw[2] = { 13 , 117 };
+X
+X	if (lngval!=0L) randw[1]=lngval;
+X
+X	interm=(randw[0]*254754L+randw[1]*529562L)%999563L;
+X	randw[1]=randw[0];
+X	randw[0]=interm;
+X	return(interm);
+X}
+X
+X/************************** makey ******************************
+X** Following routine converts an ASCII string to a key_t value.
+X** This routine originally appeared in ADVANCED PROGRAMMERS GUIDE
+X** TO UNIX SYSTEM V by R. Thomas, PHD; L. R. Rogers, and J. L. Yates.
+X** Osborne McGraw Hill.
+X*******************************************************************/
+Xkey_t
+Xmakey(p)
+Xchar *p;
+X{
+X	key_t keyv;
+X	int i;
+X
+X	if(isnumber(p))
+X		keyv = (key_t)atol(p);
+X	else
+X	{
+X		keyv=(key_t)0;
+X		for(i=0;i<sizeof(key_t) && p[i];i++)
+X			keyv=(keyv << 8) | p[i];
+X	}
+X	return(keyv);
+X}
+X
+X/***************************** isnumber *************************/
+Xint isnumber(p)
+Xchar *p;
+X{
+X	for( ; *p && isdigit(*p); p++) ;
+X	return(*p ? 0 : 1);
+X}
+X
+X/**************************** badnews **************************/
+Xint bad_news() /* things are screwed up */
+X{
+Xfprintf(stderr,"TIMED OUT\n");
+Xexit(1);
+X}
+X
+X/******************************** qerror **********************
+X ** prints out the errormessage associate with a queue
+X ***************************************************************/
+Xqerror(s)
+Xchar *s; /* message prefix string */
+X{
+Xextern int errno;
+X
+Xfprintf(stderr,"QUEUE ERROR: %s:\n     ",s);
+Xswitch(errno)
+X   {
+X   case EACCES: fprintf(stderr,
+X       "message queue exists, but locked out (EACCES)\n");
+X       break;
+X   case ENOENT: fprintf(stderr,
+X       "message queue does not exist (ENOENT)\n");
+X       break;
+X   case ENOSPC: fprintf(stderr,
+X       "too manny message queus (ENOSPC)\n");
+X       break;
+X   case EEXIST: fprintf(stderr,
+X       "message queue exists, but locked out (EEXIST)\n");
+X       break;
+X   default: fprintf(stderr,
+X       "unknown error (%n)",errno);
+X       break;
+X   }
+Xreturn(0);
+X}
+X
+X/******************************** serror **********************
+X ** prints out the errormessage associate with a semaphore
+X ***************************************************************/
+Xserror(s)
+Xchar *s; /* message prefix string */
+X{
+Xextern int errno;
+X
+Xfprintf(stderr,"SEMAPHORE ERROR: %s:\n     ",s);
+Xswitch(errno)
+X   {
+X   case EINVAL: fprintf(stderr,
+X       "invalid number of semaphore sets (EINVAL)\n");
+X       break;
+X   case EACCES: fprintf(stderr,
+X       "semaphore exists, but invalid operation (EACCES)\n");
+X       break;
+X   case ENOENT: fprintf(stderr,
+X       "semaphore does not exist (ENOENT)\n");
+X       break;
+X   case ENOSPC: fprintf(stderr,
+X       "too many semaphores (ENOSPC)\n");
+X       break;
+X   case EEXIST: fprintf(stderr,
+X       "semaphore exists, but locked out (EEXIST)\n");
+X       break;
+X   default: fprintf(stderr,
+X       "unknown error (%n)",errno);
+X       break;
+X   }
+Xreturn(0);
+X}
+END_OF_FILE
+if test 19728 -ne `wc -c <'dbmscli.c'`; then
+    echo shar: \"'dbmscli.c'\" unpacked with wrong size!
+fi
+chmod +x 'dbmscli.c'
+# end of 'dbmscli.c'
+fi
+echo shar: End of archive 5 \(of 5\).
+cp /dev/null ark5isdone
+MISSING=""
+for I in 1 2 3 4 5 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 5 archives.
+    rm -f ark[1-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0
+exit 0 # Just in case...

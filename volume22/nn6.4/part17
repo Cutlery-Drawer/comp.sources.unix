@@ -1,0 +1,2288 @@
+Subject:  v22i051:  NN Newsreader, release 6.4, Part17/21
+Newsgroups: comp.sources.unix
+Approved: rsalz@uunet.UU.NET
+X-Checksum-Snefru: 13586485 3298704d 4ddc70cc fbfacd67
+
+Submitted-by: "Kim F. Storm" <storm@texas.dk>
+Posting-number: Volume 22, Issue 51
+Archive-name: nn6.4/part17
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then feed it
+# into a shell via "sh file" or similar.  To overwrite existing files,
+# type "sh file -c".
+# The tool that generated this appeared in the comp.sources.unix newsgroup;
+# send mail to comp-sources-unix@uunet.uu.net if you want that tool.
+# Contents:  account.c articles.c config.h-dist decode.c digest.c
+# Wrapped by storm@texas.dk on Sun May  6 18:20:09 1990
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+echo If this archive is complete, you will see the following message:
+echo '          "shar: End of archive 17 (of 22)."'
+if test -f 'account.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'account.c'\"
+else
+  echo shar: Extracting \"'account.c'\" \(10252 characters\)
+  sed "s/^X//" >'account.c' <<'END_OF_FILE'
+X/*
+X *	(c) Copyright 1990, Kim Fabricius Storm.  All rights reserved.
+X *
+X *	Accounting for news reading.
+X *
+X *	The nnacct program is called by nn it three cases:
+X *
+X *	- on startup (-q) to check for permission to run nn (at this time)
+X *	- when the :cost command is executed (-cUSAGE -r) to
+X *	  produce a "cost sofar" report, and
+X *	- at exit (-uUSAGE -r) to add the USAGE to the user's account
+X *	  and print a "cost" report.
+X *
+X *	It can also be invoked by nnusage to print a usage and cost
+X *	report for the current user (default), or by the super user
+X *	to produce a usage and cost report for all users.
+X *
+X *	Accumulated accounting information is saved in the file $DB/acct.
+X *
+X *	If ACCTLOG is defined, a sequential log is maintained in $DB/acctlog.
+X *
+X *	You can define a COST_PER_MINUTE and a COST_UNIT to make
+X *	the user get a cost calculation (maybe just for the fun of it -
+X *	you can't imagine how expensive it is to read news here :-).
+X *
+X *	The COST_PER_MINUTE should be the price per minute multiplied
+X *	by 100 (to allow prices like $0.03/minute).
+X *	The definitions below corresponds to 1 Kroner per minute.
+X */
+X
+X#define ACCTLOG			/* */
+X#define COST_PER_MINUTE	100	/* price(in UNITs)/min * 100 */
+X#define COST_UNIT		"Kr."	/* Currency */
+X
+X#include "config.h"
+X#include "options.h"
+X#include "proto.h"
+X
+Ximport char *db_directory;
+X
+X
+X/*
+X * 	local authorization policy checking
+X *
+X *	return/exit values of policy_check (nnacct -P0) are:
+X *
+X *	0: access granted
+X *	1: access granted, but cannot post
+X *	2: access denied (not authorized)
+X *	3: access denied (not allowed at this time of day)
+X *	4: access denied (quota exceeded)
+X */
+X
+X#define DENY_ACCESS	0
+X#define FREE_ACCOUNT	1
+X#define ALL_HOURS	2
+X#define OFF_HOURS	3
+X
+X#define NO_POST		40	/* add if cannot post */
+X
+X/*
+X *	DEFAULT POLICY AND QUOTA FOR NEW USERS
+X *
+X *	Notice that QUOTA is measued in hours.
+X *	Both ACCOUNTING and AUTHORIZATION must be defined for
+X *	the quota mechanism to work.
+X */
+X
+X#define DEFAULT_POLICY 	ALL_HOURS	/* all time w/accounting */
+X#define DEFAULT_QUOTA 	0		/* unlimited use */
+X
+X#ifdef AUTHORIZE
+X
+X#include <time.h>
+X
+Xstatic holiday(tm)
+Xstruct tm *tm;
+X{
+X    if (tm->tm_mon == 3 && tm->tm_mday == 23) return 1;	/* my birthday */
+X    if (tm->tm_mon == 11 && tm->tm_mday == 25) return 1;	/* another birthday */
+X    /* ... */
+X    return 0;
+X}
+X
+Xstatic policy_check(policy)
+Xint policy;
+X{
+X    struct tm *tm, *localtime();
+X    time_t t;
+X    int no_post = 0;
+X
+X    if (policy >= NO_POST) {
+X	policy -= NO_POST;
+X	no_post = 1;
+X    }
+X    
+X    switch (policy % 10) {
+X     case DENY_ACCESS:
+X	return 2;
+X
+X     case ALL_HOURS:
+X     case FREE_ACCOUNT:
+X	break;
+X
+X     case OFF_HOURS:	/* adapt this to your local requirements */
+X	time(&t);
+X	tm = localtime(&t);
+X	if (tm->tm_wday == 0) break;	/* Sunday */
+X	if (tm->tm_wday == 6) break;	/* Saturday */
+X	if (tm->tm_hour < 9) break;	/* morning */
+X	if (tm->tm_hour > 16) break;	/* evening */
+X	if (holiday(tm)) break;		/* holidays */
+X	/* etc. */
+X	return 3;
+X
+X     default:
+X	return 2;
+X    }
+X
+X    return no_post;
+X}
+X
+X#endif
+X
+Xstatic int add_usage = -1;
+Xstatic int show_cost = -1;
+Xstatic int report = 0;
+Xstatic int report_all = 0;
+Xstatic int quiet = 0;
+Xstatic char *acct_file = NULL;
+Xstatic int ck_policy = -1;
+Xstatic int new_policy = -1;
+Xstatic int new_quota = -1;
+Xstatic int who_am_caller = I_AM_ACCT;
+X
+XOption_Description(acct_options) {
+X    'C', Int_Option(show_cost),
+X    'U', Int_Option(add_usage),
+X    'W', Int_Option(who_am_caller),
+X    'P', Int_Option(ck_policy),
+X    'a', Bool_Option(report_all),
+X    'f', String_Option(acct_file),
+X    'p', Int_Option(new_policy),
+X    'q', Int_Option(new_quota),
+X    'r', Bool_Option(report),
+X    'Q', Bool_Option(quiet),
+X    '\0',
+X};
+X
+X/*
+X *	Accounting information:
+X *
+X *	xxxxxxx 00000000 00000000 00 00000\n
+X *
+X *	login	time used last	 pol quota
+X *	name	(minutes) active icy (hours)
+X *
+X *	See the printf/scanf formats later on.
+X */
+X
+X
+X#define INPUT_FMT	"%s %ld %lx %d %d\n"
+X#define OUTPUT_FMT	"%s %08ld %08lx %02d %05d\n"
+X
+Xstruct account {
+X    off_t ac_offset;	/* offset in acct file */
+X    int ac_found;	/* present in acct file */
+X    
+X    char ac_user[24];	/* user name */
+X    
+X    long ac_total;	/* total usage */
+X    time_t ac_last;	/* last active */
+X    int ac_policy;	/* assigned policy */
+X    int ac_quota;	/* time quota */
+X};
+X
+Xstatic get_entry(acctf, user, ac)
+XFILE *acctf;
+Xchar *user;
+Xstruct account *ac;
+X{
+X    char line[100];
+X
+X    if (acctf != NULL && user != NULL) 
+X	rewind(acctf);
+X	
+X    ac->ac_found = 0;
+X
+X    for (;;) {
+X	ac->ac_policy = DEFAULT_POLICY;
+X	ac->ac_last = 0;
+X	ac->ac_total = 0;
+X	ac->ac_quota = DEFAULT_QUOTA;
+X	ac->ac_user[0] = NUL;
+X    
+X	if (acctf == NULL) break;
+X	
+X	ac->ac_offset = ftell(acctf);
+X
+X	if (fgets(line, 100, acctf) == NULL) break;
+X
+X	sscanf(line, INPUT_FMT, 
+X		   ac->ac_user, &ac->ac_total, &ac->ac_last, 
+X		   &ac->ac_policy, &ac->ac_quota);
+X
+X	if (user == NULL) return 1;
+X
+X	if (strcmp(user, ac->ac_user) == 0) {
+X	    ac->ac_found = 1;
+X	    return 1;
+X	}
+X    }
+X
+X    if (user != NULL) strcpy(ac->ac_user, user);
+X    return 0;
+X}
+X
+Xput_entry(acctf, ac)
+XFILE *acctf;
+Xstruct account *ac;
+X{
+X    if (ac->ac_found)
+X	fseek(acctf, ac->ac_offset, 0);
+X    else
+X	fseek(acctf, (off_t)0, 2);
+X    
+X    fprintf(acctf, OUTPUT_FMT, 
+X	    ac->ac_user, ac->ac_total, ac->ac_last,
+X	    ac->ac_policy, ac->ac_quota);
+X}
+X
+Xstatic do_cost(ac, ses)
+Xstruct account *ac;
+Xint ses;
+X{
+X    long r;
+X    
+X#ifdef COST_PER_MINUTE
+X#ifndef COST_UNIT
+X#define COST_UNIT ""
+X#endif
+X    if (ses >= 0)
+X	printf("Cost this session: %ld %s   Period total:",
+X	       ((long)ses * COST_PER_MINUTE) / 100, COST_UNIT);
+X    printf("%6ld %s",
+X	   (ac->ac_total * COST_PER_MINUTE) / 100, COST_UNIT);
+X#endif
+X    if (ses >= 0 && ac->ac_quota > 0) {
+X	r = ac->ac_quota - ac->ac_total/60;
+X	printf("  Quota: %ld hour%s", r, plural(r));
+X    }
+X    fl;
+X}
+X
+Xstatic do_report(ac, hdr)
+Xstruct account *ac;
+Xint hdr;
+X{
+X    if (hdr) {
+X	printf("USER        USAGE  QUOTA  LAST_ACTIVE");
+X#ifdef COST_PER_MINUTE
+X	printf("   COST/PERIOD");
+X#endif
+X#ifdef AUTHORIZE
+X	printf("   POLICY");
+X#endif
+X	putchar(NL);
+X    }
+X
+X    printf("%-8.8s  %4ld.%02ld  %5d  %s  ",
+X	   ac->ac_user,
+X	   ac->ac_total/60, ac->ac_total%60,
+X	   ac->ac_quota,
+X	   ac->ac_last ? date_time(ac->ac_last) : "");
+X#ifdef COST_PER_MINUTE
+X    do_cost(ac, -1);
+X#endif
+X#ifdef AUTHORIZE
+X    printf("     %2d  ", ac->ac_policy);
+X#endif
+X    printf("\n");
+X}
+X
+Xstatic do_report_all(acctf)
+XFILE *acctf;
+X{
+X    struct account ac;
+X    int first = 1;
+X    
+X    while (get_entry(acctf, (char *)NULL, &ac)) {
+X	do_report(&ac, first);
+X	first = 0;
+X    }
+X}
+X
+X
+X
+Xmain(argc, argv)
+Xint argc;
+Xchar *argv[];
+X{
+X    char *caller, *getlogin();
+X    FILE *acctf;
+X    char *fname;
+X    int users, i;
+X    struct account ac, *actab;
+X    
+X    who_am_i = I_AM_ACCT;
+X
+X    init_global();
+X
+X    users = parse_options(argc, argv, (char *)NULL, acct_options, "");
+X
+X    if (user_id != 0) {
+X	if (report_all) {
+X	    fprintf(stderr, "Only root can request complete reports\n");
+X	    exit(9);
+X	}
+X	if (new_policy >= 0) {
+X	    fprintf(stderr, "Only root can change user authorization\n");
+X	    exit(9);
+X	}
+X	if (new_quota >= 0) {
+X	    fprintf(stderr, "Only root can change user quotas\n");
+X	    exit(9);
+X	}
+X	if (users > 0) {
+X	    fprintf(stderr, "Only root can request reports for other users\n");
+X	    exit(9);
+X	}
+X
+X	if ((caller = getlogin()) == NULL)
+X	    if ((caller = user_name()) == NULL)
+X		caller = "UNKNOWN";
+X    } else
+X	caller = "root";
+X
+X    if ((new_policy >= 0 || new_quota >= 0) && users == 0) {
+X	fprintf(stderr, "usage: %s -pPOLICY -qQUOTA user...\n", argv[0]);
+X	exit(1);
+X    }
+X    
+X    if (add_usage == 0 && report) {
+X	show_cost = 0;
+X	add_usage = -1;
+X    }
+X
+X    if (add_usage > 0 || new_policy >= 0 || new_quota >= 0) {
+X	if (acct_file) {
+X	    fprintf(stderr, "Can only update current acct file\n", acct_file);
+X	    exit(2);
+X	}
+X
+X	proto_lock(I_AM_ACCT, PL_SET_QUICK);
+X    }
+X
+X    if (acct_file) {
+X	if ((acctf = open_file(acct_file, OPEN_READ)) == NULL)
+X	    acctf = open_file(relative(db_directory, acct_file), OPEN_READ);
+X	if (acctf == NULL) {
+X	    fprintf(stderr, "Accounting file %s not found\n", acct_file);
+X	    if (add_usage > 0 || new_policy >= 0 || new_quota >= 0)
+X		proto_lock(I_AM_ACCT, PL_CLEAR);
+X	    exit(1);
+X	}
+X    } else {
+X	fname = relative(db_directory, "acct");
+X        acctf = open_file(fname, OPEN_READ);
+X    }
+X
+X    if (report_all) {
+X	do_report_all(acctf);
+X	fclose(acctf);
+X	exit(0);
+X    }
+X    
+X    if (ck_policy >= 0) {
+X#ifdef AUTHORIZE
+X	get_entry(acctf, caller, &ac);
+X	exit(policy_check(ac.ac_policy));
+X#else
+X	exit(0);
+X#endif
+X    }
+X    
+X    if (show_cost >= 0) {
+X	get_entry(acctf, caller, &ac);
+X	if (ac.ac_policy == FREE_ACCOUNT) exit(0);
+X	ac.ac_total += show_cost;
+X	do_cost(&ac, show_cost);
+X	exit(0);
+X    }
+X    
+X    if (add_usage > 0) {
+X	get_entry(acctf, caller, &ac);
+X	if (ac.ac_policy == FREE_ACCOUNT) goto unlock;
+X	ac.ac_total += add_usage;
+X	time(&ac.ac_last);
+X    } else
+X    if (users > 0) {
+X	actab = newobj(struct account, users + 1);
+X	for (i = 1; i <= users; i++) {
+X	    get_entry(acctf, argv[i], &actab[i]);
+X	    if (new_policy >= 0 || new_quota >= 0) {
+X		if (new_policy >= 0)
+X		    actab[i].ac_policy = new_policy;
+X		if (new_quota >= 0)
+X		    actab[i].ac_quota = new_quota;
+X	    } else
+X		do_report(&actab[i], i == 1);
+X	}
+X    } else
+X    if (report) {
+X	if (get_entry(acctf, caller, &ac))
+X	    do_report(&ac, 1);
+X	exit(0);
+X    }
+X    
+X    if (acctf) fclose(acctf);
+X
+X    if (add_usage <= 0 && new_policy < 0 && new_quota < 0) exit(0);
+X    
+X    umask(0177);
+X    acctf = open_file(fname, OPEN_UPDATE | MUST_EXIST);
+X    
+X    if (new_policy >= 0 || new_quota >= 0) {
+X	for (i = 1; i <= users; i++)
+X	    put_entry(acctf, &actab[i]);
+X	fclose(acctf);
+X	goto unlock;
+X    }
+X
+X    if (add_usage > 0) {
+X	put_entry(acctf, &ac);
+X	if (report) {
+X#ifdef COST_PER_MINUTE
+X	    do_cost(&ac, add_usage);
+X#else
+X	    strcpy(ac.ac_user, "Total:");
+X	    do_report(&ac, 0);
+X#endif
+X	}
+X	fclose(acctf);
+X#ifdef ACCTLOG
+X	fname = relative(db_directory, "acctlog");
+X        acctf = open_file(fname, OPEN_APPEND | MUST_EXIST);
+X	fprintf(acctf, "%s\t%s\t%ld\n",
+X		caller, date_time(ac.ac_last), (long)add_usage);
+X	fclose(acctf);
+X#endif
+X	goto unlock;
+X    }
+X
+X unlock:
+X    proto_lock(I_AM_ACCT, PL_CLEAR);
+X    exit(0);
+X    /*NOTREACHED*/
+X}
+X
+Xnn_exit(n)
+X{
+X    exit(n);
+X}
+X
+Xuser_error()
+X{
+X    exit(2);
+X}
+X
+X#ifdef HAVE_JOBCONTROL
+Xsuspend_nn()
+X{}
+X#endif
+END_OF_FILE
+  if test 10252 -ne `wc -c <'account.c'`; then
+    echo shar: \"'account.c'\" unpacked with wrong size!
+  fi
+  # end of 'account.c'
+fi
+if test -f 'articles.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'articles.c'\"
+else
+  echo shar: Extracting \"'articles.c'\" \(10178 characters\)
+  sed "s/^X//" >'articles.c' <<'END_OF_FILE'
+X/*
+X *	(c) Copyright 1990, Kim Fabricius Storm.  All rights reserved.
+X *
+X *	Basic article access and management
+X */
+X
+X#include "config.h"
+X#include "db.h"
+X#include "articles.h"
+X#include "regexp.h"
+X
+Xexport int  seq_cross_filtering = 1;
+Xexport int  select_leave_next = 0; 	/* ask to select left over art. */
+X
+X
+X/*
+X * memory management
+X */
+X
+Xstatic thunk
+X    dummy_str_t = {
+X	NULL,
+X	NULL,
+X	0L
+X    },
+X    dummy_art_t = {
+X	NULL,
+X	NULL,
+X	0L
+X    };
+X
+X
+Xstatic thunk *first_str_t = &dummy_str_t;
+Xstatic thunk *current_str_t = &dummy_str_t;
+Xstatic thunk *first_art_t = &dummy_art_t;
+Xstatic thunk *current_art_t = &dummy_art_t;
+Xstatic long  cur_str_size = 0, cur_art_size = 0;
+Xstatic char *next_str;
+Xstatic article_header *next_art;
+Xstatic article_header **art_array = NULL;
+X
+Xstatic article_number max_articles = 0, mem_offset = 0;
+X
+X/*
+X * allocate one article header
+X */
+X
+X#ifndef ART_THUNK_SIZE
+X#define ART_THUNK_SIZE	127
+X#endif
+X
+Xstatic new_thunk(t, ptr, size)
+Xthunk *t;
+Xchar *ptr;
+Xlong size;
+X{
+X    thunk *new;
+X
+X    new = newobj(thunk, 1);
+X
+X    new->next_thunk = t->next_thunk;
+X    t->next_thunk = new;
+X
+X    new->this_thunk = ptr;
+X    new->thunk_size = size;
+X}
+X
+X
+Xarticle_header *alloc_art()
+X{
+X    if (cur_art_size == 0) {
+X	if (current_art_t->next_thunk == NULL)
+X	    new_thunk(current_art_t,
+X		      (char *)newobj(article_header, ART_THUNK_SIZE),
+X		      (long)ART_THUNK_SIZE);
+X
+X	current_art_t = current_art_t->next_thunk;
+X	next_art = (article_header *)current_art_t->this_thunk;
+X	cur_art_size = current_art_t->thunk_size;
+X    }
+X
+X    cur_art_size--;
+X    return next_art++;
+X}
+X
+X/*
+X * allocate a string of length 'len'
+X */
+X
+X#ifndef STR_THUNK_SIZE
+X#define STR_THUNK_SIZE	((1<<14) - 32)	/* leave room for malloc header */
+X#endif
+X
+Xchar *alloc_str(len)
+Xint len;
+X{
+X    char *ret;
+X
+X    if (cur_str_size <= len) {	/* must be room for len+1 bytes */
+X	if (current_str_t->next_thunk == NULL)
+X	    new_thunk(current_str_t,
+X		      newstr(STR_THUNK_SIZE), (long)STR_THUNK_SIZE);
+X
+X	current_str_t = current_str_t->next_thunk;
+X	next_str = current_str_t->this_thunk;
+X	cur_str_size = current_str_t->thunk_size;
+X    }
+X
+X    ret = next_str;
+X    cur_str_size -= len + 1;
+X    next_str += len;
+X    *next_str++ = NUL;	/* string is null terminated */
+X
+X    return ret;
+X}
+X
+X/*
+X * "free" the allocated memory
+X */
+X
+Xfree_memory()
+X{
+X    current_str_t = first_str_t;
+X    current_art_t = first_art_t;
+X    cur_str_size  = 0;
+X    cur_art_size  = 0;
+X    n_articles	  = 0;
+X}
+X
+X
+X/*
+X * mark/release memory
+X */
+X
+X
+Xmark_str(str_marker)
+Xstring_marker *str_marker;
+X{
+X    str_marker->sm_cur_t = current_str_t;
+X    str_marker->sm_size  = cur_str_size;
+X    str_marker->sm_next  = next_str;
+X}
+X
+Xrelease_str(str_marker)
+Xstring_marker *str_marker;
+X{
+X    current_str_t = str_marker->sm_cur_t;
+X    cur_str_size  = str_marker->sm_size;
+X    next_str      = str_marker->sm_next;
+X}
+X
+X
+Xmark_memory(mem_marker)
+Xmemory_marker *mem_marker;
+X{
+X    mark_str(&(mem_marker->mm_string));
+X
+X    mem_marker->mm_cur_t = current_art_t;
+X    mem_marker->mm_size  = cur_art_size;
+X    mem_marker->mm_next  = next_art;
+X
+X    mem_marker->mm_nart	 = n_articles;
+X    mem_offset += n_articles;
+X
+X    n_articles = 0;
+X    articles = art_array + mem_offset;
+X}
+X
+Xrelease_memory(mem_marker)
+Xmemory_marker *mem_marker;
+X{
+X    release_str(&(mem_marker->mm_string));
+X
+X    current_art_t = mem_marker->mm_cur_t;
+X    cur_art_size  = mem_marker->mm_size;
+X    next_art      = mem_marker->mm_next;
+X
+X    n_articles = mem_marker->mm_nart;
+X
+X    mem_offset -= n_articles;
+X    articles = art_array + mem_offset;
+X}
+X
+X/*
+X * merge all memory chunks into one.
+X */
+X
+Xmerge_memory()
+X{
+X    n_articles += mem_offset;
+X    mem_offset = 0;
+X    articles = art_array;
+X}
+X
+X
+X/*
+X * save article header in 'articles' array
+X * 'articles' is enlarged if too small
+X */
+X
+X#define	FIRST_ART_ARRAY_SIZE	500	/* malloc header */
+X#define	NEXT_ART_ARRAY_SIZE	512
+X
+Xadd_article(art)
+Xarticle_header *art;
+X{
+X    if ((n_articles + mem_offset) == max_articles) {
+X	/* must increase size of 'articles' */
+X
+X	if (max_articles == 0) {
+X	    /* allocate initial 'articles' array */
+X	    max_articles = FIRST_ART_ARRAY_SIZE;
+X	} else {
+X	    max_articles += NEXT_ART_ARRAY_SIZE;
+X	}
+X	art_array = resizeobj(art_array, article_header *, max_articles);
+X	articles = art_array + mem_offset;
+X    }
+X
+X    articles[n_articles] = art;
+X    n_articles++;
+X}
+X
+X
+Xaccess_group(gh, first_article, last_article, flags, mask)
+Xregister group_header *gh;
+Xarticle_number first_article, last_article;
+Xregister flag_type flags;
+Xchar *mask;
+X{
+X    group_header *cpgh;
+X    FILE *data;
+X    off_t data_offset;
+X    register article_header *ah;
+X    cross_post_number cross_post;
+X    int skip_digest, n;
+X    attr_type leave_attr, test_article();
+X    memory_marker mem_marker;
+X    static regexp *rexp = NULL;
+X    static char subptext[80];
+X
+X    if (first_article < gh->first_db_article)
+X	first_article = gh->first_db_article;
+X
+X    if (last_article > gh->last_db_article)
+X	last_article = gh->last_db_article;
+X
+X    if (last_article == 0 || first_article > last_article) return 0;
+X
+X    data = open_data_file(gh, 'd', OPEN_READ);
+X    if (data == NULL) return -10;
+X
+X    if ((data_offset = get_data_offset(gh, first_article)) == (off_t)(-1))
+X	return -11;
+X
+X
+X    if (mask == NULL) {
+X	if (rexp != NULL) {
+X	    freeobj(rexp);
+X	    rexp = NULL;
+X	}
+X    } else {
+X	if (*mask == '/') {
+X	    mask++;
+X	    if (rexp != NULL) {
+X		if (strncmp(mask, subptext, 80) != 0) {
+X		    freeobj(rexp);
+X		    rexp = NULL;
+X		}
+X	    }
+X	    if (rexp == NULL) {
+X		strncpy(subptext, mask, 80);
+X		rexp = regcomp(mask);
+X		if (rexp == NULL) return -1;
+X	    }
+X	    /* notice mask is still non-NULL */
+X	}
+X    }
+X
+X    if ((flags & (ACC_ALSO_READ_ARTICLES | ACC_ONLY_READ_ARTICLES)))
+X	leave_attr = 0;
+X    else if (select_leave_next)
+X	leave_attr = A_READ;	/* will prompt */
+X    else
+X	leave_attr = A_LEAVE_NEXT;
+X
+X    if (!(flags & ACC_SPEW_MODE))
+X	use_newsrc(gh, (flags & ACC_ORIG_NEWSRC) ? 1 : 0);
+X
+X    if ((flags & ACC_EXTRA_ARTICLES) == 0)
+X	mark_memory(&mem_marker);
+X
+X    ah = alloc_art();
+X
+X    skip_digest = 0;
+X
+X    fseek(data, data_offset, 0);
+X
+X    while (ftell(data) < gh->data_write_offset) {
+X	if (db_read_art(data) <= 0) {
+X	    fclose(data);
+X	    if ((flags & ACC_EXTRA_ARTICLES) == 0)
+X		release_memory(&mem_marker);
+X	    return -2;
+X	}
+X
+X	if (db_hdr.dh_lpos == (off_t)0)
+X	    continue;	/* article not accessible */
+X
+X	if (db_hdr.dh_number > gh->last_db_article
+X	    || db_hdr.dh_number < gh->first_db_article)
+X	    goto data_error;
+X
+X	if (skip_digest && db_data.dh_type == DH_SUB_DIGEST)
+X	    continue;
+X
+X	skip_digest = 0;
+X
+X	if (db_hdr.dh_cross_postings && !(flags & ACC_ALSO_CROSS_POSTINGS)) {
+X	    for (n = 0; n < db_hdr.dh_cross_postings; n++) {
+X		cross_post = NETW_CROSS_INT(db_data.dh_cross[n]);
+X		if (cross_post < 0 || cross_post >= master.number_of_groups)
+X		    continue;
+X		cpgh = &active_groups[cross_post];
+X		if (cpgh == gh) {
+X		    if (seq_cross_filtering) continue;
+X		    n = db_hdr.dh_cross_postings;
+X		    break;
+X		}
+X		if (cpgh->group_flag & G_UNSUBSCRIBED) continue;
+X
+X		if (!seq_cross_filtering) break;
+X		if (cpgh->preseq_index > 0 &&
+X		    cpgh->preseq_index < gh->preseq_index) break;
+X	    }
+X
+X	    if (n < db_hdr.dh_cross_postings) {
+X		if (db_data.dh_type == DH_DIGEST_HEADER) skip_digest++;
+X		continue;
+X	    }
+X	}
+X
+X	ah->flag = 0;
+X
+X	switch (db_data.dh_type) {
+X	 case DH_DIGEST_HEADER:
+X	    if (flags & ACC_DONT_SPLIT_DIGESTS)
+X		skip_digest++;
+X	    else
+X		if ((flags & ACC_ALSO_FULL_DIGEST) == 0)
+X		    continue;	/* don't want the full digest when split */
+X	    ah->flag |= A_FULL_DIGEST;
+X	    break;
+X	 case DH_SUB_DIGEST:
+X	    ah->flag |= A_DIGEST;
+X	    break;
+X	}
+X
+X	ah->a_number = db_hdr.dh_number;
+X	if (ah->a_number > last_article) break;
+X
+X	if (flags & ACC_SPEW_MODE) {
+X	    printf("%x:%s\n", (int)(gh->group_num), db_data.dh_subject);
+X	    continue;
+X	}
+X
+X	ah->hpos = db_hdr.dh_hpos;
+X	ah->fpos = ah->hpos + (off_t)(db_hdr.dh_fpos);
+X	ah->lpos = db_hdr.dh_lpos;
+X
+X	ah->attr = test_article(ah);
+X
+X	if (ah->attr != A_READ && (flags & ACC_ONLY_READ_ARTICLES))
+X	    continue;
+X
+X	if (rexp != NULL) {
+X	    if (flags & ACC_ON_SUBJECT)
+X		if (regexec_cf(rexp, db_data.dh_subject)) goto match_ok;
+X	    if (flags & ACC_ON_SENDER)
+X		if (regexec_cf(rexp, db_data.dh_sender)) goto match_ok;
+X	    continue;
+X	} else
+X	if (mask != NULL) {
+X	    if (flags & ACC_ON_SUBJECT)
+X		if (strmatch_cf(mask, db_data.dh_subject)) goto match_ok;
+X	    if (flags & ACC_ON_SENDER)
+X		if (strmatch_cf(mask, db_data.dh_sender)) goto match_ok;
+X	    continue;
+X	}
+X     match_ok:
+X
+X     attr_again:
+X
+X	switch (ah->attr) {
+X	 case A_LEAVE:
+X	    if (mask) {
+X		ah->attr = 0;
+X		break;
+X	    }
+X
+X	    if (leave_attr == A_READ) {
+X		clrdisp();
+X		prompt("Select left over articles in group %s? ", gh->group_name);
+X		leave_attr = yes(0) > 0 ? A_SELECT : A_LEAVE_NEXT;
+X	    }
+X	    ah->attr = leave_attr;
+X	    goto attr_again;
+X
+X	 case A_SELECT:
+X	    if (mask) ah->attr = 0;
+X	    break;
+X
+X	 case A_READ:
+X	    if (!(flags & (ACC_ALSO_READ_ARTICLES | ACC_ONLY_READ_ARTICLES)))
+X		if (ah->a_number > gh->last_article)
+X		    continue;
+X
+X	    /* FALL THRU */
+X
+X	 case A_SEEN:
+X	 case 0:
+X	    if (flags & ACC_DO_KILL) {
+X		ah->sender = db_data.dh_sender;
+X		ah->subject = db_data.dh_subject;
+X		if (kill_article(ah)) continue;
+X	    }
+X
+X	    /* The 'P' command to a read group must show articles as read */
+X/******/    if (gh->unread_count <= 0) ah->attr = A_READ;
+X	    break;
+X
+X	 default:
+X	    break;
+X	}
+X
+X	if (ah->name_length = db_hdr.dh_sender_length) {
+X	    ah->sender = alloc_str((int)db_hdr.dh_sender_length);
+X	    strcpy(ah->sender, db_data.dh_sender);
+X	} else
+X	    ah->sender = "";
+X
+X	if (ah->subj_length = db_hdr.dh_subject_length) {
+X	    ah->subject = alloc_str((int)db_hdr.dh_subject_length);
+X	    strcpy(ah->subject, db_data.dh_subject);
+X	} else
+X	    ah->subject = "";
+X
+X	ah->replies = db_hdr.dh_replies;
+X	ah->lines = db_hdr.dh_lines;
+X	ah->t_stamp = db_hdr.dh_date;
+X
+X	ah->a_group = (flags & ACC_MERGED_MENU) ? current_group : NULL;
+X
+X	add_article(ah);
+X	ah = alloc_art();
+X    }
+X
+X    fclose(data);
+X
+X    if ((flags & ACC_DONT_SORT_ARTICLES) == 0)
+X	sort_articles(-1);
+X
+X    return n_articles > 0 ? 1 : 0;
+X
+Xdata_error:
+X    log_entry('E', "%s: data inconsistency", gh->group_name);
+X    fclose(data);
+X    if ((flags & ACC_EXTRA_ARTICLES) == 0)
+X	release_memory(&mem_marker);
+X    return -12;
+X}
+X
+X
+END_OF_FILE
+  if test 10178 -ne `wc -c <'articles.c'`; then
+    echo shar: \"'articles.c'\" unpacked with wrong size!
+  fi
+  # end of 'articles.c'
+fi
+if test -f 'config.h-dist' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'config.h-dist'\"
+else
+  echo shar: Extracting \"'config.h-dist'\" \(11434 characters\)
+  sed "s/^X//" >'config.h-dist' <<'END_OF_FILE'
+X/**************************** NN CONFIGURATION ***************************
+X *
+X *	Configuration file for nn.
+X *
+X *	You must edit this file to reflect your local configuration
+X *	and environment.
+X *
+X *	Before editing this file, read the licence terms in the README
+X *	file and the installation guidelines in the INSTALLATION file.
+X *
+X *	(c) Copyright 1990, Kim F. Storm.  All rights reserved.
+X */
+X
+X#define	RELEASE 	"6.4"
+X
+X#include <stdio.h>
+X#include <ctype.h>
+X
+X
+X/*********************** NETWORK DEPENDENT DEFINITIONS **********************
+X *
+X *	Define NETWORK_DATABASE if you share the database through NFS on
+X *	a network with different, non-compatible machines, e.g. SUNs and
+X *	VAXen, or SUN-3 and SUN-4, or if you are using different compilers
+X *	on the same architecture.
+X *
+X *	In a homogenous network, you can leave it undefined for higher
+X *	performance (no data conversion is needed).
+X */
+X
+X/* #define NETWORK_DATABASE	/* */
+X
+X
+X/********************************** NNTP *********************************
+X *
+X * 	Define NNTP to enable nntp support.  If you are not using NNTP,
+X *	just leave the following NNTP_* definitions as they are - they
+X *	will be ignored anyway.
+X *
+X *	With NNTP, the nnmaster still maintains a local database of
+X *	all article headers for fast access (and because NNTP does not
+X *	support nn - yet), while the articles are fetched from the
+X *	nntp server when they are read or saved.
+X *
+X *	You may still share this database through NFS locally (see the
+X *	description of NETWORK_DATABASE above) if you don't want to
+X *	have separate nn databases on all your local systems.
+X *
+X *	Consult the file NNTP for further information on the use of NNTP.
+X */
+X
+X/* #define NNTP			/* */
+X
+X/*
+X *	Define NNTP_SERVER to the name of a file containing the name of the
+X *	nntp server.
+X *
+X *	It is vital that both the nnmaster and all nn users on a machine
+X *	uses the same nntp server, because the nn database is synchronized
+X *	with a specific news active file.
+X *
+X *	If the file name does not start with a slash, it is relative to
+X *	LIB_DIRECTORY defined below.
+X */
+X
+X#define NNTP_SERVER	"/usr/lib/nntp_server"
+X
+X/*
+X *	Define NNTP_POST if you want nn to reject attempts to post via
+X *	NNTP to a server, that disallows postings.
+X *
+X *	You should define this, if you use the NNTP based mini-inews for
+X *	postings from NNTP clients.  If you use another mechanism, that
+X *	does not involve NNTP, you should leave it undefined.
+X */
+X
+X#define NNTP_POST             /* */
+X
+X/*
+X *	NNTP's mini-inews seems to require that messages contain a complete
+X *	header with Message-ID, Path, and Date fields which the normal inews
+X *	generates itself.  If your mini-inews requires these headers to
+X *	be present, define NNTP_MINI_INEWS_HEADER below.
+X */
+X
+X#define NNTP_MINI_INEWS_HEADER	/* uses "broken" mini-inews */
+X
+X
+X/***************** OPERATING SYSTEM DEPENDENT DEFINITIONS *******************
+X *
+X *  	Include the appropriate s- file for your system below.
+X *
+X *	If a file does not exist for your system, you can use
+X *	conf/s-template.h as a starting point for writing you own.
+X */
+X
+X#include "s-sys5.h"
+X
+X/*
+X *	Define DEFAULT_PAGER as the initial value of the 'pager' variable.
+X *	nnadmin pipes shell command output though this command.
+X */
+X
+X#define DEFAULT_PAGER		"pg -n -s"	/* system V */
+X/* #define DEFAULT_PAGER	"more"			/* bsd */
+X
+X/*
+X *	DEFAULT_PRINTER is the initial value of the 'printer' variable.
+X *	nn's :print command pipes text into this command.
+X */
+X
+X#define DEFAULT_PRINTER		"lp -s"		/* System V */
+X/* #define DEFAULT_PRINTER	"lpr -p -JNEWS"	/* bsd */
+X
+X/*
+X * 	Define RESIZING to make nn understand dynamic window-resizing.
+X * 	(It uses the TIOCGWINSZ ioctl found on most 4.3BSD systems)
+X */
+X
+X/* #define RESIZING		/* */
+X
+X
+X/********************** MACHINE DEPENDENT DEFINITIONS **********************
+X *
+X *	Include the appropriate m- file for your system below.
+X *
+X *	If a file does not exist for your system, you can use
+X *	conf/m-template.h as a starting point for writing you own.
+X */
+X
+X#include "m-m680x0.h"
+X
+X
+X/***************************** OWNERSHIP ***************************
+X *
+X *	Specify owner and group for installed files and programs.
+X *
+X *	The nnmaster will run suid/sgid to this owner and group.
+X *
+X *	The only requirements are that the ownership allows the
+X *	nnmaster to READ the news related files and directories, and
+X *	the ordinary users to read the database and execute the nn*
+X *	programs.
+X *
+X *	Common choices are:  (news, news)  and   (your uid, your gid)
+X */
+X
+X#define OWNER	"news"
+X#define	GROUP	"news"
+X
+X
+X/**************************** LOCALIZATION ****************************
+X *
+X *	Specify where programs and files are installed.
+X *
+X *	BIN_DIRECTORY    - the location of the user programs (mandatory)
+X *
+X *	LIB_DIRECTORY	 - the location of auxiliary programs and files.
+X *			   (mandatory UNLESS ALL of the following are defined).
+X *
+X *	MASTER_DIRECTORY - the location of the master program (on server)
+X *			   (= LIB_DIRECTORY if undefined)
+X *
+X *	CLIENT_DIRECTORY - the location of auxiliary programs (on clients)
+X *			   (= LIB_DIRECTORY if undefined)
+X *
+X *	HELP_DIRECTORY   - the location of help files, online manual, etc.
+X *			   (= CLIENT_DIRECTORY/help if undefined)
+X *
+X *	CACHE_DIRECTORY	 - if NNTP is used, nn uses this central directory
+X *			   to store working copies of articles on the local
+X *			   system.  If not defined, it stores the articles
+X *			   in each user's ~/.nn directory.
+X *
+X *	TMP_DIRECTORY    - temporary file storage.  Overriden by $TMPDIR.
+X *			   (= /usr/tmp if undefined).
+X *
+X *	LOG_FILE         - the location of nn's log file.
+X *			   (= LIB_DIRECTORY/Log if undefined).
+X */
+X
+X#define BIN_DIRECTORY	"/usr/local/bin"
+X#define LIB_DIRECTORY	"/usr/local/lib/nn"
+X
+X
+X/**************************** DATABASE LOCATION **************************
+X *
+X *	Specify where the nn database should be installed.
+X *
+X *	If none of the following symbols are defined, the database will
+X *	be contained in the NEWS_DIRECTORY in a separate .nn directory for
+X *	master files and in files named .nnx and .nnd in each group's
+X *	spool directory.  To use this scheme, the OWNER specified above
+X *	must have write permission on the news spool directories.
+X *
+X *	You should also be careful not to specify a database directory
+X *	if you access news via NNTP - you may not have the proper directories
+X *	on your local system.  However, it is probably ok anyway if nnmaster
+X *	runs on the nntp server.
+X *
+X *	To change the default behaviour, you can define the following
+X *	symbols:
+X *
+X *	DB_DIRECTORY	   - the directory containing the master files.
+X *
+X *	DB_DATA_DIRECTORY  - the directory containing the per-group files
+X *			     (default is DB_DIRECTORY/DATA if undefined).
+X *
+X *	DB_LONG_NAMES	   - use group's name rather than number when
+X *			     building file names in DB_DATA_DIRECTORY.
+X *	     (The file system must support long file names!!)
+X */
+X
+X#define DB_DIRECTORY	"/usr/spool/nn"
+X
+X
+X/*************************** NEWS TRANSPORT **************************
+X *
+X *	Specify the location of your news programs and files
+X *	You only need to specify these if you are not
+X *	satisfied with the default settings.
+X *
+X *	NEWS_DIRECTORY	 	- The news spool directory.
+X *				  Default: /usr/spool/news
+X *
+X *	NEWS_LIB_DIRECTORY	- The news lib directory.
+X *				  Default: /usr/lib/news
+X *
+X *	INEWS_PATH		- The location of the inews program.
+X *				  Default: NEWS_LIB_DIR/inews
+X */
+X
+X#define NEWS_DIRECTORY		"/usr/spool/news"	/* */
+X#define NEWS_LIB_DIRECTORY	"/usr/lib/news"		/* */
+X
+X/* #define INEWS_PATH		"/usr/lib/news/inews"	/* */
+X
+X
+X/*************************** MAIL INTERFACE *************************
+X *
+X *	Specify a mailer that accepts a letter WITH a header IN THE TEXT.
+X *
+X * 	A program named 'recmail' program is normally delivered with
+X *	the Bnews system, or you can use sendmail -t if you have it.
+X *
+X *	The contrib/ directory contains two programs which you might
+X *	be able to use with a little tweaking.
+X */
+X
+X#define REC_MAIL	"/usr/lib/news/recmail"	/* non-sendmail */
+X/* #define REC_MAIL	"/usr/lib/sendmail -t"	/* sendmail */
+X
+X
+X/*
+X *	Define HAVE_ROUTING if your mailer understands domain based
+X *	adresses (...@...) and performs the necessary rerouting (e.g.
+X *	Sendmail or Smail).
+X *
+X *	Otherwise, nn will provide a simple routing facility using
+X *      routing information specified in the file LIB_DIRECTORY/routes.
+X */
+X
+X#define HAVE_ROUTING			/* */
+X
+X/*
+X *	If HAVE_ROUTING is NOT defined, nn needs to know the name of
+X * 	your host.  To obtain the host name it will use either of the
+X *	'uname' or 'gethostname' system calls as specified in the s-
+X *	file included above.
+X *
+X *	If neither 'uname' nor 'gethostname' is available, you must
+X *	define HOSTNAME to be the name of your host.  Otherwise, leave
+X *	it undefined (it will not be used anyway).
+X */
+X
+X/* #define HOSTNAME	"myhost"	/* Not used if HAVE_ROUTING */
+X
+X/*
+X *	Define APPEND_SIGNATURE if you want nn to ask users to append
+X *	~/.signature to mail messages (reply/forward/mail).
+X *
+X *	If the mailer defined in REC_MAIL automatically includes .signature
+X *	you should not define this (it will fool people to include it twice).
+X *
+X *	I think 'recmail' includes .signature, but 'sendmail -t' doesn't.
+X */
+X
+X/* #define APPEND_SIGNATURE		/* */
+X
+X/*
+X *	BUG_REPORT_ADDRESS is the initial value of the bug-report-address
+X *	variable which is used by the :bug command to report bugs in
+X *	the nn software.
+X */
+X
+X#define BUG_REPORT_ADDRESS	"nn-bugs@dkuug.dk"
+X
+X
+X/*************************** DOCUMENTATION ***************************
+X *
+X * 	Specify directories for the user and system manuals
+X *
+X * 	Adapt this to your local standards; the manuals will be named
+X * 		$(MAN_DIR)/program.$(MAN_SECTION)
+X *
+X *	USER_MAN	- nn, nntidy, nngrep, etc.
+X *	SYS_MAN		- nnadmin
+X *	DAEMON_MAN	- nnmaster
+X */
+X
+X#define USER_MAN_DIR 	"/usr/man/man1"
+X#define USER_MAN_SECTION 	"1"
+X
+X#define SYS_MAN_DIR 	"/usr/man/man1"
+X#define SYS_MAN_SECTION 	"1m"
+X
+X#define DAEMON_MAN_DIR 	"/usr/man/man8"
+X#define DAEMON_MAN_SECTION 	"8"
+X
+X
+X/************************** LOCAL POLICY *****************************
+X *
+X *	Define STATISTICS if you want to keep a record of how much
+X *	time the users spend on news reading.
+X *
+X *	Sessions shorter than the specified number of minutes are not
+X *	recorded (don't clutter up the log file).
+X *
+X *	Usage statistics is entered into the $LOG_FILE with code U
+X */
+X
+X/* #define STATISTICS	5 /* minutes */
+X
+X/*
+X *	Define ACCOUNTING if you want to keep accumulated accounting
+X *	based on the statistics in a separate 'acct' file.  In this
+X *	case, the accounting figures will be secret, and not be
+X *	written to the Log file.  And the users will not be able to
+X *	"decrease" their own account.
+X *
+X *	See account.c for optional cost calculation parameters.
+X */
+X
+X/* #define ACCOUNTING		/* */
+X
+X/*
+X *	Define AUTHORIZE if you want to restrict the use of nn to
+X *	certain users or certain periods of the day.  Define both
+X *	this and ACCOUNTING if you want to impose a usage quota
+X *
+X *	See account.c for implementing various access policies.
+X */
+X
+X/* #define AUTHORIZE	/* */
+X
+X/*
+X *	Default folder directory
+X */
+X
+X#define FOLDER_DIRECTORY	"~/News"
+X
+X/*
+X *	Max length of authors name (in "edited" format).
+X *	Also size of "Name" field on the article menus.
+X *	You may want to increase this if your terminals are wider than
+X *	80 columns.
+X */
+X
+X#define NAME_LENGTH 		16
+X
+X
+X/************************ CONFIGURATION COMPLETED ************************/
+X
+X#include "global.h"
+END_OF_FILE
+  if test 11434 -ne `wc -c <'config.h-dist'`; then
+    echo shar: \"'config.h-dist'\" unpacked with wrong size!
+  fi
+  # end of 'config.h-dist'
+fi
+if test -f 'decode.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'decode.c'\"
+else
+  echo shar: Extracting \"'decode.c'\" \(10831 characters\)
+  sed "s/^X//" >'decode.c' <<'END_OF_FILE'
+X/*
+X * Decode one or more uuencoded article back to binary form.
+X *
+X * UNIX/NN VERSION
+X *	This version cannot be used as a stand-alone uud!
+X * 	This version is made: 16 June 1989.
+X *
+X * From the Berkeley original, modified by MSD, RDR, JPHD & WLS.
+X */
+X
+X#include "config.h"
+X
+X/* #define DEC_DEBUG	/* never define this */
+X
+Xexport char *decode_header_file = "Decode.Headers";
+Xexport int decode_skip_prefix = 2;
+X
+X#define MAXCHAR 256
+X#define LINELEN 256
+X#define NORMLEN 60	/* allows for 80 encoded chars per line */
+X
+X#define SEQMAX 'z'
+X#define SEQMIN 'a'
+X
+Xstatic char seqc, partn;
+Xstatic int first, secnd, check;
+X
+X#define MAX_PREFIX 10
+Xstatic int prefix_lgt, set_prefix;
+Xstatic char prefix_str[MAX_PREFIX];
+X
+Xstatic FILE *out;
+Xstatic char *target;
+Xstatic char blank;
+Xstatic int chtbl[MAXCHAR], cdlen[NORMLEN + 3];
+Xstatic char ofname[FILENAME], arcname[FILENAME];
+Xstatic int state, arcpart;
+X
+X#define	NO_ADVANCE		0x10
+X
+X#define	DECODE_TEXT			1
+X#define	FIND_BEGIN			2
+X#define	FIND_BEGIN_AFTER_ERROR		3
+X#define FIND_BEGIN_AFTER_INCLUDE	4
+X#define NEW_BEGIN			(5 | NO_ADVANCE)
+X#define	FOUND_END	       		(6 | NO_ADVANCE)
+X#define FOUND_INCLUDE			(7 | NO_ADVANCE)
+X#define	SKIP_LEADING			8
+X#define	SKIP_TRAILING			(9 | NO_ADVANCE)
+X#define DECODE_ERROR			(10 | NO_ADVANCE)
+X#define OTHER_ERROR			(11 | NO_ADVANCE)
+X
+X#define MIN_DECODE_LEADING 8 /* lines to decode ok when doing skip-leading */
+X
+X#ifdef DEC_DEBUG
+X    char *state_tbl[] = {
+X	"-", "decode", "find begin", "find a/error", "find a/include",
+X	"new begin", "found end", "found include", "skip leading",
+X	"skip trail", "error", "other error"
+X	};
+X
+X#endif
+X
+X/*
+X * decode one line, write on out file
+X */
+X
+Xstatic strncmp_skip(buf, str, n)
+Xchar *buf, *str;
+Xint n;
+X{
+X    register int i;
+X    register char *line = buf;
+X
+X    if (!set_prefix)
+X	return strncmp(line, str, n);
+X
+X    if (decode_skip_prefix > MAX_PREFIX) decode_skip_prefix = MAX_PREFIX;
+X
+X    for (i = 0; i <= decode_skip_prefix; i++, line++) {
+X	if (*line == NUL) break;
+X	if (*line == '#' || *line == ':') break;
+X	if (strncmp(line, str, n)) continue;
+X	prefix_lgt = i;
+X	if (i) strncpy(prefix_str, buf, i);
+X	set_prefix = 0;
+X#ifdef DEC_DEBUG
+X	msg("match %s", str);
+X	user_delay(1);
+X#endif
+X	return 0;
+X    }
+X
+X    return 1;
+X}
+X
+Xstatic decode_line(buf, len, dont_write)
+Xchar *buf;
+Xregister int len;		/* actual input line length */
+Xint dont_write;			/* doing leading check */
+X{
+X    char outl[LINELEN];
+X    register char *bp, *ut;
+X    register int *trtbl = chtbl;
+X    register int n;
+X    register int blen;		/* binary length (from decoded file) */
+X    register int rlen;		/* calculated input line length */
+X
+X    /*
+X     * Get the binary line length.
+X     */
+X    if ((blen = trtbl[buf[0]]) < 0) {
+X	if (strncmp(buf, "begin", 5) == 0 || strncmp(buf, "table", 5) == 0)
+X	    return NEW_BEGIN;
+X
+X	if (state == SKIP_LEADING) return SKIP_LEADING;
+X
+X	/*
+X	 * end of uuencoded file ?
+X	 */
+X	if (strncmp(buf, "end", 3) == 0)
+X	    return FOUND_END;
+X
+X	/*
+X	 * end of current file ? : get next one.
+X	 */
+X	if (strncmp(buf, "include", 7) == 0)
+X	    return FOUND_INCLUDE;
+X
+X	/*
+X	 * trailing garbage
+X	 */
+X	return SKIP_TRAILING;
+X    }
+X
+X    rlen = cdlen[blen];
+X    if (len < rlen) goto d_err;
+X
+X    /*
+X     * Is it the empty line before the end line ?
+X     */
+X    if (blen == 0) return state;
+X
+X    /*
+X     * Pad with blanks.
+X     */
+X    for (bp = buf + len, n = rlen - len; --n >= 0; ) *bp++ = blank;
+X
+X    /*
+X     * Verify
+X     */
+X    for (n = rlen, bp = buf; --n >= 0; bp++)
+X	if (trtbl[*bp] < 0) {
+X#ifdef DEC_DEBUG
+X	    msg("%s - verify failed %d '%.30s'",
+X		state_tbl[state&0xf], rlen - n, buf);
+X	    user_delay(2);
+X#endif
+X	    goto d_err;
+X	}
+X
+X    /*
+X     * Check for uuencodes that append a 'z' to each line....
+X     */
+X    if (check)
+X	if (secnd) {
+X	    secnd = 0;
+X	    if (buf[rlen] == SEQMAX) check = 0;
+X	} else if (first) {
+X	    first = 0;
+X	    secnd = 1;
+X	    if (buf[rlen] != SEQMAX) check = 0;
+X	}
+X
+X    /*
+X     * There we check.
+X     */
+X    if (check) {
+X	if (buf[rlen] != seqc) {
+X#ifdef DEC_DEBUG
+X	    msg("check failed %d != %d", buf[rlen], seqc); user_delay(1);
+X#endif
+X	    goto d_err;
+X	}
+X
+X	if (--seqc < SEQMIN) seqc = SEQMAX;
+X    }
+X
+X    if (dont_write) return DECODE_TEXT;
+X
+X    /*
+X     * output a group of 3 bytes (4 input characters).
+X     */
+X    ut = outl;
+X    n = blen;
+X    bp = &buf[1];
+X    while (--n >= 0) {
+X	*(ut++) = trtbl[*bp] << 2 | trtbl[bp[1]] >> 4;
+X	if (n > 0) {
+X	    *(ut++) = (trtbl[bp[1]] << 4) | (trtbl[bp[2]] >> 2);
+X	    n--;
+X	}
+X	if (n > 0) {
+X	    *(ut++) = trtbl[bp[2]] << 6 | trtbl[bp[3]];
+X	    n--;
+X	}
+X	bp += 4;
+X    }
+X    if (fwrite(outl, 1, blen, out) <= 0) {
+X	msg("Error on writing decoded file");
+X	return OTHER_ERROR;
+X    }
+X
+X    return DECODE_TEXT;
+X
+X d_err:
+X    if (state == SKIP_LEADING) return SKIP_LEADING;
+X    return DECODE_ERROR;
+X
+X}
+X
+X
+X
+X/*
+X * Install the table in memory for later use.
+X */
+Xstatic inittbls()
+X{
+X    register int i, j;
+X
+X    /*
+X     * Set up the default translation table.
+X     */
+X    for (i = 0; i < ' '; i++) chtbl[i] = -1;
+X    for (i = ' ', j = 0; i < ' ' + 64; i++, j++) chtbl[i] = j;
+X    for (i = ' ' + 64; i < MAXCHAR; i++) chtbl[i] = -1;
+X    chtbl['`'] = chtbl[' '];	/* common mutation */
+X    chtbl['~'] = chtbl['^'];	/* an other common mutation */
+X    blank = ' ';
+X    /*
+X     * set up the line length table, to avoid computing lotsa * and / ...
+X     */
+X    cdlen[0] = 1;
+X    for (i = 1, j = 5; i <= NORMLEN; i += 3, j += 4)
+X	cdlen[i] = (cdlen[i + 1] = (cdlen[i + 2] = j));
+X}
+X
+Xstatic gettable(in)
+XFILE *in;
+X{
+X    char buf[LINELEN], *line;
+X    register int c, n = 0;
+X    register char *cpt;
+X
+X    for (c = 0; c <= MAXCHAR; c++) chtbl[c] = -1;
+X
+X    for (;;) {
+X	if (fgets(buf, sizeof buf, in) == NULL) {
+X	    msg("EOF while in translation table.");
+X	    return -1;
+X	}
+X	line = buf + prefix_lgt;
+X	if ((prefix_lgt > 0 && strncmp(buf, prefix_str, prefix_lgt)) ||
+X	    strncmp(line, "begin", 5) == 0) {
+X	    msg("Incomplete translation table.");
+X	    return -1;
+X	}
+X	cpt = line + strlen(line) - 1;
+X	*cpt = ' ';
+X	while (*(cpt) == ' ') {
+X	    *cpt = 0;
+X	    cpt--;
+X	}
+X	cpt = line;
+X	while (c = *cpt) {
+X	    if (chtbl[c] != -1) {
+X		msg("Duplicate char in translation table.");
+X		return -1;
+X	    }
+X	    if (n == 0) blank = c;
+X	    chtbl[c] = n++;
+X	    if (n >= 64) return 0;
+X	    cpt++;
+X	}
+X    }
+X}
+X
+Xstatic new_file()
+X{
+X    out = NULL;
+X    seqc = SEQMAX;
+X    partn = 'a';
+X    check = 1;
+X    first = 1;
+X    secnd = 0;
+X    state = FIND_BEGIN;
+X    prefix_lgt = 0;
+X    set_prefix = decode_skip_prefix;
+X    arcpart = 0;
+X    inittbls();
+X}
+X
+Xuud_start(dir)
+Xchar *dir;
+X{
+X    target = dir;
+X    new_file();
+X}
+X
+Xuud_end()
+X{
+X    if (out != NULL) {
+X	fclose(out);
+X	msg("%s INCOMPLETE -- removed", arcname);
+X	unlink(ofname);
+X	out = NULL;
+X    }
+X}
+X
+X
+Xuudecode(ah, in)
+Xregister article_header *ah;
+XFILE *in;
+X{
+X    int mode, onedone, len, lead_check = 0;
+X    int ostate = 0;
+X    char buf[LINELEN], part[2], *line;
+X    off_t real_size, start_offset;
+X    long expect_size;
+X
+X    onedone = 0;
+X
+X    /*
+X     * search for header or translation table line.
+X     */
+X    start_offset = ftell(in);
+X
+X    for (;;) {
+X	if ((state & NO_ADVANCE) == 0) {
+X	    if (ftell(in) >= ah->lpos) break;
+X	    if (fgets(buf, sizeof buf, in) == NULL) break;
+X	}
+X
+X	if (s_keyboard) return -1;
+X
+X	len=strlen(buf);
+X	if (len > 0 && buf[len - 1] == NL) buf[--len] = NUL;
+X
+X#ifdef DEC_DEBUG
+X	if (state != ostate) {
+X	    msg("%s->%s - '%.30s'", state_tbl[ostate&0xf], state_tbl[state&0xf], buf);
+X	    user_delay(2);
+X	    ostate = state;
+X	}
+X#endif
+X	switch (state) {
+X
+X	 case NEW_BEGIN:
+X	    if (out != NULL) {
+X		uud_end();
+X		user_delay(5);
+X	    }
+X	    new_file();
+X	    /* fall thru */
+X
+X	 case FIND_BEGIN:
+X	 case FIND_BEGIN_AFTER_ERROR:
+X	 case FIND_BEGIN_AFTER_INCLUDE:
+X	    set_prefix = decode_skip_prefix;
+X	    if (strncmp_skip(buf, "table", 5) == 0) {
+X		gettable(in);
+X		continue;
+X	    }
+X
+X	    if (strncmp_skip(buf, "begin", 5)) continue;
+X
+X	    line = buf + prefix_lgt;
+X
+X	    if (state == FIND_BEGIN_AFTER_INCLUDE) {
+X		if(sscanf(line,"begin part %1s%s", part, arcname) != 2) {
+X		    msg("Invalid 'begin' line after 'include'");
+X		    continue;
+X		}
+X		partn++;
+X		if (partn > 'z') partn = 'a';
+X		if (part[0] != partn) {
+X		    msg("PARTS NOT IN SEQUENCE: %s -- removed", arcname);
+X		    user_delay(5);
+X		    fclose(out);
+X		    unlink(ofname);
+X		    new_file();
+X		    state = FIND_BEGIN_AFTER_ERROR;
+X		    goto err;
+X		}
+X	    } else {
+X		if(sscanf(line,"begin%o%s", &mode, arcname) != 2)
+X		    continue;
+X
+X		if (target != NULL)
+X		    sprintf(ofname, "%s%s", target, arcname);
+X		else
+X		    strcpy(ofname, arcname);
+X
+X		if ((out = open_file(ofname, OPEN_CREATE)) == NULL) {
+X		    msg("Cannot create file: %s", ofname);
+X		    goto err;
+X		}
+X		chmod(ofname, mode);
+X
+X		if (decode_header_file)
+X		    store_header(ah, in, target, decode_header_file);
+X	    }
+X
+X	    state = DECODE_TEXT;
+X	    continue;
+X
+X	 case SKIP_LEADING:
+X	    if (len > prefix_lgt &&
+X		(!prefix_lgt || strncmp(buf, prefix_str, prefix_lgt) == 0)) {
+X		state = decode_line(buf + prefix_lgt, len - prefix_lgt, 1);
+X		if (state == DECODE_TEXT) {
+X		    if (++lead_check == MIN_DECODE_LEADING) {
+X			fseek(in, start_offset, 0);
+X			continue;
+X		    }
+X		    state = SKIP_LEADING;
+X		    continue;
+X		}
+X	    } else {
+X		set_prefix = decode_skip_prefix;
+X		if (strncmp_skip(buf, "begin", 5) == 0 ||
+X		    strncmp_skip(buf, "table", 5) == 0)
+X		    state = NEW_BEGIN;
+X	    }
+X
+X	    lead_check = 0;
+X	    start_offset = ftell(in);
+X	    continue;
+X
+X	 case DECODE_TEXT:
+X	    if (len <= prefix_lgt ||
+X		(prefix_lgt > 0 && strncmp(buf, prefix_str, prefix_lgt))) {
+X		state = SKIP_TRAILING;
+X		continue;
+X	    }
+X	    if (onedone == 0) {
+X		msg("Decoding%s: %s (part %d)",
+X		    prefix_lgt ? " & Unsharing" : "", arcname, ++arcpart);
+X
+X		onedone = 1;
+X	    }
+X	    state = decode_line(buf + prefix_lgt, len - prefix_lgt, 0);
+X	    continue;
+X
+X	 case FOUND_END:
+X	    real_size = ftell(out);
+X	    fclose(out);
+X
+X	    if (ftell(in) >= ah->lpos || fgets(buf, sizeof buf, in) == NULL) {
+X		new_file();
+X		break;
+X	    }
+X
+X	    if ((!prefix_lgt || strncmp(buf, prefix_str, prefix_lgt) == 0) &&
+X		sscanf(buf + prefix_lgt, "size%ld", &expect_size) == 1 &&
+X		real_size != expect_size) {
+X
+X		msg("%s decoded with wrong size %ld (exp. %ld)",
+X		    arcname, real_size, expect_size);
+X		user_delay(3);
+X	    } else {
+X		msg("%s complete", arcname);
+X		user_delay(1);
+X	    }
+X
+X	    new_file();
+X	    state = NEW_BEGIN;
+X	    continue;
+X
+X	 case FOUND_INCLUDE:
+X	    state = FIND_BEGIN_AFTER_INCLUDE;
+X	    return 0;
+X
+X	 case SKIP_TRAILING:
+X	    state = SKIP_LEADING;
+X	    return 0;
+X
+X	 case DECODE_ERROR:
+X	    state = SKIP_TRAILING;
+X	    continue;
+X
+X	 case OTHER_ERROR:
+X	    fclose(out);
+X	    new_file();
+X	    state = FIND_BEGIN_AFTER_ERROR;
+X	    goto err;
+X	}
+X
+X	break;	/* break in switch => break in loop */
+X    }
+X
+X    if (onedone) {
+X	if (state == DECODE_TEXT) state = SKIP_LEADING;
+X	return 0;
+X    }
+X
+X    if (state == FIND_BEGIN_AFTER_ERROR) return -1;
+X    msg("No 'begin' line");
+X
+X err:
+X    user_delay(2);
+X    return -1;
+X}
+END_OF_FILE
+  if test 10831 -ne `wc -c <'decode.c'`; then
+    echo shar: \"'decode.c'\" unpacked with wrong size!
+  fi
+  # end of 'decode.c'
+fi
+if test -f 'digest.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'digest.c'\"
+else
+  echo shar: Extracting \"'digest.c'\" \(7597 characters\)
+  sed "s/^X//" >'digest.c' <<'END_OF_FILE'
+X/*
+X *	(c) Copyright 1990, Kim Fabricius Storm.  All rights reserved.
+X *
+X *	Digest article handling
+X */
+X
+X#include "config.h"
+X#include "news.h"
+X#include "debug.h"
+X
+X#ifdef DG_TEST
+X
+X#define TEST(fmt, x, y) if (Debug & DG_TEST) printf(fmt, x, y)
+X
+X#else
+X
+X#define TEST(fmt, x, y)
+X
+X#endif
+X
+X#define UNIFY 040
+X
+Xstatic char digest_pattern[] = "igest";
+X
+Xinit_digest_parsing()
+X{
+X    register char *m;
+X
+X    for (m = digest_pattern; *m; m++) *m |= UNIFY;
+X}
+X
+X
+Xis_digest()
+X{
+X    register char *subject;
+X    register char c, *q, *m;
+X
+X    if ((subject = news.ng_subj) == NULL) return 0;
+X
+X    while (c = *subject++) {
+X	if ((c | UNIFY) != ('d' | UNIFY)) continue;
+X
+X	q = subject; m = digest_pattern;
+X	while ((c = *m++) && (*q++ | UNIFY) == c);
+X	if (c == NUL) return 1;
+X    }
+X    return 0;
+X}
+X
+X
+X/*
+X * expect that f is positioned at header of an article
+X */
+X
+Xstatic int is_mmdf_folder = 0;
+X
+Xget_digest_article(f, hdrbuf)
+XFILE *f;
+Xnews_header_buffer hdrbuf;
+X{
+X    int cont;
+X
+X    digest.dg_hpos = ftell(f);
+X    TEST("GET DIGEST hp=%ld\n", digest.dg_hpos, 0);
+X
+X    do {
+X	if (!parse_digest_header(f, 0, hdrbuf)) return -1;
+X	digest.dg_fpos = ftell(f);
+X	TEST("END HEADER hp=%ld fp=%ld\n", digest.dg_hpos, digest.dg_fpos);
+X    } while ((cont = skip_digest_body(f)) < 0);
+X
+X    TEST("END BODY lp=%ld next=%ld\n", digest.dg_lpos, ftell(f));
+X
+X    return cont;
+X}
+X
+X#define BACKUP_LINES	 50	/* remember class + offset for parsed lines */
+X
+X#define	LN_BLANK	0x01	/* blank line */
+X#define	LN_DASHED	0x02	/* dash line */
+X#define	LN_HEADER	0x04	/* (possible) header line */
+X#define	LN_ASTERISK	0x08	/* asterisk line (near end) */
+X#define	LN_END_OF	0x10	/* End of ... line */
+X#define	LN_TEXT		0x20	/* unclassified line */
+X
+X
+X/*
+X * skip until 'Subject: ' (or End of digest) line is found
+X * then backup till start of header
+X */
+X
+X/*
+X * Tuning parameters:
+X *
+X *	MIN_HEADER_LINES:	number of known header lines that must
+X *				be found in a block to identify a new
+X *				header
+X *
+X *	MAX_BLANKS_DASH		max no of blanks on a 'dash line'
+X *
+X *	MIN_DASHES		min no of dashes on a 'dash line'
+X *
+X *	MAX_BLANKS_ASTERISKS	max no of blanks on an 'asterisk line'
+X *
+X *	MIN_ASTERISKS		min no of asterisks on an 'asterisk line'
+X *
+X *	MAX_BLANKS_END_OF	max no of blanks before "End of "
+X */
+X
+X#define	MIN_HEADER_LINES	2
+X#define	MAX_BLANKS_DASH		3
+X#define	MIN_DASHES		16
+X#define	MAX_BLANKS_ASTERISK	1
+X#define	MIN_ASTERISKS		10
+X#define	MAX_BLANKS_END_OF	1
+X
+Xskip_digest_body(f)
+Xregister FILE *f;
+X{
+X    off_t  backup_p[BACKUP_LINES];
+X    int	   line_type[BACKUP_LINES];
+X    register int backup_index, backup_count;
+X    int    more_header_lines, end_or_asterisks, blanks;
+X    char   line[1024];
+X    register char *cp;
+X    char **dg_hdr_field();
+X
+X#define	decrease_index()	\
+X    if (--backup_index < 0) backup_index = BACKUP_LINES - 1
+X
+X    backup_index = -1;
+X    backup_count = 0;
+X    end_or_asterisks = 0;
+X
+X    digest.dg_lines = 0;
+X
+X
+X next_line:
+X    more_header_lines = 0;
+X
+X next_possible_header_line:
+X    digest.dg_lines++;
+X
+X    if (++backup_index == BACKUP_LINES) backup_index = 0;
+X    if (backup_count < BACKUP_LINES) backup_count++;
+X
+X    backup_p[backup_index] = ftell(f);
+X    line_type[backup_index] = LN_TEXT;
+X
+X    if (fgets(line, 1024, f) == NULL) {
+X	TEST("end_of_file, bc=%d, lines=%d\n", backup_count, digest.dg_lines);
+X
+X	if (is_mmdf_folder) {
+X	    digest.dg_lpos = backup_p[backup_index];
+X	    is_mmdf_folder = 0;
+X	    return 0;
+X	}
+X
+X	/* end of file => look for "****" or "End of" line */
+X
+X	if (end_or_asterisks)
+X	    while (--backup_count >= 0) {
+X		--digest.dg_lines;
+X		decrease_index();
+X		if (line_type[backup_index] & (LN_ASTERISK | LN_END_OF)) break;
+X	    }
+X
+X	if (digest.dg_lines == 0) return 0;
+X
+X	while (--backup_count >= 0) {
+X	    --digest.dg_lines;
+X	    digest.dg_lpos = backup_p[backup_index];
+X	    decrease_index();
+X	    if ((line_type[backup_index] &
+X		(LN_ASTERISK | LN_END_OF | LN_BLANK | LN_DASHED)) == 0)
+X		break;
+X	}
+X
+X	return 0;	/* no article follows */
+X    }
+X
+X    TEST("\n>>%-.50s ==>>", line, 0);
+X
+X    if (line[0] == '\001' && strcmp(line, "\001\001\001\001\n") == 0) {
+X	digest.dg_lpos = backup_p[backup_index];
+X	if (!is_mmdf_folder) fseek(f, digest.dg_lpos, 0);
+X	--digest.dg_lines;
+X	is_mmdf_folder = 0;
+X	return (digest.dg_lines <= 0) ? -1 : 1;
+X    }
+X
+X    if (is_mmdf_folder) goto next_line;
+X
+X    for (cp = line; *cp && isascii(*cp) && isspace(*cp); cp++);
+X
+X    if (*cp == NUL) {
+X	TEST("BLANK", 0, 0);
+X	line_type[backup_index] = LN_BLANK;
+X	goto next_line;
+X    }
+X
+X    blanks = cp - line;
+X
+X    if (*cp == '-') {
+X	if (blanks > MAX_BLANKS_DASH) goto next_line;
+X
+X	while (*cp == '-') cp++;
+X	if (cp - line - blanks > MIN_DASHES) {
+X	    while (*cp && (*cp == '-' || (isascii(*cp) && isspace(*cp)))) cp++;
+X	    if (*cp == NUL) {
+X		TEST("DASHED", 0, 0);
+X
+X		line_type[backup_index] = LN_DASHED;
+X	    }
+X
+X	}
+X	goto next_line;
+X    }
+X
+X    if (*cp == '*') {
+X	if (blanks > MAX_BLANKS_ASTERISK) goto next_line;
+X
+X	while (*cp == '*') cp++;
+X	if (cp - line - blanks > MIN_ASTERISKS) {
+X	    while (*cp && (*cp == '*' || (isascii(*cp) && isspace(*cp)))) cp++;
+X	    if (*cp == NUL) {
+X		TEST("ASTERISK", 0, 0);
+X		line_type[backup_index] = LN_ASTERISK;
+X		end_or_asterisks++;
+X	    }
+X	}
+X	goto next_line;
+X    }
+X
+X    if (blanks <= MAX_BLANKS_END_OF &&
+X	*cp == 'E' && strncmp(cp, "End of ", 7) == 0) {
+X	TEST("END_OF_", 0, 0);
+X	line_type[backup_index] = LN_END_OF;
+X	end_or_asterisks++;
+X	goto next_line;
+X    }
+X
+X    if (blanks == 0) {
+X	if (dg_hdr_field(line, 0)) {
+X	    TEST("HEADER", 0, 0);
+X
+X	    line_type[backup_index] = LN_HEADER;
+X	    if (++more_header_lines < MIN_HEADER_LINES)
+X		goto next_possible_header_line;
+X
+X	    /* found block with MIN_HEADER_LINES */
+X
+X	    /* search for beginning of header */
+X
+X	    TEST("\nSearch for start of header\n", 0, 0);
+X
+X	    for (;;) {
+X		fseek(f, backup_p[backup_index], 0);
+X		--digest.dg_lines;
+X		if (--backup_count == 0) break;
+X		decrease_index();
+X		if ((line_type[backup_index] & (LN_HEADER | LN_TEXT)) == 0)
+X		    break;
+X	    }
+X
+X	    if (digest.dg_lines == 0) {
+X		TEST("Skipped empty article\n", 0, 0);
+X		return -1;
+X	    }
+X
+X	    for (;;) {
+X		digest.dg_lpos = backup_p[backup_index];
+X		if (--backup_count < 0) break;
+X		decrease_index();
+X		if ((line_type[backup_index] & (LN_BLANK | LN_DASHED)) == 0)
+X		    break;
+X		--digest.dg_lines;
+X	    }
+X
+X	    return (digest.dg_lines == 0) ? -1 : 1;
+X	}
+X	goto next_possible_header_line;
+X    }
+X
+X    goto next_line;
+X}
+X
+X
+Xparse_digest_header(f, all, hdrbuf)
+XFILE *f;
+Xint all;
+Xnews_header_buffer hdrbuf;
+X{
+X    extern char *parse_header(), **dg_hdr_field();
+X
+X    digest.dg_date = digest.dg_from = digest.dg_subj = digest.dg_to = NULL;
+X
+X    parse_header(f, dg_hdr_field, all, hdrbuf);
+X
+X    return digest.dg_from || digest.dg_subj;
+X}
+X
+X
+Xstatic char **dg_hdr_field(lp, all)
+Xregister char *lp;
+Xint all;
+X{
+X
+X#define check(name, lgt, field) \
+X    if (isascii(lp[lgt]) && isspace(lp[lgt]) && strncmp(name, lp, lgt) == 0) {\
+X	TEST("MATCH: field ", 0, 0); \
+X	return &digest.field; \
+X    }
+X
+X
+X    TEST("\nPARSE[%.20s] ==>> ", lp, 0);
+X
+X    switch (*lp++) {
+X
+X     case '\001':
+X	if (!is_mmdf_folder && strncmp(lp, "\001\001\001\n", 4) == 0) {
+X	    is_mmdf_folder = 1;
+X	    digest.dg_hpos += 5;
+X	    return NULL;
+X	}
+X	break;
+X
+X     case 'D':
+X     case 'd':
+X	check("ate:",	4, dg_date);
+X	break;
+X
+X     case 'F':
+X     case 'f':
+X	check("rom:",	4, dg_from);
+X	break;
+X
+X     case 'R':
+X     case 'r':
+X	if (!all) break;
+X	check("e:",	2, dg_subj);
+X	break;
+X
+X     case 'S':
+X     case 's':
+X	check("ubject:", 7, dg_subj);
+X	check("ubject",	6, dg_subj);
+X	break;
+X
+X     case 'T':
+X     case 't':
+X	check("itle:",	5, dg_subj);
+X	if (!all) break;
+X	check("o:",	2, dg_to);
+X	break;
+X    }
+X
+X#undef check
+X    TEST("NOT MATCHED ", 0, 0);
+X
+X    return NULL;
+X}
+END_OF_FILE
+  if test 7597 -ne `wc -c <'digest.c'`; then
+    echo shar: \"'digest.c'\" unpacked with wrong size!
+  fi
+  # end of 'digest.c'
+fi
+echo shar: End of archive 17 \(of 22\).
+cp /dev/null ark17isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 22 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still must unpack the following archives:
+    echo "        " ${MISSING}
+fi
+exit 0
+
+exit 0 # Just in case...

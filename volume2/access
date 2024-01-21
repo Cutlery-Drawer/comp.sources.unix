@@ -1,0 +1,1653 @@
+Date: Wed, 26 Jun 85 11:39:25 edt
+From: linus!security!jjg (Jeff Glass)
+Subject: source for access control lists
+
+
+This should be everything you need to install access control lists under 4.2bsd.
+
+create a directory somewhere to hold this stuff.  run the rest of this
+through sh .  then follow the instructions in README.
+
+------------ cut here -------------
+#! /bin/sh
+echo x - Makefile
+cat >Makefile <<'!E!O!F!'
+CFLAGS = -O
+ALL = edacl lsacl chacl cpacl
+BINDIR = /usr/local
+
+# .l (man page) files confuse make, which thinks they are lex programs
+.SUFFIXES :
+.SUFFIXES : .out .o .c .e .r .f .y .s .p
+
+all : ${ALL}
+
+edacl :
+	cp edacl.sh edacl
+
+lsacl : lsacl.o
+	cc lsacl.o -o lsacl
+
+chacl : chacl.o
+	cc chacl.o -o chacl
+
+cpacl : cpacl.o
+	cc cpacl.o -o cpacl
+
+clean :
+	rm -f *.o core a.out ${ALL}
+
+man :
+	cp chacl.l cpacl.l edacl.l lsacl.l /usr/man/manl
+	cp getacl.2 setacl.2 /usr/man/man2
+
+install : ${ALL}
+	for i in ${ALL} ; do install -m 755 $$i ${BINDIR} ; done
+!E!O!F!
+echo x - README
+cat >README <<'!E!O!F!'
+This should explain how to install the mods for access control lists.
+I am writing this after the fact, though, so if I have forgotten anything,
+let me know.
+
+0) after unpacking, you should have the files
+
+	README		README.kernel
+	h.pat		sys.pat
+	acl.h		acl.c
+	getacl.2	setacl.2
+	login.pat
+
+	Makefile	jjg.h
+	chacl.c		chacl.l
+	cpacl.c		cpacl.l
+	edacl.sh	edacl.l
+	lsacl.c		lsacl.l
+
+1) h.pat and sys.pat are patches to files in the /sys/h and /sys/sys
+   directories.  if you have the patch program, then
+
+	( cd /sys/h ; patch ) < h.pat
+	( cd /sys/sys ; patch ) < sys.pat
+
+   otherwise you will have to apply the patches to the files by hand.
+
+2) install the files acl.h and acl.c in /sys/h and /sys/sys , respectively.
+
+3) make and install the new kernel.  brief instructions are in README.kernel .
+
+4) edit the Makefile and change BINDIR to whatever.  then "make install"
+   to get the programs chacl cpacl edacl lsacl .
+
+5) login.pat is a patch to /usr/src/bin/login.c , to make login clear
+   the acl on the user's terminal.  patch, make, and install login .
+
+6) install the man pages;  "make man" will do it.
+
+7) reboot.
+
+8) read the man pages for the programs, and try them out.
+
+9) please send comments, fixes, improvements, and (mild) flames back
+   to me - linus!security!jjg .
+!E!O!F!
+echo x - README.kernel
+cat >README.kernel <<'!E!O!F!'
+This is a brief set of instructions for installing the system calls getacl()
+and setacl().  It is intended for people like me, who have never hacked the
+kernel much before. 
+
+1) add the routines "getacl" and "setacl" to the standard library.
+   for the VAX, this requires that you:
+
+	a) create the files getacl.c and setacl.c in
+	   /usr/src/lib/libc/vax/sys .  copy one of the existing
+	   files there (like read.c) to get the format.
+
+	b) update the Makefile in that directory.  add "getacl.o"
+	   and "setacl.o" to the definition of the OBJS variable.
+
+	c) add the two lines
+		
+		#define SYS_getacl	151
+		#define SYS_setacl	152
+
+	   to the end of the file /usr/include/syscall.h .  change "151"
+	   and "152" to whatever are the next two numbers.
+
+	d) cd to /usr/src/lib/libc , and "make" .  then "make install".
+
+2) add the names of the new system calls ( "getacl" and "setacl" ) to
+   the end of the array syscallnames in /sys/sys/syscalls.c .
+
+3) in /sys/sys/init_sysent.c , declare getacl() and setacl() as int functions,
+   and add the two lines 
+   
+	3, getacl,	/* 151 = getacl */
+	3, setacl,	/* 152 = setacl */
+
+   to the end of the sysent array declaration.
+
+4) cd to /sys/conf , add the one line
+
+	sys/acl.c	standard
+
+   to the file /sys/conf/files , and run "/etc/config MACH",
+   where MACH is your machine's name.
+
+5) cd to ../MACH and "make depend", and "make".
+
+6) install vmunix in / .
+
+!E!O!F!
+echo x - TODO
+cat >TODO <<'!E!O!F!'
+1) put lsacl(1) into ls(1) .  ls needs a "-A" option :-)
+
+2) make cp(1) copy the file's acl to the destination file.
+
+3) when execve(2) is checking for any IEXEC permission
+   ( i.e., "(ip->i_mode & (IEXEC|IEXEC>>3|IEXEC>>6) == 0)" ),
+   check for an acl entry which has IEXEC permission.
+
+4) come up with a default acl when creating files and directories.
+   Multics allows defaults at the user/directory level.  a compromise
+   might be to allow a default at the user level, and store it in the
+   u area, ala umask(2).
+
+5) increase the size of an acl.  this requires putting the acl somewhere
+   other than the inode, or increasing the size of the inode beyond 128 bytes.
+
+
+!E!O!F!
+echo x - acl.c
+cat >acl.c <<'!E!O!F!'
+#include "../h/param.h"
+#include "../h/systm.h"
+#include "../h/dir.h"
+#include "../h/inode.h"
+#include "../h/user.h"
+#include "../h/nami.h"
+#include "../h/acl.h"
+
+#define FOLLOW_LINK 1
+
+/*
+ * pack_acle() copies an acle struct into the inode.  the acle is packed
+ * since the inode is rather short of space.
+ */
+pack_acle( ip, a, n )
+struct inode *ip;
+struct acle a;
+int n;
+{
+	/* clear the type and mode fields */
+	ip->i_acle[n/2] &= 017 << ((n%2) ? 4 : 0);
+
+	/* set the type, mode, and id fields */
+	ip->i_acle[n/2] |= ( a.a_type != A_GROUP ? A_USER : A_GROUP ) <<
+		((n%2) ? 3 : 7);
+	ip->i_acle[n/2] |= ( a.a_mode & 07 ) << ((n%2) ? 0 : 4);
+	ip->i_aclid[n] = a.a_id;
+}
+
+/*
+ * null_acle() puts an end-of-acl marker in the acl at entry n.
+ * the end-of-acl marker looks like an acl entry for root
+ * (a_type == A_USER  && a_id == 0).
+ */
+null_acle( ip, n )
+struct inode *ip;
+int n;
+{
+	/* clear the type and mode fields */
+	ip->i_acle[n/2] &= 017 << ((n%2) ? 4 : 0);
+
+	/* clear the id field */
+	ip->i_aclid[n] = 0;
+}
+
+/*
+ * getacl() returns the set of acl entries associated with the file.
+ * the user must be able to access the file in order to read the acl.
+ */
+getacl()
+{
+	struct inode *ip;
+	struct acle ka[MAXACL];
+	struct a {
+		char *fname;
+		int n_acle;
+		struct acle *acle_p;
+	} *uap = (struct a *) u.u_ap;
+	int i;
+
+	if ( (ip = namei(uchar,LOOKUP,FOLLOW_LINK)) != NULL ) {
+		/* unpack the acl entries */
+		for (i = 0; i < MAXACL && ok_acle(ip,i); i++ ) {
+			ka[i].a_type = acle_type( ip, i );
+			ka[i].a_mode = acle_mode( ip, i );
+			ka[i].a_id = acle_id( ip, i );
+		}
+
+		/* getacl doesn't need the inode any more. */
+		iput( ip );
+
+		if ( uap->n_acle < i ) {
+			u.u_error = EINVAL;
+		} else {
+			/*
+			 * copy the acl entries to the user's buffer,
+			 * and return the number of entries found.
+			 */
+			u.u_error = copyout((caddr_t) ka, (caddr_t) uap->acle_p,
+				i*sizeof(struct acle));
+			if ( u.u_error == 0 ) u.u_r.r_val1 = i;
+		}
+	}
+}
+
+/*
+ * setacl() defines the acl for an inode.  to do this, the user must
+ * be the owner of the inode, or else must be the superuser.
+ *
+ * bugs: acl entries should be sorted by a_type , so that access() does
+ * not have to read the entire acl three times.  since the number of acl
+ * entries is so small, though, this would make setacl() more complex
+ * (sorting the entries) without really buying that much.
+ */
+setacl()
+{
+	struct inode *ip;
+	struct acle ka[MAXACL];
+	int kn;
+	struct a {
+		char *fname;
+		int n_acle;
+		struct acle *acle_p;
+	} *uap = (struct a *) u.u_ap;
+	int i;
+
+	/*
+	 * copy the user's arguments into kernel space; kn will contain
+	 * the number of acl entries, and ka will contain the entries.
+	 */
+	if ( (kn = uap->n_acle) > MAXACL ) {
+		u.u_error = EINVAL;
+	} else {
+		u.u_error = copyin( (caddr_t) uap->acle_p, (caddr_t) ka,
+			kn*sizeof(struct acle) );
+		if ( u.u_error == 0 ) {
+			if ( (ip = owner(FOLLOW_LINK)) != NULL ) {
+				for ( i = 0; i < kn; i++ ) {
+					pack_acle( ip, ka[i], i );
+					if (! ok_acle(ip,i) ) break;
+				}
+
+				if ( kn < MAXACL ) null_acle( ip, kn );
+
+				/* update ctime for the inode */
+				ip->i_flag |= ICHG;
+				iput( ip );
+			}
+		}
+	}
+}
+!E!O!F!
+echo x - acl.h
+cat >acl.h <<'!E!O!F!'
+#define A_GROUP	1
+#define A_USER	0
+
+/*
+ * macros to disassemble the packed acl in the inode
+ */
+#ifdef KERNEL
+#define acle_type(ip,n)	( ( (ip)->i_acle[(n)/2] >> (((n)%2) ? 3 : 7) ) & 01 )
+#define acle_id(ip,n)	(ip)->i_aclid[(n)]
+#define acle_mode(ip,n)	( ( (ip)->i_acle[(n)/2] >> (((n)%2) ? 0 : 4) ) & 07 )
+#define ok_acle(ip,n)	( ( acle_type((ip),(n)) != A_USER ) || ( acle_id((ip),(n)) != 0 ) )
+#else
+#define ok_uacle(a)	( ( (a).a_type != A_USER ) || ( (a).a_id != 0 ) )
+#endif
+
+struct acle {
+	char a_type;	/* A_GROUP or A_USER */
+	char a_mode;	/* 0 (no permission) through 7 (rwx) */
+	int a_id;	/* gid or uid, depending */
+};
+!E!O!F!
+echo x - chacl.c
+cat >chacl.c <<'!E!O!F!'
+#include <stdio.h>
+#include <sys/param.h>
+#include <sys/acl.h>
+#include <grp.h>
+#include <pwd.h>
+#include "jjg.h"
+
+#define ERR_FATAL 1	/* for the err() routine */
+#define ERR_NONFATAL 0	/* for the err() routine */
+
+/*
+ * calling sequence: chacl [-u [user mode]] [-g [group mode]] -f [file]
+ *
+ * items enclosed in brackets may repeat.
+ */
+main(argc, argv, environ)
+int argc;
+char *argv[], *environ[];
+{
+	int i, j, na;
+	struct acle acl[MAXACL];
+	int is_u_type;
+	int filec;
+	int status;
+
+	na = 0;
+
+	for ( i = 1; i < argc; i++ ) {
+		if ( equal(argv[i],"-u") || equal(argv[i],"-g") ) {
+			is_u_type = equal( argv[i], "-u" );
+
+		} else if ( equal(argv[i],"-f") ) {
+			break;
+
+		} else if ( *argv[i] == '-' ) {
+			err( ERR_FATAL, "unrecognized option - %s", argv[i] );
+
+		} else {
+			struct passwd *up;
+			struct group *gp;
+			int valid_name;
+
+			if ( is_u_type ) {
+				up = getpwnam( argv[i] );
+				valid_name = up != NULL;
+			} else {
+				gp = getgrnam( argv[i] );
+				valid_name = gp != NULL;
+			}
+
+			if ( valid_name ) {
+				i++;
+
+				if ( i < argc ) {
+					if ( is_u_type && up->pw_uid == 0 ) {
+						err( ERR_NONFATAL, "warning: cannot deny access to user %s", "root" );
+					} else {
+						if ( sscanf( argv[i], "%d", &acl[na].a_mode ) == 1 &&
+							acl[na].a_mode >= 0 && acl[na].a_mode <= 7 ) {
+							if ( na < MAXACL ) {
+								acl[na].a_type = is_u_type ? A_USER : A_GROUP;
+								acl[na].a_id = is_u_type ? up->pw_uid : gp->gr_gid;
+								na++;
+							} else {
+								err( ERR_NONFATAL, "warning: too many acl entries (must be no more than %d)", MAXACL );
+							}
+
+						} else {
+							err( ERR_FATAL, "unrecognizable mode - %d (must be 0-7)", acl[na].a_mode );
+						}
+					}
+
+				} else {
+					err( ERR_FATAL, "expected mode after %sname", is_u_type ? "user" : "group" );
+				}
+			} else {
+				err( ERR_FATAL, is_u_type ? "no such user - %s" : "no such group - %s", argv[i] );
+			}
+		}
+	}
+
+/*	
+	printf( "number of acle = %d\n", na );
+	printf( "file list begins at %d; argc = %d\n", i+1, argc );
+
+	for ( i = 0; i < na; i++ ) {
+		printf( "type = %s id = %d mode = %d\n", acl[i].a_type == A_GROUP ? "-g"
+			: "-u", acl[i].a_id, acl[i].a_mode );
+	}
+*/
+
+	status = 0;
+	for ( filec = i+1; filec < argc; filec++ ) {
+		if ( setacl( argv[filec], na, acl ) != 0 ) {
+			perror( argv[filec] );
+			status++;
+		}
+	}
+	exit( status );
+}
+
+err( level, fmt, arg )
+int level;
+char *fmt, *arg;
+{
+	char buf[240];
+
+	sprintf( buf, fmt, arg );
+	fprintf( stderr, "chacl: %s\n", buf );
+
+	if ( level == ERR_FATAL )
+		exit( 1 );
+}
+!E!O!F!
+echo x - chacl.l
+cat >chacl.l <<'!E!O!F!'
+''' $Header:$
+''' 
+''' $Log:$
+.de Sh
+.br
+.ne 5
+.PP
+\fB\\$1\fR
+.PP
+..
+.de Sp
+.if t .sp .5v
+.if n .sp
+..
+'''
+'''     Set up \*(-- to give an unbreakable dash;
+'''     string Tr holds user defined translation string.
+'''     Bell System Logo is used as a dummy character.
+'''
+.ie n \{\
+.tr \(bs-\*(Tr
+.ds -- \(bs-
+.if (\n(.H=4u)&(1m=24u) .ds -- \(bs\h'-12u'\(bs\h'-12u'-\" diablo 10 pitch
+.if (\n(.H=4u)&(1m=20u) .ds -- \(bs\h'-12u'\(bs\h'-8u'-\" diablo 12 pitch
+.ds L" ""
+.ds R" ""
+.ds L' '
+.ds R' '
+'br\}
+.el\{\
+.ds -- \(em\|
+.tr \*(Tr
+.ds L" ``
+.ds R" ''
+.ds L' `
+.ds R' '
+'br\}
+.TH chacl 1 LOCAL
+.SH NAME
+chacl - change the access control list for files
+.SH SYNOPSIS
+.B chacl
+[-u username mode ...] [-g groupname mode ...] -f file ...
+.SH DESCRIPTION
+.I chacl
+changes the access control lists for one or more files.  The
+access control list (or acl) and the file's ownership are used to determine
+which users can access the file.
+.PP
+The
+.B \-u
+option marks the beginning of a list of "username mode" pairs.
+Similarly, the
+.B \-g
+option marks the beginning of a list of "groupname mode" pairs.
+A "name mode" pair is referred to as an "acl entry".
+The
+.B \-f
+option separates the acl from the list of files involved.
+.PP
+The username or groupname is hunted for in the first field of /etc/passwd
+or /etc/group , respectively.
+The mode is a single digit in the range [0-7] indicating read-write-execute
+permission ala
+.IR chmod .
+.PP
+The current implementation allows up to 8 acl entries.  This is defined
+by the constant MAXACL in <sys/acl.h>.  An entry cannot deny access
+to the superuser.
+Setting a file's acl removes any existing acl entries (i.e., calls to
+.I chacl
+do not accumulate).  Only the owner of a file (or the superuser) can
+change its acl.
+.PP
+Access decisions are made in the following way.
+.Sp
+	If the effective userid (euid) is the superuser, grant access.
+.Sp
+	Else if the euid is the file's owning uid, check the owner permission.
+.Sp
+	Else if the euid matches an acl entry,
+check the entry's mode.
+.Sp
+	Else if the effective groupid (egid) matches an acl entry,
+check the entry's mode.
+.Sp
+	Else if some member of the group list matches an acl entry,
+check the entry's mode.
+.Sp
+	Else if the egid is the file's owning gid, check the group permission.
+.Sp
+	Else if some member of the group list matches the file's owning gid,
+check the group permission.
+.Sp
+	Else check the other permission.
+.PP
+Order within the acl is important.  When matching against the acl, entries
+are checked in order, stopping at the first match.  (Multiple matches could
+only occur in group acl entries.)
+.SH EXAMPLES
+	chacl -u jjg 7 -g d75 0 -f gossip
+.Sp
+grants full access to the file "gossip" to the user "jjg", and denies all
+access to this file to the group "d75".
+.Sp
+	chacl -f rumors
+.Sp
+resets the acl for the file "rumors".
+.Sp
+	chacl -u jjg 6 uucp 4 -f facts
+.Sp
+grants read-write access to the user "jjg" and read access to the user
+"uucp" for the file "facts".
+.SH DIAGNOSTICS
+Various messages indicate syntactic errors in the command line arguments.
+Minor errors are flagged with a "warning:", and indicate that
+.I chacl
+carried on and set the access control lists for the files.
+.PP
+.I chacl
+returns with exit status 0 if all is well;  with exit status 1 if there
+are errors in the command line arguments;  or with exit status greater
+than 0 if the acls for some files could not be set.
+.SH SEE ALSO
+cpacl(1),
+edacl(1),
+lsacl(1),
+getacl(2),
+setacl(2)
+.SH CAVEAT
+The implementation of access control lists is an experiment.  This
+implementation stores the access control list in a (formerly) unused field
+in the inode.
+There is no guarantee that future versions of Unix will not use this field
+for something else.
+.PP
+Therefore, you should only use access control lists with the full
+understanding that you are participating in an experiment.
+.SH BUGS
+Allowing wildcards in the acl entry's name would be useful.
+!E!O!F!
+echo x - cpacl.c
+cat >cpacl.c <<'!E!O!F!'
+#include <stdio.h>
+#include <sys/param.h>
+#include <sys/acl.h>
+
+/*
+ * cpacl : copy the access control list of one file to other files.
+ *
+ * usage : cpacl fromfile tofile [tofile ...]
+ */
+main(argc, argv, environ)
+int argc;
+char *argv[], *environ[];
+{
+	int i;
+	struct acle acl[MAXACL];
+	int status;
+	int na;
+
+	status = 0;
+
+	if ( argc > 1 ) {
+		if ( (na = getacl(argv[1],MAXACL,acl)) != -1 ) {
+			for ( i = 2; i < argc; i++ ) {
+				if ( setacl( argv[i], na, acl ) != 0 ) {
+					perror( argv[i] );
+					status++;
+				}
+			}
+		} else {
+			perror( argv[1] );
+			status++;
+		}
+	} else {
+		fprintf( stderr, "cpacl: usage: cpacl fromfile tofile [tofile ...]\n" );
+	}
+
+	exit( status );
+}
+!E!O!F!
+echo x - cpacl.l
+cat >cpacl.l <<'!E!O!F!'
+''' $Header:$
+''' 
+''' $Log:$
+.de Sh
+.br
+.ne 5
+.PP
+\fB\\$1\fR
+.PP
+..
+.de Sp
+.if t .sp .5v
+.if n .sp
+..
+'''
+'''     Set up \*(-- to give an unbreakable dash;
+'''     string Tr holds user defined translation string.
+'''     Bell System Logo is used as a dummy character.
+'''
+.ie n \{\
+.tr \(bs-\*(Tr
+.ds -- \(bs-
+.if (\n(.H=4u)&(1m=24u) .ds -- \(bs\h'-12u'\(bs\h'-12u'-\" diablo 10 pitch
+.if (\n(.H=4u)&(1m=20u) .ds -- \(bs\h'-12u'\(bs\h'-8u'-\" diablo 12 pitch
+.ds L" ""
+.ds R" ""
+.ds L' '
+.ds R' '
+'br\}
+.el\{\
+.ds -- \(em\|
+.tr \*(Tr
+.ds L" ``
+.ds R" ''
+.ds L' `
+.ds R' '
+'br\}
+.TH CPACL 1 LOCAL
+.SH NAME
+cpacl - copy the access control list of one file to other files
+.SH SYNOPSIS
+.B cpacl
+fromfile tofile [tofile ...]
+.SH DESCRIPTION
+.I cpacl
+copies the access control list of a file to the access control lists of
+one or more other files.  The access control list
+and the file's ownership are used to determine which users can access
+the file.
+.PP
+.I cpacl
+gets the access control list for fromfile, and copies this acl to the acl
+for each tofile.
+.SH DIAGNOSTICS
+.I cpacl
+returns with exit status 0 if all is well;  with exit status 1 if it
+could not get the access control list for fromfile; or with exit status
+greater than 0 if the access control lists for some tofiles could not
+be set.
+.SH SEE ALSO
+chacl(1),
+edacl(1),
+lsacl(1),
+getacl(2),
+setacl(2)
+.SH CAVEAT
+The implementation of access control lists is an experiment.  This
+implementation stores the access control list in a (formerly) unused field
+in the inode.
+There is no guarantee that future versions of Unix will not use this field
+for something else.
+.PP
+Therefore, you should only use access control lists with the full
+understanding that you are participating in an experiment.
+.SH BUGS
+The entire mechanism hasn't been fully tested.
+!E!O!F!
+echo x - edacl.l
+cat >edacl.l <<'!E!O!F!'
+''' $Header:$
+''' 
+''' $Log:$
+.de Sh
+.br
+.ne 5
+.PP
+\fB\\$1\fR
+.PP
+..
+.de Sp
+.if t .sp .5v
+.if n .sp
+..
+'''
+'''     Set up \*(-- to give an unbreakable dash;
+'''     string Tr holds user defined translation string.
+'''     Bell System Logo is used as a dummy character.
+'''
+.ie n \{\
+.tr \(bs-\*(Tr
+.ds -- \(bs-
+.if (\n(.H=4u)&(1m=24u) .ds -- \(bs\h'-12u'\(bs\h'-12u'-\" diablo 10 pitch
+.if (\n(.H=4u)&(1m=20u) .ds -- \(bs\h'-12u'\(bs\h'-8u'-\" diablo 12 pitch
+.ds L" ""
+.ds R" ""
+.ds L' '
+.ds R' '
+'br\}
+.el\{\
+.ds -- \(em\|
+.tr \*(Tr
+.ds L" ``
+.ds R" ''
+.ds L' `
+.ds R' '
+'br\}
+.TH EDACL 1 LOCAL
+.SH NAME
+edacl - edit the access control lists for files
+.SH SYNOPSIS
+.B edacl
+file ...
+.SH DESCRIPTION
+.I edacl
+edits the access control lists for one or more files.  The access control list
+and the file's ownership are used to determine which users can access
+the file.
+.PP
+For each file,
+.I edacl
+invokes the editor of your choice on the access control list of that file.
+The first line has the name of the file whose acl is being edited.
+The following lines contain the acl entries.  
+.PP
+Each acl entry has three fields.  The first field is either the string "user"
+or "group".
+The second field is a user or group name;  which it is depends on the
+value of the first field.  The last field is the mode granted to that
+user or group.  It is a single digit in the range [0-7],
+indicating read-write-execute permission ala
+.IR chmod .
+.PP
+You may add, change, or delete entries.  Upon exiting the editor,
+.I edacl
+will ask you if you wish to update the acl for that file.
+.SH DIAGNOSTICS
+.I edacl
+calls
+.I lsacl(1)
+and
+.I chacl(1)
+to do the dirty work;  see the DIAGNOSTICS sections in their documentation.
+.SH ENVIRONMENT VARIABLES
+If the EDITOR variable is set,
+.I edacl
+assumes it contains the name of your desired editor.  Otherwise,
+.I edacl
+will ask you which one to use.
+.SH SEE ALSO
+chacl(1),
+cpacl(1),
+lsacl(1),
+getacl(2),
+setacl(2)
+.SH CAVEAT
+The implementation of access control lists is an experiment.  This
+implementation stores the access control list in a (formerly) unused field
+in the inode.
+There is no guarantee that future versions of Unix will not use this field
+for something else.
+.PP
+Therefore, you should only use access control lists with the full
+understanding that you are participating in an experiment.
+.SH BUGS
+The entire mechanism hasn't been fully tested.
+.PP
+It might be nice if the mode were given symbolically ("rwx" instead
+of "7").
+!E!O!F!
+echo x - edacl.sh
+cat >edacl.sh <<'!E!O!F!'
+#! /bin/csh -f
+
+set path = ( /usr/new /usr/local /usr/ucb /usr/bin /bin . )
+setenv PATH  /usr/new:/usr/local:/usr/ucb:/usr/bin:/bin:.
+unset noclobber
+set noglob
+
+set DEF_ED = /usr/ucb/vi
+# WS == WhiteSpace ; WF == WordForming ; NF == NumberForming .
+set WS = "[ 	][ 	]*"
+set WSO = "[ 	]*"
+set WF = "[a-zA-Z][a-zA-Z0-9]*"
+set NF = "[0-9][0-9]*"
+
+foreach i ( $argv[*]:q )
+	set acl_file = "/tmp/edacl_${i:t}_$$"
+	lsacl "$i" > "$acl_file"
+
+	if ( $status == 0 ) then
+		set state = edit
+		while 1
+			switch ( $state )
+			case edit :
+				if ( ! $?EDITOR ) then
+					echo -n "edacl: editor [$DEF_ED] : "
+					set EDITOR = $<
+					if ( "_$EDITOR" == "_" ) set EDITOR = $DEF_ED
+				endif
+
+				/bin/sh -c "$EDITOR '$acl_file'"
+
+				if ( $status == 0 ) then
+					set state = prompt
+				else
+					unset EDITOR
+					unsetenv EDITOR
+				endif
+
+				breaksw
+
+			case prompt :
+				echo -n edacl: update acl for "$i" "? [yne] "
+				set response = $<
+
+				if ( "_$response" == "_" || "_$response" =~ _y* ) then
+					set state = update
+				else if ( "_$response" =~ _e* ) then
+					set state = edit
+				else if ( "_$response" =~ _n* ) then
+					set state = noupdate
+				else
+					echo "Yes - update acl;  No - opposite of Yes;  Edit - try again."
+				endif
+
+				breaksw
+
+			case update :
+				chacl `sed -e 1d -e '2,$'"s/^${WSO}user\(${WS}${WF}${WS}${NF}\)/-u \1/" -e '2,$'"s/^${WSO}group\(${WS}${WF}${WS}${NF}\)/-g \1/" "$acl_file"` -f "$i"
+
+				break
+
+			case noupdate :
+
+				break
+
+			default :
+				echo "edacl: internal error (in switch statement).  HELP"
+
+				breaksw
+
+			endsw
+		end
+
+		rm -f "$acl_file"
+	endif
+end
+!E!O!F!
+echo x - getacl.2
+cat >getacl.2 <<'!E!O!F!'
+.TH GETACL 2 "15 May 1985"
+.UC 4
+.SH NAME
+getacl \- get the access control list for a file
+.SH SYNOPSIS
+.nf
+.ft B
+#include <sys/param.h>
+#include <sys/acl.h>
+.PP
+.ft B
+getacl(path, nacle, acl)
+char *path;
+int nacle;
+struct acle *acl;
+.fi
+.SH DESCRIPTION
+.I getacl
+fetches the access control list of the file whose name is given by
+.IR path .
+The list is placed in the array
+.IR acl .
+The parameter
+.I nacle
+indicates the number of access control list entries which may be placed in 
+.IR acl .
+No more than MAXACL entries, as defined in
+.RI < sys/param.h >,
+will be returned.
+.PP
+An access control list entry is described in
+.RI < sys/acl.h >.
+.PP
+.nf
+#define A_GROUP	1
+#define A_USER	0
+
+struct acle {
+	char a_type;	/* A_GROUP or A_USER */
+	char a_mode;	/* rwx [0-7] permissions */
+	int a_id;	/* gid or uid according to a_type */
+};
+.fi
+.PP
+.I a_type
+is a flag indicating whether the entry is for a user or a group.
+.I a_id
+contains either a uid or a gid, depending on the value of
+.IR a_flag .
+This user or group will have the permissions described by
+.IR a_mode ,
+which is an integer in the range 0-7. It indicates read-write-execute
+permissions in the manner of
+.IR chmod(2) .
+.SH "RETURN VALUE
+.I getacl
+returns the number of entries in the file's access control list,
+which is always greater than or equal to zero.
+A value of \-1 indicates that an error occurred, and the error
+code is stored in the global variable \fIerrno\fP\|.
+.SH "ERRORS
+.I getacl
+will fail if:
+.TP 15
+[EFAULT]
+The argument
+.I acl
+specifies an invalid address.
+.TP 15
+[EINVAL]
+The argument
+.I nacle
+is smaller than the number of access control list entries for the file.
+.TP 15
+[EPERM]
+The argument
+.I path
+contains a byte with the high-order bit set.
+.TP 15
+[ENOTDIR]
+A component of the pathname is not a directory.
+.TP 15
+[ENOENT]
+The pathname was too long, or the named file does not exist.
+.TP 15
+[EACCES]
+Search permission is denied on a component of the pathname.
+.TP 15
+[ELOOP]
+Too many symbolic links were encountered in translating the pathname.
+.SH SEE ALSO
+chacl(1),
+cpacl(1),
+edacl(1),
+lsacl(1),
+setacl(2)
+.SH CAVEAT
+The implementation of access control lists is an experiment.  This
+implementation stores the access control list in a (formerly) unused field
+in the inode.
+There is no guarantee that future versions of Unix will not use this field
+for something else.
+.PP
+Therefore, you should only use access control lists with the full
+understanding that you are participating in an experiment.
+!E!O!F!
+echo x - h.pat
+cat >h.pat <<'!E!O!F!'
+RCS file: inode.h,v
+retrieving revision 1.1
+diff -c1 -r1.1 inode.h
+*** inode.h.r1_1	Tue Jun 25 18:55:17 1985
+--- inode.h	Tue Apr 30 16:36:54 1985
+***************
+*** 48,50
+  		long	ic_blocks;	/* 104: blocks actually held */
+! 		long	ic_spare[5];	/* 108: reserved, currently unused */
+  	} i_ic;
+
+--- 48,51 -----
+  		long	ic_blocks;	/* 104: blocks actually held */
+! 		char	ic_acle[(MAXACL+1)/2];
+! 		short	ic_aclid[MAXACL];
+  	} i_ic;
+***************
+*** 58,59
+  };
+  
+
+--- 59,63 -----
+  };
++ 
++ #define i_acle		i_ic.ic_acle
++ #define i_aclid		i_ic.ic_aclid
+  
+
+# putting MAXACL in param.h is not a good idea, since changing param.h
+# causes the whole kernel to be recompiled.  you might try putting MAXACL
+# in acl.h , and including acl.h in inode.h .
+
+RCS file: param.h,v
+retrieving revision 1.1
+diff -c2 -r1.1 param.h
+*** param.h.r1_1	Tue Jun 25 18:15:16 1985
+--- param.h	Tue Apr 30 16:31:54 1985
+***************
+*** 27,30
+  
+  /*
+   * Priorities
+   */
+
+--- 27,35 -----
+  
+  /*
++  * Access Control Lists
++  */
++ #define MAXACL 8
++ 
++ /*
+   * Priorities
+   */
+!E!O!F!
+echo x - jjg.h
+cat >jjg.h <<'!E!O!F!'
+typedef enum { FALSE = 0, TRUE = 1 } bool;
+
+#include <strings.h>
+#define equal(x,y)	( strcmp((x),(y)) == 0 )
+#define equaln(x,y,n)	( strncmp((x),(y),(n)) == 0 )
+#define any(p,c)	( index((p),(c)) != (char *)0 )
+
+#ifdef DEBUG
+#ifndef stderr
+#include <stdio.h>
+#endif
+#define dprintf(x)	if (debug_control) fprintf( stderr, (x) )
+#define d2printf(x,y)	if (debug_control) fprintf( stderr, (x), (y) )
+#define d3printf(x,y,z)	if (debug_control) fprintf( stderr, (x), (y), (z) )
+#define DEBUG_FILE	"./.debug"
+#define debug_test	debug_control = (bool) (access(DEBUG_FILE,0) == 0)
+#define debug_var	bool debug_control = TRUE;
+extern bool debug_control;
+#else
+#define dprintf(x)	/* null */
+#define d2printf(x,y)	/* null */
+#define d3printf(x,y,z)	/* null */
+#define debug_test	/* null */
+#define debug_var	/* null */
+#endif
+
+#ifdef BSD41
+int BSD41_i;
+#define bcopy(x,y,n) for ( BSD41_i = 0; BSD41_i < (n); BSD41_i++ ) \
+			(y)[BSD41_i] = (x)[BSD41_i]
+#define bzero(x,n) for ( BSD41_i = 0; BSD41_i < (n); BSD41_i++ ) \
+			(x)[BSD41_i] = 0
+#endif
+!E!O!F!
+echo x - login.pat
+cat >login.pat <<'!E!O!F!'
+RCS file: login.c,v
+retrieving revision 1.1
+diff -c2 -r1.1 login.c
+*** login.c.r1_1	Wed Jun 26 10:19:05 1985
+--- login.c	Wed Jun 26 10:16:48 1985
+***************
+*** 14,17
+  #include <sys/time.h>
+  #include <sys/resource.h>
+  
+  #include <sgtty.h>
+
+--- 14,18 -----
+  #include <sys/time.h>
+  #include <sys/resource.h>
++ #include <sys/acl.h>
+  
+  #include <sgtty.h>
+***************
+*** 93,96
+  char	*rhost;
+  
+  main(argc, argv)
+  	char *argv[];
+
+--- 94,99 -----
+  char	*rhost;
+  
++ struct acle null_acl[1];
++ 
+  main(argc, argv)
+  	char *argv[];
+***************
+*** 286,289
+  	chown(ttyn, pwd->pw_uid, pwd->pw_gid);
+  	chmod(ttyn, 0622);
+  	setgid(pwd->pw_gid);
+  	strncpy(name, utmp.ut_name, NMAX);
+
+--- 289,296 -----
+  	chown(ttyn, pwd->pw_uid, pwd->pw_gid);
+  	chmod(ttyn, 0622);
++ 	/*
++ 	 * clear the acl.  
++ 	 */
++ 	setacl(ttyn, 0, null_acl );
+  	setgid(pwd->pw_gid);
+  	strncpy(name, utmp.ut_name, NMAX);
+!E!O!F!
+echo x - lsacl.c
+cat >lsacl.c <<'!E!O!F!'
+#include <stdio.h>
+#include <sys/param.h>
+#include <sys/acl.h>
+#include <grp.h>
+#include <pwd.h>
+
+main(argc, argv, environ)
+int argc;
+char *argv[], *environ[];
+{
+	int i, j, na;
+	struct acle acl[MAXACL];
+	int status;
+
+	status = 0;
+
+	for ( i = 1; i < argc; i++ ) {
+		na = getacl( argv[i], MAXACL, acl );
+
+		if ( na < 0 ) {
+			perror( argv[i] );
+			status++;
+
+		} else {
+			printf( "%s\n", argv[i] );
+
+			for ( j = 0; j < na; j++ ) {
+				int type = acl[j].a_type;
+				int id = acl[j].a_id;
+				int mode = acl[j].a_mode;
+
+				if ( type == A_USER ) {
+					struct passwd *up = getpwuid(id);
+
+					if ( up == NULL ) {
+						printf( "\tuser\t[uid %d]\t%d\n", id, mode );
+					} else {
+						printf( "\tuser\t%s\t%d\n", up->pw_name, mode );
+					}
+
+				} else {
+					struct group *gp = getgrgid(id);
+
+					if ( gp == NULL ) {
+						printf( "\tgroup\t[gid %d]\t%d\n", id, mode );
+					} else {
+						printf( "\tgroup\t%s\t%d\n", gp->gr_name, mode );
+					}
+				}
+			}
+		}
+	}
+
+	exit( status );
+}
+!E!O!F!
+echo x - lsacl.l
+cat >lsacl.l <<'!E!O!F!'
+''' $Header:$
+''' 
+''' $Log:$
+.de Sh
+.br
+.ne 5
+.PP
+\fB\\$1\fR
+.PP
+..
+.de Sp
+.if t .sp .5v
+.if n .sp
+..
+'''
+'''     Set up \*(-- to give an unbreakable dash;
+'''     string Tr holds user defined translation string.
+'''     Bell System Logo is used as a dummy character.
+'''
+.ie n \{\
+.tr \(bs-\*(Tr
+.ds -- \(bs-
+.if (\n(.H=4u)&(1m=24u) .ds -- \(bs\h'-12u'\(bs\h'-12u'-\" diablo 10 pitch
+.if (\n(.H=4u)&(1m=20u) .ds -- \(bs\h'-12u'\(bs\h'-8u'-\" diablo 12 pitch
+.ds L" ""
+.ds R" ""
+.ds L' '
+.ds R' '
+'br\}
+.el\{\
+.ds -- \(em\|
+.tr \*(Tr
+.ds L" ``
+.ds R" ''
+.ds L' `
+.ds R' '
+'br\}
+.TH LSACL 1 LOCAL
+.SH NAME
+lsacl - list the access control lists for files
+.SH SYNOPSIS
+.B lsacl
+file ...
+.SH DESCRIPTION
+.I lsacl
+lists the access control lists for one or more files.  The access control list
+and the file's ownership are used to determine which users can access
+the file.
+.PP
+For each file,
+.I lsacl
+prints the file name alone on a line.  Following that,
+.I lsacl
+prints the access control list entries, one per line.  The entries are
+indented by a tab to make them easily distinguishable from the file name.
+Each entry has a user or group name, and the mode granted to
+that user or group.  The mode is a single digit in the range [0-7],
+indicating read-write-execute permission ala
+.IR chmod .
+.SH DIAGNOSTICS
+.I lsacl
+returns with exit status 0 if all is well;  or with exit status greater
+than 0 if it cannot get the access control lists for some files.
+.SH SEE ALSO
+chacl(1),
+cpacl(1),
+edacl(1),
+getacl(2),
+setacl(2)
+.SH CAVEAT
+The implementation of access control lists is an experiment.  This
+implementation stores the access control list in a (formerly) unused field
+in the inode.
+There is no guarantee that future versions of Unix will not use this field
+for something else.
+.PP
+Therefore, you should only use access control lists with the full
+understanding that you are participating in an experiment.
+.SH BUGS
+The entire mechanism hasn't been fully tested.
+.PP
+It might be nice if the mode were given symbolically ("rwx" instead
+of "7").
+.PP
+.I lsacl
+should become yet another option to
+.IR ls .
+!E!O!F!
+echo x - setacl.2
+cat >setacl.2 <<'!E!O!F!'
+.TH SETACL 2 "15 May 1985"
+.UC 4
+.SH NAME
+setacl \- set the access control list for a file
+.SH SYNOPSIS
+.nf
+.ft B
+#include <sys/param.h>
+#include <sys/acl.h>
+.PP
+.ft B
+setacl(path, nacle, acl)
+char *path;
+int nacle;
+struct acle *acl;
+.fi
+.SH DESCRIPTION
+.I setacl
+sets the access control list of the file whose name is given by
+.IR path .
+The list is taken from the array
+.IR acl .
+The parameter
+.I nacle
+indicates the number of entries in
+.IR acl ,
+which may not be larger than MAXACL , as defined in
+.RI < sys/param.h >.
+.PP
+An access control list entry is described in
+.RI < sys/acl.h >.
+.PP
+.nf
+#define A_GROUP	1
+#define A_USER	0
+
+#define ok_uacle(a)	( ( (a).a_type != A_USER ) || ( (a).a_id != 0 ) )
+
+struct acle {
+	char a_type;	/* A_GROUP or A_USER */
+	char a_mode;	/* rwx [0-7] permissions */
+	int a_id;	/* gid or uid according to a_type */
+};
+.fi
+.PP
+.I a_type
+is a flag indicating whether the entry is for a user or a group.
+.I a_id
+contains either a uid or a gid, depending on the value of
+.IR a_flag .
+This user or group will have the permissions described by
+.IR a_mode ,
+which is an integer in the range 0-7. It indicates read-write-execute
+permissions in the manner of
+.IR chmod(2) .
+.PP
+Since the superuser always has access to all files, an entry may not
+be specified for the superuser.  An entry with a zero
+.I a_type
+and a zero
+.I a_id
+is interpreted by
+.I setacl
+as an end-of-list marker.
+.SH "RETURN VALUE
+.I setacl
+returns the value 0 if all is well.
+A value of \-1 indicates that an error occurred, and the error
+code is stored in the global variable \fIerrno\fP\|.
+.SH "ERRORS
+.I setacl
+will fail if:
+.TP 15
+[EFAULT]
+The argument
+.I acl
+specifies an invalid address.
+.TP 15
+[EINVAL]
+The argument
+.I nacle
+is greater than MAXACL.
+.TP 15
+[EPERM]
+The argument
+.I path
+contains a byte with the high-order bit set.
+.TP 15
+[ENOTDIR]
+A component of the pathname is not a directory.
+.TP 15
+[ENOENT]
+The pathname was too long, or the named file does not exist.
+.TP 15
+[EACCES]
+Search permission is denied on a component of the pathname.
+.TP 15
+[EPERM]
+The effective userid does not match the owner of the file and the
+effective userid is not the superuser.
+.TP 15
+[EROFS]
+The named file resides on a read-only file system.
+[ELOOP]
+Too many symbolic links were encountered in translating the pathname.
+.SH SEE ALSO
+chacl(1),
+cpacl(1),
+edacl(1),
+lsacl(1),
+setacl(2)
+.SH CAVEAT
+The implementation of access control lists is an experiment.  This
+implementation stores the access control list in a (formerly) unused field
+in the inode.
+There is no guarantee that future versions of Unix will not use this field
+for something else.
+.PP
+Therefore, you should only use access control lists with the full
+understanding that you are participating in an experiment.
+.SH BUGS
+Setting an access control list entry for the file's owner has no
+effect, because of the order in which the file access mode and the access
+control list are checked.  To wit, the owner permission
+in the file access mode is checked before the access control
+list entry for the file's owner. 
+This is arguably wrong, since the system reverses this order
+when checking for the permission for the file's group (i.e., the
+access control list entry for the file's group is checked before the 
+group permission in the file access mode).
+!E!O!F!
+echo x - sys.pat
+cat >sys.pat <<'!E!O!F!'
+RCS file: RCS/ufs_syscalls.c,v
+retrieving revision 1.1
+diff -c2 -r1.1 ufs_syscalls.c
+*** ufs_syscalls.r1_1	Tue Jun 25 18:34:36 1985
+--- ufs_syscalls.c	Tue Jun 25 18:33:05 1985
+***************
+*** 1049,1052
+  		mode |= IFREG;
+  	ip->i_mode = mode & ~u.u_cmask;
+  	ip->i_nlink = 1;
+  	ip->i_uid = u.u_uid;
+
+--- 1049,1059 -----
+  		mode |= IFREG;
+  	ip->i_mode = mode & ~u.u_cmask;
++ 	/*
++ 	 * clear the acl.  there should be a default acl (besides a null one).
++ 	 * there is no room to put a default acl in the parent directory's
++ 	 * inode;  so the alternative is to put a default acl in the u area
++ 	 * (which is where the umask is).
++ 	 */
++ 	null_acle( ip, 0 );
+  	ip->i_nlink = 1;
+  	ip->i_uid = u.u_uid;
+***************
+*** 1126,1129
+  	ip->i_flag |= IACC|IUPD|ICHG;
+  	ip->i_mode = uap->dmode & ~u.u_cmask;
+  	ip->i_nlink = 2;
+  	ip->i_uid = u.u_uid;
+
+--- 1133,1143 -----
+  	ip->i_flag |= IACC|IUPD|ICHG;
+  	ip->i_mode = uap->dmode & ~u.u_cmask;
++ 	/*
++ 	 * clear the acl.  there should be a default acl (besides a null one).
++ 	 * a good default for a directory might be to copy the parent
++ 	 * directory's acl.  or put a default directory acl alongside the
++ 	 * default file acl (wherever that ends up).
++ 	 */
++ 	null_acle( ip, 0 );
+  	ip->i_nlink = 2;
+  	ip->i_uid = u.u_uid;
+
+# there are some changes to the access() routine, just because it made
+# it more readable for me, that have nothing to do with acls.  like
+# changing the "m" variable to "mode_desire".
+
+RCS file: RCS/ufs_fio.c,v
+retrieving revision 1.1
+diff -c2 -r1.1 ufs_fio.c
+*** ufs_fio.c.r1_1	Tue Jun 25 18:47:49 1985
+--- ufs_fio.c	Tue Jun 25 18:45:33 1985
+***************
+*** 17,20
+  #include "../h/proc.h"
+  #include "../h/nami.h"
+  
+  /*
+
+--- 17,21 -----
+  #include "../h/proc.h"
+  #include "../h/nami.h"
++ #include "../h/acl.h"
+  
+  /*
+***************
+*** 31,35
+   * permissions.
+   */
+! access(ip, mode)
+  	register struct inode *ip;
+  	int mode;
+
+--- 32,36 -----
+   * permissions.
+   */
+! access(ip, mode_desire)
+  	register struct inode *ip;
+  	int mode_desire;
+***************
+*** 33,37
+  access(ip, mode)
+  	register struct inode *ip;
+! 	int mode;
+  {
+  	register m;
+
+--- 34,38 -----
+  access(ip, mode_desire)
+  	register struct inode *ip;
+! 	int mode_desire;
+  {
+  	register int i;
+***************
+*** 35,40
+  	int mode;
+  {
+! 	register m;
+! 	register int *gp;
+  
+  	m = mode;
+
+--- 36,43 -----
+  	int mode_desire;
+  {
+! 	register int i;
+! 	int id_match;
+! 	int mode_allow;
+! 	int *gp;
+  
+  	if (mode_desire == IWRITE) {
+***************
+*** 38,43
+  	register int *gp;
+  
+! 	m = mode;
+! 	if (m == IWRITE) {
+  		/*
+  		 * Disallow write attempts on read-only
+
+--- 41,45 -----
+  	int *gp;
+  
+! 	if (mode_desire == IWRITE) {
+  		/*
+  		 * Disallow write attempts on read-only
+***************
+*** 78,92
+  	 * check public access.
+  	 */
+! 	if (u.u_uid != ip->i_uid) {
+! 		m >>= 3;
+! 		if (u.u_gid == ip->i_gid)
+! 			goto found;
+! 		gp = u.u_groups;
+! 		for (; gp < &u.u_groups[NGROUPS] && *gp != NOGROUP; gp++)
+! 			if (ip->i_gid == *gp)
+! 				goto found;
+! 		m >>= 3;
+! found:
+! 		;
+  	}
+  	if ((ip->i_mode&m) != 0)
+
+--- 80,100 -----
+  	 * check public access.
+  	 */
+! 	id_match = 0;
+! 	/*
+! 	 * user access (1) - match effective uid against fileowner uid.
+! 	 * user access (2) - match group list against fileowner uid.
+! 	 */
+! 	if (u.u_uid == ip->i_uid) {
+! 		id_match++;
+! 		mode_allow = ip->i_mode;
+! 	} else {
+! 		for( i = 0; i < MAXACL && ok_acle(ip,i); i++ ) {
+! 			if ( ( acle_type(ip,i) == A_USER ) &&
+! 				( u.u_uid == acle_id(ip,i) ) ) {
+! 				id_match++;
+! 				mode_allow = acle_mode(ip,i) << 6;
+! 				break;
+! 			}
+! 		}
+  	}
+  		
+***************
+*** 90,94
+  		;
+  	}
+! 	if ((ip->i_mode&m) != 0)
+  		return (0);
+  	u.u_error = EACCES;
+
+--- 98,158 -----
+  		}
+  	}
+! 		
+! 	/*
+! 	 * group access (1) - match effective gid against acl.
+! 	 */
+! 	if ( ! id_match ) {
+! 		mode_desire >>= 3;
+! 		for( i = 0; i < MAXACL && ok_acle(ip,i); i++ ) {
+! 			if ( ( acle_type(ip,i) == A_GROUP ) &&
+! 				( u.u_gid == acle_id(ip,i) ) ) {
+! 				id_match++;
+! 				mode_allow = acle_mode(ip,i) << 3;
+! 				break;
+! 			}
+! 		}
+! 	}
+! 		
+! 	/*
+! 	 * group access (2) - match group list against acl.
+! 	 */
+! 	if ( ! id_match ) {
+! 		for (gp = u.u_groups; gp < &u.u_groups[NGROUPS] && *gp != NOGROUP; gp++)
+! 			for( i = 0; i < MAXACL && ok_acle(ip,i); i++ ) {
+! 				if ( ( acle_type(ip,i) == A_GROUP ) &&
+! 					( *gp == acle_id(ip,i) ) ) {
+! 					id_match++;
+! 					mode_allow = acle_mode(ip,i) << 3;
+! 					break;
+! 				}
+! 			}
+! 	}
+! 		
+! 	/*
+! 	 * group access (3) - match effective gid against fileowner gid.
+! 	 * group access (4) - match group list against fileowner gid.
+! 	 */
+! 	if ( ! id_match ) {
+! 		if ( u.u_gid == ip->i_gid ) {
+! 			id_match++;
+! 			mode_allow = ip->i_mode;
+! 		} else {
+! 			for (gp = u.u_groups; gp < &u.u_groups[NGROUPS] && *gp != NOGROUP; gp++)
+! 				if (ip->i_gid == *gp) {
+! 					id_match++;
+! 					mode_allow = ip->i_mode;
+! 					break;
+! 				}
+! 		}
+! 	}
+! 
+! 	/*
+! 	 * other access.
+! 	 */
+! 	if ( ! id_match ) {
+! 		mode_desire >>= 3;
+! 		mode_allow = ip->i_mode;
+! 	}
+! 	if ((mode_allow&mode_desire) != 0)
+  		return (0);
+  	u.u_error = EACCES;
+!E!O!F!
+

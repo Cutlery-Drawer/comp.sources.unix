@@ -1,0 +1,2370 @@
+From: decvax!vax135!hou3c!ka
+Date: Mon, 21 Jan 85 22:38:18 est
+Newsgroups: mod.sources
+Subject: Vnews part 5
+
+# Welcome to vnews release 2.11-B 1/17/85.
+# This is part 5 out of 7.
+# Feed me into sh (NOT csh).
+
+if test ! -d postnews
+then	mkdir postnews
+fi
+
+cat > postnews/postnews.c <<\!E!O!F!
+/*
+ * Postnews: post a news message to Usenet.  This C version replaces a shell
+ * script, and does more intelligent prompting and filtering than possible
+ * in a shell script.
+ */
+
+#ifndef lint
+static char	*SccsId = "@(#)postnews.c	1.16	9/18/84";
+#endif !lint
+
+/* #include "params.h" */
+#include "config.h"
+#include "defs.h"
+#include "libextern.h"
+#include <stdio.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <grp.h>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <ctype.h>
+#include <time.h>
+
+char tempfname[50];		/* file name used for making article */
+char original[BUFLEN];		/* file name of original, used in followup */
+char homedir[BUFLEN];		/* HOME environment setting */
+char ccname[BUFLEN];		/* file name for article copy */
+
+/* article header information */
+char subject[BUFLEN];
+char distribution[BUFLEN];
+char references[BUFLEN];
+char newsgroups[BUFLEN];
+char moderator[BUFLEN];
+
+char *Progname = "postnews";		/* for xerror */
+
+time_t fmodtime;
+int ismod = 0;
+char buf[BUFLEN];
+
+struct distr {
+	char abbr[24];
+	char descr[128];
+} distr[16];
+
+extern	struct	passwd *getpwnam(), *getpwuid(), *getpwent();
+FILE *ckfopen();
+
+main(argc, argv)
+char *argv[];
+{
+	init();
+
+	if (argc == 2) {
+		if (strncmp(SPOOL, argv[1], strlen(SPOOL)))
+			xerror("Can only followup to articles in %s", SPOOL);
+		followup(argv[1]);
+		strcpy(original, argv[1]);
+	} else
+	if (askyes("Is this message in response to some other message? ","no")) {
+		char ng[BUFLEN], num[BUFLEN];
+		long i, j;
+		register char *c;
+		int fd;
+		char canpost;
+
+		getpr("In what newsgroup was the article posted? ",ng);
+		if (!valid_ng(ng, &i, &j, &canpost))
+			if (canpost != 'n' )
+				byebye("There is no such newsgroup.");
+			else
+				byebye("You are not allowed to post to that group.");
+
+		for(;;) {
+			getpr("\nWhat was the article number? (type ? for help) ", num);
+			if (num[0] == 0)
+				continue;
+			else if (num[0] == '/') {
+				artlist(ng, num + 1) ;
+				continue ;
+			}
+			else if (num[0] == '?') {
+				printf("Valid article numbers are from %ld to %ld\n", j, i);
+				printf("Type /string to get a list of articles containing string\nin the author or title fields.\n");
+				continue;
+			}
+			sprintf(original, "%s/%s", SPOOL, ng);
+			for (c=original+strlen(SPOOL)+1; *c ;++c)
+				if (*c == '.')
+					*c = '/';
+			strcat(original, "/");
+			strcat(original, num);
+
+			if ((fd=open(original,0)) >= 0) {
+				close(fd);
+				printf("\narticle %s\n", original);
+				if (article_line(original, "From: ", buf))
+					printf("%s\n", buf);
+				if (article_line(original, "Subject: ", buf))
+					printf("%s\n", buf);
+				if (askyes("Is this the one you want? ", ""))
+					break;
+			} else
+				printf("I can't find that article.\n");
+		}
+
+		followup(original);
+	} else {
+		do {
+			getpr("Subject: ", subject);
+		} while (*subject == '\0');
+
+		while (!get_newsgroup())
+			;
+		get_distribution();
+	}
+
+	if (pre_checks())
+		exit(1);
+	edit_article();
+	post_checks();
+
+	post_article();
+}
+
+/*
+ * Find out the topic of interest.
+ */
+get_newsgroup()
+{
+	int n;
+	long i;
+	char canpost;
+
+	printf("Newsgroups (enter one at a time, end with a blank line):\n");
+	printf("For a list of newsgroups, type ?\n");
+	n = 0;
+	newsgroups[0] = '\0';
+
+	for(;;) {
+		getpr("> ", buf);
+		if (buf[0] == '\0')
+			if (n == 0)
+				return FALSE;
+			else
+				return TRUE;
+		if (buf[0] == '?'){
+			/* too lazy to do it myself.... */
+			printf("These are the currently active groups:\n");
+			sprintf(buf,"exec cat %s/newsgroups", LIB);
+			system(buf);
+			continue;
+		}
+		if (valid_ng(buf, &i, &i, &canpost)) {
+			if (n++ != 0)
+				strcat(newsgroups, ",");
+			strcat(newsgroups, buf);
+		} else {
+			if (canpost == 'n')
+				printf("You are not allowed to post to %s\n",
+					buf);
+			else
+				printf("%s is not a valid newsgroup.\n", buf);
+		}
+	}
+}
+
+/*
+ * Find out how widely the author wants the message distributed.
+ */
+get_distribution()
+{
+	register int i;
+	register char *r;
+	char def[BUFLEN];
+	char *index();
+
+	strcpy(def, newsgroups);
+	r = index(def, '.');
+	if (r) {
+		*r = '\0';
+		if (strcmp(def, "net") == 0)
+			strcpy(def, "world");
+	} else
+		strcpy(def, "local");
+
+	if (strcmp(def,"to") == 0) {
+		distribution[0] = '\0';
+		return;		/* He's probably testing something */
+	}
+	if (ngmatch("net.test", newsgroups))
+		strcpy(def, "local");
+	for(;;) {
+		sprintf(buf, "Distribution (default='%s', '?' for help) : ", def);
+		getpr(buf, distribution);
+		if (distribution[0] == '\0')
+			strcpy(distribution, def);
+
+		/* Did the user ask for help? */
+		if (distribution[0] == '?') {
+			printf("How widely should your article be distributed?\n");
+			for (i=0; distr[i].abbr[0]; i++)
+				printf("%s\t%s\n", distr[i].abbr, distr[i].descr);
+			continue;
+		}
+
+		/* Check that it's a proper distribution */
+		for (i=0; distr[i].abbr[0]; i++) {
+			if (strncmp(distr[i].abbr, distribution, sizeof(distr[0].abbr)) == 0) {
+				/* Found a match. Do any special rewriting. */
+				if (strcmp(distribution, "world") == 0)
+					strcpy(distribution, "net");
+				return;
+			}
+		}
+
+		printf("Type ? for help.\n");
+	}
+}
+
+/*
+ * Do sanity checks before the author types in the message.
+ */
+pre_checks()
+{
+	check_mod();
+	if (recording(newsgroups))
+		return 1;
+	return 0;
+}
+
+/*
+ * Check to see if the newsgroup is moderated.
+ */
+check_mod()
+{
+	register FILE *fd;
+	char ng[64], mod[BUFLEN];
+
+	sprintf(buf, "%s/%s", LIB, "moderators");
+	fd = ckfopen(buf, "r");
+
+	while (!feof(fd)) {
+		if (fgets(buf, sizeof buf, fd) == NULL) {
+			fclose(fd);
+			return;
+		}
+		twosplit(buf, ng, mod);
+		if (ngmatch(newsgroups, ng)) {
+			strcpy(moderator, mod);
+			ismod = 1;
+			return;
+		}
+	}
+}
+
+/*
+ * Set up the temp file with headers.
+ */
+edit_article()
+{
+	FILE *tf, *of;
+	char *editor;
+	char *endflag = "";
+	char *p;
+	char *getenv();
+	struct stat stbuf;
+
+	editor = getenv("EDITOR");
+	strcpy(tempfname, "/tmp/postXXXXXX");
+	mktemp(tempfname);
+
+	/* insert a header */
+	tf = ckfopen(tempfname, "w");
+	fprintf(tf, "Subject: %s\n", subject);
+	fprintf(tf, "Newsgroups: %s\n", newsgroups);
+	if (distribution[0] != '\0')
+		fprintf(tf, "Distribution: %s\n", distribution);
+	if (ismod)
+		fprintf(tf, "To: %s\n", moderator);
+
+	if (references[0] != '\0') {
+		fprintf(tf, "References: %s\n\n", references);
+
+		of = ckfopen(original, "r");
+		while (fgets(buf, BUFSIZ, of) != NULL)
+			if (buf[0] == '\n')	/* skip headers */
+				break;
+		while (fgets(buf, BUFSIZ, of) != NULL)
+			fprintf(tf, "> %s", buf);
+		fclose(of);
+	}
+
+	fprintf(tf, "\n*** REPLACE THIS LINE WITH YOUR MESSAGE ***\n");
+	fflush(tf);
+	fstat(fileno(tf), &stbuf);
+	fmodtime = stbuf.st_mtime;
+	fclose(tf);
+
+	/* edit the file */
+	if (editor == NULL)
+		editor = DFTEDITOR;
+
+	p = editor + strlen(editor) - 2;
+	if (strcmp(p, "vi") == 0 && references[0] == '\0')
+		endflag = "+";
+
+	sprintf(buf, "exec %s %s %s", editor, endflag, tempfname);
+
+	system(buf);
+}
+
+/*
+ * Do sanity checks after the author has typed in the message.
+ */
+post_checks()
+{
+	char group[BUFLEN];
+	char s[BUFLEN + 24];
+	char *c;
+	struct stat stbuf;
+
+	if (stat(tempfname, &stbuf) < 0) {
+		printf("File deleted - no message posted.\n");
+		unlink(tempfname);
+		exit(1);
+	}
+
+	if (stbuf.st_mtime == fmodtime || stbuf.st_size < 5) {
+		printf("File not modified - no message posted.\n");
+		unlink(tempfname);
+		exit(1);
+	}
+
+	/* Sanity checks for certain newsgroups */
+	if (ngmatch(newsgroups, "all.wanted") && ngmatch(distribution,"net,na,usa,att,btl")) {
+		printf("Is your message something that might go in your local\n");
+		printf("newspaper, for example a used car ad, or an apartment\n");
+		printf("for rent? ");
+		if (askyes("","")) {
+			printf("It's pointless to distribute your article widely, since\n");
+			printf("people more than a hundred miles away won't be interested.\n");
+			printf("Please use a more restricted distribution.\n");
+			get_distribution();
+			modify_article(tempfname,"Distribution: ",distribution,"replace");
+		}
+	}
+
+	if (ngmatch(newsgroups, "all.jokes")) {
+		if (askyes("Could this be offensive to anyone? ","")) {
+			getpr("Whom might it offend? ", group);
+			sprintf(s," - offensive to %s (ROT13)",group);
+			modify_article(tempfname, "Subject: ", s, "append");
+			encode(tempfname);
+		}
+	}
+
+	if (ngmatch(newsgroups, "net.general")) {
+		c = newsgroups;
+		while (*c != ',' && *c)
+			++c;
+		if (*c == ',') {
+			printf("Everybody reads net.general, so it doesn't make sense to\n");
+			printf("post to newsgroups in addition to net.general.	If your\n");
+			printf("article belongs in one of these other newsgroups, then you\n");
+			printf("should not post to net.general.	If it is important enough\n");
+			printf("for net.general, then you shouldn't post it in other places\n");
+			printf("as well.	Please reenter the newsgroups.\n");
+			get_newsgroup();
+			modify_article(tempfname,"Newsgroups: ",newsgroups,"replace");
+		}
+		else {
+			printf("net.general is for important announcements.\n");
+			printf("It is not for items for which you couldn't think\n");
+			printf("of a better place - those belong in net.misc.\n");
+			if (!askyes("Are you sure your message belongs in net.general? ","")) {
+				get_newsgroup();
+				modify_article(tempfname, "Newsgroups: ", newsgroups, "replace");
+			}
+		}
+	}
+}
+
+/*
+ * Save a copy of the article in the users NEWSARCHIVE directory.
+ */
+save_article()
+{
+	FILE *in, *out;
+	int c;
+	time_t timenow, time();
+	char *today, *ctime();
+
+
+	in = ckfopen(tempfname, "r");
+	out = ckfopen(ccname, "a");
+	timenow = time((time_t)0);
+	today = ctime(&timenow);
+	fprintf(out,"From postnews %s",today);
+	while ((c=getc(in)) != EOF)
+		putc(c, out);
+	putc('\n', out);
+	fclose(in);
+	fclose(out);
+}
+
+/*
+ * Post the article to the net.
+ */
+post_article()
+{
+	extern char MAILPARSER[];
+	int status;
+
+	printf("%s article...\n", ismod ? "Mailing" : "Posting" );
+	if (ismod)
+		sprintf(buf, "exec %s -t < %s", MAILPARSER, tempfname);
+	else
+		sprintf(buf, "exec %s -wi < %s", POSTNM, tempfname);
+	status = system(buf);
+
+	if (status) {
+		printf("Article not %s - exit status %d\n", ismod ? "mailed" : "posted", status);
+		savedead();
+	} else {
+		printf("Article %s successfully.\n", ismod ? "mailed" : "posted" );
+		if (ccname[0]) {
+			if (ismod)
+				save_article();
+			printf("A copy has been saved in %s\n", ccname);
+		}
+	}
+	unlink(tempfname);
+}
+
+/*
+ * Save an article that couldn't be posted.
+ */
+savedead() {
+	FILE *in, *out;
+	char deadfile[256];
+	int c;
+
+	in = ckfopen(tempfname, "r");
+	sprintf(deadfile, "%s/dead.article", homedir);
+	out = ckfopen(deadfile, "a");
+	while ((c = getc(in)) != EOF)
+		putc(c, out);
+	putc('\n', out);
+	fclose(in);
+	fclose(out);
+	printf("Article saved in %s\n", deadfile);
+}
+
+/*
+ * Initialization.
+ */
+init()
+{
+	FILE *fd;
+	register char *p;
+	int i;
+	char *getenv();
+
+	references[0] = '\0';
+	distribution[0] = '\0';
+
+	p = getenv("HOME");
+	if (p == NULL) {
+		p = getenv("LOGDIR");
+		if (p == NULL) {
+			struct passwd *pw;
+			pw = getpwuid(getuid());
+			if (pw == NULL) {
+				fprintf(stderr,"You're not in /etc/passwd\n");
+				exit(1);
+			}
+			p = pw->pw_dir;
+		}
+	}
+	strcpy(homedir, p);
+
+
+	p = getenv("NEWSARCHIVE");
+	if (p != NULL)
+		strcpy(ccname, p);
+/*
+	else
+		sprintf(ccname, "%s/author_copy", homedir);
+*/
+
+	pathinit();
+	sprintf(buf, "%s/%s", LIB, "distributions");
+	fd = ckfopen(buf, "r");
+	for (i=0; !feof(fd); i++) {
+		if (fgets(buf, sizeof buf, fd) == NULL)
+			break;
+		twosplit(buf, distr[i].abbr,distr[i].descr);
+	}
+	fclose(fd);
+}
+
+/*
+ * Split a line of the form
+ *		text whitespace text
+ * into two strings.	Also trim off any trailing newline.
+ * This is destructive on src.
+ */
+twosplit(src, dest1, dest2)
+char *src, *dest1, *dest2;
+{
+	register char *p;
+
+	nstrip(src);
+	for (p=src; isalnum(*p) || ispunct(*p); p++)
+		;
+	*p++ = 0;
+	for ( ; isspace(*p); p++)
+		;
+	strcpy(dest1, src);
+	strcpy(dest2, p);
+}
+
+/*
+ * Get a yes or no answer to a question.	A default may be used.
+ */
+askyes(msg, def)
+char *msg, *def;
+{
+
+	printf("%s", msg);
+	buf[0] = 0;
+	gets(buf);
+	switch(buf[0]) {
+	case 'y':
+	case 'Y':
+		return TRUE;
+	case 'n':
+	case 'N':
+		return FALSE;
+	case '\0':
+		switch(*def) {
+		case 'y':
+		case 'Y':
+			return TRUE;
+		case 'n':
+		case 'N':
+			return FALSE;
+		}
+	default:
+		printf("Please answer yes or no.\n");
+		return askyes(msg, def);
+	}
+}
+
+/*
+ * Get a character string into buf, using prompt msg.
+ */
+getpr(msg, bfr)
+char *msg, *bfr;
+{
+	static int numeof = 0;
+	printf("%s", msg);
+	gets(bfr);
+	nstrip(bfr);
+	if (feof(stdin)) {
+		if (numeof++ > 3) {
+			fprintf(stderr,"Too many EOFs\n");
+			exit(1);
+		}
+		clearerr(stdin);
+	}
+}
+
+byebye(mesg)
+char *mesg;
+{
+	printf("%s\n", mesg);
+	exit(1);
+}
+
+/*
+ * make a modification to the header of an article
+ *
+ *	 fname -- name of article
+ *	 field -- header field to modify
+ *	 line	-- modification line
+ *	 how	 -- 'a' or 'A' to append line to existing header line
+ *			anything else to replace existing line
+ *
+ * example:
+ *	 modify_article("/tmp/article" , "Subject: " , "new subject" , "replace");
+ *
+ *
+ */
+modify_article(fname, field, line, how)
+char *fname, *field, *line, *how;
+{
+	FILE *fpart, *fptmp;
+	char *temp2fname = "/tmp/postXXXXXX";
+	int i;
+
+	mktemp(temp2fname);
+
+	fptmp = ckfopen(temp2fname, "w");
+	fpart = ckfopen(fname, "r");
+
+	i = strlen(field);
+	while (fgets(buf, BUFLEN, fpart) != NULL) {
+		if (strncmp(field, buf, i) == 0) {
+			nstrip(buf);
+			if (*how=='a' || *how=='A')
+				/* append to current field */
+				sprintf(buf, "%s%s\n", buf, line);
+			else
+				/* replace current field */
+				sprintf(buf, "%s%s\n", field, line);
+		}
+		fputs(buf, fptmp);
+	}
+
+	fclose(fpart);
+	fclose(fptmp);
+
+	fptmp = ckfopen(temp2fname, "r");
+	fpart = ckfopen(fname, "w");
+
+	i = strlen(field);
+	while (fgets(buf,BUFLEN,fptmp) != NULL)
+		fputs(buf, fpart);
+
+	fclose(fpart);
+	fclose(fptmp);
+	unlink(temp2fname);
+}
+
+
+/* verify that newsgroup exists, and get number of entries */
+valid_ng(ng, maxart, minart, canpost)
+char *ng;
+long *maxart, *minart;
+char *canpost;
+{
+	char ng_check[BUFLEN], ng_read[BUFLEN];
+	char ACTIVE[FPATHLEN];
+	FILE *fp;
+
+	*minart = 1; *canpost = 'y';
+	sprintf(ACTIVE, "%s/active", LIB);
+	fp = ckfopen(ACTIVE, "r");
+	while (fgets(ng_read, BUFLEN, fp) != NULL) {
+		sscanf(ng_read, "%s %ld %ld %c", ng_check, maxart, minart, canpost);
+		if (strcmp(ng_check, ng) == 0) {
+			fclose(fp);
+			if (*canpost == 'y')
+				return TRUE;
+			else
+				return FALSE;
+		}
+	}
+	*canpost = 'i';
+	*maxart = 0;
+	*minart = 0;
+	fclose(fp);
+	return FALSE;
+}
+
+/* get the line specified by field from an article */
+article_line(article, field, line)
+char *article, *field, *line;
+{
+	FILE *fp;
+	char *c;
+	int i = strlen(field);
+
+	fp = ckfopen(article,"r");
+	while ((c=fgets(line,BUFLEN,fp)) != NULL && strncmp(field,line,i) != 0)
+		;
+	fclose(fp);
+	if (c != NULL) {
+		nstrip(line);
+		return TRUE;
+	} else {
+		line[0] = '\0';
+		return FALSE;
+	}
+}
+
+
+/* get the header information for a followup article */
+followup(baseart)
+register char *baseart;
+{
+	/* subject */
+	if (article_line(baseart, "Subject: ", buf)) {
+		if (!prefix(buf+9, "Re:"))
+			sprintf(subject, "Re: %s", buf+9);
+		else
+			strcpy(subject, buf+9);
+	} else
+		strcpy(subject, "Re: orphan response");
+
+	/* newsgroup */
+	if (article_line(baseart, "Newsgroups: ", buf))
+		strcpy(newsgroups, buf+12);
+	if (ngmatch(newsgroups, "net.general"))
+		strcpy(newsgroups,"net.followup");
+
+	/* distribution */
+	if (article_line(baseart, "Distribution: ", buf))
+		strcpy(distribution, buf+14);
+
+	/* references */
+	if (article_line(baseart, "References: ", buf)) {
+		strcpy(references, buf+12);
+		strcat(references, " ");
+	}
+	if (article_line(baseart, "Message-ID: ", buf))
+		strcat(references, buf+12);
+}
+
+encode(article)
+char *article;
+{
+	FILE *fpart, *fphead, *fpcoded;
+	char *headerfile = "/tmp/pheadXXXXXX";
+	char *codedfile = "/tmp/pcodeXXXXXX";
+
+	mktemp(headerfile);
+	mktemp(codedfile);
+
+	fpart = ckfopen(article, "r");
+
+	/* place article header in "headerfile" file */
+	fphead = ckfopen(headerfile, "w");
+	while (fgets(buf, BUFLEN, fpart) != NULL) {
+		fputs(buf, fphead);
+		if (buf[0] == '\n')
+			break;
+	}
+	fclose(fphead);
+
+	/* place article body in "codedfile" file */
+	fpcoded = ckfopen(codedfile, "w");
+	while (fgets(buf, BUFLEN, fpart) != NULL)
+		fputs(buf, fpcoded);
+	fclose(fpcoded);
+	fclose(fpart);
+
+	/* encode body and put back together with header */
+	rename(headerfile, article);
+
+	sprintf(buf,"exec %s/%s 13 < %s >> %s\n", LIB, "caesar", codedfile, article);
+	printf("Encoding article -- please stand by\n");
+	if (system(buf)) {
+		printf("encoding failed");
+		exit(2);
+	}
+	unlink(codedfile);
+}
+
+
+/*
+ * Print a recorded message warning the poor luser what he is doing
+ * and demand that he understands it before proceeding.  Only do
+ * this for newsgroups listed in LIBDIR/recording.
+ */
+recording(ngrps)
+char *ngrps;
+{
+	char recbuf[BUFLEN];
+	FILE *fd;
+	char nglist[BUFLEN], fname[BUFLEN];
+	int  c, n, yes;
+
+	sprintf(recbuf, "%s/%s", LIB, "recording");
+	fd = fopen(recbuf, "r");
+	if (fd == NULL)
+		return 0;
+	while ((fgets(recbuf, sizeof recbuf, fd)) != NULL) {
+		sscanf(recbuf, "%s %s", nglist, fname);
+		if (ngmatch(ngrps, nglist)) {
+			fclose(fd);
+			if (fname[0] == '/')
+				strcpy(recbuf, fname);
+			else
+				sprintf(recbuf, "%s/%s", LIB, fname);
+			fd = fopen(recbuf, "r");
+			if (fd == NULL)
+				return 0;
+			while ((c = getc(fd)) != EOF)
+				putc(c, stderr);
+			fprintf(stderr, "Do you understand this?  Hit <return> to proceed, <BREAK> to abort: ");
+			n = read(2, recbuf, 100);
+			c = recbuf[0];
+			yes = (c=='y' || c=='Y' || c=='\n' || c=='\n' || c==0);
+			if (n <= 0 || !yes)
+				return -1;
+		}
+	}
+	return 0;
+}
+
+xxit(i)
+{
+	exit(i);
+}
+
+
+xerror(fmt, a1, a2, a3, a4)
+	char *fmt;
+	{
+	fprintf(stderr, fmt, a1, a2, a3, a4);
+	putc('\n', stderr);
+	xxit(1);
+}
+!E!O!F!
+
+cat > postnews/postnm.1 <<\!E!O!F!
+.TH POSTNM 1
+.SH NAME
+postnm \- post mail or news
+.SH SYNOPSIS
+.B postnm
+[
+.B \-ixw
+]
+[ header-options ]
+[ file ]
+.SH DESCRIPTION
+.I Postnm
+reads a message in ARPANET mail format from a file, or from the
+standard input if no file is given.
+It checks the message for validity.  If the message contains a
+Newsgroups line, the message is posted to USENET.
+If the message contains To, Cc, or Bcc lines, it is mailed to
+the indicated addresses.
+.P
+Users who wish to invoke
+.I postnm
+directly should place their article in a file and then run postnm on it.
+.I Postnm
+makes no attempt to save an article when an error occurs, so if you try
+to type an article directly into
+.I postnm
+from the terminal, you will be forced to start all over again if something
+goes wrong.
+Now that
+.I postnm
+exists, users should never invoke inews directly.
+.SS options
+.IP -i 6
+Identify.  If the file $HOME/.signature exists, append it to the message.
+.IP -x 6
+Causes postnm to print out the generated command lines without
+actually posting the message.
+.IP -w 6
+Causes postnm to wait for the postings to complete rather that running
+inews and mail in the background.
+.P
+Certain header lines can be inserted into the header of the article
+from the command line using the following options:
+.sp
+.nf
+	-c	Control:
+	-d	Distribution:
+	-f	From:
+	-n	Newsgroups:
+	-R	References:
+	-s	Subject:
+	-t	To:
+.fi
+.P
+The Command header is never passed to inews or mail.
+``Command:\ reply''
+causes
+.I postnm
+to ignore the Newsgroups and Distribution lines, and ``Command:\ followup''
+causes
+.I postnm
+to ignore the To lines.
+.P
+If the environment variable NEWSARCHIVE is set, it specifies a file in which
+copies of all news (but not mail) articles are to be placed.
+.SH EXAMPLE
+postnm -c 'cancel <123@hou3c.UUCP>' -n net.misc /dev/null
+.in +5
+Cancel article <123@hou3c.UUCP>.
+.B /dev/null
+provides an empty article body.
+.in -5
+.SH FILES
+.nf
+/usr/lib/news/active            list of newsgroups
+/usr/lib/news/moderators        addresses of newsgroup moderators
+/usr/lib/news/distributions     list of distributions (optional)
+$HOME/.signature		signature file
+.SH AUTHOR
+Kenneth Almquist (ihnp4!hou3c!ka)
+!E!O!F!
+
+cat > postnews/postnm.h <<\!E!O!F!
+/*
+ * This program handles the posting or mailing of replies and followups
+ * for vnews.  It can also be invoked directly.
+ *
+ * Copyright 1984 by Kenneth Almquist.  All rights reserved.
+ *     Permission is granted for anyone to use and distribute, but not
+ *     sell, this program provided that this copyright notice is retained.
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>	/* for .signature kludge */
+#include <signal.h>
+#include "config.h"
+#include "newsdefs.h"
+#include "libextern.h"
+#include "str.h"
+#include "time.h"
+
+extern char *scanp;		/* string scanning pointer */
+
+#define MODGROUPS	"fa.all,mod.all,all.mod,all.announce"
+
+/* types of header fields */
+#define HTTO 0
+#define HTCC 1
+#define HTBCC 2
+#define HTNEWSGROUPS 3
+#define HTINREPLYTO 5
+#define HTREFERENCES 6
+#define HTSUBJECT 7
+#define HTEXPIRES 8
+#define HTFROM 9
+#define HTREPLYTO 10
+#define HTFOLLOWUPTO 11
+#define HTDIST 12
+#define HTKEYWORDS 14
+#define HTCONTROL 15
+#define HTORGANIZATION 16
+#define HTSUMMARY 17
+#define HTAPPROVED 18
+#define HTCOMMENTS 19
+#define HTMESSAGEID 20
+#define HTCOMMAND 21
+#define HTUNKNOWN 27
+
+
+struct hline {
+      struct hline *next;
+      short type;
+      short linno;
+      char *text;
+      char *hdrname;
+      char *body;
+      char *fixed;
+};
+
+#ifndef EXTERN
+#define EXTERN extern
+#define INIT(val)
+#else
+#define INIT(val) = val
+#endif
+
+EXTERN struct hline *hfirst, *hlast;		/* list of header lines */
+EXTERN struct hline *hdrline[HTCOMMAND + 1];	/* indexed by type */
+EXTERN struct hline *curhdr;			/* current header line */
+
+
+#define MAXADDR 100
+EXTERN char *addrlist[MAXADDR + 1];	/* mail destinations */
+EXTERN char **addrp INIT(addrlist);	/* next entry in addrlist */
+EXTERN char *moderator;			/* address of moderator */
+EXTERN char *references;		/* specified on command line */
+
+#include "setjmp.h"
+
+#define setexit() setjmp(syntaxjmp)
+#define reset() longjmp(syntaxjmp, 1)
+
+EXTERN jmp_buf syntaxjmp;		/* jump here on syntax errors */
+
+EXTERN int nerrors;			/* number of errors */
+EXTERN int linno;			/* input line number */
+EXTERN FILE *infp INIT(stdin);		/* input file */
+EXTERN FILE *newsfp, *mailfp;		/* temp files */
+EXTERN char mailtemp[32], newstemp[32];	/* temp files */
+#define MAXGRPS 10
+EXTERN char *nglist[MAXGRPS + 1];	/* entries on Newsgroup line */
+EXTERN char *follist[MAXGRPS + 1];	/* entries on Followup-To */
+EXTERN char *nlist[MAXGRPS + 1];	/* temporary */
+EXTERN int debug;			/* don't actuall post message */
+EXTERN int verbose;			/* verbose flag */
+EXTERN int background INIT(1);		/* run mail/inews in background */
+EXTERN char *outp;			/* for generating output lines */
+EXTERN int signit;			/* if set, append .signiture file */
+EXTERN char signfile[FPATHLEN];		/* .signiture file */
+EXTERN int signmode;			/* .signature kludge */
+EXTERN char *envkludge[200];		/* organization kludge */
+
+
+long atol();
+FILE *ckfopen();
+time_t cgtdate();
+char *ckmalloc();
+
+char *getval();
+!E!O!F!
+
+cat > postnews/postnm1.c <<\!E!O!F!
+/*
+ * Main routine and error printing routines.
+ *
+ * Copyright 1984 by Kenneth Almquist.  All rights reserved.
+ *     Permission is granted for anyone to use and distribute, but not
+ *     sell, this program provided that this copyright notice is retained.
+ */
+
+#define EXTERN
+#include "postnm.h"
+
+
+int xxit();
+
+
+main(argc, argv)
+      char **argv;
+      {
+      int c;
+      FILE *fp;
+      extern char *optarg;
+      extern int optind;
+
+      pathinit();
+      getuser();
+      while ((c = getopt(argc, argv, "ivBwxc:d:f:n:R:s:t:")) != EOF) {
+            switch (c) {
+            case 'i':
+                  signit = 1;
+                  break;
+            case 'v':
+                  verbose = 1;
+                  break;
+            case 'B':
+                  background = 1;
+                  break;
+            case 'w':
+                  background = 0;
+                  break;
+            case 'x':
+                  debug++;
+                  background = 0;
+                  break;
+            case 'c':
+                  sprintf(bfr, "Control: %s\n", optarg);
+                  prochdr(bfr, 1);
+                  break;
+            case 'd':
+                  sprintf(bfr, "Distribution: %s\n", optarg);
+                  prochdr(bfr, 1);
+                  break;
+            case 'f':
+                  sprintf(bfr, "From: %s\n", optarg);
+                  prochdr(bfr, 1);
+                  break;
+            case 'n':
+                  sprintf(bfr, "Newsgroups: %s\n", optarg);
+                  prochdr(bfr, 1);
+                  break;
+            case 'R':
+                  sprintf(bfr, "%s\n", optarg);
+                  references = savestr(bfr);
+                  break;
+            case 's':
+                  sprintf(bfr, "Subject: %s\n", optarg);
+                  prochdr(bfr, 1);
+                  break;
+            case 't':
+                  if (hdrline[HTTO] == NULL) {
+                        sprintf(bfr, "To: %s\n", optarg);
+                  } else {
+                        nstrip(hdrline[HTTO]->text);
+                        sprintf(bfr, "%s, %s\n", hdrline[HTTO]->text, optarg);
+                        hlzap(HTTO);
+                  }
+                  prochdr(bfr, 1);
+                  break;
+            case '?':
+                  exit(1);
+            }
+      }
+      if (optind < argc && (infp = fopen(argv[optind], "r")) == NULL)
+            xerror("%s: cannot open", argv[optind]);
+      if (debug) {
+            strcpy(newstemp, "news.tmp");
+            strcpy(mailtemp, "mail.tmp");
+      } else {
+            sprintf(newstemp, "/tmp/pnm%05dn", getpid());
+            sprintf(mailtemp, "/tmp/pnm%05dm", getpid());
+      }
+
+      readheader();
+
+      checkheader();
+
+      if (signal(SIGINT, SIG_IGN) != SIG_IGN)
+            signal(SIGINT, xxit);
+      if (signal(SIGHUP, SIG_IGN) != SIG_IGN)
+            signal(SIGHUP, xxit);
+
+      if (addrp != addrlist) {
+            mailfp = ckfopen(mailtemp, "w");
+            genmailhdr(mailfp);
+      }
+      if (hdrline[HTNEWSGROUPS]) {
+            newsfp = ckfopen(newstemp, "w");
+            gennewshdr(newsfp);
+      }
+
+      if (newsfp == NULL && mailfp == NULL)
+            xerror("No to or newsgroup line specified");
+      if (nerrors)
+            xxit(1);
+
+      addbody(infp);
+      if (signit) {
+            getuser();
+            sprintf(bfr, "%s/.signature", userhome);
+            if ((fp = fopen(bfr, "r")) != NULL) {
+                  if (mailfp)
+                        fputs("--", mailfp);
+                  if (newsfp)
+                        fputs("-- ", newsfp);
+                  addbody(fp);
+            }
+      }
+      if (nerrors)
+            xxit(1);
+
+      if (background) {
+            if (fork() > 0)
+                  exit(0);
+            signal(SIGINT, SIG_IGN);
+            signal(SIGQUIT, SIG_IGN);
+            signal(SIGHUP, SIG_IGN);
+#ifdef SIGTSTP
+            signal(SIGTSTP, SIG_IGN);
+#endif
+      }
+      if (mailfp) {
+            char **pp;
+            char *arg[6];
+
+            fclose(mailfp);
+            for (pp = addrlist ; pp < addrp ; pp++) {
+                  arg[0] = MAILER;
+                  arg[1] = *pp;
+                  arg[2] = NULL;
+                  if (runp(arg, mailtemp))
+                        xerror("Mailer failed");
+            }
+      }
+      if (newsfp) {
+            char *arg[6];
+            struct stat statb;
+
+            fclose(newsfp);
+            /* suppress .signature */
+            if (userhome == NULL)
+                  getuser();
+            sprintf(signfile, "%s/.signature", userhome);
+            if (stat(signfile, &statb) >= 0) {
+                  chmod(signfile, 0);		/* This is sick! */
+                  signmode = statb.st_mode;
+            }
+            if (moderator) {
+                  arg[0] = MAILER;
+                  arg[1] = moderator;
+                  arg[2] = NULL;
+                  if (runp(arg, newstemp))
+                        xerror("Mail to moderator failed");
+            } else {
+                  arg[0] = XINEWS;
+                  arg[1] = "-h";
+                  arg[2] = NULL;
+                  if (runp(arg, newstemp))
+                        xerror("inews failed");
+            }
+            savearticle() ;
+      }
+      xxit(nerrors? 1 : 0);
+}
+
+
+
+/*
+ * Print an error message for an illegal header line.
+ */
+
+synerr(fmt, a1, a2, a3, a4)
+      char *fmt;
+      {
+      fprintf(stderr, "postnm: ");
+      if (curhdr)
+            fprintf(stderr, "line %d: ", curhdr->linno);
+      fprintf(stderr, fmt, a1, a2, a3, a4);
+      putc('\n', stderr);
+      nerrors++;
+}
+
+
+jsynerr(fmt, a1, a2, a3, a4)
+      char *fmt;
+      {
+      synerr(fmt, a1, a2, a3, a4);
+      reset();
+}
+
+
+
+xerror(fmt, a1, a2, a3, a4)
+      char *fmt;
+      {
+      fprintf(stderr, "postnm: ");
+      fprintf(stderr, fmt, a1, a2, a3, a4);
+      putc('\n', stderr);
+      xxit(2);
+}
+
+
+
+xxit(status) {
+      if (!debug) {
+            unlink(newstemp);
+            unlink(mailtemp);
+      }
+      if (signmode) {
+            chmod(signfile, signmode);
+      }
+      exit(status);
+}
+
+
+
+runp(arglist, infile)
+      char **arglist;
+      char *infile;
+      {
+      int pid, status, fd;
+      extern char *optarg;
+      extern int optind;
+
+      if (debug) {
+            while (*arglist)
+                  printf("%s ", *arglist++);
+            if (infile)
+                  printf("< %s", infile);
+            putchar('\n');
+            return 0;
+      }
+      if (infile && (fd = open(infile, 0)) < 0)
+            xerror("Can't open %s", infile);
+      if ((pid = fork()) < 0)
+            xerror("Can't fork");
+      if (pid == 0) {
+            if (infile && fd != 0) {
+                  close(0);
+                  if (dup(fd) != 0)
+                        fputs("postnm: dup failed\n", stderr);
+                  close(fd);
+            }
+            execv(arglist[0], arglist);
+            fprintf(stderr, "Can't exec %s\n", arglist[0]);
+            exit(127);
+      }
+      close(fd);
+      while (wait(&status) != pid);
+      if (status & 0177) {
+            fprintf(stderr, "postnm: %s died with signal %d", arglist[0], status & 0177);
+            if (status & 0200)
+                  fprintf(stderr, " - core dumped");
+            putc('\n', stderr);
+      } else if (status) {
+            fprintf(stderr, "postnm: exit status %d from %s\n", (unsigned) status >> 8, arglist[0]);
+      }
+      return status;
+}
+
+
+
+/*
+ * Save a copy of the article in the users NEWSARCHIVE file.
+ * The article is saved only if the user explicitly sets NEWSARCHIVE.
+ * Currently, we save USENET articles but not mail, which is
+ * rather questionable.
+ */
+savearticle() {
+      register FILE *in, *out;
+      register int c;
+      time_t timenow, time();
+      char *today, *ctime();
+      char *ccname;
+      char *getenv();
+
+      if ((ccname = getenv("NEWSARCHIVE")) == NULL || ccname[0] == '\0')
+            return;
+      if ((in = fopen(newstemp, "r")) == NULL) {
+            xerror("Can't reopen %s", newstemp);
+      }
+      if ((out = fopen(ccname, "a")) == NULL) {
+            xerror("Can't open %s to save article", ccname);
+      }
+      timenow = time((time_t *)0);
+      today = ctime(&timenow);
+      fprintf(out, "From postreply %s", today);
+      while ((c=getc(in)) != EOF)
+            putc(c, out);
+      putc('\n', out);
+      fclose(in);
+      fclose(out);
+}
+!E!O!F!
+
+cat > postnews/postnm2.c <<\!E!O!F!
+/*
+ * Pass one:  read in the article.
+ *
+ * Copyright 1984 by Kenneth Almquist.  All rights reserved.
+ *     Permission is granted for anyone to use and distribute, but not
+ *     sell, this program provided that this copyright notice is retained.
+ */
+
+#include "postnm.h"
+
+/* values of ht_legal */
+#define DITTO	0		/* alias for previous name */
+#define LEGAL	1		/* normal field */
+#define ONCE	2		/* field may only occur once */
+#define ILLEGAL	3		/* user not allowed to specify this field */
+
+struct htype {
+      char *ht_name;		/* name of header field */
+      int   ht_legal;		/* whether field is legal */
+      int   ht_type;		/* field type number */
+}
+htype[] = {
+      "To",		LEGAL,	HTTO,
+      "Cc",		LEGAL,	HTCC,
+      "Bcc",		LEGAL,	HTBCC,
+      "Newsgroups",	ONCE,	HTNEWSGROUPS,
+      "Newsgroup",	DITTO,	HTNEWSGROUPS,
+      "In-Reply-To",	ONCE,	HTINREPLYTO,
+      "References",	ONCE,	HTREFERENCES,
+      "Subject",	ONCE,	HTSUBJECT,
+      "Expires",	ONCE,	HTEXPIRES,
+      "From",		ONCE,	HTFROM,
+      "Reply-To",	ONCE,	HTREPLYTO,
+      "Followup-To",	ONCE,	HTFOLLOWUPTO,
+      "Distribution",	ONCE,	HTDIST,
+      "Dist",		DITTO,	HTDIST,
+      "Keywords",	LEGAL,	HTKEYWORDS,
+      "Control",	ONCE,	HTCONTROL,
+      "Organization",	ONCE,	HTORGANIZATION,
+      "Summary",	ONCE,	HTSUMMARY,
+      "Approved",	ONCE,	HTAPPROVED,
+      "Comments",	LEGAL,	HTCOMMENTS,
+      "Message-Id",	ONCE,	HTMESSAGEID,
+      "Command",	ONCE,	HTCOMMAND,
+      "Article-I.d.",	ILLEGAL,HTUNKNOWN,
+      "Sender",		ILLEGAL,HTUNKNOWN,
+      "Resent-Sender",	ILLEGAL,HTUNKNOWN,
+      "Path",		ILLEGAL,HTUNKNOWN,
+      "Received",	ILLEGAL,HTUNKNOWN,
+      NULL,		LEGAL,	HTUNKNOWN
+};
+
+/*
+ * Read in the header.
+ */
+
+readheader() {
+      setexit();
+      while (gethline(infp) != EOF) {
+            prochdr(bfr, 0);
+      }
+}
+
+
+
+prochdr(val, faked)
+      char *val;
+      {
+      char htname[64];
+
+      curhdr = ckmalloc(sizeof *curhdr);
+      curhdr->linno = !faked? linno : 0;
+      curhdr->text = savestr(val);
+      curhdr->fixed = NULL;
+      scanp = curhdr->text;		/* scan input line */
+      if (scnchr(" \t\n:") == 0)
+            jsynerr("Illegal header line type");
+      if (scanp - curhdr->text > 63)
+            jsynerr("Header line type too long");
+      getval(curhdr->text, scanp, htname);
+      fixcase(htname);
+      skipbl();
+      if (*scanp++ != ':')
+            jsynerr("No colon on header line\nDid you remember to leave a blank line after the article header?");
+      skipbl();
+      curhdr->body = scanp;
+      if (*scanp == '\0')
+            curhdr->body--;
+
+      gettype(htname, curhdr);
+
+      appheader(curhdr, hlast);
+}
+
+
+
+gettype(htname, hp)
+      char *htname;
+      struct hline *hp;
+      {
+      register struct htype *htp;
+
+      for (htp = htype ; htp->ht_name != NULL && !equal(htp->ht_name, htname) ; htp++);
+      if (htp->ht_name == NULL) {
+            for (htp = htype ;
+                 htp->ht_name && (htp->ht_legal == ILLEGAL || !misspells(htp->ht_name, htname)) ;
+                 htp++);
+            if (htp->ht_name != NULL)
+                  synerr("You misspelled \"%s\"", htp->ht_name);
+      }
+      while (htp->ht_legal == DITTO)
+            htp--;
+      hp->type = htp->ht_type;
+      if (htp->ht_name == NULL) {
+            hp->hdrname = savestr(htname);
+      } else {
+            hp->hdrname = htp->ht_name;
+            if (htp->ht_legal == ILLEGAL)
+                  jsynerr("You cannot include a \"%s:\" header", htname);
+            else if (htp->ht_legal == ONCE && hdrline[hp->type])
+                  jsynerr("Only one \"%s:\" header line is permitted", htname);
+            hdrline[hp->type] = hp;
+      }
+}
+
+
+/*
+ * Get the correct combination of upper case and lower case in a header
+ * line name.  The first character and any character immediatly following
+ * a minus sign is capitalized.  Everything else to lower case.
+ */
+
+fixcase(p)
+      register char *p;
+      {
+      int flag = 1;
+
+      while (*p) {
+            if (*p == '-')
+                  flag = 1;
+            else if (flag) {
+                  flag = 0;
+                  if (islower(*p))
+                        *p = toupper(*p);
+            } else {
+                  if (isupper(*p))
+                        *p = tolower(*p);
+            }
+            p++;
+      }
+}
+
+
+
+misspells(word, incorrect)
+      char *word, *incorrect;
+      {
+      int i = strlen(word), j = strlen(incorrect);
+      register char *p = word, *q = incorrect;
+
+      if (j != i && j != i + 1 && j != i - 1)
+            return 0;
+      while (*p == *q && *p)
+            p++, q++;
+      if (i > j) {
+            if (equal(p + 1, q))  return 1;
+      } else if (i < j) {
+            if (equal(p, q + 1))  return 1;
+      } else {
+            if (equal(p + 1, q + 1))  return 1;
+            if (p[0] == q[1] && p[1] == q[0] && equal(p + 2, q + 2))
+                  return 1;
+      }
+      return 0;
+}
+
+
+
+
+/*
+ * Insert a header after the given header, or at the beginning of
+ * the list if NULL is given.
+ */
+
+appheader(hp, after)
+      struct hline *hp, *after;
+      {
+      struct hline **hpp;
+
+      if (after)
+            hpp = &after->next;
+      else
+            hpp = &hfirst;
+      hp->next = *hpp;
+      *hpp = hp;
+      if (hlast == after)
+            hlast = hp;
+}
+
+
+
+
+/*
+ * Read a header line into bfr, handling continuations.
+ */
+
+
+gethline(fp)
+      register FILE *fp;
+      {
+      char *p;
+      register char *q;
+      int c;
+      static int nextlinno = 1;
+
+      linno = nextlinno;
+      if (feof(fp))
+            return EOF;
+      p = bfr;
+      do {
+            if (fgets(p, bfr + LBUFLEN - p, fp) == NULL)
+                  return EOF;
+            if (bfr[0] == '\n')
+                  return EOF;
+            for (q = p ; *q != '\0' && *q != '\n' ; q++) {
+                  if ((*q < ' ' && *q != '\t') || *q > '~') {
+                        fprintf(stderr, "postnm: line %d: illegal character (octal %o)\n",
+                                nextlinno, *(unsigned char *)q);
+                        nerrors++;
+                  }
+            }
+            if (*q == '\0') {
+                  if (strlen(bfr) != LBUFLEN - 1)
+                        xerror("line %d: EOF in middle of header line", nextlinno);
+                  else
+                        xerror("line %d: Line too long", nextlinno);
+            }
+            nextlinno++;
+            p = q + 1;
+      } while (ungetc(c = getc(fp), fp), c == ' ' || c == '\t');
+      return 0;
+}
+
+
+
+/*
+ * Copy the body of the article to the mail and/or news file.  We have to
+ * check for:
+ *	1) Control characters.
+ *	2) Lines consisting of a single '.'
+ *	3) Trailing blank lines, which we silently delete.
+ *	4) Article which might trigger line eater bug.
+ */
+
+addbody(in)
+      register FILE *in;
+      {
+      register int c;
+      register FILE *mail = mailfp, *news = newsfp;
+      int nlcount = 1;		/* force initial blank line */
+      int dotflag = 0;		/* test for line containing single dot */
+      int first = 1;		/* avoid line eater */
+
+      linno++;
+      if (!feof(in))
+         while ((c = getc(in)) != EOF) {
+            if (c == '\n') {
+                  if (dotflag)
+                        xerror("line %d: some versions of mail and news choke on lines consisting of a single dot", linno - nlcount);
+                  linno++;
+                  nlcount++;
+            } else if (!isprint(c) && !isspace(c) && c != '\b') {
+                  if (in == infp)
+                        fprintf(stderr, "line %d: illegal character (octal %o)\n", linno, c);
+                  else
+                        fprintf(stderr, "illegal character in signature file (octal %o)\n", c);
+                  nerrors++;
+            } else {
+                  if (nlcount) {
+                        if (first) {
+                              first = 0;
+                              if ((c == '\t' || c == ' ') && nlcount == 1 && news && in == infp)
+                                    putc('\n', news);
+                        }
+                        if (c == '.')
+                              dotflag++;
+                        do {
+                              if (mail)
+                                    putc('\n', mail);
+                              if (news)
+                                    putc('\n', news);
+                        } while (--nlcount > 0);
+                  } else
+                        dotflag = 0;
+                  if (mail)
+                        putc(c, mail);
+                  if (news)
+                        putc(c, news);
+            }
+      }
+      if (mail)
+            putc('\n', mail);
+      if (news)
+            putc('\n', news);
+      if (mail) {
+            fflush(mail);
+            if (ferror(mail))
+                  xerror("write error on temp file");
+      }
+      if (news) {
+            fflush(news);
+            if (ferror(news))
+                  xerror("write error on temp file");
+      }
+}
+!E!O!F!
+
+cat > postnews/postnm3.c <<\!E!O!F!
+/*
+ * Pass 2:  Check header lines for errors.
+ *
+ * Copyright 1984 by Kenneth Almquist.  All rights reserved.
+ *     Permission is granted for anyone to use and distribute, but not
+ *     sell, this program provided that this copyright notice is retained.
+ */
+
+#include "postnm.h"
+
+char *cmsg[] = {		/* list of control messages */
+      "cancel",
+      "version",
+      "ihave",
+      "sendme",
+
+      "newgroup",
+      "rmgroup",
+      "sendsys",
+      "senduuname",
+      "checkgroups",
+      "delsub",
+      NULL
+};
+#define PRIVCMSG (&cmsg[4])	/* start of priviledged control messages */
+
+
+
+checkheader() {
+      char *p, *q;
+      struct hline *hp;
+
+      curhdr = hdrline[HTSUBJECT];
+      if (curhdr == NULL) {
+            if (hdrline[HTCONTROL]) {
+                  sprintf(bfr, "Subject: %s", hdrline[HTCONTROL]->body);
+                  prochdr(bfr, 1);
+            } else {
+                  fprintf(stderr, "postnm: no subject line\n");
+                  nerrors++;
+            }
+      }
+      setexit();
+      if (hdrline[HTCOMMAND]) {
+            hlselect(hdrline[HTCOMMAND]);
+            hlzap(HTCOMMAND);
+            skipbl();
+            p = scanp;
+            scnchr(" \t\n");
+            q = scanp;
+            skipws(" \t\n");
+            if (*scanp != '\0')
+cmdjsynerr:        jsynerr("Command must be \"reply\", \"followup\", or \"both\"");
+            *q = '\0';
+            if (equal(p, "reply") || equal(p, "r"))
+                  hlzap(HTNEWSGROUPS), hlzap(HTDIST);
+            else if (equal(p, "followup") || equal(p, "f"))
+                  hlzap(HTTO);
+            else if (!equal(p, "both"))
+                  goto cmdjsynerr;
+      }
+
+      for (hp = hfirst ; hp ; hp = hp->next) {
+            fixheader(hp);
+      }
+      if (references && hdrline[HTNEWSGROUPS] && !hdrline[HTREFERENCES]) {
+            sprintf(bfr, "References: %s", references);
+            prochdr(bfr, 1);
+      }
+      hlzap(HTBCC);
+      cknewsgroups();
+      *addrp = NULL;
+}
+
+
+
+/*
+ * Process a header line.
+ */
+
+fixheader(hp)
+      struct hline *hp;
+      {
+      extern char *begaddr, *endaddr;
+      char *p;
+      register char **pp;
+      time_t tim;
+      struct tm *tm;
+      static char month[12][4] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+				  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+      if (setexit())
+            return;
+      hlselect(hp);
+      switch (hp->type) {
+      case HTTO:
+      case HTCC:
+      case HTBCC:
+            for (;;) {
+                  skipws(" \t\n,");
+                  if (*scanp == '\0')
+                        break;
+                  if (addrp >= &addrlist[MAXADDR])
+                        jsynerr("too many mail addresses");
+                  parseaddr();
+                  *addrp++ = getval(begaddr, endaddr, NULL);
+            }
+            break;
+
+      case HTDIST:
+            commalist();
+            for (pp = nlist ; *pp ; pp++)
+                  if (equal(*pp, "net"))
+                        *pp = "world";
+            rmdup(nlist);
+            if (nlist[0] == NULL || nlist[1] == NULL && equal(nlist[0], "world"))
+                  hlzap(HTDIST);
+            else
+                  ckdist();
+            for (pp = nlist ; *pp ; pp++)
+                  if (equal(*pp, "world"))
+                        *pp = "net";
+            goto outlist;
+
+      case HTFOLLOWUPTO:
+            commalist();
+            if (nlist[0] == NULL)
+                  jsynerr("empty followup-to line");
+            rmdup(nlist);
+            bcopy((char *)nlist, (char *)follist, sizeof follist);
+            goto outlist;
+
+      case HTNEWSGROUPS:
+            commalist();
+            if (nlist[0] == NULL)
+                  jsynerr("empty newsgroups line");
+            rmdup(nlist);
+            bcopy((char *)nlist, (char *)nglist, sizeof nglist);
+
+outlist:    outp = bfr;
+            if (nlist[0]) {
+                  for (pp = nlist ; *pp ; pp++) {
+                        if (outp != bfr)
+                              outstr(",");
+                        outstr(*pp);
+                  }
+                  outstr("\n");
+                  hp->fixed = savestr(bfr);
+            }
+            break;
+
+      case HTEXPIRES:
+            if ((tim = cgtdate(scanp)) == -1L)
+                  jsynerr("Can't parse date");
+            tm = gmtime(&tim);
+            sprintf(bfr, "%d %s %d %02d:%02d:%02d GMT\n", tm->tm_mday,
+                    month[tm->tm_mon], tm->tm_year, tm->tm_hour, tm->tm_min,
+                    tm->tm_sec);
+            hp->fixed = savestr(bfr);
+            break;
+
+      case HTCONTROL:
+            p = scanp;
+            scnchr(" \t\n");
+            getval(p, scanp, bfr);
+            for (pp = cmsg ; *pp && !equal(*pp, bfr) ; pp++);
+            if (*pp == NULL)
+                  jsynerr("Unknown control message \"%s\"", bfr);
+            else if (pp >= PRIVCMSG && !isadmin())
+                  jsynerr("Get your system administrator to send this control message for you.");
+            break;
+
+      case HTSUBJECT:
+            if (*scanp == '\n')
+                  jsynerr("empty subject line");
+            if (prefix(scanp, "cmsg "))
+                  jsynerr("subjects beginning with cmsg confuse inews");
+            if (prefix(scanp, "Re: ") && !hdrline[HTREFERENCES] && !references)
+                  jsynerr("followup articles must have references lines");
+            break;
+
+      case HTREFERENCES:
+            if (references && !equal(scanp, references)) {
+                  fprintf(stderr, "postnm: line %d: you changed the references line but I fixed it\n", curhdr->linno);
+                  curhdr->fixed = references;
+            }
+            break;
+
+      case HTAPPROVED:
+            ckapproved();
+            break;
+
+      case HTORGANIZATION:
+            {
+                  /* Inews ignores organization lines */
+                  /* I shouldn't have to do this */
+                  char **pp, **qq;
+                  extern char **environ;
+                  sprintf(bfr, "ORGANIZATION=%s", scanp);
+                  nstrip(bfr);
+                  envkludge[0] = savestr(bfr);
+                  qq = envkludge + 1;
+                  for (pp = environ ; pp < environ + 199 && *pp ; pp++)
+                        if (!prefix(*pp, "ORGANIZATION="))
+                              *qq++ = *pp;
+                  *qq = 0;
+                  environ = envkludge;
+            }
+            break;
+
+      default:
+            break;
+      }
+}
+
+
+
+/*
+ * Check that newsgroups or distributions are legal.
+ */
+
+checklist(file, thing)
+      char *file, *thing;
+      {
+      char fname[FPATHLEN];
+      FILE *fp;
+      char *left[MAXGRPS + 1], **pp;
+
+      sprintf(fname, "%s/%s", LIB, file);
+      fp = ckfopen(fname, "r");
+      bcopy((char *)nlist, (char *)left, sizeof(left));
+      while (fgets(bfr, LBUFLEN, fp) != NULL) {
+            scanp = bfr;
+            scnchr(" \t");
+            *scanp = '\0';
+            for (pp = left ; *pp ; pp++) {
+                  if (equal(*pp, bfr)) {
+                        do *pp = *(pp + 1);
+                        while (*pp++);
+                        break;
+                  }
+            }
+      }
+      fclose(fp);
+      for (pp = left ; *pp ; pp++)
+            synerr("illegal %s %s", thing, *pp);
+}
+
+
+
+/*
+ * Check distributions for validity.  If they aren't in the distributions
+ * file, we try the active file.
+ */
+
+ckdist() {
+      FILE *fp;
+      char *p;
+      char **pp;
+      char *dlist[MAXGRPS + 1];
+
+      bcopy((char *)nlist, (char *)dlist, sizeof dlist);
+      sprintf(bfr, "%s/distributions", LIB);
+      if ((fp = fopen(bfr, "r")) != NULL) {
+            while (dlist[0] && fgets(bfr, LBUFLEN, fp)) {
+                  if (bfr[0] == '\n' || bfr[0] == '#')
+                        continue;
+                  if ((p = strpbrk(bfr, " \t\n")) == NULL)
+                        continue;
+                  *p = '\0';
+                  rmlist(bfr, dlist);
+            }
+            fclose(fp);
+      }
+      else  printf("postnm: warning: no distributions file\n");
+      if (dlist[0]) {
+            sprintf(bfr, "%s/active", LIB);
+            fp = ckfopen(bfr, "r");
+            while (dlist[0] && fgets(bfr, LBUFLEN, fp)) {
+                  if ((p = strpbrk(bfr, " \n")) == NULL)
+                        continue;
+                  *p = '\0';
+                  for (pp = dlist ; *pp ; ) {
+                        if (ngmatch(bfr, *pp))
+                              rmlist(*pp, dlist);
+                        else
+                              pp++;
+                  }
+            }
+            fclose(fp);
+      }
+
+      prtbad(dlist, "distribution", curhdr);
+}
+
+
+
+/*
+ * Check the newsgroups on the Newsgroups: and Followup-To: lines
+ * for validity.  We do both at once so that we only have to scan
+ * the active file once.
+ */
+
+cknewsgroups() {
+      FILE *actfp;
+      char *p;
+      int didng = 0;
+      char **pp;
+
+      if (nglist[0] == NULL && follist[0] == NULL)
+            return;
+      bcopy((char *)nglist, (char *)nlist, sizeof nlist);
+      sprintf(bfr, "%s/active", LIB);
+      actfp = ckfopen(bfr, "r");
+      while ((nlist[0] || follist[0]) && fgets(bfr, LBUFLEN, actfp)) {
+            if ((p = index(bfr, ' ')) == NULL && (p = index(bfr, '\n')) == NULL)
+                  continue;
+            *p = '\0';
+            if (rmlist(bfr, nlist) >= 0)
+                  didng = 1;
+            rmlist(bfr, follist);
+      }
+      fclose(actfp);
+
+      /* Not all newsgroups on followup need be legal */
+      if (nlist[0] && (!hdrline[HTREFERENCES] || !didng))
+            prtbad(nlist, "newsgroup", hdrline[HTNEWSGROUPS]);
+      else {
+            /* check for moderated groups */
+            for (pp = nglist ; *pp ; pp++) {
+                  if (hdrline[HTAPPROVED] == NULL && ngmatch(*pp, MODGROUPS)) {
+                        getmod(*pp);
+                        break;
+                  }
+            }
+      }
+      prtbad(follist, "newsgroup", hdrline[HTFOLLOWUPTO]);
+}
+
+
+prtbad(pp, what, hl)
+      char **pp;
+      char *what;
+      struct hline *hl;
+      {
+      hlselect(hl);
+      while (*pp)
+            synerr("Bad %s %s", what, *pp++);
+}
+
+
+
+/*
+ * Remove an entry from an array of character strings.
+ */
+
+rmlist(entry, list)
+      char *entry, **list;
+      {
+      register char **pp;
+      register char **qq;
+      int retval;
+
+      qq = list;
+      retval = -1;
+      for (pp = list ; *pp ; pp++) {
+            if (!equal(*pp, entry))
+                  *qq++ = *pp;
+            else
+                  retval = 0;		/* removed one */
+      }
+      *qq = NULL;
+      return retval;
+}
+
+
+
+/*
+ * Check "Approved:" line.  Currently, we require an address which must
+ * include an at sign and which cannot be enclosed in angle brackets.
+ * An optional real name in parenthesis is allowed, but not other comments.
+ */
+
+ckapproved() {
+      char *start = scanp;
+      extern char *beglocal, *endlocal, *begdomain;
+
+      if (*scanp == '(' || *scanp == ',' || *scanp == '\n')
+bad:        jsynerr("Illegal address");
+      parseaddr();
+      if (beglocal != start || *endlocal != '@' || begdomain != endlocal + 1)
+            goto bad;
+      skipbl();
+      if (*scanp)
+            goto bad;
+}
+
+
+
+/*
+ * Parse a comma separated list into its components.
+ */
+
+commalist() {
+      char **pp;
+      char *p;
+
+      pp = nlist;
+      for (;;) {
+            skipws(" \t\n,");
+            if (*scanp == '\0')
+                  break;
+            p = scanp;
+            scnchr(" \t\n,(");
+            if (pp >= nlist + MAXGRPS)
+                  jsynerr("list too long");
+            *pp++ = getval(p, scanp, NULL);
+      }
+      *pp = NULL;
+}
+
+
+
+outstr(str)
+      char *str;
+      {
+      strcpy(outp, str);
+      outp += strlen(str);
+}
+
+
+
+rmdup(list)
+      char **list;
+      {
+      register char **pp, **qq;
+
+      while (*list) {
+            for (pp = qq = list + 1 ; *pp ; pp++)
+                  if (!equal(*pp, *list))
+                        *qq++ = *pp;
+            *qq = NULL;
+            list++;
+      }
+}
+
+
+
+/*
+ * Set up a given header for parsing.
+ */
+
+hlselect(hp)
+      struct hline *hp;
+      {
+      curhdr = hp;
+      scanp = hp->body;
+}
+
+
+hlzap(type)
+      int type;
+      {
+      register struct hline *hp, **prev;
+
+      prev = &hfirst;
+      while ((hp = *prev) != NULL) {
+            if (hp->type == type)
+                  *prev = hp->next;	/* delete line */
+            else
+                  prev = &hp->next;
+      }
+      hdrline[type] = NULL;
+      hlast = NULL;
+      for (hp = hfirst ; hp ; hp = hp->next)
+            hlast = hp;
+}
+
+
+
+/*
+ * Figure out the moderator of a group.
+ */
+
+getmod(newsgroup)
+      char *newsgroup;
+      {
+      FILE *fp;
+      char *p;
+      char *q;
+      char s[BUFLEN];
+      FILE *popen();
+
+      sprintf(bfr, "%s/moderators", LIB);
+      fp = ckfopen(bfr, "r");
+      for (;;) {
+            if (fgets(bfr, LBUFLEN, fp) == NULL)
+                  goto notfound;
+            if ((p = strpbrk(bfr, " \t")) == NULL)
+                  continue;		/* "Can't happen" */
+            *p++ = '\0';
+            if (equal(bfr, newsgroup))
+                  break;
+      }
+      fclose(fp);
+      while (*p == ' ' || *p == '\t')
+            p++;
+      nstrip(p);
+      moderator = savestr(p);
+      return;
+
+notfound:
+      fclose(fp);
+
+      /* try to use return path from old article */
+      sprintf(bfr, "%s/active", LIB);
+      fp = ckfopen(bfr, "r");
+      while (fgets(bfr, LBUFLEN, fp) != NULL) {
+            p = index(bfr, ' ');
+            *p++ = '\0';
+            if (equal(bfr, newsgroup))
+                  break;
+      }
+      fclose(fp);
+      if ((q = strpbrk(p, " \t\n")) != NULL)
+            *q = '\0';
+      scopyn(p, s, 32);
+      dirname(newsgroup, bfr);
+      sprintf(bfr + strlen(bfr), "/%ld", atol(s));
+      printf("postnm: trying to find moderator for %s from %s\n", newsgroup, bfr);
+      if ((fp = fopen(bfr, "r")) != NULL) {
+            while (fgets(bfr, LBUFLEN, fp) != NULL && bfr[0] != '\n') {
+#ifdef notdef /* "From:" line has same info */
+                  if (prefix(bfr, "Path:")) {
+                        scanp = bfr + 5;
+                        s[0] = '\0';
+                        for (;;) {
+                              scchr("!:@^% \t\n");
+                              p = scanp;
+                              scnchr("!:@^% \t\n");
+                              q = scanp;
+                              scchr("!:@^% \t\n");
+                              if (*scanp)
+                                    getval(p, q, s);
+                              else
+                                    break;
+                        }
+                        if (s[0] == '\0')
+                              continue;
+                        if (index(s, '.') == NULL)
+                              strcat(s, ".UUCP");
+                        *q = '\0';
+                        sprintf(bfr, "%s@%s", p, s);
+                        moderator = savestr(bfr);
+                        printf("postnm: assuming moderator for %s is %s\n", newsgroup, bfr);
+                  }
+#endif
+                  if (prefix(bfr, "From:")) {
+                        getaddr(bfr + 5, s);
+                        moderator = savestr(s);
+                  }
+                  else if (prefix(bfr, "Approved:")) {
+                        getaddr(bfr + 9, s);
+                        moderator = savestr(s);
+                  }
+            }
+      }
+
+      if (fp != NULL)
+            fclose(fp);
+      if (! moderator)
+            synerr("Can\'t find moderator for newsgroup %s", newsgroup);
+#ifdef NOTIFY
+      sprintf(bfr, "mail \'%s\'", NOTIFY);
+#else
+      sprintf(bfr, "mail \'%s\'", ADMIN);
+#endif
+      if ((fp = popen(bfr, "w")) == NULL)
+            fprintf(stderr, "postnm: can\'t send mail to administrator\n");
+      else {
+            fprintf(fp, "Subject: missing moderator entry for %s\n\n", newsgroup);
+            fprintf(fp, "From: The postnm program.\n");
+            fprintf(fp, "\nThere is no entry for %s in %s/moderators\n",
+                    newsgroup, LIB);
+            if (moderator)
+                  fprintf(fp, "The moderator is probably %s\n", moderator);
+            pclose(fp);
+      }
+}
+!E!O!F!
+
+cat > postnews/postnm4.c <<\!E!O!F!
+/*
+ * Pass 3:  generate the news and mail headers.
+ *
+ * Copyright 1984 by Kenneth Almquist.  All rights reserved.
+ *     Permission is granted for anyone to use and distribute, but not
+ *     sell, this program provided that this copyright notice is retained.
+ */
+
+#include "postnm.h"
+
+
+/*
+ * Write out a header.
+ */
+gennewshdr(fp)
+      FILE *fp;
+      {
+      int didmod = 0;
+
+      for (curhdr = hfirst ; curhdr ; curhdr = curhdr->next) {
+            if (setexit())  continue;
+            switch (curhdr->type) {
+            case HTFROM:
+            case HTREPLYTO:
+                  newsaddr(curhdr);
+                  break;
+
+            case HTTO:
+                  fputs("To: ", fp);
+                  if (moderator && ! didmod)
+                        fprintf(fp, "%s (The Moderator), ", moderator);
+                  fputs(curhdr->body, fp);
+                  didmod = 1;
+                  break;
+
+            default:
+                  if (curhdr->fixed)
+                        fprintf(fp, "%s: %s", curhdr->hdrname, curhdr->fixed);
+                  else
+                        fprintf(fp, "%s: %s", curhdr->hdrname, curhdr->body);
+                  break;
+            }
+      }
+      if (moderator && !didmod)
+            fprintf(fp, "To: %s (The Moderator)\n", moderator);
+}
+
+
+genmailhdr(fp)
+      FILE *fp;
+      {
+      for (curhdr = hfirst ; curhdr ; curhdr = curhdr->next) {
+            if (setexit())  continue;
+            switch (curhdr->type) {
+            case HTREFERENCES:
+                  if (hdrline[HTINREPLYTO] == NULL) {
+                        register char *p, *q;
+                        p = curhdr->fixed? curhdr->fixed : curhdr->body;
+                        if ((p = rindex(p, '<')) != NULL
+                         && (q = index(p, '>')) != NULL) {
+                              fprintf(fp, "In-reply-to: USENET article %s\n",
+                                    getval(p, q + 1, bfr));
+                        }
+                  }
+                  break;
+
+            case HTEXPIRES:
+                  fputs(curhdr->text, fp);
+                  break;
+
+            default:
+                  if (curhdr->fixed)
+                        fprintf(fp, "%s: %s", curhdr->hdrname, curhdr->fixed);
+                  else
+                        fputs(curhdr->text, fp);
+                  break;
+            }
+      }
+}
+
+
+
+newsaddr(hp)
+      struct hline *hp;
+      {
+      char domain[NAMELEN], local[NAMELEN];
+      extern char *begreal, *endreal;		/* real name */
+      extern char *beglocal, *endlocal;		/* local part */
+      extern char *begdomain, *enddomain;	/* domain part */
+
+      hlselect(hp);
+      skipws(" \t\n,");
+      parseaddr();
+      skipws(" \t\n,");
+      if (*scanp != '\0') {
+            synerr("only one address permitted on \"%s:\" line", hp->hdrname);
+            return;
+      }
+      if (begdomain)
+            getval(begdomain, enddomain, domain);
+      else
+            sprintf(domain, "%s%s", FULLSYSNAME, MYDOMAIN);
+      getval(beglocal, endlocal, local);
+      fprintf(newsfp, "%s: %s@%s", hp->hdrname, local, domain);
+      if (begreal) {
+            getval(begreal, endreal, bfr);
+            fprintf(newsfp, " (%s)", bfr);
+      }
+      putc('\n', newsfp);
+      if (equal(hp->hdrname, "From")
+       && (index(local, '!') || index(domain, '!') || index(bfr, '!')))
+            synerr("Exclamation points on From: line break inews");
+}
+!E!O!F!
+
+echo Part 5 of 7 extracted.
+
+

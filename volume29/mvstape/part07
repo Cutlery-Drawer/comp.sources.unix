@@ -1,0 +1,1215 @@
+Newsgroups: comp.sources.unix
+From: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Subject: v29i026: mvstape - suite of utilities for handling IBM MVS tapes, Part07/09
+References: <1.807573809.16947@gw.home.vix.com>
+Sender: unix-sources-moderator@gw.home.vix.com
+Approved: vixie@gw.home.vix.com
+
+Submitted-By: nmm1@cus.cam.ac.uk (Nick Maclaren)
+Posting-Number: Volume 29, Issue 26
+Archive-Name: mvstape/part07
+
+#! /bin/sh
+# This is a shell archive.  Remove anything before this line, then unpack
+# it by saving it into a file and typing "sh file".  To overwrite existing
+# files, type "sh file -c".  You can also feed this as standard input via
+# unshar, or by typing "sh <file", e.g..  If this archive is complete, you
+# will see the following message at the end:
+#		"End of archive 7 (of 9)."
+# Contents:  command.c labels.c
+# Wrapped by nmm1@ursa.cus.cam.ac.uk on Fri Aug  4 15:43:59 1995
+PATH=/bin:/usr/bin:/usr/ucb ; export PATH
+if test -f 'command.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'command.c'\"
+else
+echo shar: Extracting \"'command.c'\" \(20193 characters\)
+sed "s/^X//" >'command.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xcommand.c  -  interpret the commands. */
+X
+X
+X
+X#include <ctype.h>
+X#include <limits.h>
+X
+X#include "mvstape.h"
+X#include "command.h"
+X
+X
+X
+X/* Global variables that are used only in this module, plus the command chain
+X(also needed in control.c).  Efficiency is not an issue. */
+X
+X#define input_buffsize 400    /* Surely no line will exceed this? */
+X#define max_tape_files 1000   /* For checking only (could be INT_MAX) */
+X
+Xcommand *command_chain = NULL;
+X
+Xstatic char command_buffer[input_buffsize] = "",
+X    message_buffer[2*input_buffsize] = "", /* Longer for diagnostics */
+X    *command_ptr = NULL;      /* The end of the chain */
+X
+Xstatic char current_prefix[MVSnamesize] = "";
+Xstatic char current_dir[UNIXnamesize] = "";
+Xstatic CODE_PAGE *code_page = NULL;
+Xstatic int current_recfm = recfm_U, current_lrecl = constant_64K;
+X
+Xstatic int warned_on_append = 0;
+X
+X
+X
+XSTATIC int match (const char *buffer, const char *string, int *ptr) {
+X
+X/* This looks for a command (ignoring case), and returns whether it matched.
+XIt updates the position of the first significant character after the command
+Xname in 'ptr'. */
+X
+X    int i = 0;
+X
+X    while (string[i] != '\0') {
+X        if (toupper(buffer[i]) == string[i]) ++i; else return 0;
+X    }
+X    if (buffer[i] != '\0' && ! isspace(buffer[i])) return 0;
+X    while (isspace(buffer[i])) ++i;
+X    *ptr += i;
+X    return 1;
+X}
+X
+X
+X
+XSTATIC command *get_command_buffer (void) {
+X
+X/* This gets space for a command and fails if there is none. */
+X
+X    command *buffer;
+X
+X    errno = 0;
+X    if ((buffer = malloc(sizeof(command))) == NULL)
+X        fatal("insufficient space to store command lines",ERR_system);
+X    buffer->command_next = NULL;
+X    return buffer;
+X}
+X
+X
+X
+XSTATIC char *get_command (void) {
+X
+X/* This gets the next command (i.e. up to end of line or ';'), removes trailing
+Xspaces and adds a string terminator. */
+X
+X    char *charptr, *charptr1;
+X    static char null_string[] = "";    /* Out of paranoia! */
+X    int len;
+X
+X    if (command_ptr == NULL) {
+X        if (command_args != NULL)
+X            command_ptr = command_args;
+X        else
+X            command_ptr = null_string;
+X    }
+X
+X/* See if there is another command in the current buffer. */
+X
+X    for ( ; ; ) {
+X        while (isspace(*command_ptr) || *command_ptr == ';') ++command_ptr;
+X        if (*command_ptr != '\0') {
+X            charptr = command_ptr;
+X            if ((command_ptr = strchr(command_ptr,';')) == NULL) {
+X                command_ptr = charptr+strlen(charptr);
+X                charptr1 = command_ptr-1;
+X            } else {
+X                charptr1 = command_ptr-1;
+X                ++command_ptr;
+X            }
+X            while (isspace(*charptr1)) --charptr1;
+X            *(charptr1+1) = '\0';
+X            return charptr;
+X
+X/* There is nothing left in the buffer, so see if it is possible to read
+Xanother line. */
+X
+X        } else {
+X            if (command_file == NULL) return NULL;
+X            errno = 0;
+X            if (fgets(command_buffer,input_buffsize,command_file) == NULL) {
+X                if (ferror(command_file))
+X                    fatal("I/O error on command file",ERR_system);
+X                else
+X                    return NULL;
+X
+X/* Check the length and remove the newline. */
+X
+X            } else {
+X                len = strlen(command_buffer);
+X                if (len <= 0 || command_buffer[len-1] != '\n')
+X                    fatal("Command file line not terminated with a newline",
+X                        ERR_private);
+X                command_buffer[len-1] = '\0';
+X                command_ptr = command_buffer;
+X                continue;
+X            }
+X        }
+X    }
+X}
+X
+X
+X
+XSTATIC void bad_command (const char *buffer) {
+X
+X    fatal("Invalid command: '%s'\n",ERR_private,buffer);
+X}
+X
+X
+X
+XSTATIC void display_command (const command *cmdptr) {
+X
+X/* This formats a matching command, for debugging. */
+X
+X    char *ptr = message_buffer;
+X
+X/* Format the basic operation and its options. */
+X
+X    sprintf(ptr,"%p:  ",cmdptr);
+X    switch (cmdptr->command_type) {
+Xcase command_copy: strcat(ptr,"COPY "); break;
+Xcase command_append: strcat(ptr,"APPEND "); break;
+Xcase command_skip: strcat(ptr,"SKIP "); break;
+Xdefault:    strcat(ptr,"<unset> "); break;
+X    }
+X    if (cmdptr->command_type != command_skip) {
+X        switch (cmdptr->command_opt) {
+Xcase command_opt_stream: strcat(ptr,"STREAM "); break;
+Xcase command_opt_lines: strcat(ptr,"LINES "); break;
+Xcase command_opt_records: strcat(ptr,"RECORDS "); break;
+Xcase command_opt_blocks: strcat(ptr,"BLOCKS "); break;
+Xdefault:    strcat(ptr,"<unset> "); break;
+X        }
+X        if (cmdptr->command_flags&command_flags_trans)
+X            strcat(ptr,"TRANS ");
+X        else
+X            strcat(ptr,"NOTRANS ");
+X        if (cmdptr->command_flags&command_flags_strip)
+X            strcat(ptr,"STRIP ");
+X        else
+X            strcat(ptr,"NOSTRIP ");
+X        if ((cmdptr->command_flags&
+X                    (command_flags_transcc|command_flags_ignorecc)) ==
+X                (command_flags_transcc|command_flags_ignorecc))
+X            strcat(ptr,"<invalid> ");
+X        else if (cmdptr->command_flags&command_flags_transcc)
+X            strcat(ptr,"TRANSCC ");
+X        else if (cmdptr->command_flags&command_flags_ignorecc)
+X            strcat(ptr,"IGNORECC ");
+X        else
+X            strcat(ptr,"INCLUDECC ");
+X        if (cmdptr->command_flags&command_flags_range)
+X            strcat(ptr,"<range> ");
+X        if (cmdptr->command_flags&
+X                    ~(command_flags_trans|command_flags_strip|
+X                        command_flags_transcc|command_flags_ignorecc|
+X                        command_flags_range))
+X            strcat(ptr,"<unset> ");
+X
+X/* Display the code page and format the recfm and lrecl. */
+X
+X        strcat(ptr,cmdptr->code_page->name);
+X        strcat(ptr," (");
+X        strcat(ptr,format_recfm(cmdptr->recfm));
+X        ptr = strchr(ptr,'\0');
+X        sprintf(ptr," %d) ",cmdptr->lrecl);
+X    }
+X
+X/* Format the MVS and UNIX names. */
+X
+X    ptr = strchr(ptr,'\0');
+X    if (cmdptr->seq_from != 0 || cmdptr->seq_to != 0)
+X        sprintf(ptr,"%d-%d ",cmdptr->seq_from,cmdptr->seq_to);
+X    ptr = strchr(ptr,'\0');
+X    if (cmdptr->prefix_len != 0 || cmdptr->MVSname[0] != '\0')
+X        sprintf(ptr,"%s (%d) ",cmdptr->MVSname,cmdptr->prefix_len);
+X    ptr = strchr(ptr,'\0');
+X    if (cmdptr->command_type != command_skip &&
+X            (cmdptr->dir_len != 0 || cmdptr->UNIXname[0] != '\0'))
+X        sprintf(ptr,"AS %s (%d)",cmdptr->UNIXname,cmdptr->dir_len);
+X    comment(message_buffer);
+X}
+X
+X
+X
+XSTATIC void default_prefix (void) {
+X
+X/* Set up the default prefix, using the login name.  There is no point in
+Xworrying about efficiency. */
+X
+X    int i;
+X    char *charptr;
+X
+X    errno = 0;
+X    if ((charptr = Getlogin()) == NULL || strlen(charptr) == 0 ||
+X            strlen(charptr)+1 >= MVSnamesize) {
+X        comment("unable to find a useful login name - default prefix not set");
+X        current_prefix[0] = '\0';
+X    } else 
+X        for (i = 0; i <= strlen(charptr); ++i)
+X            current_prefix[i] = tolower(charptr[i]);
+X}
+X
+X
+X
+XSTATIC void read_prefix (const char *buffer, int ptr, int length) {
+X
+X/* This reads a PREFIX command, but does not check it for validity. */
+X
+X    int i;
+X
+X    if (length-ptr+1 >= MVSnamesize) bad_command(buffer);
+X    if (ptr >= length)
+X        default_prefix();
+X    else {
+X        for (i = ptr; i < length; ++i)
+X            if (isgraph(buffer[i]) && buffer[i] != '/' && buffer[i] != '*')
+X                current_prefix[i-ptr] = tolower(buffer[i]);
+X            else
+X                bad_command(buffer);
+X        if (buffer[length-1] == '.') --length;
+X        current_prefix[length-ptr] = '\0';
+X        if (isdigit(current_prefix[0])) bad_command(buffer);
+X    }
+X}
+X
+X
+X
+XSTATIC void read_cd (const char *buffer, int ptr, int length) {
+X
+X/* Read a CD command, throwing out only lunatic names. */
+X
+X    int i;
+X    char *charptr, *charptr1;
+X
+X    if (ptr >= length)
+X        current_dir[0] = '\0';
+X    else {
+X        if (buffer[ptr] == NAME_DIR_SEP) current_dir[0] = '\0';
+X        if (strlen(current_dir)+length-ptr+1 >= UNIXnamesize-1)
+X            bad_command(buffer);
+X        charptr = current_dir+strlen(current_dir);
+X        for (i = ptr; i < length; ++i) {
+X            if (! isgraph(buffer[i]) || buffer[i] == '*' ||
+X                    strchr(NAME_CHAR_VETO,buffer[i]) != NULL ||
+X                    (NAME_DIR_SEP != '/' && buffer[i] == '/'))
+X                bad_command(buffer);
+X            *charptr++ = (buffer[i] == NAME_DIR_SEP ? '/' : buffer[i]);
+X        }
+X        if (strstr(&buffer[ptr],"//") != NULL) bad_command(buffer);
+X        if (buffer[length-1] != '/') strcat(current_dir,"/");
+X
+X/* Now remove occurrences of /./ and /../ to prevent the string accumulating
+Xjunk and running out of space or bombing Open().  Anyone who produces infinite
+Xloops using symbolic links deserves what they get. */
+X
+X        while ((charptr = strstr(current_dir,"/./")) != NULL)
+X            while (*charptr++ != '\0') *charptr = *(charptr+2);
+X        while ((charptr = strstr(current_dir+1,"/../")) != NULL) {
+X            charptr1 = charptr+4;
+X            while (charptr > current_dir && *--charptr != '/') ;
+X            if (*charptr == '/') ++charptr;
+X            if (strncmp(charptr,"../",3) == 0) break;
+X            do *charptr = *charptr1++; while (*charptr++ != '\0');
+X            if (current_dir[0] == '\0') strcpy(current_dir,"/");
+X        }
+X        CHECK_FILE_NAME(current_dir);
+X    }
+X}
+X
+X
+X
+XSTATIC void read_format (const char *buffer, int ptr, int length) {
+X
+X/* Read a FORMAT command, checking for validity but little else. */
+X
+X    int n;
+X
+X/* Flags this command as specified and deal with the compulsory letter of the
+Xrecord format. */
+X
+X    command_flags |= format_specified;
+X    if (ptr >= length) bad_command(buffer);
+X    if (toupper(buffer[ptr]) == 'F')
+X        current_recfm = recfm_F;
+X    else if (toupper(buffer[ptr]) == 'V')
+X        current_recfm = recfm_V;
+X    else if (toupper(buffer[ptr]) == 'U')
+X        current_recfm = recfm_U;
+X    else
+X        bad_command(buffer);
+X    ++ptr;
+X
+X/* Deal with the optional letters and check termination. */
+X
+X    if (current_recfm != recfm_U && toupper(buffer[ptr]) == 'B') {
+X        current_recfm |= recfm_B;
+X        ++ptr;
+X    }
+X    if (current_recfm != recfm_U && toupper(buffer[ptr]) == 'S') {
+X        current_recfm |= recfm_S;
+X        ++ptr;
+X    }
+X    if (toupper(buffer[ptr]) == 'A') {
+X        current_recfm |= recfm_A;
+X        ++ptr;
+X    }
+X    if (toupper(buffer[ptr]) == 'M') {
+X        current_recfm |= recfm_M;
+X        ++ptr;
+X    }
+X    if (ptr < length && ! isspace(buffer[ptr])) bad_command(buffer);
+X    while (isspace(buffer[ptr])) ++ptr;
+X
+X/* Interpret the record length, if any.  Allow overlong blocks, because not all
+Xutilities may write legal ones. */
+X
+X    if (ptr < length) {
+X        current_lrecl = 0;
+X        while (isdigit(buffer[ptr]))
+X            current_lrecl = 10*current_lrecl+buffer[ptr++]-'0';
+X        while (isspace(buffer[ptr])) ++ptr;
+X        n = ((current_recfm&recfm_V) != 0 ? 5 : 1)+
+X            ((current_recfm&(recfm_A|recfm_M)) != 0 ? 1 : 0);
+X        while (isspace(buffer[ptr])) ++ptr;
+X        if (current_lrecl < n || current_lrecl > constant_64K || ptr < length)
+X            bad_command(buffer);
+X    } else if ((current_recfm&recfm_F) != 0)
+X        bad_command(buffer);
+X    else
+X        current_lrecl = (current_recfm&recfm_V ? INT_MAX : constant_64K);
+X}
+X
+X
+X
+XSTATIC void read_copy (command *cmd, const char *buffer, int ptr, int length) {
+X
+X/* This reads the arguments of a COPY, APPEND or SKIP command; note that ptr
+Xmay be virtual (i.e. greater than the length). */
+X
+X    int i, j, k, offset, wild = 0, trans = -1, strip = -1, ccopt = -1,
+X        range = 0;
+X
+X    if (ptr >= length) bad_command(buffer);
+X    cmd->code_page = code_page;
+X    cmd->recfm = current_recfm;
+X    cmd->lrecl = current_lrecl;
+X
+X/* Sort out whether the MVS prefix is needed here. */
+X
+X    if (buffer[ptr] == '.') {
+X        strcpy(cmd->MVSname,current_prefix);
+X        cmd->prefix_len = strlen(current_prefix)+1;
+X        offset = strlen(current_prefix);
+X    } else {
+X        cmd->MVSname[0] = '\0';
+X        cmd->prefix_len = 0;
+X        offset = 0;
+X    }
+X
+X/* Unpick the first filename - do not bother to check it for syntax. */
+X
+X    while (ptr < length && (k = buffer[ptr]) != '\0' && ! isspace(k)) {
+X        if (k == '*')
+X            ++wild;
+X        else if (k == '(')
+X            k = ':';
+X        else if (k == ')' && (isspace(buffer[ptr+1]) || buffer[ptr+1] == '\0'))
+X            k = '\0';
+X        else if (! isgraph(k) || k == '/')
+X            bad_command(buffer);
+X        ++ptr;
+X        cmd->MVSname[offset++] = tolower(k);
+X        if (wild > 10 || offset >= MVSnamesize) bad_command(buffer);
+X    }
+X    cmd->MVSname[offset] = '\0';
+X    while (isspace(buffer[ptr])) ++ptr;
+X
+X/* See if it is the sequence number form and decode it if so. */
+X
+X    if (isdigit(cmd->MVSname[0])) {
+X        command_flags |= match_by_number;
+X        k = i = 0;
+X        while (isdigit(cmd->MVSname[i])) k = 10*k+cmd->MVSname[i++]-'0';
+X        cmd->seq_from = cmd->seq_to = k;
+X        if (cmd->MVSname[i] == '-') {
+X            range = 1;
+X            if (++wild > 10) bad_command(buffer);
+X            ++i;
+X            k = 0;
+X            while (isdigit(cmd->MVSname[i])) k = 10*k+cmd->MVSname[i++]-'0';
+X            cmd->seq_to = k;
+X        }
+X
+X/* Check for plausible values and clear the fields if irrelevant.  Note that
+Xthis kludges up the dataset name for later matching. */
+X
+X        if ((cmd->MVSname[i] != '\0' && cmd->MVSname[i] != ':') ||
+X                cmd->seq_from <= 0 || cmd->seq_to < cmd->seq_from ||
+X                cmd->seq_to > max_tape_files)
+X            bad_command(buffer);
+X        j = 0;
+X        cmd->MVSname[j++] = '*';
+X        while ((cmd->MVSname[j++] = cmd->MVSname[i++]) != '\0') ;
+X    } else {
+X        command_flags |= match_by_name;
+X        cmd->seq_from = cmd->seq_to = 0;
+X    }
+X
+X/* The SKIP command must end here.  Otherwise update the maximum tape file
+Xnumber. */
+X
+X    if (cmd->command_type == command_skip) {
+X        if (ptr >= length)
+X            return;
+X        else
+X            bad_command(buffer);
+X    } else if (cmd->seq_to == 0)
+X        max_seqno_matched = max_tape_files;
+X    else if (cmd->seq_to > max_seqno_matched)
+X        max_seqno_matched = cmd->seq_to;
+X
+X/* Move on to the second filename, if appropriate and there is one. */
+X
+X    strcpy(cmd->UNIXname,current_dir);
+X    offset = cmd->dir_len = strlen(current_dir);
+X    if (match(&buffer[ptr],"AS",&ptr)) {
+X        if (ptr >= length) bad_command(buffer);
+X        if (buffer[ptr] == NAME_DIR_SEP) {
+X            cmd->dir_len = 0;
+X            cmd->UNIXname[0] = '\0';
+X            offset = 0;
+X        }
+X
+X/* Copy the text, checking the number of asterisks. */
+X
+X        while (ptr < length && (k = buffer[ptr]) != '\0' && ! isspace(k)) {
+X            if (strchr(NAME_CHAR_VETO,k) != NULL ||
+X                    (NAME_DIR_SEP != '/' && buffer[ptr] == '/'))
+X                bad_command(buffer);
+X            if (k == NAME_DIR_SEP) k = '/';
+X            ++ptr;
+X            cmd->UNIXname[offset++] = k;
+X            if (k == '*') --wild;
+X            if (! isgraph(k) || wild < 0 || offset >= UNIXnamesize)
+X                bad_command(buffer);
+X        }
+X        cmd->UNIXname[offset] = '\0';
+X        while (isspace(buffer[ptr])) ++ptr;
+X        CHECK_FILE_NAME(cmd->UNIXname);
+X    }
+X
+X/* Decode the type of I/O, defaulting to TEXT. */
+X
+X    if (match(buffer+ptr,"STREAM",&ptr))
+X        cmd->command_opt = command_opt_stream;
+X    else if (match(buffer+ptr,"LINES",&ptr))
+X        cmd->command_opt = command_opt_lines;
+X    else if (match(buffer+ptr,"RECORDS",&ptr))
+X        cmd->command_opt = command_opt_records;
+X    else if (match(buffer+ptr,"BLOCKS",&ptr))
+X        cmd->command_opt = command_opt_blocks;
+X    else if (match(buffer+ptr,"TEXT",&ptr))
+X        cmd->command_opt = command_opt_text;
+X    else if (match(buffer+ptr,"BINARY",&ptr))
+X        cmd->command_opt = command_opt_binary;
+X    else if (match(buffer+ptr,"DATA",&ptr))
+X        cmd->command_opt = command_opt_data;
+X    else
+X        cmd->command_opt = command_opt_text;
+X
+X/* Decode the options. */
+X
+X    while (ptr < length) {
+X        if (match(buffer+ptr,"TRANS",&ptr) && trans < 0)
+X            trans = 1;
+X        else if (match(buffer+ptr,"NOTRANS",&ptr) && trans < 0)
+X            trans = 0;
+X        else if (match(buffer+ptr,"STRIP",&ptr) && strip < 0)
+X            strip = 1;
+X        else if (match(buffer+ptr,"NOSTRIP",&ptr) && strip < 0)
+X            strip = 0;
+X        else if (match(buffer+ptr,"TRANSCC",&ptr) && ccopt < 0)
+X            ccopt = 2;
+X        else if (match(buffer+ptr,"IGNORECC",&ptr) && ccopt < 0)
+X            ccopt = 1;
+X        else if (match(buffer+ptr,"INCLUDECC",&ptr) && ccopt < 0)
+X            ccopt = 0;
+X        else
+X            bad_command(buffer);
+X    }
+X
+X/* Set the non-standard defaults for the composite options. */
+X
+X    if (cmd->command_opt == command_opt_text) {
+X        cmd->command_opt = command_opt_lines;
+X        if (trans < 0) trans = 1;
+X        if (strip < 0) strip = 1;
+X        if (ccopt < 0) ccopt = 2;
+X    } else if (cmd->command_opt == command_opt_binary) {
+X        cmd->command_opt = command_opt_stream;
+X        if (ccopt < 0) ccopt = 1;
+X    } else if (cmd->command_opt == command_opt_data) {
+X        cmd->command_opt = command_opt_lines;
+X        if (trans < 0) trans = 1;
+X    }
+X
+X/* Check for invalid combinations and transfer the results to the data
+Xstructure. */
+X
+X    if ((trans >= 0 || strip >= 0 || ccopt >= 0) &&
+X            cmd->command_opt == command_opt_blocks)
+X        bad_command(buffer);
+X    if (ccopt == 2 && cmd->command_opt != command_opt_lines)
+X        bad_command(buffer);
+X    cmd->command_flags = 0;
+X    if (trans > 0) cmd->command_flags |= command_flags_trans;
+X    if (strip > 0) cmd->command_flags |= command_flags_strip;
+X    if (ccopt == 2) cmd->command_flags |= command_flags_transcc;
+X    if (ccopt == 1) cmd->command_flags |= command_flags_ignorecc;
+X    if (range != 0) cmd->command_flags |= command_flags_range;
+X}
+X
+X
+X
+Xvoid read_commands (void) {
+X
+X/* This reads the commands, converts them to compiled form and chains them
+Xtogether. */
+X
+X    command *last = NULL;    /* Silencing 'gcc -Wall' */
+X    char *buffer;
+X    int length, ptr;
+X
+X    code_page = default_code_page;
+X    default_prefix();
+X    if (debug) comment("Chain of matching commands:\n");
+X
+X/* Read a command, and see what type of command it is; start with the
+Xnon-matching commands. */
+X
+X    while ((buffer = get_command()) != NULL) {
+X        length = strlen(buffer);
+X        ptr = 0;
+X        if (match(buffer,"PREFIX",&ptr))
+X            read_prefix(buffer,ptr,length);
+X        else if (NAME_DIR_SEP >= 0 && match(buffer,"CD",&ptr))    /* Kludge! */
+X            read_cd(buffer,ptr,length);
+X        else if (match(buffer,"CODE",&ptr)) {
+X            if (ptr >= length)
+X                code_page = default_code_page;
+X            else if ((code_page = select_code_page(&buffer[ptr])) == NULL)
+X                bad_command(buffer);
+X            select_code_page(NULL);
+X        } else if (match(buffer,"FORMAT",&ptr))
+X            read_format(buffer,ptr,length);
+X
+X/* Deal with the COPY, APPEND and SKIP commands. */
+X
+X        else {
+X            last = (*(command_chain == NULL ? &command_chain :
+X                &(last->command_next)) = get_command_buffer());
+X            if (match(buffer,"COPY",&ptr)) {
+X                last->command_type = command_copy;
+X                read_copy(last,buffer,ptr,length);
+X            } else if (match(buffer,"APPEND",&ptr)) {
+X                last->command_type = command_append;
+X                if (! warned_on_append && tar_fileno >= 0) {
+X                    comment("APPEND commands treated as COPY with -T");
+X                    warned_on_append = 1;
+X                    last->command_type = command_copy;
+X                }
+X                read_copy(last,buffer,ptr,length);
+X            } else if (match(buffer,"SKIP",&ptr)) {
+X                last->command_type = command_skip;
+X                read_copy(last,buffer,ptr,length);
+X            } else
+X                bad_command(buffer);
+X
+X/* Display the command if requested, and carry on. */
+X
+X            if (debug) display_command(last);
+X        }
+X    }
+X}
+END_OF_FILE
+if test 20193 -ne `wc -c <'command.c'`; then
+    echo shar: \"'command.c'\" unpacked with wrong size!
+fi
+# end of 'command.c'
+fi
+if test -f 'labels.c' -a "${1}" != "-c" ; then 
+  echo shar: Will not clobber existing file \"'labels.c'\"
+else
+echo shar: Extracting \"'labels.c'\" \(20319 characters\)
+sed "s/^X//" >'labels.c' <<'END_OF_FILE'
+X/* (C) Copyright N.M. Maclaren 1993, 1994, 1995
+X   (C) Copyright the University of Cambridge 1993, 1994, 1995
+X   ALL RIGHTS RESERVED
+X
+Xlabels.c  -  extract information from MVS labels and the TLS dictionary.  If 
+Xallow_errors is set, it lets several errors on the trailer labels pass without
+Xcomment. */
+X
+X
+X
+X#include <limits.h>
+X
+X#include "mvstape.h"
+X#include "labels.h"
+X#include "tlsdict.h"
+X#include "control.h"
+X
+X
+X
+X/* Constants used only in this module, and the global variables vol1_label and
+Xhdr1_label. */
+X
+X#define label_field_size    20        /* Enough for all but TLS dataset names */
+X
+Xchar vol1_label[TAPE_LABEL_SIZE];     /* Mainly for consistency checking */
+Xchar hdr1_label[TAPE_LABEL_SIZE];     /* Mainly for consistency checking */
+X
+X#define TOD_quad_year 120382565       /* Used for IBM TOD format decoding! */
+X#define TOD_year 30075042
+X#define TOD_fortnight 1153563
+X#define TOD_day 82397
+X
+X
+X
+Xvoid check_compiled_code (void) {
+X
+X/* Check the compiled structures for consistency.  This is pure paranoia. */
+X
+X    if (sizeof(VOL1_LABEL) != TAPE_LABEL_SIZE ||
+X            sizeof(HDR1_LABEL) != TAPE_LABEL_SIZE ||
+X            sizeof(HDR2_LABEL) != TAPE_LABEL_SIZE ||
+X            sizeof(UTL_LABEL) != TAPE_LABEL_SIZE ||
+X            sizeof(TLS_V3_DICT) != TLS_V3_DICT_SIZE ||
+X            sizeof(TLS_V4_DICT) != TLS_V4_DICT_SIZE)
+X        fatal("CONSULT EXPERT - structures compile to wrong sizes",
+X            ERR_private);
+X}
+X
+X
+X
+XSTATIC void get_date (char *target, const void *buffer, int version,
+X    int *int_date) {
+X
+X/* Unpick the creation date into a sensible form from known places in the
+Xbuffer.  version is 0, 3 or 4 for plain SL, version 3 TLS or version 4 TLS. */
+X
+X    unsigned int date;
+X    int day, month, year, leap;
+X    char str[label_field_size], c;
+X    const HDR1_LABEL *hdr1;
+X    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+X        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+X    static int month_days[] = {31, -1, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+X
+X/* Get the date in IBM yyddd from whichever control block. */
+X
+X    switch (version) {
+Xcase 0: hdr1 = (const HDR1_LABEL *)buffer;
+X        get_string(str,hdr1->creation_date,sizeof(hdr1->creation_date));
+X        if (sscanf(str,"%2d%3d%1c",&year,&day,&c) != 2) year = -1;
+X        break;
+Xcase 3: date = get_BE_short(((const TLS_V3_DICT *)buffer)->tape_date);
+X        year = (date >> 9);
+X        day = (date & 0x1ff);
+X        break;
+Xcase 4: date = get_BE_int(((const TLS_V4_DICT *)buffer)->tape_date)-TOD_year;
+X        year = 1;
+X        while (date > TOD_quad_year) {
+X            date -= TOD_quad_year;
+X            year += 4;
+X        }
+X        while (date > TOD_year) {
+X            date -= TOD_year;
+X            ++year;
+X        }
+X        day = 1;
+X        while (date > TOD_fortnight) {
+X            date -= TOD_fortnight;
+X            day += 14;
+X        }
+X        while (date > TOD_day) {
+X            date -= TOD_day;
+X            ++day;
+X        }
+X        break;
+X    }
+X
+X/* Now get it into a sensible format.  <time.h> defines only functions that go
+Xthe other way! */
+X
+X    if (year < 60 || year >= 99 || day <= 0 || day > 366) {
+X        strcpy(target,"");
+X        if (int_date != NULL) int_date[0] = int_date[1] = int_date[2] = 0;
+X    } else {
+X        leap = (year%4 == 0 ? 29 : 28);
+X        for (month = 0; month < 12; ++month)
+X            if (day <= (month == 1 ? leap : month_days[month]))
+X                break;
+X            else
+X                day -= (month == 1 ? leap : month_days[month]);
+X        sprintf(target,"%d %s 19%d",day,months[month],year);
+X        if (int_date != NULL) {
+X            int_date[0] = year;
+X            int_date[1] = month;
+X            int_date[2] = day;
+X        }
+X    }
+X}
+X
+X
+X
+XSTATIC void label_error (const char *message, int errtype, int assumed) {
+X
+X/* Give a diagnostic for label errors.  During volume label processing, it is
+Xtoo early to use function IO_error, and the recovery rules are odd anyway. */
+X
+X    warn(message,errtype);
+X    if ((assumed > 0 && (tape_type == 0 || assumed > tape_type)) ||
+X            ++IO_error_count >= IO_error_limit)
+X        stop(EXIT_FAILURE);
+X}
+X
+X
+X
+XSTATIC void check_volume_labels (void) {
+X
+X/* This is used to check that the tape corresponds to the disk version of a TLS
+Xdictionary, and to position it as if the dictionary had been read (in case of
+Xrecovery).  It just compares the VOL1 and HDR1 labels for equality. */
+X
+X    strcpy(dataset_name,"volume and header labels");
+X    if (read_tape_block() < 0)
+X        label_error("failed to read first block on the tape",
+X            ERR_tapeio,type_TLS);
+X    else if (block_length != TAPE_LABEL_SIZE ||
+X            memcmp(&vol1_label,block_buffer,TAPE_LABEL_SIZE) != 0)
+X        label_error("disk dictionary and tape one do not match",
+X            ERR_private,type_TLS);
+X    else if (read_tape_block() < 0)
+X        label_error("failed to read first dataset label",ERR_tapeio,type_TLS);
+X    else if (block_length != TAPE_LABEL_SIZE ||
+X            memcmp(&hdr1_label,block_buffer,TAPE_LABEL_SIZE) != 0)
+X        label_error("disk dictionary and tape one do not match",
+X            ERR_private,type_TLS);
+X}
+X
+X
+X
+Xint read_volume_labels (int disk_dict) {
+X
+X/* Attempt to read the volume label and TLS dictionary, either from tape (or a
+X'diskized' tape) or disk.  It returns the type of tape.  Note that the 
+Xstructure of this code is critical to the working of function read_disk_block()
+Xin misc.c when reading from stdin. */
+X
+X    int tape_errtype, block_pos, n;
+X    char str1[label_field_size], str2[label_field_size], c;
+X    VOL1_LABEL *vol1;
+X    HDR1_LABEL *hdr1;
+X    long position;
+X
+X    tape_errtype = (disk_dict ? ERR_private : ERR_tapeio);
+X
+X/* Read the volume label, if present, save it and extract some information. */
+X
+X    if (disk_dict)
+X        strcpy(dataset_name,"TLS dictionary on disk");
+X    else
+X        strcpy(dataset_name,"volume and header labels");
+X    if (read_actual_block() < 0) {
+X        label_error("failed to read first block of tape",tape_errtype,type_NL);
+X        return type_NL;
+X    }
+X    vol1 = (VOL1_LABEL *)block_buffer;
+X    get_string(str1,vol1->labelid,sizeof(vol1->labelid));
+X    if (block_length != TAPE_LABEL_SIZE || strcmp(str1,"VOL1") != 0)
+X        return type_NL;
+X    memcpy(&vol1_label,block_buffer,TAPE_LABEL_SIZE);
+X    get_string(tape_name,vol1->tapename,sizeof(vol1->tapename));
+X    get_string(tape_owner,vol1->owner,sizeof(vol1->owner));
+X
+X/* Now try reading the first header label and save it for later checking. */
+X
+X    if (read_actual_block() <= 0) {
+X        label_error("failed to read first dataset header label",
+X            tape_errtype,type_SL);
+X        return type_SL;
+X    }
+X    memcpy(&hdr1_label,block_buffer,TAPE_LABEL_SIZE);
+X
+X/* If successful, extract some information from it. */
+X
+X    hdr1 = (HDR1_LABEL *)block_buffer;
+X    get_string(str1,hdr1->labelid,sizeof(hdr1->labelid));
+X    get_string(str2,hdr1->sequence_number,sizeof(hdr1->sequence_number));
+X    if (block_length != TAPE_LABEL_SIZE || strcmp(str1,"HDR1") != 0 ||
+X            sscanf(str2,"%d%1c",&n,&c) != 1 || n != 1) {
+X        label_error("invalid HDR1 label for first file",ERR_private,type_SL);
+X        return type_SL;
+X    }
+X    get_date(tape_date,hdr1,0,NULL);
+X
+X/* If this is not a TLS tape, or we are not using TLS processing, we are done.
+XElse prepare to read the TLS dictionary. */
+X
+X    get_string(str1,hdr1->dataset_name,sizeof(hdr1->dataset_name));
+X    if (strcmp(str1,TLS_dictionary_name) != 0) return type_SL;
+X    if (tape_type >= type_SL) return type_TLS;
+X    if (! following_EOF) skip_file(1);
+X    errno = 0;
+X    if ((TLS_dictionary = malloc(constant_64K)) == NULL)
+X        fatal("unable to get space to store TLS dictionary",ERR_system);
+X    strcpy(dataset_name,"TLS dictionary");
+X
+X/* Read the TLS dictionary from disk, failing if it does not work.  Note that a
+X'diskized' file may have space left for the dictionary, in which case recovery
+Xis needed. */
+X
+X    if (disk_dict) {
+X        if (tape_fileno >= 0) check_volume_labels();
+X        errno = 0;
+X        if (TLS_dict_fileno != STDIN_FILENO &&
+X                (position = Lseek(TLS_dict_fileno,0l,SEEK_CUR)) < 0)
+X            fatal("unable to save disk position of TLS dictionary",ERR_system);
+X        block_pos = reset_disk_file(-1);
+X        if (read_actual_block() == constant_64K &&
+X                strcmp(block_buffer,TLS_dict_marker) == 0) {
+X            if (TLS_dict_fileno == STDIN_FILENO)
+X                fatal("cannot recover TLS dictionary to or from stdin",
+X                    ERR_private);
+X            if (tape_fileno >= 0) {
+X                read_actual_block = read_tape_block;
+X                recover_TLS_dictionary();
+X                rewind_tape();
+X                read_actual_block = read_disk_block;
+X            } else
+X                recover_TLS_dictionary();
+X
+X/* Now write the dictionary back to disk where possible and deal with the cases
+Xwhere recovery is not needed. */
+X
+X            if (TLS_dict_updateable) {
+X                if (Lseek(TLS_dict_fileno,position,SEEK_SET) < 0)
+X                    fatal("unable to reposition to TLS dictionary on disk",
+X                        ERR_system);
+X                save_tape_block((char *)TLS_dictionary,constant_64K);
+X            } else
+X                warn("the recovered TLS dictionary cannot be written back",
+X                    ERR_private);
+X            reset_disk_file(block_pos);
+X            return type_TLS;
+X        } else if (block_length > 0) {
+X            check_TLS_dictionary(1);
+X            memcpy(TLS_dictionary,block_buffer,block_length);
+X            TLS_dict_length = block_length;
+X            return type_TLS;
+X        } else
+X            fatal("unable to read TLS dictionary",tape_errtype);
+X
+X/* Read the TLS dictionary from tape, attempting to recover if that fails.
+XIt is worth rewinding, because that may help avoid bugs in certain device
+Xdrivers. */
+X
+X    } else if (read_actual_block() > 0) {
+X        check_TLS_dictionary(1);
+X        memcpy(TLS_dictionary,block_buffer,block_length);
+X        TLS_dict_length = block_length;
+X    } else {
+X        label_error("unable to read TLS dictionary from tape",ERR_tapeio,0);
+X        rewind_tape();
+X        skip_file(1);
+X        skip_file(0);
+X        recover_TLS_dictionary();
+X    }
+X    return type_TLS;
+X}
+X
+X
+X
+Xvoid unpick_DCB (int dsorg, int recfm) {
+X
+X/* Unpick the DSORG and RECFM into internal form. */
+X
+X    switch (dsorg) {
+Xcase MVS_DSORG_PS:  dataset_dsorg = dsorg_PS; break;
+Xcase MVS_DSORG_PO:  dataset_dsorg = dsorg_PO; break;
+Xcase MVS_DSORG_DA:  dataset_dsorg = dsorg_DA; break;
+Xdefault:    dataset_dsorg = 0; break;
+X        }
+X
+X/* The record format is the hairier, but ignore anything that we are not
+Xinterested in. */
+X
+X    dataset_recfm = 0;
+X    if ((recfm&MVS_RECFM_U) == MVS_RECFM_U)
+X        dataset_recfm |= recfm_U;
+X    else if ((recfm&MVS_RECFM_F) == MVS_RECFM_F)
+X        dataset_recfm |= recfm_F;
+X    else if ((recfm&MVS_RECFM_V) == MVS_RECFM_V)
+X        dataset_recfm |= recfm_V;
+X    if ((recfm&MVS_RECFM_B) == MVS_RECFM_B)
+X        dataset_recfm |= recfm_B;
+X    if ((recfm&MVS_RECFM_S) == MVS_RECFM_S)
+X        dataset_recfm |= recfm_S;
+X    if ((recfm&MVS_RECFM_A) == MVS_RECFM_A)
+X        dataset_recfm |= recfm_A;
+X    if ((recfm&MVS_RECFM_M) == MVS_RECFM_M)
+X        dataset_recfm |= recfm_M;
+X}
+X
+X
+X
+Xvoid get_comments (char *target, const unsigned char *data, int length) {
+X
+X/* Translate TLS's obscure 6-bit code to ASCII! */
+X
+X    int i, j, k;
+X    static char TLS_chars[] =
+X        " .<(+|&$*);~-/,%_>?:#@'=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\\\"";
+X
+X    k = 0;
+X    for (i = 0; i < length; i += 3) {
+X        j = (data[i]<<16)+(data[i+1]<<8)+data[i+2];
+X        target[k] = TLS_chars[j>>18];
+X        target[k+1] = TLS_chars[(j>>12)&0x3f];
+X        target[k+2] = TLS_chars[(j>>6)&0x3f];
+X        target[k+3] = TLS_chars[j&0x3f];
+X        k += 4;
+X    }
+X    while (k > 0 && target[k-1] == ' ') --k;
+X    target[k] = '\0';
+X}
+X
+X
+X
+Xint read_header_labels (int operation) {
+X
+X/* Attempt to read the dataset header labels and TLS dictionary entry.  If
+Xoperation is -ve, there is already a HDR1 label in hand; if it is +ve, it
+Xreturns after looking at the TLS dictionary; otherwise, it reads the HDR1 and
+XHDR labels.  It returns the sequence number if successful and 0 if it reaches
+Xthe end of the tape. */
+X
+X    int i, j, n;
+X    char str[label_field_size], *ptr1, *ptr2, c;
+X    HDR1_LABEL *hdr1;
+X    HDR2_LABEL *hdr2;
+X
+X/* Define a macro to reduce duplicate coding.  This is truly repellent, but
+Xthere seems to be no better way to do it. */
+X
+X#define TLS_DATASET_GROBBLE(TLS_DICT_TYPE,version)                            \
+X                                                                              \
+X    TLS_DICT_TYPE *dict = &((TLS_DICT_TYPE *)TLS_dictionary)[dataset_seqno-1];\
+X    int last_entry = get_BE_short(tls_dict_last_entry(                        \
+X            &((TLS_DICT_TYPE *)TLS_dictionary)[0]));                          \
+X                                                                              \
+X    if (dataset_seqno > last_entry+1) return 0;                               \
+X    dataset_deleted = (dict->flags&tls_flags_deleted ? 1 : 0);                \
+X    get_string(dataset_name,dict->dataset_name,sizeof(dict->dataset_name));   \
+X    unpick_DCB(dict->dsorg,dict->recfm);                                      \
+X    if ((dataset_lrecl = get_BE_short(dict->lrecl)) == 32768)                 \
+X        dataset_lrecl = INT_MAX;                                              \
+X    dataset_blksize = get_BE_short(dict->blksize);                            \
+X    dataset_keylen = dict->keylen;                                            \
+X    dataset_dir_blks =                                                        \
+X        (dataset_dsorg == dsorg_PO ? get_BE_short(dict->dir_blks) : 0);       \
+X    get_date(dataset_date,dict,version,dataset_int_date);                     \
+X    get_comments(dataset_comments,(unsigned char *)dict->comments,            \
+X        sizeof(dict->comments));
+X
+X/* Unpick the information from whichever version of dictionary we have. */
+X
+X    if (tape_type == type_TLS) {
+X        if (TLS_version == 4) {
+X            TLS_DATASET_GROBBLE(TLS_V4_DICT,4)
+X            dataset_KB = get_BE_int(dict->size_KB)/1000;
+X        } else {
+X            TLS_DATASET_GROBBLE(TLS_V3_DICT,3)
+X            dataset_KB = get_BE_short(dict->tracks)*tracksize_3330;
+X        }
+X        if (operation > 0) return dataset_seqno;
+X
+X/* Set a temporary 'name' for diagnostics and skip the volume label if
+Xnecessary. */
+X
+X    } else
+X        strcpy(dataset_name,"dataset header labels");
+X    if (dataset_seqno == 1 &&
+X            (read_actual_block() != TAPE_LABEL_SIZE ||
+X                memcmp(&vol1_label,block_buffer,TAPE_LABEL_SIZE) != 0))
+X        IO_error("unable to reposition to the first header labels",
+X            ERR_skip,(block_length <= 0 ? ERR_tapeio : ERR_private));
+X
+X/* In all cases, read the first header label and check it is plausible. */
+X
+X    if (operation >= 0 && read_actual_block() == 0) {
+X        if (tape_type == type_TLS)
+X            fatal("file mark found (end of tape?) when file '%s' was expected",
+X                ERR_tapeio,dataset_name);
+X        else
+X            return 0;
+X    } else if (block_length < 0)
+X        IO_error("I/O error while reading dataset first header label",
+X            ERR_skip,ERR_tapeio);
+X    if (debug >= 2)
+X        display_buffer(stderr,block_buffer,block_length,block_length);
+X    hdr1 = (HDR1_LABEL *)block_buffer;
+X    get_string(str,hdr1->labelid,sizeof(hdr1->labelid));
+X    if (block_length != TAPE_LABEL_SIZE || strcmp(str,"HDR1") != 0)
+X        IO_error("invalid HDR1 label for dataset",ERR_skip,ERR_private);
+X
+X/* Check the sequence number and return if there is a mismatch, to allow
+Xcontrol.c to retry with the correct one.  I could relax this when allow_errors 
+Xis set, but it would rather be asking for trouble. */
+X
+X    get_string(str,hdr1->sequence_number,sizeof(hdr1->sequence_number));
+X    n = 0;
+X    if (sscanf(str,"%d%1c",&n,&c) != 1)
+X        IO_error("invalid sequence number in label",ERR_skip,ERR_private);
+X    if (n != dataset_seqno) return n;
+X
+X/* Read the dataset name and check it if it is TLS.  I don't know what to do if
+Xit doesn't match, so stop. */
+X
+X    get_string(str,hdr1->dataset_name,sizeof(hdr1->dataset_name));
+X    if (tape_type == type_TLS) {
+X        ptr1 = &dataset_name[strlen(dataset_name)];
+X        ptr2 = &str[strlen(str)];
+X        while (ptr2 > str)
+X            if (ptr1 <= dataset_name || *ptr1-- != *ptr2--)
+X                fatal("TLS dictionary name is '%s' and label name is '%s'",
+X                    ERR_private,dataset_name,str);
+X    } else {
+X        strcpy(dataset_name,str);
+X        get_date(dataset_date,hdr1,0,dataset_int_date);
+X        dataset_dsorg = dsorg_PS;
+X
+X/* For non-TLS tapes, read and decode the HDR2 record for the RECFM etc.  
+XSimilar remarks can be made about allow_errors for this record. */
+X
+X        if (read_actual_block() <= 0)
+X            IO_error("unable to read dataset second header label",
+X                ERR_skip,ERR_tapeio);
+X        if (debug >= 2)
+X            display_buffer(stderr,block_buffer,block_length,block_length);
+X        hdr2 = (HDR2_LABEL *)block_buffer;
+X        get_string(str,hdr2->labelid,sizeof(hdr2->labelid));
+X        if (block_length != TAPE_LABEL_SIZE || strcmp(str,"HDR2") != 0)
+X            IO_error("invalid HDR2 label for dataset",ERR_skip,
+X                (block_length <= 0 ? ERR_tapeio : ERR_private));
+X        n = EBCDIC_to_ASCII(hdr2->recfm1);
+X        dataset_recfm = (n == 'F' ? recfm_F : (n == 'V' ? recfm_V :
+X                (n == 'U' ? recfm_U : 0)));
+X        if (EBCDIC_to_ASCII(hdr2->recfm2) == 'A') dataset_recfm |= recfm_A;
+X        if (EBCDIC_to_ASCII(hdr2->recfm2) == 'M') dataset_recfm |= recfm_M;
+X        n = EBCDIC_to_ASCII(hdr2->recfm3);
+X        dataset_recfm |= (n == 'B' ? recfm_B : (n == 'S' ? recfm_S :
+X                (n == 'R' ? recfm_B|recfm_S : 0)));
+X
+X/* Extract the LRECL, BLKSIZE and job/step id. */
+X
+X        get_string(str,hdr2->lrecl,sizeof(hdr2->lrecl));
+X        if (sscanf(str,"%d%1c",&dataset_lrecl,&c) != 1) dataset_lrecl = 0;
+X        if (dataset_lrecl == 99999) dataset_lrecl = INT_MAX;
+X        get_string(str,hdr2->blksize,sizeof(hdr2->blksize));
+X        if (sscanf(str,"%d%1c",&dataset_blksize,&c) != 1) dataset_blksize = 0;
+X        i = 0;
+X        for (j = 0; j < sizeof(hdr2->job_step_id); ++j)
+X            if ((n = EBCDIC_to_ASCII(hdr2->job_step_id[j])) != ' ')
+X                dataset_comments[i++] = n;
+X        dataset_comments[i] = '\0';
+X    }
+X
+X/* Skip any remaining header labels and return. */
+X
+X    skip_file(1);
+X    return dataset_seqno;
+X}
+X
+X
+X
+Xvoid read_trailer_labels (int block_count) {
+X
+X/* Check the block count in the trailer labels except, of course, for TLS PDSs
+Xand dirst-eccess files where this checking feature was gratuitously removed by
+XGian Boggio-Togna!  It must not call IO_error except with ERR_ignore. */
+X
+X    int n;
+X    char str1[label_field_size], str2[label_field_size], c;
+X    HDR1_LABEL *eof1;
+X
+X/* First check that these are the right trailer labels. */
+X
+X    if (read_actual_block() <= 0) {
+X        if (! allow_errors || block_length < 0)
+X            IO_error("unable to read dataset trailer labels",ERR_ignore,
+X                ERR_tapeio);
+X        skip_file(1);
+X        return;
+X    }
+X    if (debug>= 2)
+X        display_buffer(stderr,block_buffer,block_length,block_length);
+X    eof1 = (HDR1_LABEL *)block_buffer;
+X    get_string(str1,eof1->labelid,sizeof(eof1->labelid));
+X    get_string(str2,eof1->sequence_number,sizeof(eof1->sequence_number));
+X    if (sscanf(str2,"%d%1c",&n,&c) != 1) n = 0;
+X    if (block_length != TAPE_LABEL_SIZE || strcmp(str1,"EOF1") != 0 ||
+X            n != dataset_seqno) {
+X        if (! allow_errors)
+X            IO_error("invalid EOF1 label for dataset",ERR_ignore,
+X                (block_length <= 0 ? ERR_tapeio : ERR_private));
+X        skip_file(1);
+X        return;
+X    }
+X
+X/* Now check the block count and skip any remaining labels. */
+X
+X    if (tape_type != type_TLS || dataset_dsorg == dsorg_PS) {
+X        get_string(str1,eof1->block_count,sizeof(eof1->block_count));
+X        if (sscanf(str1,"%d%1c",&n,&c) != 1 || n != block_count) {
+X            if (! allow_errors)
+X                IO_error("block count does not match that in EOF1 label",
+X                    ERR_ignore,ERR_private);
+X            skip_file(1);
+X            return;
+X        }
+X    }
+X    skip_file(1);
+X}
+END_OF_FILE
+if test 20319 -ne `wc -c <'labels.c'`; then
+    echo shar: \"'labels.c'\" unpacked with wrong size!
+fi
+# end of 'labels.c'
+fi
+echo shar: End of archive 7 \(of 9\).
+cp /dev/null ark7isdone
+MISSING=""
+for I in 1 2 3 4 5 6 7 8 9 ; do
+    if test ! -f ark${I}isdone ; then
+	MISSING="${MISSING} ${I}"
+    fi
+done
+if test "${MISSING}" = "" ; then
+    echo You have unpacked all 9 archives.
+    rm -f ark[1-9]isdone ark[1-9][0-9]isdone
+else
+    echo You still need to unpack the following archives:
+    echo "        " ${MISSING}
+fi
+##  End of shell archive.
+exit 0

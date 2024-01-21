@@ -1,0 +1,2386 @@
+Subject: v06i032:  Elm mail system (elm), Part07/14
+Newsgroups: mod.sources
+Approved: rs@mirror.UUCP
+
+Submitted by: Dave Taylor <pyramid!hplabs!hpldat!taylor>
+Mod.sources: Volume 6, Issue 32
+Archive-name: elm/Part07
+
+# Continuation of Shell Archive, created by hpldat!taylor
+
+# This is part 7
+
+# To unpack the enclosed files, please use this file as input to the
+# Bourne (sh) shell.  This can be most easily done by the command;
+#     sh < thisfilename
+
+
+if [ ! -d src ]
+then
+  echo creating directory src
+  mkdir src
+fi
+
+# ---------- file src/newmbox.c ----------
+
+filename="src/newmbox.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/newmbox.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**			newmbox.c			**/
+
+/**  read new mailbox file, (C) Copyright 1986 by Dave Taylor  **/
+
+#include <ctype.h>
+
+#ifdef BSD
+#undef tolower		/* we have our own "tolower" routine instead! */
+#endif
+
+#include "headers.h"
+
+#include <sys/types.h>		
+#include <sys/stat.h>
+#include <errno.h>
+
+#ifdef BSD			/* Berkeley has library elsewhere... */
+#  include <sys/time.h>
+#else
+#  include <time.h>
+#endif
+
+extern int errno;
+
+char *error_name(), error_description();
+
+int
+newmbox(stat, resync, main_screen)
+int stat, resync, main_screen;
+{
+	/** Read a new mailbox file or resync on current file.
+
+	    Values of stat and what they mean;
+
+		stat = 0	- changing mailboxes from within program
+		stat = 1	- read default mailbox or infile for the 
+			          first time
+	        stat = 2	- read existing mailbox, new mail arrived
+
+	    resync is TRUE iff we know the current mailbox has changed.  If
+	    it's set to true this means that we MUST READ SOMETHING, even 
+	    if it's the current mailbox again!!
+
+	    main_screen simply tells where the counting line should be.
+	**/
+
+	int  switching_to_default = 0;
+	char buff[SLEN];
+
+	if (stat > 0) {
+	  if (strlen(infile) == 0)	/* no filename yet?? */
+	    sprintf(infile,"%s%s",mailhome, username);
+	  if ((errno = can_access(infile, READ_ACCESS))) {
+	    error2("Can't open mailbox '%s' for reading [%s]", infile,
+		    error_name(errno));
+	    exit(1);
+	  }
+	}
+	else { 		 	/* get name of new mailbox! */
+	  MoveCursor(LINES-3, 30);
+	  CleartoEOS();
+	  show_last_error();
+	  PutLine0(LINES-2,0,"Name of new mailbox: ");
+	  buff[0] = '\0';
+	  (void) optionally_enter(buff, LINES-2, 21, FALSE);
+	  ClearLine(LINES-2);
+	  if (strlen(buff) == 0) {
+	    if (resync && file_changed)
+	      strcpy(buff, infile);
+	    else
+	      return(FALSE);
+	  }
+	  if (strcmp(buff, "!") == 0 ||
+		   strcmp(buff, "%") == 0) 	/* go to mailbox */
+	    sprintf(buff,"%s%s", mailhome, username);
+	  else if (! expand_filename(buff)) {
+	    error1("can't expand file %s", buff);
+	    if (resync && file_changed)
+	      strcpy(buff, infile);
+	    else
+	      return(FALSE);	
+	  }
+
+	  if (strcmp(buff, infile) == 0 && ! resync) { 
+	    dprint0(3,"User requested change to current mailbox! (newmbox)\n");
+	    error("already reading that mailbox!");
+	    return(FALSE);
+	  }
+	  if (first_word(buff, mailhome) && ! resync) {	/* a mail file! */
+	    mbox_specified = 0; 	  /* fake program to think that */
+	    stat = 1;		    	  /*     we're the default file */
+	    switching_to_default++;	  /*        remember this act!  */
+	  }
+
+	  if ((errno = can_access(buff, READ_ACCESS))) {
+	    dprint2(2,"Error: attempt to open %s as mailbox denied (%s)!\n",
+		     buff, "newmbox");
+	    error1("Permission to open file %s denied", buff);
+	    if (resync && file_changed)
+	      strcpy(buff, infile);
+	    else
+	      return(FALSE);	
+	  }
+
+	  if (resync && file_changed && strcmp(buff, infile) == 0)
+	    PutLine0(LINES-2,COLUMNS-40,"Resynchronizing file");
+	  else
+	    PutLine1(LINES-2,COLUMNS-40,"Mailbox: %s", buff);
+	  CleartoEOLN();
+	  strcpy(infile,buff);
+	  if (! switching_to_default) mbox_specified = 1;
+
+	}
+
+	clear_error();
+	clear_central_message();
+
+	header_page = 0;
+
+	(void) fclose(mailfile);   /* close it first, to avoid too many open */
+
+	if ((mailfile = fopen(infile,"r")) == NULL) 
+	  message_count = 0;
+	else if (stat < 2) {          /* new mail file! */
+	  current = 1;
+	  if (notesfile)
+	    message_count = read_notesfile();	/* can't get new notes! */
+	  else
+	    message_count = read_headers(FALSE, main_screen);
+	  if (! message_count) current = 0;
+	}
+	else 	/* resync with current mail file */
+	  message_count = read_headers(TRUE, main_screen);
+
+	return(TRUE);
+}
+
+int
+read_headers(rereading, main_screen)
+int rereading, main_screen;
+{
+	/** Reads the headers into the header_table structure and leaves
+	    the file rewound for further I/O requests.   If the file being
+	    read is the default mailbox (ie incoming) then it is copied to
+	    a temp file and closed, to allow more mail to arrive during 
+	    the elm session.  If 'rereading' is set, the program will copy
+	    the status flags from the previous data structure to the new 
+	    one if possible.  This is (obviously) for re-reading a mailfile!
+	**/
+
+	FILE *temp;
+	char buffer[LONG_STRING], temp_filename[SLEN];
+	long bytes = 0L, line_bytes = 0L;
+	register int line = 0, count = 0, subj = 0, copyit = 0, in_header = 1;
+	int count_x, count_y = 17, new_messages = 0, err;
+	int in_to_list = FALSE;
+
+	static int first_read = 0;
+
+	if (! first_read++) {
+	  ClearLine(LINES-1);
+	  ClearLine(LINES);
+	  if (rereading)
+	    PutLine1(LINES, 0, "Reading in %s, message: %d", infile, 
+		     message_count);
+	  else
+	    PutLine1(LINES, 0, "Reading in %s, message: 0", infile);
+	  count_x = LINES;
+          count_y = 22 + strlen(infile);
+	}
+	else {
+	  count_x = LINES-2;
+	  if (main_screen)
+	    PutLine0(LINES-2, 0, "Reading message: 0");
+	  else {
+	    PutLine0(LINES, 0, "\n");
+	    PutLine0(LINES, 0, "Reading message: 0");
+	    count_x = LINES;
+	  }
+	}
+
+	if (mbox_specified == 0) {
+	  lock(INCOMING);	/* ensure no mail arrives while we do this! */
+	  sprintf(temp_filename,"%s%s",temp_mbox, username);
+	  if (! rereading) {
+	    if ((temp = fopen(temp_filename,"w")) == NULL) {
+	     err = errno;
+	     unlock();	/* remove lock file! */
+	     Raw(OFF);
+	     Write_to_screen(
+		     "\nCouldn't open file %s for use as temp mailbox;\n", 1,
+	             temp_filename);
+	     Write_to_screen("** %s - %s **\n", 2,
+		     error_name(err), error_description(err));
+	     dprint3(1,
+                "Error: Couldn't open file %s as temp mbox.  errno %s (%s)\n",
+	         temp_filename, error_name(err), "read_headers");
+	     leave();
+	    }
+	   get_mailtime();
+	   copyit++;
+	   chown(temp_filename, userid, groupid);
+	 }
+	 else {
+	   if ((temp = fopen(temp_filename,"a")) == NULL) {
+	     err = errno;
+	     unlock();	/* remove lock file! */
+	     Raw(OFF);
+	     Write_to_screen(
+		     "\nCouldn't reopen file %s for use as temp mailbox;\n", 1,
+	             temp_filename);
+	     Write_to_screen("** %s - %s **\n", 2,
+		     error_name(err), error_description(err));
+	     dprint3(1,
+                "Error: Couldn't reopen file %s as temp mbox.  errno %s (%s)\n",
+	         temp_filename, error_name(err), "read_headers");
+	     emergency_exit();
+	    }
+	   copyit++;
+	  }
+	}
+
+	if (rereading) {
+	   if (fseek(mailfile, mailfile_size, 0)) {
+	     err = errno;
+	     Write_to_screen(
+		"\nCouldn't seek to %ld (end of mailbox) in %s!\n", 2,
+	     	mailfile_size, infile);	
+	     Write_to_screen("** %s - %s **\n", 2,
+		     error_name(err), error_description(err));
+	     dprint4(1,
+     "Error: Couldn't seek to end of mailbox %s: (offset %ld) Errno %s (%s)\n",
+	        infile, mailfile_size, error_name(err), "read_headers");
+	     emergency_exit();
+	   }
+	   count = message_count;		/* next available  */
+	   bytes = mailfile_size;		/* start correctly */
+	   if (message_count > 0)
+	    line  = header_table[message_count - 1].lines;
+	   else
+	    line = 0;
+	}
+
+	while (fgets(buffer, LONG_STRING, mailfile) != NULL) {
+	  if (bytes == 0L) { 	/* first line of file... */	
+
+	    if (! mbox_specified) {
+	      if (first_word(buffer, "Forward to ")) 
+	        set_central_message("Mail being forwarded to %s", 
+                   (char *) (buffer + 11));
+	    }
+
+	    /* Are we reading in a notesfile file without the flag
+	       turned on??? */
+	
+	    if (first_word(buffer, NOTES_HEADER)) {	/* if so...  */
+	      rewind(mailfile);
+	      notesfile++;		    /* set da flag, boss-man */
+	      return(read_notesfile()); 	/* hop over to notes */
+	    }
+	  }
+
+	  if (copyit) fputs(buffer, temp);
+	  line_bytes = (long) strlen(buffer); 
+	  line++;
+	  if (first_word(buffer,"From ")) {
+	    if (real_from(buffer, &header_table[count])) {
+	      header_table[count].offset = (long) bytes;
+	      header_table[count].index_number = count+1;
+	      if (! rereading || count > message_count) 
+	        header_table[count].status = 0;	        /* clear status! */
+	      strcpy(header_table[count].subject, "");	/* clear subj    */
+	      header_table[count-1].lines = line;
+	      if (new_msg(header_table[count])) {
+	        header_table[count].status |= NEW;	/* new message!  */
+
+	        if (! new_messages++ && point_to_new && ! rereading &&
+	            sortby == RECEIVED_DATE) {
+		  current = count+1;
+	          get_page(current);	/* make sure we're ON that page! */
+	        }
+
+		/* Quick comment on that last conditional test...
+
+		   We want to move the current pointer to the first new
+		   message IF this is the first of the new messages, the
+		   user requested this feature, we're not rereading the 
+		   mailbox (imagine how THAT could screw the user up!),
+		   and we're not in some funky sorting mode (received-date is
+		   the default).  As always, I'm open to suggestions on
+		   other ways to have this work intelligently.
+		*/
+	
+	      }
+	      count++;
+	      subj = 0;
+	      line = 0;
+	      in_header = 1;
+	      PutLine1(count_x, count_y, "%d", count);
+	    }
+	  }
+	  else if (in_header) {
+	    if (first_word(buffer,">From")) 
+	      forwarded(buffer, &header_table[count-1]); /* return address */
+	    else if (first_word(buffer,"Subject:") ||
+		     first_word(buffer,"Subj:") ||
+		     first_word(buffer,"Re:")) {
+	      if (! subj++) {
+	        remove_first_word(buffer);
+	        strncpy(header_table[count-1].subject, buffer, STRING);
+	      }
+	    }
+	    else if (first_word(buffer,"From:"))
+	      parse_arpa_from(buffer, header_table[count-1].from);
+	    
+	    /** when it was sent... **/
+
+	    else if (first_word(buffer, "Date:")) 
+	      parse_arpa_date(buffer, &header_table[count-1]);
+
+	    /** some status things about the message... **/
+
+	    else if (first_word(buffer, "Priority:"))
+	      header_table[count-1].status |= PRIORITY;
+	    else if (first_word(buffer, "Action:"))
+	      header_table[count-1].status |= ACTION;
+
+	    /** next let's see if it's to us or not... **/
+
+	    else if (first_word(buffer, "To:")) {
+	      in_to_list = TRUE;
+	      header_table[count-1].to[0] = '\0';	/* nothing yet */
+	      figure_out_addressee((char *) buffer +3, 
+				   header_table[count-1].to);
+	    }
+
+	    else if (buffer[0] == LINE_FEED || buffer[0] == '\0') {
+	      if (in_header) {
+	        in_header = 0;	/* in body of message! */
+	        fix_date(&header_table[count-1]);
+	      }
+	    }
+	    else if (in_to_list == TRUE) {
+	      if (whitespace(buffer[0]))
+	        figure_out_addressee(buffer, header_table[count-1].to);
+	      else in_to_list = FALSE;
+	    }
+	  }
+	  bytes += (long) line_bytes;
+	}
+
+	header_table[count > 0? count-1:count].lines = line;
+
+	if (mbox_specified == 0) {
+	  unlock();	/* remove lock file! */
+	  fclose(mailfile);
+	  fclose(temp);
+	  if ((mailfile = fopen(temp_filename,"r")) == NULL) {
+	    err = errno;
+	    MoveCursor(LINES,0);
+	    Raw(OFF);
+	    Write_to_screen("\nAugh! Couldn't reopen %s as temp mail file;\n",
+	           1, temp_filename);
+	    Write_to_screen("** %s - %s **\n", 2, error_name(err),
+		   error_description(err));
+	    dprint3(1,
+          "Error: Reopening %s as temp mail file failed!  errno %s (%s)\n",
+	           temp_filename, error_name(errno), "read_headers");
+	    leave();
+	  }
+	}
+	else 
+          rewind(mailfile);
+
+	sort_mailbox(count);	 		/* let's sort this baby now! */
+
+	return(count);
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 11389 ]
+  then
+    echo $filename changed - should be 11389 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+# ---------- file src/notesfile.c ----------
+
+filename="src/notesfile.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/notesfile.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**			notesfile.c			**/
+
+/**  Routine that reads in a file comprised of saved messages from
+     'notes'.  
+
+     (C) Copyright 1986 Dave Taylor
+**/
+
+#include "headers.h"
+#include <errno.h>
+
+char *notes_machine();
+
+extern int errno;
+
+char *error_name(), *error_description();
+
+int
+read_notesfile()
+{
+	/** read in the current mailfile, assuming it's actually a set
+	    of stored notes from the notes program... **/
+
+	char buffer[LONG_STRING];
+	register int line = 0, count = 0;
+	long  bytes = 0L, line_bytes = 0L;
+	static int first_read = 0;
+	int count_x , count_y = 17;
+
+	if (! first_read++) {
+	  MoveCursor(LINES-2, 0);
+	  CleartoEOS();
+	  PutLine1(LINES-1, 0, "Reading in %s, message: 0", infile);
+	  count_x = LINES-1;
+          count_y = 22 + strlen(infile);
+	}
+	else {
+	  PutLine0(LINES-2, 0, "Reading message: 0");
+	  count_x = LINES-2;
+	}
+
+	while (fgets(buffer, LONG_STRING, mailfile) != NULL) {
+
+	  if (line == 0) {
+	
+	    /** Double check to make sure this is okay... if the first
+	        word is "From " then we're actually reading a normal
+	        file so cruise over to the read_headers() routine
+		instead! **/
+	
+	    if (first_word(buffer, "From ")) {
+	      notesfile = 0;   /* turn that bloody flag off! */
+	      rewind(mailfile);  /* back up in da file... */
+	      return( read_headers(FALSE) );
+	    }
+	  }
+	
+	  line_bytes = (long) strlen(buffer); 
+	  line++;
+
+	  if (first_word(buffer, "/***** ")) {
+	    if (real_notes_header(buffer, &header_table[count])) {
+	      header_table[count].offset = (long) bytes;
+	      header_table[count].status = 0;
+	      header_table[count++].lines = line;
+	      PutLine1(count_x, count_y, "%d", count);
+	      line = 0;
+	    }
+	  }
+	  bytes += (long) line_bytes;
+	}
+
+        rewind(mailfile);
+
+	return(count);
+}
+
+int
+real_notes_header(buffer, entry)
+char *buffer;
+struct header_rec *entry;
+{
+	/** confirms that we're looking at a REAL notes header,
+	    and if so, saves it in the appropriate data entry  **/
+
+	char subjectbuffer[SLEN], timebuffer[NLEN], lastbuffer[NLEN], 
+	     am_pm[NLEN], the_day[NLEN], nullbuffer[NLEN];
+	
+	strcpy(nullbuffer, "NULL");
+	strcpy(lastbuffer, "LAST");
+
+	sscanf(buffer, "%*s %s %*c %s %*c %s %s %s %s %s %s", 
+	    subjectbuffer, entry->from, 
+	    timebuffer, am_pm, entry->month, the_day,
+	    lastbuffer, nullbuffer);
+
+	if (strcmp(lastbuffer, "LAST") == 0) 
+	  return(0);
+	
+	if (strcmp(nullbuffer,"NULL") != 0) 
+	  return(0);
+
+	if (timebuffer[1] != ':' && timebuffer[2] != ':') 
+	  return(0);
+
+	/* now let's play format! */
+
+	clean_up(subjectbuffer);
+
+	sprintf(entry->subject, "Note from group %s", subjectbuffer);
+	sprintf(entry->day,"%d", atoi(the_day));
+	sprintf(entry->year,"%d", atoi(lastbuffer) % 100);
+	sprintf(entry->time,"%s %s", timebuffer, am_pm);
+
+	return(1);
+}
+
+char *notes_machine()
+{
+	/** For those rare notes posted by someone on the machine that
+	    the notesfiles are saved from, this routine will fix the
+	    address to ensure it's valid.  The return value will be
+	    either 'machine!' or NULL if it's from the machine we're on
+	**/
+
+	static char machine_group[NLEN];
+	char buffer[SLEN];
+	register int i;
+
+	if (fseek(mailfile, header_table[current-1].offset, 0) != 0) {
+	  dprint3(1,"Error: errno %s encountered on seek to %d in file! (%s)\n", 
+		  error_name(errno), header_table[current-1].offset, 
+		   "notes_machine");
+	  error1("error %s trying to seek!", 
+		  error_name(errno));
+	  return( NULL );
+	}
+
+	if (fgets(buffer, SLEN, mailfile) == NULL) {
+	  dprint2(1,"Error: errno %s encountered on read (%s)", 
+		   error_name(errno), "notes_machine");
+	  error1("error %s trying to read file!", error_name(errno));
+	  return( NULL );
+	}
+
+	sscanf(buffer,"%*s %s", machine_group);
+
+	for (i=0; machine_group[i] != ':'; i++)
+	   ;
+
+	machine_group[i] = '\0';
+
+	return( (char *) machine_group);
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 3815 ]
+  then
+    echo $filename changed - should be 3815 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+# ---------- file src/pattern.c ----------
+
+filename="src/pattern.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/pattern.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**			pattern.c			**/
+
+/**    General pattern matching for the ELM mailer.     
+
+       (C) Copyright 1986 Dave Taylor
+**/
+
+#include <errno.h>
+
+#include "headers.h"
+
+static char pattern[SLEN] = { "" };
+static char alt_pattern[SLEN] = { "" };
+
+extern int errno;
+
+char *error_name();
+
+meta_match(function)
+int function;
+{
+	/** Perform specific function based on whether an entered string 
+	    matches either the From or Subject lines.. 
+	**/
+
+	register int i, tagged=0, count=0;
+	static char     meta_pattern[SLEN];
+
+	PutLine1(LINES-3, strlen("Command: "), 
+	     "%s messages that match pattern...", 
+	     function==TAGGED?"Tag":"Delete");
+
+	if (function == TAGGED) {	/* are messages already tagged??? */
+	  for (i=0; i < message_count; i++)
+	    if (ison(header_table[i].status,TAGGED))
+	      tagged++;
+
+	  if (tagged) {
+	    if (tagged > 2) 
+	      PutLine0(LINES-2,0, "Some messages are already tagged");
+	    else
+	      PutLine0(LINES-2,0, "A message is already tagged");
+	
+	    Write_to_screen("- Remove tag%s? y%c", 2, plural(tagged),BACKSPACE);
+
+	    if (tolower(ReadCh()) != 'n') {	/* remove tags... */
+	      for (i=0; i < message_count; i++) {
+	        clearit(header_table[i].status,TAGGED);
+		show_new_status(i);
+	      }
+	    }
+	  }
+	}
+	
+	PutLine0(LINES-2,0, "Enter pattern: "); CleartoEOLN();
+
+	optionally_enter(meta_pattern, LINES-2,strlen("Enter pattern: "),FALSE);
+
+	if (strlen(meta_pattern) == 0) {
+	  ClearLine(LINES-2);
+	  return(0);
+	}
+
+	strcpy(meta_pattern, shift_lower(meta_pattern));   /* lowercase it */
+
+	for (i = 0; i < message_count; i++) {
+	  if (from_matches(i, meta_pattern)) {
+	    setit(header_table[i].status, function);
+	    show_new_status(i);
+	    count++;
+	  }
+	  else if (subject_matches(i, meta_pattern)) {
+	    setit(header_table[i].status, function);
+	    show_new_status(i);
+	    count++;
+	  }
+	}
+
+	ClearLine(LINES-2);	/* remove "pattern: " prompt */
+	
+	if (count > 0)
+	  error3("%s %d messsage%s", 
+	         function==TAGGED? "tagged" : "marked for deletion",
+		 count, plural(count));
+	else
+	  error1("no matches - no messages %s",
+		 function==TAGGED? "tagged" : "marked for deletion");
+
+	return(0);
+}
+	  
+int
+pattern_match()
+{
+	/** Get a pattern from the user and try to match it with the
+	    from/subject lines being displayed.  If matched (ignoring
+	    case), move current message pointer to that message, if
+	    not, error and return ZERO **/
+
+	register int i;
+
+	PutLine0(LINES-3,40,"/ = match anywhere in messages");
+	
+	PutLine0(LINES-1,0, "Match Pattern:");
+
+	if (pattern_enter(pattern, alt_pattern, LINES-1, 16, 
+	    "Match Pattern (in entire mailbox):"))
+	  if (strlen(alt_pattern) > 0) {
+	    strcpy(alt_pattern, shift_lower(alt_pattern));
+	    return(match_in_message(alt_pattern));
+	  }
+	  else
+	    return(1);
+	  
+	if (strlen(pattern) == 0) 
+	  return(0);
+	else
+	  strcpy(pattern, shift_lower(pattern));
+
+	for (i = current; i < message_count; i++) {
+	  if (from_matches(i, pattern)) {
+	    current = ++i;
+	    return(1);
+	  }
+	  else if (subject_matches(i, pattern)) {
+	    current = ++i;
+	    return(1);
+	  }
+	}
+
+	return(0);
+}
+
+int
+from_matches(message_number, pat)
+int message_number;
+char *pat;
+{
+	/** Returns true iff the pattern occurs in it's entirety
+	    in the from line of the indicated message **/
+
+	return( in_string(shift_lower(header_table[message_number].from), 
+		pat) );
+}
+
+int
+subject_matches(message_number, pat)
+int message_number;
+char *pat;
+{
+	/** Returns true iff the pattern occurs in it's entirety
+	    in the subject line of the indicated message **/
+
+	return( in_string(shift_lower(header_table[message_number].subject), 
+		pat) );
+}
+
+match_in_message(pat)
+char *pat;
+{
+	/** Match a string INSIDE a message...starting at the current 
+	    message read each line and try to find the pattern.  As
+	    soon as we do, set current and leave! 
+	    Returns 1 if found, 0 if not
+	**/
+
+	char buffer[LONG_STRING];
+	int  message_number;
+	long location;
+
+	location = header_table[current-1].offset;
+	message_number = current-1;
+
+	if (fseek(mailfile, location, 0) != 0) {
+
+	  dprint3(1,"Error: seek %ld bytes into file failed. errno %d (%s)\n",
+		   location, errno, "match_in_message");
+	  error2("ELM [match] failed looking %ld bytes into file (%s)",
+		 location, error_name(errno));
+	  return(1);	/* fake it out to avoid replacing error message */
+	}
+
+	error("searching for pattern...");
+
+	while (fgets(buffer, LONG_STRING, mailfile) != NULL) {
+	
+	  if (in_string(shift_lower(buffer), pat)) {
+	    current = message_number; 
+	    clear_error();
+	    return(1);
+	  }
+
+	  location += (long) strlen(buffer);
+
+	  if (location > header_table[message_number].offset)
+	    message_number++;
+	}
+
+	return(0);
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 4687 ]
+  then
+    echo $filename changed - should be 4687 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+# ---------- file src/quit.c ----------
+
+filename="src/quit.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/quit.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**		quit.c		**/
+
+/** quit: leave the current mailbox and quit the program.
+  
+    (C) Copyright 1985, Dave Taylor
+**/
+
+#include "headers.h"
+
+#ifndef TRUE
+#define TRUE	1
+#endif
+
+quit()
+{
+	/* a wonderfully short routine!! */
+
+	if (leave_mbox() == -1)
+	  return;			/* new mail!  (damn it)  resync */
+
+	leave();
+}
+
+resync()
+{
+	/* Resync on the current mailbox... **/
+
+	error("reading mailfile in again...");
+	sleep(1);
+
+	newmbox(1, TRUE, FALSE);	/* pretend we've never seen it! */
+	showscreen();
+
+	mailfile_size = bytes(infile);	/* complete resync */
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 550 ]
+  then
+    echo $filename changed - should be 550 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+# ---------- file src/file_utils.c ----------
+
+filename="src/file_utils.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/file_utils.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**			file_utils.c			**/
+
+/** File oriented utility routines for ELM 
+
+    (C) Copyright 1986 Dave Taylor
+**/
+
+#include "headers.h"
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <ctype.h>
+#include <errno.h>
+
+#ifdef BSD
+#undef tolower
+#endif
+#include <signal.h>
+#include <errno.h>
+
+extern int errno;		/* system error number */
+
+char *error_name(), *error_description();
+
+long
+bytes(name)
+char *name;
+{
+	/** return the number of bytes in the specified file.  This
+	    is to check to see if new mail has arrived....  **/
+
+	int ok = 1;
+	extern int errno;	/* system error number! */
+	struct stat buffer;
+
+	if (stat(name, &buffer) != 0)
+	  if (errno != 2) {
+	    dprint2(1,"Error: errno %s on fstat of file %s (bytes)\n", 
+		     error_name(errno), name);
+	    Write_to_screen("\n\rError attempting fstat on file %s!\n\r",
+		     1, name);
+	    Write_to_screen("** %s - %s **\n\r", 2, error_name(errno),
+		  error_description(errno));
+	    emergency_exit();
+	  }
+	  else
+	    ok = 0;
+	
+	return(ok ? (long) buffer.st_size : 0L);
+}
+
+int
+can_access(file, mode)
+char *file; 
+int   mode;
+{
+	/** returns TRUE iff user can access file **/
+
+	int status, pid, w;
+	register int (*istat)(), (*qstat)();
+	
+#ifdef NO_VM		/* machine without virtual memory!! */
+	if ((pid = fork()) == 0) {
+#else
+	if ((pid = vfork()) == 0) {
+#endif
+	  setuid(userid);		/** back to normal userid **/
+	  setgid(groupid);
+	  errno = 0;
+	  (void) access(file, mode);
+	  _exit(errno);
+	  _exit(127);
+	}
+
+	istat = signal(SIGINT, SIG_IGN);
+	qstat = signal(SIGQUIT, SIG_IGN);
+
+	while ((w = wait(&status)) != pid && w != -1)
+		;
+
+	if (w == -1) status = FALSE;
+	
+	signal(SIGINT, istat);
+	signal(SIGQUIT, qstat);
+
+	return(status);
+}
+
+int
+can_open(file, mode)
+char *file; 
+char *mode;
+{
+	/** returns TRUE iff user can open the file.  This is not
+	    the same as can_access - it's used for when the file might
+	    not exist... **/
+
+	int status, pid, w;
+	register int (*istat)(), (*qstat)();
+	
+#ifdef NO_VM		/* machine without virtual memory!! */
+	if ((pid = fork()) == 0) {
+#else
+	if ((pid = vfork()) == 0) {
+#endif
+	  setuid(userid);		/** back to normal userid **/
+	  setgid(groupid);
+	  errno = 0;
+	  (void) fopen(file, mode);
+	  _exit(errno);
+	  _exit(127);
+	}
+
+	istat = signal(SIGINT, SIG_IGN);
+	qstat = signal(SIGQUIT, SIG_IGN);
+
+	while ((w = wait(&status)) != pid && w != -1)
+		;
+
+	if (w == -1) status = FALSE;
+	
+	signal(SIGINT, istat);
+	signal(SIGQUIT, qstat);
+
+	return(status);
+}
+
+int
+copy(from, to)
+char *from, *to;
+{
+	/** this routine copies a specified file to the destination
+	    specified.  Non-zero return code indicates that something
+	    dreadful happened! **/
+
+	FILE *from_file, *to_file;
+	char buffer[VERY_LONG_STRING];
+	
+	if ((from_file = fopen(from, "r")) == NULL) {
+	  dprint1(1,"Error: could not open %s for reading (copy)\n", from);
+	  error1("could not open file %s", from);
+	  return(1);
+	}
+
+	if ((to_file = fopen(to, "w")) == NULL) {
+	  dprint1(1,"Error: could not open %s for writing (copy)\n", to);
+	  error1("could not open file %s", to);
+	  return(1);
+	}
+
+	while (fgets(buffer, VERY_LONG_STRING, from_file) != NULL)
+	  fputs(buffer, to_file);
+
+	fclose(from_file);
+	fclose(to_file);
+
+	return(0);
+}
+
+int
+append(fd, filename)
+FILE *fd;
+char *filename;
+{
+	/** This routine appends the specified file to the already
+	    open file descriptor.. Returns non-zero if fails.  **/
+
+	FILE *my_fd;
+	char buffer[VERY_LONG_STRING];
+	
+	if ((my_fd = fopen(filename, "r")) == NULL) {
+	  dprint1(1,"Error: could not open %s for reading (append)\n", filename);
+	  return(1);
+	}
+
+	while (fgets(buffer, VERY_LONG_STRING, my_fd) != NULL)
+	  fputs(buffer, fd);
+
+	fclose(my_fd);
+
+	return(0);
+}
+
+check_mailfile_size()
+{
+	/** Check to ensure we have mail.  Only used with the '-z'
+	    starting option. **/
+
+	char filename[SLEN];
+	struct stat buffer;
+
+	strcpy(username,getlogin());
+	if (strlen(username) == 0)
+	  cuserid(username);
+
+	sprintf(filename,"%s/%s", mailhome, username);
+
+	if (stat(filename, &buffer) == -1) {
+	  printf(" You have no mail.\n");
+	  exit(0);
+	}
+	else if (buffer.st_size < 2) { 		/* maybe one byte??? */
+	  printf("You have no mail to read.\n");
+	  exit(0);
+	}
+}
+
+create_readmsg_file()
+{
+	/** Creates the file ".current" in the users home directory
+	    for use with the "readmsg" program.
+	**/
+
+	FILE *fd;
+	char buffer[SLEN];
+
+	sprintf(buffer,"%s/%s", home, readmsg_file);
+
+	if ((fd = fopen (buffer, "w")) == NULL) {
+	  dprint3(1,"Error: couldn't create file %s - error %s (%s)\n",
+		 buffer, error_name(errno), "create_readmsg_file");
+	  return;	/* no error to user */
+	}
+
+	fprintf(fd, "%d\n", header_table[current-1].index_number);
+	fclose(fd);
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 4640 ]
+  then
+    echo $filename changed - should be 4640 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+# ---------- file src/reply.c ----------
+
+filename="src/reply.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/reply.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**		reply.c		**/
+
+/*** routine allows replying to the sender of the current message 
+
+     (C) Copyright 1985, Dave Taylor
+***/
+
+#include "headers.h"
+#include <errno.h>
+
+#ifndef BSD
+#  include <sys/utsname.h>
+#endif
+
+/** Note that this routine generates automatic header information
+    for the subject and (obviously) to lines, but that these can
+    be altered while in the editor composing the reply message! 
+**/
+
+char *strip_parens(), *get_token(), *notes_machine();
+
+extern int errno;
+
+char *error_name();
+
+int
+reply()
+{
+	/** Reply to the current message.  Returns non-zero iff
+	    the screen has to be rewritten. **/
+
+	char return_address[LONG_SLEN], subject[SLEN];
+	int  return_value;
+
+	get_return(return_address);
+
+	if (first_word(header_table[current-1].from, "To:")) {
+	  strcpy(subject, header_table[current-1].subject);
+	  return_value = send(return_address, subject, TRUE);
+	}
+	else if (header_table[current-1].subject[0] != '\0') {
+	  if ((strncmp("Re:", header_table[current-1].subject, 3) == 0) ||
+	      (strncmp("RE:", header_table[current-1].subject, 3) == 0) ||
+	      (strncmp("re:", header_table[current-1].subject, 3) == 0)) 
+	    strcpy(subject, header_table[current-1].subject);
+	  else {
+	    strcpy(subject,"Re: ");
+	    strcat(subject,header_table[current-1].subject); 
+	  }
+	  return_value = send(return_address, subject, TRUE);
+	}
+	else
+	  return_value = send(return_address, "Re: your mail", TRUE);
+
+	return(return_value);
+}
+
+int
+reply_to_everyone()
+{
+	/** Reply to everyone who received the current message.  
+	    This includes other people in the 'To:' line and people
+	    in the 'Cc:' line too.  Returns non-zero iff the screen 
+            has to be rewritten. **/
+
+	char return_address[LONG_SLEN], subject[SLEN];
+	char full_address[VERY_LONG_STRING];
+	int  return_value;
+
+	get_return(return_address);
+
+	strcpy(full_address, return_address);	/* sender gets copy */
+	
+	get_and_expand_everyone(return_address, full_address);
+
+	if (header_table[current-1].subject[0] != '\0') {
+	  if ((strncmp("Re:", header_table[current-1].subject, 3) == 0) ||
+	      (strncmp("RE:", header_table[current-1].subject, 3) == 0) ||
+	      (strncmp("re:", header_table[current-1].subject, 3) == 0)) 
+	    strcpy(subject, header_table[current-1].subject);
+	  else {
+	    strcpy(subject,"Re: ");
+	    strcat(subject,header_table[current-1].subject); 
+	  }
+	  return_value = send(full_address, subject, TRUE);
+	}
+	else
+	  return_value = send(full_address, "Re: your mail", TRUE);
+
+	return(return_value);
+
+}
+
+int
+forward()
+{
+	/** Forward the current message.  What this actually does is
+	    to set auto_copy to true, then call 'send' to get the 
+	    address and route the mail. 
+	**/
+
+	char subject[SLEN], address[VERY_LONG_STRING];
+	int  original_cc, results, edit_msg;
+
+	original_cc = auto_copy;
+	address[0] = '\0';
+
+	edit_msg = (want_to("Edit outgoing message (y/n) ? ",'y',FALSE) != 'n');
+	Write_to_screen("%s", 1, edit_msg? "Yes" : "No");
+
+	auto_cc = TRUE;			/* we want a copy */
+
+	if (strlen(header_table[current-1].subject) > 0) {
+	  strcpy(subject,header_table[current-1].subject); 
+	  results = send(address, subject, edit_msg);
+	}
+	else
+	  results = send(address, "Forwarded Mail...", edit_msg);
+	
+	auto_copy = original_cc;
+
+	return(results);
+}
+
+get_and_expand_everyone(return_address, full_address)
+char *return_address, *full_address;
+{
+	/** Read the current message, extracting addresses from the 'To:'
+	    and 'Cc:' lines.   As each address is taken, ensure that it
+	    isn't to the author of the message NOR to us.  If neither,
+	    prepend with current return address and append to the 
+	    'full_address' string.
+	**/
+
+    char ret_address[LONG_SLEN], buf[LONG_SLEN], new_address[LONG_SLEN];
+    char *bufptr, *address;
+    int  in_message = 1, first_pass = 0;
+
+    /** First off, get to the first line of the message desired **/
+
+    if (fseek(mailfile, header_table[current-1].offset, 0) == -1) {
+	dprint3(1,"Error: seek %ld resulted in errno %s (%s)\n", 
+		 header_table[current-1].offset, error_name(errno), 
+		 "get_and_expand_everyone");
+	error2("ELM [seek] couldn't read %d bytes into file (%s)",
+	       header_table[current-1].offset, error_name(errno));
+	return;
+    }
+ 
+    /** okay!  Now we're there!  **/
+
+    /** let's fix the ret_address to reflect the return address of this
+	message with '%s' instead of the persons login name... **/
+
+    translate_return(return_address, ret_address);
+
+    /** now let's parse the actual message! **/
+
+    while (in_message) {
+      in_message = (int) (fgets(buf, LONG_SLEN, mailfile) != NULL);
+      if (first_word(buf, "From ") && first_pass++ != 0) 
+	in_message = FALSE;
+      else if (first_word(buf, "To:") || first_word(buf, "Cc:") ||
+	       first_word(buf, "CC:") || first_word(buf, "cc:")) {
+	do {
+	  no_ret(buf);
+
+	  bufptr = (char *) (strip_parens(buf) + 3); /* 3 = strlen of prompt */
+
+	  while ((address = get_token(bufptr, "\t, ", 0)) != NULL) {
+	    if (okay_address(address, return_address)) {
+	      sprintf(new_address, ret_address, address);
+	      optimize_and_add(new_address, full_address);
+	    }
+	    bufptr = NULL;
+	  }
+
+          in_message = (int) (fgets(buf, LONG_SLEN, mailfile) != NULL);
+	
+	} while (in_message && whitespace(buf[0]));
+
+      }
+      else if (strlen(buf) < 2)	/* done with header */
+	 in_message = FALSE;
+    }
+}
+
+int
+okay_address(address, return_address)
+char *address, *return_address;
+{
+	/** This routine checks to ensure that the address we just got
+	    from the "To:" or "Cc:" line isn't us AND isn't the person	
+	    who sent the message.  Returns true iff neither is the case **/
+
+	char our_address[SLEN];
+	struct addr_rec  *alternatives;
+
+	if (in_string(address, return_address))
+	  return(FALSE);
+
+	sprintf(our_address, "%s!%s", hostname, username);
+
+	if (in_string(address, our_address))
+	  return(FALSE);
+
+	sprintf(our_address, "%s@%s", username, hostname);
+	  
+	if (in_string(address, our_address))
+	  return(FALSE);
+
+	alternatives = alternative_addresses;
+
+	while (alternatives != NULL) {
+	  if (in_string(address, alternatives->address))
+	    return(FALSE);
+	  alternatives = alternatives->next;
+	}
+
+	return(TRUE);
+}
+	    
+optimize_and_add(new_address, full_address)
+char *new_address, *full_address;
+{
+	/** This routine will add the new address to the list of addresses
+	    in the full address buffer IFF it doesn't already occur.  It
+	    will also try to fix dumb hops if possible, specifically hops
+	    of the form ...a!b...!a... and hops of the form a@b@b etc 
+	**/
+
+	register int len, host_count = 0, i;
+	char     hosts[MAX_HOPS][SLEN];	/* array of machine names */
+	char     *host, *addrptr;
+
+	if (in_string(full_address, new_address))
+	  return(1);	/* duplicate address */
+
+	/** optimize **/
+	/*  break down into a list of machine names, checking as we go along */
+	
+	addrptr = (char *) new_address;
+
+	while ((host = get_token(addrptr, "!", 1)) != NULL) {
+	  for (i = 0; i < host_count && ! equal(hosts[i], host); i++)
+	      ;
+
+	  if (i == host_count) {
+	    strcpy(hosts[host_count++], host);
+	    if (host_count == MAX_HOPS) {
+	       dprint1(2,
+              "Error: hit max_hops limit trying to build return address (%s)\n",
+		      "optimize_and_add");
+	       error("Can't build return address - hit MAX_HOPS limit!");
+	       return(1);
+	    }
+	  }
+	  else 
+	    host_count = i + 1;
+	  addrptr = NULL;
+	}
+
+	/** fix the ARPA addresses, if needed **/
+	
+	if (chloc(hosts[host_count-1], '@') > -1)
+	  fix_arpa_address(hosts[host_count-1]);
+	  
+	/** rebuild the address.. **/
+
+	new_address[0] = '\0';
+
+	for (i = 0; i < host_count; i++)
+	  sprintf(new_address, "%s%s%s", new_address, 
+	          new_address[0] == '\0'? "" : "!",
+	          hosts[i]);
+
+	if (full_address[0] == '\0')
+	  strcpy(full_address, new_address);
+	else {
+	  len = strlen(full_address);
+	  full_address[len  ] = ',';
+	  full_address[len+1] = ' ';
+	  full_address[len+2] = '\0';
+	  strcat(full_address, new_address);
+	}
+
+	return(0);
+}
+
+get_return_name(address, name, shift_lower)
+char *address, *name;
+int   shift_lower;
+{
+	/** Given the address (either a single address or a combined list 
+	    of addresses) extract the login name of the first person on
+	    the list and return it as 'name'.  Modified to stop at
+	    any non-alphanumeric character. **/
+
+	/** An important note to remember is that it isn't vital that this
+	    always returns just the login name, but rather that it always
+	    returns the SAME name.  If the persons' login happens to be,
+	    for example, joe.richards, then it's arguable if the name 
+	    should be joe, or the full login.  It's really immaterial, as
+	    indicated before, so long as we ALWAYS return the same name! **/
+
+	/** Another note: modified to return the argument as all lowercase
+	    always, unless shift_lower is FALSE... **/
+
+	char single_address[LONG_SLEN];
+	register int i, loc, index = 0;
+
+	dprint2(6,"get_return_name called with (%s, <>, shift=%s)\n", 
+		   address, onoff(shift_lower));
+
+	/* First step - copy address up to a comma, space, or EOLN */
+
+	for (i=0; address[i] != ',' && ! whitespace(address[i]) && 
+	     address[i] != '\0'; i++)
+	  single_address[i] = address[i];
+	single_address[i] = '\0';
+
+	/* Now is it an ARPA address?? */
+
+	if ((loc = chloc(single_address, '@')) != -1) {	  /* Yes */
+
+	  /* At this point the algorithm is to keep shifting our copy 
+	     window left until we hit a '!'.  The login name is then
+             located between the '!' and the first metacharacter to 
+	     it's right (ie '%', ':' or '@'). */
+
+	  for (i=loc; single_address[i] != '!' && i > -1; i--)
+	      if (single_address[i] == '%' || 
+	          single_address[i] == ':' ||
+	          single_address[i] == '.' ||	/* no domains */
+		  single_address[i] == '@') loc = i-1;
+	
+	  if (i < 0 || single_address[i] == '!') i++;
+
+	  for (index = 0; index < loc - i + 1; index++)
+	    if (shift_lower)
+	      name[index] = tolower(single_address[index+i]);
+	    else
+	      name[index] = single_address[index+i];
+	  name[index] = '\0';
+	}
+	else {	/* easier - standard USENET address */
+
+	  /* This really is easier - we just cruise left from the end of
+	     the string until we hit either a '!' or the beginning of the
+             line.  No sweat. */
+
+	  loc = strlen(single_address)-1; 	/* last char */
+
+	  for (i = loc; single_address[i] != '!' && single_address[i] != '.' 
+	       && i > -1; i--)
+	     if (shift_lower)
+	       name[index++] = tolower(single_address[i]);
+	     else
+	       name[index++] = single_address[i];
+	  name[index] = '\0';
+	  reverse(name);
+	}
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 10560 ]
+  then
+    echo $filename changed - should be 10560 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+# ---------- file src/screen.c ----------
+
+filename="src/screen.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/screen.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**		screen.c		**/
+
+/**  screen display routines for ELM program 
+
+     (C) Copyright 1985, Dave Taylor
+**/
+
+#include "headers.h"
+
+static   int  last_current	 = -1;
+
+showscreen()
+{
+	char buffer[SLEN];
+
+	ClearScreen();
+
+	if (notesfile) 
+	  sprintf(buffer, "Notes from '%s' (%d note%s) [Version %s]",
+	        infile, message_count, 
+		plural(message_count), VERSION);
+	else 
+	  sprintf(buffer, "Mailbox is '%s' with %d message%s [Version %s]",
+	        infile, message_count, 
+		plural(message_count), VERSION);
+	Centerline(1, buffer);
+
+	last_header_page = -1;	 	/* force a redraw regardless */
+	show_headers();
+
+	if (mini_menu)
+	  show_menu();
+
+	show_last_error();
+	
+	if (hp_terminal) 
+	  define_softkeys(MAIN);
+}
+
+update_title()
+{
+	/** display a new title line, probably due to new mail arriving **/
+
+	char buffer[SLEN];
+
+	if (notesfile) 
+	  sprintf(buffer, "Notes from '%s' (%d note%s) [Version %s]",
+	        infile, message_count, 
+		plural(message_count), VERSION);
+	else 
+	  sprintf(buffer, "Mailbox is '%s' with %d message%s [Version %s]",
+	        infile, message_count, 
+		plural(message_count), VERSION);
+
+	ClearLine(1);
+
+	Centerline(1, buffer);
+}
+
+show_menu()
+{
+	/** write main system menu... **/
+
+	Centerline(LINES-7,
+  "|=pipe, !=shell, ?=help, <n>=set current to n, /=search pattern");
+        Centerline(LINES-6,
+"A)lias, C)hange mailbox, D)elete, E)dit, F)orward, G)roup reply, M)ail,"); 
+	Centerline(LINES-5,
+  "N)ext, O)ptions, P)rint, R)eply, S)ave, T)ag, Q)uit, U)ndelete, or eX)it");
+
+	show_last_error();
+}
+
+int
+show_headers()
+{
+	/** display page of headers (10) if present.  First check to 
+	    ensure that header_page is in bounds, fixing silently if not.
+	    If out of bounds, return zero, else return non-zero **/
+
+	register int this_msg = 0, line = 4, last = 0, last_line;
+	char newfrom[SLEN], buffer[SLEN];
+	
+	if (fix_header_page())
+	  return(FALSE);
+
+	if (header_page == last_header_page) 	/* nothing to do! */
+	  return(FALSE);
+
+	/** compute last header to display **/
+
+	this_msg = header_page * headers_per_page;
+
+	last = this_msg + (headers_per_page - 1);
+
+	if (last >= message_count) last = message_count-1;
+
+	/** okay, now let's show the header page! **/
+
+	ClearLine(line);	/* Clear the top line... */
+
+	MoveCursor(line, 0);	/* and move back to the top of the page... */
+
+	for (; this_msg <= last; this_msg++) {
+
+	  tail_of(header_table[this_msg].from, newfrom, TRUE); 
+
+	  if (this_msg == current-1)
+	    build_header_line(buffer, &header_table[this_msg], this_msg+1, TRUE, 
+			      newfrom);
+	  else
+	    build_header_line(buffer, &header_table[this_msg], 
+			      this_msg+1, FALSE, newfrom);
+
+	  Write_to_screen("%s\r\n", 1, buffer);	/* avoid '%' probs */
+	  CleartoEOLN();
+	  line++;		/* for clearing up in a sec... */
+
+	}
+
+	if (mini_menu)
+	  last_line = LINES-8;
+	else
+	  last_line = LINES-3;
+
+	while (line < last_line) {
+	  CleartoEOLN();
+	  Writechar('\r');
+	  Writechar('\n');
+	  line++;
+	}
+
+	display_central_message();
+
+	last_current = current;
+	last_header_page = header_page;
+
+	return(TRUE);
+}
+
+show_current()
+{
+	/** Display page of headers (10) if present.  First check to 
+	    ensure that header_page is in bounds, fixing silently if not.
+	    Note that this will ensure that 'current' is always set to
+	    the top message on the screen if we go to a new screen! **/
+
+	register int first = 0, last = 0, last_line, new_line;
+	char     newfrom[SLEN], old_buffer[SLEN], new_buffer[SLEN];
+
+	(void) fix_header_page();	/* Who cares what it does? ;-) */
+
+	/** compute last header to display **/
+
+	first = header_page * headers_per_page;
+	last  = first + (headers_per_page - 1);
+
+	if (last > message_count) 
+	  last = message_count;
+
+	/** okay, now let's show the pointers... **/
+
+	/** have we changed??? **/
+
+	if (current == last_current) 
+	  return;
+
+	last_line = ((last_current-1) % headers_per_page)+4;
+	new_line  = ((current-1) % headers_per_page)+4;
+
+	if (has_highlighting && ! arrow_cursor) {
+	  /** build the old and new header lines... **/
+  
+	  tail_of(header_table[current-1].from, newfrom, TRUE); 
+	  build_header_line(new_buffer, &header_table[current-1], current, 
+			    TRUE, newfrom);
+
+	  if (last_current > 0) {  /* say we went from no mail to new... */
+	    tail_of(header_table[last_current-1].from, newfrom, TRUE); 
+	    build_header_line(old_buffer, &header_table[last_current-1], 
+		    last_current, FALSE, newfrom);
+
+	    ClearLine(last_line);
+	    PutLine0(last_line, 0, old_buffer);
+	  }
+	  PutLine0(new_line, 0, new_buffer);
+	}
+	else {
+	  if (on_page(last_current)) 
+	    PutLine0(last_line,0,"  ");	/* remove old pointer... */
+	  if (on_page(current))
+	    PutLine0(new_line, 0,"->");
+	}
+	
+	last_current = current;
+}
+
+build_header_line(buffer, entry, message_number, highlight, from)
+char *buffer;
+struct header_rec *entry;
+int message_number, highlight;
+char *from;
+{
+	/** Build in buffer the message header ... entry is the current
+	    message entry, 'from' is a modified (displayable) from line, 
+	    'highlight' is either TRUE or FALSE, and 'message_number'
+	    is the number of the message.
+	**/
+
+	/** Note: using 'strncpy' allows us to output as much of the
+	    subject line as possible given the dimensions of the screen.
+	    The key is that 'strncpy' returns a 'char *' to the string
+	    that it is handing to the dummy variable!  Neat, eh? **/
+	
+	char subj[LONG_SLEN],		/* to output subject */
+	     buff[NLEN];		/* keep start_highlight value */
+
+	if (strcmp(start_highlight,"->") != 0 && arrow_cursor) {
+	  strcpy(buff, start_highlight);
+	  strcpy(start_highlight, "->");
+	}
+
+	strncpy(subj, entry->subject, COLUMNS-45);
+
+	subj[COLUMNS-45] = '\0';	/* insurance, eh? */
+
+	/* now THIS is a frightening format statement!!!  */
+
+	sprintf(buffer, "%s%s%c%c%c%-3d %3.3s %-2d %-18.18s (%d) %s%s%s", 
+		highlight? start_highlight : "",
+		strcmp(start_highlight,"->") == 0 && highlight? "" : "  ",
+		show_status(entry->status),
+		(entry->status & DELETED? 'D' : ' '), 
+		(entry->status & TAGGED?  '+' : ' '),
+	        message_number,
+	        entry->month, 
+		atoi(entry->day), 
+		from, 
+		entry->lines, 
+		(entry->lines / 1000   > 0? ""   :	/* spacing the  */
+		  entry->lines / 100   > 0? " "  :	/* same for the */
+		    entry->lines / 10  > 0? "  " :	/* lines in ()  */
+		                            "   "),    /*   [wierd]    */
+		subj,
+		highlight? end_highlight : " ");
+
+	/** Actually, it's rather an impressive feat that we can
+	    do so much in essentially one statement!  (Of course,
+	    I'll bet the test suite for the printf routine isn't
+	    THIS rigorous either!!!) (to be honest, though, just 
+	    looking at this statement makes me chuckle...)
+	**/
+
+	if (arrow_cursor) 			/* restore! */
+	  strcpy(start_highlight, buff);
+
+}
+
+int
+fix_header_page()
+{
+	/** this routine will check and ensure that the current header
+	    page being displayed contains messages!  It will silently
+	    fix 'header-page' if wrong.  Returns TRUE if changed.  **/
+
+	int last_page, old_header;
+
+	old_header = header_page;
+
+	last_page = (int) ((message_count-1) / headers_per_page);
+ 
+	if (header_page > last_page) 
+	  header_page = last_page;
+	else if (header_page < 0) 
+          header_page = 0;
+
+	return(old_header != header_page);
+}
+
+int
+on_page(message)
+int message;
+{
+	/** Returns true iff the specified message is on the displayed page. **/
+
+	if (message >= header_page * headers_per_page)
+	  if (message <= ((header_page+1) * headers_per_page)) 
+	    return(TRUE);
+
+	return(FALSE);
+}
+
+show_status(status)
+int status;
+{
+	/** This routine returns a single character indicative of
+	    the status of this message.  The precedence is;
+
+		E = Expired message
+	        P = Priority message
+		A = Action associated with message
+		N = New message
+		_ = (space) default 
+	**/
+
+	     if (status & EXPIRED)  return( 'E' );
+	else if (status & PRIORITY) return( 'P' );
+	else if (status & ACTION)   return( 'A' );
+	else if (status & NEW)      return( 'N' );
+	else 			    return( ' ' );
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 7956 ]
+  then
+    echo $filename changed - should be 7956 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+# ---------- file src/strings.c ----------
+
+filename="src/strings.c"
+
+if [ -f $filename ]
+then
+  echo File \"$filename\" already exists\!  Skipping...
+  filename=/dev/null		# throw it away
+else
+  echo extracting file src/strings.c...
+fi
+
+cat << 'END-OF-FILE' > $filename
+/**			strings.c		**/
+
+/** This file contains all the string oriented functions for the
+    ELM Mailer, and lots of other generally useful string functions! 
+
+    For BSD systems, this file also includes the function "tolower"
+    to translate the given character from upper case to lower case.
+
+    (C) Copyright 1985, Dave Taylor
+**/
+
+#include <stdio.h>
+#include "headers.h"
+#include <ctype.h>
+
+#ifdef BSD
+#undef tolower
+#undef toupper
+#endif
+
+/** forward declarations **/
+
+char *format_long(), *strip_commas(), *tail_of_string(), *shift_lower(),
+     *get_token(), *strip_parens(), *argv_zero(), *change_ats();
+
+#ifdef BSD
+
+int
+tolower(ch)
+char ch;
+{
+	/** This should be a macro call, but if you use this as a macro
+	    calls to 'tolower' where the argument is a function call will
+	    cause the function to be called TWICE which is obviously the
+	    wrong behaviour.  On the other hand, to just blindly translate
+	    assuming the character is always uppercase can cause BIG
+	    problems, so...
+	**/
+
+	return ( isupper(ch) ? ch - 'A' + 'a' : ch );
+}
+
+int
+toupper(ch)
+char ch;
+{
+	/** see comment for above routine - tolower() **/
+
+	return ( islower(ch) ? ch - 'a' + 'A' : ch );
+}
+
+#endif
+
+int
+printable_chars(string)
+char *string;
+{
+	/** Returns the number of "printable" (ie non-control) characters
+	    in the given string... Modified 4/86 to know about TAB
+	    characters being every eight characters... **/
+
+	register int count = 0, index;
+
+	for (index = 0; index < strlen(string); index++)
+	  if (string[index] >= ' ') 
+	    if (string[index] == '\t')
+	      count += (7-(count % 8));
+	    else
+	      count++;
+
+	return(count);
+}
+
+tail_of(from, buffer, header_line)
+char *from, *buffer;
+int   header_line;
+{
+	/** Return last two words of 'from'.  This is to allow
+	    painless display of long return addresses as simply the
+	    machine!username.  Alternatively, if the first three
+	    characters of the 'from' address are 'To:' and 'header_line'
+	    is TRUE, then return the buffer value prepended with 'To '. 
+
+	    Mangled to know about the PREFER_UUCP hack.  6/86
+	**/
+
+	/** Note: '!' delimits Usenet nodes, '@' delimits ARPA nodes,
+	          ':' delimits CSNet & Bitnet nodes, and '%' delimits
+		  multiple stage ARPA hops... **/
+
+	register int loc, i = 0, cnt = 0;
+	char     tempbuffer[SLEN];
+	
+#ifdef PREFER_UUCP
+	
+	/** let's see if we have an address appropriate for hacking **/
+
+	if (chloc(from,'!') != -1 && in_string(from, BOGUS_INTERNET))
+	   from[strlen(from)-strlen(BOGUS_INTERNET)] = '\0';
+
+#endif
+
+	for (loc = strlen(from)-1; loc >= 0 && cnt < 2; loc--) {
+	  if (from[loc] == BANG || from[loc] == AT_SIGN ||
+	      from[loc] == COLON) cnt++;
+	  if (cnt < 2) buffer[i++] = from[loc];
+	}
+
+	buffer[i] = '\0';
+
+	reverse(buffer);
+
+	if ((strncmp(buffer,"To:", 3) == 0) && header_line)
+	  buffer[2] = ' ';
+	else if ((strncmp(from, "To:", 3) == 0) && header_line) {
+	  sprintf(tempbuffer,"To %s", buffer); 
+	  strcpy(buffer, tempbuffer);
+	}
+	else if (strncmp(buffer, "To:", 3) == 0) {
+	  for (i=3; i < strlen(buffer); i++)
+	    tempbuffer[i-3] = buffer[i];
+	  tempbuffer[i-3] = '\0';
+	  strcpy(buffer, tempbuffer);
+	}
+}
+
+char *format_long(inbuff, init_len)
+char *inbuff;
+int   init_len;
+{
+	/** Return buffer with \n\t sequences added at each point
+	    where it would be more than 80 chars long.  It only 
+	    allows the breaks at legal points (ie white spaces).
+	    init-len is the characters already on the first line...
+	    Changed so that if this is called while mailing without
+	    the overhead of "elm", it'll include "\r\n\t" instead.
+	**/
+
+	static char ret_buffer[VERY_LONG_STRING];
+	register int index = 0, current_length = 0, depth=15, i;
+	char     buffer[VERY_LONG_STRING];
+	char     *word, *bufptr;
+
+	strcpy(buffer, inbuff);
+
+	bufptr = (char *) buffer;
+
+	current_length = init_len + 2;	/* for luck */
+
+	while ((word = get_token(bufptr," ", depth)) != NULL) {
+	  if (strlen(word) + current_length > 80) {
+	    if (index > 0) {
+	      if (mail_only)
+	        ret_buffer[index++] = '\r';
+	      ret_buffer[index++] = '\n';
+	      ret_buffer[index++] = '\t';
+	    }
+	    for (i=0; i<strlen(word); i++)
+	      ret_buffer[index++] = word[i];
+	    current_length = strlen(word) + 8;	/* 8 = TAB */
+	  }
+	  else {
+	    if (index > 0)
+	      ret_buffer[index++] = ' ';
+	    for (i=0; i<strlen(word); i++)
+	      ret_buffer[index++] = word[i];
+	    current_length += strlen(word) + 1;
+	  }
+	
+	  bufptr = NULL;
+	}
+	
+	ret_buffer[index] = '\0';
+
+	return( (char *) ret_buffer);
+}
+
+char *strip_commas(string)
+char *string;
+{
+	/** return string with all commas changed to spaces.  This IS
+	    destructive and will permanently change the input string.. **/
+
+	register int i;
+
+	for (i=0; i < strlen(string); i++)
+	  if (string[i] == COMMA)
+	    string[i] = SPACE;
+
+	return( (char *) string);
+}
+
+char *strip_parens(string)
+char *string;
+{
+	/** Return string with all parenthesized information removed.
+	    This is a non-destructive algorithm... **/
+
+	static char  buffer[VERY_LONG_STRING];
+	register int i, depth = 0, buffer_index = 0;
+
+	for (i=0; i < strlen(string); i++) {
+	  if (string[i] == '(')
+	    depth++;
+	  else if (string[i] == ')') 
+	    depth--;
+	  else if (depth == 0)
+	    buffer[buffer_index++] = string[i];
+	}
+	
+	buffer[buffer_index] = '\0';
+
+	return( (char *) buffer);
+}
+
+move_left(string, chars)
+char string[];
+int  chars;
+{
+	/** moves string chars characters to the left DESTRUCTIVELY **/
+
+	register int i;
+
+	chars--; /* index starting at zero! */
+
+	for (i=chars; string[i] != '\0' && string[i] != '\n'; i++)
+	  string[i-chars] = string[i];
+
+	string[i-chars] = '\0';
+}
+
+remove_first_word(string)
+char *string;
+{	/** removes first word of string, ie up to first non-white space
+	    following a white space! **/
+
+	register int loc;
+
+	for (loc = 0; string[loc] != ' ' && string[loc] != '\0'; loc++) 
+	    ;
+
+	while (string[loc] == ' ' || string[loc] == '\t')
+	  loc++;
+	
+	move_left(string, ++loc);
+}
+
+char *tail_of_string(string, maxchars)
+char *string;
+int  maxchars;
+{
+	/** Return a string that is the last 'maxchars' characters of the
+	    given string.  This is only used if the first word of the string
+	    is longer than maxchars, else it will return what is given to
+	    it... 
+	**/
+
+	static char buffer[SLEN];
+	register int index, i;
+
+	for (index=0;! whitespace(string[index]) && index < strlen(string); 
+	     index++)
+	  ;
+
+	if (index < maxchars) {
+	  strncpy(buffer, string, maxchars-2);	/* word too short */
+	  buffer[maxchars-2] = '.';
+	  buffer[maxchars-1] = '.';
+	  buffer[maxchars]   = '.';
+	  buffer[maxchars+1] = '\0';
+	} 
+	else {
+	  i = maxchars;
+	  buffer[i--] = '\0';
+	  while (i > 1) 
+	    buffer[i--] = string[index--];
+	  buffer[2] = '.';
+	  buffer[1] = '.';
+	  buffer[0] = '.';
+	}
+
+	return( (char *) buffer);
+}
+
+reverse(string)
+char *string;
+{
+	/** reverse string... pretty trivial routine, actually! **/
+
+	char buffer[SLEN];
+	register int i, j = 0;
+
+	for (i = strlen(string)-1; i >= 0; i--)
+	  buffer[j++] = string[i];
+
+	buffer[j] = '\0';
+
+	strcpy(string, buffer);
+}
+
+int
+get_word(buffer, start, word)
+char *buffer, *word;
+int start;
+{
+	/**	return next word in buffer, starting at 'start'.
+		delimiter is space or end-of-line.  Returns the
+		location of the next word, or -1 if returning
+		the last word in the buffer.  -2 indicates empty
+		buffer!  **/
+
+	register int loc = 0;
+
+	while (buffer[start] == ' ' && buffer[start] != '\0')
+	  start++;
+
+	if (buffer[start] == '\0') return(-2);	 /* nothing IN buffer! */
+
+	while (buffer[start] != ' ' && buffer[start] != '\0')
+	  word[loc++] = buffer[start++];
+
+	word[loc] = '\0';
+	return(start);
+}
+
+char *shift_lower(string)
+char *string;
+{
+	/** return 'string' shifted to lower case.  Do NOT touch the
+	    actual string handed to us! **/
+
+	static char buffer[LONG_SLEN];
+	register int i;
+
+	for (i=0; i < strlen(string); i++)
+	  if (isupper(string[i]))
+	    buffer[i] = tolower(string[i]);
+	  else
+	    buffer[i] = string[i];
+	
+	buffer[strlen(string)] = 0;
+	
+	return( (char *) buffer);
+}
+
+int
+words_in_string(buffer)
+char *buffer;
+{
+	/** This routine returns the number of words in the given line.
+	    A word is defined as a series of characters surrounded by
+	    either the beginning of the string, the end of the string,
+	    or white space.
+		For example, the following line has 8 words:
+	    "This is a test of the program, okay?"
+	**/
+
+	register int count = 0, i = 0;
+	
+	while (buffer[i] != '\0') {
+	  
+	  while (whitespace(buffer[i])) i++;
+	
+	  if (buffer[i] != '\0')
+  	    count++;
+
+	  while (! whitespace(buffer[i]) && buffer[i] != '\0') i++;
+	}
+	return(count);
+}
+
+clean_up(buffer)
+char *buffer;
+{
+	/** This routine takes a string of the form "a:b" and returns it 
+            as just "b"... **/
+
+	char mybuffer[SLEN];
+	register int loc, myloc = 0;
+
+	for (loc=0; buffer[loc] != ':'; loc++)
+	   ;
+
+	while (buffer[++loc] != '\0')
+	  mybuffer[myloc++] = buffer[loc];
+
+	mybuffer[myloc] = '\0';
+
+	strcpy(buffer, mybuffer);
+}
+
+Centerline(line, string)
+int line;
+char *string;
+{
+	/** Output 'string' on the given line, centered. **/
+
+	register int length, col;
+
+	length = strlen(string);
+
+	if (length > COLUMNS)
+	  col = 0;
+	else
+	  col = (COLUMNS - length) / 2;
+
+	PutLine0(line, col, string);
+}
+
+char *argv_zero(string)
+char *string;
+{
+	/** given a string of the form "/something/name" return a
+	    string of the form "name"... **/
+
+	static char buffer[NLEN];
+	register int i, j=0;
+
+	for (i=strlen(string)-1; string[i] != '/'; i--)
+	  buffer[j++] = string[i];
+	buffer[j] = '\0';
+
+	reverse(buffer);
+
+	return( (char *) buffer);
+}
+
+#define MAX_RECURSION		20		/* up to 20 deep recursion */
+
+char *get_token(source, keys, depth)
+char *source, *keys;
+int   depth;
+{
+	/** This function is similar to strtok() (see "opt_utils")
+	    but allows nesting of calls via pointers... 
+	**/
+
+	register int  last_ch;
+	static   char *buffers[MAX_RECURSION];
+	char     *return_value, *sourceptr;
+
+	if (depth > MAX_RECURSION) {
+	   error1("get_token calls nested greater than %d deep!", 
+		  MAX_RECURSION);
+	   emergency_exit();
+	}
+
+	if (source != NULL)
+	  buffers[depth] = source;
+	
+	sourceptr = buffers[depth];
+	
+	if (*sourceptr == '\0') 
+	  return(NULL);		/* we hit end-of-string last time!? */
+
+	sourceptr += strspn(sourceptr, keys);	  /* skip the bad.. */
+	
+	if (*sourceptr == '\0') {
+	  buffers[depth] = sourceptr;
+	  return(NULL);			/* we've hit end-of-string   */
+	}
+
+	last_ch = strcspn(sourceptr, keys);   /* end of good stuff   */
+
+	return_value = sourceptr;	      /* and get the ret     */
+
+	sourceptr += last_ch;		      /* ...value            */
+
+	if (*sourceptr != '\0')		/** don't forget if we're at end! **/
+	  sourceptr++;			      
+	
+	return_value[last_ch] = '\0';	      /* ..ending right      */
+
+	buffers[depth] = sourceptr;	      /* save this, mate!    */
+
+	return((char *) return_value);	     /* and we're outta here! */
+}
+END-OF-FILE
+
+if [ "$filename" != "/dev/null" ]
+then
+  size=`wc -c < $filename`
+
+  if [ $size != 10842 ]
+  then
+    echo $filename changed - should be 10842 bytes, not $size bytes
+  fi
+
+  chmod 644 $filename
+fi
+
+echo end of this archive file....
+exit 0
+
